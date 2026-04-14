@@ -1,0 +1,13 @@
+{
+  "name": "@checkleft/exec",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./javascript/checkleft_exec.d.ts",
+      "import": "./javascript/checkleft_exec.mjs",
+      "default": "./javascript/checkleft_exec.mjs"
+    }
+  }
+}

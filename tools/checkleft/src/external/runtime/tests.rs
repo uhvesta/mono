@@ -1,18 +1,21 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::Result;
 use tempfile::tempdir;
 
 use crate::external::{
-    EXTERNAL_CHECK_API_V1, ExternalCheckArtifactPackage, ExternalCheckCapabilities,
-    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalSourcePackageBuilder,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_EXEC_RUNTIME_V1, ExternalCheckArtifactPackage,
+    ExternalCheckCapabilities, ExternalCheckExecPackage, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalSourcePackageBuilder,
 };
 use crate::input::ChangeSet;
 use crate::output::Severity;
 use crate::source_tree::LocalSourceTree;
 
-use super::{ExternalCheckExecutor, WasmExternalCheckExecutor, sha256_hex};
+use super::{DefaultExternalCheckExecutor, ExternalCheckExecutor, sha256_hex};
 
 #[test]
 fn executes_artifact_module_and_parses_findings() {
@@ -37,7 +40,7 @@ i64.const {encoded}
     fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
     let artifact_sha256 = sha256_hex(&fs::read(temp.path().join("check.wasm")).expect("read wasm"));
 
-    let executor = WasmExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
     let package = ExternalCheckPackage {
         id: "example-check".to_owned(),
         runtime: "sandbox-v1".to_owned(),
@@ -117,7 +120,7 @@ i64.const {encoded}
         },
     });
     let executor =
-        WasmExternalCheckExecutor::with_source_package_builder(temp.path(), source_builder)
+        DefaultExternalCheckExecutor::with_source_package_builder(temp.path(), source_builder)
             .expect("create executor");
     let package = ExternalCheckPackage {
         id: "source-check".to_owned(),
@@ -161,7 +164,7 @@ i64.const 0
     .expect("parse wat");
     fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
 
-    let executor = WasmExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
     let package = ExternalCheckPackage {
         id: "example-check".to_owned(),
         runtime: "sandbox-v1".to_owned(),
@@ -202,7 +205,7 @@ fn core_runtime_trap_does_not_fall_back_to_component_mode() {
     fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
     let artifact_sha256 = sha256_hex(&fs::read(temp.path().join("check.wasm")).expect("read wasm"));
 
-    let executor = WasmExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
     let package = ExternalCheckPackage {
         id: "example-check".to_owned(),
         runtime: "sandbox-v1".to_owned(),
@@ -245,7 +248,7 @@ i64.const 0
     fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
     let artifact_sha256 = sha256_hex(&fs::read(temp.path().join("check.wasm")).expect("read"));
 
-    let executor = WasmExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
     let package = ExternalCheckPackage {
         id: "example-check".to_owned(),
         runtime: "sandbox-v1".to_owned(),
@@ -275,4 +278,152 @@ i64.const 0
             .to_string()
             .contains("invalid command capability declaration")
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn executes_repo_local_exec_runtime_and_parses_findings() {
+    let temp = tempdir().expect("temp dir");
+    let script_path = temp.path().join("check.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+input="$(cat)"
+case "$input" in
+  *"docs/file.md"*)
+    printf '%s' '{"findings":[{"severity":"warning","message":"exec-ok","location":null,"remediation":null,"suggested_fix":null}]}'
+    ;;
+  *)
+    printf '%s' '{"findings":[]}'
+    ;;
+esac
+"#,
+    )
+    .expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let package = ExternalCheckPackage {
+        id: "exec-check".to_owned(),
+        runtime: EXTERNAL_CHECK_EXEC_RUNTIME_V1.to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: ExternalCheckCapabilities::default(),
+        implementation: ExternalCheckPackageImplementation::Exec(ExternalCheckExecPackage {
+            executable_path: "check.sh".to_owned(),
+            args: Vec::new(),
+            provenance: None,
+        }),
+    };
+
+    let result = executor
+        .execute(
+            &package,
+            &ChangeSet::new(vec![crate::input::ChangedFile {
+                path: "docs/file.md".into(),
+                kind: crate::input::ChangeKind::Modified,
+                old_path: None,
+            }]),
+            &LocalSourceTree::new(temp.path()).expect("tree"),
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("execute");
+
+    assert_eq!(result.check_id, "exec-check");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].severity, Severity::Warning);
+    assert_eq!(result.findings[0].message, "exec-ok");
+}
+
+#[test]
+#[cfg(unix)]
+fn exec_runtime_reports_non_zero_exit_and_stderr() {
+    let temp = tempdir().expect("temp dir");
+    let script_path = temp.path().join("check.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+echo 'bad-output' >&2
+exit 17
+"#,
+    )
+    .expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let package = ExternalCheckPackage {
+        id: "exec-check".to_owned(),
+        runtime: EXTERNAL_CHECK_EXEC_RUNTIME_V1.to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: ExternalCheckCapabilities::default(),
+        implementation: ExternalCheckPackageImplementation::Exec(ExternalCheckExecPackage {
+            executable_path: "check.sh".to_owned(),
+            args: Vec::new(),
+            provenance: None,
+        }),
+    };
+
+    let error = executor
+        .execute(
+            &package,
+            &ChangeSet::default(),
+            &LocalSourceTree::new(temp.path()).expect("tree"),
+            &toml::Value::Table(Default::default()),
+        )
+        .expect_err("must fail");
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("exited with status"));
+    assert!(rendered.contains("stderr: bad-output"));
+}
+
+#[test]
+#[cfg(unix)]
+fn exec_runtime_sets_bazel_bindir_for_bazel_bin_launchers() {
+    let temp = tempdir().expect("temp dir");
+    let bazel_bin_dir = temp.path().join("bazel-bin");
+    fs::create_dir_all(&bazel_bin_dir).expect("mkdir bazel-bin");
+    let script_path = bazel_bin_dir.join("check.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+if [ "${BAZEL_BINDIR:-}" != "." ]; then
+  echo "expected BAZEL_BINDIR=. but got '${BAZEL_BINDIR:-}'" >&2
+  exit 23
+fi
+printf '%s' '{"findings":[{"severity":"info","message":"bazel-bindir-ok","location":null,"remediation":null,"suggested_fix":null}]}'
+"#,
+    )
+    .expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let package = ExternalCheckPackage {
+        id: "exec-check".to_owned(),
+        runtime: EXTERNAL_CHECK_EXEC_RUNTIME_V1.to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        capabilities: ExternalCheckCapabilities::default(),
+        implementation: ExternalCheckPackageImplementation::Exec(ExternalCheckExecPackage {
+            executable_path: "bazel-bin/check.sh".to_owned(),
+            args: Vec::new(),
+            provenance: None,
+        }),
+    };
+
+    let result = executor
+        .execute(
+            &package,
+            &ChangeSet::default(),
+            &LocalSourceTree::new(temp.path()).expect("tree"),
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("execute");
+
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].severity, Severity::Info);
+    assert_eq!(result.findings[0].message, "bazel-bindir-ok");
 }

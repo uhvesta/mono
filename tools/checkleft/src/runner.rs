@@ -8,10 +8,11 @@ use tokio::task::JoinSet;
 
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::{CheckRegistry, ConfiguredCheck};
-use crate::config::{CheckConfig, ConfigDiagnostic, ConfigResolver};
+use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver};
 use crate::external::{
-    ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageProvider,
-    NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
+    EXTERNAL_CHECK_EXEC_RUNTIME_V1, ExternalCheckExecutor, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider, NoopExternalCheckExecutor,
+    NoopExternalCheckPackageProvider,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -476,6 +477,24 @@ impl Runner {
                 ),
                 remediation: Some(
                     "Set `check = ...` to match the external package `id` or update the package manifest."
+                        .to_owned(),
+                ),
+            };
+        }
+
+        if matches!(check.origin, CheckConfigOrigin::ExternalUrl)
+            && matches!(
+                &package.implementation,
+                ExternalCheckPackageImplementation::Exec(_)
+            )
+        {
+            return ScheduledExecution::Invalid {
+                message: format!(
+                    "external check `{}` from `settings.external_checks_url` cannot use runtime `{}`",
+                    check.id, EXTERNAL_CHECK_EXEC_RUNTIME_V1
+                ),
+                remediation: Some(
+                    "Move this check definition into the repository's checked-in CHECKS file or use a sandboxed runtime."
                         .to_owned(),
                 ),
             };

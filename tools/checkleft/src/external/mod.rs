@@ -9,8 +9,11 @@ use serde::Deserialize;
 use crate::path::validate_relative_path;
 
 pub const EXTERNAL_CHECK_RUNTIME_V1: &str = "sandbox-v1";
+pub const EXTERNAL_CHECK_EXEC_RUNTIME_V1: &str = "exec-v1";
 pub const EXTERNAL_CHECK_API_V1: &str = "v1";
 pub const GENERATED_IMPLEMENTATION_PREFIX: &str = "generated:";
+
+pub mod exec_protocol;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalCheckImplementationRef {
@@ -64,6 +67,7 @@ pub struct ExternalCheckPackage {
 pub enum ExternalCheckPackageImplementation {
     Source(ExternalCheckSourcePackage),
     Artifact(ExternalCheckArtifactPackage),
+    Exec(ExternalCheckExecPackage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +82,13 @@ pub struct ExternalCheckSourcePackage {
 pub struct ExternalCheckArtifactPackage {
     pub artifact_path: String,
     pub artifact_sha256: String,
+    pub provenance: Option<ExternalCheckArtifactProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCheckExecPackage {
+    pub executable_path: String,
+    pub args: Vec<String>,
     pub provenance: Option<ExternalCheckArtifactProvenance>,
 }
 
@@ -111,7 +122,7 @@ pub use command_policy::ExternalCommandCapabilities;
 mod source_builder;
 pub use source_builder::{ExternalSourcePackageBuilder, JavaScriptComponentSourcePackageBuilder};
 mod runtime;
-pub use runtime::{ExternalCheckExecutor, NoopExternalCheckExecutor, WasmExternalCheckExecutor};
+pub use runtime::{DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor};
 
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)
@@ -131,6 +142,7 @@ pub fn parse_external_check_package_manifest(contents: &str) -> Result<ExternalC
 enum RawExternalCheckMode {
     Source,
     Artifact,
+    Exec,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,7 +153,7 @@ struct RawExternalCheckPackage {
     api_version: String,
     mode: RawExternalCheckMode,
     #[serde(default)]
-    capabilities: RawExternalCheckCapabilities,
+    capabilities: Option<RawExternalCheckCapabilities>,
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
@@ -154,6 +166,10 @@ struct RawExternalCheckPackage {
     artifact_path: Option<String>,
     #[serde(default)]
     artifact_sha256: Option<String>,
+    #[serde(default)]
+    executable_path: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
     #[serde(default)]
     provenance: Option<ExternalCheckArtifactProvenance>,
 }
@@ -172,17 +188,14 @@ impl RawExternalCheckPackage {
             sources,
             artifact_path,
             artifact_sha256,
+            executable_path,
+            args,
             provenance,
         } = self;
 
         let id = required_non_empty("id", id)?;
         let runtime = required_non_empty("runtime", runtime)?;
-        if runtime != EXTERNAL_CHECK_RUNTIME_V1 {
-            bail!(
-                "unsupported runtime `{runtime}` (expected `{}`)",
-                EXTERNAL_CHECK_RUNTIME_V1
-            );
-        }
+        validate_runtime_for_mode(mode, &runtime)?;
 
         let api_version = required_non_empty("api_version", api_version)?;
         if api_version != EXTERNAL_CHECK_API_V1 {
@@ -192,7 +205,7 @@ impl RawExternalCheckPackage {
             );
         }
 
-        let capabilities = capabilities.validate()?;
+        let capabilities = validate_capabilities(mode, capabilities)?;
         let implementation = match mode {
             RawExternalCheckMode::Source => {
                 ExternalCheckPackageImplementation::Source(validate_source_implementation(
@@ -202,6 +215,8 @@ impl RawExternalCheckPackage {
                     sources,
                     artifact_path,
                     artifact_sha256,
+                    executable_path,
+                    args,
                     provenance,
                 )?)
             }
@@ -213,6 +228,21 @@ impl RawExternalCheckPackage {
                     sources,
                     artifact_path,
                     artifact_sha256,
+                    executable_path,
+                    args,
+                    provenance,
+                )?)
+            }
+            RawExternalCheckMode::Exec => {
+                ExternalCheckPackageImplementation::Exec(validate_exec_implementation(
+                    language,
+                    entry,
+                    build_adapter,
+                    sources,
+                    artifact_path,
+                    artifact_sha256,
+                    executable_path,
+                    args,
                     provenance,
                 )?)
             }
@@ -236,10 +266,14 @@ fn validate_source_implementation(
     sources: Vec<String>,
     artifact_path: Option<String>,
     artifact_sha256: Option<String>,
+    executable_path: Option<String>,
+    args: Vec<String>,
     provenance: Option<ExternalCheckArtifactProvenance>,
 ) -> Result<ExternalCheckSourcePackage> {
     reject_if_present("artifact_path", artifact_path.as_ref())?;
     reject_if_present("artifact_sha256", artifact_sha256.as_ref())?;
+    reject_if_present("executable_path", executable_path.as_ref())?;
+    reject_if_present_list("args", &args)?;
     reject_if_present("provenance", provenance.as_ref())?;
 
     let sources = sources
@@ -263,11 +297,15 @@ fn validate_artifact_implementation(
     sources: Vec<String>,
     artifact_path: Option<String>,
     artifact_sha256: Option<String>,
+    executable_path: Option<String>,
+    args: Vec<String>,
     provenance: Option<ExternalCheckArtifactProvenance>,
 ) -> Result<ExternalCheckArtifactPackage> {
     reject_if_present("language", language.as_ref())?;
     reject_if_present("entry", entry.as_ref())?;
     reject_if_present("build_adapter", build_adapter.as_ref())?;
+    reject_if_present("executable_path", executable_path.as_ref())?;
+    reject_if_present_list("args", &args)?;
     if !sources.is_empty() {
         bail!("field `sources` is not allowed in `artifact` mode");
     }
@@ -275,6 +313,39 @@ fn validate_artifact_implementation(
     Ok(ExternalCheckArtifactPackage {
         artifact_path: required_some_relative_path_string("artifact_path", artifact_path)?,
         artifact_sha256: required_some_sha256("artifact_sha256", artifact_sha256)?,
+        provenance,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_exec_implementation(
+    language: Option<String>,
+    entry: Option<String>,
+    build_adapter: Option<String>,
+    sources: Vec<String>,
+    artifact_path: Option<String>,
+    artifact_sha256: Option<String>,
+    executable_path: Option<String>,
+    args: Vec<String>,
+    provenance: Option<ExternalCheckArtifactProvenance>,
+) -> Result<ExternalCheckExecPackage> {
+    reject_if_present("language", language.as_ref())?;
+    reject_if_present("entry", entry.as_ref())?;
+    reject_if_present("build_adapter", build_adapter.as_ref())?;
+    reject_if_present("artifact_path", artifact_path.as_ref())?;
+    reject_if_present("artifact_sha256", artifact_sha256.as_ref())?;
+    if !sources.is_empty() {
+        bail!("field `sources` is not allowed in `exec` mode");
+    }
+
+    let args = args
+        .into_iter()
+        .map(|arg| required_non_empty("args[]", arg))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ExternalCheckExecPackage {
+        executable_path: required_some_relative_path_string("executable_path", executable_path)?,
+        args,
         provenance,
     })
 }
@@ -311,8 +382,49 @@ impl RawExternalCheckCapabilities {
     }
 }
 
+fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Result<()> {
+    let expected = match mode {
+        RawExternalCheckMode::Source | RawExternalCheckMode::Artifact => EXTERNAL_CHECK_RUNTIME_V1,
+        RawExternalCheckMode::Exec => EXTERNAL_CHECK_EXEC_RUNTIME_V1,
+    };
+    if runtime != expected {
+        bail!("unsupported runtime `{runtime}` for `{mode}` mode (expected `{expected}`)");
+    }
+    Ok(())
+}
+
+fn validate_capabilities(
+    mode: RawExternalCheckMode,
+    capabilities: Option<RawExternalCheckCapabilities>,
+) -> Result<ExternalCheckCapabilities> {
+    match (mode, capabilities) {
+        (RawExternalCheckMode::Exec, Some(_)) => {
+            bail!("field `capabilities` is not allowed in `exec` mode");
+        }
+        (_, Some(raw)) => raw.validate(),
+        (_, None) => Ok(ExternalCheckCapabilities::default()),
+    }
+}
+
+impl fmt::Display for RawExternalCheckMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source => write!(f, "source"),
+            Self::Artifact => write!(f, "artifact"),
+            Self::Exec => write!(f, "exec"),
+        }
+    }
+}
+
 fn reject_if_present<T>(field_name: &str, value: Option<&T>) -> Result<()> {
     if value.is_some() {
+        bail!("field `{field_name}` is not allowed for this package mode");
+    }
+    Ok(())
+}
+
+fn reject_if_present_list<T>(field_name: &str, values: &[T]) -> Result<()> {
+    if !values.is_empty() {
         bail!("field `{field_name}` is not allowed for this package mode");
     }
     Ok(())

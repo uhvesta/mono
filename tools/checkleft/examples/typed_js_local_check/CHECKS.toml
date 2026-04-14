@@ -1,0 +1,8 @@
+[[checks]]
+id = "no-debug-logging"
+check = "no-debug-logging"
+implementation = "generated:no-debug-logging"
+
+[checks.config]
+forbidden_calls = ["console.log"]
+include_extensions = [".js", ".jsx", ".ts", ".tsx"]

@@ -50,3 +50,8 @@ checks:
   repo-scoped path in `${XDG_CACHE_HOME:-$HOME/.cache}/checkleft/`, and share
   the JS toolchain install across repos when the pinned toolchain inputs match.
   Those entries are derived-only and can be deleted to force a rebuild.
+
+## Examples
+
+- Repo-local `exec-v1` example with typed JavaScript API usage:
+  [`examples/typed_js_local_check/README.md`](examples/typed_js_local_check/README.md)

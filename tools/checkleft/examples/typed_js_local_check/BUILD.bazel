@@ -1,0 +1,40 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_test")
+load("@aspect_rules_js//npm:defs.bzl", "npm_link_package")
+load("//tools/checkleft/bazel:defs.bzl", "checkleft", "local_check")
+
+package(default_visibility = ["//visibility:private"])
+
+npm_link_package(
+    name = "node_modules/@checkleft/exec",
+    root_package = "",
+    visibility = ["//visibility:private"],
+)
+
+js_binary(
+    name = "no_debug_logging_bin",
+    entry_point = "check.mjs",
+    data = [
+        "check.mjs",
+        ":node_modules/@checkleft/exec",
+    ],
+)
+
+local_check(
+    name = "no-debug-logging",
+    binary = ":no_debug_logging_bin",
+)
+
+js_test(
+    name = "check_test",
+    entry_point = "check_test.mjs",
+    data = [
+        "check.mjs",
+        "fixture.ts",
+        ":node_modules/@checkleft/exec",
+    ],
+)
+
+checkleft(
+    name = "run_example",
+    checks = [":no-debug-logging"],
+)

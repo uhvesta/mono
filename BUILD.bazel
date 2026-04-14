@@ -1,3 +1,4 @@
+load("@aspect_rules_js//npm:defs.bzl", "npm_link_package")
 load("@npm//:defs.bzl", "npm_link_all_packages")
 
 # Root BUILD file
@@ -11,3 +12,8 @@ exports_files([
 ])
 
 npm_link_all_packages(name = "node_modules")
+
+npm_link_package(
+    name = "node_modules/@checkleft/exec",
+    src = "//tools/checkleft/api:checkleft_exec_pkg",
+)

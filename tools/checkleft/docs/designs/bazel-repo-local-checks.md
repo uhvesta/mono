@@ -262,7 +262,7 @@ This design needs two Bazel-facing rules or macros:
 
 Suggested attributes:
 
-- `id`: external package ID and default generated implementation ID
+- `id`: optional external package ID; defaults to `name`
 - `binary`: executable Bazel target to run
 - `args`: optional static argv suffix
 - `implementation_name`: optional generated implementation ID override
@@ -327,7 +327,6 @@ py_binary(
 
 local_check(
     name = "frontend_no_legacy_api",
-    id = "frontend-no-legacy-api",
     binary = ":frontend_no_legacy_api_bin",
 )
 
@@ -336,6 +335,9 @@ check_index(
     checks = [":frontend_no_legacy_api"],
 )
 ```
+
+When the Bazel target name is not the desired check ID, repos can still set
+`id = ...` explicitly.
 
 The check program itself can stay simple:
 
@@ -395,6 +397,16 @@ At the callsite, the repo should write:
 ```starlark
 load("//tools/checkleft/bazel:defs.bzl", "checkleft")
 
+checkleft(
+    name = "run_checkleft",
+    checks = [":frontend_no_legacy_api"],
+)
+```
+
+For repos that want the intermediate target to stay explicit, `checkleft(...)`
+should also accept:
+
+```starlark
 checkleft(
     name = "run_checkleft",
     check_index = ":check_index",

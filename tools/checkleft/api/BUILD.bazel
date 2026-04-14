@@ -1,0 +1,31 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+
+package(default_visibility = ["//visibility:private"])
+
+js_library(
+    name = "checkleft_exec_js",
+    srcs = ["javascript/checkleft_exec.mjs"],
+    types = ["javascript/checkleft_exec.d.ts"],
+    visibility = ["//visibility:public"],
+)
+
+npm_package(
+    name = "checkleft_exec_pkg",
+    srcs = [
+        ":checkleft_exec_js",
+        "package.json",
+    ],
+    package = "@checkleft/exec",
+    version = "0.0.0",
+    visibility = ["//visibility:public"],
+)
+
+exports_files(
+    [
+        "javascript/checkleft_exec.d.ts",
+        "javascript/checkleft_exec.mjs",
+        "python/checkleft_exec.py",
+    ],
+    visibility = ["//visibility:public"],
+)

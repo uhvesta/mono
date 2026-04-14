@@ -178,6 +178,78 @@ allow_bypass = true
 }
 
 #[tokio::test]
+async fn runner_allows_exec_runtime_for_local_config() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "domain-typo"
+check = "domain-typo-check"
+implementation = "generated:domain-typo-check"
+"#,
+    )
+    .expect("write config");
+
+    let provider = StaticExternalProvider {
+        package: Some(ExternalCheckPackage {
+            id: "domain-typo-check".to_owned(),
+            runtime: "exec-v1".to_owned(),
+            api_version: "v1".to_owned(),
+            capabilities: Default::default(),
+            implementation: ExternalCheckPackageImplementation::Exec(
+                crate::external::ExternalCheckExecPackage {
+                    executable_path: "bazel-bin/checks/domain_typo/domain_typo".to_owned(),
+                    args: Vec::new(),
+                    provenance: None,
+                },
+            ),
+        }),
+    };
+    let seen_packages = Arc::new(Mutex::new(Vec::new()));
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "domain-typo-check".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Warning,
+                message: "local exec ran".to_owned(),
+                location: None,
+                remediation: None,
+                suggested_fix: None,
+            }],
+        }),
+        error_message: None,
+        seen_packages: Arc::clone(&seen_packages),
+    };
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("docs/file.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].findings[0].message, "local exec ran");
+    assert_eq!(
+        seen_packages.lock().expect("lock seen packages").as_slice(),
+        ["domain-typo-check"]
+    );
+}
+
+#[tokio::test]
 async fn runner_applies_policy_severity_override_to_external_results() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
@@ -426,6 +498,91 @@ implementation = "generated:domain-typo-check"
         error
             .to_string()
             .contains("failed to resolve external check packages")
+    );
+}
+
+#[tokio::test]
+async fn runner_rejects_exec_runtime_from_external_checks_url() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
+
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/shared/CHECKS.yaml"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"
+checks:
+  - id: domain-typo
+    check: domain-typo-check
+    implementation: generated:domain-typo-check
+"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let provider = StaticExternalProvider {
+        package: Some(ExternalCheckPackage {
+            id: "domain-typo-check".to_owned(),
+            runtime: "exec-v1".to_owned(),
+            api_version: "v1".to_owned(),
+            capabilities: Default::default(),
+            implementation: ExternalCheckPackageImplementation::Exec(
+                crate::external::ExternalCheckExecPackage {
+                    executable_path: "bazel-bin/checks/domain_typo/domain_typo".to_owned(),
+                    args: Vec::new(),
+                    provenance: None,
+                },
+            ),
+        }),
+    };
+    let seen_packages = Arc::new(Mutex::new(Vec::new()));
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "domain-typo-check".to_owned(),
+            findings: Vec::new(),
+        }),
+        error_message: None,
+        seen_packages: Arc::clone(&seen_packages),
+    };
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        crate::config::ConfigResolverOptions {
+            external_checks_url: Some(format!("{}/shared/CHECKS.yaml", server.uri())),
+        },
+    )
+    .await
+    .expect("resolver");
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(resolver),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("docs/file.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].findings[0]
+            .message
+            .contains("cannot use runtime `exec-v1`")
+    );
+    assert!(
+        seen_packages
+            .lock()
+            .expect("lock seen packages")
+            .is_empty()
     );
 }
 

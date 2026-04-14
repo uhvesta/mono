@@ -40,10 +40,17 @@ pub struct CheckConfig {
     pub check: String,
     pub id: String,
     pub source_path: PathBuf,
+    pub origin: CheckConfigOrigin,
     pub implementation: Option<ExternalCheckImplementationRef>,
     pub enabled: bool,
     pub policy: CheckPolicyConfig,
     pub config: toml::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckConfigOrigin {
+    Local,
+    ExternalUrl,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -275,6 +282,7 @@ impl ConfigResolver {
                 check: check.check.unwrap_or_else(|| configured_id.clone()),
                 id: configured_id,
                 source_path: config_relative_path.clone(),
+                origin: CheckConfigOrigin::Local,
                 implementation,
                 enabled: check.enabled,
                 policy,
@@ -628,6 +636,7 @@ fn apply_external_checks_file(
             check: check.check.clone().unwrap_or_else(|| configured_id.clone()),
             id: configured_id,
             source_path: external_checks_file.source_path.clone(),
+            origin: CheckConfigOrigin::ExternalUrl,
             implementation,
             enabled: check.enabled,
             policy,

@@ -11,9 +11,9 @@ use checkleft::checks::register_builtin_checks;
 use checkleft::config::{ConfigResolver, ConfigResolverOptions};
 use checkleft::external::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    ExternalCheckExecutor, ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
-    GeneratedExternalCheckPackageProvider, NoopExternalCheckExecutor,
-    NoopExternalCheckPackageProvider, WasmExternalCheckExecutor,
+    DefaultExternalCheckExecutor, ExternalCheckExecutor, ExternalCheckPackageProvider,
+    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
+    NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
 };
 use checkleft::input::ChangeSet;
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
@@ -272,7 +272,7 @@ fn build_external_check_executor(root: &Path) -> Result<Arc<dyn ExternalCheckExe
     if external_provider_mode()? == ExternalProviderMode::Off {
         return Ok(Arc::new(NoopExternalCheckExecutor));
     }
-    Ok(Arc::new(WasmExternalCheckExecutor::new(root)?))
+    Ok(Arc::new(DefaultExternalCheckExecutor::new(root)?))
 }
 
 fn external_provider_mode() -> Result<ExternalProviderMode> {

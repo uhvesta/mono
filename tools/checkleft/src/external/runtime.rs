@@ -1,6 +1,9 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -12,9 +15,10 @@ use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding};
 
 use super::{
-    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCommandCapabilities, ExternalSourcePackageBuilder,
-    JavaScriptComponentSourcePackageBuilder,
+    EXTERNAL_CHECK_EXEC_RUNTIME_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage,
+    ExternalCheckExecPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCommandCapabilities, ExternalSourcePackageBuilder,
+    JavaScriptComponentSourcePackageBuilder, exec_protocol,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -23,6 +27,11 @@ const MEMORY_EXPORT: &str = "memory";
 const INPUT_OFFSET: usize = 0;
 const WASM_PAGE_SIZE_BYTES: usize = 65_536;
 const EXECUTION_FUEL_LIMIT: u64 = 10_000_000;
+const CHECKLEFT_REPO_ROOT_ENV: &str = "CHECKLEFT_REPO_ROOT";
+const CHECKLEFT_CHECK_ID_ENV: &str = "CHECKLEFT_CHECK_ID";
+const BAZEL_BINDIR_ENV: &str = "BAZEL_BINDIR";
+const EXEC_STDOUT_CAPTURE_LIMIT_BYTES: usize = 1_048_576;
+const EXEC_STDERR_CAPTURE_LIMIT_BYTES: usize = 262_144;
 
 #[derive(Debug)]
 enum CoreArtifactExecutionError {
@@ -62,19 +71,19 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
         _config: &toml::Value,
     ) -> Result<CheckResult> {
         bail!(
-            "external check package `{}` resolved successfully but sandbox runtime execution is not implemented yet",
+            "external check package `{}` resolved successfully but runtime execution is not implemented yet",
             package.id
         )
     }
 }
 
-pub struct WasmExternalCheckExecutor {
+pub struct DefaultExternalCheckExecutor {
     root: PathBuf,
     engine: Engine,
     source_package_builder: Arc<dyn ExternalSourcePackageBuilder>,
 }
 
-impl WasmExternalCheckExecutor {
+impl DefaultExternalCheckExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let root = root.canonicalize().with_context(|| {
@@ -185,7 +194,8 @@ impl WasmExternalCheckExecutor {
         let run = get_core_run_function(&instance, &mut store)
             .map_err(CoreArtifactExecutionError::mismatch)?;
 
-        let input = ExternalCheckRuntimeInput::new(changeset, config, command_capabilities);
+        let input =
+            ExternalCheckRuntimeInput::with_capabilities(changeset, config, command_capabilities);
         let input_bytes = serde_json::to_vec(&input)
             .context("failed to encode runtime input payload as JSON")
             .map_err(CoreArtifactExecutionError::execution)?;
@@ -236,7 +246,8 @@ impl WasmExternalCheckExecutor {
         let instance = instantiate_component(&linker, &mut store, &component, package.id.as_str())?;
         let run = get_component_run_function(&instance, &mut store)?;
 
-        let input = ExternalCheckRuntimeInput::new(changeset, config, command_capabilities);
+        let input =
+            ExternalCheckRuntimeInput::with_capabilities(changeset, config, command_capabilities);
         let input_json =
             serde_json::to_string(&input).context("failed to encode component runtime input")?;
         let (output_json,) = call_component_run(&run, &mut store, input_json)?;
@@ -256,9 +267,108 @@ impl WasmExternalCheckExecutor {
         }
         Ok(self.root.join(path))
     }
+
+    fn execute_exec(
+        &self,
+        package: &ExternalCheckPackage,
+        exec: &ExternalCheckExecPackage,
+        changeset: &ChangeSet,
+        config: &toml::Value,
+    ) -> Result<CheckResult> {
+        let executable_path = self.resolve_exec_path(&exec.executable_path)?;
+        let input = exec_protocol::ExecCheckRequest {
+            changeset: changeset.clone(),
+            config: config.clone(),
+        };
+        let input_bytes =
+            serde_json::to_vec(&input).context("failed to encode exec runtime input as JSON")?;
+
+        let mut command = Command::new(&executable_path);
+        command
+            .args(&exec.args)
+            .current_dir(&self.root)
+            .env(CHECKLEFT_REPO_ROOT_ENV, &self.root)
+            .env(CHECKLEFT_CHECK_ID_ENV, &package.id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if uses_bazel_bin_launcher(&self.root, &executable_path) {
+            command.env(BAZEL_BINDIR_ENV, ".");
+        }
+
+        let mut child = command
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to spawn exec runtime for package `{}` at {}",
+                    package.id,
+                    executable_path.display()
+                )
+            })?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open exec runtime stdin pipe")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to open exec runtime stdout pipe")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("failed to open exec runtime stderr pipe")?;
+
+        let stdout_handle = spawn_stream_reader(
+            stdout,
+            EXEC_STDOUT_CAPTURE_LIMIT_BYTES,
+            "exec runtime stdout",
+        );
+        let stderr_handle = spawn_stream_reader(
+            stderr,
+            EXEC_STDERR_CAPTURE_LIMIT_BYTES,
+            "exec runtime stderr",
+        );
+
+        stdin
+            .write_all(&input_bytes)
+            .context("failed to write exec runtime input to stdin")?;
+        drop(stdin);
+
+        let status = child.wait().with_context(|| {
+            format!(
+                "failed waiting for exec runtime of package `{}`",
+                package.id
+            )
+        })?;
+        let stdout_bytes = join_stream_reader(stdout_handle, "exec runtime stdout")?;
+        let stderr_bytes = join_stream_reader(stderr_handle, "exec runtime stderr")?;
+
+        ensure_successful_exit(package, &executable_path, status, &stderr_bytes)?;
+
+        let output: exec_protocol::ExecCheckResponse = serde_json::from_slice(&stdout_bytes)
+            .with_context(|| {
+                format!(
+                    "exec runtime output for package `{}` was not valid JSON",
+                    package.id
+                )
+            })?;
+
+        Ok(CheckResult {
+            check_id: package.id.clone(),
+            findings: output.findings,
+        })
+    }
+    fn resolve_exec_path(&self, executable_path: &str) -> Result<PathBuf> {
+        let path = Path::new(executable_path);
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
+        }
+        Ok(self.root.join(path))
+    }
 }
 
-impl ExternalCheckExecutor for WasmExternalCheckExecutor {
+impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
     fn execute(
         &self,
         package: &ExternalCheckPackage,
@@ -266,29 +376,51 @@ impl ExternalCheckExecutor for WasmExternalCheckExecutor {
         _source_tree: &dyn SourceTree,
         config: &toml::Value,
     ) -> Result<CheckResult> {
-        if package.runtime != EXTERNAL_CHECK_RUNTIME_V1 {
-            bail!(
-                "unsupported external runtime `{}` for package `{}`",
-                package.runtime,
-                package.id
-            );
-        }
-
-        let command_capabilities = ExternalCommandCapabilities::from_manifest(
-            &package.capabilities,
-        )
-        .with_context(|| {
-            format!(
-                "invalid command capability declaration for package `{}`",
-                package.id
-            )
-        })?;
-
         match &package.implementation {
+            ExternalCheckPackageImplementation::Exec(exec) => {
+                if package.runtime != EXTERNAL_CHECK_EXEC_RUNTIME_V1 {
+                    bail!(
+                        "unsupported external runtime `{}` for exec package `{}`",
+                        package.runtime,
+                        package.id
+                    );
+                }
+                self.execute_exec(package, exec, changeset, config)
+            }
             ExternalCheckPackageImplementation::Artifact(artifact) => {
+                if package.runtime != EXTERNAL_CHECK_RUNTIME_V1 {
+                    bail!(
+                        "unsupported external runtime `{}` for artifact package `{}`",
+                        package.runtime,
+                        package.id
+                    );
+                }
+                let command_capabilities =
+                    ExternalCommandCapabilities::from_manifest(&package.capabilities)
+                        .with_context(|| {
+                            format!(
+                                "invalid command capability declaration for package `{}`",
+                                package.id
+                            )
+                        })?;
                 self.execute_artifact(package, artifact, &command_capabilities, changeset, config)
             }
             ExternalCheckPackageImplementation::Source(source) => {
+                if package.runtime != EXTERNAL_CHECK_RUNTIME_V1 {
+                    bail!(
+                        "unsupported external runtime `{}` for source package `{}`",
+                        package.runtime,
+                        package.id
+                    );
+                }
+                let command_capabilities =
+                    ExternalCommandCapabilities::from_manifest(&package.capabilities)
+                        .with_context(|| {
+                            format!(
+                                "invalid command capability declaration for package `{}`",
+                                package.id
+                            )
+                        })?;
                 let built_artifact = self
                     .source_package_builder
                     .build_source_package(package, source)?;
@@ -410,11 +542,12 @@ fn read_memory(
 struct ExternalCheckRuntimeInput<'a> {
     changeset: &'a ChangeSet,
     config: &'a toml::Value,
-    capabilities: ExternalCheckRuntimeCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<ExternalCheckRuntimeCapabilities>,
 }
 
 impl<'a> ExternalCheckRuntimeInput<'a> {
-    fn new(
+    fn with_capabilities(
         changeset: &'a ChangeSet,
         config: &'a toml::Value,
         command_capabilities: &ExternalCommandCapabilities,
@@ -422,12 +555,12 @@ impl<'a> ExternalCheckRuntimeInput<'a> {
         Self {
             changeset,
             config,
-            capabilities: ExternalCheckRuntimeCapabilities {
+            capabilities: Some(ExternalCheckRuntimeCapabilities {
                 commands: command_capabilities.allowed_commands().to_vec(),
                 command_timeout_ms: command_capabilities.timeout_ms(),
                 max_stdout_bytes: command_capabilities.max_stdout_bytes(),
                 max_stderr_bytes: command_capabilities.max_stderr_bytes(),
-            },
+            }),
         }
     }
 }
@@ -514,6 +647,71 @@ where
     E: Into<anyhow::Error>,
 {
     result.map_err(Into::into)
+}
+
+fn ensure_successful_exit(
+    package: &ExternalCheckPackage,
+    executable_path: &Path,
+    status: ExitStatus,
+    stderr_bytes: &[u8],
+) -> Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(stderr_bytes).trim().to_owned();
+    let stderr_suffix = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {stderr}")
+    };
+    bail!(
+        "exec runtime for package `{}` at {} exited with status {}{}",
+        package.id,
+        executable_path.display(),
+        status,
+        stderr_suffix
+    );
+}
+
+fn spawn_stream_reader<R>(
+    mut reader: R,
+    max_bytes: usize,
+    stream_name: &'static str,
+) -> thread::JoinHandle<Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = reader
+                .read(&mut chunk)
+                .with_context(|| format!("failed to read {stream_name}"))?;
+            if read == 0 {
+                break;
+            }
+            if output.len() + read > max_bytes {
+                bail!("{stream_name} exceeded {max_bytes} bytes");
+            }
+            output.extend_from_slice(&chunk[..read]);
+        }
+        Ok(output)
+    })
+}
+
+fn join_stream_reader(
+    handle: thread::JoinHandle<Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("{stream_name} reader thread panicked"))?
+}
+
+fn uses_bazel_bin_launcher(root: &Path, executable_path: &Path) -> bool {
+    executable_path.starts_with(root.join("bazel-bin"))
 }
 
 #[cfg(test)]

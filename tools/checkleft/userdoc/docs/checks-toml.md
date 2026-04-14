@@ -52,6 +52,7 @@ Supported keys:
 
 - `id` (required): check instance ID used in output.
 - `check` (optional): implementation ID; defaults to `id`.
+- `implementation` (optional): external package reference, either a checked-in manifest path or `generated:<id>`.
 - `enabled` (optional, default `true`): disable with `false`.
 - `config` (optional table): check-specific configuration.
 - `policy` (optional table): framework-managed severity/bypass controls.
@@ -85,6 +86,18 @@ remediation = "iOS build directories must not be checked in. Remove them from th
 when = ["added", "modified", "renamed"]
 patterns = ["mobile/ios/.build/**"]
 ```
+
+## Pattern: Repo-local external check from a generated index
+
+```toml
+[[checks]]
+id = "frontend-no-legacy-api"
+check = "frontend-no-legacy-api"
+implementation = "generated:frontend-no-legacy-api"
+```
+
+Generated implementations are resolved through the configured generated index,
+for example from a Bazel-produced `check_index` target.
 
 ## Pattern: Disable a parent check in a child directory
 

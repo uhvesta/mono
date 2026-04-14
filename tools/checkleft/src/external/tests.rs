@@ -6,10 +6,10 @@ use tempfile::tempdir;
 
 use super::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckImplementationRef,
-    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
-    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
-    parse_external_check_package_manifest,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_EXEC_RUNTIME_V1, EXTERNAL_CHECK_RUNTIME_V1,
+    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
+    GeneratedExternalCheckPackageProvider, parse_external_check_package_manifest,
 };
 
 struct StaticProvider {
@@ -76,6 +76,35 @@ target = "//checks/workflow_shell_strict:check_wasm"
 }
 
 #[test]
+fn parses_exec_mode_manifest() {
+    let manifest = r#"
+id = "frontend-no-legacy-api"
+mode = "exec"
+runtime = "exec-v1"
+api_version = "v1"
+executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
+args = ["--format=json"]
+
+[provenance]
+generator = "bazel"
+target = "//checks/frontend_no_legacy_api:frontend_no_legacy_api_bin"
+"#;
+
+    let package = parse_external_check_package_manifest(manifest).expect("valid manifest");
+    assert_eq!(package.runtime, EXTERNAL_CHECK_EXEC_RUNTIME_V1);
+    match package.implementation {
+        ExternalCheckPackageImplementation::Exec(exec) => {
+            assert_eq!(
+                exec.executable_path,
+                "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
+            );
+            assert_eq!(exec.args, vec!["--format=json"]);
+        }
+        other => panic!("expected exec package, got {other:?}"),
+    }
+}
+
+#[test]
 fn source_mode_rejects_artifact_fields() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
@@ -104,6 +133,19 @@ api_version = "v1"
 
     let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
     assert!(error.to_string().contains("artifact_path"));
+}
+
+#[test]
+fn exec_mode_requires_executable_path() {
+    let manifest = r#"
+id = "frontend-no-legacy-api"
+mode = "exec"
+runtime = "exec-v1"
+api_version = "v1"
+"#;
+
+    let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
+    assert!(error.to_string().contains("executable_path"));
 }
 
 #[test]
@@ -139,6 +181,37 @@ commands = ["grep", "grep"]
 
     let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
     assert!(error.to_string().contains("duplicate command"));
+}
+
+#[test]
+fn exec_mode_rejects_capabilities() {
+    let manifest = r#"
+id = "frontend-no-legacy-api"
+mode = "exec"
+runtime = "exec-v1"
+api_version = "v1"
+executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
+
+[capabilities]
+commands = ["grep"]
+"#;
+
+    let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
+    assert!(error.to_string().contains("capabilities"));
+}
+
+#[test]
+fn exec_mode_rejects_sandbox_runtime() {
+    let manifest = r#"
+id = "frontend-no-legacy-api"
+mode = "exec"
+runtime = "sandbox-v1"
+api_version = "v1"
+executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
+"#;
+
+    let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
+    assert!(error.to_string().contains("expected `exec-v1`"));
 }
 
 #[test]

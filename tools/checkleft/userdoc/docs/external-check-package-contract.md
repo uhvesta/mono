@@ -4,7 +4,7 @@ This page freezes the initial external-check contracts for the sandboxed polyglo
 
 Scope for this phase:
 
-1. Manifest schema (`source` and `artifact` modes).
+1. Manifest schema (`source`, `artifact`, and `exec` modes).
 2. Implementation reference syntax (`generated:` and file path refs).
 3. Capability policy contract shape.
 4. Host API operation names and semantics.
@@ -65,10 +65,10 @@ All external check package manifests are TOML.
 Required common fields:
 
 1. `id`
-2. `runtime` (currently must be `sandbox-v1`)
+2. `runtime`
 3. `api_version` (currently must be `v1`)
-4. `mode` (`source` or `artifact`)
-5. Optional `[capabilities]` table
+4. `mode` (`source`, `artifact`, or `exec`)
+5. Optional `[capabilities]` table for sandboxed modes only
 
 ### `source` mode fields
 
@@ -108,6 +108,30 @@ Not allowed in `artifact` mode:
 3. `build_adapter`
 4. `sources`
 
+### `exec` mode fields
+
+Required:
+
+1. `runtime = "exec-v1"`
+2. `executable_path` (safe relative path)
+
+Optional:
+
+1. `args`
+2. `[provenance]`
+   - `generator`
+   - `target`
+
+Not allowed in `exec` mode:
+
+1. `[capabilities]`
+2. `language`
+3. `entry`
+4. `build_adapter`
+5. `sources`
+6. `artifact_path`
+7. `artifact_sha256`
+
 ## Source Build Cache
 
 For JavaScript and TypeScript `source` mode packages using the
@@ -145,6 +169,9 @@ Runtime policy (enforced later in execution wiring):
 
 1. Effective allowed commands = global checkleft command ceiling ∩ manifest `commands`.
 2. Shell entrypoints remain hard-blocked.
+
+`exec-v1` packages do not support capabilities. They run as trusted repo-local
+executables and must omit the `[capabilities]` table entirely.
 
 ## Host API Contract Surface (Names Frozen)
 
