@@ -61,6 +61,56 @@ def _workspace_bin_path(file):
     return "bazel-bin/{}".format(file.short_path)
 
 
+def _render_bash_runfiles_setup(require_runfiles):
+    lines = [
+        "self=\"$0\"",
+        "if [[ \"$self\" != /* ]]; then",
+        "    self=\"$PWD/$self\"",
+        "fi",
+        "while [[ -L \"$self\" ]]; do",
+        "    target=\"$(readlink \"$self\")\"",
+        "    if [[ \"$target\" == /* ]]; then",
+        "        self=\"$target\"",
+        "    else",
+        "        self=\"$(cd -- \"$(dirname -- \"$self\")\" && pwd)/$target\"",
+        "    fi",
+        "done",
+        "",
+        "runfiles=\"${RUNFILES_DIR:-}\"",
+        "if [[ -z \"$runfiles\" && -n \"${RUNFILES_MANIFEST_FILE:-}\" ]]; then",
+        "    runfiles=\"${RUNFILES_MANIFEST_FILE}\"",
+        "    if [[ \"$runfiles\" == *.runfiles_manifest ]]; then",
+        "        runfiles=\"${runfiles%_manifest}\"",
+        "    elif [[ \"$runfiles\" == */MANIFEST ]]; then",
+        "        runfiles=\"${runfiles%/MANIFEST}\"",
+        "    else",
+        "        echo \"error: unexpected RUNFILES_MANIFEST_FILE value: $RUNFILES_MANIFEST_FILE\" >&2",
+        "        exit 1",
+        "    fi",
+        "fi",
+        "if [[ -z \"$runfiles\" && -e \"$self.runfiles\" ]]; then",
+        "    runfiles=\"$self.runfiles\"",
+        "fi",
+    ]
+    if require_runfiles:
+        lines.extend([
+            "if [[ -z \"$runfiles\" ]]; then",
+            "    echo \"error: failed to locate Bazel runfiles for $self\" >&2",
+            "    exit 1",
+            "fi",
+        ])
+    lines.extend([
+        "if [[ -n \"$runfiles\" ]]; then",
+        "    if [[ \"$runfiles\" != /* ]]; then",
+        "        runfiles=\"$PWD/$runfiles\"",
+        "    fi",
+        "    export RUNFILES=\"$runfiles\"",
+        "    export RUNFILES_DIR=\"$runfiles\"",
+        "fi",
+    ])
+    return "\n".join(lines)
+
+
 def _local_check_impl(ctx):
     check_id = ctx.attr.id.strip() or ctx.label.name
     if not check_id:
@@ -78,40 +128,13 @@ def _local_check_impl(ctx):
     launcher_script = """#!/usr/bin/env bash
 set -euo pipefail
 
-self="$0"
-if [[ "$self" != /* ]]; then
-    self="$PWD/$self"
-fi
+{runfiles_setup}
 
-runfiles="${{RUNFILES_DIR:-}}"
-if [[ -z "$runfiles" && -n "${{RUNFILES_MANIFEST_FILE:-}}" ]]; then
-    runfiles="${{RUNFILES_MANIFEST_FILE}}"
-    if [[ "$runfiles" == *.runfiles_manifest ]]; then
-        runfiles="${{runfiles%_manifest}}"
-    elif [[ "$runfiles" == */MANIFEST ]]; then
-        runfiles="${{runfiles%/MANIFEST}}"
-    else
-        echo "error: unexpected RUNFILES_MANIFEST_FILE value: $RUNFILES_MANIFEST_FILE" >&2
-        exit 1
-    fi
-fi
-if [[ -z "$runfiles" && -e "$self.runfiles" ]]; then
-    runfiles="$self.runfiles"
-fi
-if [[ -z "$runfiles" ]]; then
-    echo "error: failed to locate Bazel runfiles for $self" >&2
-    exit 1
-fi
-if [[ "$runfiles" != /* ]]; then
-    runfiles="$PWD/$runfiles"
-fi
-
-export RUNFILES="$runfiles"
-export RUNFILES_DIR="$runfiles"
-cd "$runfiles"
+cd "$RUNFILES"
 
 exec "$runfiles/{workspace_name}/{binary_short_path}" "$@"
 """.format(
+        runfiles_setup = _render_bash_runfiles_setup(require_runfiles = True),
         workspace_name = ctx.workspace_name,
         binary_short_path = ctx.executable.binary.short_path,
     )
@@ -282,41 +305,7 @@ def _checkleft_launcher_impl(ctx):
     script = """#!/usr/bin/env bash
 set -euo pipefail
 
-self="$0"
-if [[ "$self" != /* ]]; then
-    self="$PWD/$self"
-fi
-while [[ -L "$self" ]]; do
-    target="$(readlink "$self")"
-    if [[ "$target" == /* ]]; then
-        self="$target"
-    else
-        self="$(cd -- "$(dirname -- "$self")" && pwd)/$target"
-    fi
-done
-
-runfiles="${{RUNFILES_DIR:-}}"
-if [[ -z "$runfiles" && -n "${{RUNFILES_MANIFEST_FILE:-}}" ]]; then
-    runfiles="${{RUNFILES_MANIFEST_FILE}}"
-    if [[ "$runfiles" == *.runfiles_manifest ]]; then
-        runfiles="${{runfiles%_manifest}}"
-    elif [[ "$runfiles" == */MANIFEST ]]; then
-        runfiles="${{runfiles%/MANIFEST}}"
-    else
-        echo "error: unexpected RUNFILES_MANIFEST_FILE value: $RUNFILES_MANIFEST_FILE" >&2
-        exit 1
-    fi
-fi
-if [[ -z "$runfiles" && -e "$self.runfiles" ]]; then
-    runfiles="$self.runfiles"
-fi
-if [[ -n "$runfiles" ]]; then
-    if [[ "$runfiles" != /* ]]; then
-        runfiles="$PWD/$runfiles"
-    fi
-    export RUNFILES="$runfiles"
-    export RUNFILES_DIR="$runfiles"
-fi
+{runfiles_setup}
 
 workspace_dir="${{BUILD_WORKSPACE_DIRECTORY:-$PWD}}"
 cd "$workspace_dir"
@@ -326,6 +315,7 @@ export CHECKLEFT_EXTERNAL_CHECK_INDEX="$workspace_dir/{index_path}"
 
 exec "$workspace_dir/{checkleft_path}" run "$@"
 """.format(
+        runfiles_setup = _render_bash_runfiles_setup(require_runfiles = False),
         index_path = _workspace_bin_path(index_file),
         checkleft_path = _workspace_bin_path(ctx.executable._checkleft_bin),
     )
