@@ -20,6 +20,168 @@ Notes:
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass` (see [Bypass mechanism](bypass.md)).
 
+## `bazel-policies`
+
+Purpose:
+
+- Flags configured Bazel Starlark policy violations in changed `BUILD`,
+  `BUILD.bazel`, `MODULE.bazel`, and supported `.bzl` files.
+
+Config keys:
+
+- `rules` (required array)
+- `severity` (optional default for rules, default `error`)
+- `remediation` (optional default for rules)
+
+Per-rule keys:
+
+- `kind` (required)
+
+Supported rule kinds:
+
+- `forbidden_rule_call`
+  - `symbols` (required array of callee names such as `genrule` or `native.genrule`)
+  - `message` (optional string)
+  - `severity` (optional `error|warning|info`)
+  - `remediation` (optional string)
+- `forbidden_package_default_visibility`
+  - `values` (required array of forbidden `package(default_visibility=...)` strings)
+  - `message` (optional string)
+  - `severity` (optional `error|warning|info`)
+  - `remediation` (optional string)
+
+Example:
+
+```yaml
+checks:
+  - id: bazel-policies
+    check: bazel-policies
+    config:
+      rules:
+        - kind: forbidden_rule_call
+          symbols:
+            - genrule
+            - native.genrule
+          message: Do not add genrules.
+          remediation: Use a dedicated rule or a checked-in macro with narrower semantics.
+
+        - kind: forbidden_package_default_visibility
+          values:
+            - //visibility:public
+```
+
+Notes:
+
+- `forbidden_rule_call` is AST-backed and matches direct call syntax, not macro expansion.
+- `forbidden_package_default_visibility` only applies to build files.
+- Findings default to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass`.
+
+## `bazelrc-policies`
+
+Purpose:
+
+- Flags configured Bazel rc policy violations in changed `.bazelrc` files and
+  their imported rc fragments.
+
+Config keys:
+
+- `rules` (required array)
+- `severity` (optional default for rules, default `error`)
+- `remediation` (optional default for rules)
+
+Per-rule keys:
+
+- `kind` (required)
+
+Supported rule kinds:
+
+- `required_flag`
+  - `commands` (required array of Bazel command scopes)
+  - `flag` (required flag name without leading dashes)
+  - `value` (optional exact required value)
+  - `message` (optional string)
+  - `severity` (optional `error|warning|info`)
+  - `remediation` (optional string)
+- `forbidden_flag`
+  - `commands` (required array of Bazel command scopes)
+  - `flag` (required flag name without leading dashes)
+  - `message` (optional string)
+  - `severity` (optional `error|warning|info`)
+  - `remediation` (optional string)
+
+Example:
+
+```yaml
+checks:
+  - id: bazelrc-policies
+    check: bazelrc-policies
+    config:
+      rules:
+        - kind: required_flag
+          commands: [build]
+          flag: downloader_config
+          value: /etc/bazel/downloader.cfg
+
+        - kind: forbidden_flag
+          commands: [build, test]
+          flag: remote_download_all
+```
+
+Notes:
+
+- This check parses rc declarations rather than computing full effective flag expansion.
+- `common` and Bazel command inheritance are honored for matching unconditional rules.
+- Config-scoped entries such as `build:ci` are parsed but ignored by the initial rule set.
+- Findings default to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass`.
+
+## `bazelversion-policies`
+
+Purpose:
+
+- Flags configured `.bazelversion` policy violations in changed repository-root `.bazelversion` files.
+
+Config keys:
+
+- `rules` (required array)
+- `severity` (optional default for rules, default `error`)
+- `remediation` (optional default for rules)
+
+Per-rule keys:
+
+- `kind` (required)
+
+Supported rule kinds:
+
+- `allowed_version_patterns`
+  - `patterns` (required array of allowed glob-style patterns)
+  - `message` (optional string)
+  - `severity` (optional `error|warning|info`)
+  - `remediation` (optional string)
+
+Example:
+
+```yaml
+checks:
+  - id: bazelversion-policies
+    check: bazelversion-policies
+    config:
+      rules:
+        - kind: allowed_version_patterns
+          patterns:
+            - channel:live
+            - channel:alpha
+            - 8.*
+```
+
+Notes:
+
+- The check reads the trimmed `.bazelversion` contents and matches them against glob-style patterns such as `channel:*` or `8.*`.
+- Only changed repository-root `.bazelversion` files are evaluated.
+- Findings default to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass`.
+
 ## `code-patterns`
 
 Purpose:

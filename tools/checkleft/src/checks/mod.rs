@@ -1,4 +1,5 @@
 mod api_breaking_surface;
+mod bazel;
 mod code_patterns;
 mod docs_link_integrity;
 mod file_size;
@@ -20,6 +21,9 @@ use crate::check::CheckRegistry;
 
 pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(api_breaking_surface::ApiBreakingSurfaceCheck)?;
+    registry.register(bazel::BazelPoliciesCheck)?;
+    registry.register(bazel::BazelrcPoliciesCheck)?;
+    registry.register(bazel::BazelversionPoliciesCheck)?;
     registry.register(code_patterns::CodePatternsCheck)?;
     registry.register(docs_link_integrity::DocsLinkIntegrityCheck)?;
     registry.register(forbidden_imports_deps::ForbiddenImportsDepsCheck)?;
