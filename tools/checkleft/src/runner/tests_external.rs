@@ -549,6 +549,7 @@ checks:
     let resolver = ConfigResolver::new_with_options(
         temp.path(),
         crate::config::ConfigResolverOptions {
+            external_checks_file: None,
             external_checks_url: Some(format!("{}/shared/CHECKS.yaml", server.uri())),
         },
     )
@@ -583,6 +584,91 @@ checks:
             .lock()
             .expect("lock seen packages")
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn runner_allows_exec_runtime_from_external_checks_file() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
+
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+checks:
+  - id: domain-typo
+    check: domain-typo-check
+    implementation: generated:domain-typo-check
+"#,
+    )
+    .expect("write external config");
+
+    let provider = StaticExternalProvider {
+        package: Some(ExternalCheckPackage {
+            id: "domain-typo-check".to_owned(),
+            runtime: "exec-v1".to_owned(),
+            api_version: "v1".to_owned(),
+            capabilities: Default::default(),
+            implementation: ExternalCheckPackageImplementation::Exec(
+                crate::external::ExternalCheckExecPackage {
+                    executable_path: "bazel-bin/checks/domain_typo/domain_typo".to_owned(),
+                    args: Vec::new(),
+                    provenance: None,
+                },
+            ),
+        }),
+    };
+    let seen_packages = Arc::new(Mutex::new(Vec::new()));
+    let executor = StaticExternalExecutor {
+        result: Some(CheckResult {
+            check_id: "domain-typo-check".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Warning,
+                message: "external file exec ran".to_owned(),
+                location: None,
+                remediation: None,
+                suggested_fix: None,
+            }],
+        }),
+        error_message: None,
+        seen_packages: Arc::clone(&seen_packages),
+    };
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        crate::config::ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("resolver");
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(resolver),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(provider),
+        Arc::new(executor),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("docs/file.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].findings[0].message, "external file exec ran");
+    assert_eq!(
+        seen_packages.lock().expect("lock seen packages").as_slice(),
+        ["domain-typo-check"]
     );
 }
 

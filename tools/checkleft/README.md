@@ -22,6 +22,7 @@ Run from the root of a Git or Jujutsu repository:
 checkleft run
 checkleft run --verbose
 checkleft run --all
+checkleft run --external-checks-file /path/to/shared/CHECKS.yaml
 checkleft run --external-checks-url https://example.com/CHECKS.yaml
 checkleft list
 ```

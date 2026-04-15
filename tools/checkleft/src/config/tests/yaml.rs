@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::config::{ConfigResolver, ConfigResolverOptions};
+use crate::config::{CheckConfigOrigin, ConfigResolver, ConfigResolverOptions};
 
 #[test]
 fn resolves_yaml_config_file() {
@@ -147,6 +147,7 @@ checks:
     let resolver = ConfigResolver::new_with_options(
         temp.path(),
         ConfigResolverOptions {
+            external_checks_file: None,
             external_checks_url: Some(format!("{}/shared/CHECKS.yaml", server.uri())),
         },
     )
@@ -157,6 +158,107 @@ checks:
         .expect("resolve checks");
 
     assert!(checks.get("external-only").is_some());
+}
+
+#[tokio::test]
+async fn merges_external_checks_file_before_local_root_yaml() {
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+checks:
+  - id: shared-file-size
+    config:
+      max_lines: 999
+  - id: external-only
+"#,
+    )
+    .expect("write external config");
+
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checks:
+  - id: shared-file-size
+    config:
+      max_lines: 321
+  - id: local-only
+"#,
+    )
+    .expect("write local config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect("resolve checks");
+
+    assert!(checks.get("external-only").is_some());
+    assert!(checks.get("local-only").is_some());
+    assert_eq!(
+        checks
+            .get("external-only")
+            .expect("external-only present")
+            .origin,
+        CheckConfigOrigin::ExternalFile
+    );
+    assert_eq!(
+        checks
+            .get("shared-file-size")
+            .expect("shared-file-size present")
+            .config
+            .as_table()
+            .expect("shared-file-size config table")
+            .get("max_lines")
+            .expect("max_lines")
+            .as_integer(),
+        Some(321)
+    );
+}
+
+#[tokio::test]
+async fn rejects_file_implementation_from_external_checks_file() {
+    let temp = tempdir().expect("create temp dir");
+    let external_path = temp.path().join("shared/CHECKS.yaml");
+    fs::create_dir_all(external_path.parent().expect("shared dir")).expect("create shared dir");
+    fs::write(
+        &external_path,
+        r#"
+checks:
+  - id: domain-typo
+    check: domain-typo-check
+    implementation: checks/domain_typo.check.toml
+"#,
+    )
+    .expect("write external config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_file: Some(external_path.display().to_string()),
+            external_checks_url: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+    let error = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect_err("resolution must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("external checks files may only use `generated:` implementations")
+    );
 }
 
 #[tokio::test]
@@ -173,6 +275,7 @@ async fn fails_when_external_checks_url_returns_404() {
     let error = ConfigResolver::new_with_options(
         temp.path(),
         ConfigResolverOptions {
+            external_checks_file: None,
             external_checks_url: Some(format!("{}/missing/CHECKS.yaml", server.uri())),
         },
     )

@@ -301,6 +301,21 @@ def _declare_check_index(name, visibility, checks):
 
 def _checkleft_launcher_impl(ctx):
     index_file = ctx.attr.check_index[CheckIndexInfo].index
+    external_checks_file_arg = ""
+    extra_files = [ctx.executable._checkleft_bin, index_file]
+    if ctx.file.external_checks_file != None:
+        external_checks_output = ctx.actions.declare_file(
+            "{}__{}".format(ctx.label.name, ctx.file.external_checks_file.basename),
+        )
+        ctx.actions.symlink(
+            output = external_checks_output,
+            target_file = ctx.file.external_checks_file,
+        )
+        external_checks_file_arg = " --external-checks-file \"$workspace_dir/{}\"".format(
+            _workspace_bin_path(external_checks_output),
+        )
+        extra_files.append(external_checks_output)
+
     launcher = ctx.actions.declare_file("{}.sh".format(ctx.label.name))
     script = """#!/usr/bin/env bash
 set -euo pipefail
@@ -313,15 +328,16 @@ cd "$workspace_dir"
 export CHECKLEFT_EXTERNAL_PROVIDER_MODE=generated-only
 export CHECKLEFT_EXTERNAL_CHECK_INDEX="$workspace_dir/{index_path}"
 
-exec "$workspace_dir/{checkleft_path}" run "$@"
+exec "$workspace_dir/{checkleft_path}" run{external_checks_file_arg} "$@"
 """.format(
         runfiles_setup = _render_bash_runfiles_setup(require_runfiles = False),
         index_path = _workspace_bin_path(index_file),
         checkleft_path = _workspace_bin_path(ctx.executable._checkleft_bin),
+        external_checks_file_arg = external_checks_file_arg,
     )
     ctx.actions.write(output = launcher, content = script, is_executable = True)
 
-    runfiles = ctx.runfiles(files = [ctx.executable._checkleft_bin, index_file]).merge(
+    runfiles = ctx.runfiles(files = extra_files).merge(
         ctx.attr.check_index[DefaultInfo].default_runfiles,
     )
 
@@ -339,6 +355,9 @@ _checkleft_launcher = rule(
             mandatory = True,
             providers = [CheckIndexInfo],
         ),
+        "external_checks_file": attr.label(
+            allow_single_file = True,
+        ),
         "_checkleft_bin": attr.label(
             default = "//tools/checkleft:checkleft",
             executable = True,
@@ -348,7 +367,7 @@ _checkleft_launcher = rule(
 )
 
 
-def _checkleft_impl(name, visibility, check_index, checks):
+def _checkleft_impl(name, visibility, check_index, checks, external_checks_file):
     has_check_index = check_index != None
     has_checks = checks != []
 
@@ -368,6 +387,7 @@ def _checkleft_impl(name, visibility, check_index, checks):
         name = name,
         visibility = visibility,
         check_index = resolved_check_index,
+        external_checks_file = external_checks_file,
     )
 
 
@@ -380,6 +400,10 @@ checkleft = macro(
         "checks": attr.label_list(
             default = [],
             providers = [CheckInfo],
+            configurable = False,
+        ),
+        "external_checks_file": attr.label(
+            allow_single_file = True,
             configurable = False,
         ),
     },

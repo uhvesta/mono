@@ -296,15 +296,13 @@ impl DefaultExternalCheckExecutor {
             command.env(BAZEL_BINDIR_ENV, ".");
         }
 
-        let mut child = command
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn exec runtime for package `{}` at {}",
-                    package.id,
-                    executable_path.display()
-                )
-            })?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn exec runtime for package `{}` at {}",
+                package.id,
+                executable_path.display()
+            )
+        })?;
 
         let mut stdin = child
             .stdin

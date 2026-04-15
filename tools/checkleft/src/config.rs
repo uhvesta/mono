@@ -50,6 +50,7 @@ pub struct CheckConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckConfigOrigin {
     Local,
+    ExternalFile,
     ExternalUrl,
 }
 
@@ -114,6 +115,7 @@ pub struct ConfigResolver {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigResolverOptions {
+    pub external_checks_file: Option<String>,
     pub external_checks_url: Option<String>,
 }
 
@@ -132,7 +134,17 @@ impl ConfigResolver {
         options: ConfigResolverOptions,
     ) -> Result<Self> {
         let root = canonicalize_root(root.into())?;
-        let external_root_configs = if let Some(external_checks_url) =
+        let external_root_configs = if let Some(external_checks_file) =
+            normalize_optional_cli_value(options.external_checks_file)
+        {
+            if normalize_optional_cli_value(options.external_checks_url).is_some() {
+                bail!("only one of external checks file or external checks URL may be configured");
+            }
+            vec![load_external_checks_file_path(
+                &root,
+                &external_checks_file,
+            )?]
+        } else if let Some(external_checks_url) =
             normalize_optional_cli_value(options.external_checks_url)
         {
             load_external_checks_chain(&external_checks_url).await?
@@ -335,6 +347,7 @@ struct ParsedCheckPolicyConfig {
 
 #[derive(Debug)]
 struct LoadedChecksFile {
+    origin: CheckConfigOrigin,
     source_label: String,
     source_path: PathBuf,
     parsed: ParsedChecksFile,
@@ -618,11 +631,18 @@ fn apply_external_checks_file(
     for check in &external_checks_file.parsed.checks {
         let configured_id = check.id.clone();
         let implementation = if check.enabled {
-            parse_check_implementation(
+            let implementation = parse_check_implementation(
                 check.implementation.as_deref(),
                 &configured_id,
                 Some(&external_checks_file.source_label),
-            )?
+            )?;
+            validate_external_root_check_implementation(
+                external_checks_file.origin,
+                implementation.as_ref(),
+                &configured_id,
+                &external_checks_file.source_label,
+            )?;
+            implementation
         } else {
             None
         };
@@ -636,7 +656,7 @@ fn apply_external_checks_file(
             check: check.check.clone().unwrap_or_else(|| configured_id.clone()),
             id: configured_id,
             source_path: external_checks_file.source_path.clone(),
-            origin: CheckConfigOrigin::ExternalUrl,
+            origin: external_checks_file.origin,
             implementation,
             enabled: check.enabled,
             policy,
@@ -670,6 +690,22 @@ fn discover_root_external_checks_url_for_prefetch(root: &Path) -> Result<Option<
     Ok(Some(external_checks_url))
 }
 
+fn load_external_checks_file_path(
+    root: &Path,
+    external_checks_file: &str,
+) -> Result<LoadedChecksFile> {
+    let resolved_path = resolve_external_checks_file_path(root, external_checks_file)?;
+    let source_label = resolved_path.display().to_string();
+    let parsed = parse_checks_contents_from_path(&resolved_path, &source_label)?;
+
+    Ok(LoadedChecksFile {
+        origin: CheckConfigOrigin::ExternalFile,
+        source_label,
+        source_path: resolved_path,
+        parsed,
+    })
+}
+
 fn normalize_optional_cli_value(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {
         let trimmed = value.trim();
@@ -683,6 +719,30 @@ fn normalize_optional_cli_value(raw: Option<String>) -> Option<String> {
 
 fn validate_external_checks_url(raw_url: &str, base_url: Option<&reqwest::Url>) -> Result<()> {
     resolve_external_checks_url(raw_url, base_url).map(|_| ())
+}
+
+fn resolve_external_checks_file_path(root: &Path, raw_path: &str) -> Result<PathBuf> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        bail!("external checks file path must not be empty");
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    validate_relative_path(&path)
+        .context("external checks file path must be a safe relative path")?;
+    Ok(root.join(path))
+}
+
+fn parse_checks_contents_from_path(path: &Path, source_label: &str) -> Result<ParsedChecksFile> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read external checks config {source_label}"))?;
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    parse_checks_contents(&contents, extension, source_label)
+        .with_context(|| format!("failed to parse external checks config {source_label}"))
 }
 
 fn normalize_configured_external_checks_url(
@@ -755,6 +815,27 @@ fn resolve_external_checks_url(
     parsed.with_context(|| format!("invalid external checks URL `{trimmed}`"))
 }
 
+fn validate_external_root_check_implementation(
+    origin: CheckConfigOrigin,
+    implementation: Option<&ExternalCheckImplementationRef>,
+    check_id: &str,
+    source_label: &str,
+) -> Result<()> {
+    let Some(implementation) = implementation else {
+        return Ok(());
+    };
+
+    if origin == CheckConfigOrigin::ExternalFile
+        && matches!(implementation, ExternalCheckImplementationRef::File(_))
+    {
+        bail!(
+            "invalid `implementation` for check `{check_id}` in {source_label}: external checks files may only use `generated:` implementations"
+        );
+    }
+
+    Ok(())
+}
+
 async fn fetch_external_checks_file(
     client: &reqwest::Client,
     url: reqwest::Url,
@@ -818,6 +899,7 @@ async fn fetch_external_checks_file(
                 let parsed = parse_checks_contents(&contents, extension, url.as_str())
                     .with_context(|| format!("failed to parse external checks config {url}"))?;
                 return Ok(LoadedChecksFile {
+                    origin: CheckConfigOrigin::ExternalUrl,
                     source_label: url.to_string(),
                     source_path: PathBuf::from(url.as_str()),
                     parsed,

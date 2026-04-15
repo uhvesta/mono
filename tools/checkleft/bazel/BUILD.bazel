@@ -26,3 +26,9 @@ checkleft(
     name = "run_checkleft_embedded_index_smoke",
     checks = [":noop-check"],
 )
+
+checkleft(
+    name = "run_checkleft_external_file_smoke",
+    check_index = ":noop_check_index",
+    external_checks_file = ":testdata/external_checks.yaml",
+)

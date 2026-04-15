@@ -126,8 +126,14 @@ fn stage_checkleft_source_tree(
     copy_tree(package_root.join("api"), output_root.join("api"))?;
     fs::create_dir_all(output_root.join("bazel"))
         .with_context(|| format!("failed to create `{}`", output_root.join("bazel").display()))?;
-    write_string(output_root.join("bazel/defs.bzl"), &render_release_bazel_defs(repo_root)?)?;
-    write_string(output_root.join("bazel/BUILD.bazel"), &render_bazel_package_build())?;
+    write_string(
+        output_root.join("bazel/defs.bzl"),
+        &render_release_bazel_defs(repo_root)?,
+    )?;
+    write_string(
+        output_root.join("bazel/BUILD.bazel"),
+        &render_bazel_package_build(),
+    )?;
     write_string(output_root.join("BUILD.bazel"), &render_build_bazel())?;
     write_string(
         output_root.join("MODULE.bazel"),
@@ -276,7 +282,10 @@ fn render_release_bazel_defs(repo_root: &Path) -> Result<String> {
         .with_context(|| {
             format!(
                 "failed to read `{}`",
-                repo_root.join(CHECKLEFT_SUBDIR).join("bazel/defs.bzl").display()
+                repo_root
+                    .join(CHECKLEFT_SUBDIR)
+                    .join("bazel/defs.bzl")
+                    .display()
             )
         })?;
 
@@ -908,7 +917,11 @@ npm_package(
         assert!(!defs_bzl.contains("default = \"//tools/checkleft:checkleft\""));
         assert!(packaged_root.join("api/BUILD.bazel").is_file());
         assert!(packaged_root.join("api/package.json").is_file());
-        assert!(packaged_root.join("api/javascript/checkleft_exec.mjs").is_file());
+        assert!(
+            packaged_root
+                .join("api/javascript/checkleft_exec.mjs")
+                .is_file()
+        );
         assert_eq!(
             fs::read_to_string(packaged_root.join(".bazelversion")).expect("read .bazelversion"),
             "8.4.0\n"

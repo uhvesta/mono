@@ -482,7 +482,7 @@ impl Runner {
             };
         }
 
-        if matches!(check.origin, CheckConfigOrigin::ExternalUrl)
+        if check.origin == CheckConfigOrigin::ExternalUrl
             && matches!(
                 &package.implementation,
                 ExternalCheckPackageImplementation::Exec(_)

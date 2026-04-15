@@ -60,6 +60,8 @@ enum Commands {
 #[derive(Debug, Args, Clone, Default)]
 struct ConfigArgs {
     #[arg(long)]
+    external_checks_file: Option<String>,
+    #[arg(long)]
     external_checks_url: Option<String>,
 }
 
@@ -117,6 +119,7 @@ async fn run_cli() -> Result<ExitCode> {
                 &vcs,
                 all,
                 base_ref.as_deref(),
+                config.external_checks_file,
                 config.external_checks_url,
             )
             .await?;
@@ -163,6 +166,7 @@ async fn run_cli() -> Result<ExitCode> {
                 &vcs,
                 all,
                 base_ref.as_deref(),
+                config.external_checks_file,
                 config.external_checks_url,
             )
             .await?;
@@ -190,6 +194,7 @@ async fn build_runner(
     vcs: &Vcs,
     all: bool,
     base_ref: Option<&str>,
+    external_checks_file: Option<String>,
     external_checks_url: Option<String>,
 ) -> Result<Runner> {
     info!("registering built-in checks");
@@ -200,6 +205,7 @@ async fn build_runner(
         ConfigResolver::new_with_options(
             root,
             ConfigResolverOptions {
+                external_checks_file,
                 external_checks_url,
             },
         )
