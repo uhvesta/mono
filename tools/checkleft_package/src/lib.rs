@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 
 const CHECKLEFT_SUBDIR: &str = "tools/checkleft";
 const RULES_RUST_VERSION: &str = "0.68.1";
+const ASPECT_RULES_JS_VERSION: &str = "2.8.2";
 const COMPATIBILITY_LEVEL: u32 = 0;
 
 pub fn find_checkleft_repo_root(start: &Path) -> Result<PathBuf> {
@@ -122,6 +123,11 @@ fn stage_checkleft_source_tree(
     )?;
     copy_file(package_root.join("LICENSE"), output_root.join("LICENSE"))?;
     copy_tree(package_root.join("src"), output_root.join("src"))?;
+    copy_tree(package_root.join("api"), output_root.join("api"))?;
+    fs::create_dir_all(output_root.join("bazel"))
+        .with_context(|| format!("failed to create `{}`", output_root.join("bazel").display()))?;
+    write_string(output_root.join("bazel/defs.bzl"), &render_release_bazel_defs(repo_root)?)?;
+    write_string(output_root.join("bazel/BUILD.bazel"), &render_bazel_package_build())?;
     write_string(output_root.join("BUILD.bazel"), &render_build_bazel())?;
     write_string(
         output_root.join("MODULE.bazel"),
@@ -257,6 +263,32 @@ rust_test(
     .to_owned()
 }
 
+fn render_bazel_package_build() -> String {
+    r#"package(default_visibility = ["//visibility:private"])
+
+exports_files(["defs.bzl"])
+"#
+    .to_owned()
+}
+
+fn render_release_bazel_defs(repo_root: &Path) -> Result<String> {
+    let source = fs::read_to_string(repo_root.join(CHECKLEFT_SUBDIR).join("bazel/defs.bzl"))
+        .with_context(|| {
+            format!(
+                "failed to read `{}`",
+                repo_root.join(CHECKLEFT_SUBDIR).join("bazel/defs.bzl").display()
+            )
+        })?;
+
+    let needle = "default = \"//tools/checkleft:checkleft\",";
+    let replacement = "default = \"//:checkleft\",";
+    if !source.contains(needle) {
+        bail!("expected `{needle}` in Bazel defs template");
+    }
+
+    Ok(source.replacen(needle, replacement, 1))
+}
+
 fn render_module_bazel(flattened_manifest: &str) -> Result<String> {
     let manifest = parse_toml(flattened_manifest)?;
     let version = package_version(flattened_manifest)?;
@@ -275,6 +307,7 @@ module(
 )
 
 bazel_dep(name = "rules_rust", version = "{RULES_RUST_VERSION}")
+bazel_dep(name = "aspect_rules_js", version = "{ASPECT_RULES_JS_VERSION}")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
@@ -353,6 +386,12 @@ local_path_override(
     path = "/absolute/path/to/checkleft-{version}-source",
 )
 ```
+
+Public Bazel surface exported by the archive:
+
+- `@checkleft//:checkleft` - the CLI binary
+- `@checkleft//bazel:defs.bzl` - `local_check`, `check_index`, and `checkleft`
+- `@checkleft//api:checkleft_exec_pkg` - JS helper package for `@checkleft/exec`
 "#
     ))
 }
@@ -624,6 +663,9 @@ mod tests {
     fn packages_standalone_archive_with_flattened_manifest_and_bazel_files() {
         let repo = TempDir::new().expect("tempdir");
         fs::create_dir_all(repo.path().join("tools/checkleft/src")).expect("mkdir src");
+        fs::create_dir_all(repo.path().join("tools/checkleft/api/javascript"))
+            .expect("mkdir api/javascript");
+        fs::create_dir_all(repo.path().join("tools/checkleft/bazel")).expect("mkdir bazel");
         fs::write(repo.path().join(".bazelversion"), "8.4.0\n").expect("write bazelversion");
         fs::write(
             repo.path().join("Cargo.toml"),
@@ -695,6 +737,66 @@ walkdir = { workspace = true }
         .expect("write readme");
         fs::write(repo.path().join("tools/checkleft/LICENSE"), "Apache-2.0\n")
             .expect("write license");
+        fs::write(
+            repo.path().join("tools/checkleft/api/BUILD.bazel"),
+            r#"load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+
+js_library(
+    name = "checkleft_exec_js",
+    srcs = ["javascript/checkleft_exec.mjs"],
+    types = ["javascript/checkleft_exec.d.ts"],
+)
+
+npm_package(
+    name = "checkleft_exec_pkg",
+    srcs = [
+        ":checkleft_exec_js",
+        "package.json",
+    ],
+    package = "@checkleft/exec",
+    version = "0.0.0",
+)
+"#,
+        )
+        .expect("write api BUILD");
+        fs::write(
+            repo.path().join("tools/checkleft/api/package.json"),
+            r#"{
+  "name": "@checkleft/exec",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module"
+}
+"#,
+        )
+        .expect("write api package.json");
+        fs::write(
+            repo.path()
+                .join("tools/checkleft/api/javascript/checkleft_exec.mjs"),
+            "export function readRequest() { return {}; }\n",
+        )
+        .expect("write exec helper");
+        fs::write(
+            repo.path()
+                .join("tools/checkleft/api/javascript/checkleft_exec.d.ts"),
+            "export interface ExecCheckRequest {}\n",
+        )
+        .expect("write exec helper types");
+        fs::write(
+            repo.path().join("tools/checkleft/bazel/defs.bzl"),
+            r#"_checkleft_launcher = rule(
+    attrs = {
+        "_checkleft_bin": attr.label(
+            default = "//tools/checkleft:checkleft",
+            executable = True,
+            cfg = "target",
+        ),
+    },
+)
+"#,
+        )
+        .expect("write bazel defs");
 
         let archive_path =
             package_checkleft_source_archive(repo.path(), None).expect("package archive");
@@ -784,6 +886,7 @@ walkdir = { workspace = true }
         assert!(module_bazel.contains("version = \"0.1.2\""));
         assert!(module_bazel.contains("rust_toolchains"));
         assert!(module_bazel.contains("checkleft_crates"));
+        assert!(module_bazel.contains("aspect_rules_js"));
         assert!(module_bazel.contains("BAZEL_CONSUMPTION.md"));
 
         let consumption_doc = fs::read_to_string(packaged_root.join("BAZEL_CONSUMPTION.md"))
@@ -791,12 +894,21 @@ walkdir = { workspace = true }
         assert!(consumption_doc.contains("register_toolchains"));
         assert!(consumption_doc.contains("archive_override"));
         assert!(consumption_doc.contains("local_path_override"));
+        assert!(consumption_doc.contains("@checkleft//bazel:defs.bzl"));
+        assert!(consumption_doc.contains("@checkleft//api:checkleft_exec_pkg"));
         assert!(consumption_doc.contains("1.93.1"));
 
         let build_bazel =
             fs::read_to_string(packaged_root.join("BUILD.bazel")).expect("read BUILD.bazel");
         assert!(build_bazel.contains("package(default_visibility = [\"//visibility:private\"])"));
         assert!(build_bazel.contains("visibility = [\"//visibility:public\"]"));
+        let defs_bzl =
+            fs::read_to_string(packaged_root.join("bazel/defs.bzl")).expect("read defs.bzl");
+        assert!(defs_bzl.contains("default = \"//:checkleft\""));
+        assert!(!defs_bzl.contains("default = \"//tools/checkleft:checkleft\""));
+        assert!(packaged_root.join("api/BUILD.bazel").is_file());
+        assert!(packaged_root.join("api/package.json").is_file());
+        assert!(packaged_root.join("api/javascript/checkleft_exec.mjs").is_file());
         assert_eq!(
             fs::read_to_string(packaged_root.join(".bazelversion")).expect("read .bazelversion"),
             "8.4.0\n"
