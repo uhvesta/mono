@@ -2,8 +2,8 @@ CheckInfo = provider(
     doc = "Metadata for one repo-local checkleft exec-v1 package.",
     fields = {
         "args": "Static argv entries for the wrapped executable.",
-        "binary": "Executable File produced by Bazel.",
         "check_id": "External package id stored in the generated manifest.",
+        "launcher": "Executable File produced by local_check for checkleft to invoke.",
         "implementation_name": "Generated implementation id used in check indexes.",
         "manifest": "Manifest file written by local_check.",
         "provenance_target": "Target label recorded in manifest provenance.",
@@ -56,6 +56,8 @@ def _render_exec_manifest(check_id, executable_path, args, provenance_target):
 
 
 def _workspace_bin_path(file):
+    if file.short_path.startswith("../"):
+        return "bazel-bin/external/{}".format(file.short_path[len("../"):])
     return "bazel-bin/{}".format(file.short_path)
 
 
@@ -68,30 +70,78 @@ def _local_check_impl(ctx):
     if implementation_name.startswith("generated:"):
         fail("`implementation_name` must not include the `generated:` prefix")
 
-    for arg in ctx.attr.args:
+    for arg in ctx.attr.exec_args:
         if not arg:
             fail("`args` entries must not be empty")
+
+    launcher = ctx.actions.declare_file(ctx.label.name)
+    launcher_script = """#!/usr/bin/env bash
+set -euo pipefail
+
+self="$0"
+if [[ "$self" != /* ]]; then
+    self="$PWD/$self"
+fi
+
+runfiles="${{RUNFILES_DIR:-}}"
+if [[ -z "$runfiles" && -n "${{RUNFILES_MANIFEST_FILE:-}}" ]]; then
+    runfiles="${{RUNFILES_MANIFEST_FILE}}"
+    if [[ "$runfiles" == *.runfiles_manifest ]]; then
+        runfiles="${{runfiles%_manifest}}"
+    elif [[ "$runfiles" == */MANIFEST ]]; then
+        runfiles="${{runfiles%/MANIFEST}}"
+    else
+        echo "error: unexpected RUNFILES_MANIFEST_FILE value: $RUNFILES_MANIFEST_FILE" >&2
+        exit 1
+    fi
+fi
+if [[ -z "$runfiles" && -e "$self.runfiles" ]]; then
+    runfiles="$self.runfiles"
+fi
+if [[ -z "$runfiles" ]]; then
+    echo "error: failed to locate Bazel runfiles for $self" >&2
+    exit 1
+fi
+if [[ "$runfiles" != /* ]]; then
+    runfiles="$PWD/$runfiles"
+fi
+
+export RUNFILES="$runfiles"
+export RUNFILES_DIR="$runfiles"
+cd "$runfiles"
+
+exec "$runfiles/{workspace_name}/{binary_short_path}" "$@"
+""".format(
+        workspace_name = ctx.workspace_name,
+        binary_short_path = ctx.executable.binary.short_path,
+    )
+    ctx.actions.write(output = launcher, content = launcher_script, is_executable = True)
 
     manifest = ctx.actions.declare_file("{}.check.toml".format(ctx.label.name))
     ctx.actions.write(
         output = manifest,
         content = _render_exec_manifest(
             check_id = check_id,
-            executable_path = _workspace_bin_path(ctx.executable.binary),
-            args = ctx.attr.args,
+            executable_path = _workspace_bin_path(launcher),
+            args = ctx.attr.exec_args,
             provenance_target = str(ctx.attr.binary.label),
         ),
     )
 
+    runfiles = ctx.runfiles(files = [ctx.executable.binary]).merge(
+        ctx.attr.binary[DefaultInfo].default_runfiles,
+    )
+
     return [
         DefaultInfo(
-            files = depset([manifest]),
-            runfiles = ctx.runfiles(files = [manifest, ctx.executable.binary]),
+            executable = launcher,
+            files = depset([launcher, manifest]),
+            runfiles = runfiles.merge(ctx.runfiles(files = [manifest])),
         ),
         CheckInfo(
-            args = ctx.attr.args,
-            binary = ctx.executable.binary,
+            args = ctx.attr.exec_args,
             check_id = check_id,
+            launcher = launcher,
             implementation_name = implementation_name,
             manifest = manifest,
             provenance_target = str(ctx.attr.binary.label),
@@ -99,8 +149,9 @@ def _local_check_impl(ctx):
     ]
 
 
-local_check = rule(
+_local_check_rule = rule(
     implementation = _local_check_impl,
+    executable = True,
     attrs = {
         "id": attr.string(default = ""),
         "binary": attr.label(
@@ -108,9 +159,36 @@ local_check = rule(
             executable = True,
             cfg = "target",
         ),
-        "args": attr.string_list(),
+        "exec_args": attr.string_list(),
         "implementation_name": attr.string(default = ""),
     },
+)
+
+
+def _local_check_macro_impl(name, visibility, id, binary, args, implementation_name):
+    _local_check_rule(
+        name = name,
+        visibility = visibility,
+        id = id,
+        binary = binary,
+        exec_args = args,
+        implementation_name = implementation_name,
+    )
+
+
+local_check = macro(
+    attrs = {
+        "id": attr.string(default = "", configurable = False),
+        "binary": attr.label(
+            mandatory = True,
+            executable = True,
+            cfg = "target",
+            configurable = False,
+        ),
+        "args": attr.string_list(default = [], configurable = False),
+        "implementation_name": attr.string(default = "", configurable = False),
+    },
+    implementation = _local_check_macro_impl,
 )
 
 
@@ -145,7 +223,7 @@ def _check_index_impl(ctx):
             output = manifest,
             content = _render_exec_manifest(
                 check_id = info.check_id,
-                executable_path = _workspace_bin_path(info.binary),
+                executable_path = _workspace_bin_path(info.launcher),
                 args = info.args,
                 provenance_target = info.provenance_target,
             ),
@@ -203,6 +281,42 @@ def _checkleft_launcher_impl(ctx):
     launcher = ctx.actions.declare_file("{}.sh".format(ctx.label.name))
     script = """#!/usr/bin/env bash
 set -euo pipefail
+
+self="$0"
+if [[ "$self" != /* ]]; then
+    self="$PWD/$self"
+fi
+while [[ -L "$self" ]]; do
+    target="$(readlink "$self")"
+    if [[ "$target" == /* ]]; then
+        self="$target"
+    else
+        self="$(cd -- "$(dirname -- "$self")" && pwd)/$target"
+    fi
+done
+
+runfiles="${{RUNFILES_DIR:-}}"
+if [[ -z "$runfiles" && -n "${{RUNFILES_MANIFEST_FILE:-}}" ]]; then
+    runfiles="${{RUNFILES_MANIFEST_FILE}}"
+    if [[ "$runfiles" == *.runfiles_manifest ]]; then
+        runfiles="${{runfiles%_manifest}}"
+    elif [[ "$runfiles" == */MANIFEST ]]; then
+        runfiles="${{runfiles%/MANIFEST}}"
+    else
+        echo "error: unexpected RUNFILES_MANIFEST_FILE value: $RUNFILES_MANIFEST_FILE" >&2
+        exit 1
+    fi
+fi
+if [[ -z "$runfiles" && -e "$self.runfiles" ]]; then
+    runfiles="$self.runfiles"
+fi
+if [[ -n "$runfiles" ]]; then
+    if [[ "$runfiles" != /* ]]; then
+        runfiles="$PWD/$runfiles"
+    fi
+    export RUNFILES="$runfiles"
+    export RUNFILES_DIR="$runfiles"
+fi
 
 workspace_dir="${{BUILD_WORKSPACE_DIRECTORY:-$PWD}}"
 cd "$workspace_dir"

@@ -1,4 +1,4 @@
-load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_rules_js//js:defs.bzl", "js_library", "js_test")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 
 package(default_visibility = ["//visibility:private"])
@@ -19,6 +19,16 @@ npm_package(
     package = "@checkleft/exec",
     version = "0.0.0",
     visibility = ["//visibility:public"],
+)
+
+js_test(
+    name = "checkleft_exec_js_test",
+    entry_point = "javascript/checkleft_exec_test.mjs",
+    data = [
+        ":checkleft_exec_js",
+        "javascript/checkleft_exec_child.mjs",
+        "javascript/checkleft_exec_test.mjs",
+    ],
 )
 
 exports_files(
