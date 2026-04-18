@@ -33,6 +33,7 @@ pub trait ExecutionRunner: Send + Sync {
         execution: &WorkExecution,
         work_item: &WorkItem,
         workspace_path: &Path,
+        cube_change_id: Option<&str>,
     ) -> Result<RunOutcome>;
 }
 
@@ -82,11 +83,12 @@ impl ExecutionRunner for AcpExecutionRunner {
         execution: &WorkExecution,
         work_item: &WorkItem,
         workspace_path: &Path,
+        cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
         let worker = self.worker_client(worker_id).await?;
         let _guard = worker.prompt_lock.lock().await;
         let session_id = worker.acp.new_session(workspace_path).await?;
-        let prompt = compose_execution_prompt(execution, work_item, workspace_path);
+        let prompt = compose_execution_prompt(execution, work_item, workspace_path, cube_change_id);
         let mut transcript = String::new();
 
         let response = worker
@@ -169,6 +171,7 @@ impl ExecutionRunner for AcpExecutionRunner {
             work_item,
             workspace_path,
             result_summary.as_deref(),
+            cube_change_id,
         ));
 
         Ok(RunOutcome {
@@ -184,6 +187,7 @@ fn compose_execution_prompt(
     execution: &WorkExecution,
     work_item: &WorkItem,
     workspace_path: &Path,
+    cube_change_id: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(
@@ -197,6 +201,9 @@ fn compose_execution_prompt(
     prompt.push_str(&format!("- execution kind: `{}`\n", execution.kind));
     prompt.push_str(&format!("- workspace: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("- work item: `{}`\n", work_item_name(work_item)));
+    if let Some(cube_change_id) = cube_change_id {
+        prompt.push_str(&format!("- local change: `{}`\n", cube_change_id));
+    }
     if let Some(details) = work_item_details(work_item) {
         prompt.push_str("- details:\n");
         prompt.push_str(details.trim_end());
@@ -281,6 +288,7 @@ fn review_attention(
     work_item: &WorkItem,
     workspace_path: &Path,
     result_summary: Option<&str>,
+    cube_change_id: Option<&str>,
 ) -> RunAttention {
     let title = match execution.kind.as_str() {
         "project_design" => format!("Review design output for {}", work_item_name(work_item)),
@@ -291,12 +299,17 @@ fn review_attention(
     };
 
     let summary = result_summary.unwrap_or("_No summary was captured for this run._");
+    let local_change = cube_change_id
+        .map(|change_id| format!("- local change: `{change_id}`\n"))
+        .unwrap_or_default();
     let body_markdown = format!(
-        "Execution `{}` is waiting for human review.\n\n- work item: `{}`\n- execution kind: `{}`\n- workspace: `{}`\n\n## Run Summary\n{}\n",
+        "Execution `{}` is waiting for human review.\n\n- work item: `{}`\n- execution kind: `{}`\n- workspace: `{}`\n{}\
+\n## Run Summary\n{}\n",
         execution.id,
         work_item_name(work_item),
         execution.kind,
         workspace_path.display(),
+        local_change,
         summary,
     );
 

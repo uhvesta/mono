@@ -24,10 +24,20 @@ pub struct CubeWorkspaceLease {
     pub workspace_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CubeChangeHandle {
+    pub change_id: String,
+}
+
 #[async_trait]
 pub trait CubeClient: Send + Sync {
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
     async fn lease_workspace(&self, repo_id: &str, task: &str) -> Result<CubeWorkspaceLease>;
+    async fn create_change(
+        &self,
+        workspace_path: &PathBuf,
+        title: &str,
+    ) -> Result<CubeChangeHandle>;
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
 }
 
@@ -119,6 +129,39 @@ impl CubeClient for CommandCubeClient {
         Ok(CubeWorkspaceLease {
             lease_id,
             workspace_path: payload.workspace.workspace_path,
+        })
+    }
+
+    async fn create_change(
+        &self,
+        workspace_path: &PathBuf,
+        title: &str,
+    ) -> Result<CubeChangeHandle> {
+        #[derive(Deserialize)]
+        struct ChangePayload {
+            change: ChangeRecord,
+        }
+
+        #[derive(Deserialize)]
+        struct ChangeRecord {
+            change_id: String,
+        }
+
+        let payload: ChangePayload = serde_json::from_value(
+            self.run_json(&[
+                "--json",
+                "change",
+                "create",
+                "--workspace",
+                &workspace_path.display().to_string(),
+                "--title",
+                title,
+            ])
+            .await?,
+        )
+        .context("failed to decode `cube change create` payload")?;
+        Ok(CubeChangeHandle {
+            change_id: payload.change.change_id,
         })
     }
 
@@ -288,6 +331,26 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
+        let change_title = execution_change_title(execution, &work_item);
+        let change = match self
+            .cube_client
+            .create_change(&lease.workspace_path, &change_title)
+            .await
+        {
+            Ok(change) => change,
+            Err(err) => {
+                if let Err(release_err) = self.cube_client.release_workspace(&lease.lease_id).await
+                {
+                    tracing::error!(
+                        ?release_err,
+                        lease_id = %lease.lease_id,
+                        "failed to release workspace after change creation failure"
+                    );
+                }
+                self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)?;
+                return Err(err);
+            }
+        };
 
         match self.work_db.start_execution_run(
             &execution.id,
@@ -304,13 +367,14 @@ impl ExecutionCoordinator {
                     worker_id,
                     cube_repo_id = %repo.repo_id,
                     cube_lease_id = %lease.lease_id,
+                    cube_change_id = %change.change_id,
                     workspace_path = %lease.workspace_path.display(),
                     "started execution run"
                 );
                 let coordinator = self.clone();
                 tokio::spawn(async move {
                     coordinator
-                        .run_execution(execution, run, work_item, worker_id_owned, lease)
+                        .run_execution(execution, run, work_item, worker_id_owned, lease, change)
                         .await;
                 });
                 Ok(())
@@ -359,6 +423,7 @@ impl ExecutionCoordinator {
         work_item: WorkItem,
         worker_id: String,
         lease: CubeWorkspaceLease,
+        change: CubeChangeHandle,
     ) {
         let run_outcome = self
             .execution_runner
@@ -367,6 +432,7 @@ impl ExecutionCoordinator {
                 &execution,
                 &work_item,
                 lease.workspace_path.as_path(),
+                Some(change.change_id.as_str()),
             )
             .await;
 
@@ -516,6 +582,16 @@ fn execution_task_summary(execution: &WorkExecution, work_item: &WorkItem) -> St
     }
 }
 
+fn execution_change_title(execution: &WorkExecution, work_item: &WorkItem) -> String {
+    match work_item {
+        WorkItem::Product(product) => format!("{}: {}", execution.kind, product.name),
+        WorkItem::Project(project) => format!("{}: {}", execution.kind, project.name),
+        WorkItem::Task(task) | WorkItem::Chore(task) => {
+            format!("{}: {}", execution.kind, task.name)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::pending;
@@ -529,7 +605,10 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::time::sleep;
 
-    use super::{CubeClient, CubeRepoHandle, CubeWorkspaceLease, ExecutionCoordinator, WorkerPool};
+    use super::{
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, ExecutionCoordinator,
+        WorkerPool,
+    };
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome};
     use crate::work::{
         CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, WorkDb,
@@ -540,9 +619,11 @@ mod tests {
     struct FakeCubeClient {
         ensure_calls: Mutex<Vec<String>>,
         lease_calls: Mutex<Vec<(String, String)>>,
+        create_calls: Mutex<Vec<(String, String)>>,
         release_calls: Mutex<Vec<String>>,
         fail_ensure: bool,
         fail_lease: bool,
+        fail_create: bool,
     }
 
     #[async_trait]
@@ -571,6 +652,23 @@ mod tests {
             })
         }
 
+        async fn create_change(
+            &self,
+            workspace_path: &PathBuf,
+            title: &str,
+        ) -> Result<CubeChangeHandle> {
+            self.create_calls
+                .lock()
+                .await
+                .push((workspace_path.display().to_string(), title.to_owned()));
+            if self.fail_create {
+                return Err(anyhow!("cube change create failed"));
+            }
+            Ok(CubeChangeHandle {
+                change_id: "chg-1".to_owned(),
+            })
+        }
+
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
             self.release_calls.lock().await.push(lease_id.to_owned());
             Ok(())
@@ -578,7 +676,7 @@ mod tests {
     }
 
     struct FakeExecutionRunner {
-        calls: Mutex<Vec<(String, String, String)>>,
+        calls: Mutex<Vec<(String, String, String, Option<String>)>>,
         fail: bool,
         pending: bool,
     }
@@ -601,11 +699,13 @@ mod tests {
             execution: &WorkExecution,
             work_item: &WorkItem,
             workspace_path: &std::path::Path,
+            cube_change_id: Option<&str>,
         ) -> Result<RunOutcome> {
             self.calls.lock().await.push((
                 worker_id.to_owned(),
                 execution.id.clone(),
                 workspace_path.display().to_string(),
+                cube_change_id.map(str::to_owned),
             ));
             if self.pending {
                 pending::<()>().await;
@@ -695,7 +795,9 @@ mod tests {
         assert_eq!(coordinator.worker_pool().idle_count().await, 0);
         assert_eq!(cube.ensure_calls.lock().await.len(), 1);
         assert_eq!(cube.lease_calls.lock().await.len(), 1);
+        assert_eq!(cube.create_calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await.len(), 1);
+        assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
     }
 
     #[tokio::test]
@@ -786,6 +888,53 @@ mod tests {
             run.error_text.as_deref(),
             Some("cube workspace lease failed")
         );
+        assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn change_creation_failure_marks_execution_failed_and_releases_workspace() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_create: true,
+            ..FakeCubeClient::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        coordinator.kick();
+        wait_for_execution_status(
+            db.as_ref(),
+            &db.list_executions(Some(&chore.id)).unwrap()[0].id,
+            "failed",
+        )
+        .await;
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        assert_eq!(execution.status, "failed");
+        let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.error_text.as_deref(), Some("cube change create failed"));
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
         assert_eq!(coordinator.worker_pool().idle_count().await, 1);
     }
 

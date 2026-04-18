@@ -54,3 +54,15 @@ pub struct WorkspaceCandidate {
     pub workspace_id: String,
     pub workspace_path: PathBuf,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangeRecord {
+    pub change_id: String,
+    pub repo: String,
+    pub workspace_path: PathBuf,
+    pub parent_change_id: Option<String>,
+    pub title: String,
+    pub jj_change_id: String,
+    pub head_commit: String,
+    pub created_at_epoch_s: i64,
+}
