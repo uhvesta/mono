@@ -17,6 +17,7 @@ use crate::protocol::{
     AgentInfo, AgentRole, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
     FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS, TopicEventPayload, work_product_topic,
 };
+use crate::runner::AcpExecutionRunner;
 use crate::work::{WorkDb, WorkItem};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
@@ -216,6 +217,7 @@ impl ServerState {
             work_db.clone(),
             worker_pool,
             Arc::new(CommandCubeClient::new(cfg.clone())),
+            Arc::new(AcpExecutionRunner::new(cfg.clone())),
         ));
         Ok(Self {
             work_db,
@@ -440,9 +442,7 @@ async fn run_server(cli: Cli, cfg: &RuntimeConfig) -> Result<()> {
     println!("boss-engine listening on {socket_path}");
 
     let coordinator = server_state.execution_coordinator.clone();
-    tokio::spawn(async move {
-        coordinator.kick().await;
-    });
+    coordinator.kick();
 
     loop {
         let (stream, _) = listener.accept().await.context("socket accept failed")?;
@@ -1425,9 +1425,7 @@ async fn publish_work_invalidation(
         }
 
         let coordinator = server_state.execution_coordinator.clone();
-        tokio::spawn(async move {
-            coordinator.kick().await;
-        });
+        coordinator.kick();
     }
 
     let revision = server_state.bump_work_revision();

@@ -574,6 +574,122 @@ impl WorkDb {
         Ok((execution, run))
     }
 
+    pub fn finish_execution_run(
+        &self,
+        execution_id: &str,
+        run_id: &str,
+        execution_status: &str,
+        run_status: &str,
+        result_summary: Option<&str>,
+        error_text: Option<&str>,
+        clear_workspace_lease: bool,
+        attention: Option<CreateAttentionItemInput>,
+    ) -> Result<(WorkExecution, WorkRun, Option<WorkAttentionItem>)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        if execution.status != "running" {
+            bail!(
+                "execution {execution_id} is not running and cannot finish a run from status `{}`",
+                execution.status
+            );
+        }
+
+        let run = query_run(&tx, run_id)?.with_context(|| format!("unknown run: {run_id}"))?;
+        if run.execution_id != execution_id {
+            bail!("run {run_id} does not belong to execution {execution_id}");
+        }
+        if run.status != "active" {
+            bail!(
+                "run {run_id} is not active and cannot be finished from status `{}`",
+                run.status
+            );
+        }
+
+        let now = now_string();
+        let execution_finished_at = if execution_status_is_terminal(execution_status) {
+            Some(now.as_str())
+        } else {
+            None
+        };
+        let normalized_result_summary = normalize_optional_text(result_summary.map(str::to_owned));
+        let normalized_error_text = normalize_optional_text(error_text.map(str::to_owned));
+
+        tx.execute(
+            "UPDATE work_executions
+             SET status = ?2,
+                 cube_lease_id = CASE WHEN ?3 THEN NULL ELSE cube_lease_id END,
+                 workspace_path = CASE WHEN ?3 THEN NULL ELSE workspace_path END,
+                 finished_at = ?4
+             WHERE id = ?1",
+            params![
+                execution_id,
+                execution_status,
+                clear_workspace_lease,
+                execution_finished_at,
+            ],
+        )?;
+
+        tx.execute(
+            "UPDATE work_runs
+             SET status = ?2,
+                 error_text = ?3,
+                 result_summary = ?4,
+                 finished_at = ?5
+             WHERE id = ?1",
+            params![
+                run_id,
+                run_status,
+                normalized_error_text,
+                normalized_result_summary,
+                now,
+            ],
+        )?;
+
+        let attention_item = if let Some(input) = attention {
+            if input.execution_id != execution_id {
+                bail!(
+                    "attention item execution `{}` does not match finished execution `{execution_id}`",
+                    input.execution_id
+                );
+            }
+
+            let attention_id = next_id("attn");
+            let status = input.status.unwrap_or_else(|| "open".to_owned());
+            let resolved_at = normalize_optional_text(input.resolved_at);
+            tx.execute(
+                "INSERT INTO work_attention_items (
+                    id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    attention_id,
+                    execution_id,
+                    input.kind,
+                    status,
+                    input.title,
+                    input.body_markdown,
+                    now,
+                    resolved_at,
+                ],
+            )?;
+
+            Some(
+                query_attention_item(&tx, &attention_id)?.with_context(|| {
+                    format!("missing attention item after insert: {attention_id}")
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let run = query_run(&tx, run_id)?.with_context(|| format!("unknown run: {run_id}"))?;
+        tx.commit()?;
+        Ok((execution, run, attention_item))
+    }
+
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -1452,6 +1568,10 @@ fn can_reconcile_execution_status(status: &str) -> bool {
     matches!(status, "queued" | "ready" | "waiting_dependency")
 }
 
+fn execution_status_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "abandoned")
+}
+
 fn project_accepts_execution(project: &Project) -> bool {
     !matches!(project.status.as_str(), "done" | "archived")
 }
@@ -2209,6 +2329,158 @@ mod tests {
             Some("cube workspace lease failed")
         );
         assert!(run.finished_at.is_some());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn finishes_active_run_into_waiting_human_with_attention() {
+        let path = temp_db_path("finish-run-waiting");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                workspace_path: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        let (execution, run, attention) = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("Implemented the first pass."),
+                None,
+                false,
+                Some(CreateAttentionItemInput {
+                    execution_id: execution.id.clone(),
+                    kind: "review_required".to_owned(),
+                    status: None,
+                    title: "Review implementation output for Cleanup".to_owned(),
+                    body_markdown: "Review requested.".to_owned(),
+                    resolved_at: None,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
+        assert_eq!(
+            execution.workspace_path.as_deref(),
+            Some("/tmp/mono-agent-001")
+        );
+        assert!(execution.finished_at.is_none());
+        assert_eq!(run.status, "completed");
+        assert_eq!(
+            run.result_summary.as_deref(),
+            Some("Implemented the first pass.")
+        );
+        assert!(run.error_text.is_none());
+        assert!(run.finished_at.is_some());
+        let attention = attention.expect("attention item should be created");
+        assert_eq!(attention.kind, "review_required");
+        assert_eq!(db.list_attention_items(&execution.id).unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
+        let path = temp_db_path("finish-run-failed");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                workspace_path: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        let (execution, run, attention) = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "failed",
+                "failed",
+                None,
+                Some("agent run failed"),
+                true,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(execution.status, "failed");
+        assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
+        assert!(execution.cube_lease_id.is_none());
+        assert!(execution.workspace_path.is_none());
+        assert!(execution.finished_at.is_some());
+        assert_eq!(run.status, "failed");
+        assert_eq!(run.error_text.as_deref(), Some("agent run failed"));
+        assert!(attention.is_none());
 
         let _ = std::fs::remove_file(path);
     }

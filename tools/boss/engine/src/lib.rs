@@ -4,4 +4,5 @@ pub mod cli;
 pub mod config;
 pub mod coordinator;
 pub mod protocol;
+pub mod runner;
 pub mod work;

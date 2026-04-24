@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -9,7 +10,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
-use crate::work::{WorkDb, WorkExecution, WorkItem};
+use crate::runner::{ExecutionRunner, RunOutcome};
+use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution, WorkItem, WorkRun};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CubeRepoHandle {
@@ -187,7 +189,8 @@ pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
     cube_client: Arc<dyn CubeClient>,
-    scheduling_lock: Mutex<()>,
+    execution_runner: Arc<dyn ExecutionRunner>,
+    scheduling_active: AtomicBool,
 }
 
 impl ExecutionCoordinator {
@@ -195,12 +198,14 @@ impl ExecutionCoordinator {
         work_db: Arc<WorkDb>,
         worker_pool: WorkerPool,
         cube_client: Arc<dyn CubeClient>,
+        execution_runner: Arc<dyn ExecutionRunner>,
     ) -> Self {
         Self {
             work_db,
             worker_pool,
             cube_client,
-            scheduling_lock: Mutex::new(()),
+            execution_runner,
+            scheduling_active: AtomicBool::new(false),
         }
     }
 
@@ -208,9 +213,19 @@ impl ExecutionCoordinator {
         self.worker_pool.clone()
     }
 
-    pub async fn kick(&self) {
-        let Ok(_guard) = self.scheduling_lock.try_lock() else {
+    pub fn kick(self: &Arc<Self>) {
+        if self.scheduling_active.swap(true, Ordering::AcqRel) {
             return;
+        }
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            coordinator.run_scheduler().await;
+        });
+    }
+
+    async fn run_scheduler(self: Arc<Self>) {
+        let _guard = SchedulingGuard {
+            active: &self.scheduling_active,
         };
 
         loop {
@@ -243,7 +258,11 @@ impl ExecutionCoordinator {
         }
     }
 
-    async fn schedule_execution(&self, execution: &WorkExecution, worker_id: &str) -> Result<()> {
+    async fn schedule_execution(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+    ) -> Result<()> {
         let work_item = self
             .work_db
             .get_work_item(&execution.work_item_id)
@@ -257,8 +276,7 @@ impl ExecutionCoordinator {
         {
             Ok(repo) => repo,
             Err(err) => {
-                self.record_start_failure(execution, worker_id, None, &err)
-                    .await?;
+                self.record_start_failure(execution, worker_id, None, &err)?;
                 return Err(err);
             }
         };
@@ -266,8 +284,7 @@ impl ExecutionCoordinator {
         let lease = match self.cube_client.lease_workspace(&repo.repo_id, &task).await {
             Ok(lease) => lease,
             Err(err) => {
-                self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)
-                    .await?;
+                self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)?;
                 return Err(err);
             }
         };
@@ -280,6 +297,7 @@ impl ExecutionCoordinator {
             &lease.workspace_path.display().to_string(),
         ) {
             Ok((execution, run)) => {
+                let worker_id_owned = worker_id.to_owned();
                 tracing::info!(
                     execution_id = %execution.id,
                     run_id = %run.id,
@@ -289,6 +307,12 @@ impl ExecutionCoordinator {
                     workspace_path = %lease.workspace_path.display(),
                     "started execution run"
                 );
+                let coordinator = self.clone();
+                tokio::spawn(async move {
+                    coordinator
+                        .run_execution(execution, run, work_item, worker_id_owned, lease)
+                        .await;
+                });
                 Ok(())
             }
             Err(err) => {
@@ -305,7 +329,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    async fn record_start_failure(
+    fn record_start_failure(
         &self,
         execution: &WorkExecution,
         worker_id: &str,
@@ -327,6 +351,161 @@ impl ExecutionCoordinator {
         );
         Ok(())
     }
+
+    async fn run_execution(
+        self: Arc<Self>,
+        execution: WorkExecution,
+        run: WorkRun,
+        work_item: WorkItem,
+        worker_id: String,
+        lease: CubeWorkspaceLease,
+    ) {
+        let run_outcome = self
+            .execution_runner
+            .run_execution(
+                &worker_id,
+                &execution,
+                &work_item,
+                lease.workspace_path.as_path(),
+            )
+            .await;
+
+        match run_outcome {
+            Ok(outcome) => {
+                if let Err(err) = self
+                    .record_run_completion(&execution, &run, &lease, &worker_id, outcome)
+                    .await
+                {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        run_id = %run.id,
+                        worker_id = %worker_id,
+                        "failed to record execution completion"
+                    );
+                }
+            }
+            Err(err) => {
+                let released = match self.cube_client.release_workspace(&lease.lease_id).await {
+                    Ok(()) => true,
+                    Err(release_err) => {
+                        tracing::error!(
+                            ?release_err,
+                            execution_id = %execution.id,
+                            run_id = %run.id,
+                            lease_id = %lease.lease_id,
+                            "failed to release workspace after run failure"
+                        );
+                        false
+                    }
+                };
+                let error_text = err.to_string();
+
+                match self.work_db.finish_execution_run(
+                    &execution.id,
+                    &run.id,
+                    "failed",
+                    "failed",
+                    None,
+                    Some(error_text.as_str()),
+                    released,
+                    None,
+                ) {
+                    Ok((execution, run, _)) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            run_id = %run.id,
+                            worker_id = %worker_id,
+                            error = %err,
+                            released_workspace = released,
+                            "execution run failed"
+                        );
+                    }
+                    Err(record_err) => {
+                        tracing::error!(
+                            ?record_err,
+                            execution_id = %execution.id,
+                            run_id = %run.id,
+                            worker_id = %worker_id,
+                            "failed to record execution run failure"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.worker_pool.release_worker(&worker_id).await;
+        self.kick();
+    }
+
+    async fn record_run_completion(
+        &self,
+        execution: &WorkExecution,
+        run: &WorkRun,
+        lease: &CubeWorkspaceLease,
+        worker_id: &str,
+        outcome: RunOutcome,
+    ) -> Result<()> {
+        let released = if outcome.release_workspace {
+            match self.cube_client.release_workspace(&lease.lease_id).await {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        run_id = %run.id,
+                        lease_id = %lease.lease_id,
+                        "failed to release workspace after successful run"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        let attention = outcome.attention.map(|attention| CreateAttentionItemInput {
+            execution_id: execution.id.clone(),
+            kind: attention.kind,
+            status: None,
+            title: attention.title,
+            body_markdown: attention.body_markdown,
+            resolved_at: None,
+        });
+
+        let (execution, run, attention) = self.work_db.finish_execution_run(
+            &execution.id,
+            &run.id,
+            &outcome.execution_status,
+            "completed",
+            outcome.result_summary.as_deref(),
+            None,
+            released,
+            attention,
+        )?;
+
+        tracing::info!(
+            execution_id = %execution.id,
+            run_id = %run.id,
+            worker_id,
+            execution_status = %execution.status,
+            run_status = %run.status,
+            attention_created = attention.is_some(),
+            released_workspace = released,
+            "execution run completed"
+        );
+        Ok(())
+    }
+}
+
+struct SchedulingGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for SchedulingGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 fn execution_task_summary(execution: &WorkExecution, work_item: &WorkItem) -> String {
@@ -339,17 +518,22 @@ fn execution_task_summary(execution: &WorkExecution, work_item: &WorkItem) -> St
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+    use tokio::time::sleep;
 
     use super::{CubeClient, CubeRepoHandle, CubeWorkspaceLease, ExecutionCoordinator, WorkerPool};
+    use crate::runner::{ExecutionRunner, RunAttention, RunOutcome};
     use crate::work::{
         CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, WorkDb,
+        WorkExecution, WorkItem,
     };
 
     #[derive(Default)]
@@ -393,6 +577,75 @@ mod tests {
         }
     }
 
+    struct FakeExecutionRunner {
+        calls: Mutex<Vec<(String, String, String)>>,
+        fail: bool,
+        pending: bool,
+    }
+
+    impl Default for FakeExecutionRunner {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail: false,
+                pending: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionRunner for FakeExecutionRunner {
+        async fn run_execution(
+            &self,
+            worker_id: &str,
+            execution: &WorkExecution,
+            work_item: &WorkItem,
+            workspace_path: &std::path::Path,
+        ) -> Result<RunOutcome> {
+            self.calls.lock().await.push((
+                worker_id.to_owned(),
+                execution.id.clone(),
+                workspace_path.display().to_string(),
+            ));
+            if self.pending {
+                pending::<()>().await;
+            }
+            if self.fail {
+                return Err(anyhow!("worker prompt failed"));
+            }
+
+            Ok(RunOutcome {
+                execution_status: "waiting_human".to_owned(),
+                result_summary: Some(format!("finished {}", execution.kind)),
+                attention: Some(RunAttention {
+                    kind: "review_required".to_owned(),
+                    title: format!("Review {}", execution.kind),
+                    body_markdown: format!("Review {}", test_work_item_name(work_item)),
+                }),
+                release_workspace: false,
+            })
+        }
+    }
+
+    async fn wait_for_execution_status(db: &WorkDb, execution_id: &str, expected: &str) {
+        for _ in 0..100 {
+            let execution = db.get_execution(execution_id).unwrap();
+            if execution.status == expected {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("execution {execution_id} never reached status `{expected}`");
+    }
+
+    fn test_work_item_name(work_item: &WorkItem) -> &str {
+        match work_item {
+            WorkItem::Product(product) => &product.name,
+            WorkItem::Project(project) => &project.name,
+            WorkItem::Task(task) | WorkItem::Chore(task) => &task.name,
+        }
+    }
+
     #[tokio::test]
     async fn schedules_ready_execution_into_running_run() {
         let dir = tempdir().unwrap();
@@ -414,8 +667,23 @@ mod tests {
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
-        let coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone());
-        coordinator.kick().await;
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+        wait_for_execution_status(
+            db.as_ref(),
+            &db.list_executions(Some(&chore.id)).unwrap()[0].id,
+            "running",
+        )
+        .await;
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
         assert_eq!(execution.status, "running");
@@ -427,6 +695,49 @@ mod tests {
         assert_eq!(coordinator.worker_pool().idle_count().await, 0);
         assert_eq!(cube.ensure_calls.lock().await.len(), 1);
         assert_eq!(cube.lease_calls.lock().await.len(), 1);
+        assert_eq!(runner.calls.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_run_moves_execution_to_waiting_human_and_releases_worker() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            runner,
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        let execution = db.get_execution(&execution.id).unwrap();
+        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
+        let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
+        assert_eq!(run.status, "completed");
+        assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+        assert_eq!(db.list_attention_items(&execution.id).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -453,8 +764,19 @@ mod tests {
             fail_lease: true,
             ..FakeCubeClient::default()
         });
-        let coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone());
-        coordinator.kick().await;
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        coordinator.kick();
+        wait_for_execution_status(
+            db.as_ref(),
+            &db.list_executions(Some(&chore.id)).unwrap()[0].id,
+            "failed",
+        )
+        .await;
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
         assert_eq!(execution.status, "failed");
@@ -511,8 +833,28 @@ mod tests {
         db.reconcile_product_executions(&product.id).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
-        let coordinator = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone());
-        coordinator.kick().await;
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        coordinator.kick();
+        for _ in 0..100 {
+            let executions = db.list_executions(None).unwrap();
+            if executions
+                .iter()
+                .filter(|execution| execution.status == "running")
+                .count()
+                == 1
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
 
         let executions = db.list_executions(None).unwrap();
         assert_eq!(

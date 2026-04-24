@@ -12,6 +12,7 @@ rust_library(
         "src/coordinator.rs",
         "src/lib.rs",
         "src/protocol.rs",
+        "src/runner.rs",
         "src/work.rs",
     ],
     crate_root = "src/lib.rs",
