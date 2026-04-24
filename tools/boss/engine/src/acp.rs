@@ -87,6 +87,8 @@ pub struct AcpClient {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     next_request_id: AtomicU64,
     permission_coordinator: PermissionCoordinator,
+    session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
+    default_cwd: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl AcpClient {
@@ -142,11 +144,15 @@ impl AcpClient {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let permission_coordinator = PermissionCoordinator::default();
+        let session_cwds = Arc::new(Mutex::new(HashMap::new()));
+        let default_cwd = Arc::new(Mutex::new(None));
 
         let client_host = Arc::new(ClientHost::new(
             cfg.cwd.clone(),
             interactive_permissions,
             permission_coordinator.clone(),
+            session_cwds.clone(),
+            default_cwd.clone(),
         ));
 
         tokio::spawn(write_loop(stdin, request_rx));
@@ -166,6 +172,8 @@ impl AcpClient {
             pending,
             next_request_id: AtomicU64::new(1),
             permission_coordinator,
+            session_cwds,
+            default_cwd,
         })
     }
 
@@ -209,6 +217,11 @@ impl AcpClient {
             .get("sessionId")
             .and_then(Value::as_str)
             .context("session/new response missing sessionId")?;
+        self.session_cwds
+            .lock()
+            .await
+            .insert(session_id.to_owned(), cwd.to_path_buf());
+        *self.default_cwd.lock().await = Some(cwd.to_path_buf());
 
         Ok(session_id.to_owned())
     }
@@ -615,6 +628,8 @@ struct ClientHost {
     terminals: TerminalManager,
     interactive_permissions: bool,
     permission_coordinator: PermissionCoordinator,
+    session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
+    default_cwd: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl ClientHost {
@@ -622,11 +637,19 @@ impl ClientHost {
         cwd: PathBuf,
         interactive_permissions: bool,
         permission_coordinator: PermissionCoordinator,
+        session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
+        default_cwd: Arc<Mutex<Option<PathBuf>>>,
     ) -> Self {
         Self {
-            terminals: TerminalManager::new(preferred_child_path(&cwd)),
+            terminals: TerminalManager::new(
+                preferred_child_path(&cwd),
+                session_cwds.clone(),
+                default_cwd.clone(),
+            ),
             interactive_permissions,
             permission_coordinator,
+            session_cwds,
+            default_cwd,
         }
     }
 
@@ -652,6 +675,8 @@ impl ClientHost {
     async fn read_text_file(&self, params: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct ReadRequest {
+            #[serde(rename = "sessionId")]
+            session_id: Option<String>,
             path: String,
             line: Option<usize>,
             limit: Option<usize>,
@@ -659,9 +684,12 @@ impl ClientHost {
 
         let request: ReadRequest =
             serde_json::from_value(params).context("invalid read request")?;
-        let content = tokio::fs::read_to_string(&request.path)
+        let session_cwd = self.session_cwd(request.session_id.as_deref()).await;
+        let resolved_path =
+            resolve_relative_to_session(Path::new(&request.path), session_cwd.as_deref());
+        let content = tokio::fs::read_to_string(&resolved_path)
             .await
-            .with_context(|| format!("failed to read file {}", request.path))?;
+            .with_context(|| format!("failed to read file {}", resolved_path.display()))?;
 
         if request.line.is_none() && request.limit.is_none() {
             return Ok(json!({ "content": content }));
@@ -683,25 +711,37 @@ impl ClientHost {
     async fn write_text_file(&self, params: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct WriteRequest {
+            #[serde(rename = "sessionId")]
+            session_id: Option<String>,
             path: String,
             content: String,
         }
 
         let request: WriteRequest =
             serde_json::from_value(params).context("invalid write request")?;
-        let path = Path::new(&request.path);
+        let session_cwd = self.session_cwd(request.session_id.as_deref()).await;
+        let path = resolve_relative_to_session(Path::new(&request.path), session_cwd.as_deref());
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await.with_context(|| {
-                    format!("failed to create parent directories for {}", request.path)
+                    format!("failed to create parent directories for {}", path.display())
                 })?;
             }
         }
-        tokio::fs::write(&request.path, request.content)
+        tokio::fs::write(&path, request.content)
             .await
-            .with_context(|| format!("failed to write file {}", request.path))?;
+            .with_context(|| format!("failed to write file {}", path.display()))?;
 
         Ok(json!({}))
+    }
+
+    async fn session_cwd(&self, session_id: Option<&str>) -> Option<PathBuf> {
+        if let Some(session_id) = session_id {
+            if let Some(cwd) = self.session_cwds.lock().await.get(session_id).cloned() {
+                return Some(cwd);
+            }
+        }
+        self.default_cwd.lock().await.clone()
     }
 
     async fn request_permission(
@@ -815,14 +855,22 @@ struct TerminalManager {
     terminals: Mutex<HashMap<String, Arc<TerminalProcess>>>,
     next_id: AtomicU64,
     child_path: OsString,
+    session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
+    default_cwd: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl TerminalManager {
-    fn new(child_path: OsString) -> Self {
+    fn new(
+        child_path: OsString,
+        session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
+        default_cwd: Arc<Mutex<Option<PathBuf>>>,
+    ) -> Self {
         Self {
             terminals: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             child_path,
+            session_cwds,
+            default_cwd,
         }
     }
 
@@ -873,8 +921,13 @@ impl TerminalManager {
 
         let (executable, args, launch_mode) =
             normalize_terminal_command(raw_command.clone(), request_args);
-
-        let cwd_label = cwd.clone().unwrap_or_else(|| "<none>".to_owned());
+        let session_cwd = self.session_cwd(session_id.as_deref()).await;
+        let resolved_cwd =
+            resolve_terminal_cwd(cwd.as_deref().map(Path::new), session_cwd.as_deref());
+        let cwd_label = resolved_cwd
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_owned());
         info!(
             raw_command = %raw_command,
             executable = %executable,
@@ -893,10 +946,12 @@ impl TerminalManager {
             .kill_on_drop(true)
             .env("PATH", &self.child_path);
 
-        if let Some(cwd) = &cwd {
-            let cwd_path = Path::new(&cwd);
-            if !cwd_path.is_dir() {
-                bail!("terminal/create cwd does not exist or is not a directory: {cwd}");
+        if let Some(cwd) = &resolved_cwd {
+            if !cwd.is_dir() {
+                bail!(
+                    "terminal/create cwd does not exist or is not a directory: {}",
+                    cwd.display()
+                );
             }
             command.current_dir(cwd);
         }
@@ -1009,6 +1064,31 @@ impl TerminalManager {
             .cloned()
             .with_context(|| format!("terminal not found: {terminal_id}"))
     }
+
+    async fn session_cwd(&self, session_id: Option<&str>) -> Option<PathBuf> {
+        if let Some(session_id) = session_id {
+            if let Some(cwd) = self.session_cwds.lock().await.get(session_id).cloned() {
+                return Some(cwd);
+            }
+        }
+        self.default_cwd.lock().await.clone()
+    }
+}
+
+fn resolve_relative_to_session(path: &Path, session_cwd: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(session_cwd) = session_cwd {
+        session_cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn resolve_terminal_cwd(request_cwd: Option<&Path>, session_cwd: Option<&Path>) -> Option<PathBuf> {
+    request_cwd
+        .map(|cwd| resolve_relative_to_session(cwd, session_cwd))
+        .or_else(|| session_cwd.map(Path::to_path_buf))
 }
 
 fn normalize_terminal_command(
@@ -1046,10 +1126,11 @@ fn command_uses_shell_operators(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         boss_cli_shim_dir, merged_child_path, normalize_terminal_command, preferred_child_path,
+        resolve_relative_to_session, resolve_terminal_cwd,
     };
 
     #[test]
@@ -1111,6 +1192,19 @@ mod tests {
         assert_eq!(paths[1], PathBuf::from("/usr/bin"));
         assert_eq!(paths[2], PathBuf::from("/custom/bin"));
         assert_eq!(paths[3], PathBuf::from("/bin"));
+    }
+
+    #[test]
+    fn resolve_relative_to_session_joins_relative_paths() {
+        let resolved =
+            resolve_relative_to_session(Path::new("src/main.rs"), Some(Path::new("/tmp/session")));
+        assert_eq!(resolved, PathBuf::from("/tmp/session/src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_terminal_cwd_defaults_to_session_cwd() {
+        let resolved = resolve_terminal_cwd(None, Some(Path::new("/tmp/session")));
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/session")));
     }
 }
 

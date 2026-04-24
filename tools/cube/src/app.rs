@@ -13,7 +13,7 @@ use crate::cli::{
     WorkspaceCommand,
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
-use crate::metadata::RepoRecord;
+use crate::metadata::{ChangeRecord, RepoRecord};
 use crate::paths;
 use crate::store::Store;
 
@@ -29,6 +29,12 @@ pub struct RunResult {
 struct RepoEnsureDefaults {
     repo_root: PathBuf,
     workspace_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ChangeIdentity {
+    jj_change_id: String,
+    head_commit: String,
 }
 
 impl RunResult {
@@ -54,6 +60,8 @@ pub enum CubeError {
     WorkspaceNotFound(String),
     #[error("lease `{0}` is not tracked")]
     LeaseNotFound(String),
+    #[error("change `{0}` is not tracked")]
+    ChangeNotFound(String),
     #[error("failed to access Cube metadata: {0}")]
     Storage(#[source] rusqlite::Error),
     #[error("failed to prepare Cube data directory: {0}")]
@@ -86,7 +94,9 @@ impl CubeError {
             Self::InvalidArgument(_) | Self::NotImplemented(_) => ExitCode::from(2),
             Self::RepoNotFound(_) => ExitCode::from(3),
             Self::NoAvailableWorkspace(_) => ExitCode::from(4),
-            Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) => ExitCode::from(5),
+            Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) | Self::ChangeNotFound(_) => {
+                ExitCode::from(5)
+            }
             Self::Storage(_) | Self::Io(_) | Self::CommandFailed { .. } | Self::Json(_) => {
                 ExitCode::FAILURE
             }
@@ -116,7 +126,7 @@ fn run_with_context(
     match cli.command {
         Command::Repo { command } => run_repo(command, database_path, runner, repo_ensure_defaults),
         Command::Workspace { command } => run_workspace(command, database_path, runner),
-        Command::Change { command } => run_change(command),
+        Command::Change { command } => run_change(command, database_path, runner),
         Command::Stack { command } => run_stack(command),
         Command::Pr { command } => run_pr(command),
         Command::Graph(args) => run_graph(args),
@@ -449,11 +459,101 @@ fn run_workspace(
     }
 }
 
-fn run_change(command: ChangeCommand) -> Result<RunResult> {
-    Err(CubeError::NotImplemented(format!(
-        "change command `{}` is not implemented yet",
-        change_command_name(&command)
-    )))
+fn run_change(
+    command: ChangeCommand,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+) -> Result<RunResult> {
+    let mut store = if let Some(path) = database_path {
+        Store::open_at(path)?
+    } else {
+        Store::open_default()?
+    };
+
+    match command {
+        ChangeCommand::Create(args) => {
+            if args.workspace.is_some() && args.parent.is_some() {
+                return Err(CubeError::InvalidArgument(
+                    "change create accepts either --workspace or --parent, not both".to_string(),
+                ));
+            }
+            if args.workspace.is_none() && args.parent.is_none() {
+                return Err(CubeError::InvalidArgument(
+                    "change create requires --workspace or --parent".to_string(),
+                ));
+            }
+
+            let (repo, workspace_path, parent_change_id) = if let Some(workspace) = args.workspace {
+                let workspace_path = PathBuf::from(&workspace);
+                let record = find_workspace_record(&mut store, &workspace_path)?
+                    .ok_or_else(|| CubeError::WorkspaceNotFound(workspace.clone()))?;
+                (record.repo, workspace_path, None)
+            } else if let Some(parent_change_id) = args.parent {
+                let parent = store
+                    .get_change(&parent_change_id)?
+                    .ok_or_else(|| CubeError::ChangeNotFound(parent_change_id.clone()))?;
+                (parent.repo, parent.workspace_path, Some(parent.change_id))
+            } else {
+                unreachable!("validated create arguments");
+            };
+
+            if let Some(parent_change_id) = parent_change_id.as_deref() {
+                let parent = store
+                    .get_change(parent_change_id)?
+                    .ok_or_else(|| CubeError::ChangeNotFound(parent_change_id.to_string()))?;
+                runner.run(&CommandInvocation {
+                    cwd: workspace_path.clone(),
+                    program: "jj".to_string(),
+                    args: vec![
+                        "new".to_string(),
+                        parent.jj_change_id,
+                        "-m".to_string(),
+                        args.title.clone(),
+                    ],
+                })?;
+            } else {
+                runner.run(&CommandInvocation {
+                    cwd: workspace_path.clone(),
+                    program: "jj".to_string(),
+                    args: vec!["describe".to_string(), "-m".to_string(), args.title.clone()],
+                })?;
+            }
+
+            let identity = current_change_identity(runner, &workspace_path)?;
+            let change_id = format!("chg_{}", Uuid::new_v4().simple());
+            let record = store.insert_change(&ChangeRecord {
+                change_id,
+                repo,
+                workspace_path,
+                parent_change_id,
+                title: args.title,
+                jj_change_id: identity.jj_change_id,
+                head_commit: identity.head_commit,
+                created_at_epoch_s: current_epoch_s()?,
+            })?;
+
+            RunResult::new(
+                format!("Created change `{}`.", record.change_id),
+                json!({
+                    "change": record,
+                }),
+            )
+        }
+        ChangeCommand::Checkout { change } => Err(CubeError::NotImplemented(format!(
+            "change command `checkout` is not implemented yet for `{change}`"
+        ))),
+        ChangeCommand::Info { change } => {
+            let record = store
+                .get_change(&change)?
+                .ok_or_else(|| CubeError::ChangeNotFound(change.clone()))?;
+            RunResult::new(
+                human_change_detail(&record),
+                json!({
+                    "change": record,
+                }),
+            )
+        }
+    }
 }
 
 fn run_stack(command: StackCommand) -> Result<RunResult> {
@@ -562,11 +662,50 @@ fn current_workspace_commit(runner: &dyn CommandRunner, workspace_path: &Path) -
         program: "jj".to_string(),
         args: vec![
             "log".to_string(),
+            "--no-graph".to_string(),
             "-r".to_string(),
             "@".to_string(),
             "-T".to_string(),
             "commit_id.short()".to_string(),
         ],
+    })
+}
+
+fn current_change_identity(
+    runner: &dyn CommandRunner,
+    workspace_path: &Path,
+) -> Result<ChangeIdentity> {
+    let output = runner.run(&CommandInvocation {
+        cwd: workspace_path.to_path_buf(),
+        program: "jj".to_string(),
+        args: vec![
+            "log".to_string(),
+            "--no-graph".to_string(),
+            "-r".to_string(),
+            "@".to_string(),
+            "-T".to_string(),
+            "change_id ++ \"\\n\" ++ commit_id.short()".to_string(),
+        ],
+    })?;
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let jj_change_id = lines
+        .next()
+        .ok_or_else(|| {
+            CubeError::InvalidArgument("jj change query did not return a change id".to_string())
+        })?
+        .to_string();
+    let head_commit = lines
+        .next()
+        .ok_or_else(|| {
+            CubeError::InvalidArgument("jj change query did not return a head commit".to_string())
+        })?
+        .to_string();
+    Ok(ChangeIdentity {
+        jj_change_id,
+        head_commit,
     })
 }
 
@@ -611,14 +750,6 @@ fn current_epoch_s() -> Result<i64> {
         .as_secs() as i64)
 }
 
-fn change_command_name(command: &ChangeCommand) -> &'static str {
-    match command {
-        ChangeCommand::Create { .. } => "create",
-        ChangeCommand::Checkout { .. } => "checkout",
-        ChangeCommand::Info { .. } => "info",
-    }
-}
-
 fn stack_command_name(command: &StackCommand) -> &'static str {
     match command {
         StackCommand::Rebase { .. } => "rebase",
@@ -653,6 +784,22 @@ fn human_repo_detail(record: &RepoRecord) -> String {
     if let Some(source) = &record.source {
         lines.push(format!("source: {}", source.display()));
     }
+    lines.join("\n")
+}
+
+fn human_change_detail(record: &ChangeRecord) -> String {
+    let mut lines = vec![
+        format!("change_id: {}", record.change_id),
+        format!("repo: {}", record.repo),
+        format!("workspace_path: {}", record.workspace_path.display()),
+        format!("title: {}", record.title),
+        format!("jj_change_id: {}", record.jj_change_id),
+        format!("head_commit: {}", record.head_commit),
+    ];
+    if let Some(parent_change_id) = &record.parent_change_id {
+        lines.push(format!("parent_change_id: {parent_change_id}"));
+    }
+    lines.push(format!("created_at_epoch_s: {}", record.created_at_epoch_s));
     lines.join("\n")
 }
 
@@ -925,7 +1072,7 @@ mod tests {
             ExpectedCommand::ok(
                 first_path.clone(),
                 "jj",
-                &["log", "-r", "@", "-T", "commit_id.short()"],
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
                 "abc1234",
             ),
         ]);
@@ -979,7 +1126,7 @@ mod tests {
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
-                &["log", "-r", "@", "-T", "commit_id.short()"],
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
                 "abc1234",
             ),
         ]);
@@ -1042,7 +1189,7 @@ mod tests {
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
-                &["log", "-r", "@", "-T", "commit_id.short()"],
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
                 "abc1234",
             ),
         ]);
@@ -1108,7 +1255,7 @@ mod tests {
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
-                &["log", "-r", "@", "-T", "commit_id.short()"],
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
                 "abc1234",
             ),
         ]);
@@ -1136,6 +1283,301 @@ mod tests {
             .expect_err("status should forget missing workspace");
 
         assert!(matches!(error, CubeError::WorkspaceNotFound(_)));
+    }
+
+    #[test]
+    fn change_create_records_named_workspace_head() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-004");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "implement cube",
+        ]);
+        run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        lease_runner.assert_exhausted();
+
+        let change_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["describe", "-m", "Implement parser"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "change_id ++ \"\\n\" ++ commit_id.short()",
+                ],
+                "zxy123\nabc1234",
+            ),
+        ]);
+        let create = Cli::parse_from([
+            "cube",
+            "change",
+            "create",
+            "--workspace",
+            &workspace_path.display().to_string(),
+            "--title",
+            "Implement parser",
+        ]);
+        let result =
+            run_with_dependencies(create, Some(&database_path), &change_runner).expect("change");
+
+        assert_eq!(result.payload["change"]["repo"], "mono");
+        assert_eq!(
+            result.payload["change"]["workspace_path"],
+            workspace_path.display().to_string()
+        );
+        assert_eq!(result.payload["change"]["title"], "Implement parser");
+        assert_eq!(result.payload["change"]["jj_change_id"], "zxy123");
+        assert_eq!(result.payload["change"]["head_commit"], "abc1234");
+        change_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn change_create_from_parent_uses_parent_jj_change_id() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-004");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "implement cube",
+        ]);
+        run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        lease_runner.assert_exhausted();
+
+        let root_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["describe", "-m", "Implement parser"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "change_id ++ \"\\n\" ++ commit_id.short()",
+                ],
+                "root123\nabc1234",
+            ),
+        ]);
+        let root = Cli::parse_from([
+            "cube",
+            "change",
+            "create",
+            "--workspace",
+            &workspace_path.display().to_string(),
+            "--title",
+            "Implement parser",
+        ]);
+        let root_result =
+            run_with_dependencies(root, Some(&database_path), &root_runner).expect("root change");
+        root_runner.assert_exhausted();
+        let parent_change_id = root_result.payload["change"]["change_id"]
+            .as_str()
+            .expect("parent change id")
+            .to_string();
+
+        let child_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["new", "root123", "-m", "Add tests"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "change_id ++ \"\\n\" ++ commit_id.short()",
+                ],
+                "child456\nbcd2345",
+            ),
+        ]);
+        let child = Cli::parse_from([
+            "cube",
+            "change",
+            "create",
+            "--parent",
+            &parent_change_id,
+            "--title",
+            "Add tests",
+        ]);
+        let child_result =
+            run_with_dependencies(child, Some(&database_path), &child_runner).expect("child");
+
+        assert_eq!(
+            child_result.payload["change"]["parent_change_id"],
+            parent_change_id
+        );
+        assert_eq!(child_result.payload["change"]["jj_change_id"], "child456");
+        child_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn change_info_round_trips_record() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-004");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "implement cube",
+        ]);
+        run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        lease_runner.assert_exhausted();
+
+        let change_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["describe", "-m", "Implement parser"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "change_id ++ \"\\n\" ++ commit_id.short()",
+                ],
+                "zxy123\nabc1234",
+            ),
+        ]);
+        let create = Cli::parse_from([
+            "cube",
+            "change",
+            "create",
+            "--workspace",
+            &workspace_path.display().to_string(),
+            "--title",
+            "Implement parser",
+        ]);
+        let create_result =
+            run_with_dependencies(create, Some(&database_path), &change_runner).expect("change");
+        change_runner.assert_exhausted();
+
+        let change_id = create_result.payload["change"]["change_id"]
+            .as_str()
+            .expect("change id")
+            .to_string();
+        let info = Cli::parse_from(["cube", "change", "info", "--change", &change_id]);
+        let info_result = run_with_dependencies(info, Some(&database_path), &FakeRunner::default())
+            .expect("info");
+
+        assert_eq!(info_result.payload["change"]["change_id"], change_id);
+        assert_eq!(info_result.payload["change"]["title"], "Implement parser");
     }
 
     #[derive(Default)]

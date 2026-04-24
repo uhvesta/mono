@@ -4,7 +4,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::app::CubeError;
-use crate::metadata::{RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState};
+use crate::metadata::{
+    ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState,
+};
 use crate::paths::database_path;
 
 pub struct Store {
@@ -435,6 +437,61 @@ impl Store {
         }))
     }
 
+    pub fn insert_change(&self, record: &ChangeRecord) -> Result<ChangeRecord, CubeError> {
+        self.connection
+            .execute(
+                r#"
+                INSERT INTO changes (
+                    change_id,
+                    repo,
+                    workspace_path,
+                    parent_change_id,
+                    title,
+                    jj_change_id,
+                    head_commit,
+                    created_at_epoch_s
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    record.change_id,
+                    record.repo,
+                    path_to_string(&record.workspace_path),
+                    record.parent_change_id,
+                    record.title,
+                    record.jj_change_id,
+                    record.head_commit,
+                    record.created_at_epoch_s,
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+
+        self.get_change(&record.change_id)?
+            .ok_or_else(|| CubeError::ChangeNotFound(record.change_id.clone()))
+    }
+
+    pub fn get_change(&self, change_id: &str) -> Result<Option<ChangeRecord>, CubeError> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT
+                    change_id,
+                    repo,
+                    workspace_path,
+                    parent_change_id,
+                    title,
+                    jj_change_id,
+                    head_commit,
+                    created_at_epoch_s
+                FROM changes
+                WHERE change_id = ?1
+                "#,
+                params![change_id],
+                row_to_change_record,
+            )
+            .optional()
+            .map_err(CubeError::Storage)
+    }
+
     fn migrate(&self) -> Result<(), CubeError> {
         self.connection
             .execute_batch(
@@ -469,6 +526,22 @@ impl Store {
 
                 CREATE INDEX IF NOT EXISTS workspaces_repo_state_idx
                     ON workspaces(repo, state);
+
+                CREATE TABLE IF NOT EXISTS changes (
+                    change_id TEXT PRIMARY KEY,
+                    repo TEXT NOT NULL,
+                    workspace_path TEXT NOT NULL,
+                    parent_change_id TEXT,
+                    title TEXT NOT NULL,
+                    jj_change_id TEXT NOT NULL,
+                    head_commit TEXT NOT NULL,
+                    created_at_epoch_s INTEGER NOT NULL,
+                    FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE,
+                    FOREIGN KEY(parent_change_id) REFERENCES changes(change_id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS changes_repo_created_idx
+                    ON changes(repo, created_at_epoch_s);
                 "#,
             )
             .map_err(CubeError::Storage)
@@ -513,11 +586,24 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
     })
 }
 
+fn row_to_change_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRecord> {
+    Ok(ChangeRecord {
+        change_id: row.get(0)?,
+        repo: row.get(1)?,
+        workspace_path: row.get::<_, String>(2)?.into(),
+        parent_change_id: row.get(3)?,
+        title: row.get(4)?,
+        jj_change_id: row.get(5)?,
+        head_commit: row.get(6)?,
+        created_at_epoch_s: row.get(7)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
-    use crate::metadata::{RepoRecord, WorkspaceCandidate};
+    use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceCandidate};
 
     use super::Store;
 
@@ -587,5 +673,36 @@ mod tests {
         let workspaces = store.list_workspaces("mono").expect("workspaces");
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].workspace_id, "mono-agent-002");
+    }
+
+    #[test]
+    fn insert_and_get_change_round_trip() {
+        let (tempdir, store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        let config = RepoRecord {
+            repo: "mono".to_string(),
+            origin: "git@github.com:spinyfin/mono.git".to_string(),
+            main_branch: "main".to_string(),
+            workspace_root,
+            workspace_prefix: "mono-agent-".to_string(),
+            source: None,
+        };
+        store.upsert_repo(&config).expect("repo");
+
+        let change = ChangeRecord {
+            change_id: "chg_test".to_string(),
+            repo: "mono".to_string(),
+            workspace_path: tempdir.path().join("workspaces/mono-agent-001"),
+            parent_change_id: None,
+            title: "Add parser".to_string(),
+            jj_change_id: "abc123xyz".to_string(),
+            head_commit: "d34db33".to_string(),
+            created_at_epoch_s: 123,
+        };
+
+        let inserted = store.insert_change(&change).expect("change");
+        assert_eq!(inserted, change);
+        let fetched = store.get_change("chg_test").expect("get");
+        assert_eq!(fetched, Some(change));
     }
 }
