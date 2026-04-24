@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "lib/rust/broker-robinhood",
+  "lib/rust/parley",
   "tools/boss/cli",
   "tools/hood",
   "tools/boss/engine",

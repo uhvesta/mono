@@ -1,0 +1,29 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files([
+    "Cargo.toml",
+    "README.md",
+])
+
+rust_library(
+    name = "parley",
+    crate_name = "parley",
+    srcs = ["src/lib.rs"],
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "parley_tests",
+    size = "small",
+    crate = ":parley",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
