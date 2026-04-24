@@ -1,0 +1,463 @@
+import AppKit
+import SwiftUI
+import GhosttyKit
+
+private extension NSScreen {
+    var ghosttyDisplayID: UInt32 {
+        guard let screenNumber = deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return 0
+        }
+        return screenNumber.uint32Value
+    }
+}
+
+struct GhosttyTerminalView: NSViewRepresentable {
+    let runtime: GhosttyRuntime
+    let session: TerminalPaneSession
+    let launchSpec: TerminalLaunchSpec
+
+    func makeNSView(context: Context) -> GhosttyTerminalHostView {
+        GhosttyTerminalHostView(runtime: runtime, session: session, launchSpec: launchSpec)
+    }
+
+    func updateNSView(_ view: GhosttyTerminalHostView, context: Context) {
+        view.syncGeometry()
+    }
+}
+
+final class GhosttyTerminalHostView: NSView {
+    let runtime: GhosttyRuntime
+    let session: TerminalPaneSession
+    let launchSpec: TerminalLaunchSpec
+    private(set) var surface: ghostty_surface_t?
+
+    private var trackingAreaRef: NSTrackingArea?
+    private var currentCursor: NSCursor = .iBeam
+    private var cursorVisible = true
+    private var backgroundColor = NSColor.black
+    private var claudeMonitorTimer: Timer?
+
+    init(runtime: GhosttyRuntime, session: TerminalPaneSession, launchSpec: TerminalLaunchSpec) {
+        self.runtime = runtime
+        self.session = session
+        self.launchSpec = launchSpec
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 820))
+
+        wantsLayer = true
+        layer?.backgroundColor = backgroundColor.cgColor
+
+        let surface = launchSpec.workingDirectory.withCString { workingDirectory in
+            launchSpec.initialInput.withCString { initialInput in
+                var config = ghostty_surface_config_new()
+                config.platform_tag = GHOSTTY_PLATFORM_MACOS
+                config.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
+                    nsview: Unmanaged.passUnretained(self).toOpaque()
+                ))
+                config.userdata = Unmanaged.passUnretained(self).toOpaque()
+                config.scale_factor = Double(NSScreen.main?.backingScaleFactor ?? 2.0)
+                config.font_size = launchSpec.fontSize
+                config.working_directory = workingDirectory
+                config.initial_input = initialInput
+                return ghostty_surface_new(runtime.app, &config)
+            }
+        }
+
+        guard let surface else {
+            fatalError("ghostty_surface_new failed")
+        }
+
+        self.surface = surface
+        session.attach(hostView: self)
+        syncGeometry()
+        startClaudeMonitor()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted, let surface {
+            ghostty_surface_set_focus(surface, true)
+        }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted, let surface {
+            ghostty_surface_set_focus(surface, false)
+        }
+        return accepted
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+
+        if window == nil {
+            claudeMonitorTimer?.invalidate()
+            claudeMonitorTimer = nil
+            session.updateClaudeMonitor(snapshot: nil)
+        } else if claudeMonitorTimer == nil {
+            startClaudeMonitor()
+        }
+
+        syncGeometry()
+    }
+
+    override func layout() {
+        super.layout()
+        syncGeometry()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        syncGeometry()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let trackingAreaRef {
+            removeTrackingArea(trackingAreaRef)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        trackingAreaRef = trackingArea
+    }
+
+    override func resetCursorRects() {
+        discardCursorRects()
+        addCursorRect(bounds, cursor: currentCursor)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        currentCursor.set()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        sendMousePosition(event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        sendMousePosition(event)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        sendMousePosition(event)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        sendMousePosition(event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        sendMouseButton(event, state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_LEFT)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        sendMouseButton(event, state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_LEFT)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        sendMouseButton(event, state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_RIGHT)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        sendMouseButton(event, state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_RIGHT)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        sendMouseButton(event, state: GHOSTTY_MOUSE_PRESS, button: otherButton(for: event))
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        sendMouseButton(event, state: GHOSTTY_MOUSE_RELEASE, button: otherButton(for: event))
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let surface else { return }
+        var mods = Int32(0)
+        if event.hasPreciseScrollingDeltas {
+            mods |= 1
+        }
+        ghostty_surface_mouse_scroll(surface, event.scrollingDeltaX, event.scrollingDeltaY, mods)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        sendKey(event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        sendKey(event, action: GHOSTTY_ACTION_RELEASE, includeText: false)
+    }
+
+    func syncGeometry() {
+        guard let surface else { return }
+
+        let size = convertToBacking(bounds.size)
+        ghostty_surface_set_size(
+            surface,
+            UInt32(max(size.width, 1).rounded(.up)),
+            UInt32(max(size.height, 1).rounded(.up))
+        )
+
+        if let window {
+            ghostty_surface_set_content_scale(surface, window.backingScaleFactor, window.backingScaleFactor)
+            if let screen = window.screen {
+                ghostty_surface_set_display_id(surface, screen.ghosttyDisplayID)
+            }
+        }
+    }
+
+    func applyInitialSize(_ size: ghostty_action_initial_size_s) {
+        session.statusMessage = "Initial size \(size.width)x\(size.height)"
+    }
+
+    func setCellSize(_ size: ghostty_action_cell_size_s) {
+        session.statusMessage = "Cell \(size.width)x\(size.height)"
+    }
+
+    func applyColorChange(_ change: ghostty_action_color_change_s) {
+        guard change.kind == GHOSTTY_ACTION_COLOR_KIND_BACKGROUND else { return }
+        backgroundColor = NSColor(
+            calibratedRed: CGFloat(change.r) / 255.0,
+            green: CGFloat(change.g) / 255.0,
+            blue: CGFloat(change.b) / 255.0,
+            alpha: 1.0
+        )
+        layer?.backgroundColor = backgroundColor.cgColor
+    }
+
+    func setCursorShape(_ shape: ghostty_action_mouse_shape_e) {
+        currentCursor = switch shape {
+        case GHOSTTY_MOUSE_SHAPE_POINTER:
+            .pointingHand
+        case GHOSTTY_MOUSE_SHAPE_TEXT:
+            .iBeam
+        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR:
+            .crosshair
+        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED:
+            .operationNotAllowed
+        case GHOSTTY_MOUSE_SHAPE_W_RESIZE, GHOSTTY_MOUSE_SHAPE_E_RESIZE, GHOSTTY_MOUSE_SHAPE_EW_RESIZE:
+            .resizeLeftRight
+        case GHOSTTY_MOUSE_SHAPE_N_RESIZE, GHOSTTY_MOUSE_SHAPE_S_RESIZE, GHOSTTY_MOUSE_SHAPE_NS_RESIZE:
+            .resizeUpDown
+        default:
+            .arrow
+        }
+
+        window?.invalidateCursorRects(for: self)
+    }
+
+    func setCursorVisible(_ visible: Bool) {
+        guard cursorVisible != visible else { return }
+        cursorVisible = visible
+        NSCursor.setHiddenUntilMouseMoves(!visible)
+    }
+
+    private func startClaudeMonitor() {
+        claudeMonitorTimer?.invalidate()
+        claudeMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateClaudeMonitorState()
+            }
+        }
+        claudeMonitorTimer?.tolerance = 0.1
+        updateClaudeMonitorState()
+    }
+
+    private func updateClaudeMonitorState() {
+        guard let surface else {
+            session.updateClaudeMonitor(snapshot: nil)
+            return
+        }
+
+        let visibleContents = readVisibleContents(from: surface)
+        session.updateClaudeMonitor(snapshot: makeClaudeSnapshot(from: visibleContents))
+    }
+
+    private func readVisibleContents(from surface: ghostty_surface_t) -> String {
+        var text = ghostty_text_s()
+        let selection = ghostty_selection_s(
+            top_left: ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                x: 0,
+                y: 0
+            ),
+            bottom_right: ghostty_point_s(
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                x: 0,
+                y: 0
+            ),
+            rectangle: false
+        )
+
+        guard ghostty_surface_read_text(surface, selection, &text) else {
+            return ""
+        }
+
+        defer { ghostty_surface_free_text(surface, &text) }
+        return String(cString: text.text)
+    }
+
+    private func makeClaudeSnapshot(from visibleContents: String) -> ClaudeMonitorSnapshot? {
+        let trimmedContents = visibleContents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedContents.isEmpty else { return nil }
+
+        let prompt = promptLine(in: visibleContents)
+        return ClaudeMonitorSnapshot(
+            tail: extractTail(from: visibleContents, keepLines: 24),
+            claudeVisible: visibleContents.contains("Claude Code") ||
+                visibleContents.contains("auto mode on") ||
+                visibleContents.contains("/effort"),
+            busy: visibleContents.localizedCaseInsensitiveContains("esc to interrupt"),
+            promptVisible: prompt != nil,
+            promptLine: prompt,
+            starting: visibleContents.contains("Accessing workspace:") ||
+                visibleContents.contains("Quick safety check:")
+        )
+    }
+
+    private func extractTail(from text: String, keepLines: Int) -> String {
+        let lines = text
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+
+        guard !lines.isEmpty else { return "" }
+        return lines.suffix(keepLines).joined(separator: "\n")
+    }
+
+    private func promptLine(in text: String) -> String? {
+        for line in text.split(whereSeparator: \.isNewline).reversed() {
+            let value = String(line)
+            if value.trimmingCharacters(in: .whitespaces).hasPrefix("❯") {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    private func sendMouseButton(
+        _ event: NSEvent,
+        state: ghostty_input_mouse_state_e,
+        button: ghostty_input_mouse_button_e
+    ) {
+        guard let surface else { return }
+        ghostty_surface_mouse_button(surface, state, button, ghosttyMods(event.modifierFlags))
+        sendMousePosition(event)
+    }
+
+    private func sendMousePosition(_ event: NSEvent) {
+        guard let surface else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        ghostty_surface_mouse_pos(
+            surface,
+            point.x,
+            bounds.height - point.y,
+            ghosttyMods(event.modifierFlags)
+        )
+    }
+
+    private func sendKey(
+        _ event: NSEvent,
+        action: ghostty_input_action_e,
+        includeText: Bool = true
+    ) {
+        guard let surface else { return }
+
+        let translationMods = ghostty_surface_key_translation_mods(
+            surface,
+            ghosttyMods(event.modifierFlags)
+        )
+
+        var keyEvent = ghostty_input_key_s()
+        keyEvent.action = action
+        keyEvent.mods = ghosttyMods(event.modifierFlags)
+        keyEvent.consumed_mods = ghostty_input_mods_e(
+            rawValue: translationMods.rawValue & ~ghosttyMods([.control, .command]).rawValue
+        )
+        keyEvent.keycode = UInt32(event.keyCode)
+        keyEvent.text = nil
+        keyEvent.composing = false
+
+        if let characters = event.characters(byApplyingModifiers: []),
+           let scalar = characters.unicodeScalars.first {
+            keyEvent.unshifted_codepoint = scalar.value
+        } else {
+            keyEvent.unshifted_codepoint = 0
+        }
+
+        guard includeText, let text = ghosttyCharacters(for: event), !text.isEmpty else {
+            _ = ghostty_surface_key(surface, keyEvent)
+            return
+        }
+
+        if let firstByte = text.utf8.first, firstByte >= 0x20 {
+            text.withCString { ptr in
+                keyEvent.text = ptr
+                _ = ghostty_surface_key(surface, keyEvent)
+            }
+        } else {
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+    }
+
+    private func ghosttyCharacters(for event: NSEvent) -> String? {
+        guard let characters = event.characters else { return nil }
+
+        if characters.count == 1, let scalar = characters.unicodeScalars.first {
+            if scalar.value < 0x20 {
+                return event.characters(byApplyingModifiers: event.modifierFlags.subtracting(.control))
+            }
+
+            if scalar.value >= 0xF700 && scalar.value <= 0xF8FF {
+                return nil
+            }
+        }
+
+        return characters
+    }
+
+    private func ghosttyMods(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
+        var rawValue = GHOSTTY_MODS_NONE.rawValue
+        if flags.contains(.shift) { rawValue |= GHOSTTY_MODS_SHIFT.rawValue }
+        if flags.contains(.control) { rawValue |= GHOSTTY_MODS_CTRL.rawValue }
+        if flags.contains(.option) { rawValue |= GHOSTTY_MODS_ALT.rawValue }
+        if flags.contains(.command) { rawValue |= GHOSTTY_MODS_SUPER.rawValue }
+        if flags.contains(.capsLock) { rawValue |= GHOSTTY_MODS_CAPS.rawValue }
+        if flags.contains(.numericPad) { rawValue |= GHOSTTY_MODS_NUM.rawValue }
+        return ghostty_input_mods_e(rawValue: rawValue)
+    }
+
+    private func otherButton(for event: NSEvent) -> ghostty_input_mouse_button_e {
+        switch event.buttonNumber {
+        case 2:
+            return GHOSTTY_MOUSE_MIDDLE
+        case 3:
+            return GHOSTTY_MOUSE_FOUR
+        case 4:
+            return GHOSTTY_MOUSE_FIVE
+        default:
+            return GHOSTTY_MOUSE_UNKNOWN
+        }
+    }
+}
