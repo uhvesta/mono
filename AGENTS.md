@@ -1,1 +1,2 @@
 - always use minimal bazel visibility, never default to public. Maintain bazel visibility health.
+- Documentation-only changes (markdown files, design docs, plans, READMEs) should be pushed directly to `main` instead of opening a PR.
