@@ -429,6 +429,249 @@ Pool size: at least `worker_count + headroom` per repo. With 8 workers,
    directory non-interactively to do a small task, release. Verify the
    leased workspace is a viable Claude Code working directory.
 
+### Findings
+
+Distilled results of running the proposed exploration above. Smoke-test
+artefacts live outside this doc.
+
+#### On unknown 1 — cube readiness
+
+Audit + smoke test against cube at `28200da`. `cargo build -p cube`
+and `bazel build //tools/cube` both succeed cleanly. The
+lease/release/status loop works end-to-end against a throwaway pool
+in `/tmp/`. The Claude-in-cube smoke test (`claude -p` inside a
+leased dir) wrote only to the leased path — no escape.
+
+Capability table (`tools/cube/src/`):
+
+| Command | State | Ref |
+|---|---|---|
+| `repo add` / `list` / `info` | IMPLEMENTED | `app.rs:117`, `141`, `159` |
+| `workspace lease` | IMPLEMENTED (single-pool, no auto-create, no setup engine, no flock) | `app.rs:185` |
+| `workspace release` | IMPLEMENTED (resets via `jj git fetch && jj new main`) | `app.rs:223` |
+| `workspace status` | IMPLEMENTED (delegates to `jj status`) | `app.rs:242` |
+| `workspace setup` | STUBBED — returns "No setup steps configured" | `app.rs:256` |
+| `change *`, `stack *`, `pr *`, `graph`, `doctor` | MISSING — all return `NotImplemented` | `app.rs:271-298` |
+
+SQLite store is real and tested (`store.rs`). No `flock` around
+`claim_workspace`; concurrency relies on SQLite atomicity
+(`store.rs:199`). The change/PR metadata tables described in the
+design doc are absent; only `repos` and `workspaces` exist.
+
+Bugs and gaps surfaced:
+
+- `head_commit` recording is broken — `jj log` template includes the
+  graph header (`app.rs:365`); needs `--no-graph -r @`.
+- No `--database` CLI flag; out-of-tree callers must set
+  `CUBE_DATA_DIR` (`paths.rs:6`). Boss V2 needs to know that.
+- `repo add --source` accepts a seed path (`cli.rs:60`) but lease
+  never reads it — no auto-create on pool exhaustion.
+- Release does not clean up abandoned `jj` changes a worker may have
+  created; working copy is clean for the next lease, but history
+  accretes.
+
+**Verdict**: cube is **usable today only for the workspace pooling
+layer** — exactly what R4's working decision asks of it. Stacked-change
+and PR features (`change *`, `stack *`, `pr *`) are entirely unbuilt;
+Boss V2 must continue to drive `jj` / `gh` / `git` directly inside
+leased workspaces. Gap-fixes to harden the pooling layer for V2, in
+priority order: (1) fix the `head_commit` template bug, (2) add a
+`--database`/explicit-data-dir CLI flag, (3) add `flock` around
+`claim_workspace`, (4) auto-create workspaces from `--source` on pool
+exhaustion, (5) implement `workspace setup` so per-repo bootstrap is
+cube's job, not Boss's.
+
+#### On unknown 2 — lease lifetime boundary cases
+
+**Recommendation**: keep per-task lease as the primary boundary,
+releasing on PR-merge-or-abandon for the current task. Boss passes a
+`preferred_workspace_id` hint to `cube workspace lease`; cube prefers
+the prior workspace when free, falls back to any free one after a
+short wait.
+
+**Rationale**: a task is the smallest stable identity Boss already
+tracks (work-taxonomy `tasks.id`), so anchoring leases there avoids
+inventing a new lifecycle object. Soft affinity preserves Bazel /
+`pnpm` cache warmth without holding a workspace idle across human
+review latency, which would starve the pool. Tradeoff: warm-cache hit
+rate vs pool utilization — affinity is advisory, never blocking.
+
+Boundary cases handled:
+
+- Stacked PRs in one task: single lease spans the whole stack;
+  release only when the *task* terminates.
+- Rework after merge / follow-up bugfix on the same `task_id`:
+  re-lease with `preferred_workspace_id`; cube's setup-fingerprint
+  logic skips redundant provisioning.
+- Task split mid-flight: each new task gets its own lease.
+- Punted: cross-agent handoff (e.g. reviewer-bot leasing the same
+  workspace) — defer until Boss models reviewer agents.
+- Punted: explicit pinning across host reboot — rely on cube
+  metadata persistence, no Boss-level guarantee.
+
+#### On unknown 3 — Boss / cube / worker integration shape
+
+**Working sketch.** Boss-engine drives cube via subprocess `--json`
+invocations from inside the existing `tokio` task that owns each
+agent's lifecycle:
+
+```text
+boss-engine                         cube                        claude
+     |  cube workspace lease           |                              |
+     |  --repo mono --task T-184       |                              |
+     |  --json --holder boss/agent-7  >|                              |
+     |                                 | (lock, reset, setup)         |
+     |  <-- {lease_id, workspace_path, |                              |
+     |       workspace_id, base_rev,   |                              |
+     |       expires_at, setup_status} |                              |
+     |                                                                |
+     |  spawn claude --cwd <path> --session-id … ------------------>  |
+     |  env: BOSS_TASK_ID, BOSS_LEASE_ID, CUBE_LEASE_ID, CUBE_REPO    |
+     |                                                                |
+     |  on Done / abandon / crash:                                    |
+     |  cube workspace release --lease <lease_id> --json              |
+     |  <-- {released: true, workspace_id, dirty: false}              |
+```
+
+Sample lease JSON:
+
+```json
+{ "lease_id": "lse_01HZX...", "workspace_id": "mono-agent-007",
+  "workspace_path": "/Users/brianduff/Documents/dev/workspaces/mono-agent-007",
+  "base_rev": "main@28200da", "expires_at": "2026-04-26T18:00:00Z",
+  "setup_status": "fresh", "holder": "boss/agent-7" }
+```
+
+Error handling:
+
+- **Lease fails (pool exhausted)**: engine emits a `WorkError`, marks
+  the task `queued_waiting_workspace`, retries on the next workspace
+  `released` notification (or polls every 30s).
+- **Worker crash mid-task**: the `tokio::spawn` watching the ACP
+  child sees process exit / disconnect; engine fires
+  `cube workspace release --lease <id> --reason crash --keep-dirty`.
+  Cube records dirty state but frees the slot.
+- **Boss-engine crash**: lease TTL (30 min, heartbeated by the engine
+  via `cube workspace heartbeat`) covers it. On engine restart,
+  `cube workspace list --json --holder boss/*` reconciles and
+  force-releases orphans.
+- **Cube release fails**: engine logs, retains `lease_id` in
+  `tasks.lease_id`, surfaces a `lease_release_failed` event so the
+  user can `cube doctor` and `cube workspace force-release` manually.
+
+`cube workspace heartbeat`, `--reason crash --keep-dirty`, and
+`cube workspace force-release` are not implemented today (per
+unknown 1) — these are gap-fixes the integration will require.
+
+#### On unknown 4 — jj-vs-git in workers
+
+**Decision**: workspace-local `CLAUDE.md` written by Boss-engine
+post-lease. Path: `<workspace_path>/.claude/CLAUDE.md`. Writer:
+Boss-engine, immediately after `cube workspace lease` returns and
+before `claude` is spawned. Cube stays VCS-policy-agnostic; the
+policy is Boss's.
+
+Sample contents:
+
+```markdown
+# Boss worker rules (lease lse_01HZX...)
+- This workspace is leased by Boss; do not run `jj git fetch` or
+  `jj new main` (cube already did).
+- Use `jj` for all VCS work: `jj st`, `jj diff`, `jj new`,
+  `jj describe`, `jj squash`, `jj rebase`.
+- Do NOT use `git commit / checkout / rebase / reset / stash`.
+  Use `jj` equivalents.
+- For PR sync and merge use `cube pr sync` / `cube pr merge` (when
+  implemented), not raw `gh pr create` / `git push`.
+- `git status`, `git log`, `git show` are read-only and OK.
+- Honour the repo's own `CLAUDE.md`; the rules above only add
+  jj-first VCS conventions.
+- Task id: T-184. Lease id: lse_01HZX. Workspace: mono-agent-007.
+```
+
+**Idempotency**: overwrite-on-lease. The file is ephemeral; cube
+release deletes `.claude/CLAUDE.md` (and `.claude/` if empty) as part
+of its cleanup hook. No merge logic.
+
+**Conflict with repo-tracked `CLAUDE.md`** (e.g.
+`tools/boss/CLAUDE.md`): both are loaded; the Boss template
+explicitly defers to repo rules so layering is additive, not
+overriding.
+
+**Why not the alternatives?** An alias shim
+(`alias git=jj-git-wrapper`) doesn't survive subshells the agent
+spawns through `bash -lc` and silently breaks scripts that need real
+git. A pre-tool hook intercept is global, fragile across Claude Code
+versions, and hides the rule from the model's reasoning rather than
+teaching it.
+
+#### On unknown 5 — cross-product workspaces
+
+**Recommendation**: Boss resolves `work_item.product_id` to a cube
+repo-pool id via a single `products.cube_pool_id` column (nullable).
+Lease requests dispatch to that pool. A null mapping fails the work
+item into a `needs_pool_config` blocked state with an actionable
+error, rather than auto-provisioning.
+
+**Rationale**: the work taxonomy already names `product_id` as the
+canonical routing key, so a thin lookup is the cheapest correct
+routing layer. Refusing to auto-create pools keeps cube's
+"operator-curated workspace_root" assumption intact and prevents
+Boss from silently creating workspaces under unexpected paths.
+Tradeoff: explicit setup friction for new products vs predictable
+filesystem layout and no surprise disk usage.
+
+Boundary cases handled:
+
+- Known product (mono, flunge): direct lookup, single hop to cube.
+- Unknown / unconfigured product: work item moves to `blocked` with
+  `reason = "no cube pool for product <slug>"`; surfaced in the Work
+  navigator.
+- Product with `repo_remote_url` but no pool: same blocked path;
+  Boss does not infer pool config from the URL.
+- Multi-repo product (future `related_repo_remote_urls_json`):
+  defer; V2 routes only against the primary pool, additional repos
+  require their own product entry.
+- Punted: cross-product tasks (e.g. a coordinated change across
+  mono + flunge) — out of scope for V2.
+
+#### On unknown 6 — setup state freshness
+
+**Recommendation**: re-validate cube setup fingerprints on every
+lease acquisition (not on a wall-clock schedule), using cube's
+existing per-step invalidation keys plus a Boss-injected
+`secrets_version` marker. Secrets steps additionally carry an
+absolute 12h max-age TTL that forces re-decode regardless of
+fingerprint match.
+
+**Rationale**: per-lease validation costs a hash of declared inputs
+(lockfile mtimes, script SHA, version markers) and aligns
+invalidation with the moment an agent actually needs a clean state,
+so there's no window where a stale workspace is handed out. A
+scheduled refresh would either run too often on idle pools or too
+rarely on busy ones. Tradeoff: lease latency gains a sub-second
+fingerprint check in exchange for eliminating "drifted while idle"
+failure modes; secrets get a tighter ceiling because their staleness
+is silent and security-relevant.
+
+Boundary cases handled:
+
+- Lockfile change (`pnpm-lock.yaml`, `Cargo.lock`): fingerprint
+  diff → rerun `deps` step only.
+- Setup script edited on `main`: script SHA differs → rerun affected
+  step.
+- Secrets rotated externally: Boss bumps `secrets_version`; next
+  lease re-decodes. Independent 12h TTL bounds worst-case staleness
+  for un-bumped rotations.
+- Generated-code step where inputs are hard to enumerate: declared
+  as `always` policy in cube config; accepted cost.
+- Long-idle workspace: first lease pays full re-validation; no
+  background refresh needed.
+- Punted: cross-workspace shared caches (e.g. a single `pnpm`
+  store) — orthogonal optimization, owned by cube.
+- Punted: fingerprint format migration when a setup step's input
+  list changes shape — handled by cube's metadata versioning.
+
 ### Resolution criteria
 
 - Cube audit committed in writing.
