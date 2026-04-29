@@ -454,11 +454,12 @@ Capability table (`tools/cube/src/`):
 | `change create` / `info` | IMPLEMENTED (records local change-graph rows; `change checkout` still `NotImplemented` at `app.rs:542`) | `app.rs:474`, `545` |
 | `stack *`, `pr *`, `graph`, `doctor` | MISSING — all return `NotImplemented` | `app.rs:559`, `566`, `573`, `579` |
 
-SQLite store is real and tested (`store.rs`). No `flock` around
-`claim_workspace`; concurrency relies on SQLite atomicity
-(`store.rs:240`). A `changes` metadata table now exists alongside
-`repos` and `workspaces` (`store.rs:501-545`); the `prs` table
-described in the design doc is still absent.
+SQLite store is real and tested (`store.rs`). A repo-pool `flock`
+now wraps `claim_workspace` and `release` via the `lock` module
+(`lock.rs`); lock files live at `<data_dir>/locks/<repo>.lock`. A
+`changes` metadata table exists alongside `repos` and `workspaces`
+(`store.rs:501-545`); the `prs` table described in the design doc is
+still absent.
 
 Bugs and gaps surfaced:
 
@@ -483,12 +484,11 @@ working decision asks of it. The remaining stacked-change and PR
 features (`change checkout`, `stack *`, `pr *`) are unbuilt; Boss V2
 must continue to drive `jj` / `gh` / `git` directly inside leased
 workspaces. Gap-fixes to harden the pooling layer for V2, in priority
-order: (1) add `flock` around `claim_workspace`, (2) implement
-`workspace setup` so per-repo bootstrap is cube's job, not Boss's,
-(3) auto-create workspaces from `--source` on pool exhaustion,
-(4) add the heartbeat / `--reason crash --keep-dirty` /
-`force-release` lease-lifecycle commands the integration sketch
-needs.
+order: (1) implement `workspace setup` so per-repo bootstrap is
+cube's job, not Boss's, (2) auto-create workspaces from `--source`
+on pool exhaustion, (3) add the heartbeat / `--reason crash
+--keep-dirty` / `force-release` lease-lifecycle commands the
+integration sketch needs.
 
 #### On unknown 2 — lease lifetime boundary cases
 
@@ -713,21 +713,24 @@ decisive unknowns are resolved in the findings above. Concretely:
 **Cube prerequisites for V2 hard dependency** (must land before V2
 takes the dependency, in priority order):
 
-1. Add `flock` around `claim_workspace` (`store.rs:240`) so
-   cross-process contention is hardened.
-2. Implement `workspace setup` (currently stubbed at `app.rs:447`).
-3. Auto-create workspaces from `--source` on pool exhaustion
+1. Implement `workspace setup` (currently stubbed at `app.rs:447`).
+2. Auto-create workspaces from `--source` on pool exhaustion
    (`cli.rs:65` flag is parsed but never read).
-4. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
+3. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
    release, and `cube workspace force-release` — all required by the
    integration sketch's error handling.
 
-The original prereq list also called out (a) a `head_commit` template
-parsing bug — fixed at `app.rs:659` — and (b) a `--database` CLI
-flag. (b) was dropped on review: cube's SQLite store is a
-machine-global registry (`paths.rs`), and Boss V2 invocations should
-use the global db like every other caller. `CUBE_DATA_DIR` covers
-the test/debug-isolation use case; no per-product partitioning is
+Already landed since the original audit:
+
+- Fix the `head_commit` template parsing bug (`app.rs:659`).
+- Repo-pool `flock` around `claim_workspace` and `release`
+  (`lock.rs`, `paths::repo_lock_path`).
+
+The original prereq list also called out a `--database` CLI flag.
+That was dropped on review: cube's SQLite store is a machine-global
+registry (`paths.rs`), and Boss V2 invocations should use the global
+db like every other caller. `CUBE_DATA_DIR` covers the
+test/debug-isolation use case; no per-product partitioning is
 wanted.
 
 Stacked-change and PR features (`change checkout`, `stack *`, `pr *`,

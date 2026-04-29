@@ -13,6 +13,7 @@ use crate::cli::{
     WorkspaceCommand,
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
+use crate::lock::RepoLock;
 use crate::metadata::{ChangeRecord, RepoRecord};
 use crate::paths;
 use crate::store::Store;
@@ -368,6 +369,7 @@ fn run_workspace(
             let repo_record = store
                 .get_repo(&repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
+            let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
             let candidates = discover_workspaces(&repo_record)?;
             store.sync_workspaces(&repo, &candidates)?;
 
@@ -411,6 +413,7 @@ fn run_workspace(
             let workspace = store
                 .get_workspace_by_lease(&lease)?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+            let _lock = RepoLock::acquire(&repo_lock_path(&workspace.repo, database_path)?)?;
             if !workspace_path_exists(&workspace) {
                 store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
                 return Err(CubeError::LeaseNotFound(lease));
@@ -741,6 +744,13 @@ fn holder_identity() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
     format!("{user}@{host}:{}", std::process::id())
+}
+
+fn repo_lock_path(repo: &str, database_path: Option<&Path>) -> Result<PathBuf> {
+    match database_path.and_then(Path::parent) {
+        Some(parent) => Ok(paths::repo_lock_path_in(parent, repo)),
+        None => paths::repo_lock_path(repo),
+    }
 }
 
 fn current_epoch_s() -> Result<i64> {

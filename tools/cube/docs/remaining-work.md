@@ -34,12 +34,7 @@ The full audit lives in
 Items that must land before Boss V2 takes a hard dependency on cube.
 Priority order; (1) blocks the others least and is the smallest fix.
 
-- [ ] **(1) Add `flock` around `claim_workspace`.** Concurrency
-      currently relies solely on SQLite atomicity (`store.rs:240`).
-      A repo-pool-level `flock` is documented in the design but not
-      implemented.
-
-- [ ] **(2) Implement `workspace setup`.** Today returns
+- [ ] **(1) Implement `workspace setup`.** Today returns
       "No setup steps are configured for {workspace_id}."
       unconditionally (`app.rs:447`). The setup engine, fingerprinting,
       and `on-create` / `on-fingerprint-change` / `always` policies are
@@ -47,12 +42,12 @@ Priority order; (1) blocks the others least and is the smallest fix.
       [main.md §Setup and Provisioning](./main.md#setup-and-provisioning)
       but unimplemented.
 
-- [ ] **(3) Auto-create workspaces from `--source` on pool
+- [ ] **(2) Auto-create workspaces from `--source` on pool
       exhaustion.** `repo add --source` accepts a seed path
       (`cli.rs:65`) but `lease` never reads it. Currently a full pool
       blocks new leases with exit code 4.
 
-- [ ] **(4) Add lease-lifecycle commands required by Boss V2's
+- [ ] **(3) Add lease-lifecycle commands required by Boss V2's
       integration sketch:**
       - `cube workspace heartbeat --lease <id>` — Boss-engine pings
         to refresh lease TTL
@@ -62,7 +57,7 @@ Priority order; (1) blocks the others least and is the smallest fix.
       - `cube workspace force-release --lease <id>` — operator-grade
         release that bypasses ownership checks for orphan reclamation
 
-When all four land, R4's "cube prerequisites" close.
+When all three land, R4's "cube prerequisites" close.
 
 ### Design principle: single global database
 
@@ -88,6 +83,10 @@ directly.
   `app.rs` (e.g. line 1075).
 - ✓ Drop the `--database` CLI flag from the prereq list — superseded
   by the single-global-database principle above.
+- ✓ Add repo-pool `flock` around `claim_workspace` and `release`
+  (`lock.rs`, `paths::repo_lock_path`). Lock files live at
+  `<data_dir>/locks/<repo>.lock` and serialize the lease/release
+  critical sections per repo.
 
 ## Beyond V2 scope
 

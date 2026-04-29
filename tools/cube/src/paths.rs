@@ -23,3 +23,11 @@ pub fn data_dir() -> Result<PathBuf, CubeError> {
 pub fn database_path() -> Result<PathBuf, CubeError> {
     Ok(data_dir()?.join("state.db"))
 }
+
+pub fn repo_lock_path(repo: &str) -> Result<PathBuf, CubeError> {
+    Ok(repo_lock_path_in(&data_dir()?, repo))
+}
+
+pub fn repo_lock_path_in(data_dir: &std::path::Path, repo: &str) -> PathBuf {
+    data_dir.join("locks").join(format!("{repo}.lock"))
+}
