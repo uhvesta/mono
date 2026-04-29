@@ -4,7 +4,7 @@ use crate::app::CubeError;
 
 pub fn data_dir() -> Result<PathBuf, CubeError> {
     if let Some(path) = std::env::var_os("CUBE_DATA_DIR") {
-        return Ok(PathBuf::from(path).join("cube"));
+        return Ok(PathBuf::from(path));
     }
 
     if let Some(path) = std::env::var_os("XDG_DATA_HOME") {

@@ -34,19 +34,12 @@ The full audit lives in
 Items that must land before Boss V2 takes a hard dependency on cube.
 Priority order; (1) blocks the others least and is the smallest fix.
 
-- [ ] **(1) Add a `--database` / explicit-data-dir CLI flag.** Today,
-      out-of-tree callers must set `CUBE_DATA_DIR` (`paths.rs:6`).
-      The internal plumbing accepts an optional database path
-      (`app.rs:114`), but no CLI flag exposes it (only `--json` is
-      defined on `Cli` in `cli.rs`). Boss V2 needs a flag for clean
-      per-product / per-test paths.
-
-- [ ] **(2) Add `flock` around `claim_workspace`.** Concurrency
+- [ ] **(1) Add `flock` around `claim_workspace`.** Concurrency
       currently relies solely on SQLite atomicity (`store.rs:240`).
       A repo-pool-level `flock` is documented in the design but not
       implemented.
 
-- [ ] **(3) Implement `workspace setup`.** Today returns
+- [ ] **(2) Implement `workspace setup`.** Today returns
       "No setup steps are configured for {workspace_id}."
       unconditionally (`app.rs:447`). The setup engine, fingerprinting,
       and `on-create` / `on-fingerprint-change` / `always` policies are
@@ -54,12 +47,12 @@ Priority order; (1) blocks the others least and is the smallest fix.
       [main.md §Setup and Provisioning](./main.md#setup-and-provisioning)
       but unimplemented.
 
-- [ ] **(4) Auto-create workspaces from `--source` on pool
+- [ ] **(3) Auto-create workspaces from `--source` on pool
       exhaustion.** `repo add --source` accepts a seed path
       (`cli.rs:65`) but `lease` never reads it. Currently a full pool
       blocks new leases with exit code 4.
 
-- [ ] **(5) Add lease-lifecycle commands required by Boss V2's
+- [ ] **(4) Add lease-lifecycle commands required by Boss V2's
       integration sketch:**
       - `cube workspace heartbeat --lease <id>` — Boss-engine pings
         to refresh lease TTL
@@ -69,13 +62,32 @@ Priority order; (1) blocks the others least and is the smallest fix.
       - `cube workspace force-release --lease <id>` — operator-grade
         release that bypasses ownership checks for orphan reclamation
 
-When all five land, R4's "cube prerequisites" close.
+When all four land, R4's "cube prerequisites" close.
+
+### Design principle: single global database
+
+Cube's SQLite store is a **machine-global registry** of repos and
+workspaces. Every invocation — from Boss, from an agent, from a
+human — must hit the same `state.db`, so a stray `cube workspace
+list` shows every lease the machine knows about. Resolution
+(`paths.rs`):
+
+1. `CUBE_DATA_DIR` env var (override; pure path — no auto-suffix)
+2. `XDG_DATA_HOME/cube`
+3. `~/.local/share/cube`
+
+There is intentionally **no `--database` CLI flag**. Per-test or
+per-debug isolation is handled via `CUBE_DATA_DIR` at the test
+harness level. Programmatic embedding can use `Store::open_at(path)`
+directly.
 
 ### Already landed
 
 - ✓ Fix the `head_commit` template parsing bug — `current_workspace_commit`
   now uses `--no-graph -r @` (`app.rs:659`); covered by tests in
   `app.rs` (e.g. line 1075).
+- ✓ Drop the `--database` CLI flag from the prereq list — superseded
+  by the single-global-database principle above.
 
 ## Beyond V2 scope
 
