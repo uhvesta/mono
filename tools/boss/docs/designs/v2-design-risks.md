@@ -446,40 +446,47 @@ Capability table (`tools/cube/src/`):
 
 | Command | State | Ref |
 |---|---|---|
-| `repo add` / `list` / `info` | IMPLEMENTED | `app.rs:117`, `141`, `159` |
-| `workspace lease` | IMPLEMENTED (single-pool, no auto-create, no setup engine, no flock) | `app.rs:185` |
-| `workspace release` | IMPLEMENTED (resets via `jj git fetch && jj new main`) | `app.rs:223` |
-| `workspace status` | IMPLEMENTED (delegates to `jj status`) | `app.rs:242` |
-| `workspace setup` | STUBBED — returns "No setup steps configured" | `app.rs:256` |
-| `change *`, `stack *`, `pr *`, `graph`, `doctor` | MISSING — all return `NotImplemented` | `app.rs:271-298` |
+| `repo add` / `list` / `info` | IMPLEMENTED | `app.rs:167`, `191`, `209` |
+| `workspace lease` | IMPLEMENTED (single-pool, no auto-create, no setup engine, no flock) | `app.rs:367` |
+| `workspace release` | IMPLEMENTED (resets via `jj git fetch && jj new main`) | `app.rs:410` |
+| `workspace status` | IMPLEMENTED (delegates to `jj status`) | `app.rs:433` |
+| `workspace setup` | STUBBED — returns "No setup steps are configured for {workspace_id}" | `app.rs:447` |
+| `change create` / `info` | IMPLEMENTED (records local change-graph rows; `change checkout` still `NotImplemented` at `app.rs:542`) | `app.rs:474`, `545` |
+| `stack *`, `pr *`, `graph`, `doctor` | MISSING — all return `NotImplemented` | `app.rs:559`, `566`, `573`, `579` |
 
 SQLite store is real and tested (`store.rs`). No `flock` around
 `claim_workspace`; concurrency relies on SQLite atomicity
-(`store.rs:199`). The change/PR metadata tables described in the
-design doc are absent; only `repos` and `workspaces` exist.
+(`store.rs:240`). A `changes` metadata table now exists alongside
+`repos` and `workspaces` (`store.rs:501-545`); the `prs` table
+described in the design doc is still absent.
 
 Bugs and gaps surfaced:
 
-- `head_commit` recording is broken — `jj log` template includes the
-  graph header (`app.rs:365`); needs `--no-graph -r @`.
+- ~~`head_commit` recording is broken~~ — fixed:
+  `current_workspace_commit` uses `--no-graph -r @` (`app.rs:659`)
+  and is covered by tests.
 - No `--database` CLI flag; out-of-tree callers must set
-  `CUBE_DATA_DIR` (`paths.rs:6`). Boss V2 needs to know that.
-- `repo add --source` accepts a seed path (`cli.rs:60`) but lease
+  `CUBE_DATA_DIR` (`paths.rs:6`). The internal `database_path`
+  plumbing exists (`app.rs:114`) but is not exposed on `Cli`
+  (`cli.rs`). Boss V2 needs to know that.
+- `repo add --source` accepts a seed path (`cli.rs:65`) but lease
   never reads it — no auto-create on pool exhaustion.
 - Release does not clean up abandoned `jj` changes a worker may have
   created; working copy is clean for the next lease, but history
   accretes.
 
 **Verdict**: cube is **usable today only for the workspace pooling
-layer** — exactly what R4's working decision asks of it. Stacked-change
-and PR features (`change *`, `stack *`, `pr *`) are entirely unbuilt;
-Boss V2 must continue to drive `jj` / `gh` / `git` directly inside
-leased workspaces. Gap-fixes to harden the pooling layer for V2, in
-priority order: (1) fix the `head_commit` template bug, (2) add a
-`--database`/explicit-data-dir CLI flag, (3) add `flock` around
-`claim_workspace`, (4) auto-create workspaces from `--source` on pool
-exhaustion, (5) implement `workspace setup` so per-repo bootstrap is
-cube's job, not Boss's.
+layer** (plus `change create` / `info` metadata) — exactly what R4's
+working decision asks of it. The remaining stacked-change and PR
+features (`change checkout`, `stack *`, `pr *`) are unbuilt; Boss V2
+must continue to drive `jj` / `gh` / `git` directly inside leased
+workspaces. Gap-fixes to harden the pooling layer for V2, in priority
+order: (1) add a `--database` / explicit-data-dir CLI flag, (2) add
+`flock` around `claim_workspace`, (3) implement `workspace setup` so
+per-repo bootstrap is cube's job, not Boss's, (4) auto-create
+workspaces from `--source` on pool exhaustion, (5) add the
+heartbeat / `--reason crash --keep-dirty` / `force-release`
+lease-lifecycle commands the integration sketch needs.
 
 #### On unknown 2 — lease lifetime boundary cases
 
@@ -704,21 +711,26 @@ decisive unknowns are resolved in the findings above. Concretely:
 **Cube prerequisites for V2 hard dependency** (must land before V2
 takes the dependency, in priority order):
 
-1. Fix the `head_commit` template parsing bug (`app.rs:365`).
-2. Add a `--database` / explicit-data-dir CLI flag (today: only
+1. Add a `--database` / explicit-data-dir CLI flag (today: only
    `CUBE_DATA_DIR`).
-3. Add `flock` around `claim_workspace` (`store.rs:199`) so
+2. Add `flock` around `claim_workspace` (`store.rs:240`) so
    cross-process contention is hardened.
-4. Implement `workspace setup` (currently stubbed at `app.rs:256`).
-5. Auto-create workspaces from `--source` on pool exhaustion
-   (`cli.rs:60` flag is parsed but never read).
-6. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
+3. Implement `workspace setup` (currently stubbed at `app.rs:447`).
+4. Auto-create workspaces from `--source` on pool exhaustion
+   (`cli.rs:65` flag is parsed but never read).
+5. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
    release, and `cube workspace force-release` — all required by the
    integration sketch's error handling.
 
-Stacked-change and PR features (`change *`, `stack *`, `pr *`,
+The original prereq list also called out a `head_commit` template
+parsing bug; that has been fixed (`app.rs:659`) and is no longer a
+prerequisite.
+
+Stacked-change and PR features (`change checkout`, `stack *`, `pr *`,
 `graph`, `doctor`) are out of scope for V2's cube dependency. Boss V2
 drives `jj` / `gh` / `git` directly inside leased workspaces.
+(`change create` and `change info` are already implemented but
+unused by V2.)
 
 These prerequisites should be filed as work items against cube and
 tracked separately; this risk does not need to be re-opened when they
