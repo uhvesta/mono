@@ -724,6 +724,228 @@ These prerequisites should be filed as work items against cube and
 tracked separately; this risk does not need to be re-opened when they
 land.
 
+## R3: Worker isolation
+
+### Why it matters
+
+Workers are real `claude` Code instances with full bash + edit-file
+authority running in cube-leased workspaces. Without isolation, a
+confused or misled worker can invoke Boss-only authority
+(`bossctl`), interfere with sibling workers, or otherwise escalate
+beyond its assigned task. The threat model is not malicious code;
+it's an LLM-driven worker following bad instructions.
+
+### Threat model
+
+In scope:
+
+1. **Confused worker** reaches into Boss / sibling sessions to "fix"
+   something.
+2. **Misled worker** — task content tricks it into invoking
+   privileged commands.
+3. **Prompt-injected content** nudges escalation while the worker
+   reads files / reviews PRs.
+4. **Cross-pane interference** — worker `kill`s another worker's
+   pid or writes outside its workspace.
+
+Out of scope: determined malicious code on the host, macOS sandbox
+escapes, multi-user / remote scenarios. Personal-use tool on one
+machine.
+
+### What R4 already mitigates
+
+Cube gives each worker its own working tree, so threat (4) is partly
+handled for filesystem operations. Process-level interference and
+control-socket access remain.
+
+### Options
+
+| Option | Mechanism | Strength | Cost |
+|---|---|---|---|
+| A | PATH separation only — `bossctl` only on Boss's PATH | Casual misuse only | Trivial |
+| B | Auth token via env to Boss only | Strong if env doesn't leak | Medium |
+| C | LOCAL_PEERPID on AF_UNIX socket; trust root = Boss session pid | Strong; no token mgmt; matches process model | Medium |
+| D | macOS `sandbox-exec` / App Sandbox per worker | Real isolation | Heavy; libghostty+claude under sandbox unproven |
+| E | Per-worker macOS user account | Strong | Heavy; ACL nightmare for cube-shared dirs |
+
+### Hard constraints
+
+- **Single-user macOS.** Per-user accounts (E) and full sandboxing
+  (D) are out of proportion to the threat model.
+- **Boss and workers are separate process trees.** The macOS app
+  spawns each pane independently, so PID-lineage discrimination is
+  structurally available.
+- **`bossctl` must be invokable from Claude's bash tool.** The
+  socket must accept connections from descendants of Boss's
+  `claude` process, not just the `claude` process itself.
+
+### Working decision
+
+**Layered: C + A + per-worker `.claude/CLAUDE.md` advisory.**
+
+- **`LOCAL_PEERPID` subtree match** is the load-bearing primitive.
+  Boss-engine binds the control socket and treats Boss session pid
+  as the trust root. On each `bossctl` connection, engine reads
+  peer pid via `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` and walks the
+  ppid chain; allow if the trust root appears anywhere in the
+  chain, deny otherwise.
+- **PATH separation** is free defense-in-depth: workers' env
+  doesn't include `bossctl` on PATH, so casual discovery requires
+  effort.
+- **Socket file at `0600`** under
+  `~/Library/Application Support/Boss/`.
+- **Per-worker `.claude/CLAUDE.md`** (already written by Boss-engine
+  per R4) carries an advisory line: "do not interact with sibling
+  sessions; do not invoke any `boss*` commands."
+
+Skipped:
+
+- **Auth tokens (B)**: useful for remote scenarios but add a leak
+  vector and rotation logic for no real benefit when peer-PID auth
+  is available locally.
+- **Sandbox (D)**: cost is far above what the threat model
+  justifies. Revisit if multi-tenant or hostile-content scenarios
+  appear.
+
+### Decisive unknowns
+
+1. **`LOCAL_PEERPID` viability on macOS.** Does
+   `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` actually return the right
+   pid for AF_UNIX socket peers, and does ppid walking distinguish
+   sibling process trees correctly?
+2. **PID-lineage policy.** Exact match vs subtree match. Subtree is
+   easier and still safe in our process model (workers spawned by
+   the app as separate roots), but needs validation.
+3. **Process-kill threat.** A worker can `kill -9 <boss-pid>` if it
+   discovers it. Worth mitigating for V2?
+4. **Worker launch env hygiene.** What env vars does the app pass
+   to a worker pane? Anything that would let a worker reconstruct
+   a Boss control connection?
+
+### Proposed exploration
+
+1. **`LOCAL_PEERPID` POC.** Tiny Rust binary: AF_UNIX server gets
+   peer pid, walks ppid chain, compares to trust root. Drive with
+   two leader processes (boss / worker), each spawning a deep
+   nested-shell client. Verify ALLOW for boss-leader chain, DENY
+   for worker-leader chain.
+2. **Pick a lineage policy.** Subtree if the POC shows the chain
+   stays intact at connection time and bash exec-optimization
+   doesn't break correctness.
+3. **Decide on process-kill mitigation.** Default position: accept
+   the risk for V2.
+4. **Spec worker-pane env.** List the exact env keys the app
+   passes; verify nothing carries Boss-control authority.
+
+### Findings
+
+#### On unknown 1 — `LOCAL_PEERPID` viability
+
+Rust POC built and run at `/tmp/peerpid-poc/` (throwaway; not
+checked in). Server uses `getsockopt(SOL_LOCAL, LOCAL_PEERPID)`;
+walks ppid via `ps -o ppid=`. Driver spawns a "boss leader" and a
+"worker leader" as siblings, each with a `SIGUSR1` trap that runs a
+deep nested-shell chain (`bash → bash → sh → client`).
+
+Test 1 (boss sends client; trust root = boss leader pid):
+
+```text
+peer pid: 59502
+ppid chain: [59502, 59500, 59475, 59469, ...]
+trust root: 59475
+decision: ALLOW
+```
+
+Test 2 (worker sends client; trust root still = boss leader pid):
+
+```text
+peer pid: 59652
+ppid chain: [59652, 59651, 59490, 59469, ...]
+trust root: 59475
+decision: DENY
+```
+
+Both tests pass. Observations:
+
+- `LOCAL_PEERPID` returns the actual peer pid; no surprises.
+- The ppid chain stays alive at connection time because each
+  intermediate process blocks on its child.
+- Bash `-c` chains often exec-optimize (compress hops), but the
+  trust root still appears because the chain ultimately lands at
+  it or its ancestor. Subtree match is safe.
+- `ps`-based ppid walking costs ~5–10 forks per check. Acceptable
+  for V2; for production replace with `proc_pidinfo` libproc
+  syscall.
+
+#### On unknown 2 — PID-lineage policy
+
+**Decision: subtree match.** Walk peer-pid's ppid chain; if Boss
+session pid appears anywhere, allow. POC validated this against
+both positive and negative cases. Exact match would fail when
+`bossctl` is invoked from Claude's bash tool (which spawns a
+subshell), so subtree is required, not just convenient.
+
+#### On unknown 3 — process-kill threat
+
+**Accepted.** A worker that discovers Boss's pid can SIGKILL it.
+Mitigation requires either a privileged supervisor or running Boss
+as a different user — both out of proportion to the threat. The
+worst-case outcome is the user restarts Boss; cube leases survive
+via TTL, the work is recoverable. Not worth defending against in
+V2.
+
+#### On unknown 4 — worker launch env hygiene
+
+**Working spec.** When the app spawns a worker pane, env contains
+only:
+
+- `PATH` (sanitized; no Boss-tool directory)
+- `HOME`, `USER`, `SHELL`, `TERM`, `LANG`, locale vars (standard)
+- `BOSS_TASK_ID`, `BOSS_LEASE_ID`, `CUBE_LEASE_ID`, `CUBE_REPO`
+  (per the R4 integration sketch — informational, not authority)
+
+Explicitly excluded from worker env:
+
+- `BOSS_CONTROL_SOCKET` (only on Boss session env)
+- any token / credential the app holds for itself
+- the user's full shell env if they launched the app from a
+  terminal (potentially carries unrelated secrets)
+
+Workers inherit `cwd` from the cube-leased path; otherwise env is
+constructed fresh, not inherited from the app's process. This
+should be enforced at the spawn site (the app's pane-creation
+code), not relied on as a side effect.
+
+### Resolution criteria
+
+- LOCAL_PEERPID POC has been run and the result recorded.
+- Lineage policy is committed in writing.
+- Process-kill position is committed in writing.
+- Worker-pane env spec is committed in writing.
+
+### Decision
+
+**Adopt the layered model: PATH separation + `LOCAL_PEERPID`
+subtree-match auth on the control socket + advisory
+`.claude/CLAUDE.md` per worker.** All four decisive unknowns are
+resolved in the findings above.
+
+Implementation work this implies for V2:
+
+- Boss-engine: bind control socket at
+  `~/Library/Application Support/Boss/control.sock` mode `0600`,
+  record Boss session pid as trust root, implement
+  `getsockopt`/ppid-walk auth on each accept (use `proc_pidinfo`,
+  not `ps`-shell-out, in the real implementation).
+- App: when spawning a Ghostty pane, build env from a fixed
+  allowlist; never pass `BOSS_CONTROL_SOCKET` or app-internal
+  credentials to a worker pane.
+- Boss-engine: writes the per-worker `.claude/CLAUDE.md` (already
+  required by R4) and includes the "do not interact with sibling
+  sessions" advisory line.
+
+These should be tracked as Boss V2 implementation tasks.
+
 ## Risk backlog
 
 These risks have been identified but not yet worked through. They are
@@ -734,10 +956,6 @@ we get to it. Order is rough priority, not strict sequence.
   to pick the concrete mechanism (hooks, JSONL, SDK events, screen
   scrape, or a layered combination) and define what events Boss
   subscribes to. Closely linked to R1.
-- **R3: Worker isolation model.** How do we stop a worker from invoking
-  Boss-only authority (e.g. `bossctl`) or otherwise escalating? PATH
-  separation, auth tokens on the control socket, sandboxing, or
-  combinations.
 - **R5: Scheduler ownership.** Boss-Claude and the human can both start
   work. Decide which component arbitrates capacity and assignment, and
   what intent API both go through.
