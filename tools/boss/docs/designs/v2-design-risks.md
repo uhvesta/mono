@@ -190,6 +190,29 @@ question:
 Distilled results of running the proposed exploration above. Full POC
 artefacts live outside this doc to keep it navigable.
 
+#### On unknown 1 — company tool/agent-client policy
+
+Tested empirically on the work laptop using a stdlib-only Python
+script (`/tmp/r1-policy-test.py` — throwaway). The test runs the
+full custom-client tool-use loop: a user prompt that requires a
+`bash` tool, the script (not Claude Code) executes the command
+locally, returns the result, loops until end-of-turn.
+
+Result: **PASS** using a properly-scoped raw `ANTHROPIC_API_KEY`
+issued to the user. (The key is parked in macOS Keychain;
+truncated by the Keychain Access GUI but recoverable in full via
+`security find-generic-password -s "Claude Code-credentials" -w`.)
+
+Implications:
+
+- Custom clients (SDK or ACP-with-custom-handlers) can authenticate
+  against `api.anthropic.com` and complete tool-use turns
+  end-to-end in the work environment.
+- Network egress to the Anthropic API is not corporate-filtered.
+- The policy unknown does **not** force terminal-embed. Both R1
+  options remain technically open; the decision is now an
+  engineering call grounded in unknowns 2–4.
+
 #### On unknown 2 — hook coverage
 
 POC at `/tmp/boss-hook-poc-001/` against `claude 2.1.119`. A
@@ -328,7 +351,50 @@ We have an answer when:
 
 ### Decision
 
-_Pending exploration._
+**Adopt terminal-embed as the V2 worker shape, with a hybrid
+structured side-channel for orchestration.** All four decisive
+unknowns are resolved in the findings above.
+
+Rationale:
+
+- **Policy (unknown 1)**: not blocking. Empirically verified that
+  custom clients work in the target environment. Both options
+  technically available.
+- **Hook coverage (unknown 2)**: stream-json with
+  `--include-hook-events` covers three of the four orchestration
+  questions cleanly. Awaiting-input (Q3) needs a complementary
+  signal but is not architecturally fatal.
+- **JSONL viability (unknown 3)**: viable as a complementary
+  channel for richer observation when needed.
+- **Boss product gap (unknown 4)**: chrome-around-the-pane
+  affordances dominate by count and are sufficient for the cockpit
+  hypothesis; inside-conversation features are the daily-use
+  quality ceiling but additive, not load-bearing.
+
+Terminal-embed wins this call because:
+
+1. It inherits Claude Code's entire product surface (slash
+   commands, tool rendering, plan mode, hooks, todos, MCP UX,
+   paste, image attach, `/memory`, etc.) — a rendering surface we
+   would otherwise own and maintain forever in the native-chat
+   path.
+2. Reversibility asymmetry favors it: swapping a terminal pane for
+   a native chat surface later is a frontend change. The reverse
+   migration (drop affordances humans grew to depend on) is much
+   costlier.
+3. Boss's own session particularly benefits from being a real
+   Claude TUI.
+
+Implementation note for V2: design the engine / ACP boundary so a
+future migration of individual workers (or all workers) to native
+chat is a frontend change, not a re-architecture. The
+inside-conversation gap inventory (finding on unknown 4) is the
+explicit forcing function for revisiting this risk if the cockpit
+quality ceiling becomes binding.
+
+R2 (worker → Boss structured channel) carries the concrete
+hooks-vs-JSONL-vs-stream-json decision and the orchestration event
+schema; this risk does not need to be reopened when R2 lands.
 
 ## R4: Per-worker workspace and concurrency
 
