@@ -682,9 +682,47 @@ Boundary cases handled:
 
 ### Decision
 
-_Working decision recorded above. Pending audit, smoke test, and
-unknowns 1–6 to be resolved before the v2 plan adopts cube as a hard
-dependency._
+**Adopt cube as Boss V2's per-worker workspace layer.** All six
+decisive unknowns are resolved in the findings above. Concretely:
+
+- **Lease layer**: cube. Boss-engine drives it via subprocess `--json`.
+- **Lease lifetime**: per-task. Boss passes `preferred_workspace_id`
+  for soft affinity; cube falls back to any free workspace after a
+  short wait.
+- **Cross-product routing**: `products.cube_pool_id` lookup; null
+  mapping → work item blocked with `needs_pool_config`. No
+  auto-provisioning.
+- **VCS policy in workers**: workspace-local `.claude/CLAUDE.md`
+  written by Boss-engine post-lease, deleted on release; defers to
+  the repo's tracked `CLAUDE.md` on overlap.
+- **Setup state freshness**: per-lease fingerprint validation against
+  cube's existing invalidation keys, plus a Boss-injected
+  `secrets_version` marker and a 12h max-age TTL on secrets steps.
+- **Pool size**: `worker_count + headroom`. With 8 workers, start at
+  12 per repo.
+
+**Cube prerequisites for V2 hard dependency** (must land before V2
+takes the dependency, in priority order):
+
+1. Fix the `head_commit` template parsing bug (`app.rs:365`).
+2. Add a `--database` / explicit-data-dir CLI flag (today: only
+   `CUBE_DATA_DIR`).
+3. Add `flock` around `claim_workspace` (`store.rs:199`) so
+   cross-process contention is hardened.
+4. Implement `workspace setup` (currently stubbed at `app.rs:256`).
+5. Auto-create workspaces from `--source` on pool exhaustion
+   (`cli.rs:60` flag is parsed but never read).
+6. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
+   release, and `cube workspace force-release` — all required by the
+   integration sketch's error handling.
+
+Stacked-change and PR features (`change *`, `stack *`, `pr *`,
+`graph`, `doctor`) are out of scope for V2's cube dependency. Boss V2
+drives `jj` / `gh` / `git` directly inside leased workspaces.
+
+These prerequisites should be filed as work items against cube and
+tracked separately; this risk does not need to be re-opened when they
+land.
 
 ## Risk backlog
 
