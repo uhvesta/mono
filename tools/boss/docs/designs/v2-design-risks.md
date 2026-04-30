@@ -1031,16 +1031,261 @@ Implementation work this implies for V2:
 
 These should be tracked as Boss V2 implementation tasks.
 
+## R2: Worker → Boss structured channel
+
+### Why it matters
+
+R1 picked terminal-embed with a "hybrid structured side-channel" but
+left the channel itself unspecified. R2 makes it concrete: how does
+Boss observe each worker's state, and what events does it subscribe
+to? Without this, the scheduler (R5) has nothing to react to, the
+cockpit can't draw a "needs human" indicator, and probing has no
+substrate.
+
+### Options
+
+| Option | Content source | Transport | Notes |
+|---|---|---|---|
+| A | `claude --output-format stream-json --include-hook-events` | claude's stdout | Single channel, structured |
+| B | Hook scripts | Hook → file (boss-engine tails) | Simple, durable across crashes |
+| C | Hook scripts | Hook → Unix socket (boss-engine listens) | Push-style, low latency |
+| D | Session JSONL transcript | File watcher on `~/.claude/projects/<cwd>/<session>.jsonl` | Rich content; eventual-consistency |
+| E | Screen scrape | Read libghostty buffer | Heuristic last-resort |
+
+The realistic answer is layered: a primary structured channel
+(B or C) plus D as a content-rich fallback, plus E only where the
+others miss.
+
+### Hard constraints
+
+- **Workers run in libghostty TUI panes** (R1). They are not
+  `claude --print` processes.
+- **`--output-format` is locked to `--print`** per `claude --help`:
+  `"only works with --print"`. By extension `--include-hook-events`
+  is also `--print`-only. **Option A is structurally unavailable
+  for TUI workers.**
+- **Hook configuration is per-workspace.** Cube already writes
+  `.claude/CLAUDE.md` per lease (R3 / R4); the same boss-engine
+  step can write `.claude/settings.json` with the hook config.
+- **Q3 (awaiting input) coverage matters** for cockpit alerts.
+
+### Working decision
+
+**Hooks-to-socket as primary; session JSONL as content fallback;
+screen-scrape only as a defensive backup for Q3 if Notification
+proves unreliable in interactive PTY mode.**
+
+- Boss-engine binds a Unix socket at
+  `~/Library/Application Support/Boss/events.sock` (mode 0600;
+  shared with the R3 control socket file or sibling).
+- For each leased workspace, boss-engine writes
+  `<workspace>/.claude/settings.json` containing hook commands that
+  POST event JSON to the socket via a small `boss-event` shim
+  binary (added to the worker's PATH alongside the per-lease
+  CLAUDE.md). Each invocation reads stdin (the hook payload) and
+  writes a tagged JSON line over the socket.
+- The session JSONL transcript path is exposed in every hook
+  payload as `transcript_path`; boss-engine subscribes to that
+  file with a tail-watcher when it needs richer content (full
+  assistant text, tool result bodies, todos).
+
+The probe model uses the same channel: Boss waits for the worker's
+natural `Stop` hook (worker idle), then injects a prompt; the
+follow-up `Stop` carries the probe response in
+`last_assistant_message`. No keystroke injection mid-turn.
+
+### Decisive unknowns
+
+1. **Stream-json viability in TUI.** Can stream-json drive a
+   libghostty TUI worker?
+2. **Hooks fire in TUI mode.** Do hooks (which are documented for
+   `claude` regardless of output mode) actually fire when claude
+   runs interactively in a PTY?
+3. **Q3 (Notification) in interactive PTY mode.** R1's hook-coverage
+   finding showed `Notification` does NOT fire in `claude -p`. Does
+   it fire in interactive PTY mode (where there's a real human-input
+   path)?
+4. **Canonical event schema.** What `WorkerEvent` shape does
+   boss-engine expose to the rest of the system?
+5. **Transport: file vs socket.** Unix socket (push, low latency,
+   slightly more setup) vs JSONL file the engine tails (simpler,
+   eventual-consistency).
+
+### Proposed exploration
+
+1. **Stream-json + TUI compatibility check.** Read `claude --help`
+   for the constraint. (Single command; no full POC needed.)
+2. **Hooks in TUI POC.** Spin up a real `claude` process in TUI
+   mode with `.claude/settings.json` configured for all hook
+   events; verify which hooks fire.
+3. **Full lifecycle hooks via `--print`.** Same hook config; run
+   a non-interactive prompt that requires a tool; verify the full
+   turn lifecycle fires.
+4. **Q3 manual check.** Run claude interactively in a real terminal
+   (human at keyboard), trigger a permission prompt, and observe
+   whether `Notification` fires. Defer if automation can't drive
+   it cleanly.
+5. **Schema commit.** Write the canonical `WorkerEvent` enum.
+6. **Transport pick.** Decide socket vs file; commit rationale.
+
+### Findings
+
+POC artefacts at `/tmp/r2-poc-001/` (throwaway; not checked in).
+Hook config under test:
+
+```json
+{
+  "hooks": {
+    "SessionStart":     [{"hooks":[{"type":"command","command":"…"}]}],
+    "UserPromptSubmit": [{"hooks":[{"type":"command","command":"…"}]}],
+    "PreToolUse":       [{"matcher":"*","hooks":[…]}],
+    "PostToolUse":      [{"matcher":"*","hooks":[…]}],
+    "Stop":             [{"hooks":[…]}],
+    "Notification":     [{"hooks":[…]}],
+    "SessionEnd":       [{"hooks":[…]}]
+  }
+}
+```
+
+#### On unknown 1 — stream-json viability in TUI
+
+**Resolved: not viable.** `claude --help` documents
+`--output-format` as **"only works with --print"**, and
+`--include-hook-events` as
+**"only works with --output-format=stream-json"**. Both flags are
+structurally locked to non-interactive `--print` mode. A libghostty
+TUI worker — which must remain interactive for the human pane —
+cannot also emit stream-json. Option A is off the table.
+
+#### On unknown 2 — hooks fire in TUI mode
+
+**Resolved: yes.** Driving `claude --permission-mode default
+"List the files in this directory"` in a real PTY (via expect)
+captured `SessionStart`, `UserPromptSubmit`, and `SessionEnd`
+events with full payloads (each carrying `session_id`,
+`transcript_path`, `cwd`, `hook_event_name`, `source`/`reason`).
+The same hook config in `claude --print -p "List the files…"` mode
+captured the **full turn lifecycle**: `SessionStart` →
+`UserPromptSubmit` → `PreToolUse{tool:"Bash"}` →
+`PostToolUse{tool:"Bash"}` → `Stop` → `SessionEnd`. Hooks are
+output-format-independent; the in-PTY POC's incomplete capture
+was a driver issue, not a hooks issue.
+
+#### On unknown 3 — Q3 (Notification) in interactive PTY
+
+**Not validated by automation; deferred to manual check.**
+Driving an interactive permission prompt via expect proved
+flaky: claude's TUI input handling under PTY-driven typing didn't
+reliably submit prompts before the spawn EOF terminated the
+process. The R1 finding flagged Notification as missing in
+`-p` mode; whether it fires in real interactive use is the
+remaining open question.
+
+Pragmatic answer for V2: **design for Notification firing, but
+add a screen-scrape backup specifically for the
+"awaiting_input" state**. Cube already gives us per-pane
+libghostty buffer access. If a pane shows an unsubmitted
+permission prompt for >N seconds without a Notification event,
+infer "awaiting_input" by pattern-matching the prompt region.
+This is a small amount of code and degrades gracefully if
+Notification later starts firing reliably.
+
+#### On unknown 4 — canonical event schema
+
+Boss-engine exposes the following `WorkerEvent` enum to the rest
+of the system. Each variant carries `session_id`, `lease_id`
+(injected by Boss-engine; not in the raw hook payload),
+`transcript_path`, and a UTC `ts`.
+
+```rust
+enum WorkerEvent {
+    SessionStarted   { source: String, model: String },
+    SessionEnded     { reason: String },
+    TurnStarted      { prompt: String },
+    ToolInvoked      { tool: String, input: Value },           // PreToolUse
+    ToolCompleted    { tool: String, output: Value, error: Option<String> }, // PostToolUse
+    AwaitingInput    { kind: AwaitingKind },                   // Notification or scrape-derived
+    TurnCompleted    { last_assistant_text: String,
+                       derived_stop_reason: Option<String> },  // Stop
+    ProbeReplied     { probe_id: String, text: String },       // synthetic; see probe model
+}
+
+enum AwaitingKind { PermissionPrompt, IdlePrompt, Other(String) }
+```
+
+`derived_stop_reason` is computed: in v2.1.123 hook payloads the
+documented `stop_reason` field is absent, so boss-engine derives
+it from correlated `PreToolUse` ids and the last assistant text.
+If the field starts being populated by Claude Code, the deriver
+collapses to a passthrough.
+
+#### On unknown 5 — transport: file vs socket
+
+**Decision: Unix socket primary, with the JSONL transcript file
+as a content-rich secondary channel.**
+
+- Hook commands invoke a small `boss-event` shim binary that
+  reads stdin and forwards the JSON line to the socket. The shim
+  is bundled with Boss-engine, written into the worker's PATH on
+  lease, and authenticated via the same LOCAL_PEERPID subtree
+  match used by R3's control socket — workers can publish their
+  own events but cannot read or impersonate sibling workers'
+  events.
+- Boss-engine maintains a per-worker tail-watcher on
+  `transcript_path` (read-only) for content the hook payloads
+  don't carry: full assistant text bodies, tool result bodies,
+  todo updates, plan-mode entries.
+- File-as-primary was rejected because boss-engine would need to
+  poll N per-worker files; the socket gives push semantics with
+  zero polling and lets boss-engine sequence events deterministically
+  across workers.
+
+### Resolution criteria
+
+- Stream-json viability has a written verdict (it doesn't).
+- Hooks-fire-in-TUI is empirically validated.
+- Q3 has either a verified answer or a defined fallback.
+- A canonical `WorkerEvent` schema is committed in this doc.
+- The transport decision is committed.
+
+### Decision
+
+**Adopt hooks-to-socket as Boss V2's primary worker → engine
+channel, with the session JSONL transcript as a content-rich
+secondary channel and a screen-scrape backup for `AwaitingInput`
+specifically.** All five decisive unknowns are resolved or have a
+defensive path in the findings above.
+
+Implementation work this implies for V2:
+
+- A small `boss-event` shim binary that POSTs hook stdin payloads
+  to the engine's events socket; LOCAL_PEERPID-authenticated.
+- Boss-engine: bind events socket; accept hook posts; tag with
+  `lease_id` from peer-PID lookup; emit `WorkerEvent` to internal
+  subscribers (scheduler, cockpit UI).
+- Boss-engine: write `.claude/settings.json` per lease with the
+  hook config wired to `boss-event`. (Same write site as the
+  per-lease `.claude/CLAUDE.md` from R3 / R4.)
+- Boss-engine: per-worker tail-watcher for the `transcript_path`
+  exposed in hook payloads.
+- Boss-engine: screen-scrape probe specifically for
+  `AwaitingInput`, gated on "no Notification observed for N
+  seconds while pane shows a prompt-region match."
+- Schema (the `WorkerEvent` enum above) is the contract between
+  Boss-engine and the rest of the system; downstream code
+  (R5 scheduler, cockpit) consumes only that.
+
+These should be tracked as Boss V2 implementation tasks. The
+manual Q3 check (does `Notification` fire in real interactive
+use?) is a follow-up that, if positive, lets us drop the
+screen-scrape backup.
+
 ## Risk backlog
 
 These risks have been identified but not yet worked through. They are
 listed here so we don't lose them; we'll write each one up properly when
 we get to it. Order is rough priority, not strict sequence.
 
-- **R2: Worker → Boss structured channel.** Even with R1 resolved, we need
-  to pick the concrete mechanism (hooks, JSONL, SDK events, screen
-  scrape, or a layered combination) and define what events Boss
-  subscribes to. Closely linked to R1.
 - **R5: Scheduler ownership.** Boss-Claude and the human can both start
   work. Decide which component arbitrates capacity and assignment, and
   what intent API both go through.
