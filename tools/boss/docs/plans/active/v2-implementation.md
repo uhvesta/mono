@@ -36,7 +36,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 |-------|------------------------------------------------|------------------------------|
 | 1     | Engine and CLI foundations                     | 🟢 named deliverables shipped; small CLI follow-ups (Product/Project delete+move) tracked under Pending |
 | 2     | Multi-client subscriptions                     | 🟡 mostly shipped — outbound queue is unbounded, no coalescing or slow-client disconnect |
-| 3     | Kanban Work tab                                | 🟡 board done, three filters left |
+| 3     | Kanban Work tab                                | 🟢 shipped                   |
 | 4     | Execution layer + cube V2 prereqs              | 🟡 mostly shipped — cube driver missing `status` subcommand |
 | 5     | ExecutionCoordinator                           | 🟡 partially shipped — multiple gaps (worker affinity/LRU, `executions.<id>` topic, `request_execution` RPC, waiting-state semantics) |
 | 6     | libghostty embedding and worker spawn          | ❌ not started               |
@@ -203,45 +203,36 @@ connected clients in real time.
 
 ---
 
-### Phase 3: Kanban Work tab — remaining filters
+### Phase 3: Kanban Work tab — 🟢 shipped
 
-**Goal.** Finish the kanban Work tab by adding the two filter
-toggles and upgrading project filtering to multi-select.
+**Goal.** Replace the tree-first Work tab with a kanban board.
 
-**Status.** The board itself has shipped. Already in place in
+**Status (in `main`).** The full deliverable list has shipped in
 `tools/boss/app-macos/Sources/{Models.swift, ChatViewModel.swift,
-ContentView.swift}`: `selectedProductID`, `boardGrouping`,
-`selectedCardID` state; four fixed columns with status mapping;
-task/chore cards with project label, blocked badge, PR link;
-drag-and-drop and menu-based move actions; quick-add in Backlog;
-project-grouping toggle; card inspector for create/edit; real-time
-updates via subscriptions; UserDefaults persistence.
+ContentView.swift}`:
 
-**Deliverables (delta only).**
+- Board state: `selectedWorkProductID`, `selectedProjectFilterIDs`
+  (multi-select), `includeChores`, `showBlockedOnly`,
+  `workBoardGrouping`, `selectedWorkCardID`.
+- Four fixed columns (Backlog / Doing / Review / Done) with status
+  mapping (`blocked` renders inside Doing).
+- Card primitives for tasks and chores; project label, blocked
+  badge, PR link.
+- Move actions between columns (menu and drag-and-drop).
+- Quick-add affordance at top of Backlog.
+- Sidebar: product picker, multi-select project filter checkboxes
+  (with "All Projects" reset), and Options section with "Include
+  chores" and "Show blocked only" toggles.
+- Inspector for create/edit on a selected card.
+- UserDefaults persistence for product, project filter set,
+  includeChores, showBlockedOnly, and grouping.
+- Real-time board updates via the Phase 2 subscription mechanism.
 
-- Frontend state additions:
-  - `includeChores: Bool` (default true) — when false, hide chore
-    cards from the board.
-  - `showBlockedOnly: Bool` (default false) — when true, show only
-    items with `blocked == true`.
-  - Replace single-select `selectedWorkProjectFilterID: String?`
-    with `selectedProjectFilterIDs: Set<String>` to allow
-    multi-project filtering.
-- Sidebar UI:
-  - "Include chores" and "Show blocked only" toggles in the left
-    sidebar Options section.
-  - Project filter list switches from radio-style (All / one
-    project) to multi-select checkboxes; "All Projects" clears the
-    set.
-- Persistence: add the three new state fields to UserDefaults
-  alongside the existing board state.
+**Done when (acceptance, kept for the record).**
 
-**Done when.**
-
-- The two toggles correctly filter board contents in real time.
-- Multiple projects can be selected simultaneously and the board
-  reflects the union.
-- The three new selections survive an app restart.
+- Human can manage all current work-taxonomy CRUD through the
+  kanban board without dropping to the tree view.
+- Status changes from `boss` CLI propagate live to the board.
 
 **Depends on.** Phase 2.
 

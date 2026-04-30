@@ -202,7 +202,7 @@ struct ContentView: View {
     }
 
     private var workSidebar: some View {
-        List(selection: workSidebarSelection) {
+        List {
             if !model.products.isEmpty {
                 Section {
                     ZStack(alignment: .trailing) {
@@ -231,33 +231,61 @@ struct ContentView: View {
                 }
             }
 
-            if let selectedProduct = model.selectedProduct {
+            if model.selectedProduct != nil {
                 Section {
                     WorkSidebarFilterRow(
                         title: "All Projects",
                         subtitle: nil,
                         systemImage: "square.stack.3d.up",
-                        isSelected: model.selectedProject == nil,
-                        trailing: nil
+                        isSelected: !model.hasProjectFilters,
+                        trailing: nil,
+                        showsCheckbox: false
                     )
-                    .tag(WorkNodeID.product(selectedProduct.id))
                     .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
                     .listRowBackground(Color.clear)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        model.clearProjectFilters()
+                    }
 
                     ForEach(model.projectsForSelectedProduct) { project in
+                        let isOn = model.selectedProjectFilterIDs.contains(project.id)
                         WorkSidebarFilterRow(
                             title: project.name,
                             subtitle: nil,
                             systemImage: "folder",
-                            isSelected: model.selectedProject?.id == project.id,
-                            trailing: project.status.capitalized
+                            isSelected: isOn,
+                            trailing: project.status.capitalized,
+                            showsCheckbox: true,
+                            isCheckboxOn: isOn
                         )
-                        .tag(WorkNodeID.project(project.id))
                         .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
                         .listRowBackground(Color.clear)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            model.toggleProjectFilter(project.id)
+                        }
                     }
                 } header: {
                     workSidebarSectionTitle("Projects")
+                }
+
+                Section {
+                    Toggle("Include chores", isOn: Binding(
+                        get: { model.includeChores },
+                        set: { model.setIncludeChores($0) }
+                    ))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
+                    .listRowBackground(Color.clear)
+
+                    Toggle("Show blocked only", isOn: Binding(
+                        get: { model.showBlockedOnly },
+                        set: { model.setShowBlockedOnly($0) }
+                    ))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
+                    .listRowBackground(Color.clear)
+                } header: {
+                    workSidebarSectionTitle("Options")
                 }
             }
         }
@@ -291,17 +319,6 @@ struct ContentView: View {
             set: { newValue in
                 guard let productID = newValue else { return }
                 model.selectWorkProduct(productID)
-            }
-        )
-    }
-
-    private var workSidebarSelection: Binding<WorkNodeID?> {
-        Binding(
-            get: {
-                model.selectedWorkSidebarNodeID
-            },
-            set: { newValue in
-                model.selectWorkSidebarNode(newValue)
             }
         )
     }
@@ -554,7 +571,7 @@ struct ContentView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(product.name)
                         .font(.title2.weight(.semibold))
-                    Text(model.selectedProject?.name ?? "All projects")
+                    Text(model.projectFilterDescription)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -704,14 +721,24 @@ private struct WorkSidebarFilterRow: View {
     let systemImage: String
     let isSelected: Bool
     let trailing: String?
+    var showsCheckbox: Bool = false
+    var isCheckboxOn: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            Image(systemName: systemImage)
-                .foregroundStyle(isSelected ? .primary : .secondary)
-                .font(.system(size: 14, weight: .medium))
-                .frame(width: 15, alignment: .center)
-                .padding(.top, 2)
+            if showsCheckbox {
+                Image(systemName: isCheckboxOn ? "checkmark.square.fill" : "square")
+                    .foregroundStyle(isCheckboxOn ? Color.accentColor : .secondary)
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(width: 15, alignment: .center)
+                    .padding(.top, 2)
+            } else {
+                Image(systemName: systemImage)
+                    .foregroundStyle(isSelected ? .primary : .secondary)
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(width: 15, alignment: .center)
+                    .padding(.top, 2)
+            }
             VStack(alignment: .leading, spacing: subtitle == nil ? 0 : 2) {
                 HStack(alignment: .top, spacing: 8) {
                     Text(title)
