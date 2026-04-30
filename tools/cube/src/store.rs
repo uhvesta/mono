@@ -302,22 +302,56 @@ impl Store {
         task: &str,
         lease_id: &str,
         leased_at_epoch_s: i64,
+        prefer: Option<&str>,
     ) -> Result<Option<WorkspaceRecord>, CubeError> {
         let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
-        let candidate = transaction
-            .query_row(
-                r#"
-                SELECT workspace_id, workspace_path
-                FROM workspaces
-                WHERE repo = ?1 AND state = ?2
-                ORDER BY workspace_id
-                LIMIT 1
-                "#,
-                params![repo, WorkspaceState::Free.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(CubeError::Storage)?;
+        let candidate = if let Some(preferred_id) = prefer {
+            let preferred = transaction
+                .query_row(
+                    r#"
+                    SELECT workspace_id, workspace_path
+                    FROM workspaces
+                    WHERE repo = ?1 AND workspace_id = ?2 AND state = ?3
+                    "#,
+                    params![repo, preferred_id, WorkspaceState::Free.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(CubeError::Storage)?;
+            if preferred.is_some() {
+                preferred
+            } else {
+                transaction
+                    .query_row(
+                        r#"
+                        SELECT workspace_id, workspace_path
+                        FROM workspaces
+                        WHERE repo = ?1 AND state = ?2
+                        ORDER BY workspace_id
+                        LIMIT 1
+                        "#,
+                        params![repo, WorkspaceState::Free.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(CubeError::Storage)?
+            }
+        } else {
+            transaction
+                .query_row(
+                    r#"
+                    SELECT workspace_id, workspace_path
+                    FROM workspaces
+                    WHERE repo = ?1 AND state = ?2
+                    ORDER BY workspace_id
+                    LIMIT 1
+                    "#,
+                    params![repo, WorkspaceState::Free.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(CubeError::Storage)?
+        };
 
         let Some((workspace_id, workspace_path)) = candidate else {
             transaction.rollback().map_err(CubeError::Storage)?;
@@ -767,10 +801,10 @@ mod tests {
 
         // lease one workspace in each repo with distinct holders
         store
-            .claim_workspace("mono", "boss/worker-7", "demo", "lease-mono", 100)
+            .claim_workspace("mono", "boss/worker-7", "demo", "lease-mono", 100, None)
             .expect("claim mono");
         store
-            .claim_workspace("flunge", "alice@host:42", "fix", "lease-flunge", 100)
+            .claim_workspace("flunge", "alice@host:42", "fix", "lease-flunge", 100, None)
             .expect("claim flunge");
 
         // unfiltered: 4 workspaces total, ordered by repo then id

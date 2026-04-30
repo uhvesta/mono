@@ -151,12 +151,19 @@ of the abstraction.
 
 ```text
 cube workspace lease mono --task "write cube design doc"
+cube workspace lease mono --task "resume parser work" --prefer mono-agent-007
 ```
 
 Behavior:
 
 - Acquire a repo-level lock.
-- Find a free workspace from the pool, or create one if policy allows it.
+- If `--prefer <id>` is provided and that workspace is free in the repo, claim
+  it; otherwise fall back to the first free workspace. The flag is best-effort
+  and silently falls back when the preferred workspace is leased or unknown,
+  so callers should compare the returned workspace id against their preference
+  to detect a fallback.
+- Otherwise find a free workspace from the pool, or create one if policy
+  allows it.
 - Mark the workspace leased with holder metadata.
 - Run the repo-specific reset sequence before returning it.
 - If the workspace is newly created, or its recorded setup state is stale, run

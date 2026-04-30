@@ -83,6 +83,11 @@ pub enum WorkspaceCommand {
         /// Short task summary recorded with the lease.
         #[arg(long)]
         task: String,
+        /// Preferred workspace id to lease (best-effort). If the named
+        /// workspace is free it will be leased; otherwise lease falls
+        /// back to the first free workspace in the repo.
+        #[arg(long)]
+        prefer: Option<String>,
     },
     /// Release a workspace lease.
     ///
@@ -259,10 +264,46 @@ mod tests {
 
         match cli.command {
             Command::Workspace {
-                command: WorkspaceCommand::Lease { repo, task },
+                command:
+                    WorkspaceCommand::Lease {
+                        repo,
+                        task,
+                        prefer,
+                    },
             } => {
                 assert_eq!(repo, "mono");
                 assert_eq!(task, "implement parser");
+                assert!(prefer.is_none());
+            }
+            _ => panic!("expected workspace lease command"),
+        }
+    }
+
+    #[test]
+    fn workspace_lease_accepts_prefer_flag() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "resume parser work",
+            "--prefer",
+            "mono-agent-007",
+        ]);
+
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Lease {
+                        repo,
+                        task,
+                        prefer,
+                    },
+            } => {
+                assert_eq!(repo, "mono");
+                assert_eq!(task, "resume parser work");
+                assert_eq!(prefer.as_deref(), Some("mono-agent-007"));
             }
             _ => panic!("expected workspace lease command"),
         }

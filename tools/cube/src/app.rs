@@ -365,7 +365,11 @@ fn run_workspace(
     };
 
     match command {
-        WorkspaceCommand::Lease { repo, task } => {
+        WorkspaceCommand::Lease {
+            repo,
+            task,
+            prefer,
+        } => {
             let repo_record = store
                 .get_repo(&repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
@@ -382,6 +386,7 @@ fn run_workspace(
                 &task,
                 &lease_id,
                 leased_at_epoch_s,
+                prefer.as_deref(),
             )? {
                 Some(ws) => ws,
                 None => {
@@ -389,7 +394,14 @@ fn run_workspace(
                     candidates.push(new_candidate);
                     store.sync_workspaces(&repo, &candidates)?;
                     store
-                        .claim_workspace(&repo, &holder, &task, &lease_id, leased_at_epoch_s)?
+                        .claim_workspace(
+                            &repo,
+                            &holder,
+                            &task,
+                            &lease_id,
+                            leased_at_epoch_s,
+                            prefer.as_deref(),
+                        )?
                         .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?
                 }
             };
@@ -1454,6 +1466,193 @@ mod tests {
             ),
             "mono-agent-003"
         );
+    }
+
+    #[test]
+    fn workspace_lease_with_prefer_claims_named_workspace_when_free() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let preferred_path = workspace_root.join("mono-agent-005");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "def5678",
+            ),
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "resume cube prefer work",
+            "--prefer",
+            "mono-agent-005",
+        ]);
+        let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-005"
+        );
+        assert_eq!(
+            result.payload["workspace"]["workspace_path"],
+            preferred_path.display().to_string()
+        );
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_lease_with_prefer_falls_back_when_preferred_is_leased() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        // First lease takes mono-agent-005 (the preferred one).
+        let preferred_path = workspace_root.join("mono-agent-005");
+        let first_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "first123",
+            ),
+        ]);
+        let first_lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "first task",
+            "--prefer",
+            "mono-agent-005",
+        ]);
+        run_with_dependencies(first_lease, Some(&database_path), &first_runner)
+            .expect("first lease");
+        first_runner.assert_exhausted();
+
+        // Second lease prefers mono-agent-005 (leased), should fall back to mono-agent-004.
+        let fallback_path = workspace_root.join("mono-agent-004");
+        let second_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(fallback_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(fallback_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                fallback_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "second456",
+            ),
+        ]);
+        let second_lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "second task",
+            "--prefer",
+            "mono-agent-005",
+        ]);
+        let result = run_with_dependencies(second_lease, Some(&database_path), &second_runner)
+            .expect("second lease");
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-004"
+        );
+        second_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_lease_with_unknown_prefer_falls_back_to_first_free() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let first_path = workspace_root.join("mono-agent-004");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "fallback path",
+            "--prefer",
+            "mono-agent-999",
+        ]);
+        let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-004"
+        );
+        runner.assert_exhausted();
     }
 
     #[test]
