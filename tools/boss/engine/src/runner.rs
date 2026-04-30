@@ -17,12 +17,49 @@ pub struct RunAttention {
     pub body_markdown: String,
 }
 
+/// What a worker is waiting for after a run ends. Drives the lease
+/// retain/release decision in the coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunWaitState {
+    /// Run finished cleanly with no further work expected (`completed` or
+    /// equivalent terminal status). Workspace is released.
+    Terminal,
+    /// Worker is blocked on an upstream dependency. Workspace is released
+    /// and re-leased when the work becomes ready again.
+    WaitingDependency,
+    /// Worker is awaiting human input/redirect. Workspace is retained so
+    /// the next run can continue in-place.
+    WaitingHuman,
+    /// Worker is awaiting human review of an open PR. Workspace retained.
+    WaitingReview,
+    /// Worker is awaiting merge of an approved PR. Workspace retained.
+    WaitingMerge,
+}
+
+impl RunWaitState {
+    pub fn execution_status(self) -> &'static str {
+        match self {
+            RunWaitState::Terminal => "completed",
+            RunWaitState::WaitingDependency => "waiting_dependency",
+            RunWaitState::WaitingHuman => "waiting_human",
+            RunWaitState::WaitingReview => "waiting_review",
+            RunWaitState::WaitingMerge => "waiting_merge",
+        }
+    }
+
+    pub fn release_workspace(self) -> bool {
+        matches!(
+            self,
+            RunWaitState::Terminal | RunWaitState::WaitingDependency
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
-    pub execution_status: String,
+    pub wait_state: RunWaitState,
     pub result_summary: Option<String>,
     pub attention: Option<RunAttention>,
-    pub release_workspace: bool,
 }
 
 #[async_trait]
@@ -175,10 +212,9 @@ impl ExecutionRunner for AcpExecutionRunner {
         ));
 
         Ok(RunOutcome {
-            execution_status: "waiting_human".to_owned(),
+            wait_state: RunWaitState::WaitingHuman,
             result_summary,
             attention,
-            release_workspace: false,
         })
     }
 }

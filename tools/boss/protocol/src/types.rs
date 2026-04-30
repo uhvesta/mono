@@ -51,7 +51,11 @@ pub struct WorkExecution {
     pub repo_remote_url: String,
     pub cube_repo_id: Option<String>,
     pub cube_lease_id: Option<String>,
+    pub cube_workspace_id: Option<String>,
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub priority: i64,
+    pub preferred_workspace_id: Option<String>,
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -145,9 +149,19 @@ pub struct CreateExecutionInput {
     pub repo_remote_url: Option<String>,
     pub cube_repo_id: Option<String>,
     pub cube_lease_id: Option<String>,
+    pub cube_workspace_id: Option<String>,
     pub workspace_path: Option<String>,
+    pub priority: Option<i64>,
+    pub preferred_workspace_id: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestExecutionInput {
+    pub work_item_id: String,
+    pub priority: Option<i64>,
+    pub preferred_workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

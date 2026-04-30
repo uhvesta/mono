@@ -12,13 +12,17 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
-use crate::coordinator::{CommandCubeClient, ExecutionCoordinator, WorkerPool};
+use crate::coordinator::{
+    CommandCubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
+};
 use crate::protocol::{
     AgentInfo, AgentRole, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
-    FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS, TopicEventPayload, work_product_topic,
+    FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS, TopicEventPayload, execution_topic,
+    work_product_topic,
 };
 use crate::runner::AcpExecutionRunner;
 use crate::work::{WorkDb, WorkItem};
+use async_trait::async_trait;
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
@@ -206,26 +210,33 @@ struct ServerState {
     execution_coordinator: Arc<ExecutionCoordinator>,
     topic_broker: Arc<TopicBroker>,
     next_session_id: AtomicU64,
-    work_revision: AtomicU64,
+    work_revision: Arc<AtomicU64>,
 }
 
 impl ServerState {
     fn new(cfg: Arc<RuntimeConfig>) -> Result<Self> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
-        let execution_coordinator = Arc::new(ExecutionCoordinator::new(
+        let topic_broker = Arc::new(TopicBroker::default());
+        let work_revision = Arc::new(AtomicU64::new(0));
+        let publisher: Arc<dyn ExecutionPublisher> = Arc::new(BrokerExecutionPublisher {
+            topic_broker: topic_broker.clone(),
+            work_revision: work_revision.clone(),
+        });
+        let execution_coordinator = Arc::new(ExecutionCoordinator::with_publisher(
             work_db.clone(),
             worker_pool,
             Arc::new(CommandCubeClient::new(cfg.clone())),
             Arc::new(AcpExecutionRunner::new(cfg.clone())),
+            publisher,
         ));
         Ok(Self {
             work_db,
             agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
             execution_coordinator,
-            topic_broker: Arc::new(TopicBroker::default()),
+            topic_broker,
             next_session_id: AtomicU64::new(1),
-            work_revision: AtomicU64::new(0),
+            work_revision,
         })
     }
 
@@ -242,6 +253,43 @@ impl ServerState {
 
     fn bump_work_revision(&self) -> u64 {
         self.work_revision.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+struct BrokerExecutionPublisher {
+    topic_broker: Arc<TopicBroker>,
+    work_revision: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl ExecutionPublisher for BrokerExecutionPublisher {
+    async fn publish(
+        &self,
+        execution_id: &str,
+        work_item_id: &str,
+        status: &str,
+        reason: &str,
+    ) {
+        let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let topic = execution_topic(execution_id);
+        let event = FrontendEvent::TopicEvent {
+            topic: topic.clone(),
+            revision,
+            origin_session_id: String::new(),
+            origin_request_id: None,
+            event: TopicEventPayload::ExecutionInvalidated {
+                reason: reason.to_owned(),
+                execution_id: execution_id.to_owned(),
+                work_item_id: work_item_id.to_owned(),
+                status: status.to_owned(),
+            },
+        };
+        self.topic_broker
+            .publish(
+                &topic,
+                FrontendEventEnvelope::push_with_revision(revision, event),
+            )
+            .await;
     }
 }
 
@@ -1151,6 +1199,25 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::ExecutionCreated { execution },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::RequestExecution { input } => match work_db.request_execution(input) {
+                Ok(execution) => {
+                    server_state.execution_coordinator.kick();
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::ExecutionRequested { execution },
                     );
                 }
                 Err(err) => {

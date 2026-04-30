@@ -9,7 +9,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 pub use boss_protocol::{
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
     CreateProjectInput, CreateRunInput, CreateTaskInput, ExecutionReconcileResult, Product,
-    Project, Task, WorkAttentionItem, WorkExecution, WorkItem, WorkItemPatch, WorkRun, WorkTree,
+    Project, RequestExecutionInput, Task, WorkAttentionItem, WorkExecution, WorkItem,
+    WorkItemPatch, WorkRun, WorkTree,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -158,13 +159,32 @@ impl WorkDb {
         Ok(execution)
     }
 
+    /// Returns or creates a ready execution for `work_item_id`, applying any
+    /// priority / preferred-workspace overrides from the request.
+    ///
+    /// If the most recent execution for this work item is still in flight
+    /// (`ready` / `running` / `waiting_*`) we update its priority and
+    /// preferred_workspace_id rather than creating a duplicate. If it is
+    /// terminal (or absent), we insert a fresh `ready` execution.
+    pub fn request_execution(
+        &self,
+        input: RequestExecutionInput,
+    ) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = request_execution_in_tx(&tx, input)?;
+        tx.commit()?;
+        Ok(execution)
+    }
+
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         if let Some(work_item_id) = work_item_id {
             let _ = product_id_for_work_item(&conn, work_item_id)?;
             let mut stmt = conn.prepare(
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                        workspace_path, created_at, started_at, finished_at
+                        cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                        created_at, started_at, finished_at
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -175,7 +195,8 @@ impl WorkDb {
 
         let mut stmt = conn.prepare(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                    workspace_path, created_at, started_at, finished_at
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -192,10 +213,11 @@ impl WorkDb {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                    workspace_path, created_at, started_at, finished_at
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at
              FROM work_executions
              WHERE status = 'ready'
-             ORDER BY created_at ASC, id ASC",
+             ORDER BY priority DESC, created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
@@ -297,6 +319,7 @@ impl WorkDb {
         agent_id: &str,
         cube_repo_id: &str,
         cube_lease_id: &str,
+        cube_workspace_id: &str,
         workspace_path: &str,
     ) -> Result<(WorkExecution, WorkRun)> {
         let mut conn = self.connect()?;
@@ -316,14 +339,16 @@ impl WorkDb {
              SET status = 'running',
                  cube_repo_id = ?2,
                  cube_lease_id = ?3,
-                 workspace_path = ?4,
-                 started_at = COALESCE(started_at, ?5),
+                 cube_workspace_id = ?4,
+                 workspace_path = ?5,
+                 started_at = COALESCE(started_at, ?6),
                  finished_at = NULL
              WHERE id = ?1",
             params![
                 execution_id,
                 cube_repo_id,
                 cube_lease_id,
+                cube_workspace_id,
                 workspace_path,
                 now
             ],
@@ -370,6 +395,7 @@ impl WorkDb {
              SET status = 'failed',
                  cube_repo_id = COALESCE(?2, cube_repo_id),
                  cube_lease_id = NULL,
+                 cube_workspace_id = NULL,
                  workspace_path = NULL,
                  started_at = COALESCE(started_at, ?3),
                  finished_at = ?3
@@ -440,6 +466,7 @@ impl WorkDb {
             "UPDATE work_executions
              SET status = ?2,
                  cube_lease_id = CASE WHEN ?3 THEN NULL ELSE cube_lease_id END,
+                 cube_workspace_id = CASE WHEN ?3 THEN NULL ELSE cube_workspace_id END,
                  workspace_path = CASE WHEN ?3 THEN NULL ELSE workspace_path END,
                  finished_at = ?4
              WHERE id = ?1",
@@ -857,7 +884,10 @@ impl WorkDb {
                 repo_remote_url TEXT NOT NULL,
                 cube_repo_id TEXT,
                 cube_lease_id TEXT,
+                cube_workspace_id TEXT,
                 workspace_path TEXT,
+                priority INTEGER NOT NULL DEFAULT 0,
+                preferred_workspace_id TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT
@@ -865,6 +895,9 @@ impl WorkDb {
 
             CREATE INDEX IF NOT EXISTS work_executions_work_item_idx
                 ON work_executions(work_item_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS work_executions_ready_idx
+                ON work_executions(status, priority, created_at);
 
             CREATE TABLE IF NOT EXISTS work_runs (
                 id TEXT PRIMARY KEY,
@@ -898,8 +931,9 @@ impl WorkDb {
                 ON work_attention_items(execution_id, created_at);
             ",
         )?;
+        migrate_work_executions_v3(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '2')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '3')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -1084,10 +1118,13 @@ fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         repo_remote_url: row.get(4)?,
         cube_repo_id: row.get(5)?,
         cube_lease_id: row.get(6)?,
-        workspace_path: row.get(7)?,
-        created_at: row.get(8)?,
-        started_at: row.get(9)?,
-        finished_at: row.get(10)?,
+        cube_workspace_id: row.get(7)?,
+        workspace_path: row.get(8)?,
+        priority: row.get(9)?,
+        preferred_workspace_id: row.get(10)?,
+        created_at: row.get(11)?,
+        started_at: row.get(12)?,
+        finished_at: row.get(13)?,
     })
 }
 
@@ -1131,15 +1168,19 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
     let status = input.status.unwrap_or_else(|| "queued".to_owned());
     let cube_repo_id = normalize_optional_text(input.cube_repo_id);
     let cube_lease_id = normalize_optional_text(input.cube_lease_id);
+    let cube_workspace_id = normalize_optional_text(input.cube_workspace_id);
     let workspace_path = normalize_optional_text(input.workspace_path);
+    let priority = input.priority.unwrap_or(0);
+    let preferred_workspace_id = normalize_optional_text(input.preferred_workspace_id);
     let started_at = normalize_optional_text(input.started_at);
     let finished_at = normalize_optional_text(input.finished_at);
 
     conn.execute(
         "INSERT INTO work_executions (
             id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-            workspace_path, created_at, started_at, finished_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+            created_at, started_at, finished_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
             input.work_item_id,
@@ -1148,7 +1189,10 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
             repo_remote_url,
             cube_repo_id,
             cube_lease_id,
+            cube_workspace_id,
             workspace_path,
+            priority,
+            preferred_workspace_id,
             now,
             started_at,
             finished_at,
@@ -1197,7 +1241,8 @@ fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
 fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>> {
     conn.query_row(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                workspace_path, created_at, started_at, finished_at
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at
          FROM work_executions
          WHERE id = ?1",
         [id],
@@ -1294,6 +1339,39 @@ fn ensure_project_belongs_to_product(
     Ok(())
 }
 
+fn migrate_work_executions_v3(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "cube_workspace_id",
+            "ALTER TABLE work_executions ADD COLUMN cube_workspace_id TEXT",
+        ),
+        (
+            "priority",
+            "ALTER TABLE work_executions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "preferred_workspace_id",
+            "ALTER TABLE work_executions ADD COLUMN preferred_workspace_id TEXT",
+        ),
+    ] {
+        if !work_executions_has_column(conn, column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
+fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(work_executions)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
     let exists = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM work_executions WHERE id = ?1)",
@@ -1312,7 +1390,8 @@ fn query_latest_execution_for_work_item(
 ) -> Result<Option<WorkExecution>> {
     conn.query_row(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                workspace_path, created_at, started_at, finished_at
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
@@ -1355,7 +1434,10 @@ fn reconcile_work_item_execution(
                     repo_remote_url: Some(repo_remote_url.to_owned()),
                     cube_repo_id: None,
                     cube_lease_id: None,
+                    cube_workspace_id: None,
                     workspace_path: None,
+                    priority: None,
+                    preferred_workspace_id: None,
                     started_at: None,
                     finished_at: None,
                 },
@@ -1365,6 +1447,77 @@ fn reconcile_work_item_execution(
     }
 
     Ok(())
+}
+
+fn request_execution_in_tx(
+    conn: &Connection,
+    input: RequestExecutionInput,
+) -> Result<WorkExecution> {
+    let RequestExecutionInput {
+        work_item_id,
+        priority,
+        preferred_workspace_id,
+    } = input;
+
+    let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
+    let kind = execution_kind_for_work_item(conn, &work_item_id)?;
+
+    if let Some(existing) = query_latest_execution_for_work_item(conn, &work_item_id)? {
+        if !execution_status_is_terminal(&existing.status) {
+            let next_status = if existing.status == "waiting_dependency" {
+                "ready".to_owned()
+            } else {
+                existing.status.clone()
+            };
+            let next_priority = priority.unwrap_or(existing.priority);
+            let next_preferred = preferred_workspace_id.or(existing.preferred_workspace_id);
+            conn.execute(
+                "UPDATE work_executions
+                 SET status = ?2,
+                     priority = ?3,
+                     preferred_workspace_id = ?4
+                 WHERE id = ?1",
+                params![existing.id, next_status, next_priority, next_preferred],
+            )?;
+            return query_execution(conn, &existing.id)?
+                .with_context(|| format!("unknown execution: {}", existing.id));
+        }
+    }
+
+    let _ = product_id_for_work_item(conn, &work_item_id)?;
+    insert_execution(
+        conn,
+        CreateExecutionInput {
+            work_item_id,
+            kind,
+            status: Some("ready".to_owned()),
+            repo_remote_url: None,
+            cube_repo_id: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            workspace_path: None,
+            priority,
+            preferred_workspace_id,
+            started_at: None,
+            finished_at: None,
+        },
+    )
+}
+
+fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
+    Ok(match classify_id(work_item_id)? {
+        ItemKind::Product => "product_design".to_owned(),
+        ItemKind::Project => "project_design".to_owned(),
+        ItemKind::Task => {
+            let task = query_task(conn, work_item_id)?
+                .filter(|task| task.deleted_at.is_none())
+                .with_context(|| format!("unknown task: {work_item_id}"))?;
+            match task.kind.as_str() {
+                "chore" => "chore_implementation".to_owned(),
+                _ => "task_implementation".to_owned(),
+            }
+        }
+    })
 }
 
 fn update_execution_status(
@@ -1749,7 +1902,10 @@ mod tests {
                 repo_remote_url: None,
                 cube_repo_id: Some("cube_repo_mono".to_owned()),
                 cube_lease_id: None,
+                cube_workspace_id: None,
                 workspace_path: Some("/tmp/mono-agent-001".to_owned()),
+                priority: None,
+                preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
             })
@@ -1828,7 +1984,10 @@ mod tests {
                 repo_remote_url: None,
                 cube_repo_id: None,
                 cube_lease_id: None,
+                cube_workspace_id: None,
                 workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
             })
@@ -1846,7 +2005,10 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 cube_repo_id: None,
                 cube_lease_id: None,
+                cube_workspace_id: None,
                 workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
             })
@@ -2065,7 +2227,10 @@ mod tests {
                 repo_remote_url: None,
                 cube_repo_id: None,
                 cube_lease_id: None,
+                cube_workspace_id: None,
                 workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
             })
@@ -2077,6 +2242,7 @@ mod tests {
                 "worker-1",
                 "mono",
                 "lease-1",
+                "mono-agent-001",
                 "/tmp/mono-agent-001",
             )
             .unwrap();
@@ -2124,7 +2290,10 @@ mod tests {
                 repo_remote_url: None,
                 cube_repo_id: None,
                 cube_lease_id: None,
+                cube_workspace_id: None,
                 workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
             })
@@ -2180,7 +2349,10 @@ mod tests {
                 repo_remote_url: None,
                 cube_repo_id: None,
                 cube_lease_id: None,
+                cube_workspace_id: None,
                 workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
             })
@@ -2192,6 +2364,7 @@ mod tests {
                 "worker-1",
                 "mono",
                 "lease-1",
+                "mono-agent-001",
                 "/tmp/mono-agent-001",
             )
             .unwrap();
@@ -2264,7 +2437,10 @@ mod tests {
                 repo_remote_url: None,
                 cube_repo_id: None,
                 cube_lease_id: None,
+                cube_workspace_id: None,
                 workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
             })
@@ -2276,6 +2452,7 @@ mod tests {
                 "worker-1",
                 "mono",
                 "lease-1",
+                "mono-agent-001",
                 "/tmp/mono-agent-001",
             )
             .unwrap();

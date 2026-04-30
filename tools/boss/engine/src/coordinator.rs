@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -13,6 +13,11 @@ use crate::config::RuntimeConfig;
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution, WorkItem, WorkRun};
 
+/// Hard cap on the worker pool. The runtime config can request a smaller
+/// pool, but values above this are clamped (with a warning). Phase 5 of
+/// the V2 plan locks 8 as the upper bound.
+pub const MAX_WORKER_POOL_SIZE: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CubeRepoHandle {
     pub repo_id: String,
@@ -21,6 +26,7 @@ pub struct CubeRepoHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CubeWorkspaceLease {
     pub lease_id: String,
+    pub workspace_id: String,
     pub workspace_path: PathBuf,
 }
 
@@ -44,7 +50,12 @@ pub struct CubeWorkspaceStatus {
 #[async_trait]
 pub trait CubeClient: Send + Sync {
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
-    async fn lease_workspace(&self, repo_id: &str, task: &str) -> Result<CubeWorkspaceLease>;
+    async fn lease_workspace(
+        &self,
+        repo_id: &str,
+        task: &str,
+        prefer_workspace_id: Option<&str>,
+    ) -> Result<CubeWorkspaceLease>;
     async fn create_change(
         &self,
         workspace_path: &PathBuf,
@@ -121,7 +132,12 @@ impl CubeClient for CommandCubeClient {
         })
     }
 
-    async fn lease_workspace(&self, repo_id: &str, task: &str) -> Result<CubeWorkspaceLease> {
+    async fn lease_workspace(
+        &self,
+        repo_id: &str,
+        task: &str,
+        prefer_workspace_id: Option<&str>,
+    ) -> Result<CubeWorkspaceLease> {
         #[derive(Deserialize)]
         struct LeasePayload {
             workspace: LeaseWorkspace,
@@ -130,20 +146,25 @@ impl CubeClient for CommandCubeClient {
         #[derive(Deserialize)]
         struct LeaseWorkspace {
             lease_id: Option<String>,
+            workspace_id: String,
             workspace_path: PathBuf,
         }
 
-        let payload: LeasePayload = serde_json::from_value(
-            self.run_json(&["--json", "workspace", "lease", repo_id, "--task", task])
-                .await?,
-        )
-        .context("failed to decode `cube workspace lease` payload")?;
+        let mut args: Vec<&str> = vec![
+            "--json", "workspace", "lease", repo_id, "--task", task,
+        ];
+        if let Some(prefer) = prefer_workspace_id {
+            args.extend_from_slice(&["--prefer", prefer]);
+        }
+        let payload: LeasePayload = serde_json::from_value(self.run_json(&args).await?)
+            .context("failed to decode `cube workspace lease` payload")?;
         let lease_id = payload
             .workspace
             .lease_id
             .context("cube workspace lease response missing lease_id")?;
         Ok(CubeWorkspaceLease {
             lease_id,
+            workspace_id: payload.workspace.workspace_id,
             workspace_path: payload.workspace.workspace_path,
         })
     }
@@ -246,56 +267,164 @@ impl CubeClient for CommandCubeClient {
 
 #[derive(Debug, Clone)]
 pub struct WorkerPool {
-    inner: Arc<Mutex<Vec<WorkerSlot>>>,
+    inner: Arc<Mutex<WorkerPoolInner>>,
+}
+
+#[derive(Debug)]
+struct WorkerPoolInner {
+    workers: Vec<WorkerSlot>,
+    /// Monotonic counter; the smallest `last_used_seq` among idle workers
+    /// is the LRU pick. Workers that have never run a task carry
+    /// `last_used_seq = 0`, which sorts ahead of any used worker.
+    next_seq: u64,
 }
 
 #[derive(Debug, Clone)]
 struct WorkerSlot {
     worker_id: String,
     execution_id: Option<String>,
+    last_workspace_id: Option<String>,
+    last_used_seq: u64,
 }
 
 impl WorkerPool {
     pub fn new(size: usize) -> Self {
-        let workers = (0..size)
+        let clamped = if size > MAX_WORKER_POOL_SIZE {
+            tracing::warn!(
+                requested = size,
+                cap = MAX_WORKER_POOL_SIZE,
+                "worker pool size exceeds hard cap; clamping"
+            );
+            MAX_WORKER_POOL_SIZE
+        } else {
+            size
+        };
+        let workers = (0..clamped)
             .map(|index| WorkerSlot {
                 worker_id: format!("worker-{}", index + 1),
                 execution_id: None,
+                last_workspace_id: None,
+                last_used_seq: 0,
             })
             .collect();
         Self {
-            inner: Arc::new(Mutex::new(workers)),
+            inner: Arc::new(Mutex::new(WorkerPoolInner {
+                workers,
+                next_seq: 1,
+            })),
         }
     }
 
-    pub async fn claim_idle_worker(&self, execution_id: &str) -> Option<String> {
-        let mut workers = self.inner.lock().await;
-        for worker in workers.iter_mut() {
-            if worker.execution_id.is_none() {
+    /// Claim an idle worker for `execution_id`. Selection is affinity-first:
+    /// if `preferred_workspace_id` is set and an idle worker last ran in
+    /// that workspace, that worker is chosen. Otherwise the least-recently-
+    /// used idle worker wins (workers that have never run sort first).
+    pub async fn claim_worker(
+        &self,
+        execution_id: &str,
+        preferred_workspace_id: Option<&str>,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+
+        if let Some(target) = preferred_workspace_id {
+            if let Some(idx) = inner.workers.iter().position(|w| {
+                w.execution_id.is_none()
+                    && w.last_workspace_id.as_deref() == Some(target)
+            }) {
+                let worker = &mut inner.workers[idx];
                 worker.execution_id = Some(execution_id.to_owned());
                 return Some(worker.worker_id.clone());
             }
         }
-        None
+
+        let lru_idx = inner
+            .workers
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.execution_id.is_none())
+            .min_by_key(|(idx, w)| (w.last_used_seq, *idx))
+            .map(|(idx, _)| idx)?;
+        let worker = &mut inner.workers[lru_idx];
+        worker.execution_id = Some(execution_id.to_owned());
+        Some(worker.worker_id.clone())
     }
 
-    pub async fn release_worker(&self, worker_id: &str) {
-        let mut workers = self.inner.lock().await;
-        if let Some(worker) = workers
+    /// Release `worker_id` back to the idle pool. If `last_workspace_id`
+    /// is provided we record it as the worker's affinity for future
+    /// preferred-workspace claims.
+    pub async fn release_worker(&self, worker_id: &str, last_workspace_id: Option<&str>) {
+        let mut inner = self.inner.lock().await;
+        let seq = inner.next_seq;
+        inner.next_seq = inner.next_seq.wrapping_add(1).max(1);
+        if let Some(worker) = inner
+            .workers
             .iter_mut()
             .find(|worker| worker.worker_id == worker_id)
         {
             worker.execution_id = None;
+            worker.last_used_seq = seq;
+            if let Some(workspace_id) = last_workspace_id {
+                worker.last_workspace_id = Some(workspace_id.to_owned());
+            }
         }
+    }
+
+    pub async fn capacity(&self) -> usize {
+        let inner = self.inner.lock().await;
+        inner.workers.len()
     }
 
     #[cfg(test)]
     async fn idle_count(&self) -> usize {
-        let workers = self.inner.lock().await;
-        workers
+        let inner = self.inner.lock().await;
+        inner
+            .workers
             .iter()
             .filter(|worker| worker.execution_id.is_none())
             .count()
+    }
+
+    #[cfg(test)]
+    async fn worker_affinity(&self, worker_id: &str) -> Option<String> {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == worker_id)
+            .and_then(|worker| worker.last_workspace_id.clone())
+    }
+}
+
+/// Sink for `executions.<id>` topic invalidations. The engine wires this
+/// to the topic broker; tests use a no-op or recording double.
+#[async_trait]
+pub trait ExecutionPublisher: Send + Sync {
+    async fn publish(
+        &self,
+        execution_id: &str,
+        work_item_id: &str,
+        status: &str,
+        reason: &str,
+    );
+}
+
+#[derive(Default)]
+pub struct NoopExecutionPublisher;
+
+#[async_trait]
+impl ExecutionPublisher for NoopExecutionPublisher {
+    async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
+}
+
+/// Tiny abstraction so the coordinator can bump the shared work-revision
+/// counter without depending on `ServerState`.
+pub trait RevisionSource: Send + Sync {
+    fn next(&self) -> u64;
+}
+
+impl RevisionSource for AtomicU64 {
+    fn next(&self) -> u64 {
+        self.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
@@ -304,6 +433,7 @@ pub struct ExecutionCoordinator {
     worker_pool: WorkerPool,
     cube_client: Arc<dyn CubeClient>,
     execution_runner: Arc<dyn ExecutionRunner>,
+    publisher: Arc<dyn ExecutionPublisher>,
     scheduling_active: AtomicBool,
 }
 
@@ -314,11 +444,28 @@ impl ExecutionCoordinator {
         cube_client: Arc<dyn CubeClient>,
         execution_runner: Arc<dyn ExecutionRunner>,
     ) -> Self {
+        Self::with_publisher(
+            work_db,
+            worker_pool,
+            cube_client,
+            execution_runner,
+            Arc::new(NoopExecutionPublisher::default()),
+        )
+    }
+
+    pub fn with_publisher(
+        work_db: Arc<WorkDb>,
+        worker_pool: WorkerPool,
+        cube_client: Arc<dyn CubeClient>,
+        execution_runner: Arc<dyn ExecutionRunner>,
+        publisher: Arc<dyn ExecutionPublisher>,
+    ) -> Self {
         Self {
             work_db,
             worker_pool,
             cube_client,
             execution_runner,
+            publisher,
             scheduling_active: AtomicBool::new(false),
         }
     }
@@ -346,7 +493,12 @@ impl ExecutionCoordinator {
             let Some(execution) = self.next_ready_execution() else {
                 break;
             };
-            let Some(worker_id) = self.worker_pool.claim_idle_worker(&execution.id).await else {
+            let preferred_workspace_id = execution.preferred_workspace_id.clone();
+            let Some(worker_id) = self
+                .worker_pool
+                .claim_worker(&execution.id, preferred_workspace_id.as_deref())
+                .await
+            else {
                 break;
             };
 
@@ -357,7 +509,9 @@ impl ExecutionCoordinator {
                     worker_id = %worker_id,
                     "failed to start execution"
                 );
-                self.worker_pool.release_worker(&worker_id).await;
+                self.worker_pool
+                    .release_worker(&worker_id, preferred_workspace_id.as_deref())
+                    .await;
             }
         }
     }
@@ -395,7 +549,15 @@ impl ExecutionCoordinator {
             }
         };
 
-        let lease = match self.cube_client.lease_workspace(&repo.repo_id, &task).await {
+        let lease = match self
+            .cube_client
+            .lease_workspace(
+                &repo.repo_id,
+                &task,
+                execution.preferred_workspace_id.as_deref(),
+            )
+            .await
+        {
             Ok(lease) => lease,
             Err(err) => {
                 self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)?;
@@ -428,6 +590,7 @@ impl ExecutionCoordinator {
             worker_id,
             &repo.repo_id,
             &lease.lease_id,
+            &lease.workspace_id,
             &lease.workspace_path.display().to_string(),
         ) {
             Ok((execution, run)) => {
@@ -438,10 +601,19 @@ impl ExecutionCoordinator {
                     worker_id,
                     cube_repo_id = %repo.repo_id,
                     cube_lease_id = %lease.lease_id,
+                    cube_workspace_id = %lease.workspace_id,
                     cube_change_id = %change.change_id,
                     workspace_path = %lease.workspace_path.display(),
                     "started execution run"
                 );
+                self.publisher
+                    .publish(
+                        &execution.id,
+                        &execution.work_item_id,
+                        &execution.status,
+                        "execution_started",
+                    )
+                    .await;
                 let coordinator = self.clone();
                 tokio::spawn(async move {
                     coordinator
@@ -484,6 +656,15 @@ impl ExecutionCoordinator {
             error = %error,
             "recorded execution start failure"
         );
+        let publisher = self.publisher.clone();
+        let execution_id = execution.id.clone();
+        let work_item_id = execution.work_item_id.clone();
+        let status = execution.status.clone();
+        tokio::spawn(async move {
+            publisher
+                .publish(&execution_id, &work_item_id, &status, "execution_start_failed")
+                .await;
+        });
         Ok(())
     }
 
@@ -548,7 +729,7 @@ impl ExecutionCoordinator {
                     released,
                     None,
                 ) {
-                    Ok((execution, run, _)) => {
+                    Ok((execution, _run, _)) => {
                         tracing::warn!(
                             execution_id = %execution.id,
                             run_id = %run.id,
@@ -557,6 +738,14 @@ impl ExecutionCoordinator {
                             released_workspace = released,
                             "execution run failed"
                         );
+                        self.publisher
+                            .publish(
+                                &execution.id,
+                                &execution.work_item_id,
+                                &execution.status,
+                                "execution_run_failed",
+                            )
+                            .await;
                     }
                     Err(record_err) => {
                         tracing::error!(
@@ -571,7 +760,9 @@ impl ExecutionCoordinator {
             }
         }
 
-        self.worker_pool.release_worker(&worker_id).await;
+        self.worker_pool
+            .release_worker(&worker_id, Some(lease.workspace_id.as_str()))
+            .await;
         self.kick();
     }
 
@@ -583,7 +774,8 @@ impl ExecutionCoordinator {
         worker_id: &str,
         outcome: RunOutcome,
     ) -> Result<()> {
-        let released = if outcome.release_workspace {
+        let release_workspace = outcome.wait_state.release_workspace();
+        let released = if release_workspace {
             match self.cube_client.release_workspace(&lease.lease_id).await {
                 Ok(()) => true,
                 Err(err) => {
@@ -613,7 +805,7 @@ impl ExecutionCoordinator {
         let (execution, run, attention) = self.work_db.finish_execution_run(
             &execution.id,
             &run.id,
-            &outcome.execution_status,
+            outcome.wait_state.execution_status(),
             "completed",
             outcome.result_summary.as_deref(),
             None,
@@ -631,6 +823,14 @@ impl ExecutionCoordinator {
             released_workspace = released,
             "execution run completed"
         );
+        self.publisher
+            .publish(
+                &execution.id,
+                &execution.work_item_id,
+                &execution.status,
+                "execution_run_completed",
+            )
+            .await;
         Ok(())
     }
 }
@@ -678,18 +878,18 @@ mod tests {
 
     use super::{
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
-        ExecutionCoordinator, WorkerPool,
+        ExecutionCoordinator, ExecutionPublisher, MAX_WORKER_POOL_SIZE, WorkerPool,
     };
-    use crate::runner::{ExecutionRunner, RunAttention, RunOutcome};
+    use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
-        CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, WorkDb,
-        WorkExecution, WorkItem,
+        CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
+        RequestExecutionInput, WorkDb, WorkExecution, WorkItem,
     };
 
     #[derive(Default)]
     struct FakeCubeClient {
         ensure_calls: Mutex<Vec<String>>,
-        lease_calls: Mutex<Vec<(String, String)>>,
+        lease_calls: Mutex<Vec<(String, String, Option<String>)>>,
         create_calls: Mutex<Vec<(String, String)>>,
         release_calls: Mutex<Vec<String>>,
         status_calls: Mutex<Vec<PathBuf>>,
@@ -698,6 +898,14 @@ mod tests {
         fail_ensure: bool,
         fail_lease: bool,
         fail_create: bool,
+        next_workspace_id: Mutex<Option<String>>,
+    }
+
+    impl FakeCubeClient {
+        fn with_next_workspace_id(self, id: impl Into<String>) -> Self {
+            *self.next_workspace_id.try_lock().expect("uncontended") = Some(id.into());
+            self
+        }
     }
 
     #[async_trait]
@@ -712,17 +920,31 @@ mod tests {
             })
         }
 
-        async fn lease_workspace(&self, repo_id: &str, task: &str) -> Result<CubeWorkspaceLease> {
-            self.lease_calls
-                .lock()
-                .await
-                .push((repo_id.to_owned(), task.to_owned()));
+        async fn lease_workspace(
+            &self,
+            repo_id: &str,
+            task: &str,
+            prefer_workspace_id: Option<&str>,
+        ) -> Result<CubeWorkspaceLease> {
+            self.lease_calls.lock().await.push((
+                repo_id.to_owned(),
+                task.to_owned(),
+                prefer_workspace_id.map(str::to_owned),
+            ));
             if self.fail_lease {
                 return Err(anyhow!("cube workspace lease failed"));
             }
+            let workspace_id = self
+                .next_workspace_id
+                .lock()
+                .await
+                .clone()
+                .or_else(|| prefer_workspace_id.map(str::to_owned))
+                .unwrap_or_else(|| "mono-agent-001".to_owned());
             Ok(CubeWorkspaceLease {
                 lease_id: "lease-1".to_owned(),
-                workspace_path: PathBuf::from("/tmp/mono-agent-001"),
+                workspace_id: workspace_id.clone(),
+                workspace_path: PathBuf::from(format!("/tmp/{workspace_id}")),
             })
         }
 
@@ -829,15 +1051,37 @@ mod tests {
             }
 
             Ok(RunOutcome {
-                execution_status: "waiting_human".to_owned(),
+                wait_state: RunWaitState::WaitingHuman,
                 result_summary: Some(format!("finished {}", execution.kind)),
                 attention: Some(RunAttention {
                     kind: "review_required".to_owned(),
                     title: format!("Review {}", execution.kind),
                     body_markdown: format!("Review {}", test_work_item_name(work_item)),
                 }),
-                release_workspace: false,
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPublisher {
+        events: Mutex<Vec<(String, String, String, String)>>,
+    }
+
+    #[async_trait]
+    impl ExecutionPublisher for RecordingPublisher {
+        async fn publish(
+            &self,
+            execution_id: &str,
+            work_item_id: &str,
+            status: &str,
+            reason: &str,
+        ) {
+            self.events.lock().await.push((
+                execution_id.to_owned(),
+                work_item_id.to_owned(),
+                status.to_owned(),
+                reason.to_owned(),
+            ));
         }
     }
 
@@ -1050,6 +1294,225 @@ mod tests {
         assert_eq!(run.error_text.as_deref(), Some("cube change create failed"));
         assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
         assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn worker_pool_clamps_size_to_hard_cap() {
+        let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE + 4);
+        assert_eq!(pool.capacity().await, MAX_WORKER_POOL_SIZE);
+    }
+
+    #[tokio::test]
+    async fn worker_pool_prefers_workspace_affinity_over_lru() {
+        let pool = WorkerPool::new(2);
+
+        // worker-1 picks up exec-a → records affinity to ws-a
+        let first = pool.claim_worker("exec-a", None).await.unwrap();
+        assert_eq!(first, "worker-1");
+        pool.release_worker(&first, Some("ws-a")).await;
+
+        // worker-2 picks up exec-b → records affinity to ws-b
+        let second = pool.claim_worker("exec-b", None).await.unwrap();
+        assert_eq!(second, "worker-2");
+        pool.release_worker(&second, Some("ws-b")).await;
+
+        // worker-1 was used first, so by LRU it would win. But preferring
+        // ws-b should pick worker-2 instead.
+        let claimed = pool.claim_worker("exec-c", Some("ws-b")).await.unwrap();
+        assert_eq!(claimed, "worker-2");
+        pool.release_worker(&claimed, Some("ws-b")).await;
+
+        // Without preference, LRU picks the worker that was idle longest;
+        // worker-1 has been idle since the first release, so it wins.
+        let lru = pool.claim_worker("exec-d", None).await.unwrap();
+        assert_eq!(lru, "worker-1");
+    }
+
+    #[tokio::test]
+    async fn higher_priority_executions_run_first() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let early = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Old".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let late = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "New".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Bump the later chore's priority — it should run first despite
+        // the older one being in the queue first.
+        db.request_execution(RequestExecutionInput {
+            work_item_id: late.id.clone(),
+            priority: Some(10),
+            preferred_workspace_id: None,
+        })
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        for _ in 0..100 {
+            let runs = runner.calls.lock().await;
+            if !runs.is_empty() {
+                break;
+            }
+            drop(runs);
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let calls = runner.calls.lock().await;
+        assert!(!calls.is_empty(), "scheduler did not start any run");
+        let started_execution_id = &calls[0].1;
+        let late_execution = db
+            .list_executions(Some(&late.id))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            started_execution_id, &late_execution.id,
+            "expected the higher-priority chore to run first"
+        );
+        // Old chore should still be queued (and was NOT picked).
+        let early_execution = db
+            .list_executions(Some(&early.id))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(early_execution.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn scheduler_passes_preferred_workspace_to_lease_and_records_affinity() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        db.request_execution(RequestExecutionInput {
+            work_item_id: chore.id.clone(),
+            priority: None,
+            preferred_workspace_id: Some("mono-agent-007".to_owned()),
+        })
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default().with_next_workspace_id("mono-agent-007"));
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        let calls = cube.lease_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2.as_deref(), Some("mono-agent-007"));
+        drop(calls);
+
+        let execution = db.get_execution(&execution.id).unwrap();
+        assert_eq!(
+            execution.cube_workspace_id.as_deref(),
+            Some("mono-agent-007")
+        );
+        assert_eq!(
+            coordinator
+                .worker_pool()
+                .worker_affinity("worker-1")
+                .await
+                .as_deref(),
+            Some("mono-agent-007")
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_publishes_execution_topic_events() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let coordinator = Arc::new(ExecutionCoordinator::with_publisher(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+            publisher.clone(),
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        let events = publisher.events.lock().await;
+        let reasons: Vec<&str> = events
+            .iter()
+            .map(|(_, _, _, reason)| reason.as_str())
+            .collect();
+        assert!(reasons.contains(&"execution_started"));
+        assert!(reasons.contains(&"execution_run_completed"));
+        let last_status = events
+            .iter()
+            .rev()
+            .find(|(_, _, _, reason)| reason == "execution_run_completed")
+            .map(|(_, _, status, _)| status.clone());
+        assert_eq!(last_status.as_deref(), Some("waiting_human"));
     }
 
     #[tokio::test]

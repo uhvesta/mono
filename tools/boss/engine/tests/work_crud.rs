@@ -231,6 +231,9 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
             assert_eq!(reason, "project_created");
             assert_eq!(product_id.as_deref(), Some(product.id.as_str()));
         }
+        TopicEventPayload::ExecutionInvalidated { .. } => {
+            panic!("unexpected execution invalidation on work topic")
+        }
     }
 
     Ok(())
@@ -306,6 +309,9 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             assert_eq!(product_id.as_deref(), Some(product.id.as_str()));
             assert_eq!(item_ids, vec![task.id.clone()]);
         }
+        TopicEventPayload::ExecutionInvalidated { .. } => {
+            panic!("unexpected execution invalidation on work topic")
+        }
     }
 
     Ok(())
@@ -355,7 +361,9 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
     let mut reasons = Vec::new();
     for _ in 0..2 {
         let inv = watcher.next_invalidation(Duration::from_secs(1)).await?;
-        let TopicEventPayload::WorkInvalidated { reason, .. } = inv.event;
+        let TopicEventPayload::WorkInvalidated { reason, .. } = inv.event else {
+            panic!("unexpected execution invalidation on work topic")
+        };
         reasons.push(reason);
     }
     assert_eq!(reasons, vec!["project_created", "chore_created"]);

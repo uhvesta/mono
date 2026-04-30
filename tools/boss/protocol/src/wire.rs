@@ -2,14 +2,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
-    CreateProjectInput, CreateRunInput, CreateTaskInput, Product, Project, Task,
-    WorkAttentionItem, WorkExecution, WorkItem, WorkItemPatch, WorkRun,
+    CreateProjectInput, CreateRunInput, CreateTaskInput, Product, Project,
+    RequestExecutionInput, Task, WorkAttentionItem, WorkExecution, WorkItem, WorkItemPatch,
+    WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
 
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
+}
+
+pub fn execution_topic(execution_id: &str) -> String {
+    format!("executions.{execution_id}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -130,6 +135,10 @@ pub enum FrontendRequest {
         #[serde(flatten)]
         input: CreateExecutionInput,
     },
+    RequestExecution {
+        #[serde(flatten)]
+        input: RequestExecutionInput,
+    },
     ListExecutions {
         work_item_id: Option<String>,
     },
@@ -241,6 +250,9 @@ pub enum FrontendEvent {
     ExecutionCreated {
         execution: WorkExecution,
     },
+    ExecutionRequested {
+        execution: WorkExecution,
+    },
     RunsList {
         execution_id: String,
         runs: Vec<WorkRun>,
@@ -338,5 +350,11 @@ pub enum TopicEventPayload {
         reason: String,
         product_id: Option<String>,
         item_ids: Vec<String>,
+    },
+    ExecutionInvalidated {
+        reason: String,
+        execution_id: String,
+        work_item_id: String,
+        status: String,
     },
 }

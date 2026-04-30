@@ -38,7 +38,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 2     | Multi-client subscriptions                     | 🟡 mostly shipped — outbound queue is unbounded, no coalescing or slow-client disconnect |
 | 3     | Kanban Work tab                                | 🟢 shipped                   |
 | 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers land in Phases 8-9 |
-| 5     | ExecutionCoordinator                           | 🟡 partially shipped — multiple gaps (worker affinity/LRU, `executions.<id>` topic, `request_execution` RPC, waiting-state semantics) |
+| 5     | ExecutionCoordinator                           | 🟢 named deliverables shipped — affinity-first/LRU worker selection, 8-worker hard cap, priority + FIFO ready queue, `executions.<id>` topic, `request_execution` RPC, `RunWaitState` enum |
 | 6     | libghostty embedding and worker spawn          | ❌ not started               |
 | 7     | Boss session and bossctl                       | ❌ not started               |
 | 8     | Review and attention                           | 🟡 schema + manual PR-URL only — no auto-detect, no poller, no Triage UI, no re-engage |
@@ -294,65 +294,59 @@ Phase B; [cube remaining-work](../../../../cube/docs/remaining-work.md).
 
 ---
 
-### Phase 5: ExecutionCoordinator — 🟡 partially shipped
+### Phase 5: ExecutionCoordinator — 🟢 named deliverables shipped
 
 **Goal.** Add the server-global scheduler that turns work-item
 events into runs.
 
 **Status (done).**
 
-- `ExecutionCoordinator` struct exists (`coordinator.rs:231-237`)
-  with `new()`, `worker_pool()`, `kick()`, and an internal
-  `run_scheduler` driving the loop.
+- `ExecutionCoordinator` with `kick()` entry point and internal
+  `run_scheduler` loop (`coordinator.rs`); construction supports an
+  optional `ExecutionPublisher` via `with_publisher()`.
 - Auto-creation of execution stubs by work-item kind (project →
   `project_design`, chore → `chore_implementation`, task →
-  `task_implementation`) via `reconcile_work_item_execution()`
-  (`work.rs:400-468`); integration site at `app.rs:1406`.
-- `WorkerPool` with a configurable size cap
-  (`coordinator.rs:187-198`; `config.rs:42-49`,
-  env `BOSS_WORKER_POOL_SIZE`, default 1).
-- `RunOutcome` struct and run lifecycle start → active → end
-  (`runner.rs:21-26`, scheduler at `coordinator.rs:500-560`).
-- Single boolean `release_workspace` on `RunOutcome` drives the
-  retain/release decision (`runner.rs:25`,
-  `coordinator.rs:515-560`).
+  `task_implementation`) via `reconcile_work_item_execution()` in
+  `work.rs`, fired from `publish_work_invalidation` after every
+  work mutation.
+- `WorkerPool` enforces a hard 8-worker cap
+  (`MAX_WORKER_POOL_SIZE`); larger configs are clamped with a
+  warning. Default pool size remains config-driven via
+  `BOSS_WORKER_POOL_SIZE`.
+- Worker selection is affinity-first via
+  `preferred_workspace_id`, then LRU among idle workers. Workers
+  record the cube workspace they last ran in on release; the
+  scheduler passes `preferred_workspace_id` from the execution
+  through to `cube workspace lease --prefer …` so cube reuses the
+  same workspace when available.
+- Priority + FIFO-within-priority ready queue: executions carry an
+  integer `priority` column; `list_ready_executions` orders by
+  `priority DESC, created_at ASC, id ASC`. Higher-priority work
+  preempts older queued work as soon as a worker frees up.
+- `RunOutcome::wait_state` is now a `RunWaitState` enum (`Terminal`
+  / `WaitingDependency` / `WaitingHuman` / `WaitingReview` /
+  `WaitingMerge`). The coordinator releases the cube lease for
+  `Terminal` and `WaitingDependency` and retains it for the three
+  human-/review-/merge-bound states, matching the V2 design.
+- `executions.<id>` topic publishing: `BrokerExecutionPublisher`
+  fans an `ExecutionInvalidated` `TopicEventPayload` through the
+  shared `TopicBroker` whenever an execution transitions
+  (`execution_started`, `execution_run_completed`,
+  `execution_run_failed`, `execution_start_failed`). Each
+  invalidation bumps the shared `work_revision`.
+- `request_execution(work_item_id, opts)` RPC
+  (`FrontendRequest::RequestExecution`,
+  `FrontendEvent::ExecutionRequested`) creates or refreshes a
+  ready execution for the work item with optional priority and
+  preferred-workspace overrides, then kicks the coordinator.
+- Run lifecycle is unchanged in shape (start → active → end) but
+  end-state mapping is enum-driven; `start_execution_run` now also
+  records `cube_workspace_id` so the engine can correlate
+  workspaces across reconnects in later phases.
 
-**Pending.**
-
-- **No `coordinate()` method** on `ExecutionCoordinator`. The
-  prior status block claimed one — wrong. The real entry point is
-  `kick()`; the loop is `run_scheduler` internally. Either rename
-  the contract in the design or add a method named to match.
-- **Worker selection is naive.** `claim_idle_worker()`
-  (`coordinator.rs:200-209`) picks the first idle worker. The
-  deliverable calls for affinity-first via
-  `preferred_workspace_id`, then LRU among free; neither is
-  implemented (`grep` for `preferred_workspace_id` / `affinity` /
-  `lru` in `coordinator.rs` → nothing). This needs to land before
-  Phase 6 spawns workers that benefit from affinity.
-- **Hard 8-worker cap is not asserted.** The pool size is
-  configurable and defaults to 1. The deliverable's "8-worker hard
-  cap" is a runtime config value, not a code-level invariant. If
-  the design wants it as a hard cap, enforce it in `WorkerPool`
-  construction.
-- **Priority + FIFO-within-priority queue** is not implemented.
-  The scheduler walks ready executions in DB-iteration order. No
-  priority field on executions; no ordered queue.
-- **`executions.<id>` topic publishing** is not wired. No topic
-  constant in `protocol.rs`; no publish call site in coordinator.
-  `TopicBroker` is only used for `work.*` topics today. Phase 8's
-  triage UI will need this.
-- **`request_execution(work_item_id, opts)` RPC** is not in the
-  protocol. The only entry point today is `CreateExecution` driven
-  manually. Either add the RPC or rename the design to match what
-  we shipped (decide which).
-- **Lease retain/release semantics** use a single
-  `release_workspace: bool` on `RunOutcome` — and inspection of
-  `runner.rs:181` shows the field is hardcoded `false` in the
-  current path. The design calls for four `waiting_*` states
-  (`waiting_human` / `waiting_review` / `waiting_merge` retain,
-  `waiting_dependency` releases); promote the boolean to an enum
-  before Phase 8 lights up review-driven releases.
+**Pending.** No deliverables remain for Phase 5 itself. Live
+exercise of the new RPCs (a `boss work start` CLI surface,
+re-engagement after review) ships as part of Phases 7–8.
 
 **Done when (acceptance, kept for the record).**
 
