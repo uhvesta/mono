@@ -14,6 +14,7 @@ rust_library(
         "src/protocol.rs",
         "src/runner.rs",
         "src/work.rs",
+        "src/worker_setup.rs",
     ],
     crate_root = "src/lib.rs",
     edition = "2024",

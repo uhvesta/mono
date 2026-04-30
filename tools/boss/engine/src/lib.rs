@@ -6,3 +6,4 @@ pub mod coordinator;
 pub mod protocol;
 pub mod runner;
 pub mod work;
+pub mod worker_setup;
