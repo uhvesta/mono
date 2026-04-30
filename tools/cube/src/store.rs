@@ -139,7 +139,9 @@ impl Store {
                 holder,
                 task,
                 leased_at_epoch_s,
-                head_commit
+                lease_expires_at_epoch_s,
+                head_commit,
+                last_release_reason
             FROM workspaces
             WHERE 1=1
             "#,
@@ -188,7 +190,9 @@ impl Store {
                     holder,
                     task,
                     leased_at_epoch_s,
-                    head_commit
+                    lease_expires_at_epoch_s,
+                    head_commit,
+                    last_release_reason
                 FROM workspaces
                 WHERE repo = ?1
                 ORDER BY workspace_id
@@ -196,28 +200,7 @@ impl Store {
             )
             .map_err(CubeError::Storage)?;
         let rows = statement
-            .query_map(params![repo], |row| {
-                let state_raw: String = row.get(3)?;
-                Ok(WorkspaceRecord {
-                    repo: row.get(0)?,
-                    workspace_id: row.get(1)?,
-                    workspace_path: row.get::<_, String>(2)?.into(),
-                    state: WorkspaceState::from_str(&state_raw).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                                "invalid workspace state `{state_raw}`"
-                            )),
-                        )
-                    })?,
-                    lease_id: row.get(4)?,
-                    holder: row.get(5)?,
-                    task: row.get(6)?,
-                    leased_at_epoch_s: row.get(7)?,
-                    head_commit: row.get(8)?,
-                })
-            })
+            .query_map(params![repo], row_to_workspace_record)
             .map_err(CubeError::Storage)?;
 
         rows.collect::<Result<Vec<_>, _>>()
@@ -302,6 +285,7 @@ impl Store {
         task: &str,
         lease_id: &str,
         leased_at_epoch_s: i64,
+        lease_expires_at_epoch_s: Option<i64>,
         prefer: Option<&str>,
     ) -> Result<Option<WorkspaceRecord>, CubeError> {
         let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
@@ -368,8 +352,10 @@ impl Store {
                     holder = ?3,
                     task = ?4,
                     leased_at_epoch_s = ?5,
-                    head_commit = NULL
-                WHERE repo = ?6 AND workspace_id = ?7 AND state = ?8
+                    lease_expires_at_epoch_s = ?6,
+                    head_commit = NULL,
+                    last_release_reason = NULL
+                WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
                 "#,
                 params![
                     WorkspaceState::Leased.as_str(),
@@ -377,6 +363,7 @@ impl Store {
                     holder,
                     task,
                     leased_at_epoch_s,
+                    lease_expires_at_epoch_s,
                     repo,
                     workspace_id,
                     WorkspaceState::Free.as_str(),
@@ -396,7 +383,9 @@ impl Store {
                     holder,
                     task,
                     leased_at_epoch_s,
-                    head_commit
+                    lease_expires_at_epoch_s,
+                    head_commit,
+                    last_release_reason
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -444,7 +433,9 @@ impl Store {
                     holder,
                     task,
                     leased_at_epoch_s,
-                    head_commit
+                    lease_expires_at_epoch_s,
+                    head_commit,
+                    last_release_reason
                 FROM workspaces
                 WHERE workspace_path = ?1
                 "#,
@@ -471,7 +462,9 @@ impl Store {
                     holder,
                     task,
                     leased_at_epoch_s,
-                    head_commit
+                    lease_expires_at_epoch_s,
+                    head_commit,
+                    last_release_reason
                 FROM workspaces
                 WHERE lease_id = ?1
                 "#,
@@ -495,7 +488,11 @@ impl Store {
         Ok(())
     }
 
-    pub fn release_workspace(&self, lease_id: &str) -> Result<Option<WorkspaceRecord>, CubeError> {
+    pub fn release_workspace(
+        &self,
+        lease_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<WorkspaceRecord>, CubeError> {
         let before = self.get_workspace_by_lease(lease_id)?;
         let Some(record) = before else {
             return Ok(None);
@@ -511,10 +508,12 @@ impl Store {
                     holder = NULL,
                     task = NULL,
                     leased_at_epoch_s = NULL,
-                    head_commit = NULL
+                    lease_expires_at_epoch_s = NULL,
+                    head_commit = NULL,
+                    last_release_reason = ?3
                 WHERE lease_id = ?1
                 "#,
-                params![lease_id, WorkspaceState::Free.as_str()],
+                params![lease_id, WorkspaceState::Free.as_str(), reason],
             )
             .map_err(CubeError::Storage)?;
 
@@ -524,7 +523,9 @@ impl Store {
             holder: None,
             task: None,
             leased_at_epoch_s: None,
+            lease_expires_at_epoch_s: None,
             head_commit: None,
+            last_release_reason: reason.map(str::to_string),
             ..record
         }))
     }
@@ -600,6 +601,86 @@ impl Store {
             .map_err(CubeError::Storage)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(CubeError::Storage)
+    }
+
+    /// Force-release a lease without checking holder ownership. Used for
+    /// orphan reclamation on engine restart.
+    pub fn force_release_lease(
+        &self,
+        lease_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+        // Same SQL as release_workspace today; the distinction is at the
+        // CLI/callsite level where force-release skips the workspace reset.
+        // Holder/ownership checks aren't enforced anywhere in the store yet,
+        // so this is a thin wrapper for now.
+        self.release_workspace(lease_id, reason)
+    }
+
+    /// Update the expiry for a leased workspace. Returns the updated row,
+    /// or None if no workspace currently holds the lease id.
+    pub fn heartbeat_lease(
+        &self,
+        lease_id: &str,
+        new_expires_at_epoch_s: Option<i64>,
+    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+        let updated = self
+            .connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET lease_expires_at_epoch_s = ?2
+                WHERE lease_id = ?1 AND state = ?3
+                "#,
+                params![
+                    lease_id,
+                    new_expires_at_epoch_s,
+                    WorkspaceState::Leased.as_str(),
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.get_workspace_by_lease(lease_id)
+    }
+
+    /// Sweep leases whose expiry is at or before `now_epoch_s`; flip them
+    /// back to `free` and record `expired` as the release reason. Returns
+    /// the number of leases reclaimed.
+    pub fn expire_stale_leases(
+        &self,
+        repo: &str,
+        now_epoch_s: i64,
+    ) -> Result<usize, CubeError> {
+        let updated = self
+            .connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    state = ?2,
+                    lease_id = NULL,
+                    holder = NULL,
+                    task = NULL,
+                    leased_at_epoch_s = NULL,
+                    lease_expires_at_epoch_s = NULL,
+                    head_commit = NULL,
+                    last_release_reason = 'expired'
+                WHERE repo = ?1
+                  AND state = ?3
+                  AND lease_expires_at_epoch_s IS NOT NULL
+                  AND lease_expires_at_epoch_s <= ?4
+                "#,
+                params![
+                    repo,
+                    WorkspaceState::Free.as_str(),
+                    WorkspaceState::Leased.as_str(),
+                    now_epoch_s,
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(updated)
     }
 
     pub fn insert_change(&self, record: &ChangeRecord) -> Result<ChangeRecord, CubeError> {
@@ -684,7 +765,9 @@ impl Store {
                     holder TEXT,
                     task TEXT,
                     leased_at_epoch_s INTEGER,
+                    lease_expires_at_epoch_s INTEGER,
                     head_commit TEXT,
+                    last_release_reason TEXT,
                     PRIMARY KEY(repo, workspace_id),
                     FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE
                 );
@@ -721,7 +804,33 @@ impl Store {
                 );
                 "#,
             )
-            .map_err(CubeError::Storage)
+            .map_err(CubeError::Storage)?;
+
+        // Additive column upgrades for existing databases. New CREATE TABLE
+        // already includes these, but ALTER lets us pick them up on a DB
+        // that pre-dates this code.
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN lease_expires_at_epoch_s INTEGER",
+        )?;
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN last_release_reason TEXT",
+        )?;
+
+        Ok(())
+    }
+}
+
+fn try_add_column(connection: &Connection, sql: &str) -> Result<(), CubeError> {
+    match connection.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(CubeError::Storage(e)),
     }
 }
 
@@ -780,7 +889,9 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         holder: row.get(5)?,
         task: row.get(6)?,
         leased_at_epoch_s: row.get(7)?,
-        head_commit: row.get(8)?,
+        lease_expires_at_epoch_s: row.get(8)?,
+        head_commit: row.get(9)?,
+        last_release_reason: row.get(10)?,
     })
 }
 
@@ -801,7 +912,9 @@ fn row_to_change_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRecor
 mod tests {
     use tempfile::TempDir;
 
-    use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceState};
+    use crate::metadata::{
+        ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState,
+    };
 
     use super::{Store, WorkspaceListFilter};
 
@@ -907,10 +1020,26 @@ mod tests {
 
         // lease one workspace in each repo with distinct holders
         store
-            .claim_workspace("mono", "boss/worker-7", "demo", "lease-mono", 100, None)
+            .claim_workspace(
+                "mono",
+                "boss/worker-7",
+                "demo",
+                "lease-mono",
+                100,
+                Some(1900),
+                None,
+            )
             .expect("claim mono");
         store
-            .claim_workspace("flunge", "alice@host:42", "fix", "lease-flunge", 100, None)
+            .claim_workspace(
+                "flunge",
+                "alice@host:42",
+                "fix",
+                "lease-flunge",
+                100,
+                Some(1900),
+                None,
+            )
             .expect("claim flunge");
 
         // unfiltered: 4 workspaces total, ordered by repo then id
@@ -970,6 +1099,116 @@ mod tests {
             .expect("list mono free");
         assert_eq!(mono_free.len(), 1);
         assert_eq!(mono_free[0].workspace_id, "mono-agent-002");
+    }
+
+    #[test]
+    fn ttl_lifecycle_expires_and_heartbeat_extends() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@example.com:org/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+            })
+            .expect("repo");
+        store
+            .sync_workspaces(
+                "mono",
+                &[
+                    WorkspaceCandidate {
+                        workspace_id: "mono-agent-001".to_string(),
+                        workspace_path: workspace_root.join("mono-agent-001"),
+                    },
+                    WorkspaceCandidate {
+                        workspace_id: "mono-agent-002".to_string(),
+                        workspace_path: workspace_root.join("mono-agent-002"),
+                    },
+                ],
+            )
+            .expect("sync");
+
+        // Lease two workspaces with TTL of 100s, leased at t=0
+        let lease_a = store
+            .claim_workspace("mono", "alice", "fix", "lease-a", 0, Some(100), None)
+            .expect("claim a")
+            .expect("got record");
+        let lease_b = store
+            .claim_workspace("mono", "bob", "review", "lease-b", 0, Some(100), None)
+            .expect("claim b")
+            .expect("got record");
+        assert_eq!(lease_a.lease_expires_at_epoch_s, Some(100));
+        assert_eq!(lease_b.lease_expires_at_epoch_s, Some(100));
+
+        // Heartbeat lease-a to extend it to t=500
+        let beat = store
+            .heartbeat_lease("lease-a", Some(500))
+            .expect("heartbeat")
+            .expect("found");
+        assert_eq!(beat.lease_expires_at_epoch_s, Some(500));
+
+        // Sweep at t=200 — only lease-b is past its TTL
+        let reclaimed = store.expire_stale_leases("mono", 200).expect("sweep");
+        assert_eq!(reclaimed, 1);
+
+        let after = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .expect("list");
+        let by_id: std::collections::HashMap<&str, &WorkspaceRecord> = after
+            .iter()
+            .map(|r| (r.workspace_id.as_str(), r))
+            .collect();
+
+        let a = by_id["mono-agent-001"];
+        assert_eq!(a.state, WorkspaceState::Leased);
+        assert_eq!(a.lease_id.as_deref(), Some("lease-a"));
+
+        let b = by_id["mono-agent-002"];
+        assert_eq!(b.state, WorkspaceState::Free);
+        assert!(b.lease_id.is_none());
+        assert_eq!(b.last_release_reason.as_deref(), Some("expired"));
+    }
+
+    #[test]
+    fn release_records_reason() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@example.com:org/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+            })
+            .expect("repo");
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: workspace_root.join("mono-agent-001"),
+                }],
+            )
+            .expect("sync");
+        store
+            .claim_workspace("mono", "alice", "fix", "lease-a", 0, Some(100), None)
+            .expect("claim");
+
+        let released = store
+            .release_workspace("lease-a", Some("crash"))
+            .expect("release")
+            .expect("found");
+        assert_eq!(released.last_release_reason.as_deref(), Some("crash"));
+        assert_eq!(released.state, WorkspaceState::Free);
+        assert!(released.lease_expires_at_epoch_s.is_none());
     }
 
     #[test]

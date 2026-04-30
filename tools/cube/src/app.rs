@@ -21,6 +21,11 @@ use crate::store::{Store, WorkspaceListFilter};
 
 type Result<T> = std::result::Result<T, CubeError>;
 
+/// Default lease TTL: 30 minutes from acquisition. The Boss-engine
+/// integration sketch in R4 of v2-design-risks.md heartbeats every
+/// few minutes against this window.
+const DEFAULT_LEASE_TTL_SECS: i64 = 1800;
+
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub message: String,
@@ -381,15 +386,21 @@ fn run_workspace(
             let mut candidates = discover_workspaces(&repo_record)?;
             store.sync_workspaces(&repo, &candidates)?;
 
+            let leased_at_epoch_s = current_epoch_s()?;
+            // Sweep any leases that have already exceeded their TTL so they
+            // become claimable again.
+            store.expire_stale_leases(&repo, leased_at_epoch_s)?;
+
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
-            let leased_at_epoch_s = current_epoch_s()?;
+            let lease_expires_at = Some(leased_at_epoch_s + DEFAULT_LEASE_TTL_SECS);
             let mut workspace = match store.claim_workspace(
                 &repo,
                 &holder,
                 &task,
                 &lease_id,
                 leased_at_epoch_s,
+                lease_expires_at,
                 prefer.as_deref(),
             )? {
                 Some(ws) => ws,
@@ -404,6 +415,7 @@ fn run_workspace(
                             &task,
                             &lease_id,
                             leased_at_epoch_s,
+                            lease_expires_at,
                             prefer.as_deref(),
                         )?
                         .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?
@@ -418,7 +430,7 @@ fn run_workspace(
             if let Err(error) =
                 reset_workspace(runner, &workspace.workspace_path, &repo_record.main_branch)
             {
-                let _ = store.release_workspace(&lease_id);
+                let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                 return Err(error);
             }
 
@@ -461,6 +473,8 @@ fn run_workspace(
             workspace,
             lease,
             repo,
+            reason,
+            keep_dirty,
         } => {
             let lease = resolve_release_lease(&mut store, workspace, lease, repo)?;
             let workspace = store
@@ -471,16 +485,72 @@ fn run_workspace(
                 store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
                 return Err(CubeError::LeaseNotFound(lease));
             }
-            let repo_record = store
-                .get_repo(&workspace.repo)?
-                .ok_or_else(|| CubeError::RepoNotFound(workspace.repo.clone()))?;
-            reset_workspace(runner, &workspace.workspace_path, &repo_record.main_branch)?;
+            if !keep_dirty {
+                let repo_record = store
+                    .get_repo(&workspace.repo)?
+                    .ok_or_else(|| CubeError::RepoNotFound(workspace.repo.clone()))?;
+                reset_workspace(runner, &workspace.workspace_path, &repo_record.main_branch)?;
+            }
             let released = store
-                .release_workspace(&lease)?
+                .release_workspace(&lease, reason.as_deref())?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
 
+            let message = if keep_dirty {
+                format!("Released {} (kept dirty).", released.workspace_id)
+            } else {
+                format!("Released {}.", released.workspace_id)
+            };
             RunResult::new(
-                format!("Released {}.", released.workspace_id),
+                message,
+                json!({
+                    "workspace": released,
+                }),
+            )
+        }
+        WorkspaceCommand::Heartbeat {
+            lease,
+            ttl_seconds,
+        } => {
+            let now = current_epoch_s()?;
+            let ttl = ttl_seconds
+                .map(|s| s as i64)
+                .unwrap_or(DEFAULT_LEASE_TTL_SECS);
+            let new_expires_at = now + ttl;
+            let updated = store
+                .heartbeat_lease(&lease, Some(new_expires_at))?
+                .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+            RunResult::new(
+                format!(
+                    "Heartbeat lease {}; new expiry {} (in {}s).",
+                    lease, new_expires_at, ttl
+                ),
+                json!({
+                    "workspace": updated,
+                }),
+            )
+        }
+        WorkspaceCommand::ForceRelease {
+            workspace,
+            lease,
+            repo,
+            reason,
+        } => {
+            let lease = resolve_release_lease(&mut store, workspace, lease, repo)?;
+            // Repo-scoped lock so a concurrent normal release can't race.
+            let workspace_record = store
+                .get_workspace_by_lease(&lease)?
+                .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+            let _lock =
+                RepoLock::acquire(&repo_lock_path(&workspace_record.repo, database_path)?)?;
+            let reason = reason.unwrap_or_else(|| "force-released".to_string());
+            let released = store
+                .force_release_lease(&lease, Some(&reason))?
+                .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+            RunResult::new(
+                format!(
+                    "Force-released {} (workspace not reset).",
+                    released.workspace_id
+                ),
                 json!({
                     "workspace": released,
                 }),
@@ -1068,7 +1138,10 @@ mod tests {
     use crate::cli::{Cli, Command};
     use crate::command_runner::{CommandInvocation, CommandRunner};
 
-    use super::{CubeError, RepoEnsureDefaults, Result, run_with_context, run_with_dependencies};
+    use super::{
+        CubeError, RepoEnsureDefaults, Result, current_epoch_s, run_with_context,
+        run_with_dependencies,
+    };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1874,6 +1947,228 @@ mod tests {
         // Workspace id is unknown to the registry until something has synced
         // it, so this surfaces as WorkspaceNotFound.
         assert!(matches!(error, CubeError::WorkspaceNotFound(_)));
+    }
+
+    #[test]
+    fn workspace_release_keep_dirty_skips_reset_and_records_reason() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        // No reset commands expected — --keep-dirty short-circuits the
+        // jj git fetch / jj new main pair.
+        let release_runner = FakeRunner::default();
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "release",
+                "--lease",
+                &lease_id,
+                "--reason",
+                "crash",
+                "--keep-dirty",
+            ]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+
+        assert_eq!(result.payload["workspace"]["state"], "free");
+        assert_eq!(result.payload["workspace"]["last_release_reason"], "crash");
+        assert!(result.message.contains("kept dirty"));
+        release_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_force_release_skips_reset() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+
+        // Force-release runs no shell commands.
+        let release_runner = FakeRunner::default();
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "force-release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("force-release");
+
+        assert_eq!(result.payload["workspace"]["state"], "free");
+        assert_eq!(
+            result.payload["workspace"]["last_release_reason"],
+            "force-released"
+        );
+        release_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_heartbeat_extends_expiry() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        let before_expiry = lease_result.payload["workspace"]["lease_expires_at_epoch_s"]
+            .as_i64()
+            .expect("initial expiry");
+
+        // Sleep a touch so wall-clock current_epoch_s advances; the
+        // heartbeat handler uses it as the new base.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Heartbeat with the default TTL (1800s) — since current_epoch_s
+        // moved forward by >1s since the lease, the new expiry must be
+        // strictly greater than the initial one.
+        let beat_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "heartbeat", "--lease", &lease_id]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("heartbeat");
+
+        let after_expiry = beat_result.payload["workspace"]["lease_expires_at_epoch_s"]
+            .as_i64()
+            .expect("new expiry");
+        assert!(
+            after_expiry > before_expiry,
+            "heartbeat should advance expiry: before={before_expiry}, after={after_expiry}"
+        );
+
+        // Also confirm a custom shorter TTL is honored exactly.
+        let custom = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "heartbeat",
+                "--lease",
+                &lease_id,
+                "--ttl-seconds",
+                "60",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("heartbeat custom");
+        let custom_expiry = custom.payload["workspace"]["lease_expires_at_epoch_s"]
+            .as_i64()
+            .expect("custom expiry");
+        let now_after = current_epoch_s().expect("now");
+        // expiry should be ~60s after the call; allow some slack for slow runners.
+        let delta = custom_expiry - now_after;
+        assert!(
+            (delta - 60).abs() <= 5,
+            "custom expiry {custom_expiry} should be ~now+60={}, delta {delta}s",
+            now_after + 60
+        );
     }
 
     #[test]
