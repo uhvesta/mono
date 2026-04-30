@@ -421,13 +421,39 @@ land before Phase 5 finishes. Split into 6a–6f.
 
 **Phase-5-dependent — gated on Phase 5 ExecutionCoordinator.**
 
-- **6f: spawn integration + cutover.** Engine spawns `claude`
-  subprocess for each scheduled run. App ↔ engine pane-handshake
-  protocol: engine asks app to host a pane for run X; app returns
-  pane handle; engine wires stdio. `lease_id` injection via the
-  `LOCAL_PEERPID` lookup from 6c, correlated through cube
-  workspace pids. Cutover from PoC single-agent transcript model
-  to pane-per-worker; old transcript code removed.
+The engine→app pane RPC design — transport, types, trust model, and
+sub-PR breakdown — lives in
+[`designs/engine-app-rpc`](../../designs/engine-app-rpc.md). The 6f
+work splits along that doc's implementation plan:
+
+- **6f-1: worker pid registry.** Engine-side `WorkerRegistry`
+  with macOS `proc_pidinfo` ancestor walk. Shipped in PR #146.
+- **6f-2: events socket → run-id correlation.** `IncomingHookEvent`
+  gains `run_id` resolved via the registry. Shipped in PR #147.
+- **6f-3: events accept loop on engine startup.** Engine binds the
+  events socket and decodes hook payloads via the registry. Shipped
+  in PR #148.
+- **6f-4: protocol additions.** `RegisterAppSession`,
+  `EngineRequest` event variant, `EngineResponse` request variant,
+  `EngineToAppRequest` / `EngineToAppResponse` enums in
+  `boss-protocol`. Wire types only; no engine or app implementation.
+- **6f-5: engine-side dispatch.** Engine tracks the registered app
+  session, pushes `EngineRequest` events to it, awaits matching
+  `EngineResponse` requests with timeout. Pending-request map keyed
+  by request id; on app-disconnect, every pending sender resolves as
+  `AppDisconnected`.
+- **6f-6: app-side pane allocator.** Refactor
+  `WorkersWorkspaceModel` to support on-demand allocation (currently
+  pre-spawns 8). Wire `EngineRequest` handling. Implement shell-pid
+  lookup via `proc_listpids` (best-effort; brittleness softened by
+  the registry's ancestor walk).
+- **6f-7: spawn-flow wiring.** ExecutionCoordinator calls
+  `engine.spawn_worker_pane()` when a run starts; registers the
+  returned `shell_pid`; releases the pane on terminal state.
+- **6f-8: PoC chat-code cutover.** Remove the chat-style Agents UI
+  references in the app. Boss panel in Work mode keeps using
+  `ChatViewModel` for now — Phase 7 replaces it with a Boss
+  libghostty pane.
 
 **Done when (acceptance).**
 

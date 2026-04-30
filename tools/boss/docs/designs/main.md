@@ -691,6 +691,8 @@ Phasing follows the work-execution rollout (Phase A through G); see
 - [`work-cli`](work-cli.md) — `boss` CLI command map.
 - [`work-subscriptions`](work-subscriptions.md) — engine pub/sub
   protocol.
+- [`engine-app-rpc`](engine-app-rpc.md) — engine → app pane RPCs
+  layered on the frontend socket (Phase 6f spawn flow).
 - [cube `main`](../../../cube/docs/main.md) — workspace pool layer.
 - [cube `remaining-work`](../../../cube/docs/remaining-work.md) —
   cube V2 prerequisites.
