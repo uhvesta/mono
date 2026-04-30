@@ -1532,15 +1532,264 @@ These should be tracked as Boss V2 implementation tasks. R6
 inherits durable-recovery details; R8 inherits the `boss` vs
 `bossctl` CLI-surface decision.
 
+## R6: Crash and resume
+
+### Why it matters
+
+Boss V2 runs nine long-lived `claude` sessions for hours at a time
+across an active workday. App quits, engine restarts (during dev
+or after a panic), single workers crash, and OS reboots are all
+ordinary lifecycle events. Without a recovery story, every crash
+abandons in-progress work and the user has to re-bootstrap state.
+
+R5 explicitly delegated the recovery semantics here: it committed
+to "queue + active assignments persist in SQLite" but punted
+*reattachment policy* and *what's irrecoverable* to R6.
+
+### Crash classes
+
+State spans three layers, and each crash class hits a different
+subset:
+
+- **Boss-engine SQLite**: tasks, queue, lease IDs, `claude`
+  session IDs, worker assignments.
+- **Cube SQLite**: workspace pool, leases (heartbeat-protected
+  TTL per R4).
+- **Claude Code on disk**: per-session JSONL transcripts at
+  `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
+
+| Class | Engine | Workers | Cube state | Disk JSONL |
+|---|---|---|---|---|
+| App restart | alive | alive | alive | intact |
+| Engine restart | dead → reconciles | alive | alive (TTL holds) | intact |
+| Worker crash | alive | one dead | alive | intact |
+| OS reboot | dead | dead | TTL expires | intact |
+
+### Hard constraints
+
+- **SQLite is the source of truth** for task state, queue
+  contents, worker→task bindings, and `claude` session IDs.
+  Other layers reconcile against it.
+- **Cube is the source of truth for workspace ownership** (it
+  enforces lease TTL and `flock`).
+- **Claude Code session JSONL is the source of truth for
+  transcript content** but is read-only from Boss-engine's
+  perspective — Boss never writes it.
+- **`claude --resume` must work programmatically** — required by
+  the working decision below. Validated by the POC.
+
+### Working decision
+
+**SQLite primary; reconcile against cube and `claude` process
+state on every restart; worker recovery uses `claude --resume`.**
+
+For each crash class:
+
+- **App restart**: engine + workers survive. App reconnects to
+  engine over its existing socket; engine replays full state.
+  No worker disruption.
+- **Engine restart**: workers survive (claude processes are
+  parent-of-engine independent under launchd / equivalent). On
+  startup, engine reads SQLite, then reconciles against:
+  - cube (`cube workspace list --json --holder boss/*` —
+    confirm leases still held)
+  - claude process state (does the recorded pid still exist?
+    is the recorded session_id resumable?)
+  Three-way OK → reattach by resuming the hook event channel
+  (R2's socket) and `claude --resume`-ing if the process died
+  in the gap. Mismatch → see "lost-state policy" below.
+- **Worker crash** (single `claude` dies): engine sees socket
+  disconnect or `WorkerEvent::SessionEnded` reason ≠ `other`.
+  Re-spawns `claude --resume <session_id>` in the same workspace.
+  Conversation context preserved (POC verified).
+- **OS reboot**: cold start. Cube TTLs expire → workspaces are
+  free; tasks marked `active` in SQLite are reconciled to
+  `queued` (no resumption attempt — too much external state lost).
+  User can re-dispatch from Work UI.
+
+### Decisive unknowns
+
+All resolved as part of the working decision. The load-bearing
+empirical question (`claude --resume` viability) was validated
+in the POC below.
+
+#### 1. `claude --resume` viability
+
+**POC at `/tmp/r6-poc-001/` and `/tmp/r6-poc-002/` (throwaway).**
+Hook config from R2 captured all events to a JSONL file.
+
+Test 1 — clean resume:
+
+```text
+$ claude --model haiku -p "Say the word 'pomegranate'."
+pomegranate
+# events: SessionStart{source:"startup"}, UserPromptSubmit, Stop, SessionEnd
+# session_id captured: c75cbb6d-22f7-47b1-bdfc-ce65dd2b9b54
+
+$ claude --model haiku --resume c75cbb6d-… -p "What word did I just ask?"
+pomegranate
+# events: SessionStart{source:"resume"}, UserPromptSubmit, Stop, SessionEnd
+# same session_id preserved
+```
+
+Test 2 — mid-turn kill resume:
+
+```text
+# Background: claude runs Bash backgrounded (TaskOutput polling)
+# Killed claude (and child tree) ~6s in via pkill -KILL
+# events at kill: SessionStart, UserPromptSubmit, PreToolUse{Bash},
+#   PostToolUse{Bash}, PreToolUse{TaskOutput}  — no Stop, no SessionEnd
+$ claude --resume <sid> -p "What were you doing? Did the bash finish?"
+> "I ran a bash command in the background … task ID is no longer
+>  found, which means it has completed."
+# events: SessionStart{source:"resume"}, UserPromptSubmit, Stop, SessionEnd
+# same session_id preserved
+```
+
+Confirmed:
+
+- Programmatic invocation works (no interactive picker required).
+- Same `session_id` preserved across resume — Boss-engine SQLite
+  and JSONL stay consistent.
+- `SessionStart` fires with `source: "resume"` — clean signal
+  for boss-engine to distinguish from `"startup"`.
+- `.claude/settings.json` hook config loads correctly post-resume.
+- Conversation context preserved.
+- Mid-turn kill recovers cleanly into a new turn that can read
+  prior context.
+
+#### 2. What's explicitly irrecoverable
+
+**Mid-turn tool side effects** that hadn't completed at kill
+time. Per the POC: claude does not retry orphaned tool calls; it
+infers completion from the missing task ID. Three sub-cases:
+
+- **Tool ran to completion before kill**: side effects (files
+  written, PRs opened, etc.) survive on disk / GitHub. Claude
+  on resume sees them via fresh Read / Bash.
+- **Tool was in-flight at kill**: side effects partial or absent.
+  Claude on resume assumes completion. Discrepancy with actual
+  state must be recovered by the next turn (human / Boss prompts
+  "did X actually happen?", claude verifies).
+- **Tool not yet started (PreToolUse never fired)**: clean
+  resume; claude re-decides whether to run the tool.
+
+**LLM streaming output mid-token** at kill is also lost —
+unrecoverable, accept.
+
+**The libghostty pane buffer** is in-memory; on app restart, the
+visible scrollback for each pane is lost. Boss-engine can
+re-render the pane from the JSONL transcript if we want, but
+for V2 this is a hot view that resets on restart — accepted.
+
+#### 3. Engine reattachment policy
+
+**Three-way reconcile per `active` task on engine startup:**
+
+```text
+SQLite says: task active, assigned worker_id, claude session_id, lease_id
+Cube says:   lease_id still held by boss/* OR not
+Process:     claude pid alive OR not; if dead, --resume probe succeeds OR not
+
+3 yes → reattach (rewire R2 hook socket; if claude died, --resume)
+2 yes → reattach if "process dead" is the missing one (--resume)
+1 yes (only SQLite) → declare lost (see below)
+0 yes (mismatch elsewhere) → declare lost
+```
+
+**Declare-lost policy**: task moves from `active` to
+`queued` (so the user can re-dispatch from Work UI without
+manually fixing state). The lost session_id is recorded in
+`task.previous_session_ids` for audit. Cube lease force-released
+if held.
+
+#### 4. App reattachment
+
+**Full state replay** on engine reconnect (v1).
+
+- App connects → engine streams snapshot: all tasks + their
+  status, all worker session metadata, all queued items.
+- After snapshot, app subscribes to the same `WorkerEvent`
+  stream (R2) plus a `WorkItemUpdated` stream for status
+  transitions.
+
+Delta-since-sequence is a future optimization; not worth the
+complexity v1.
+
+#### 5. Lease TTL + heartbeat
+
+**TTL: 30 minutes (R4 default). Heartbeat: every 5 minutes from
+boss-engine.** Missed-heartbeat policy:
+
+- Cube marks the lease eligible for force-release after
+  `2 × heartbeat_interval = 10 min` without a ping.
+- Cube's `workspace force-release` (per cube remaining-work
+  doc — currently unimplemented) will reclaim the slot.
+- Boss-engine, on restart, immediately heartbeats all leases
+  it owns from SQLite. If cube refuses (TTL already expired
+  and slot reclaimed), the task is declared lost (see §3).
+
+#### 6. OS reboot
+
+Cold start — every layer needs to come back from disk. Cube
+TTLs will all be expired by the time the engine starts; force-release
+all `boss/*`-held leases as part of startup reconcile. Tasks that
+were `active` at reboot move to `queued`. User re-dispatches.
+
+We do **not** auto-resume on reboot, even though `claude --resume`
+would technically work, because the surrounding environment
+(file edits in flight, network calls partway through, etc.)
+makes silent auto-resumption error-prone. The user gets a clear
+"these tasks were active when the machine restarted; here's the
+queue" view in Work UI.
+
+### Resolution criteria
+
+- Source-of-truth layering committed.
+- Crash classes enumerated with per-class behavior.
+- `claude --resume` empirically validated.
+- Reattachment policy defined.
+- Explicit irrecoverable list committed.
+
+### Decision
+
+**SQLite is the source of truth; reconcile against cube and
+process state on engine startup; worker recovery is
+`claude --resume <session_id>`.** All decisive unknowns are
+resolved above. The POC at `/tmp/r6-poc-{001,002}/` validates
+the load-bearing primitive.
+
+Implementation work this implies for V2:
+
+- Boss-engine: persist `task.claude_session_id` and
+  `task.assigned_worker_pid` columns alongside R5's queue state.
+- Boss-engine: startup reconciliation pass — three-way check
+  against cube and process state for each `active` task.
+- Boss-engine: heartbeat to cube every 5 min for held leases.
+- Boss-engine: socket reconnect logic for live workers (R2's
+  hook events socket needs to accept reconnects from existing
+  workers post-engine-restart).
+- Boss-engine: `claude --resume` in cube workspace on worker
+  crash detection.
+- Boss-engine: state-snapshot RPC for app reattachment; v1 ships
+  full snapshot, delta later.
+- SwiftUI app: connect → snapshot → subscribe; show "these
+  tasks were active when [engine restarted | machine
+  restarted]; review and re-dispatch."
+- Cube: implement `workspace heartbeat`, `--reason crash
+  --keep-dirty` on release, and `workspace force-release` (per
+  R4 working decision; tracked in cube remaining-work doc).
+
+These should be tracked as Boss V2 implementation tasks. R7
+inherits the human-facing "review what was lost" affordance for
+the work-item review/approval flow.
+
 ## Risk backlog
 
 These risks have been identified but not yet worked through. They are
 listed here so we don't lose them; we'll write each one up properly when
 we get to it. Order is rough priority, not strict sequence.
 
-- **R6: Crash and resume.** What persists across app restarts? How do we
-  reattach to running `claude` sessions, and which state lives in the
-  engine vs the app vs Claude Code itself?
 - **R7: Review and approval flow.** "Ready for review" is a state in the
   plan but the human's review affordance is undefined. Decide where in
   Work mode this lives.
