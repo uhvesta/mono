@@ -34,7 +34,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 
 | Phase | Title                                          | Status                       |
 |-------|------------------------------------------------|------------------------------|
-| 1     | Engine and CLI foundations                     | 🟢 named deliverables shipped; small CLI follow-ups (Product/Project delete+move) tracked under Pending |
+| 1     | Engine and CLI foundations                     | 🟢 named deliverables shipped; CLI follow-ups (Product/Project delete+move) landed |
 | 2     | Multi-client subscriptions                     | 🟡 mostly shipped — outbound queue is unbounded, no coalescing or slow-client disconnect |
 | 3     | Kanban Work tab                                | 🟢 shipped                   |
 | 4     | Execution layer + cube V2 prereqs              | 🟡 mostly shipped — cube driver missing `status` subcommand |
@@ -111,12 +111,17 @@ public-facing `boss` CLI for work-taxonomy CRUD.
   `Discovery::from_env(...)` + `BossClient::connect(&discovery)`
   (`cli/src/main.rs`).
 - `boss` CLI binary at `tools/boss/cli/` with subcommands shipped:
-  - `product` — Create / List / Show / Update.
-  - `project` — Create / List / Show / Update.
+  - `product` — Create / List / Show / Update / Move / Delete.
+  - `project` — Create / List / Show / Update / Move / Delete.
   - `task` — Create / List / Show / Update / Move / Delete /
     Reorder.
   - `chore` — Create / List / Show / Update / Move / Delete.
   - `engine` — Status / Start / Stop.
+  - Product/Project `delete` is a soft archive (sets status=archived);
+    the engine refuses hard delete for these entities. `move --to`
+    accepts the entity's lifecycle status enum
+    (active/paused/archived for products; planned/active/blocked/
+    done/archived for projects).
 - `--json`, `--quiet`, `--no-input`, `--no-autostart` global flags;
   TTY prompts on interactive create flows.
 - Concurrent-client integration test: in-process engine on temp
@@ -126,15 +131,8 @@ public-facing `boss` CLI for work-taxonomy CRUD.
   entry point used by tests, taking explicit socket + optional
   pid-file paths so no env mutation is required.
 
-**Pending (small CLI follow-ups, do not block downstream phases).**
+**Pending.**
 
-- `boss product delete` and `boss project delete` — the original
-  deliverables listed full CRUD on every entity; Product and Project
-  currently lack `delete`. Track as a separate small CLI chore.
-- `boss product move` and `boss project move` — same; `move` was
-  named for every entity in the deliverables. Adding it depends on
-  what board semantics make sense for products/projects (likely
-  status transitions only).
 - `boss chore reorder` — chores aren't ordered within projects in
   the schema, so this is a no-op until the schema introduces
   ordering. No action needed unless the schema changes.

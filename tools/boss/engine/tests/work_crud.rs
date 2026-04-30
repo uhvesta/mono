@@ -159,6 +159,35 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
     let chores_after = list_chores(&mut client, &product.id).await?;
     assert!(chores_after.iter().all(|item| item.id != chore.id));
 
+    // Mirror what `boss product delete` / `boss project delete` do on the
+    // wire: the CLI archives instead of hard-deleting, since the engine
+    // refuses hard delete of products/projects.
+    let archived_project = expect_project(
+        update_work_item(
+            &mut client,
+            &project.id,
+            WorkItemPatch {
+                status: Some("archived".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(archived_project.status, "archived");
+
+    let archived_product = expect_product(
+        update_work_item(
+            &mut client,
+            &product.id,
+            WorkItemPatch {
+                status: Some("archived".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(archived_product.status, "archived");
+
     Ok(())
 }
 

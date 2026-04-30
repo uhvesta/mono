@@ -74,6 +74,11 @@ enum ProductCommand {
     List,
     Show(ProductSelectorArg),
     Update(ProductUpdateArgs),
+    /// Archive a product. Products are not hard-deleted; the engine convention
+    /// is to set status=archived so the row stays available for history.
+    Delete(ProductSelectorArg),
+    /// Move a product into a different lifecycle status (active/paused/archived).
+    Move(ProductMoveArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,6 +87,12 @@ enum ProjectCommand {
     List(ProjectListArgs),
     Show(ProjectShowArgs),
     Update(ProjectUpdateArgs),
+    /// Archive a project. Projects are not hard-deleted; the engine convention
+    /// is to set status=archived so the row stays available for history.
+    Delete(ProjectSelectorArgs),
+    /// Move a project into a different lifecycle status
+    /// (planned/active/blocked/done/archived).
+    Move(ProjectMoveArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,6 +298,25 @@ struct TaskMoveArgs {
 
     #[arg(long = "to")]
     target: MoveTarget,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProductMoveArgs {
+    selector: String,
+
+    #[arg(long = "to")]
+    target: ProductStatus,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProjectMoveArgs {
+    #[arg(long)]
+    product: Option<String>,
+
+    selector: String,
+
+    #[arg(long = "to")]
+    target: ProjectStatus,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -575,7 +605,9 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
         status_semantics: vec![
             "CLI status values use in-review on the command line.",
             "Internally, in-review maps to in_review.",
-            "Move targets map as follows: backlog|todo -> todo, doing|active -> active, review|in-review -> in_review, blocked -> blocked, done -> done.",
+            "Task and chore move targets map: backlog|todo -> todo, doing|active -> active, review|in-review -> in_review, blocked -> blocked, done -> done.",
+            "Product move/delete: --to active|paused|archived. delete is a soft archive (sets status=archived).",
+            "Project move/delete: --to planned|active|blocked|done|archived. delete is a soft archive (sets status=archived).",
         ],
         workflow_guidance: vec![
             "Use the current UI or conversational context first when deciding where new work belongs.",
@@ -726,6 +758,41 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 print_product_details("Updated product", &product);
             })
         }
+        ProductCommand::Delete(args) => {
+            let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+            let patch = WorkItemPatch {
+                status: Some(ProductStatus::Archived.as_str().to_owned()),
+                ..WorkItemPatch::default()
+            };
+            let archived = expect_product(update_work_item(&mut client, &product.id, patch).await?)?;
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "product": archived,
+                    "deleted": true,
+                    "archived": true,
+                }),
+                || {
+                    if !ctx.quiet {
+                        println!(
+                            "Archived product {} ({}) — products are not hard-deleted.",
+                            archived.name, archived.slug,
+                        );
+                    }
+                },
+            )
+        }
+        ProductCommand::Move(args) => {
+            let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+            let patch = WorkItemPatch {
+                status: Some(args.target.as_str().to_owned()),
+                ..WorkItemPatch::default()
+            };
+            let moved = expect_product(update_work_item(&mut client, &product.id, patch).await?)?;
+            print_entity(ctx, &serde_json::json!({ "product": moved }), || {
+                print_product_details("Moved product", &moved);
+            })
+        }
     }
 }
 
@@ -790,6 +857,45 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let project = expect_project(item)?;
             print_entity(ctx, &serde_json::json!({ "project": project }), || {
                 print_project_details("Updated project", &project);
+            })
+        }
+        ProjectCommand::Delete(args) => {
+            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let project =
+                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let patch = WorkItemPatch {
+                status: Some(ProjectStatus::Archived.as_str().to_owned()),
+                ..WorkItemPatch::default()
+            };
+            let archived = expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "project": archived,
+                    "deleted": true,
+                    "archived": true,
+                }),
+                || {
+                    if !ctx.quiet {
+                        println!(
+                            "Archived project {} ({}) — projects are not hard-deleted.",
+                            archived.name, archived.slug,
+                        );
+                    }
+                },
+            )
+        }
+        ProjectCommand::Move(args) => {
+            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let project =
+                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let patch = WorkItemPatch {
+                status: Some(args.target.as_str().to_owned()),
+                ..WorkItemPatch::default()
+            };
+            let moved = expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
+            print_entity(ctx, &serde_json::json!({ "project": moved }), || {
+                print_project_details("Moved project", &moved);
             })
         }
     }
@@ -1621,7 +1727,10 @@ fn print_task_details(title: &str, task: &Task) {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Commands, MoveTarget, ProductCommand, TaskCommand, pick_by_index};
+    use super::{
+        Cli, Commands, MoveTarget, ProductCommand, ProductStatus, ProjectCommand, ProjectStatus,
+        TaskCommand, pick_by_index,
+    };
 
     #[test]
     fn move_target_maps_review_to_in_review() {
@@ -1655,6 +1764,80 @@ mod tests {
             }
             _ => panic!("expected task move command"),
         }
+    }
+
+    #[test]
+    fn parses_product_delete_command() {
+        let cli = Cli::parse_from(["boss", "product", "delete", "boss"]);
+        match cli.command {
+            Commands::Product {
+                command: ProductCommand::Delete(args),
+            } => {
+                assert_eq!(args.selector, "boss");
+            }
+            _ => panic!("expected product delete command"),
+        }
+    }
+
+    #[test]
+    fn parses_product_move_command() {
+        let cli = Cli::parse_from(["boss", "product", "move", "boss", "--to", "paused"]);
+        match cli.command {
+            Commands::Product {
+                command: ProductCommand::Move(args),
+            } => {
+                assert_eq!(args.selector, "boss");
+                assert!(matches!(args.target, ProductStatus::Paused));
+            }
+            _ => panic!("expected product move command"),
+        }
+    }
+
+    #[test]
+    fn parses_project_delete_command() {
+        let cli = Cli::parse_from([
+            "boss", "project", "delete", "work-cli", "--product", "boss",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::Delete(args),
+            } => {
+                assert_eq!(args.selector, "work-cli");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected project delete command"),
+        }
+    }
+
+    #[test]
+    fn parses_project_move_command() {
+        let cli = Cli::parse_from([
+            "boss", "project", "move", "work-cli", "--product", "boss", "--to", "done",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::Move(args),
+            } => {
+                assert_eq!(args.selector, "work-cli");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert!(matches!(args.target, ProjectStatus::Done));
+            }
+            _ => panic!("expected project move command"),
+        }
+    }
+
+    #[test]
+    fn product_status_archived_serializes_to_archived() {
+        assert_eq!(ProductStatus::Archived.as_str(), "archived");
+        assert_eq!(ProductStatus::Active.as_str(), "active");
+        assert_eq!(ProductStatus::Paused.as_str(), "paused");
+    }
+
+    #[test]
+    fn project_status_archived_serializes_to_archived() {
+        assert_eq!(ProjectStatus::Archived.as_str(), "archived");
+        assert_eq!(ProjectStatus::Done.as_str(), "done");
+        assert_eq!(ProjectStatus::Planned.as_str(), "planned");
     }
 
     #[test]
