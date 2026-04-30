@@ -1,0 +1,165 @@
+import Foundation
+import GhosttyKit
+
+enum ClaudeMonitorState: Equatable {
+    case unavailable
+    case notDetected
+    case ready
+    case working
+
+    var label: String {
+        switch self {
+        case .unavailable:
+            "Claude Unknown"
+        case .notDetected:
+            "Claude Not Detected"
+        case .ready:
+            "Claude Ready"
+        case .working:
+            "Claude Is Working"
+        }
+    }
+}
+
+struct TerminalLaunchSpec {
+    let fontSize: Float32
+    let workingDirectory: String
+    let initialInput: String
+}
+
+struct ClaudeMonitorSnapshot {
+    let tail: String
+    let claudeVisible: Bool
+    let busy: Bool
+    let promptVisible: Bool
+    let promptLine: String?
+    let starting: Bool
+}
+
+struct ClaudeMonitorTracker {
+    private let idleDebouncePolls = 2
+    private var lastTail: String?
+    private var lastPromptLine: String?
+    private var turnInFlight = false
+    private var stablePromptPolls = 0
+
+    mutating func reset() {
+        lastTail = nil
+        lastPromptLine = nil
+        turnInFlight = false
+        stablePromptPolls = 0
+    }
+
+    mutating func evaluate(_ snapshot: ClaudeMonitorSnapshot?) -> ClaudeMonitorState {
+        guard let snapshot else {
+            reset()
+            return .unavailable
+        }
+
+        guard snapshot.claudeVisible else {
+            reset()
+            return .notDetected
+        }
+
+        let tailChanged = lastTail.map { $0 != snapshot.tail } ?? false
+        let promptJustSubmitted =
+            !turnInFlight &&
+            tailChanged &&
+            promptHasInput(lastPromptLine) &&
+            snapshot.promptVisible &&
+            !promptHasInput(snapshot.promptLine)
+
+        defer {
+            lastTail = snapshot.tail
+            lastPromptLine = snapshot.promptLine
+        }
+
+        if snapshot.busy || snapshot.starting {
+            turnInFlight = true
+            stablePromptPolls = 0
+            return .working
+        }
+
+        if promptJustSubmitted {
+            turnInFlight = true
+            stablePromptPolls = 0
+        }
+
+        if snapshot.promptVisible {
+            guard turnInFlight else {
+                stablePromptPolls = 0
+                return .ready
+            }
+
+            stablePromptPolls = tailChanged ? 1 : stablePromptPolls + 1
+            if stablePromptPolls >= idleDebouncePolls {
+                turnInFlight = false
+                stablePromptPolls = 0
+                return .ready
+            }
+
+            return .working
+        }
+
+        turnInFlight = true
+        stablePromptPolls = 0
+        return .working
+    }
+
+    private func promptHasInput(_ promptLine: String?) -> Bool {
+        guard let promptLine else { return false }
+        let trimmed = promptLine.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("❯") else { return false }
+        return !trimmed.dropFirst().trimmingCharacters(in: .whitespaces).isEmpty
+    }
+}
+
+enum PaneRole: Equatable {
+    case boss
+    case worker(slot: Int)
+
+    var defaultTitle: String {
+        switch self {
+        case .boss: "Boss"
+        case .worker(let slot): "Worker \(slot)"
+        }
+    }
+}
+
+@MainActor
+final class TerminalPaneSession: ObservableObject, Identifiable {
+    let id: String
+    let role: PaneRole
+    let launchSpec: TerminalLaunchSpec
+
+    @Published var displayTitle: String
+    @Published var workingDirectory: String
+    @Published var rendererHealthy = false
+    @Published var statusMessage: String?
+    @Published var terminalReady = false
+    @Published var claudeState: ClaudeMonitorState = .unavailable
+
+    weak var hostView: GhosttyTerminalHostView?
+    private var claudeMonitorTracker = ClaudeMonitorTracker()
+
+    init(id: String, role: PaneRole, launchSpec: TerminalLaunchSpec) {
+        self.id = id
+        self.role = role
+        self.launchSpec = launchSpec
+        self.displayTitle = role.defaultTitle
+        self.workingDirectory = launchSpec.workingDirectory
+    }
+
+    func setTitle(_ title: String) {
+        displayTitle = title.isEmpty ? role.defaultTitle : title
+    }
+
+    func attach(hostView: GhosttyTerminalHostView) {
+        self.hostView = hostView
+        terminalReady = true
+    }
+
+    func updateClaudeMonitor(snapshot: ClaudeMonitorSnapshot?) {
+        claudeState = claudeMonitorTracker.evaluate(snapshot)
+    }
+}

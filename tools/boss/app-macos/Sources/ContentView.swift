@@ -10,12 +10,27 @@ private let workBossPanelCollapsedWidth: CGFloat = 88
 
 struct ContentView: View {
     @StateObject private var model = ChatViewModel()
+    #if canImport(GhosttyKit)
+    @StateObject private var workersWorkspace = WorkersWorkspaceModel()
+    #endif
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            detail
+        // Both modes are rendered simultaneously and toggled via opacity +
+        // hit-testing. SwiftUI's structural `if`/`else` would tear down the
+        // libghostty NSViews on every Agents↔Work switch, which would force
+        // `ghostty_surface_new` and restart every claude session.
+        ZStack {
+            NavigationSplitView {
+                sidebar
+            } detail: {
+                detail
+            }
+            .opacity(model.navigationMode == .work ? 1 : 0)
+            .allowsHitTesting(model.navigationMode == .work)
+
+            agentsView
+                .opacity(model.navigationMode == .agents ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .agents)
         }
         .frame(minWidth: 860, minHeight: 560)
         .task {
@@ -36,13 +51,7 @@ struct ContentView: View {
             }
 
             ToolbarItem {
-                if model.navigationMode == .agents {
-                    Button {
-                        model.createAgent()
-                    } label: {
-                        Label("New Agent", systemImage: "plus")
-                    }
-                } else {
+                if model.navigationMode == .work {
                     Menu {
                         Button("New Product") {
                             model.presentCreateProduct()
@@ -134,71 +143,33 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        Group {
-            if model.navigationMode == .agents {
-                agentSidebar
-            } else {
-                workSidebar
-            }
-        }
-        .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 360)
+        workSidebar
+            .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 360)
     }
 
     private var detail: some View {
-        Group {
-            if model.navigationMode == .agents {
-                agentDetail
-            } else {
-                workDetail
-            }
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
+        workDetail
+            .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private var agentSidebar: some View {
-        List(model.agents, selection: $model.selectedAgentID) { agent in
-            HStack {
-                Image(systemName: agent.role.systemImage)
-                    .foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(agent.name)
-                        .font(.body)
-                    if agent.isBoss {
-                        Text("Coordinator")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if !agent.isReady {
-                        Text("Starting…")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    } else if agent.isSending {
-                        Text("Working…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .tag(agent.id)
+    private var agentsView: some View {
+        #if canImport(GhosttyKit)
+        WorkersDetailView(workspace: workersWorkspace)
+            .background(Color(nsColor: .windowBackgroundColor))
+        #else
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Agents mode requires GhosttyKit.")
+                .font(.title3.weight(.semibold))
+            Text("Run `tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh` and rebuild with SwiftPM.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
         }
-        .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
-            HStack {
-                Button {
-                    model.createAgent()
-                } label: {
-                    Label("New Agent", systemImage: "plus")
-                }
-                .buttonStyle(.borderless)
-                Spacer()
-                if !model.isConnected {
-                    Label("Disconnected", systemImage: "circle.fill")
-                        .foregroundStyle(.red)
-                        .font(.caption)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(nsColor: .windowBackgroundColor))
+        #endif
     }
 
     private var workSidebar: some View {
@@ -321,21 +292,6 @@ struct ContentView: View {
                 model.selectWorkProduct(productID)
             }
         )
-    }
-
-    private var agentDetail: some View {
-        VStack(spacing: 0) {
-            messageList(items: model.selectedAgentTimeline)
-            composer(
-                draft: $model.draft,
-                agentID: model.selectedAgentID,
-                isReady: model.isSelectedAgentReady,
-                isSending: model.isSelectedAgentSending,
-                autoFocus: true,
-                focusTrigger: model.selectedAgentID,
-                onSend: model.sendDraft
-            )
-        }
     }
 
     private var workDetail: some View {

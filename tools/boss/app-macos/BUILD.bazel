@@ -11,6 +11,11 @@ exports_files([
 swift_library(
     name = "boss_mac_app_lib",
     module_name = "BossMacApp",
+    # Single-level glob: Sources/Ghostty/*.swift is intentionally excluded
+    # from the Bazel build. Those files require GhosttyKit.xcframework, which
+    # is built out-of-band by scripts/bootstrap-ghosttykit.sh and only wired
+    # through SwiftPM. The Workers mode in ContentView is gated on
+    # `canImport(GhosttyKit)` and shows a placeholder under Bazel.
     srcs = glob(["Sources/*.swift"]),
     deps = [
         "@swiftpkg_textual//:Textual",

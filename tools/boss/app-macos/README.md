@@ -70,3 +70,51 @@ BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools
 - `BOSS_SHOW_SYSTEM_MESSAGES`: set `1` to include internal system status messages
 - `BOSS_ENGINE_LOG_PATH`: log file path (default `/tmp/boss-engine.log`)
 - `RUST_LOG`: tracing filter for engine logs (default `info,acp_stderr=debug`)
+
+## Agents mode (Phase 6a libghostty embedding)
+
+The toolbar's **Agents** mode is a full-bleed 4 × 2 grid of `libghostty`
+terminal panes (one per worker slot). Each pane runs `claude` directly
+via libghostty `initial_input` — engine-driven spawn lands in Phase 6f.
+
+The Boss pane is intentionally not here; per the V2 design it lives in
+**Work** mode as a docked panel (Phase 7). Phase 6a ships only the
+worker grid.
+
+### Bootstrap
+
+`GhosttyKit.xcframework` is **not** checked in. Build it locally first:
+
+```bash
+cd tools/boss/app-macos
+./scripts/bootstrap-ghosttykit.sh
+```
+
+The script clones `ghostty-org/ghostty`, builds the macOS xcframework via
+zig, and places it at `tools/boss/app-macos/ThirdParty/GhosttyKit.xcframework`.
+
+Requirements: macOS 15+, Xcode Metal Toolchain (`xcodebuild
+-downloadComponent MetalToolchain`), and `zig@0.15` (Homebrew preferred,
+falls back to a cached download).
+
+### Run
+
+Agents-mode panes are currently SwiftPM-only:
+
+```bash
+cd tools/boss/app-macos
+swift run BossMacApp
+```
+
+The Bazel build does not include `Sources/Ghostty/*.swift`; under Bazel
+the Agents tab shows a placeholder pointing at this section. The Work
+tab is unaffected and continues to function in both build paths.
+
+### Known limitation: claude folder-trust prompt
+
+Each pane launches `claude` in `$HOME` with no leased workspace yet, so
+on first run claude shows its interactive workspace-trust prompt
+("Accept" / "Cancel"). Click Accept once per pane the first time; the
+acceptance is persisted in `~/.claude.json` and won't repeat on
+subsequent app launches. This goes away in Phase 6f, where each worker
+runs in a leased cube workspace the user already trusts.

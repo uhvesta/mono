@@ -11,12 +11,21 @@ let package = Package(
         .package(url: "https://github.com/gonzalezreal/textual", from: "0.1.0"),
     ],
     targets: [
+        .binaryTarget(
+            name: "GhosttyKit",
+            path: "ThirdParty/GhosttyKit.xcframework"
+        ),
         .executableTarget(
             name: "BossMacApp",
             dependencies: [
                 .product(name: "Textual", package: "textual"),
+                "GhosttyKit",
             ],
-            path: "Sources"
+            path: "Sources",
+            linkerSettings: [
+                .linkedFramework("Carbon"),
+                .linkedLibrary("c++"),
+            ]
         ),
     ]
 )
