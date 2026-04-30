@@ -16,6 +16,7 @@ use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner}
 use crate::lock::RepoLock;
 use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceRecord, WorkspaceState};
 use crate::paths;
+use crate::setup::{self, SetupReport, StepStatus, run_setup_engine};
 use crate::store::{Store, WorkspaceListFilter};
 
 type Result<T> = std::result::Result<T, CubeError>;
@@ -63,6 +64,8 @@ pub enum CubeError {
     LeaseNotFound(String),
     #[error("change `{0}` is not tracked")]
     ChangeNotFound(String),
+    #[error("setup step `{step}` failed: {error}")]
+    SetupStepFailed { step: String, error: String },
     #[error("failed to access Cube metadata: {0}")]
     Storage(#[source] rusqlite::Error),
     #[error("failed to prepare Cube data directory: {0}")]
@@ -98,6 +101,7 @@ impl CubeError {
             Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) | Self::ChangeNotFound(_) => {
                 ExitCode::from(5)
             }
+            Self::SetupStepFailed { .. } => ExitCode::from(6),
             Self::Storage(_) | Self::Io(_) | Self::CommandFailed { .. } | Self::Json(_) => {
                 ExitCode::FAILURE
             }
@@ -422,14 +426,34 @@ fn run_workspace(
             store.update_workspace_head_commit(&lease_id, Some(&head_commit))?;
             workspace.head_commit = Some(head_commit);
 
+            let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
+
+            let lease_message = format!(
+                "Leased {} at {}.",
+                workspace.workspace_id,
+                workspace.workspace_path.display()
+            );
+
+            if let Some(failure) = setup_report.first_failure() {
+                // Lease is intentionally retained: the workspace is leased
+                // but its setup needs repair (`cube workspace setup`) or
+                // explicit release. The error surfaces the failed step so
+                // callers can decide how to recover.
+                let StepStatus::Failed { error } = &failure.status else {
+                    unreachable!("first_failure returned non-failure step");
+                };
+                return Err(CubeError::SetupStepFailed {
+                    step: failure.id.clone(),
+                    error: error.clone(),
+                });
+            }
+
+            let message = format_lease_message(&lease_message, &setup_report);
             RunResult::new(
-                format!(
-                    "Leased {} at {}.",
-                    workspace.workspace_id,
-                    workspace.workspace_path.display()
-                ),
+                message,
                 json!({
                     "workspace": workspace,
+                    "setup": setup_report,
                 }),
             )
         }
@@ -480,13 +504,22 @@ fn run_workspace(
             let path = PathBuf::from(&workspace);
             let record = find_workspace_record(&mut store, &path)?
                 .ok_or_else(|| CubeError::WorkspaceNotFound(workspace.clone()))?;
-            RunResult::new(
-                format!("No setup steps are configured for {}.", record.workspace_id),
-                json!({
-                    "workspace": record,
-                    "steps": [],
-                }),
-            )
+            let report = run_setup_for_workspace(&store, runner, &record)?;
+            let payload = json!({
+                "workspace": record,
+                "setup": report,
+            });
+            if let Some(failure) = report.first_failure() {
+                let StepStatus::Failed { error } = &failure.status else {
+                    unreachable!("first_failure returned non-failure step");
+                };
+                return Err(CubeError::SetupStepFailed {
+                    step: failure.id.clone(),
+                    error: error.clone(),
+                });
+            }
+            let message = format_setup_message(&record.workspace_id, &report);
+            RunResult::new(message, payload)
         }
         WorkspaceCommand::List {
             repo,
@@ -699,6 +732,40 @@ fn auto_create_workspace(
         workspace_id,
         workspace_path,
     })
+}
+
+fn run_setup_for_workspace(
+    store: &Store,
+    runner: &dyn CommandRunner,
+    workspace: &WorkspaceRecord,
+) -> Result<SetupReport> {
+    let Some(config) = setup::read_setup_config(&workspace.workspace_path)? else {
+        return Ok(SetupReport::empty());
+    };
+    let now = current_epoch_s()?;
+    run_setup_engine(store, runner, workspace, &config, now)
+}
+
+fn format_lease_message(lease_message: &str, report: &SetupReport) -> String {
+    if report.steps.is_empty() {
+        return lease_message.to_string();
+    }
+    format!(
+        "{lease_message} Setup: {} ran, {} skipped.",
+        report.ran_count(),
+        report.skipped_count()
+    )
+}
+
+fn format_setup_message(workspace_id: &str, report: &SetupReport) -> String {
+    if report.steps.is_empty() {
+        return format!("No setup steps are configured for {workspace_id}.");
+    }
+    format!(
+        "Setup complete for {workspace_id}: {} ran, {} skipped.",
+        report.ran_count(),
+        report.skipped_count()
+    )
 }
 
 fn discover_workspaces(repo: &RepoRecord) -> Result<Vec<crate::metadata::WorkspaceCandidate>> {
@@ -2297,6 +2364,402 @@ mod tests {
 
         assert_eq!(info_result.payload["change"]["change_id"], change_id);
         assert_eq!(info_result.payload["change"]["title"], "Implement parser");
+    }
+
+    fn write_setup_yaml(workspace_path: &std::path::Path, body: &str) {
+        let path = workspace_path.join(".cube/setup.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("setup dir");
+        std::fs::write(&path, body).expect("setup yaml");
+    }
+
+    fn lease_runner_for(workspace_path: &std::path::Path, head: &str) -> FakeRunner {
+        FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                head,
+            ),
+        ])
+    }
+
+    fn lease_runner_with_setup(
+        workspace_path: &std::path::Path,
+        head: &str,
+        setup_steps: Vec<ExpectedCommand>,
+    ) -> FakeRunner {
+        let mut commands = vec![
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                head,
+            ),
+        ];
+        commands.extend(setup_steps);
+        FakeRunner::new(commands)
+    }
+
+    fn add_repo_cli(workspace_root: &std::path::Path) -> Cli {
+        Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ])
+    }
+
+    #[test]
+    fn workspace_setup_returns_empty_when_no_setup_yaml() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        let setup_runner = FakeRunner::default();
+        let setup = Cli::parse_from([
+            "cube",
+            "workspace",
+            "setup",
+            "--workspace",
+            &workspace_path.display().to_string(),
+        ]);
+        let result =
+            run_with_dependencies(setup, Some(&database_path), &setup_runner).expect("setup");
+        setup_runner.assert_exhausted();
+        assert_eq!(
+            result.message,
+            "No setup steps are configured for mono-agent-001."
+        );
+        assert_eq!(result.payload["setup"]["steps"], json!([]));
+    }
+
+    #[test]
+    fn workspace_setup_runs_steps_then_skips_when_fingerprint_unchanged() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::write(workspace_path.join("pnpm-lock.yaml"), b"v1").unwrap();
+        write_setup_yaml(
+            &workspace_path,
+            r#"version: 1
+steps:
+  - id: deps
+    command: pnpm install --frozen-lockfile
+    fingerprint:
+      - file: pnpm-lock.yaml
+"#,
+        );
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // First lease runs the deps step.
+        let lease_runner = lease_runner_with_setup(
+            &workspace_path,
+            "abc1234",
+            vec![ExpectedCommand::ok(
+                workspace_path.clone(),
+                "pnpm",
+                &["install", "--frozen-lockfile"],
+                "",
+            )],
+        );
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        lease_runner.assert_exhausted();
+        let setup_steps = lease_result.payload["setup"]["steps"]
+            .as_array()
+            .expect("steps array");
+        assert_eq!(setup_steps.len(), 1);
+        assert_eq!(setup_steps[0]["id"], "deps");
+        assert_eq!(setup_steps[0]["status"], "ran");
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Release so we can re-lease cleanly.
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+
+        // Second lease: lockfile unchanged, deps step is skipped (no
+        // pnpm command in expectations).
+        let second_lease_runner = lease_runner_for(&workspace_path, "def5678");
+        let second_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo2"]),
+            Some(&database_path),
+            &second_lease_runner,
+        )
+        .expect("second lease");
+        second_lease_runner.assert_exhausted();
+        let second_steps = second_result.payload["setup"]["steps"]
+            .as_array()
+            .expect("steps array");
+        assert_eq!(second_steps.len(), 1);
+        assert_eq!(second_steps[0]["status"], "skipped");
+        assert_eq!(second_steps[0]["reason"], "fingerprint_unchanged");
+    }
+
+    #[test]
+    fn workspace_setup_reruns_when_lockfile_changes() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::write(workspace_path.join("pnpm-lock.yaml"), b"v1").unwrap();
+        write_setup_yaml(
+            &workspace_path,
+            r#"version: 1
+steps:
+  - id: deps
+    command: pnpm install
+    fingerprint:
+      - file: pnpm-lock.yaml
+"#,
+        );
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_with_setup(
+            &workspace_path,
+            "abc1234",
+            vec![ExpectedCommand::ok(
+                workspace_path.clone(),
+                "pnpm",
+                &["install"],
+                "",
+            )],
+        );
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        lease_runner.assert_exhausted();
+
+        // Lockfile bumps; re-running setup explicitly (without re-leasing)
+        // should pick up the change.
+        std::fs::write(workspace_path.join("pnpm-lock.yaml"), b"v2").unwrap();
+
+        let setup_runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            workspace_path.clone(),
+            "pnpm",
+            &["install"],
+            "",
+        )]);
+        let setup_result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "setup",
+                "--workspace",
+                &workspace_path.display().to_string(),
+            ]),
+            Some(&database_path),
+            &setup_runner,
+        )
+        .expect("setup");
+        setup_runner.assert_exhausted();
+        let steps = setup_result.payload["setup"]["steps"].as_array().unwrap();
+        assert_eq!(steps[0]["status"], "ran");
+    }
+
+    #[test]
+    fn workspace_setup_on_create_skips_after_first_run() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        write_setup_yaml(
+            &workspace_path,
+            r#"version: 1
+steps:
+  - id: secrets
+    command: ./decode-secrets.sh
+    run_when: on-create
+"#,
+        );
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // First lease: on-create runs once.
+        let lease_runner = lease_runner_with_setup(
+            &workspace_path,
+            "abc1234",
+            vec![ExpectedCommand::ok(
+                workspace_path.clone(),
+                "./decode-secrets.sh",
+                &[],
+                "",
+            )],
+        );
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        lease_runner.assert_exhausted();
+
+        // Release before re-leasing the same workspace.
+        let workspace_record = {
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).unwrap();
+            store
+                .get_workspace_by_path(&workspace_path)
+                .unwrap()
+                .unwrap()
+        };
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "release",
+                "--lease",
+                workspace_record.lease_id.as_deref().unwrap(),
+            ]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+
+        // Second lease: on-create should skip (no decode-secrets in expectations).
+        let second_runner = lease_runner_for(&workspace_path, "def5678");
+        let second = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo2"]),
+            Some(&database_path),
+            &second_runner,
+        )
+        .expect("second lease");
+        second_runner.assert_exhausted();
+        let steps = second.payload["setup"]["steps"].as_array().unwrap();
+        assert_eq!(steps[0]["status"], "skipped");
+        assert_eq!(steps[0]["reason"], "already_ran");
+    }
+
+    #[test]
+    fn workspace_setup_failure_surfaces_step_id_and_retains_lease() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        write_setup_yaml(
+            &workspace_path,
+            r#"version: 1
+steps:
+  - id: deps
+    command: pnpm install
+    run_when: always
+"#,
+        );
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let failing = ExpectedCommand {
+            cwd: workspace_path.clone(),
+            program: "pnpm".to_string(),
+            args: vec!["install".to_string()],
+            result: Err(CubeError::CommandFailed {
+                program: "pnpm".to_string(),
+                args: vec!["install".to_string()],
+                status: Some(1),
+                stderr: "boom".to_string(),
+            }),
+            creates_dir: None,
+        };
+        let lease_runner = lease_runner_with_setup(&workspace_path, "abc1234", vec![failing]);
+
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect_err("lease should surface setup failure");
+        lease_runner.assert_exhausted();
+        match error {
+            CubeError::SetupStepFailed { step, error } => {
+                assert_eq!(step, "deps");
+                assert!(error.contains("pnpm"), "error mentions program: {error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // Lease is retained: the workspace row remains leased so the user
+        // can rerun `cube workspace setup` to repair it.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let record = store
+            .get_workspace_by_path(&workspace_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, crate::metadata::WorkspaceState::Leased);
+        assert!(record.lease_id.is_some());
     }
 
     #[derive(Default)]

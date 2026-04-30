@@ -529,6 +529,79 @@ impl Store {
         }))
     }
 
+    pub fn get_workspace_setup_state(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+        step_id: &str,
+    ) -> Result<Option<WorkspaceSetupState>, CubeError> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT repo, workspace_id, step_id, fingerprint, last_run_epoch_s
+                FROM workspace_setup
+                WHERE repo = ?1 AND workspace_id = ?2 AND step_id = ?3
+                "#,
+                params![repo, workspace_id, step_id],
+                row_to_workspace_setup_state,
+            )
+            .optional()
+            .map_err(CubeError::Storage)
+    }
+
+    pub fn upsert_workspace_setup_state(
+        &self,
+        state: &WorkspaceSetupState,
+    ) -> Result<(), CubeError> {
+        self.connection
+            .execute(
+                r#"
+                INSERT INTO workspace_setup (
+                    repo,
+                    workspace_id,
+                    step_id,
+                    fingerprint,
+                    last_run_epoch_s
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(repo, workspace_id, step_id) DO UPDATE SET
+                    fingerprint = excluded.fingerprint,
+                    last_run_epoch_s = excluded.last_run_epoch_s
+                "#,
+                params![
+                    state.repo,
+                    state.workspace_id,
+                    state.step_id,
+                    state.fingerprint,
+                    state.last_run_epoch_s,
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
+    pub fn list_workspace_setup_states(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+    ) -> Result<Vec<WorkspaceSetupState>, CubeError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                r#"
+                SELECT repo, workspace_id, step_id, fingerprint, last_run_epoch_s
+                FROM workspace_setup
+                WHERE repo = ?1 AND workspace_id = ?2
+                ORDER BY step_id
+                "#,
+            )
+            .map_err(CubeError::Storage)?;
+        let rows = statement
+            .query_map(params![repo, workspace_id], row_to_workspace_setup_state)
+            .map_err(CubeError::Storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(CubeError::Storage)
+    }
+
     pub fn insert_change(&self, record: &ChangeRecord) -> Result<ChangeRecord, CubeError> {
         self.connection
             .execute(
@@ -634,10 +707,43 @@ impl Store {
 
                 CREATE INDEX IF NOT EXISTS changes_repo_created_idx
                     ON changes(repo, created_at_epoch_s);
+
+                CREATE TABLE IF NOT EXISTS workspace_setup (
+                    repo TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    last_run_epoch_s INTEGER NOT NULL,
+                    PRIMARY KEY(repo, workspace_id, step_id),
+                    FOREIGN KEY(repo, workspace_id)
+                        REFERENCES workspaces(repo, workspace_id)
+                        ON DELETE CASCADE
+                );
                 "#,
             )
             .map_err(CubeError::Storage)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSetupState {
+    pub repo: String,
+    pub workspace_id: String,
+    pub step_id: String,
+    pub fingerprint: String,
+    pub last_run_epoch_s: i64,
+}
+
+fn row_to_workspace_setup_state(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceSetupState> {
+    Ok(WorkspaceSetupState {
+        repo: row.get(0)?,
+        workspace_id: row.get(1)?,
+        step_id: row.get(2)?,
+        fingerprint: row.get(3)?,
+        last_run_epoch_s: row.get(4)?,
+    })
 }
 
 fn path_to_string(path: &Path) -> String {
