@@ -16,6 +16,7 @@ pub struct Store {
 #[derive(Default, Debug)]
 pub struct WorkspaceListFilter<'a> {
     pub repo: Option<&'a str>,
+    pub workspace_id: Option<&'a str>,
     pub state: Option<WorkspaceState>,
     pub holder_pattern: Option<&'a str>,
 }
@@ -147,6 +148,10 @@ impl Store {
         if let Some(repo) = filter.repo {
             sql.push_str(" AND repo = ?");
             bound.push(repo.to_string());
+        }
+        if let Some(workspace_id) = filter.workspace_id {
+            sql.push_str(" AND workspace_id = ?");
+            bound.push(workspace_id.to_string());
         }
         if let Some(state) = filter.state {
             sql.push_str(" AND state = ?");

@@ -409,7 +409,12 @@ fn run_workspace(
                 }),
             )
         }
-        WorkspaceCommand::Release { lease } => {
+        WorkspaceCommand::Release {
+            workspace,
+            lease,
+            repo,
+        } => {
+            let lease = resolve_release_lease(&mut store, workspace, lease, repo)?;
             let workspace = store
                 .get_workspace_by_lease(&lease)?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
@@ -476,6 +481,7 @@ fn run_workspace(
                 repo: repo.as_deref(),
                 state: parsed_state,
                 holder_pattern: holder.as_deref(),
+                ..Default::default()
             };
             let records = store.list_workspaces_filtered(&filter)?;
             let message = if records.is_empty() {
@@ -797,6 +803,46 @@ fn holder_identity() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
     format!("{user}@{host}:{}", std::process::id())
+}
+
+fn resolve_release_lease(
+    store: &mut Store,
+    workspace: Option<String>,
+    lease: Option<String>,
+    repo: Option<String>,
+) -> Result<String> {
+    if let Some(lease) = lease {
+        return Ok(lease);
+    }
+    let workspace_id = workspace.ok_or_else(|| {
+        CubeError::InvalidArgument(
+            "release requires a workspace id positional or --lease".to_string(),
+        )
+    })?;
+    let matches = store.list_workspaces_filtered(&WorkspaceListFilter {
+        repo: repo.as_deref(),
+        workspace_id: Some(&workspace_id),
+        ..Default::default()
+    })?;
+    match matches.as_slice() {
+        [] => Err(CubeError::WorkspaceNotFound(workspace_id)),
+        [single] => single.lease_id.clone().ok_or_else(|| {
+            CubeError::InvalidArgument(format!(
+                "workspace `{}/{}` is not currently leased",
+                single.repo, single.workspace_id
+            ))
+        }),
+        many => {
+            let repos = many
+                .iter()
+                .map(|r| r.repo.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CubeError::InvalidArgument(format!(
+                "workspace id `{workspace_id}` matches multiple repos ({repos}); disambiguate with --repo"
+            )))
+        }
+    }
 }
 
 fn repo_lock_path(repo: &str, database_path: Option<&Path>) -> Result<PathBuf> {
@@ -1223,6 +1269,97 @@ mod tests {
             serde_json::Value::Null
         );
         release_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_release_by_workspace_id_resolves_active_lease() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-004");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "demo",
+        ]);
+        run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        lease_runner.assert_exhausted();
+
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+        ]);
+        let release =
+            Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
+        let result = run_with_dependencies(release, Some(&database_path), &release_runner)
+            .expect("release by id");
+
+        assert_eq!(result.payload["workspace"]["state"], "free");
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+        release_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_release_by_workspace_id_errors_when_not_leased() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        // sync_workspaces is normally called inside lease, so trigger it
+        // via list with the registry knowing about this workspace.
+        let list = Cli::parse_from(["cube", "workspace", "list", "--repo", "mono"]);
+        let _ = run_with_dependencies(list, Some(&database_path), &FakeRunner::default());
+
+        let release =
+            Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
+        let error =
+            run_with_dependencies(release, Some(&database_path), &FakeRunner::default())
+                .expect_err("release should fail");
+        // Workspace id is unknown to the registry until something has synced
+        // it, so this surfaces as WorkspaceNotFound.
+        assert!(matches!(error, CubeError::WorkspaceNotFound(_)));
     }
 
     #[test]

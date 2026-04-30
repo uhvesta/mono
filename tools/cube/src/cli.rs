@@ -85,10 +85,21 @@ pub enum WorkspaceCommand {
         task: String,
     },
     /// Release a workspace lease.
+    ///
+    /// Pass either a workspace id positionally (e.g.
+    /// `cube workspace release mono-agent-004`) or the lease uuid
+    /// via `--lease`. Use `--repo` to disambiguate when the same
+    /// workspace id exists under multiple repos.
     Release {
+        /// Workspace id to release (e.g. `mono-agent-004`).
+        #[arg(conflicts_with = "lease", required_unless_present = "lease")]
+        workspace: Option<String>,
         /// Lease id returned by `workspace lease`.
-        #[arg(long)]
-        lease: String,
+        #[arg(long, conflicts_with = "workspace")]
+        lease: Option<String>,
+        /// Optional repo filter; only used with the workspace-id form.
+        #[arg(long, requires = "workspace")]
+        repo: Option<String>,
     },
     /// Inspect workspace lease state.
     Status {
@@ -255,6 +266,80 @@ mod tests {
             }
             _ => panic!("expected workspace lease command"),
         }
+    }
+
+    #[test]
+    fn workspace_release_accepts_lease_or_workspace_id() {
+        let by_lease = Cli::parse_from(["cube", "workspace", "release", "--lease", "abc-123"]);
+        match by_lease.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Release {
+                        workspace,
+                        lease,
+                        repo,
+                    },
+            } => {
+                assert!(workspace.is_none());
+                assert_eq!(lease.as_deref(), Some("abc-123"));
+                assert!(repo.is_none());
+            }
+            _ => panic!("expected release command"),
+        }
+
+        let by_id = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
+        match by_id.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Release {
+                        workspace,
+                        lease,
+                        repo,
+                    },
+            } => {
+                assert_eq!(workspace.as_deref(), Some("mono-agent-004"));
+                assert!(lease.is_none());
+                assert!(repo.is_none());
+            }
+            _ => panic!("expected release command"),
+        }
+
+        let by_id_with_repo = Cli::parse_from([
+            "cube", "workspace", "release", "mono-agent-004", "--repo", "mono",
+        ]);
+        match by_id_with_repo.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Release { workspace, repo, .. },
+            } => {
+                assert_eq!(workspace.as_deref(), Some("mono-agent-004"));
+                assert_eq!(repo.as_deref(), Some("mono"));
+            }
+            _ => panic!("expected release command"),
+        }
+    }
+
+    #[test]
+    fn workspace_release_rejects_both_or_neither() {
+        // Both forms together
+        let both = Cli::try_parse_from([
+            "cube",
+            "workspace",
+            "release",
+            "mono-agent-004",
+            "--lease",
+            "abc-123",
+        ]);
+        assert!(both.is_err());
+
+        // Neither
+        let neither = Cli::try_parse_from(["cube", "workspace", "release"]);
+        assert!(neither.is_err());
+
+        // --repo without workspace id is also rejected (requires)
+        let lonely_repo =
+            Cli::try_parse_from(["cube", "workspace", "release", "--repo", "mono"]);
+        assert!(lonely_repo.is_err());
     }
 
     #[test]
