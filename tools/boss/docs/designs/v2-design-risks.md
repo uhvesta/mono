@@ -1982,12 +1982,170 @@ rendering (diff viewer, in-app comments, in-app approve,
 auto-merge) is **explicitly out of scope for V2**; revisit after
 basic functionality is working.
 
+## R8: `boss` vs `bossctl` boundary
+
+### Why it matters
+
+The V2 plan introduced two CLIs — `boss` for durable work, `bossctl`
+for live orchestration — but `work start` straddles both
+(durable state mutation + live worker spawn), and the SwiftUI app
+needs to drive the same operations as `bossctl` without being part
+of Boss-Claude's subtree (per R3's auth model). R8 pins the
+architecture and the command map.
+
+Most of this risk is already settled by R3 (control-socket auth)
+and R5 (`request_execution` as a single RPC shared by both
+callers). R8 just commits the remaining edges.
+
+### What prior risks settled
+
+- **R3**: `LOCAL_PEERPID` subtree-match on the control socket;
+  Boss session is the trust root for `bossctl`.
+- **R5**: `request_execution(work_item_id, opts)` is a single
+  RPC; both `bossctl` and the SwiftUI app submit to it.
+
+### Working decision
+
+**One backend service (Boss-engine); two CLI personas (`boss` +
+`bossctl`); SwiftUI app talks to the engine directly via RPC.**
+
+#### Command map
+
+`boss` — durable work and CLI ergonomics. Available on the human's
+shell PATH:
+
+```text
+boss product list | create | update | archive
+boss project list | create | update | reorder
+boss task list | create | update | delete
+boss chore list | create | update | delete
+boss work start <id> | cancel <id> [--force]
+boss status                   # quick "what's running" view
+```
+
+`bossctl` — live agent / terminal orchestration. Available **only
+on the Boss session's PATH** (per R3):
+
+```text
+bossctl agents list | status | focus <id> | send <id> --text … |
+        interrupt <id> | launch <id> | stop <id> | transcript <id>
+bossctl work start <id> | cancel <id> [--force]   # alias for symmetry
+bossctl probe <id> --text …  | status <id>
+bossctl workspace summary
+```
+
+`bossctl work start` exists for symmetry — it dispatches the same
+`request_execution` RPC as `boss work start`, so Boss-Claude can
+use a consistent prefix for everything it does.
+
+The SwiftUI app does **not** shell out to `bossctl`; it makes RPC
+calls directly to Boss-engine over the same control socket.
+
+#### Auth model — refining R3
+
+Engine binds one Unix socket at
+`~/Library/Application Support/Boss/control.sock` (mode `0600`).
+Two trust roots, not one:
+
+- **App pid**: the SwiftUI app process.
+- **Boss session pid**: the `claude` TUI for the Boss role.
+
+On accept, engine reads peer pid via `getsockopt(SOL_LOCAL,
+LOCAL_PEERPID)` and walks ppid; allow if either trust root
+appears in the chain.
+
+RPC-level authorization tiers:
+
+- **Public to user** (file ACL alone — both trust roots and any
+  process the user runs): durable work-taxonomy CRUD
+  (`list_products`, `create_task`, …). This makes `boss` callable
+  from any user shell.
+- **Restricted to app or Boss session subtree**: `request_execution`,
+  `cancel_execution`, work-state-mutating writes.
+- **Restricted to Boss session subtree only**: live agent control
+  (`bossctl agents *`, probe, focus, send, interrupt). Workers
+  fail this check.
+
+Workers — who connect on their own subtree — pass file ACL but
+fail the subtree check for any sensitive op. Combined with R3's
+PATH separation and the per-worker `.claude/CLAUDE.md` advisory,
+this is the layered isolation R3 committed to.
+
+### Decisive unknowns (resolved)
+
+#### 1. One service or two?
+
+**One.** Two services would duplicate the SQLite store, the
+event subscription, and the cube integration; nothing meaningful
+gained. `boss` and `bossctl` are sibling thin clients on the same
+engine.
+
+#### 2. Where does `work start` live?
+
+**In both `boss` and `bossctl`** — both invoke the same
+`request_execution` RPC. The duplication is intentional:
+human-facing scripts and Boss-Claude's command surface should each
+have a complete vocabulary without cross-referencing the other.
+
+#### 3. Does the SwiftUI app shell out to `bossctl`?
+
+**No.** The app is not in Boss session's subtree, so a
+`bossctl` subprocess from the app would fail the live-tier auth
+check. The app talks to engine RPCs directly, with the app pid
+itself as a trust root.
+
+#### 4. What's available to humans on the shell?
+
+**`boss` only.** Putting `bossctl` on the human's PATH would
+require humans to run their shell inside the Boss session
+subtree (impractical). Humans who want to do live orchestration
+do it through the SwiftUI app.
+
+#### 5. What about workers?
+
+**Neither `boss` nor `bossctl` on worker PATH.** R3's sanitized
+env. The advisory `.claude/CLAUDE.md` (R3 + R4) tells workers
+not to invoke any `boss*` commands. Even if a worker discovered
+the command, the live-tier RPCs would deny based on subtree
+match; the durable-tier RPCs would technically succeed via file
+ACL, but nothing constructive happens (a worker creating a
+project for itself is harmless and detectable).
+
+### Resolution criteria
+
+- Single-vs-multiple-service decision committed.
+- Command map for `boss` and `bossctl` written down.
+- Auth model with both trust roots committed.
+- Worker access decision committed.
+
+### Decision
+
+**One backend service, two CLI personas, SwiftUI app talks to the
+engine directly. Two trust roots (app + Boss session) for the
+control socket; three RPC authorization tiers (user, app/Boss
+subtree, Boss subtree only).**
+
+Implementation work this implies for V2:
+
+- Boss-engine: control socket binding with two-trust-root
+  LOCAL_PEERPID auth; per-RPC tier check.
+- `boss` CLI: thin client over engine RPC; available on user's
+  shell PATH via app installer.
+- `bossctl` CLI: thin client over engine RPC; lives in a
+  Boss-session-only directory and is added to PATH only when
+  spawning the Boss libghostty pane (per R3 env hygiene spec).
+- SwiftUI app: direct engine RPC client; no `bossctl`
+  subprocess.
+- Both CLIs share an underlying Rust crate that wraps the
+  engine RPC schema, so a single change to the protocol updates
+  both CLIs and the engine in lockstep.
+
+These should be tracked as Boss V2 implementation tasks. R8 has
+no dependencies past it; this closes the V2 design-risks doc.
+
 ## Risk backlog
 
-These risks have been identified but not yet worked through. They are
-listed here so we don't lose them; we'll write each one up properly when
-we get to it. Order is rough priority, not strict sequence.
+_All identified risks (R1–R8) are now resolved. New risks surfaced
+during V2 implementation should be added here as one-line entries,
+then promoted to full sections when worked through._
 
-- **R8: `boss` vs `bossctl` boundary.** `work start` straddles durable
-  state and live orchestration. Decide whether they're two CLI personas
-  on one backend, or genuinely separate services.
