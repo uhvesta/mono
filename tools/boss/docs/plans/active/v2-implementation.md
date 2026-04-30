@@ -150,7 +150,7 @@ public-facing `boss` CLI for work-taxonomy CRUD.
 
 ---
 
-### Phase 2: Multi-client subscriptions — 🟡 mostly shipped
+### Phase 2: Multi-client subscriptions — 🟢 shipped
 
 **Goal.** Make work mutations from any client propagate to all
 connected clients in real time.
@@ -163,36 +163,34 @@ connected clients in real time.
   `Subscribed` / `Unsubscribed` responses (`protocol.rs:185-190`)
   — both directions wired.
 - Topics `work.products` and `work.product.<id>` defined and
-  published (`protocol.rs:9-12`; publish sites at `app.rs:346,
-  558, 694, 725, 756, 789, 823, 892`).
+  published (`protocol.rs:9-12`; publish sites across the work
+  mutation handlers in `app.rs`).
 - `publish_work_invalidation()` fires after DB writes commit
   (`app.rs:1394-1458`).
+- `work_revision` exposed on **read** responses too, via
+  `send_response_with_revision` (`ListProducts`/`ListProjects`/
+  `ListTasks`/`ListChores`/`GetWorkItem`/`GetWorkTree` in
+  `app.rs:799-905, 1080`).
+- **Bounded outbound queue, coalescing, slow-client disconnect**
+  (PR #137). Per-session queue capped at `MAX_SESSION_QUEUE = 256`
+  (`app.rs:253`); same-topic invalidations are coalesced into a
+  single pending envelope (`app.rs:1793-1845` covers the unit
+  tests); a session whose queue overflows is dropped rather than
+  blocking the publisher (`app.rs:297-310`).
 - macOS app subscribes on connect and refetches on invalidation
   (`app-macos/Sources/ChatViewModel.swift`,
   `app-macos/Sources/EngineClient.swift`).
-
-**Pending.**
-
-- **Outbound queue is unbounded.** `TopicBroker` uses
-  `mpsc::unbounded_channel()` (`app.rs:255`); the publish path is
-  `let _ = sender.send(envelope.clone())` (`app.rs:359`) with no
-  back-pressure. The deliverable calls for a bounded queue —
-  pick a sensible bound and enforce it.
-- **No same-topic coalescing.** `grep` for "coalesce" /
-  "coalesc" in engine source returns nothing. Two rapid mutations
-  on the same product currently emit two invalidations.
-- **No slow-client disconnect policy.** Nothing closes the
-  session when the per-session queue fills. Once the queue is
-  bounded this becomes a hard requirement.
-- Confirm `work_revision` is exposed on **read** responses too,
-  not just subscribe responses. The deliverable calls for both;
-  I verified subscribe but not the read side.
+- End-to-end test for the "Done when" criterion lives at
+  `engine/tests/work_crud.rs::cli_status_update_propagates_to_subscriber_within_one_second`
+  — drives a `WorkItemPatch { status: "active" }` from one client
+  and asserts a second subscribed client receives the matching
+  `work_invalidated` event in under 1s.
 
 **Done when (acceptance, kept for the record).**
 
 - A `boss task update <id> --status active` from a terminal causes
   the macOS app's Work tab to update within ~1s without manual
-  refresh.
+  refresh. Verified by the integration test above.
 
 **Depends on.** Phase 1.
 
