@@ -62,10 +62,56 @@ repobin list
 repobin exec boss -- task list
 ```
 
+## Default mode
+
+When a tool is invoked from a working directory that has no matching
+`REPOBIN.toml` (or the matching file does not declare that tool), `repobin`
+falls back to a `repobin.yaml` peer to the installed binary:
+
+```yaml
+version: 1
+tools:
+  boss:
+    repo: git@github.com:spinyfin/mono.git
+  cube:
+    repo: git@github.com:spinyfin/mono.git
+```
+
+The yaml only carries the repo URL — the canonical Bazel target lives in the
+target repo's `REPOBIN.toml` and is read from the cached checkout after
+refresh, so renaming a target in the source repo automatically takes effect
+on the next default-mode invocation.
+
+`repobin install` writes this file automatically by recording each local
+tool's name against `git remote get-url origin`. Re-installing from another
+repo merges new entries; existing entries are kept. Pass `--no-defaults` to
+skip writing the file.
+
+In default mode the configured repo is shallow-cloned into the cache and the
+build runs from that clone (using the target declared in
+`<checkout>/REPOBIN.toml`). A short notice goes to stderr so it is obvious
+that the tool was built from `HEAD`:
+
+```text
+repobin: running `boss` from git@github.com:spinyfin/mono.git @ 1a2b3c4 (cloned; default mode — not in a configured workspace)
+```
+
+The cache lives at `$XDG_CACHE_HOME/repobin/repos/<slug>-<hash>/checkout` (or
+`~/.cache/repobin/repos/...`). Subsequent invocations reuse that checkout: a
+`fetch_stamp` gates whether to refresh (default 5 min, override with
+`REPOBIN_DEFAULTS_TTL_SECS`). Past the gate, `repobin` runs `git ls-remote
+origin HEAD`; if the remote sha differs from the local sha, it
+`fetch --depth=1 origin HEAD` + `reset --hard FETCH_HEAD`. Concurrent
+invocations serialise on a per-cache `flock`. Override the cache root via
+`REPOBIN_CACHE_DIR`.
+
+`repobin doctor` lists the active defaults file.
+
 ## Notes
 
 - `repobin` currently supports Bazel-backed tools only.
-- It expects a working `bazel` entry point on `PATH`.
+- It expects a working `bazel` entry point on `PATH` and a `git` entry point
+  for default-mode clones.
 - `repobin install` defaults to `~/bin` and warns if the chosen directory is
   not on `PATH`.
 - If you use `direnv`, prefer adding the chosen `repobin` bin dir to `PATH`

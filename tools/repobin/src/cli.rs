@@ -36,6 +36,10 @@ pub struct BinDirArgs {
 pub struct InstallArgs {
     #[command(flatten)]
     pub bin_dir: BinDirArgs,
+
+    /// Skip writing defaults to `repobin.yaml` next to the installed binary.
+    #[arg(long)]
+    pub no_defaults: bool,
 }
 
 #[derive(Debug, Clone, Args)]

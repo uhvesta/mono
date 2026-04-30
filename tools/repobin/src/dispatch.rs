@@ -42,13 +42,31 @@ pub fn prepare_dispatch_from_repo_config<B: BazelAdapter>(
                 config_path: repo_config.config_path.clone(),
             })?;
 
-    bazel.build(&repo_config.repo_root, &tool.target)?;
-    let executable_path = bazel.resolve_executable(&repo_config.repo_root, &tool.target)?;
+    plan_from_target(
+        bazel,
+        &repo_config.repo_root,
+        tool_name,
+        &tool.target,
+        cwd,
+        forwarded_args,
+    )
+}
+
+fn plan_from_target<B: BazelAdapter>(
+    bazel: &B,
+    repo_root: &Path,
+    tool_name: &str,
+    target: &str,
+    cwd: &Path,
+    forwarded_args: &[OsString],
+) -> Result<DispatchPlan, RepobinError> {
+    bazel.build(repo_root, target)?;
+    let executable_path = bazel.resolve_executable(repo_root, target)?;
 
     Ok(DispatchPlan {
-        repo_root: repo_config.repo_root,
+        repo_root: repo_root.to_path_buf(),
         tool_name: tool_name.to_string(),
-        target: tool.target.clone(),
+        target: target.to_string(),
         executable_path,
         original_cwd: cwd.to_path_buf(),
         forwarded_args: forwarded_args.to_vec(),

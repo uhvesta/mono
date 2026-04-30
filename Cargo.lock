@@ -1937,7 +1937,10 @@ name = "repobin"
 version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
+ "fs4",
  "serde",
+ "serde_yaml",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "toml",
