@@ -34,18 +34,8 @@ The full audit lives in
 ## V2 prerequisites
 
 Items that must land before Boss V2 takes a hard dependency on cube.
-
-- [ ] **Add lease-lifecycle commands required by Boss V2's
-      integration sketch:**
-      - `cube workspace heartbeat --lease <id>` — Boss-engine pings
-        to refresh lease TTL
-      - `cube workspace release --reason crash --keep-dirty` — release
-        flag for crash recovery so cube records dirty state but frees
-        the slot
-      - `cube workspace force-release --lease <id>` — operator-grade
-        release that bypasses ownership checks for orphan reclamation
-
-When this lands, R4's "cube prerequisites" close.
+All V2 prerequisites have landed — see "Already landed" below. R4's
+"cube prerequisites" are closed.
 
 ### Design principle: single global database
 
@@ -71,6 +61,14 @@ directly.
   `app.rs` (e.g. line 1075).
 - ✓ Drop the `--database` CLI flag from the prereq list — superseded
   by the single-global-database principle above.
+- ✓ Add lease lifecycle: TTL (default 1800s, set on `claim_workspace`),
+  `cube workspace heartbeat --lease <id> [--ttl-seconds <n>]` extends
+  the expiry, `cube workspace release --reason <text> --keep-dirty`
+  records reasons and skips reset for crash forensics, `cube workspace
+  force-release` frees a stuck lease without running the workspace
+  reset. Stale leases are reclaimed by `expire_stale_leases` at the
+  start of every `lease`. New columns: `lease_expires_at_epoch_s`,
+  `last_release_reason`.
 - ✓ Add repo-pool `flock` around `claim_workspace` and `release`
   (`lock.rs`, `paths::repo_lock_path`). Lock files live at
   `<data_dir>/locks/<repo>.lock` and serialize the lease/release
@@ -132,8 +130,6 @@ Smaller items that don't block but should be tracked.
       in R4 contemplates a "workspace `released`" notification on a
       subscription channel; today, callers must poll
       `cube workspace list --json`.
-- [ ] No lease TTL enforcement. Design references a 30-min default;
-      actual implementation has no expiry sweep.
 
 ## Cross-references
 

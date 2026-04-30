@@ -105,6 +105,47 @@ pub enum WorkspaceCommand {
         /// Optional repo filter; only used with the workspace-id form.
         #[arg(long, requires = "workspace")]
         repo: Option<String>,
+        /// Annotate the release with a reason (e.g. `crash`, `oom`).
+        /// Recorded in the workspaces row's `last_release_reason`.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Skip the `jj git fetch && jj new main` reset on release.
+        /// The slot is freed in cube's registry but the workspace's
+        /// working copy is left as-is for forensics. Pair with
+        /// `--reason crash` for crash recovery.
+        #[arg(long)]
+        keep_dirty: bool,
+    },
+    /// Refresh a lease's expiry so it isn't reclaimed by the TTL sweep.
+    ///
+    /// Boss-engine pings this on a timer to keep its leases alive.
+    Heartbeat {
+        /// Lease id to refresh.
+        #[arg(long)]
+        lease: String,
+        /// Override the new TTL in seconds. Defaults to the standard
+        /// 1800s window from now.
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
+    /// Force-release a lease without running the workspace reset.
+    ///
+    /// Bypasses ownership / holder checks. Intended for orphan
+    /// reclamation after a holder process has crashed; pair with
+    /// `cube workspace list --holder <pattern>` to find candidates.
+    ForceRelease {
+        /// Workspace id to release.
+        #[arg(conflicts_with = "lease", required_unless_present = "lease")]
+        workspace: Option<String>,
+        /// Lease id to release.
+        #[arg(long, conflicts_with = "workspace")]
+        lease: Option<String>,
+        /// Optional repo filter; only used with the workspace-id form.
+        #[arg(long, requires = "workspace")]
+        repo: Option<String>,
+        /// Annotate the release with a reason (defaults to `force-released`).
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Inspect workspace lease state.
     Status {
@@ -319,6 +360,7 @@ mod tests {
                         workspace,
                         lease,
                         repo,
+                        ..
                     },
             } => {
                 assert!(workspace.is_none());
@@ -336,6 +378,7 @@ mod tests {
                         workspace,
                         lease,
                         repo,
+                        ..
                     },
             } => {
                 assert_eq!(workspace.as_deref(), Some("mono-agent-004"));
@@ -357,6 +400,101 @@ mod tests {
                 assert_eq!(repo.as_deref(), Some("mono"));
             }
             _ => panic!("expected release command"),
+        }
+    }
+
+    #[test]
+    fn workspace_release_accepts_reason_and_keep_dirty() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "release",
+            "--lease",
+            "abc",
+            "--reason",
+            "crash",
+            "--keep-dirty",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Release {
+                        reason, keep_dirty, ..
+                    },
+            } => {
+                assert_eq!(reason.as_deref(), Some("crash"));
+                assert!(keep_dirty);
+            }
+            _ => panic!("expected release command"),
+        }
+    }
+
+    #[test]
+    fn workspace_heartbeat_parses() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "heartbeat",
+            "--lease",
+            "abc-123",
+            "--ttl-seconds",
+            "600",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command: WorkspaceCommand::Heartbeat { lease, ttl_seconds },
+            } => {
+                assert_eq!(lease, "abc-123");
+                assert_eq!(ttl_seconds, Some(600));
+            }
+            _ => panic!("expected heartbeat command"),
+        }
+    }
+
+    #[test]
+    fn workspace_force_release_parses_both_forms() {
+        let by_id = Cli::parse_from(["cube", "workspace", "force-release", "mono-agent-004"]);
+        match by_id.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::ForceRelease {
+                        workspace,
+                        lease,
+                        reason,
+                        ..
+                    },
+            } => {
+                assert_eq!(workspace.as_deref(), Some("mono-agent-004"));
+                assert!(lease.is_none());
+                assert!(reason.is_none());
+            }
+            _ => panic!("expected force-release command"),
+        }
+
+        let by_lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "force-release",
+            "--lease",
+            "abc",
+            "--reason",
+            "stuck",
+        ]);
+        match by_lease.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::ForceRelease {
+                        workspace,
+                        lease,
+                        reason,
+                        ..
+                    },
+            } => {
+                assert!(workspace.is_none());
+                assert_eq!(lease.as_deref(), Some("abc"));
+                assert_eq!(reason.as_deref(), Some("stuck"));
+            }
+            _ => panic!("expected force-release command"),
         }
     }
 

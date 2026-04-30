@@ -46,7 +46,9 @@ pub struct WorkspaceRecord {
     pub holder: Option<String>,
     pub task: Option<String>,
     pub leased_at_epoch_s: Option<i64>,
+    pub lease_expires_at_epoch_s: Option<i64>,
     pub head_commit: Option<String>,
+    pub last_release_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

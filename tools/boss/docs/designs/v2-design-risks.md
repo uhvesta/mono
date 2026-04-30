@@ -554,11 +554,9 @@ layer** (plus `change create` / `info` metadata) — exactly what R4's
 working decision asks of it. The remaining stacked-change and PR
 features (`change checkout`, `stack *`, `pr *`) are unbuilt; Boss V2
 must continue to drive `jj` / `gh` / `git` directly inside leased
-workspaces. Gap-fixes to harden the pooling layer for V2, in priority
-order: (1) implement `workspace setup` so per-repo bootstrap is
-cube's job, not Boss's, (2) add the heartbeat / `--reason crash
---keep-dirty` / `force-release` lease-lifecycle commands the
-integration sketch needs.
+workspaces. The only remaining gap-fix to harden the pooling layer
+for V2 is implementing `workspace setup` so per-repo bootstrap is
+cube's job, not Boss's.
 
 #### On unknown 2 — lease lifetime boundary cases
 
@@ -639,8 +637,8 @@ Error handling:
   user can `cube doctor` and `cube workspace force-release` manually.
 
 `cube workspace heartbeat`, `--reason crash --keep-dirty`, and
-`cube workspace force-release` are not implemented today (per
-unknown 1) — these are gap-fixes the integration will require.
+`cube workspace force-release` are now implemented; the integration
+sketch above can be wired up directly without further cube changes.
 
 #### On unknown 4 — jj-vs-git in workers
 
@@ -781,12 +779,9 @@ decisive unknowns are resolved in the findings above. Concretely:
   12 per repo.
 
 **Cube prerequisites for V2 hard dependency** (must land before V2
-takes the dependency, in priority order):
+takes the dependency):
 
 1. Implement `workspace setup` (currently stubbed at `app.rs:447`).
-2. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
-   release, and `cube workspace force-release` — all required by the
-   integration sketch's error handling.
 
 Already landed since the original audit:
 
@@ -797,6 +792,13 @@ Already landed since the original audit:
   `repo.source` is consumed if set, falling back to `repo.origin`;
   new id is `<prefix>{max+1:03}`
   (`app.rs::auto_create_workspace`).
+- Lease lifecycle commands: lease TTL (default 1800s) set on claim
+  with `lease_expires_at_epoch_s` column; `cube workspace heartbeat
+  --lease <id> [--ttl-seconds <n>]` extends; `cube workspace release
+  --reason <text> --keep-dirty` records reasons and skips reset for
+  forensics; `cube workspace force-release` frees a stuck lease
+  without reset; `expire_stale_leases` sweeps expired rows back to
+  free at the start of every lease.
 
 The original prereq list also called out a `--database` CLI flag.
 That was dropped on review: cube's SQLite store is a machine-global
