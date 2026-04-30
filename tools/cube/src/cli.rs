@@ -102,6 +102,19 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         workspace: String,
     },
+    /// List workspaces in the registry.
+    List {
+        /// Filter by repo id.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by state (`free` or `leased`).
+        #[arg(long)]
+        state: Option<String>,
+        /// Filter by holder. SQLite GLOB pattern — `*` matches anything,
+        /// e.g. `--holder boss/*`.
+        #[arg(long)]
+        holder: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,6 +254,57 @@ mod tests {
                 assert_eq!(task, "implement parser");
             }
             _ => panic!("expected workspace lease command"),
+        }
+    }
+
+    #[test]
+    fn workspace_list_accepts_filters() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "list",
+            "--repo",
+            "mono",
+            "--state",
+            "leased",
+            "--holder",
+            "boss/*",
+        ]);
+
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::List {
+                        repo,
+                        state,
+                        holder,
+                    },
+            } => {
+                assert_eq!(repo.as_deref(), Some("mono"));
+                assert_eq!(state.as_deref(), Some("leased"));
+                assert_eq!(holder.as_deref(), Some("boss/*"));
+            }
+            _ => panic!("expected workspace list command"),
+        }
+    }
+
+    #[test]
+    fn workspace_list_with_no_flags_is_global() {
+        let cli = Cli::parse_from(["cube", "workspace", "list"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::List {
+                        repo,
+                        state,
+                        holder,
+                    },
+            } => {
+                assert!(repo.is_none());
+                assert!(state.is_none());
+                assert!(holder.is_none());
+            }
+            _ => panic!("expected workspace list command"),
         }
     }
 

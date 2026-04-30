@@ -14,9 +14,9 @@ use crate::cli::{
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::lock::RepoLock;
-use crate::metadata::{ChangeRecord, RepoRecord};
+use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceRecord, WorkspaceState};
 use crate::paths;
-use crate::store::Store;
+use crate::store::{Store, WorkspaceListFilter};
 
 type Result<T> = std::result::Result<T, CubeError>;
 
@@ -459,6 +459,41 @@ fn run_workspace(
                 }),
             )
         }
+        WorkspaceCommand::List {
+            repo,
+            state,
+            holder,
+        } => {
+            let parsed_state = match state.as_deref() {
+                Some(raw) => Some(WorkspaceState::from_str(raw).ok_or_else(|| {
+                    CubeError::InvalidArgument(format!(
+                        "invalid --state `{raw}`; expected `free` or `leased`"
+                    ))
+                })?),
+                None => None,
+            };
+            let filter = WorkspaceListFilter {
+                repo: repo.as_deref(),
+                state: parsed_state,
+                holder_pattern: holder.as_deref(),
+            };
+            let records = store.list_workspaces_filtered(&filter)?;
+            let message = if records.is_empty() {
+                "No workspaces match.".to_string()
+            } else {
+                records
+                    .iter()
+                    .map(human_workspace_summary)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            RunResult::new(
+                message,
+                json!({
+                    "workspaces": records,
+                }),
+            )
+        }
     }
 }
 
@@ -714,6 +749,24 @@ fn current_change_identity(
 
 fn workspace_path_exists(record: &crate::metadata::WorkspaceRecord) -> bool {
     record.workspace_path.is_dir()
+}
+
+fn human_workspace_summary(record: &WorkspaceRecord) -> String {
+    let mut parts = vec![
+        format!("{}/{}", record.repo, record.workspace_id),
+        record.state.as_str().to_string(),
+        record.workspace_path.display().to_string(),
+    ];
+    if let Some(holder) = &record.holder {
+        parts.push(format!("holder={holder}"));
+    }
+    if let Some(task) = &record.task {
+        parts.push(format!("task={task:?}"));
+    }
+    if let Some(lease_id) = &record.lease_id {
+        parts.push(format!("lease={lease_id}"));
+    }
+    parts.join("  ")
 }
 
 fn human_workspace_detail(record: &crate::metadata::WorkspaceRecord, jj_status: &str) -> String {
@@ -1293,6 +1346,78 @@ mod tests {
             .expect_err("status should forget missing workspace");
 
         assert!(matches!(error, CubeError::WorkspaceNotFound(_)));
+    }
+
+    #[test]
+    fn workspace_list_returns_filtered_rows() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-002")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let first_path = workspace_root.join("mono-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "demo",
+        ]);
+        run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+        // global list returns both rows
+        let list_all = Cli::parse_from(["cube", "workspace", "list"]);
+        let result_all =
+            run_with_dependencies(list_all, Some(&database_path), &FakeRunner::default())
+                .expect("list");
+        let rows = result_all.payload["workspaces"]
+            .as_array()
+            .expect("array");
+        assert_eq!(rows.len(), 2);
+
+        // state filter narrows to leased only
+        let list_leased = Cli::parse_from(["cube", "workspace", "list", "--state", "leased"]);
+        let result_leased =
+            run_with_dependencies(list_leased, Some(&database_path), &FakeRunner::default())
+                .expect("list leased");
+        let leased = result_leased.payload["workspaces"]
+            .as_array()
+            .expect("array");
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0]["workspace_id"], "mono-agent-001");
+        assert_eq!(leased[0]["state"], "leased");
+        assert_eq!(leased[0]["task"], "demo");
+
+        // invalid state returns argument error
+        let list_bad = Cli::parse_from(["cube", "workspace", "list", "--state", "bogus"]);
+        let error = run_with_dependencies(list_bad, Some(&database_path), &FakeRunner::default())
+            .expect_err("invalid state");
+        assert!(matches!(error, CubeError::InvalidArgument(_)));
     }
 
     #[test]

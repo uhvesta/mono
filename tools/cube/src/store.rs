@@ -13,6 +13,13 @@ pub struct Store {
     connection: Connection,
 }
 
+#[derive(Default, Debug)]
+pub struct WorkspaceListFilter<'a> {
+    pub repo: Option<&'a str>,
+    pub state: Option<WorkspaceState>,
+    pub holder_pattern: Option<&'a str>,
+}
+
 impl Store {
     pub fn open_default() -> Result<Self, CubeError> {
         let path = database_path()?;
@@ -112,6 +119,52 @@ impl Store {
             .query_map([], row_to_repo_record)
             .map_err(CubeError::Storage)?;
 
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(CubeError::Storage)
+    }
+
+    pub fn list_workspaces_filtered(
+        &self,
+        filter: &WorkspaceListFilter<'_>,
+    ) -> Result<Vec<WorkspaceRecord>, CubeError> {
+        let mut sql = String::from(
+            r#"
+            SELECT
+                repo,
+                workspace_id,
+                workspace_path,
+                state,
+                lease_id,
+                holder,
+                task,
+                leased_at_epoch_s,
+                head_commit
+            FROM workspaces
+            WHERE 1=1
+            "#,
+        );
+        let mut bound: Vec<String> = Vec::new();
+        if let Some(repo) = filter.repo {
+            sql.push_str(" AND repo = ?");
+            bound.push(repo.to_string());
+        }
+        if let Some(state) = filter.state {
+            sql.push_str(" AND state = ?");
+            bound.push(state.as_str().to_string());
+        }
+        if let Some(holder_pattern) = filter.holder_pattern {
+            sql.push_str(" AND holder GLOB ?");
+            bound.push(holder_pattern.to_string());
+        }
+        sql.push_str(" ORDER BY repo, workspace_id");
+
+        let mut statement = self.connection.prepare(&sql).map_err(CubeError::Storage)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(bound.iter()),
+                row_to_workspace_record,
+            )
+            .map_err(CubeError::Storage)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(CubeError::Storage)
     }
@@ -603,9 +656,9 @@ fn row_to_change_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRecor
 mod tests {
     use tempfile::TempDir;
 
-    use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceCandidate};
+    use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceState};
 
-    use super::Store;
+    use super::{Store, WorkspaceListFilter};
 
     fn open_store() -> (TempDir, Store) {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -673,6 +726,105 @@ mod tests {
         let workspaces = store.list_workspaces("mono").expect("workspaces");
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].workspace_id, "mono-agent-002");
+    }
+
+    #[test]
+    fn list_workspaces_filtered_applies_repo_state_and_holder() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        for repo in ["mono", "flunge"] {
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: repo.to_string(),
+                    origin: format!("git@example.com:org/{repo}.git"),
+                    main_branch: "main".to_string(),
+                    workspace_root: workspace_root.clone(),
+                    workspace_prefix: format!("{repo}-agent-"),
+                    source: None,
+                })
+                .expect("repo");
+            store
+                .sync_workspaces(
+                    repo,
+                    &[
+                        WorkspaceCandidate {
+                            workspace_id: format!("{repo}-agent-001"),
+                            workspace_path: workspace_root.join(format!("{repo}-agent-001")),
+                        },
+                        WorkspaceCandidate {
+                            workspace_id: format!("{repo}-agent-002"),
+                            workspace_path: workspace_root.join(format!("{repo}-agent-002")),
+                        },
+                    ],
+                )
+                .expect("sync");
+        }
+
+        // lease one workspace in each repo with distinct holders
+        store
+            .claim_workspace("mono", "boss/worker-7", "demo", "lease-mono", 100)
+            .expect("claim mono");
+        store
+            .claim_workspace("flunge", "alice@host:42", "fix", "lease-flunge", 100)
+            .expect("claim flunge");
+
+        // unfiltered: 4 workspaces total, ordered by repo then id
+        let all = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .expect("list");
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            all.iter()
+                .map(|r| format!("{}/{}", r.repo, r.workspace_id))
+                .collect::<Vec<_>>(),
+            vec![
+                "flunge/flunge-agent-001",
+                "flunge/flunge-agent-002",
+                "mono/mono-agent-001",
+                "mono/mono-agent-002",
+            ]
+        );
+
+        // repo filter
+        let mono = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .expect("list mono");
+        assert_eq!(mono.len(), 2);
+        assert!(mono.iter().all(|r| r.repo == "mono"));
+
+        // state filter
+        let leased = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                state: Some(WorkspaceState::Leased),
+                ..Default::default()
+            })
+            .expect("list leased");
+        assert_eq!(leased.len(), 2);
+        assert!(leased.iter().all(|r| r.state == WorkspaceState::Leased));
+
+        // holder GLOB filter
+        let boss_owned = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                holder_pattern: Some("boss/*"),
+                ..Default::default()
+            })
+            .expect("list boss");
+        assert_eq!(boss_owned.len(), 1);
+        assert_eq!(boss_owned[0].holder.as_deref(), Some("boss/worker-7"));
+
+        // combined filters
+        let mono_free = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                state: Some(WorkspaceState::Free),
+                ..Default::default()
+            })
+            .expect("list mono free");
+        assert_eq!(mono_free.len(), 1);
+        assert_eq!(mono_free[0].workspace_id, "mono-agent-002");
     }
 
     #[test]
