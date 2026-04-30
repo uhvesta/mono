@@ -6,6 +6,8 @@
 
 mod types;
 mod wire;
+mod worker_event;
 
 pub use types::*;
 pub use wire::*;
+pub use worker_event::*;
