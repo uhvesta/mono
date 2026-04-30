@@ -1,0 +1,11 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+
+rust_binary(
+    name = "boss-event",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)

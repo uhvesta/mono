@@ -213,6 +213,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-event"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+]
+
+[[package]]
 name = "boss-protocol"
 version = "0.1.0"
 dependencies = [
