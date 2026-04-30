@@ -44,11 +44,18 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 8     | Review and attention                           | 🟡 schema + manual PR-URL only — no auto-detect, no poller, no Triage UI, no re-engage |
 | 9     | Resume and continuity                          | ❌ not started               |
 | 10    | Transcripts and hardening                      | ❌ schema columns only       |
+| 11    | Bazel `GhosttyKit` integration                 | ❌ not started — hard prereq for shipping the post-6f Bazel `.app` |
 
 The biggest open item is **Phase 6** (libghostty + worker spawn);
 Phases 7 and 9 effectively wait on it. Phase 8 has the data model
 but none of the live PR / poller / triage logic. Phase 10 hardening
-is essentially untouched.
+is essentially untouched. **Phase 11** is a build-system gap exposed
+by Phase 6a: the SwiftPM build includes the libghostty-driven Agents
+grid, but the Bazel build (the documented `bazel run //tools/boss/
+app-macos:BossMacApp` production path) excludes `Sources/Ghostty/`
+and falls through to a placeholder. Must land before — or as part of
+— the 6f cutover, otherwise the Bazel-built app loses Agents-mode
+functionality post-cutover.
 
 Each phase below carries its own **Status (done)** and **Pending**
 sections with file references so they can be ticked off
@@ -429,8 +436,19 @@ land before Phase 5 finishes. Split into 6a–6f.
   libghostty pane, the worker does the work and opens a PR. Engine
   observes the full lifecycle via WorkerEvents.
 
+**Build-system gap (tracked as Phase 11).** The 6a SwiftPM build
+links `GhosttyKit` and ships the live grid, but the Bazel build
+(the documented `bazel run //tools/boss/app-macos:BossMacApp`
+production path) excludes `Sources/Ghostty/*.swift` via a
+single-level glob and falls through to a placeholder via
+`#if canImport(GhosttyKit)`. After 6f cutover, the Bazel-built
+`.app` would have a non-functional Agents tab. Phase 11 closes
+this gap and must land before — or as part of — 6f.
+
 **Depends on.** Phase 5 for 6f only; 6a–6e and 6g do not depend on
-Phase 5. Cube V2 prereqs already landed in Phase 4.
+Phase 5. Cube V2 prereqs already landed in Phase 4. 6f also depends
+on Phase 11 (Bazel `GhosttyKit` integration) for the production
+build path.
 
 **References.** [`v2-design-risks`](../../designs/v2-design-risks.md)
 R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
@@ -652,6 +670,88 @@ R6; [`work-execution`](../../designs/work-execution.md) Phase E.
 
 **References.** [`work-execution`](../../designs/work-execution.md)
 Phases F + G.
+
+---
+
+### Phase 11: Bazel `GhosttyKit` integration — ❌ not started (prereq for 6f)
+
+**Goal.** Make the Bazel-built `.app` ship the same libghostty-driven
+Agents grid as the SwiftPM build, so the documented production path
+(`bazel run //tools/boss/app-macos:BossMacApp`) keeps working through
+and after the Phase 6f cutover.
+
+**Why this is its own phase.** Phase 6a got the Workers grid into the
+app via SwiftPM by adding `GhosttyKit` as a `binaryTarget` in
+`Package.swift` and excluding `Sources/Ghostty/*.swift` from the
+Bazel `swift_library` glob. That was deliberate: integrating the
+xcframework into Bazel is a non-trivial build-system problem
+(per-developer `zig` build, ~200 MB binary, per-arch slices), and
+keeping it out of the 6a PR avoided a multi-track scope creep.
+
+That deferral has a cost: until Phase 11 lands, the Bazel build of
+the macOS app falls through to a placeholder for Agents mode. The
+Phase 6f cutover removes the chat-based PoC Agents UI entirely; once
+that lands without Phase 11, the Bazel `.app` has no working Agents
+mode at all. So Phase 11 is a hard prereq for 6f.
+
+**Status (done).** Nothing.
+
+- `tools/boss/app-macos/Package.swift` declares
+  `.binaryTarget(name: "GhosttyKit", path:
+  "ThirdParty/GhosttyKit.xcframework")` (SwiftPM only).
+- `tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh` builds the
+  xcframework via the upstream `ghostty-org/ghostty` repo at
+  `origin/main` using `zig@0.15`.
+- `tools/boss/app-macos/BUILD.bazel`'s `srcs = glob(["Sources/
+  *.swift"])` is single-level and excludes `Sources/Ghostty/*.swift`.
+
+**Pending.**
+
+- **xcframework production path under Bazel.** Pick one of:
+  - **(a) Pinned binary in a separate repo or Git LFS / artifact
+    registry.** Build the xcframework once per ghostty SHA + arch,
+    publish to a place a Bazel `http_archive` (or similar) can fetch
+    by SHA256. Pros: reproducible, no per-developer zig install.
+    Cons: needs an artifact-publishing pipeline and a release process
+    for new ghostty versions.
+  - **(b) Bazel-driven build of the xcframework.** Wire `genrule` /
+    `rules_zig` to clone ghostty at a pinned commit and run
+    `zig build` inside the Bazel sandbox. Pros: single source of
+    truth for ghostty version. Cons: every developer + CI worker
+    needs zig + Metal toolchain available, and per-build cost is
+    high.
+  - **(c) Hybrid.** Bootstrap script writes to a known cache path;
+    Bazel target imports from that cache via a developer-config
+    macro; CI uses the same cache via a one-time setup step. Pros:
+    incremental migration. Cons: more moving parts.
+- **Bazel rule wiring.** Add the xcframework as an
+  `apple_dynamic_xcframework_import` (or static equivalent) and link
+  the resulting target into `boss_mac_app_lib`. Confirm the static
+  archive (`libghostty-internal-fat.a`) and Carbon framework + libc++
+  linker requirements come through the Bazel link.
+- **Glob change.** Once `GhosttyKit` is on the Bazel side too, change
+  the `srcs` glob in `BUILD.bazel` from `["Sources/*.swift"]` to
+  `["Sources/**/*.swift"]` so `Sources/Ghostty/*.swift` is included.
+- **Drop the `#if canImport(GhosttyKit)` gate** in `ContentView.swift`
+  once both build paths import the module unconditionally.
+- **Update README** to remove the bootstrap-required dance for the
+  Bazel path (SwiftPM may still need it for fast iteration unless we
+  wire a SwiftPM ↔ Bazel shared cache).
+
+**Done when (acceptance).**
+
+- `bazel build //tools/boss/app-macos:BossMacApp` succeeds without
+  the developer first running `bootstrap-ghosttykit.sh`.
+- The Bazel-built `.app`'s Agents tab shows the live 4 × 2 grid
+  (same as `swift run BossMacApp`), not the placeholder.
+- `bazel test`-able CI does not require a pre-installed `zig`
+  (option (a) or (c) — option (b) accepts this cost).
+
+**Depends on.** Phase 6a (which introduces the SwiftPM xcframework
+path that Phase 11 unifies with).
+
+**References.** Phase 6a PR; ghostty upstream `macos/GhosttyKit.xcframework`
+build target; `rules_apple` xcframework import docs.
 
 ---
 
