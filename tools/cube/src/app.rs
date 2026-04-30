@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use console::{Style, style};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -200,15 +201,7 @@ fn run_repo(
         }
         RepoCommand::List => {
             let repos = store.list_repos()?;
-            let message = if repos.is_empty() {
-                "No repos configured.".to_string()
-            } else {
-                repos
-                    .iter()
-                    .map(human_repo_summary)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let message = format_repo_list(&repos);
             RunResult::new(
                 message,
                 json!({
@@ -611,15 +604,7 @@ fn run_workspace(
                 ..Default::default()
             };
             let records = store.list_workspaces_filtered(&filter)?;
-            let message = if records.is_empty() {
-                "No workspaces match.".to_string()
-            } else {
-                records
-                    .iter()
-                    .map(human_workspace_summary)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let message = format_workspace_list(&records);
             RunResult::new(
                 message,
                 json!({
@@ -969,46 +954,138 @@ fn workspace_path_exists(record: &crate::metadata::WorkspaceRecord) -> bool {
     record.workspace_path.is_dir()
 }
 
-fn human_workspace_summary(record: &WorkspaceRecord) -> String {
-    let mut parts = vec![
-        format!("{}/{}", record.repo, record.workspace_id),
-        record.state.as_str().to_string(),
-        record.workspace_path.display().to_string(),
-    ];
-    if let Some(holder) = &record.holder {
-        parts.push(format!("holder={holder}"));
+fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
+    if records.is_empty() {
+        return "No workspaces match.".to_string();
     }
-    if let Some(task) = &record.task {
-        parts.push(format!("task={task:?}"));
+
+    let names: Vec<String> = records
+        .iter()
+        .map(|r| format!("{}/{}", r.repo, r.workspace_id))
+        .collect();
+    let paths: Vec<String> = records
+        .iter()
+        .map(|r| abbreviate_path(&r.workspace_path))
+        .collect();
+    let name_w = names.iter().map(|s| s.len()).max().unwrap_or(0);
+    let state_w = records
+        .iter()
+        .map(|r| r.state.as_str().len())
+        .max()
+        .unwrap_or(0);
+
+    let label_w = "holder".len();
+    let dim = Style::new().dim();
+    let mut lines = Vec::with_capacity(records.len());
+    for ((record, name), path) in records.iter().zip(&names).zip(&paths) {
+        let name_pad = format!("{name:<name_w$}");
+        let state_pad = format!("{:<state_w$}", record.state.as_str());
+        let state_styled = match record.state {
+            WorkspaceState::Free => style(state_pad).green(),
+            WorkspaceState::Leased => style(state_pad).yellow(),
+        };
+        lines.push(format!(
+            "{}  {}  {}",
+            style(name_pad).cyan().bold(),
+            state_styled,
+            dim.apply_to(path),
+        ));
+
+        if record.state == WorkspaceState::Leased {
+            if let Some(holder) = &record.holder {
+                lines.push(format!(
+                    "    {}  {}",
+                    dim.apply_to(format!("{:<label_w$}", "holder")),
+                    holder,
+                ));
+            }
+            if let Some(task) = &record.task {
+                lines.push(format!(
+                    "    {}  {}",
+                    dim.apply_to(format!("{:<label_w$}", "task")),
+                    task,
+                ));
+            }
+            if let Some(lease) = &record.lease_id {
+                lines.push(format!(
+                    "    {}  {}",
+                    dim.apply_to(format!("{:<label_w$}", "lease")),
+                    dim.apply_to(lease),
+                ));
+            }
+        }
     }
-    if let Some(lease_id) = &record.lease_id {
-        parts.push(format!("lease={lease_id}"));
-    }
-    parts.join("  ")
+    lines.join("\n")
 }
 
 fn human_workspace_detail(record: &crate::metadata::WorkspaceRecord, jj_status: &str) -> String {
+    let dim = Style::new().dim();
     let mut lines = vec![
-        format!("repo: {}", record.repo),
-        format!("workspace_id: {}", record.workspace_id),
-        format!("workspace_path: {}", record.workspace_path.display()),
-        format!("state: {}", record.state.as_str()),
+        format!("{} {}", dim.apply_to("repo:"), record.repo),
+        format!(
+            "{} {}",
+            dim.apply_to("workspace_id:"),
+            style(&record.workspace_id).cyan().bold(),
+        ),
+        format!(
+            "{} {}",
+            dim.apply_to("workspace_path:"),
+            abbreviate_path(&record.workspace_path),
+        ),
+        format!(
+            "{} {}",
+            dim.apply_to("state:"),
+            style_state(record.state),
+        ),
     ];
     if let Some(lease_id) = &record.lease_id {
-        lines.push(format!("lease_id: {lease_id}"));
+        lines.push(format!(
+            "{} {}",
+            dim.apply_to("lease_id:"),
+            dim.apply_to(lease_id),
+        ));
     }
     if let Some(holder) = &record.holder {
-        lines.push(format!("holder: {holder}"));
+        lines.push(format!("{} {holder}", dim.apply_to("holder:")));
     }
     if let Some(task) = &record.task {
-        lines.push(format!("task: {task}"));
+        lines.push(format!("{} {task}", dim.apply_to("task:")));
     }
     if let Some(head_commit) = &record.head_commit {
-        lines.push(format!("head_commit: {head_commit}"));
+        lines.push(format!(
+            "{} {}",
+            dim.apply_to("head_commit:"),
+            dim.apply_to(head_commit),
+        ));
     }
-    lines.push("jj_status:".to_string());
+    lines.push(dim.apply_to("jj_status:").to_string());
     lines.push(jj_status.to_string());
     lines.join("\n")
+}
+
+fn style_state(state: WorkspaceState) -> console::StyledObject<&'static str> {
+    match state {
+        WorkspaceState::Free => style(state.as_str()).green(),
+        WorkspaceState::Leased => style(state.as_str()).yellow(),
+    }
+}
+
+fn abbreviate_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if !home.is_empty() {
+            if s == home.as_ref() {
+                return "~".to_string();
+            }
+            if let Some(rest) = s.strip_prefix(home.as_ref())
+                && rest.starts_with('/')
+            {
+                return format!("~{rest}");
+            }
+        }
+    }
+    s
 }
 
 fn holder_identity() -> String {
@@ -1084,43 +1161,106 @@ fn pr_command_name(command: &PrCommand) -> &'static str {
     }
 }
 
-fn human_repo_summary(record: &RepoRecord) -> String {
-    format!(
-        "{}: {} ({}, prefix `{}`)",
-        record.repo,
-        record.workspace_root.display(),
-        record.main_branch,
-        record.workspace_prefix
-    )
+fn format_repo_list(records: &[RepoRecord]) -> String {
+    if records.is_empty() {
+        return "No repos configured.".to_string();
+    }
+    let dim = Style::new().dim();
+    let name_w = records.iter().map(|r| r.repo.len()).max().unwrap_or(0);
+    let root_w = records
+        .iter()
+        .map(|r| abbreviate_path(&r.workspace_root).len())
+        .max()
+        .unwrap_or(0);
+    records
+        .iter()
+        .map(|r| {
+            let name_pad = format!("{:<name_w$}", r.repo);
+            let root = abbreviate_path(&r.workspace_root);
+            let root_pad = format!("{root:<root_w$}");
+            format!(
+                "{}  {}  {} {} {} {}",
+                style(name_pad).cyan().bold(),
+                dim.apply_to(root_pad),
+                dim.apply_to("branch"),
+                r.main_branch,
+                dim.apply_to("prefix"),
+                r.workspace_prefix,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn human_repo_detail(record: &RepoRecord) -> String {
+    let dim = Style::new().dim();
     let mut lines = vec![
-        format!("repo: {}", record.repo),
-        format!("origin: {}", record.origin),
-        format!("main_branch: {}", record.main_branch),
-        format!("workspace_root: {}", record.workspace_root.display()),
-        format!("workspace_prefix: {}", record.workspace_prefix),
+        format!(
+            "{} {}",
+            dim.apply_to("repo:"),
+            style(&record.repo).cyan().bold(),
+        ),
+        format!("{} {}", dim.apply_to("origin:"), record.origin),
+        format!("{} {}", dim.apply_to("main_branch:"), record.main_branch),
+        format!(
+            "{} {}",
+            dim.apply_to("workspace_root:"),
+            abbreviate_path(&record.workspace_root),
+        ),
+        format!(
+            "{} {}",
+            dim.apply_to("workspace_prefix:"),
+            record.workspace_prefix,
+        ),
     ];
     if let Some(source) = &record.source {
-        lines.push(format!("source: {}", source.display()));
+        lines.push(format!(
+            "{} {}",
+            dim.apply_to("source:"),
+            abbreviate_path(source),
+        ));
     }
     lines.join("\n")
 }
 
 fn human_change_detail(record: &ChangeRecord) -> String {
+    let dim = Style::new().dim();
     let mut lines = vec![
-        format!("change_id: {}", record.change_id),
-        format!("repo: {}", record.repo),
-        format!("workspace_path: {}", record.workspace_path.display()),
-        format!("title: {}", record.title),
-        format!("jj_change_id: {}", record.jj_change_id),
-        format!("head_commit: {}", record.head_commit),
+        format!(
+            "{} {}",
+            dim.apply_to("change_id:"),
+            style(&record.change_id).cyan().bold(),
+        ),
+        format!("{} {}", dim.apply_to("repo:"), record.repo),
+        format!(
+            "{} {}",
+            dim.apply_to("workspace_path:"),
+            abbreviate_path(&record.workspace_path),
+        ),
+        format!("{} {}", dim.apply_to("title:"), record.title),
+        format!(
+            "{} {}",
+            dim.apply_to("jj_change_id:"),
+            dim.apply_to(&record.jj_change_id),
+        ),
+        format!(
+            "{} {}",
+            dim.apply_to("head_commit:"),
+            dim.apply_to(&record.head_commit),
+        ),
     ];
     if let Some(parent_change_id) = &record.parent_change_id {
-        lines.push(format!("parent_change_id: {parent_change_id}"));
+        lines.push(format!(
+            "{} {}",
+            dim.apply_to("parent_change_id:"),
+            parent_change_id,
+        ));
     }
-    lines.push(format!("created_at_epoch_s: {}", record.created_at_epoch_s));
+    lines.push(format!(
+        "{} {}",
+        dim.apply_to("created_at_epoch_s:"),
+        record.created_at_epoch_s,
+    ));
     lines.join("\n")
 }
 
