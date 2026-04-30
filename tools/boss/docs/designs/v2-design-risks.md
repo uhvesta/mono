@@ -538,8 +538,11 @@ Bugs and gaps surfaced:
   V2 invocations should use the global db like every other caller.
   `CUBE_DATA_DIR` covers test/debug isolation; no per-product
   partitioning is needed or wanted.
-- `repo add --source` accepts a seed path (`cli.rs:65`) but lease
-  never reads it — no auto-create on pool exhaustion.
+- ~~`repo add --source` accepts a seed path but lease never reads
+  it~~ — fixed: `cube workspace lease` auto-creates a fresh workspace
+  on pool exhaustion. Clones from `repo.source` if set, else from
+  `repo.origin`; new id is `<prefix>{max+1:03}`
+  (`app.rs::auto_create_workspace`).
 - Release does not clean up abandoned `jj` changes a worker may have
   created; working copy is clean for the next lease, but history
   accretes.
@@ -551,8 +554,7 @@ features (`change checkout`, `stack *`, `pr *`) are unbuilt; Boss V2
 must continue to drive `jj` / `gh` / `git` directly inside leased
 workspaces. Gap-fixes to harden the pooling layer for V2, in priority
 order: (1) implement `workspace setup` so per-repo bootstrap is
-cube's job, not Boss's, (2) auto-create workspaces from `--source`
-on pool exhaustion, (3) add the heartbeat / `--reason crash
+cube's job, not Boss's, (2) add the heartbeat / `--reason crash
 --keep-dirty` / `force-release` lease-lifecycle commands the
 integration sketch needs.
 
@@ -780,9 +782,7 @@ decisive unknowns are resolved in the findings above. Concretely:
 takes the dependency, in priority order):
 
 1. Implement `workspace setup` (currently stubbed at `app.rs:447`).
-2. Auto-create workspaces from `--source` on pool exhaustion
-   (`cli.rs:65` flag is parsed but never read).
-3. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
+2. Add `cube workspace heartbeat`, `--reason crash --keep-dirty` on
    release, and `cube workspace force-release` — all required by the
    integration sketch's error handling.
 
@@ -791,6 +791,10 @@ Already landed since the original audit:
 - Fix the `head_commit` template parsing bug (`app.rs:659`).
 - Repo-pool `flock` around `claim_workspace` and `release`
   (`lock.rs`, `paths::repo_lock_path`).
+- Auto-create on pool exhaustion in `cube workspace lease` —
+  `repo.source` is consumed if set, falling back to `repo.origin`;
+  new id is `<prefix>{max+1:03}`
+  (`app.rs::auto_create_workspace`).
 
 The original prereq list also called out a `--database` CLI flag.
 That was dropped on review: cube's SQLite store is a machine-global

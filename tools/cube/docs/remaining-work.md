@@ -42,12 +42,7 @@ Priority order; (1) blocks the others least and is the smallest fix.
       [main.md §Setup and Provisioning](./main.md#setup-and-provisioning)
       but unimplemented.
 
-- [ ] **(2) Auto-create workspaces from `--source` on pool
-      exhaustion.** `repo add --source` accepts a seed path
-      (`cli.rs:65`) but `lease` never reads it. Currently a full pool
-      blocks new leases with exit code 4.
-
-- [ ] **(3) Add lease-lifecycle commands required by Boss V2's
+- [ ] **(2) Add lease-lifecycle commands required by Boss V2's
       integration sketch:**
       - `cube workspace heartbeat --lease <id>` — Boss-engine pings
         to refresh lease TTL
@@ -57,7 +52,7 @@ Priority order; (1) blocks the others least and is the smallest fix.
       - `cube workspace force-release --lease <id>` — operator-grade
         release that bypasses ownership checks for orphan reclamation
 
-When all three land, R4's "cube prerequisites" close.
+When both land, R4's "cube prerequisites" close.
 
 ### Design principle: single global database
 
@@ -87,6 +82,11 @@ directly.
   (`lock.rs`, `paths::repo_lock_path`). Lock files live at
   `<data_dir>/locks/<repo>.lock` and serialize the lease/release
   critical sections per repo.
+- ✓ Auto-create workspaces on pool exhaustion. `cube workspace lease`
+  now clones a fresh workspace (from `repo.source` if set, else from
+  `repo.origin`) when no free slot is available, picks the next
+  numeric id (`<prefix>{max+1:03}`), syncs it into the registry, and
+  leases it. Implemented in `app.rs::auto_create_workspace`.
 
 ## Beyond V2 scope
 
