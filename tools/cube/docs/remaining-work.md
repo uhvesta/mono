@@ -12,15 +12,17 @@ candidates for work, not aspirations.
 What works (current `main`):
 
 - `cube repo add` / `list` / `info`
-- `cube workspace lease` (single-pool, no auto-create, no setup engine,
-  no `flock`)
+- `cube workspace lease` (single-pool, no auto-create) — runs the
+  setup engine after reset; per-repo `flock` serialises lease/release
 - `cube workspace release` (resets via `jj git fetch && jj new main`)
 - `cube workspace status` (delegates to `jj status`)
+- `cube workspace setup` — re-runs `<workspace>/.cube/setup.yaml`
+  against the existing lease, with per-step fingerprint reuse
 - `cube change create` and `cube change info` (records local
   change-graph metadata against a leased workspace; `change checkout`
   remains unimplemented)
-- SQLite-backed `repos`, `workspaces`, and `changes` metadata
-  (`store.rs`)
+- SQLite-backed `repos`, `workspaces`, `changes`, and
+  `workspace_setup` metadata (`store.rs`)
 - Both `cargo build -p cube` and `bazel build //tools/cube` build
   cleanly
 
@@ -32,17 +34,8 @@ The full audit lives in
 ## V2 prerequisites
 
 Items that must land before Boss V2 takes a hard dependency on cube.
-Priority order; (1) blocks the others least and is the smallest fix.
 
-- [ ] **(1) Implement `workspace setup`.** Today returns
-      "No setup steps are configured for {workspace_id}."
-      unconditionally (`app.rs:447`). The setup engine, fingerprinting,
-      and `on-create` / `on-fingerprint-change` / `always` policies are
-      described in
-      [main.md §Setup and Provisioning](./main.md#setup-and-provisioning)
-      but unimplemented.
-
-- [ ] **(2) Add lease-lifecycle commands required by Boss V2's
+- [ ] **Add lease-lifecycle commands required by Boss V2's
       integration sketch:**
       - `cube workspace heartbeat --lease <id>` — Boss-engine pings
         to refresh lease TTL
@@ -52,7 +45,7 @@ Priority order; (1) blocks the others least and is the smallest fix.
       - `cube workspace force-release --lease <id>` — operator-grade
         release that bypasses ownership checks for orphan reclamation
 
-When both land, R4's "cube prerequisites" close.
+When this lands, R4's "cube prerequisites" close.
 
 ### Design principle: single global database
 
@@ -87,6 +80,13 @@ directly.
   `repo.origin`) when no free slot is available, picks the next
   numeric id (`<prefix>{max+1:03}`), syncs it into the registry, and
   leases it. Implemented in `app.rs::auto_create_workspace`.
+- ✓ Implement `cube workspace setup` and lease-time provisioning
+  (`setup.rs`, `app.rs::run_setup_for_workspace`). Reads
+  `<workspace>/.cube/setup.yaml`, runs steps under `on-create` /
+  `on-fingerprint-change` / `always` policies, persists per-step
+  fingerprints in the new `workspace_setup` table, and surfaces
+  failures as `SetupStepFailed` (exit code 6) without rolling back
+  the lease so the workspace can be repaired in place.
 
 ## Beyond V2 scope
 
