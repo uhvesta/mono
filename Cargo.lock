@@ -200,6 +200,7 @@ dependencies = [
  "boss-client",
  "boss-protocol",
  "clap",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

@@ -3,6 +3,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod coordinator;
+pub mod events_socket;
 pub mod protocol;
 pub mod runner;
 pub mod transcript_tail;
