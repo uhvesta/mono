@@ -41,7 +41,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 5     | ExecutionCoordinator                           | 🟡 partially shipped — multiple gaps (worker affinity/LRU, `executions.<id>` topic, `request_execution` RPC, waiting-state semantics) |
 | 6     | libghostty embedding and worker spawn          | ❌ not started               |
 | 7     | Boss session and bossctl                       | ❌ not started               |
-| 8     | Review and attention                           | 🟡 attention-item schema only |
+| 8     | Review and attention                           | 🟡 schema + manual PR-URL only — no auto-detect, no poller, no Triage UI, no re-engage |
 | 9     | Resume and continuity                          | ❌ not started               |
 | 10    | Transcripts and hardening                      | ❌ schema columns only       |
 
@@ -478,43 +478,66 @@ R3, R5, R8.
 
 ---
 
-### Phase 8: Review and attention — 🟡 schema only
+### Phase 8: Review and attention — 🟡 schema + manual PR-URL only
 
 **Goal.** Close the human-in-the-loop review cycle.
 
 **Status (done).**
 
-- `work_attention_items` table and CRUD
-  (`engine/src/work.rs:90-99` for the `WorkAttentionItem` struct;
-  CRUD across `work.rs:754-820`).
-- Attention items are created when a run finishes in a state that
-  needs human input (`engine/src/coordinator.rs:533-550`,
-  triggered when the runner returns
-  `execution_status: "waiting_human"` at
+- `work_attention_items` table, struct, and CRUD
+  (`engine/src/work.rs:90` `WorkAttentionItem` struct;
+  `work.rs:1066-1078` table DDL; `work.rs:754-820`
+  `create_attention_item` / `list_attention_items` /
+  `get_attention_item`).
+- Attention items are created when a run finishes in
+  `waiting_human` (`engine/src/coordinator.rs:533-550`, off
   `engine/src/runner.rs:178`).
+- `tasks.pr_url` column on the work-taxonomy schema
+  (`engine/src/work.rs:1020`); settable via `boss task update
+  --pr-url <url>` and via the app's task edit form
+  (`app-macos/Sources/ContentView.swift:1112`,
+  `:1119`).
+- PR URL is rendered in kanban card detail
+  (`ContentView.swift:914` metadata row) and shown as a label on
+  the card itself (`ContentView.swift:838-839`). This is the
+  Phase 3 kanban work, but it incidentally fills the "card detail
+  shows PR URL" half of one Phase 8 deliverable — only the
+  *display* half; see Pending below.
 
 **Pending.**
 
-- Engine: PR detection — pattern-match worker
+- Engine: **automatic** PR detection — pattern-match worker
   `last_assistant_text` for GitHub PR URL; periodic
   `gh pr list --head <branch>` discovery using cube's deterministic
-  branch names. (No `gh pr` invocations in engine source today.)
+  branch names. (`grep` for `last_assistant_text` and
+  `github.com/.*pull` in `engine/src/` returns nothing. The
+  `pr_url` field exists but only as a manual setter today.)
 - Engine: GitHub poller — every 60s, `gh pr view --json state,
   mergedAt, statusCheckRollup, reviews, comments` for each
-  execution in `waiting_review` or `waiting_merge`.
+  execution in `waiting_review` or `waiting_merge`. (`grep` for
+  `"gh pr"` in `engine/src/` → nothing.)
 - Engine: extend attention-item creation to also fire on
-  `waiting_review` (currently only the `waiting_human` path
-  creates them).
-- Engine: `request_re_engagement(work_item_id)` RPC: re-leases the
-  workspace (with `preferred_workspace_id`), resumes the claude
-  session via `--resume`, sends synthesized comments-as-prompt.
+  `waiting_review`. (`grep` for `waiting_review` / `waiting_merge`
+  in `engine/src/` → nothing; only the `waiting_human` path
+  creates attention items.)
+- Engine: `request_re_engagement(work_item_id)` RPC: re-leases
+  the workspace (with `preferred_workspace_id`), resumes the
+  claude session via `--resume`, sends synthesized
+  comments-as-prompt. (`grep` for `re_engage` /
+  `request_re_engagement` → nothing.)
 - App: Triage / Needs Attention surface in Work mode. Lists
   attention items with primary action ("Open PR" / "Re-engage
-  worker" / "View blocker" / "Re-dispatch").
-- App: Work-mode card detail shows PR URL, status ribbon, "Open
-  in browser", "Re-engage worker (N comments)".
+  worker" / "View blocker" / "Re-dispatch"). (`grep` for
+  `Triage` / `AttentionItem` / `attention` in
+  `app-macos/Sources/` → nothing — the attention-items table on
+  the engine has no consumer in the app.)
+- App: card detail additions on top of the existing PR URL line —
+  status ribbon (PR open / draft / merged / failing checks),
+  "Open in browser" button, "Re-engage worker (N comments)"
+  action. (None of these strings appear in `ContentView.swift`.)
 - Engine: detect `state: MERGED` → execution `completed`, lease
-  released.
+  released. (`grep` for `MERGED` / `mergedAt` in engine →
+  nothing.)
 
 **Done when (acceptance).**
 
