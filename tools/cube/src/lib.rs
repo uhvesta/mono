@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audit;
 pub mod cli;
 pub mod command_runner;
 pub mod lock;

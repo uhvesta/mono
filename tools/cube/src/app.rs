@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::audit;
 use crate::cli::{
     ChangeCommand, Cli, Command, DoctorArgs, GraphArgs, PrCommand, RepoCommand, StackCommand,
     WorkspaceCommand,
@@ -367,11 +368,7 @@ fn run_workspace(
     };
 
     match command {
-        WorkspaceCommand::Lease {
-            repo,
-            task,
-            prefer,
-        } => {
+        WorkspaceCommand::Lease { repo, task, prefer } => {
             let repo_record = store
                 .get_repo(&repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
@@ -431,6 +428,15 @@ fn run_workspace(
             store.update_workspace_head_commit(&lease_id, Some(&head_commit))?;
             workspace.head_commit = Some(head_commit);
 
+            audit!(database_path, "lease.acquired",
+                repo = workspace.repo,
+                workspace_id = workspace.workspace_id,
+                lease_id = lease_id,
+                holder = holder,
+                task = task,
+                head_commit = workspace.head_commit,
+            );
+
             let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
 
             let lease_message = format!(
@@ -488,6 +494,14 @@ fn run_workspace(
                 .release_workspace(&lease, reason.as_deref())?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
 
+            audit!(database_path, "lease.released",
+                repo = released.repo,
+                workspace_id = released.workspace_id,
+                lease_id = lease,
+                reason = reason,
+                keep_dirty = keep_dirty,
+            );
+
             let message = if keep_dirty {
                 format!("Released {} (kept dirty).", released.workspace_id)
             } else {
@@ -500,10 +514,7 @@ fn run_workspace(
                 }),
             )
         }
-        WorkspaceCommand::Heartbeat {
-            lease,
-            ttl_seconds,
-        } => {
+        WorkspaceCommand::Heartbeat { lease, ttl_seconds } => {
             let now = current_epoch_s()?;
             let ttl = ttl_seconds
                 .map(|s| s as i64)
@@ -533,12 +544,19 @@ fn run_workspace(
             let workspace_record = store
                 .get_workspace_by_lease(&lease)?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
-            let _lock =
-                RepoLock::acquire(&repo_lock_path(&workspace_record.repo, database_path)?)?;
+            let _lock = RepoLock::acquire(&repo_lock_path(&workspace_record.repo, database_path)?)?;
             let reason = reason.unwrap_or_else(|| "force-released".to_string());
             let released = store
                 .force_release_lease(&lease, Some(&reason))?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+
+            audit!(database_path, "lease.force_released",
+                repo = released.repo,
+                workspace_id = released.workspace_id,
+                lease_id = lease,
+                reason = reason,
+            );
+
             RunResult::new(
                 format!(
                     "Force-released {} (workspace not reset).",
@@ -1693,14 +1711,7 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "third",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "third"]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
         assert_eq!(
@@ -1712,14 +1723,14 @@ mod tests {
 
     #[test]
     fn next_workspace_id_picks_max_plus_one() {
-        assert_eq!(super::next_workspace_id("mono-agent-", &[]), "mono-agent-001");
+        assert_eq!(
+            super::next_workspace_id("mono-agent-", &[]),
+            "mono-agent-001"
+        );
         assert_eq!(
             super::next_workspace_id(
                 "mono-agent-",
-                &[
-                    "mono-agent-001".to_string(),
-                    "mono-agent-002".to_string(),
-                ],
+                &["mono-agent-001".to_string(), "mono-agent-002".to_string(),],
             ),
             "mono-agent-003"
         );
@@ -1727,10 +1738,7 @@ mod tests {
         assert_eq!(
             super::next_workspace_id(
                 "mono-agent-",
-                &[
-                    "mono-agent-001".to_string(),
-                    "mono-agent-007".to_string(),
-                ],
+                &["mono-agent-001".to_string(), "mono-agent-007".to_string(),],
             ),
             "mono-agent-008"
         );
@@ -1999,7 +2007,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_release_by_workspace_id_resolves_active_lease() {
+    fn lease_and_release_emit_audit_log_entries() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
@@ -2035,8 +2043,93 @@ mod tests {
             "lease",
             "mono",
             "--task",
-            "demo",
+            "audit smoke",
         ]);
+        let lease_result =
+            run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+        ]);
+        let release = Cli::parse_from([
+            "cube",
+            "workspace",
+            "release",
+            "--lease",
+            &lease_id,
+            "--reason",
+            "done",
+        ]);
+        run_with_dependencies(release, Some(&database_path), &release_runner).expect("release");
+        release_runner.assert_exhausted();
+
+        let audit_dir = tempdir.path().join("audit");
+        let audit_files: Vec<_> = std::fs::read_dir(&audit_dir)
+            .expect("audit dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(audit_files.len(), 1, "expected one weekly audit file");
+
+        let contents = std::fs::read_to_string(&audit_files[0]).expect("audit content");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected lease + release events");
+
+        let acquired: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(acquired["event"], "lease.acquired");
+        assert_eq!(acquired["repo"], "mono");
+        assert_eq!(acquired["workspace_id"], "mono-agent-004");
+        assert_eq!(acquired["lease_id"], lease_id);
+        assert_eq!(acquired["task"], "audit smoke");
+        assert_eq!(acquired["head_commit"], "abc1234");
+        assert!(acquired["holder"].is_string());
+        assert!(acquired["ts"].as_str().unwrap().ends_with('Z'));
+
+        let released: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(released["event"], "lease.released");
+        assert_eq!(released["lease_id"], lease_id);
+        assert_eq!(released["reason"], "done");
+        assert_eq!(released["keep_dirty"], false);
+    }
+
+    #[test]
+    fn workspace_release_by_workspace_id_resolves_active_lease() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-004");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]);
         run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         lease_runner.assert_exhausted();
 
@@ -2044,13 +2137,15 @@ mod tests {
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
         ]);
-        let release =
-            Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
+        let release = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
         let result = run_with_dependencies(release, Some(&database_path), &release_runner)
             .expect("release by id");
 
         assert_eq!(result.payload["workspace"]["state"], "free");
-        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-004"
+        );
         release_runner.assert_exhausted();
     }
 
@@ -2079,11 +2174,9 @@ mod tests {
         let list = Cli::parse_from(["cube", "workspace", "list", "--repo", "mono"]);
         let _ = run_with_dependencies(list, Some(&database_path), &FakeRunner::default());
 
-        let release =
-            Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
-        let error =
-            run_with_dependencies(release, Some(&database_path), &FakeRunner::default())
-                .expect_err("release should fail");
+        let release = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
+        let error = run_with_dependencies(release, Some(&database_path), &FakeRunner::default())
+            .expect_err("release should fail");
         // Workspace id is unknown to the registry until something has synced
         // it, so this surfaces as WorkspaceNotFound.
         assert!(matches!(error, CubeError::WorkspaceNotFound(_)));
@@ -2466,14 +2559,7 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "demo",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]);
         run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
         // global list returns both rows
@@ -2481,9 +2567,7 @@ mod tests {
         let result_all =
             run_with_dependencies(list_all, Some(&database_path), &FakeRunner::default())
                 .expect("list");
-        let rows = result_all.payload["workspaces"]
-            .as_array()
-            .expect("array");
+        let rows = result_all.payload["workspaces"].as_array().expect("array");
         assert_eq!(rows.len(), 2);
 
         // state filter narrows to leased only

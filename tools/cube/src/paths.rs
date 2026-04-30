@@ -31,3 +31,11 @@ pub fn repo_lock_path(repo: &str) -> Result<PathBuf, CubeError> {
 pub fn repo_lock_path_in(data_dir: &std::path::Path, repo: &str) -> PathBuf {
     data_dir.join("locks").join(format!("{repo}.lock"))
 }
+
+pub fn audit_dir() -> Result<PathBuf, CubeError> {
+    Ok(audit_dir_in(&data_dir()?))
+}
+
+pub fn audit_dir_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("audit")
+}
