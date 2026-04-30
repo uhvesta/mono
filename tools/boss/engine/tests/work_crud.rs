@@ -236,6 +236,133 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Result<()> {
+    // Phase 2 "Done when": a CLI-style mutation made by one client surfaces
+    // on a second connected client without manual refresh, fast enough to
+    // feel live. We model the human's CLI as `writer_client` and a watcher
+    // playing the role of the macOS Work tab.
+    let engine = TestEngine::spawn().await?;
+
+    let mut writer_client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(
+        &mut writer_client,
+        CreateProductInput {
+            name: "Live".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut writer_client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 2".to_owned(),
+            description: None,
+            goal: None,
+        },
+    )
+    .await?;
+    let task = create_task(
+        &mut writer_client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Wire subscription".to_owned(),
+            description: None,
+        },
+    )
+    .await?;
+
+    let topic = work_product_topic(&product.id);
+    let watcher = subscribe_watcher(engine.socket_str(), topic.clone()).await?;
+
+    let started = std::time::Instant::now();
+    update_work_item(
+        &mut writer_client,
+        &task.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .await?;
+
+    let invalidation = watcher.next_invalidation(Duration::from_secs(1)).await?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "invalidation propagation took {elapsed:?}, expected < 1s"
+    );
+    assert_eq!(invalidation.topic, topic);
+    match invalidation.event {
+        TopicEventPayload::WorkInvalidated {
+            reason,
+            product_id,
+            item_ids,
+        } => {
+            assert_eq!(reason, "work_item_updated");
+            assert_eq!(product_id.as_deref(), Some(product.id.as_str()));
+            assert_eq!(item_ids, vec![task.id.clone()]);
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn each_mutation_emits_one_invalidation() -> Result<()> {
+    // Three separate mutations should produce three distinct invalidations
+    // for the watcher in order — coalescing only collapses *unsent* duplicates,
+    // so distinct events on a draining socket should pass through one-for-one.
+    let engine = TestEngine::spawn().await?;
+
+    let mut writer_client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(
+        &mut writer_client,
+        CreateProductInput {
+            name: "Sequenced".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+
+    let topic = work_product_topic(&product.id);
+    let watcher = subscribe_watcher(engine.socket_str(), topic.clone()).await?;
+
+    let _project = create_project(
+        &mut writer_client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "P".to_owned(),
+            description: None,
+            goal: None,
+        },
+    )
+    .await?;
+    let _chore = create_chore(
+        &mut writer_client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "C".to_owned(),
+            description: None,
+        },
+    )
+    .await?;
+
+    let mut reasons = Vec::new();
+    for _ in 0..2 {
+        let inv = watcher.next_invalidation(Duration::from_secs(1)).await?;
+        let TopicEventPayload::WorkInvalidated { reason, .. } = inv.event;
+        reasons.push(reason);
+    }
+    assert_eq!(reasons, vec!["project_created", "chore_created"]);
+
+    Ok(())
+}
+
 struct Invalidation {
     topic: String,
     event: TopicEventPayload,

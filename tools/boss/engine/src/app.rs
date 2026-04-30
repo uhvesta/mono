@@ -1,12 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
@@ -244,6 +245,167 @@ impl ServerState {
     }
 }
 
+/// Maximum events that can be queued for one session before we treat the
+/// client as slow. Sized for typical work-invalidation traffic: each
+/// mutation emits at most a couple of envelopes, and same-topic
+/// invalidations are coalesced, so 256 absorbs bursts while bounding
+/// memory.
+const MAX_SESSION_QUEUE: usize = 256;
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnqueueOutcome {
+    Enqueued,
+    Coalesced,
+    Closed,
+    Slow,
+}
+
+struct SessionQueue {
+    items: VecDeque<FrontendEventEnvelope>,
+    /// For each topic with a pending unsent TopicEvent, the index of that
+    /// envelope in `items` (front-relative; decremented on pop). Lets us
+    /// overwrite stale invalidations instead of growing the queue.
+    pending_topics: HashMap<String, usize>,
+    closed: bool,
+    slow: bool,
+}
+
+impl SessionQueue {
+    fn new() -> Self {
+        Self {
+            items: VecDeque::new(),
+            pending_topics: HashMap::new(),
+            closed: false,
+            slow: false,
+        }
+    }
+
+    fn enqueue(&mut self, env: FrontendEventEnvelope) -> EnqueueOutcome {
+        if self.closed {
+            return EnqueueOutcome::Closed;
+        }
+        if self.slow {
+            return EnqueueOutcome::Slow;
+        }
+
+        if let Some(topic) = topic_event_topic(&env.payload) {
+            if let Some(&idx) = self.pending_topics.get(&topic) {
+                debug_assert!(idx < self.items.len());
+                self.items[idx] = env;
+                return EnqueueOutcome::Coalesced;
+            }
+            if self.items.len() >= MAX_SESSION_QUEUE {
+                self.slow = true;
+                return EnqueueOutcome::Slow;
+            }
+            let idx = self.items.len();
+            self.items.push_back(env);
+            self.pending_topics.insert(topic, idx);
+            return EnqueueOutcome::Enqueued;
+        }
+
+        if self.items.len() >= MAX_SESSION_QUEUE {
+            self.slow = true;
+            return EnqueueOutcome::Slow;
+        }
+        self.items.push_back(env);
+        EnqueueOutcome::Enqueued
+    }
+
+    fn pop_front(&mut self) -> Option<FrontendEventEnvelope> {
+        let env = self.items.pop_front()?;
+        // Indices in `pending_topics` are front-relative; shift them down
+        // by one and drop the entry that pointed at the just-popped item.
+        let mut next = HashMap::with_capacity(self.pending_topics.len());
+        for (topic, idx) in self.pending_topics.drain() {
+            if idx == 0 {
+                continue;
+            }
+            next.insert(topic, idx - 1);
+        }
+        self.pending_topics = next;
+        Some(env)
+    }
+}
+
+fn topic_event_topic(payload: &FrontendEvent) -> Option<String> {
+    match payload {
+        FrontendEvent::TopicEvent { topic, .. } => Some(topic.clone()),
+        _ => None,
+    }
+}
+
+/// Outbound side of one connected session: a bounded coalescing queue plus
+/// the shutdown trigger the reader loop selects on. The broker fans
+/// invalidations out by calling `enqueue`; the writer task drains via
+/// `next`; if either side decides the session is slow or finished, it
+/// `close`s the sink and `trigger_shutdown` stops the reader.
+struct SessionSink {
+    queue: StdMutex<SessionQueue>,
+    notify: Notify,
+    shutdown: StdMutex<Option<oneshot::Sender<()>>>,
+}
+
+impl SessionSink {
+    fn new(shutdown_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            queue: StdMutex::new(SessionQueue::new()),
+            notify: Notify::new(),
+            shutdown: StdMutex::new(Some(shutdown_tx)),
+        }
+    }
+
+    fn enqueue(&self, env: FrontendEventEnvelope) -> EnqueueOutcome {
+        let outcome = {
+            let mut q = self.queue.lock().expect("session queue lock poisoned");
+            q.enqueue(env)
+        };
+        match outcome {
+            EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced => self.notify.notify_one(),
+            EnqueueOutcome::Closed | EnqueueOutcome::Slow => {}
+        }
+        outcome
+    }
+
+    fn close(&self) {
+        {
+            let mut q = self.queue.lock().expect("session queue lock poisoned");
+            q.closed = true;
+        }
+        self.notify.notify_one();
+    }
+
+    fn trigger_shutdown(&self) {
+        if let Some(tx) = self.shutdown.lock().expect("shutdown lock poisoned").take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Wait for the next envelope. Returns `None` once the sink is closed
+    /// and the queue is drained.
+    async fn next(&self) -> Option<FrontendEventEnvelope> {
+        loop {
+            // Register interest first so a `notify_one` between our queue
+            // peek and the await still wakes us.
+            let notified = self.notify.notified();
+            let snapshot = {
+                let mut q = self.queue.lock().expect("session queue lock poisoned");
+                if let Some(env) = q.pop_front() {
+                    Some(Some(env))
+                } else if q.closed {
+                    Some(None)
+                } else {
+                    None
+                }
+            };
+            match snapshot {
+                Some(env_opt) => return env_opt,
+                None => notified.await,
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct TopicBroker {
     inner: Mutex<TopicBrokerInner>,
@@ -251,24 +413,20 @@ struct TopicBroker {
 
 #[derive(Default)]
 struct TopicBrokerInner {
-    senders: HashMap<String, mpsc::UnboundedSender<FrontendEventEnvelope>>,
+    sinks: HashMap<String, Arc<SessionSink>>,
     topics_by_session: HashMap<String, HashSet<String>>,
     sessions_by_topic: HashMap<String, HashSet<String>>,
 }
 
 impl TopicBroker {
-    async fn register_session(
-        &self,
-        session_id: &str,
-        sender: mpsc::UnboundedSender<FrontendEventEnvelope>,
-    ) {
+    async fn register_session(&self, session_id: &str, sink: Arc<SessionSink>) {
         let mut inner = self.inner.lock().await;
-        inner.senders.insert(session_id.to_owned(), sender);
+        inner.sinks.insert(session_id.to_owned(), sink);
     }
 
     async fn remove_session(&self, session_id: &str) {
         let mut inner = self.inner.lock().await;
-        inner.senders.remove(session_id);
+        inner.sinks.remove(session_id);
         if let Some(topics) = inner.topics_by_session.remove(session_id) {
             for topic in topics {
                 if let Some(sessions) = inner.sessions_by_topic.get_mut(&topic) {
@@ -341,21 +499,47 @@ impl TopicBroker {
         removed
     }
 
-    #[allow(dead_code)]
+    /// Fan an envelope out to every session subscribed to `topic`. Sessions
+    /// whose queue overflows are evicted from the broker and have their
+    /// connection torn down — invalidations are cheap to replay by
+    /// resubscribing, so a backpressure-stalled client gets disconnected
+    /// rather than allowed to balloon engine memory.
     async fn publish(&self, topic: &str, envelope: FrontendEventEnvelope) {
-        let senders = {
+        let sinks = {
             let inner = self.inner.lock().await;
             inner
                 .sessions_by_topic
                 .get(topic)
                 .into_iter()
                 .flat_map(|sessions| sessions.iter())
-                .filter_map(|session_id| inner.senders.get(session_id).cloned())
+                .filter_map(|session_id| {
+                    inner
+                        .sinks
+                        .get(session_id)
+                        .map(|sink| (session_id.clone(), sink.clone()))
+                })
                 .collect::<Vec<_>>()
         };
 
-        for sender in senders {
-            let _ = sender.send(envelope.clone());
+        let mut slow = Vec::new();
+        for (session_id, sink) in sinks {
+            match sink.enqueue(envelope.clone()) {
+                EnqueueOutcome::Enqueued
+                | EnqueueOutcome::Coalesced
+                | EnqueueOutcome::Closed => {}
+                EnqueueOutcome::Slow => slow.push((session_id, sink)),
+            }
+        }
+
+        for (session_id, sink) in slow {
+            tracing::warn!(
+                session_id = %session_id,
+                topic,
+                "slow subscriber: outbound queue full, disconnecting"
+            );
+            sink.close();
+            sink.trigger_shutdown();
+            self.remove_session(&session_id).await;
         }
     }
 }
@@ -482,17 +666,19 @@ async fn handle_frontend_connection(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<FrontendEventEnvelope>();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let sink = Arc::new(SessionSink::new(shutdown_tx));
     server_state
         .topic_broker
-        .register_session(&session_id, event_tx.clone())
+        .register_session(&session_id, sink.clone())
         .await;
-    let _ = event_tx.send(FrontendEventEnvelope::push(FrontendEvent::Hello {
+    let _ = sink.enqueue(FrontendEventEnvelope::push(FrontendEvent::Hello {
         session_id: session_id.clone(),
     }));
 
+    let writer_sink = sink.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
+        while let Some(event) = writer_sink.next().await {
             let line = match serde_json::to_string(&event) {
                 Ok(line) => line,
                 Err(err) => {
@@ -514,9 +700,23 @@ async fn handle_frontend_connection(
                 break;
             }
         }
+        // Make sure the reader loop wakes if we exited from a write failure
+        // rather than an explicit shutdown.
+        writer_sink.close();
+        writer_sink.trigger_shutdown();
     });
 
-    while let Some(line) = reader.next_line().await.context("socket read failed")? {
+    loop {
+        let line_result = tokio::select! {
+            _ = &mut shutdown_rx => {
+                tracing::info!(session_id = %session_id, "session shutdown triggered");
+                break;
+            }
+            line = reader.next_line() => line,
+        };
+        let Some(line) = line_result.context("socket read failed")? else {
+            break;
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -524,10 +724,13 @@ async fn handle_frontend_connection(
         let envelope: FrontendRequestEnvelope = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(err) => {
-                let _ = event_tx.send(FrontendEventEnvelope::push(FrontendEvent::Error {
-                    agent_id: None,
-                    message: format!("invalid request payload: {err}"),
-                }));
+                send_push(
+                    &sink,
+                    FrontendEvent::Error {
+                        agent_id: None,
+                        message: format!("invalid request payload: {err}"),
+                    },
+                );
                 continue;
             }
         };
@@ -541,7 +744,7 @@ async fn handle_frontend_connection(
                     .subscribe(&session_id, &topics)
                     .await;
                 send_response(
-                    &event_tx,
+                    &sink,
                     &request_id,
                     FrontendEvent::Subscribed {
                         topics,
@@ -555,7 +758,7 @@ async fn handle_frontend_connection(
                     .unsubscribe(&session_id, &topics)
                     .await;
                 send_response(
-                    &event_tx,
+                    &sink,
                     &request_id,
                     FrontendEvent::Unsubscribed { topics },
                 );
@@ -577,7 +780,7 @@ async fn handle_frontend_connection(
                     )
                     .await;
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         revision,
                         FrontendEvent::WorkItemCreated { item },
@@ -585,7 +788,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -596,7 +799,7 @@ async fn handle_frontend_connection(
             FrontendRequest::ListProducts => match work_db.list_products() {
                 Ok(products) => {
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         server_state.current_work_revision(),
                         FrontendEvent::ProductsList { products },
@@ -604,7 +807,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -616,7 +819,7 @@ async fn handle_frontend_connection(
                 match work_db.list_projects(&product_id) {
                     Ok(projects) => {
                         send_response_with_revision(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             server_state.current_work_revision(),
                             FrontendEvent::ProjectsList {
@@ -627,7 +830,7 @@ async fn handle_frontend_connection(
                     }
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: err.to_string(),
@@ -642,7 +845,7 @@ async fn handle_frontend_connection(
             } => match work_db.list_tasks(&product_id, project_id.as_deref()) {
                 Ok(tasks) => {
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         server_state.current_work_revision(),
                         FrontendEvent::TasksList {
@@ -654,7 +857,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -665,7 +868,7 @@ async fn handle_frontend_connection(
             FrontendRequest::ListChores { product_id } => match work_db.list_chores(&product_id) {
                 Ok(chores) => {
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         server_state.current_work_revision(),
                         FrontendEvent::ChoresList { product_id, chores },
@@ -673,7 +876,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -684,7 +887,7 @@ async fn handle_frontend_connection(
             FrontendRequest::GetWorkItem { id } => match work_db.get_work_item(&id) {
                 Ok(item) => {
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         server_state.current_work_revision(),
                         FrontendEvent::WorkItemResult { item },
@@ -692,7 +895,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -715,7 +918,7 @@ async fn handle_frontend_connection(
                     )
                     .await;
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         revision,
                         FrontendEvent::WorkItemCreated { item },
@@ -723,7 +926,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -746,7 +949,7 @@ async fn handle_frontend_connection(
                     )
                     .await;
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         revision,
                         FrontendEvent::WorkItemCreated { item },
@@ -754,7 +957,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -777,7 +980,7 @@ async fn handle_frontend_connection(
                     )
                     .await;
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         revision,
                         FrontendEvent::WorkItemCreated { item },
@@ -785,7 +988,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -812,7 +1015,7 @@ async fn handle_frontend_connection(
                         )
                         .await;
                         send_response_with_revision(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             revision,
                             FrontendEvent::WorkItemUpdated { item },
@@ -820,7 +1023,7 @@ async fn handle_frontend_connection(
                     }
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: err.to_string(),
@@ -844,7 +1047,7 @@ async fn handle_frontend_connection(
                         )
                         .await;
                         send_response_with_revision(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             revision,
                             FrontendEvent::WorkItemDeleted { id },
@@ -852,7 +1055,7 @@ async fn handle_frontend_connection(
                     }
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: err.to_string(),
@@ -862,7 +1065,7 @@ async fn handle_frontend_connection(
                 },
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -874,7 +1077,7 @@ async fn handle_frontend_connection(
             {
                 Ok(tree) => {
                     send_response_with_revision(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         server_state.current_work_revision(),
                         FrontendEvent::WorkTree {
@@ -887,7 +1090,7 @@ async fn handle_frontend_connection(
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -913,7 +1116,7 @@ async fn handle_frontend_connection(
                         )
                         .await;
                         send_response_with_revision(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             revision,
                             FrontendEvent::ProjectTasksReordered {
@@ -924,7 +1127,7 @@ async fn handle_frontend_connection(
                     }
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: err.to_string(),
@@ -934,7 +1137,7 @@ async fn handle_frontend_connection(
                 },
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -945,14 +1148,14 @@ async fn handle_frontend_connection(
             FrontendRequest::CreateExecution { input } => match work_db.create_execution(input) {
                 Ok(execution) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::ExecutionCreated { execution },
                     );
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -964,7 +1167,7 @@ async fn handle_frontend_connection(
                 match work_db.list_executions(work_item_id.as_deref()) {
                     Ok(executions) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::ExecutionsList {
                                 work_item_id,
@@ -974,7 +1177,7 @@ async fn handle_frontend_connection(
                     }
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: err.to_string(),
@@ -986,14 +1189,14 @@ async fn handle_frontend_connection(
             FrontendRequest::GetExecution { id } => match work_db.get_execution(&id) {
                 Ok(execution) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::ExecutionResult { execution },
                     );
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -1003,11 +1206,11 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::CreateRun { input } => match work_db.create_run(input) {
                 Ok(run) => {
-                    send_response(&event_tx, &request_id, FrontendEvent::RunCreated { run });
+                    send_response(&sink, &request_id, FrontendEvent::RunCreated { run });
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -1018,14 +1221,14 @@ async fn handle_frontend_connection(
             FrontendRequest::ListRuns { execution_id } => match work_db.list_runs(&execution_id) {
                 Ok(runs) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::RunsList { execution_id, runs },
                     );
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -1035,11 +1238,11 @@ async fn handle_frontend_connection(
             },
             FrontendRequest::GetRun { id } => match work_db.get_run(&id) {
                 Ok(run) => {
-                    send_response(&event_tx, &request_id, FrontendEvent::RunResult { run });
+                    send_response(&sink, &request_id, FrontendEvent::RunResult { run });
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -1051,14 +1254,14 @@ async fn handle_frontend_connection(
                 match work_db.create_attention_item(input) {
                     Ok(item) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::AttentionItemCreated { item },
                         );
                     }
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: err.to_string(),
@@ -1071,7 +1274,7 @@ async fn handle_frontend_connection(
                 match work_db.list_attention_items(&execution_id) {
                     Ok(items) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::AttentionItemsList {
                                 execution_id,
@@ -1081,7 +1284,7 @@ async fn handle_frontend_connection(
                     }
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: err.to_string(),
@@ -1093,14 +1296,14 @@ async fn handle_frontend_connection(
             FrontendRequest::GetAttentionItem { id } => match work_db.get_attention_item(&id) {
                 Ok(item) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::AttentionItemResult { item },
                     );
                 }
                 Err(err) => {
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::WorkError {
                             message: err.to_string(),
@@ -1111,7 +1314,7 @@ async fn handle_frontend_connection(
             FrontendRequest::CreateAgent { name, role } => {
                 let (agent_id, agent_name, role) = registry.allocate_agent(name, role);
                 send_response(
-                    &event_tx,
+                    &sink,
                     &request_id,
                     FrontendEvent::AgentCreated {
                         agent_id: agent_id.clone(),
@@ -1120,7 +1323,7 @@ async fn handle_frontend_connection(
                     },
                 );
 
-                let event_tx = event_tx.clone();
+                let sink = sink.clone();
                 let registry = registry.clone();
                 tokio::spawn(async move {
                     match registry
@@ -1128,12 +1331,12 @@ async fn handle_frontend_connection(
                         .await
                     {
                         Ok(()) => {
-                            send_push(&event_tx, FrontendEvent::AgentReady { agent_id });
+                            send_push(&sink, FrontendEvent::AgentReady { agent_id });
                         }
                         Err(err) => {
                             tracing::error!(?err, agent_id = %agent_id, "failed to initialize agent");
                             send_push(
-                                &event_tx,
+                                &sink,
                                 FrontendEvent::Error {
                                     agent_id: Some(agent_id),
                                     message: format!("failed to initialize agent: {err}"),
@@ -1145,13 +1348,13 @@ async fn handle_frontend_connection(
             }
             FrontendRequest::ListAgents => {
                 let agents = registry.list_agents().await;
-                send_response(&event_tx, &request_id, FrontendEvent::AgentList { agents });
+                send_response(&sink, &request_id, FrontendEvent::AgentList { agents });
             }
             FrontendRequest::RemoveAgent { agent_id } => {
                 match registry.remove_agent(&agent_id).await {
                     Ok(()) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::AgentRemoved { agent_id },
                         );
@@ -1159,7 +1362,7 @@ async fn handle_frontend_connection(
                     Err(err) => {
                         tracing::error!(?err, agent_id = %agent_id, "failed to remove agent");
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::Error {
                                 agent_id: Some(agent_id),
@@ -1181,7 +1384,7 @@ async fn handle_frontend_connection(
                         Ok(tuple) => tuple,
                         Err(err) => {
                             send_response(
-                                &event_tx,
+                                &sink,
                                 &request_id,
                                 FrontendEvent::Error {
                                     agent_id: Some(agent_id),
@@ -1192,7 +1395,7 @@ async fn handle_frontend_connection(
                         }
                     };
 
-                let event_tx = event_tx.clone();
+                let sink = sink.clone();
                 let agent_id_owned = agent_id.clone();
                 let prompt_text = compose_agent_prompt(system_prompt.as_deref(), &text);
 
@@ -1204,7 +1407,7 @@ async fn handle_frontend_connection(
                         .prompt_streaming(&session_id, &prompt_text, |event| match event {
                             AcpEvent::AgentMessageChunk { text, .. } => {
                                 send_push(
-                                    &event_tx,
+                                    &sink,
                                     FrontendEvent::Chunk {
                                         agent_id: aid.clone(),
                                         text,
@@ -1213,7 +1416,7 @@ async fn handle_frontend_connection(
                             }
                             AcpEvent::ToolCall { title, status, .. } => {
                                 send_push(
-                                    &event_tx,
+                                    &sink,
                                     FrontendEvent::ToolCall {
                                         agent_id: aid.clone(),
                                         name: title,
@@ -1231,7 +1434,7 @@ async fn handle_frontend_connection(
                                     tool_call_id.unwrap_or_else(|| "tool".to_owned())
                                 });
                                 send_push(
-                                    &event_tx,
+                                    &sink,
                                     FrontendEvent::ToolCall {
                                         agent_id: aid.clone(),
                                         name: label,
@@ -1245,7 +1448,7 @@ async fn handle_frontend_connection(
                                 ..
                             } => {
                                 send_push(
-                                    &event_tx,
+                                    &sink,
                                     FrontendEvent::PermissionRequest {
                                         agent_id: aid.clone(),
                                         id: permission_id,
@@ -1261,7 +1464,7 @@ async fn handle_frontend_connection(
                                 ..
                             } => {
                                 send_push(
-                                    &event_tx,
+                                    &sink,
                                     FrontendEvent::TerminalStarted {
                                         agent_id: aid.clone(),
                                         id,
@@ -1273,7 +1476,7 @@ async fn handle_frontend_connection(
                             }
                             AcpEvent::TerminalOutput { id, text, .. } => {
                                 send_push(
-                                    &event_tx,
+                                    &sink,
                                     FrontendEvent::TerminalOutput {
                                         agent_id: aid.clone(),
                                         id,
@@ -1288,7 +1491,7 @@ async fn handle_frontend_connection(
                                 ..
                             } => {
                                 send_push(
-                                    &event_tx,
+                                    &sink,
                                     FrontendEvent::TerminalDone {
                                         agent_id: aid.clone(),
                                         id,
@@ -1308,7 +1511,7 @@ async fn handle_frontend_connection(
                                 "prompt completed"
                             );
                             send_push(
-                                &event_tx,
+                                &sink,
                                 FrontendEvent::Done {
                                     agent_id: agent_id_owned,
                                     stop_reason: response.stop_reason,
@@ -1318,7 +1521,7 @@ async fn handle_frontend_connection(
                         Err(err) => {
                             tracing::error!(?err, agent_id = %agent_id_owned, "prompt failed");
                             send_push(
-                                &event_tx,
+                                &sink,
                                 FrontendEvent::Error {
                                     agent_id: Some(agent_id_owned),
                                     message: err.to_string(),
@@ -1344,7 +1547,7 @@ async fn handle_frontend_connection(
                     Ok((acp, _, _, _)) => acp,
                     Err(err) => {
                         send_response(
-                            &event_tx,
+                            &sink,
                             &request_id,
                             FrontendEvent::Error {
                                 agent_id: Some(agent_id),
@@ -1358,7 +1561,7 @@ async fn handle_frontend_connection(
                 if let Err(err) = acp.respond_permission(&id, granted).await {
                     tracing::error!(?err, permission_id = %id, "failed to apply permission response");
                     send_response(
-                        &event_tx,
+                        &sink,
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: Some(agent_id),
@@ -1371,37 +1574,33 @@ async fn handle_frontend_connection(
     }
 
     server_state.topic_broker.remove_session(&session_id).await;
-    drop(event_tx);
+    sink.close();
     let _ = writer_task.await;
     Ok(())
 }
 
-fn send_response(
-    event_tx: &mpsc::UnboundedSender<FrontendEventEnvelope>,
-    request_id: &str,
-    payload: FrontendEvent,
-) {
-    let _ = event_tx.send(FrontendEventEnvelope::response(
+fn send_response(sink: &SessionSink, request_id: &str, payload: FrontendEvent) {
+    sink.enqueue(FrontendEventEnvelope::response(
         request_id.to_owned(),
         payload,
     ));
 }
 
 fn send_response_with_revision(
-    event_tx: &mpsc::UnboundedSender<FrontendEventEnvelope>,
+    sink: &SessionSink,
     request_id: &str,
     revision: u64,
     payload: FrontendEvent,
 ) {
-    let _ = event_tx.send(FrontendEventEnvelope::response_with_revision(
+    sink.enqueue(FrontendEventEnvelope::response_with_revision(
         request_id.to_owned(),
         revision,
         payload,
     ));
 }
 
-fn send_push(event_tx: &mpsc::UnboundedSender<FrontendEventEnvelope>, payload: FrontendEvent) {
-    let _ = event_tx.send(FrontendEventEnvelope::push(payload));
+fn send_push(sink: &SessionSink, payload: FrontendEvent) {
+    sink.enqueue(FrontendEventEnvelope::push(payload));
 }
 
 async fn publish_work_invalidation(
@@ -1555,4 +1754,189 @@ async fn run_prompt(acp: &AcpClient, session_id: &str, prompt: &str) -> Result<(
 
     eprintln!("\n[done] {}", response.stop_reason);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::TopicEventPayload;
+
+    fn topic_envelope(topic: &str, revision: u64) -> FrontendEventEnvelope {
+        FrontendEventEnvelope::push_with_revision(
+            revision,
+            FrontendEvent::TopicEvent {
+                topic: topic.to_owned(),
+                revision,
+                origin_session_id: "test".to_owned(),
+                origin_request_id: None,
+                event: TopicEventPayload::WorkInvalidated {
+                    reason: "test".to_owned(),
+                    product_id: None,
+                    item_ids: vec![],
+                },
+            },
+        )
+    }
+
+    fn response_envelope(request_id: &str) -> FrontendEventEnvelope {
+        FrontendEventEnvelope::response(
+            request_id.to_owned(),
+            FrontendEvent::ProductsList { products: vec![] },
+        )
+    }
+
+    fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
+        topic_event_topic(&env.payload)
+    }
+
+    #[test]
+    fn coalesces_same_topic_into_a_single_pending_envelope() {
+        let mut q = SessionQueue::new();
+        assert_eq!(
+            q.enqueue(topic_envelope("work.products", 1)),
+            EnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            q.enqueue(topic_envelope("work.products", 2)),
+            EnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            q.enqueue(topic_envelope("work.products", 3)),
+            EnqueueOutcome::Coalesced
+        );
+        assert_eq!(q.items.len(), 1);
+        let env = q.pop_front().unwrap();
+        assert_eq!(env.revision, Some(3));
+        assert!(q.pop_front().is_none());
+    }
+
+    #[test]
+    fn does_not_coalesce_across_topics() {
+        let mut q = SessionQueue::new();
+        q.enqueue(topic_envelope("work.products", 1));
+        q.enqueue(topic_envelope("work.product.p1", 2));
+        q.enqueue(topic_envelope("work.products", 3));
+        assert_eq!(q.items.len(), 2);
+
+        let first = q.pop_front().unwrap();
+        let second = q.pop_front().unwrap();
+        assert_eq!(topic_of(&first).as_deref(), Some("work.products"));
+        assert_eq!(first.revision, Some(3));
+        assert_eq!(topic_of(&second).as_deref(), Some("work.product.p1"));
+        assert_eq!(second.revision, Some(2));
+    }
+
+    #[test]
+    fn coalescing_indices_survive_pops_of_other_topics() {
+        let mut q = SessionQueue::new();
+        q.enqueue(topic_envelope("a", 1));
+        q.enqueue(topic_envelope("b", 2));
+        // Pop topic "a", then a new "b" event should still coalesce with
+        // the earlier "b" sitting at the (now-front) of the queue.
+        let popped = q.pop_front().unwrap();
+        assert_eq!(topic_of(&popped).as_deref(), Some("a"));
+        assert_eq!(
+            q.enqueue(topic_envelope("b", 3)),
+            EnqueueOutcome::Coalesced
+        );
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(q.pop_front().unwrap().revision, Some(3));
+    }
+
+    #[test]
+    fn enqueue_marks_slow_when_queue_is_full() {
+        let mut q = SessionQueue::new();
+        // Fill with non-coalescing responses up to the cap.
+        for i in 0..MAX_SESSION_QUEUE {
+            assert_eq!(
+                q.enqueue(response_envelope(&format!("r-{i}"))),
+                EnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            q.enqueue(response_envelope("overflow")),
+            EnqueueOutcome::Slow
+        );
+        assert!(q.slow);
+        // Subsequent enqueues continue to report Slow.
+        assert_eq!(
+            q.enqueue(response_envelope("after-overflow")),
+            EnqueueOutcome::Slow
+        );
+    }
+
+    #[test]
+    fn enqueue_returns_closed_after_close() {
+        let mut q = SessionQueue::new();
+        q.closed = true;
+        assert_eq!(
+            q.enqueue(response_envelope("r-1")),
+            EnqueueOutcome::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_next_drains_queue_and_returns_none_when_closed() {
+        let (tx, _rx) = oneshot::channel::<()>();
+        let sink = Arc::new(SessionSink::new(tx));
+        sink.enqueue(response_envelope("r-1"));
+        sink.enqueue(response_envelope("r-2"));
+        sink.close();
+
+        let first = sink.next().await.expect("first envelope");
+        assert_eq!(first.request_id.as_deref(), Some("r-1"));
+        let second = sink.next().await.expect("second envelope");
+        assert_eq!(second.request_id.as_deref(), Some("r-2"));
+        assert!(sink.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sink_close_wakes_pending_next_call() {
+        let (tx, _rx) = oneshot::channel::<()>();
+        let sink = Arc::new(SessionSink::new(tx));
+        let waiter = sink.clone();
+        let join = tokio::spawn(async move { waiter.next().await });
+        // Give the spawned task time to enter notified().await.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        sink.close();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .expect("close should wake next()");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn broker_publish_disconnects_slow_subscriber() {
+        let (tx, mut rx) = oneshot::channel::<()>();
+        let sink = Arc::new(SessionSink::new(tx));
+
+        // Pre-fill the sink past capacity by injecting non-coalescing entries
+        // (responses are not coalesced) without ever draining.
+        {
+            let mut q = sink.queue.lock().unwrap();
+            for i in 0..MAX_SESSION_QUEUE {
+                let outcome = q.enqueue(response_envelope(&format!("r-{i}")));
+                assert_eq!(outcome, EnqueueOutcome::Enqueued);
+            }
+        }
+
+        let broker = TopicBroker::default();
+        broker.register_session("session-1", sink.clone()).await;
+        broker.subscribe("session-1", &["work.products".to_owned()]).await;
+
+        // Publishing one more event should overflow and trigger shutdown.
+        broker
+            .publish("work.products", topic_envelope("work.products", 99))
+            .await;
+
+        let shutdown = tokio::time::timeout(std::time::Duration::from_secs(1), &mut rx)
+            .await
+            .expect("shutdown should fire");
+        assert!(shutdown.is_ok());
+
+        // Broker should also have evicted the session.
+        let inner = broker.inner.lock().await;
+        assert!(!inner.sinks.contains_key("session-1"));
+        assert!(!inner.sessions_by_topic.contains_key("work.products"));
+    }
 }
