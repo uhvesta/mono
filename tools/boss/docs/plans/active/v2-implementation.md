@@ -34,7 +34,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 
 | Phase | Title                                          | Status                       |
 |-------|------------------------------------------------|------------------------------|
-| 1     | Engine and CLI foundations                     | ✅ shipped                   |
+| 1     | Engine and CLI foundations                     | 🟡 deliverables in `main`, work still in flight (see `mono-agent-001` lease) |
 | 2     | Multi-client subscriptions                     | ✅ shipped (verify back-pressure) |
 | 3     | Kanban Work tab                                | 🟡 board done, three filters left |
 | 4     | Execution layer + cube V2 prereqs              | ✅ shipped                   |
@@ -86,32 +86,51 @@ Each phase has: **Status (done)**, **Pending**, **Done when**
 
 ---
 
-### Phase 1: Engine and CLI foundations — ✅ shipped
+### Phase 1: Engine and CLI foundations — 🟡 in flight (deliverables in `main`, see active lease)
 
 **Goal.** Refactor the engine for multi-client use and ship the
 public-facing `boss` CLI for work-taxonomy CRUD.
 
-**Status.** Complete. Evidence:
+**Status (in `main`).**
 
 - Config split: `RuntimeConfig` separate from `AcpConfig`,
-  `anthropic_api_key` optional
-  (`engine/src/config.rs:9-49`).
+  `anthropic_api_key` optional (`engine/src/config.rs:9-49`).
 - Request envelope with `request_id` correlation
   (`engine/src/protocol.rs:24-65`).
 - Shared protocol module imported by engine and CLI; Swift client
   marshals the same envelopes
   (`app-macos/Sources/EngineClient.swift`).
-- `boss` CLI binary at `tools/boss/cli/` with `product`, `project`,
-  `task`, `chore` subcommands (Create / List / Show / Update / Move
-  / Delete / Reorder) and `engine status / start / stop / active /
-  paused / archived` (`cli/src/main.rs:82-123`).
+- `boss` CLI binary at `tools/boss/cli/` with subcommands shipped:
+  - `product` — Create / List / Show / Update.
+  - `project` — Create / List / Show / Update.
+  - `task` — Create / List / Show / Update / Move / Delete /
+    Reorder.
+  - `chore` — Create / List / Show / Update / Move / Delete.
+  - `engine` — Status / Start / Stop.
+  (`cli/src/main.rs:82-123`)
 - `--json`, `--quiet`, `--no-input`, `--no-autostart` global flags
   (`cli/src/main.rs:38-52`); TTY prompts on interactive create
   flows.
 
-**Pending.** None known. Close this phase out once you confirm the
-"Done when" criteria below still hold under a concurrent-client
-smoke test.
+**In flight / pending.**
+
+- Phase 1-tagged work is currently leased on `mono-agent-001`
+  ("boss v2 phase 1: engine refactor + boss CLI"). Do **not**
+  close this phase until that work lands. Coordinate with whoever
+  holds that lease before declaring Phase 1 done; deltas they ship
+  belong in this section.
+- Known gaps relative to the original deliverables list, in case
+  they're what the in-flight work is filling:
+  - `boss product delete` and `boss project delete` (deliverables
+    list called for full CRUD on every entity; `delete` is absent
+    on Product and Project today).
+  - `boss chore reorder` (chores aren't ordered within projects in
+    the schema, so this may be a no-op — confirm intent).
+  - Shared client crate (`boss-client`). The CLI talks to the
+    socket directly in `cli/src/main.rs` rather than going
+    through a separate `boss-client` library crate; this is fine
+    if intentional, but the deliverable as written named a crate.
+  - Concurrent-client smoke test as evidence for "Done when."
 
 **Done when (acceptance, kept for the record).**
 
