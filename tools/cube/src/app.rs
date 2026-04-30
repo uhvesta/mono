@@ -370,16 +370,28 @@ fn run_workspace(
                 .get_repo(&repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
-            let candidates = discover_workspaces(&repo_record)?;
+            let mut candidates = discover_workspaces(&repo_record)?;
             store.sync_workspaces(&repo, &candidates)?;
 
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
             let leased_at_epoch_s = current_epoch_s()?;
-            let Some(mut workspace) =
-                store.claim_workspace(&repo, &holder, &task, &lease_id, leased_at_epoch_s)?
-            else {
-                return Err(CubeError::NoAvailableWorkspace(repo));
+            let mut workspace = match store.claim_workspace(
+                &repo,
+                &holder,
+                &task,
+                &lease_id,
+                leased_at_epoch_s,
+            )? {
+                Some(ws) => ws,
+                None => {
+                    let new_candidate = auto_create_workspace(runner, &repo_record, &candidates)?;
+                    candidates.push(new_candidate);
+                    store.sync_workspaces(&repo, &candidates)?;
+                    store
+                        .claim_workspace(&repo, &holder, &task, &lease_id, leased_at_epoch_s)?
+                        .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?
+                }
             };
 
             if !workspace_path_exists(&workspace) {
@@ -624,6 +636,57 @@ fn run_doctor(_args: DoctorArgs) -> Result<RunResult> {
     Err(CubeError::NotImplemented(
         "doctor command is not implemented yet".to_string(),
     ))
+}
+
+fn next_workspace_id(prefix: &str, existing: &[String]) -> String {
+    let mut max_n: u32 = 0;
+    let mut found_any = false;
+    for id in existing {
+        if let Some(suffix) = id.strip_prefix(prefix) {
+            if let Ok(n) = suffix.parse::<u32>() {
+                found_any = true;
+                if n > max_n {
+                    max_n = n;
+                }
+            }
+        }
+    }
+    let next = if found_any { max_n + 1 } else { 1 };
+    format!("{prefix}{next:03}")
+}
+
+fn auto_create_workspace(
+    runner: &dyn CommandRunner,
+    repo_record: &RepoRecord,
+    existing: &[crate::metadata::WorkspaceCandidate],
+) -> Result<crate::metadata::WorkspaceCandidate> {
+    let existing_ids: Vec<String> = existing.iter().map(|c| c.workspace_id.clone()).collect();
+    let workspace_id = next_workspace_id(&repo_record.workspace_prefix, &existing_ids);
+    let workspace_path = repo_record.workspace_root.join(&workspace_id);
+
+    fs::create_dir_all(&repo_record.workspace_root)?;
+
+    let clone_source = match &repo_record.source {
+        Some(source) if source.exists() => source.display().to_string(),
+        _ => repo_record.origin.clone(),
+    };
+
+    runner.run(&CommandInvocation {
+        cwd: repo_record.workspace_root.clone(),
+        program: "jj".to_string(),
+        args: vec![
+            "git".to_string(),
+            "clone".to_string(),
+            "--colocate".to_string(),
+            clone_source,
+            workspace_path.display().to_string(),
+        ],
+    })?;
+
+    Ok(crate::metadata::WorkspaceCandidate {
+        workspace_id,
+        workspace_path,
+    })
 }
 
 fn discover_workspaces(repo: &RepoRecord) -> Result<Vec<crate::metadata::WorkspaceCandidate>> {
@@ -1206,6 +1269,191 @@ mod tests {
         );
         assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
         runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_lease_auto_creates_when_pool_is_empty() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        // intentionally no workspace dirs created up front
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let new_path = workspace_root.join("mono-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "auto-create demo",
+        ]);
+        let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-001"
+        );
+        assert_eq!(result.payload["workspace"]["state"], "leased");
+        assert_eq!(result.payload["workspace"]["task"], "auto-create demo");
+        assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_lease_auto_creates_next_id_after_existing() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-007")).expect("workspace dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        // Lease both existing workspaces first so the pool is exhausted
+        for (path, task) in [
+            (workspace_root.join("mono-agent-001"), "first"),
+            (workspace_root.join("mono-agent-007"), "second"),
+        ] {
+            let runner = FakeRunner::new(vec![
+                ExpectedCommand::ok(path.clone(), "jj", &["git", "fetch"], ""),
+                ExpectedCommand::ok(path.clone(), "jj", &["new", "main"], ""),
+                ExpectedCommand::ok(
+                    path.clone(),
+                    "jj",
+                    &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                    "deadbee",
+                ),
+            ]);
+            let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", task]);
+            run_with_dependencies(lease, Some(&database_path), &runner).expect("seed lease");
+        }
+
+        // Pool now exhausted; next lease should clone mono-agent-008 (max+1)
+        let new_path = workspace_root.join("mono-agent-008");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "third",
+        ]);
+        let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-008"
+        );
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn next_workspace_id_picks_max_plus_one() {
+        assert_eq!(super::next_workspace_id("mono-agent-", &[]), "mono-agent-001");
+        assert_eq!(
+            super::next_workspace_id(
+                "mono-agent-",
+                &[
+                    "mono-agent-001".to_string(),
+                    "mono-agent-002".to_string(),
+                ],
+            ),
+            "mono-agent-003"
+        );
+        // Non-contiguous: jumps to max+1, doesn't fill the gap.
+        assert_eq!(
+            super::next_workspace_id(
+                "mono-agent-",
+                &[
+                    "mono-agent-001".to_string(),
+                    "mono-agent-007".to_string(),
+                ],
+            ),
+            "mono-agent-008"
+        );
+        // Mixed-prefix or non-numeric IDs are ignored.
+        assert_eq!(
+            super::next_workspace_id(
+                "mono-agent-",
+                &[
+                    "flunge-agent-099".to_string(),
+                    "mono-agent-abc".to_string(),
+                    "mono-agent-002".to_string(),
+                ],
+            ),
+            "mono-agent-003"
+        );
     }
 
     #[test]
@@ -1883,6 +2131,9 @@ mod tests {
             assert_eq!(expected.cwd, invocation.cwd);
             assert_eq!(expected.program, invocation.program);
             assert_eq!(expected.args, invocation.args);
+            if let Some(path) = &expected.creates_dir {
+                std::fs::create_dir_all(path).expect("create simulated workspace dir");
+            }
             expected.result
         }
     }
@@ -1893,6 +2144,7 @@ mod tests {
         program: String,
         args: Vec<String>,
         result: Result<String>,
+        creates_dir: Option<PathBuf>,
     }
 
     impl ExpectedCommand {
@@ -1902,7 +2154,13 @@ mod tests {
                 program: program.to_string(),
                 args: args.iter().map(|arg| (*arg).to_string()).collect(),
                 result: Ok(stdout.to_string()),
+                creates_dir: None,
             }
+        }
+
+        fn creating_dir(mut self, path: PathBuf) -> Self {
+            self.creates_dir = Some(path);
+            self
         }
     }
 }
