@@ -139,4 +139,4 @@ Smaller items that don't block but should be tracked.
 
 - Design: [tools/cube/docs/main.md](./main.md)
 - Boss V2 dependency: [tools/boss/docs/designs/v2-design-risks.md](../../boss/docs/designs/v2-design-risks.md) — R4
-- Boss V2 plan: [tools/boss/docs/plans/active/swiftui-boss-v2.md](../../boss/docs/plans/active/swiftui-boss-v2.md)
+- Boss V2 plan: [tools/boss/docs/plans/active/v2-implementation.md](../../boss/docs/plans/active/v2-implementation.md)

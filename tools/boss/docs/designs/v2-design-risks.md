@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The Boss V2 plan ([swiftui-boss-v2.md](../plans/active/swiftui-boss-v2.md))
+The Boss V2 plan ([swiftui-boss-v2.md](../plans/done/swiftui-boss-v2.md))
 introduces several large architectural decisions at once. Some of those
 decisions are easy to reverse later; others lock in months of work and a
 specific failure surface.
@@ -21,8 +21,10 @@ The intended workflow is:
 5. Define the smallest POC or investigation that resolves those unknowns.
 6. Record the decision and its rationale.
 
-We work through risks one at a time. The plan in `swiftui-boss-v2.md` should
-be revised once the major risks have decisions.
+We worked through risks one at a time. All eight risks are now
+resolved; the canonical V2 spec lives in
+[`main.md`](main.md) and the build sequence in
+[`../plans/active/v2-implementation.md`](../plans/active/v2-implementation.md).
 
 ## Risk template
 

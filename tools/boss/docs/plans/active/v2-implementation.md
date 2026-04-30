@@ -7,9 +7,8 @@ that shaped V2 are recorded in
 turns those into ordered work.
 
 This plan supersedes the earlier
-[`swiftui-boss-v2.md`](swiftui-boss-v2.md), which was the brainstorm
-that started V2 — left in place for history but no longer the active
-plan.
+[`swiftui-boss-v2.md`](../done/swiftui-boss-v2.md), which was the
+brainstorm that started V2 and has been archived to `plans/done/`.
 
 ## Principles
 
