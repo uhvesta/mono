@@ -1700,6 +1700,29 @@ async fn handle_frontend_connection(
                     );
                 }
             }
+            FrontendRequest::RegisterAppSession => {
+                // Real dispatch (promote the calling session to the
+                // registered app session) lands in a follow-up; for
+                // now the engine rejects the call so the wire types
+                // are exercised end-to-end on a stub implementation.
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::Error {
+                        agent_id: None,
+                        message: "register_app_session not yet implemented".to_owned(),
+                    },
+                );
+            }
+            FrontendRequest::EngineResponse { request_id: rid, .. } => {
+                // The dispatcher that routes responses to pending
+                // engine→app requests is wired in a follow-up; for
+                // now we just log + drop.
+                tracing::warn!(
+                    response_request_id = %rid,
+                    "engine_response received before dispatch is wired; dropping",
+                );
+            }
         }
     }
 

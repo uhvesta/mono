@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::types::{
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
     CreateProjectInput, CreateRunInput, CreateTaskInput, Product, Project,
@@ -183,6 +184,17 @@ pub enum FrontendRequest {
         id: String,
         granted: bool,
     },
+    /// App self-identifies as the singleton app session. The engine
+    /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
+    /// engine's parent). After registration, `EngineRequest` events
+    /// flow to this session only.
+    RegisterAppSession,
+    /// App's reply to a previous `FrontendEvent::EngineRequest`.
+    /// `request_id` echoes the value the engine sent.
+    EngineResponse {
+        request_id: String,
+        response: EngineToAppResponse,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +344,17 @@ pub enum FrontendEvent {
     Error {
         agent_id: Option<String>,
         message: String,
+    },
+    /// Engine confirms the calling session is now the registered app
+    /// session, and any prior registration was invalidated.
+    AppSessionRegistered,
+    /// Engine asks the registered app session to perform a pane
+    /// operation. The app must reply with a
+    /// [`FrontendRequest::EngineResponse`] carrying the same
+    /// `request_id`.
+    EngineRequest {
+        request_id: String,
+        request: EngineToAppRequest,
     },
 }
 
