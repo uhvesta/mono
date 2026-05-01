@@ -12,6 +12,8 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
+use crate::events_socket::{bind_events_socket, handle_connection};
+use crate::worker_registry::WorkerRegistry;
 use crate::coordinator::{
     CommandCubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
@@ -209,6 +211,7 @@ struct ServerState {
     agent_registry: Arc<AgentRegistry>,
     execution_coordinator: Arc<ExecutionCoordinator>,
     topic_broker: Arc<TopicBroker>,
+    worker_registry: WorkerRegistry,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
 }
@@ -235,6 +238,7 @@ impl ServerState {
             agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
             execution_coordinator,
             topic_broker,
+            worker_registry: WorkerRegistry::new(),
             next_session_id: AtomicU64::new(1),
             work_revision,
         })
@@ -648,7 +652,24 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
     let pid_file_path =
         std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
-    serve(cfg, socket_path.into(), Some(pid_file_path.into())).await
+    let events_socket_path = default_events_socket_path()?;
+    serve(
+        cfg,
+        socket_path.into(),
+        Some(pid_file_path.into()),
+        Some(events_socket_path),
+    )
+    .await
+}
+
+fn default_events_socket_path() -> Result<std::path::PathBuf> {
+    if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
+        return Ok(override_path.into());
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        bail!("HOME must be set to derive the default events socket path");
+    };
+    Ok(std::path::PathBuf::from(home).join("Library/Application Support/Boss/events.sock"))
 }
 
 /// Run the frontend server until the listener fails.
@@ -656,11 +677,15 @@ async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
 /// `socket_path` is bound exclusively (the file is removed first if it exists).
 /// When `pid_file_path` is `Some`, the engine writes its pid there and removes
 /// the file on shutdown — pass `None` from in-process tests to avoid touching
-/// shared filesystem state.
+/// shared filesystem state. When `events_socket_path` is `Some`, the engine
+/// also binds the worker events socket (mode 0600) and runs an accept loop
+/// that decodes hook payloads via the worker registry; pass `None` from
+/// tests that don't exercise the events channel.
 pub async fn serve(
     cfg: Arc<RuntimeConfig>,
     socket_path: std::path::PathBuf,
     pid_file_path: Option<std::path::PathBuf>,
+    events_socket_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let server_state = Arc::new(ServerState::new(cfg.clone())?);
 
@@ -688,6 +713,16 @@ pub async fn serve(
     tracing::info!(socket_path = %socket_path.display(), "frontend socket is ready");
     println!("boss-engine listening on {}", socket_path.display());
 
+    if let Some(path) = events_socket_path {
+        let registry = server_state.worker_registry.clone();
+        let events_listener = bind_events_socket(&path)
+            .with_context(|| format!("failed to bind events socket {}", path.display()))?;
+        tracing::info!(events_socket_path = %path.display(), "events socket is ready");
+        tokio::spawn(async move {
+            run_events_accept_loop(events_listener, registry).await;
+        });
+    }
+
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
@@ -699,6 +734,34 @@ pub async fn serve(
                 tracing::error!(?err, "frontend connection failed");
             }
         });
+    }
+}
+
+async fn run_events_accept_loop(listener: UnixListener, registry: WorkerRegistry) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    match handle_connection(stream, &registry).await {
+                        Ok(incoming) => {
+                            tracing::info!(
+                                peer_pid = ?incoming.peer_pid,
+                                run_id = ?incoming.run_id,
+                                event = ?incoming.event,
+                                "events socket: hook event received",
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "events socket: failed to handle connection");
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::error!(?err, "events socket accept failed");
+            }
+        }
     }
 }
 
