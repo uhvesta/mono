@@ -39,17 +39,21 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 3     | Kanban Work tab                                | 🟢 shipped                   |
 | 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers land in Phases 8-9 |
 | 5     | ExecutionCoordinator                           | 🟢 named deliverables shipped — affinity-first/LRU worker selection, 8-worker hard cap, priority + FIFO ready queue, `executions.<id>` topic, `request_execution` RPC, `RunWaitState` enum |
-| 6     | libghostty embedding and worker spawn          | ❌ not started               |
+| 6     | libghostty embedding and worker spawn          | 🟡 mostly shipped — 6a–6g (Phase-5-independent) + 6f-1..3 done; 6f-4..8 (engine→app RPC + spawn flow + cutover) remain |
 | 7     | Boss session and bossctl                       | ❌ not started               |
 | 8     | Review and attention                           | 🟡 schema + manual PR-URL only — no auto-detect, no poller, no Triage UI, no re-engage |
 | 9     | Resume and continuity                          | ❌ not started               |
 | 10    | Transcripts and hardening                      | ❌ schema columns only       |
 | 11    | Bazel `GhosttyKit` integration                 | ❌ not started — hard prereq for shipping the post-6f Bazel `.app` |
 
-The biggest open item is **Phase 6** (libghostty + worker spawn);
-Phases 7 and 9 effectively wait on it. Phase 8 has the data model
-but none of the live PR / poller / triage logic. Phase 10 hardening
-is essentially untouched. **Phase 11** is a build-system gap exposed
+The biggest remaining piece in Phase 6 is the engine→app pane RPC
+chain (6f-4..8): protocol wire types, engine-side dispatch, app-side
+pane allocator, ExecutionCoordinator wiring, and PoC chat-code
+cutover. Until those land, the engine ingests hook events but no
+worker is ever spawned by the coordinator. Phases 7 and 9 still
+effectively wait on Phase 6 closing. Phase 8 has the data model but
+none of the live PR / poller / triage logic. Phase 10 hardening is
+essentially untouched. **Phase 11** is a build-system gap exposed
 by Phase 6a: the SwiftPM build includes the libghostty-driven Agents
 grid, but the Bazel build (the documented `bazel run //tools/boss/
 app-macos:BossMacApp` production path) excludes `Sources/Ghostty/`
@@ -369,76 +373,47 @@ Phase C; [`v2-design-risks`](../../designs/v2-design-risks.md) R5.
 
 ---
 
-### Phase 6: libghostty embedding and worker spawn — ❌ not started (load-bearing)
+### Phase 6: libghostty embedding and worker spawn — 🟡 mostly shipped
 
 **Goal.** End-to-end vertical slice: engine spawns real `claude`
 workers in libghostty panes, workers do work, events flow back.
 
-**Status (done).** Nothing on this phase has shipped to `main`.
-Substrate from earlier phases is in place: execution and run rows,
-cube driver, scheduler. The standalone embedding prototype lives on
-the `brianduff/ghostty-swiftui-prototype` feature branch (PR #115)
-but has not merged or been folded into the macOS app. `grep -rn
-"ghostty\|libghostty\|TerminalSession" app-macos/Sources` returns
-nothing; `tools/boss/bin/` contains only the `boss` binary (no
-`boss-event` shim).
+**Status (in `main`).**
 
-**Sub-phases.** Phase 6 is large; the Phase 5 dependency is
-concentrated in the spawn/wiring sub-phase, so several pieces can
-land before Phase 5 finishes. Split into 6a–6f.
+- Substrate from earlier phases: execution and run rows, cube
+  driver, scheduler with affinity-first/LRU and 8-worker hard cap.
+- All Phase-5-independent slices (6a–6g) shipped:
+  - 6a: libghostty embedding in `app-macos` Agents mode (PR #138).
+  - 6b: `boss-event` shim binary at `tools/boss/event-shim/`
+    (PR #143).
+  - 6c: events socket scaffold + `LOCAL_PEERPID` lookup (PR #145).
+  - 6d: `WorkerEvent` enum + hook normalizer in `boss-protocol`
+    (PR #140).
+  - 6e: CLAUDE.md / settings.json templating in `boss-engine`
+    (PR #141).
+  - 6g: transcript tail-watcher in `boss-engine` (PR #142).
+- First three Phase-5-dependent slices (6f-1..3) shipped:
+  - 6f-1: `WorkerRegistry` with `proc_pidinfo` ancestor walk
+    (PR #146).
+  - 6f-2: events socket annotates `IncomingHookEvent.run_id` via
+    the registry (PR #150, originally #147 — re-cut after the 6f-1
+    base branch was deleted on merge).
+  - 6f-3: engine `serve()` binds the events socket and runs the
+    accept loop on startup (PR #151, originally #148 — same
+    re-cut reason).
+- Engine→app pane RPC design landed in
+  [`designs/engine-app-rpc`](../../designs/engine-app-rpc.md)
+  (PR #149).
 
-**Phase-5-independent — can land in parallel to Phase 5.**
+**Pending.** The remaining 6f sub-slices wire the design's RPC
+chain end-to-end. Each is a self-contained PR.
 
-- **6a: libghostty embedding.** Port the `ghostty-proto` pattern
-  (Runtime, surface NSView, key/mouse forwarding, Claude monitor)
-  into `tools/boss/app-macos`. Build a 1 + 8 pane layout in a new
-  Workers mode. Each pane is a `TerminalSessionModel` placeholder;
-  panes launch `claude` directly via libghostty `initial_input`
-  pending the engine spawn integration in 6f. Includes
-  `bootstrap-ghosttykit.sh` and `Package.swift` wiring.
-- **6b: `boss-event` shim binary.** Standalone Rust binary that
-  reads stdin (claude hook payload) and posts JSON to the engine
-  events socket. Lives at `tools/boss/cli/boss-event/`. Testable
-  against a stub Unix socket.
-- **6c: events socket scaffold + `LOCAL_PEERPID`.** Engine binds
-  `~/Library/Application Support/Boss/events.sock` at mode 0600,
-  decodes incoming JSON envelopes, looks up `LOCAL_PEERPID`. No
-  lease correlation yet — `lease_id` injection ties into 6f.
-- **6d: `WorkerEvent` enum + hook normalization.** Pure data types
-  + parser converting raw claude hook payloads into typed
-  `WorkerEvent`s (SessionStart, UserPromptSubmit, PreToolUse,
-  PostToolUse, Stop, Notification, SessionEnd). Derive
-  `stop_reason`. Unit-tested against fixture payloads.
-- **6e: CLAUDE.md / settings.json templating.** Engine-side
-  templating that renders per-lease `CLAUDE.md` (jj-first rules,
-  do-not-touch-siblings advisory) and `settings.json` (hook
-  config). String generation; testable with golden files. Caller
-  in 6f writes them into the workspace before subprocess launch.
-- **6g: transcript tail-watcher.** File-watching plumbing on
-  `transcript_path` that streams new JSONL lines as they arrive.
-  Testable with fixture file appends; complements the hook-event
-  channel.
-
-**Phase-5-dependent — gated on Phase 5 ExecutionCoordinator.**
-
-The engine→app pane RPC design — transport, types, trust model, and
-sub-PR breakdown — lives in
-[`designs/engine-app-rpc`](../../designs/engine-app-rpc.md). The 6f
-work splits along that doc's implementation plan:
-
-- **6f-1: worker pid registry.** Engine-side `WorkerRegistry`
-  with macOS `proc_pidinfo` ancestor walk. Shipped in PR #146.
-- **6f-2: events socket → run-id correlation.** `IncomingHookEvent`
-  gains `run_id` resolved via the registry. Shipped in PR #147.
-- **6f-3: events accept loop on engine startup.** Engine binds the
-  events socket and decodes hook payloads via the registry. Shipped
-  in PR #148.
-- **6f-4: protocol additions.** `RegisterAppSession`,
+- **6f-4: protocol additions.** `RegisterAppSession` request,
   `EngineRequest` event variant, `EngineResponse` request variant,
   `EngineToAppRequest` / `EngineToAppResponse` enums in
   `boss-protocol`. Wire types only; no engine or app implementation.
-- **6f-5: engine-side dispatch.** Engine tracks the registered app
-  session, pushes `EngineRequest` events to it, awaits matching
+- **6f-5: engine-side dispatch.** `ServerState` tracks the registered
+  app session, pushes `EngineRequest` events to it, awaits matching
   `EngineResponse` requests with timeout. Pending-request map keyed
   by request id; on app-disconnect, every pending sender resolves as
   `AppDisconnected`.
@@ -447,11 +422,13 @@ work splits along that doc's implementation plan:
   pre-spawns 8). Wire `EngineRequest` handling. Implement shell-pid
   lookup via `proc_listpids` (best-effort; brittleness softened by
   the registry's ancestor walk).
-- **6f-7: spawn-flow wiring.** ExecutionCoordinator calls
+- **6f-7: spawn-flow wiring.** `ExecutionCoordinator` calls
   `engine.spawn_worker_pane()` when a run starts; registers the
-  returned `shell_pid`; releases the pane on terminal state.
+  returned `shell_pid`; releases the pane on terminal state. This
+  is the end-to-end vertical slice that closes Phase 6's acceptance
+  criterion.
 - **6f-8: PoC chat-code cutover.** Remove the chat-style Agents UI
-  references in the app. Boss panel in Work mode keeps using
+  references in `app-macos`. Boss panel in Work mode keeps using
   `ChatViewModel` for now — Phase 7 replaces it with a Boss
   libghostty pane.
 
