@@ -2,12 +2,9 @@
 //! running inside leased worker workspaces, looks up the connecting
 //! peer's pid via `LOCAL_PEERPID`, decodes the JSON hook payload via
 //! [`boss_protocol::normalize_hook_event`], and produces typed
-//! [`IncomingHookEvent`]s annotated with the peer pid.
-//!
-//! Phase 6c ships the listener + PEERPID lookup + decode pipeline.
-//! Lease correlation (peer pid → lease id) is wired in Phase 6f, when
-//! the spawn flow gives the engine a registry of (worker pid → lease)
-//! mappings to consult here.
+//! [`IncomingHookEvent`]s annotated with the peer pid and (when the
+//! peer's process tree is registered with [`crate::worker_registry`])
+//! the matching `run_id`.
 //!
 //! macOS-only. The `LOCAL_PEERPID` getsockopt is not portable; Boss
 //! itself is macOS-only so this is consistent with the rest of the

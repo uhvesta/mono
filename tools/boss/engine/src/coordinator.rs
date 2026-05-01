@@ -14,8 +14,8 @@ use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution, WorkItem, WorkRun};
 
 /// Hard cap on the worker pool. The runtime config can request a smaller
-/// pool, but values above this are clamped (with a warning). Phase 5 of
-/// the V2 plan locks 8 as the upper bound.
+/// pool, but values above this are clamped (with a warning). The V2
+/// design fixes 8 as the upper bound.
 pub const MAX_WORKER_POOL_SIZE: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

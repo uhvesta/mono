@@ -57,11 +57,11 @@ pub enum SessionStartSource {
 
 /// Why a worker turn ended. The hook payload alone only tells us
 /// `stop_hook_active`; richer reasons (`AwaitingInput`, `Interrupted`)
-/// are derived by the events-socket sequencer (Phase 6c) using
-/// surrounding context — `Notification` immediately before `Stop`
-/// implies the worker is awaiting a permission prompt, etc. The
-/// normalizer here always returns [`StopReason::Completed`]; the
-/// sequencer overwrites as needed.
+/// are derived by an events-socket sequencer using surrounding
+/// context — `Notification` immediately before `Stop` implies the
+/// worker is awaiting a permission prompt, etc. The normalizer here
+/// always returns [`StopReason::Completed`]; the sequencer overwrites
+/// as needed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -214,13 +214,13 @@ mod tests {
         let raw = json!({
             "session_id": "sess-1",
             "hook_event_name": "UserPromptSubmit",
-            "prompt": "ship phase 6d",
+            "prompt": "ship the worker event normalizer",
         });
         assert_eq!(
             normalize_hook_event(&raw).unwrap(),
             WorkerEvent::UserPromptSubmit {
                 session_id: "sess-1".into(),
-                prompt: "ship phase 6d".into(),
+                prompt: "ship the worker event normalizer".into(),
             }
         );
     }

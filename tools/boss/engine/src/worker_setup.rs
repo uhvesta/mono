@@ -10,10 +10,10 @@
 //! - `settings.json` — claude hooks config that wires every hook event
 //!   (`SessionStart` … `SessionEnd`) to the `boss-event` shim binary, so
 //!   the engine's events socket sees a structured stream of worker
-//!   activity (consumed by 6c's events socket / 6d's normalizer).
+//!   activity.
 //!
-//! Phase 6e ships the renderers and a tiny `write_workspace_files()`
-//! helper. Actual call-sites (the worker spawn flow) land in 6f.
+//! This module is just the renderers and a tiny `write_workspace_files()`
+//! helper. Call-sites in the worker spawn flow are wired separately.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,9 +33,9 @@ pub struct WorkerSetupInput {
     /// `BOSS_EVENTS_SOCKET` env var so the shim knows where to connect.
     pub events_socket_path: PathBuf,
     /// Absolute path to the `boss-event` shim binary the engine will
-    /// place into the worker's PATH per lease (Phase 6b ships the
-    /// binary; this template references it by absolute path so a hook
-    /// fires even if the user's PATH is unusual).
+    /// place into the worker's PATH per lease. This template
+    /// references the shim by absolute path so a hook fires even if
+    /// the user's PATH is unusual.
     pub boss_event_path: PathBuf,
 }
 

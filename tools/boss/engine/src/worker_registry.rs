@@ -2,9 +2,9 @@
 //!
 //! When the engine spawns a worker (claude in a leased cube workspace),
 //! it knows the worker process's pid and the run id it was spawned for.
-//! The events socket (Phase 6c) accepts hook deliveries from the
-//! `boss-event` shim, which runs as a *descendant* of the worker
-//! process — so peer pid is the shim's pid, not the worker's.
+//! The events socket accepts hook deliveries from the `boss-event`
+//! shim, which runs as a *descendant* of the worker process — so peer
+//! pid is the shim's pid, not the worker's.
 //!
 //! This registry stores the (worker_pid, run_id) pairs the spawn flow
 //! creates, and looks them up via an ancestor walk: given the shim's

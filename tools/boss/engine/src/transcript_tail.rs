@@ -2,9 +2,9 @@
 //!
 //! Each claude session writes a transcript JSONL file at a path the
 //! engine records on `WorkRun.transcript_path`. The hooks-to-socket
-//! channel (Phase 6c) gives us discrete events; the transcript carries
-//! richer per-token content. This module is the primitive that streams
-//! that file as it grows, returning each newly-written JSONL line as a
+//! channel gives us discrete events; the transcript carries richer
+//! per-token content. This module is the primitive that streams that
+//! file as it grows, returning each newly-written JSONL line as a
 //! parsed [`serde_json::Value`].
 //!
 //! The watcher tolerates:

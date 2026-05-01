@@ -1,15 +1,16 @@
 //! `boss-event` — a thin stdin-to-Unix-socket shim invoked by claude
 //! hooks running inside a Boss-managed worker.
 //!
-//! Each claude hook is configured (via the `settings.json` template
-//! from Phase 6e) to spawn this binary, with the hook payload arriving
-//! on stdin. The shim reads stdin to EOF, opens the engine's events
-//! socket at `$BOSS_EVENTS_SOCKET`, writes the payload, and exits.
+//! Each claude hook is configured (via the engine's per-lease
+//! `settings.json` template) to spawn this binary, with the hook
+//! payload arriving on stdin. The shim reads stdin to EOF, opens the
+//! engine's events socket at `$BOSS_EVENTS_SOCKET`, writes the
+//! payload, and exits.
 //!
 //! The shim is intentionally minimal: no parsing, no retries, no
 //! framing. The engine derives the worker's lease via `LOCAL_PEERPID`
-//! on its side (Phase 6c), so the shim doesn't need to embed the
-//! lease id, only the raw hook JSON.
+//! on its side, so the shim doesn't need to embed the lease id, only
+//! the raw hook JSON.
 //!
 //! Hooks fire on the worker's hot path; staying small and synchronous
 //! keeps the per-hook overhead trivial. If the socket isn't reachable
