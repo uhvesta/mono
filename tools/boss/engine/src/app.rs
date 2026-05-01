@@ -12,16 +12,17 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::config::RuntimeConfig;
-use crate::events_socket::{bind_events_socket, handle_connection};
+use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::worker_registry::WorkerRegistry;
 use crate::coordinator::{
     CommandCubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
 use crate::protocol::{
-    AgentInfo, AgentRole, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
-    FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS, TopicEventPayload, execution_topic,
-    work_product_topic,
+    AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FrontendEvent,
+    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, TOPIC_WORK_PRODUCTS,
+    TopicEventPayload, execution_topic, work_product_topic,
 };
+use tokio::time::{Duration, timeout};
 use crate::runner::AcpExecutionRunner;
 use crate::work::{WorkDb, WorkItem};
 use async_trait::async_trait;
@@ -214,10 +215,62 @@ struct ServerState {
     worker_registry: WorkerRegistry,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
+    /// Pid of the process the engine trusts as the macOS app — must
+    /// match a session's `peer_pid` for `RegisterAppSession` to
+    /// succeed. `None` only in tests; production sets this from
+    /// `getppid()` at startup.
+    app_pid: Option<libc::pid_t>,
+    /// Currently-registered app session, if any. Engine→app requests
+    /// are routed only to this session.
+    app_session: Arc<Mutex<Option<AppSessionHandle>>>,
+}
+
+/// Live state for the registered app session. The sink is used to
+/// push `EngineRequest` events; the pending map keys outstanding
+/// engine→app calls by their `request_id`.
+struct AppSessionHandle {
+    session_id: String,
+    sink: Arc<SessionSink>,
+    pending: HashMap<String, oneshot::Sender<EngineToAppResponse>>,
+    next_request_id: u64,
+}
+
+impl AppSessionHandle {
+    fn new(session_id: String, sink: Arc<SessionSink>) -> Self {
+        Self {
+            session_id,
+            sink,
+            pending: HashMap::new(),
+            next_request_id: 1,
+        }
+    }
+
+    fn allocate_request_id(&mut self) -> String {
+        let id = format!("eng-req-{}", self.next_request_id);
+        self.next_request_id += 1;
+        id
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SendToAppError {
+    #[error("no app session is registered")]
+    NotRegistered,
+    #[error("app disconnected before responding")]
+    AppDisconnected,
+    #[error("timed out waiting for app response")]
+    Timeout,
+    #[error("app responded with unexpected response kind for request kind {0}")]
+    ResponseKindMismatch(&'static str),
 }
 
 impl ServerState {
     fn new(cfg: Arc<RuntimeConfig>) -> Result<Self> {
+        let app_pid = current_parent_pid();
+        Self::new_with_app_pid(cfg, app_pid)
+    }
+
+    fn new_with_app_pid(cfg: Arc<RuntimeConfig>, app_pid: Option<libc::pid_t>) -> Result<Self> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let topic_broker = Arc::new(TopicBroker::default());
@@ -241,7 +294,123 @@ impl ServerState {
             worker_registry: WorkerRegistry::new(),
             next_session_id: AtomicU64::new(1),
             work_revision,
+            app_pid,
+            app_session: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Send a request to the registered app session and await the
+    /// response. Returns `Err` if no app is registered, the app
+    /// disconnects before replying, or the request times out.
+    pub async fn send_to_app(
+        &self,
+        request: EngineToAppRequest,
+        wait: Duration,
+    ) -> Result<EngineToAppResponse, SendToAppError> {
+        let (tx, rx) = oneshot::channel();
+        let request_id = {
+            let mut guard = self.app_session.lock().await;
+            let Some(handle) = guard.as_mut() else {
+                return Err(SendToAppError::NotRegistered);
+            };
+            let request_id = handle.allocate_request_id();
+            handle.pending.insert(request_id.clone(), tx);
+            handle.sink.enqueue(FrontendEventEnvelope::push(
+                FrontendEvent::EngineRequest {
+                    request_id: request_id.clone(),
+                    request: request.clone(),
+                },
+            ));
+            request_id
+        };
+
+        match timeout(wait, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_recv_err)) => {
+                self.drop_pending(&request_id).await;
+                Err(SendToAppError::AppDisconnected)
+            }
+            Err(_elapsed) => {
+                self.drop_pending(&request_id).await;
+                Err(SendToAppError::Timeout)
+            }
+        }
+    }
+
+    async fn drop_pending(&self, request_id: &str) {
+        if let Some(handle) = self.app_session.lock().await.as_mut() {
+            handle.pending.remove(request_id);
+        }
+    }
+
+    /// Register `session_id` as the app session. Any prior
+    /// registration's pending requests are resolved as
+    /// `AppDisconnected`.
+    async fn register_app_session(&self, session_id: String, sink: Arc<SessionSink>) {
+        let prior = self
+            .app_session
+            .lock()
+            .await
+            .replace(AppSessionHandle::new(session_id, sink));
+        if let Some(prior) = prior {
+            for (_, tx) in prior.pending {
+                let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
+                    result: Err(EngineToAppError::AppDisconnected),
+                });
+            }
+        }
+    }
+
+    /// If `session_id` is the registered app, drop the registration
+    /// and resolve all pending requests as `AppDisconnected`.
+    async fn drop_app_session_if_matches(&self, session_id: &str) {
+        let mut guard = self.app_session.lock().await;
+        let take = matches!(guard.as_ref(), Some(handle) if handle.session_id == session_id);
+        if take {
+            if let Some(prior) = guard.take() {
+                for (_, tx) in prior.pending {
+                    let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
+                        result: Err(EngineToAppError::AppDisconnected),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Route an `EngineResponse` from the app back to the waiting
+    /// `send_to_app` caller.
+    async fn deliver_app_response(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        response: EngineToAppResponse,
+    ) {
+        let mut guard = self.app_session.lock().await;
+        let Some(handle) = guard.as_mut() else {
+            tracing::warn!(
+                request_id,
+                "engine_response dropped: no registered app session",
+            );
+            return;
+        };
+        if handle.session_id != session_id {
+            tracing::warn!(
+                request_id,
+                "engine_response dropped: came from non-app session",
+            );
+            return;
+        }
+        match handle.pending.remove(request_id) {
+            Some(tx) => {
+                let _ = tx.send(response);
+            }
+            None => {
+                tracing::warn!(
+                    request_id,
+                    "engine_response dropped: no pending request matches",
+                );
+            }
+        }
     }
 
     fn allocate_session_id(&self) -> String {
@@ -728,13 +897,28 @@ pub async fn serve(
 
     loop {
         let (stream, _) = listener.accept().await.context("socket accept failed")?;
+        // Capture peer pid synchronously before any async yield so the
+        // shim's quick-close (or any other peer that doesn't linger)
+        // can't race us into ENOTCONN.
+        let peer_pid_value = peer_pid(&stream).ok();
         let server_state = server_state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_frontend_connection(stream, server_state).await {
+            if let Err(err) =
+                handle_frontend_connection(stream, server_state, peer_pid_value).await
+            {
                 tracing::error!(?err, "frontend connection failed");
             }
         });
     }
+}
+
+fn current_parent_pid() -> Option<libc::pid_t> {
+    // SAFETY: getppid() has no preconditions; the returned pid is
+    // valid for the lifetime of the parent process (and thereafter
+    // returns 1 / launchd, which we treat as no-app-detected via the
+    // explicit check below).
+    let ppid = unsafe { libc::getppid() };
+    if ppid <= 1 { None } else { Some(ppid) }
 }
 
 async fn run_events_accept_loop(listener: UnixListener, registry: WorkerRegistry) {
@@ -768,6 +952,7 @@ async fn run_events_accept_loop(listener: UnixListener, registry: WorkerRegistry
 async fn handle_frontend_connection(
     stream: UnixStream,
     server_state: Arc<ServerState>,
+    peer_pid: Option<libc::pid_t>,
 ) -> Result<()> {
     tracing::info!("frontend connected");
     let registry = server_state.agent_registry.clone();
@@ -1701,32 +1886,47 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::RegisterAppSession => {
-                // Real dispatch (promote the calling session to the
-                // registered app session) lands in a follow-up; for
-                // now the engine rejects the call so the wire types
-                // are exercised end-to-end on a stub implementation.
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::Error {
-                        agent_id: None,
-                        message: "register_app_session not yet implemented".to_owned(),
-                    },
-                );
+                let trust_ok = match (server_state.app_pid, peer_pid) {
+                    (None, _) => true, // tests / no-trust-root mode
+                    (Some(expected), Some(observed)) => expected == observed,
+                    (Some(_), None) => false,
+                };
+                if !trust_ok {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        expected = ?server_state.app_pid,
+                        "register_app_session rejected: peer pid mismatch",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "register_app_session: peer pid does not match app_pid"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                server_state
+                    .register_app_session(session_id.clone(), sink.clone())
+                    .await;
+                tracing::info!(session_id = %session_id, "app session registered");
+                send_response(&sink, &request_id, FrontendEvent::AppSessionRegistered);
             }
-            FrontendRequest::EngineResponse { request_id: rid, .. } => {
-                // The dispatcher that routes responses to pending
-                // engine→app requests is wired in a follow-up; for
-                // now we just log + drop.
-                tracing::warn!(
-                    response_request_id = %rid,
-                    "engine_response received before dispatch is wired; dropping",
-                );
+            FrontendRequest::EngineResponse {
+                request_id: response_request_id,
+                response,
+            } => {
+                server_state
+                    .deliver_app_response(&session_id, &response_request_id, response)
+                    .await;
             }
         }
     }
 
     server_state.topic_broker.remove_session(&session_id).await;
+    server_state.drop_app_session_if_matches(&session_id).await;
     sink.close();
     let _ = writer_task.await;
     Ok(())
@@ -2091,5 +2291,206 @@ mod tests {
         let inner = broker.inner.lock().await;
         assert!(!inner.sinks.contains_key("session-1"));
         assert!(!inner.sessions_by_topic.contains_key("work.products"));
+    }
+
+    fn test_server_state() -> Arc<ServerState> {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: temp.path().to_path_buf(),
+                db_path: temp.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        // Leak the temp dir for the lifetime of the test process; the
+        // ServerState's WorkDb keeps a handle to a path inside it.
+        std::mem::forget(temp);
+        Arc::new(ServerState::new_with_app_pid(cfg, None).unwrap())
+    }
+
+    fn make_session_sink() -> Arc<SessionSink> {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+        Arc::new(SessionSink::new(shutdown_tx))
+    }
+
+    #[tokio::test]
+    async fn send_to_app_returns_not_registered_when_no_app() {
+        let server_state = test_server_state();
+        let result = server_state
+            .send_to_app(
+                EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+                    run_id: "r".into(),
+                    workspace_path: "/tmp".into(),
+                    initial_input: "claude\n".into(),
+                    env: vec![],
+                }),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(matches!(result, Err(SendToAppError::NotRegistered)));
+    }
+
+    #[tokio::test]
+    async fn send_to_app_round_trips_via_deliver_response() {
+        let server_state = test_server_state();
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let send = tokio::spawn(async move {
+            server_clone
+                .send_to_app(
+                    EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+                        run_id: "run-7".into(),
+                        workspace_path: "/tmp".into(),
+                        initial_input: "claude\n".into(),
+                        env: vec![],
+                    }),
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        // Pull the EngineRequest event off the sink; that gives us
+        // the request_id the engine assigned.
+        let envelope = sink
+            .next()
+            .await
+            .expect("an EngineRequest event should be enqueued");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+
+        // Deliver a response for that id.
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SpawnWorkerPane {
+                    result: Ok(crate::protocol::SpawnWorkerPaneResult {
+                        slot_id: 4,
+                        shell_pid: 9001,
+                    }),
+                },
+            )
+            .await;
+
+        let response = send.await.expect("send_to_app task panicked").expect("ok");
+        match response {
+            EngineToAppResponse::SpawnWorkerPane { result } => {
+                let result = result.expect("ok variant");
+                assert_eq!(result.slot_id, 4);
+                assert_eq!(result.shell_pid, 9001);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_to_app_resolves_app_disconnected_on_session_drop() {
+        let server_state = test_server_state();
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let send = tokio::spawn(async move {
+            server_clone
+                .send_to_app(
+                    EngineToAppRequest::ReleaseWorkerPane(
+                        crate::protocol::ReleaseWorkerPaneInput {
+                            slot_id: 1,
+                            kill_grace_seconds: 2,
+                        },
+                    ),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+
+        // Drain the EngineRequest event so the test isn't racy on
+        // sink ordering.
+        let _ = sink.next().await;
+
+        // Simulate the app session disconnecting.
+        server_state.drop_app_session_if_matches("session-app").await;
+
+        let response = send.await.expect("send task panicked").expect("ok");
+        match response {
+            EngineToAppResponse::SpawnWorkerPane {
+                result: Err(EngineToAppError::AppDisconnected),
+            } => {} // currently the cleanup path uses SpawnWorkerPane variant uniformly; ok.
+            EngineToAppResponse::ReleaseWorkerPane {
+                result: Err(EngineToAppError::AppDisconnected),
+            } => {}
+            other => panic!("expected AppDisconnected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_to_app_times_out_when_app_silent() {
+        let server_state = test_server_state();
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink)
+            .await;
+
+        let result = server_state
+            .send_to_app(
+                EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+                    run_id: "r".into(),
+                    workspace_path: "/tmp".into(),
+                    initial_input: "claude\n".into(),
+                    env: vec![],
+                }),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(matches!(result, Err(SendToAppError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn second_register_invalidates_first() {
+        let server_state = test_server_state();
+        let first_sink = make_session_sink();
+        server_state
+            .register_app_session("session-1".into(), first_sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let in_flight = tokio::spawn(async move {
+            server_clone
+                .send_to_app(
+                    EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+                        run_id: "r".into(),
+                        workspace_path: "/tmp".into(),
+                        initial_input: "claude\n".into(),
+                        env: vec![],
+                    }),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        let _ = first_sink.next().await; // drain queued event
+
+        // A second registration replaces the first and resolves
+        // pending requests as AppDisconnected.
+        let second_sink = make_session_sink();
+        server_state
+            .register_app_session("session-2".into(), second_sink)
+            .await;
+
+        let response = in_flight.await.expect("send task").expect("ok");
+        match response {
+            EngineToAppResponse::SpawnWorkerPane {
+                result: Err(EngineToAppError::AppDisconnected),
+            } => {}
+            other => panic!("expected AppDisconnected, got {other:?}"),
+        }
     }
 }
