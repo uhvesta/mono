@@ -354,6 +354,22 @@ impl WorkDb {
             ],
         )?;
 
+        // Auto-advance the work item's kanban status to `active` so
+        // the card moves into the Doing column when work begins.
+        // Only applies to tasks/chores; products and projects use a
+        // different status vocabulary and aren't rendered on the
+        // kanban. Don't downgrade items already in `done` or
+        // `archived` — manual transitions win.
+        tx.execute(
+            "UPDATE tasks
+             SET status = 'active',
+                 updated_at = ?2
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status NOT IN ('done', 'archived')",
+            params![execution.work_item_id, now],
+        )?;
+
         let run_id = next_id("run");
         tx.execute(
             "INSERT INTO work_runs (
@@ -2327,6 +2343,82 @@ mod tests {
         assert_eq!(run.status, "active");
         assert!(run.started_at.is_some());
         assert!(run.finished_at.is_none());
+
+        // Auto-advance: starting an execution moves the chore's
+        // kanban status from `todo` to `active` so it appears in the
+        // Doing column.
+        let advanced_chore = db.get_work_item(&chore.id).unwrap();
+        match advanced_chore {
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+            other => panic!("expected chore/task, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn start_execution_does_not_downgrade_done_chores() {
+        let path = temp_db_path("no-downgrade");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already done".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        // Manually mark the chore as done before starting execution.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        db.start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+        // The chore was already `done` — auto-advance must not
+        // overwrite that with `active`. Manual transitions win.
+        let unchanged = db.get_work_item(&chore.id).unwrap();
+        match unchanged {
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "done"),
+            other => panic!("expected chore/task, got {other:?}"),
+        }
 
         let _ = std::fs::remove_file(path);
     }
