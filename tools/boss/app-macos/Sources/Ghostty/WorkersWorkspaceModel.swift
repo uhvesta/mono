@@ -37,6 +37,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         )
         slots[index].session = session
         slots[index].runId = request.runId
+        slots[index].summary = request.summary
 
         // TODO: use proc_listpids(PROC_PPID_ONLY, ...)
         // right after surface init to find the shell pid. For now
@@ -58,6 +59,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
         slots[index].session = nil
         slots[index].runId = nil
+        slots[index].summary = nil
         return .success
     }
 
@@ -83,10 +85,17 @@ struct WorkerSlot: Identifiable, Equatable {
     let slotId: Int
     var session: TerminalPaneSession?
     var runId: String?
+    /// Short 2–4 word task summary the engine generated for this
+    /// run. Shown in the pane titlebar in place of `runId` when
+    /// present; the runId stays available as a tooltip.
+    var summary: String?
 
     var id: Int { slotId }
 
     static func == (lhs: WorkerSlot, rhs: WorkerSlot) -> Bool {
-        lhs.slotId == rhs.slotId && lhs.runId == rhs.runId && lhs.session === rhs.session
+        lhs.slotId == rhs.slotId
+            && lhs.runId == rhs.runId
+            && lhs.summary == rhs.summary
+            && lhs.session === rhs.session
     }
 }

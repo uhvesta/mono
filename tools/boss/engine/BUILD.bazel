@@ -13,6 +13,7 @@ rust_library(
         "src/coordinator.rs",
         "src/events_socket.rs",
         "src/lib.rs",
+        "src/pane_summary.rs",
         "src/protocol.rs",
         "src/runner.rs",
         "src/spawn_flow.rs",

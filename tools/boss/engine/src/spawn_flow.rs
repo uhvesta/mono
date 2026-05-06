@@ -67,6 +67,12 @@ pub struct StartWorkerInput {
     /// settings.json template injects (`BOSS_EVENTS_SOCKET`,
     /// `BOSS_LEASE_ID`).
     pub extra_env: Vec<(String, String)>,
+    /// Optional 2–4 word summary to display in the pane titlebar in
+    /// place of the run id. The app keeps the run id available as a
+    /// tooltip; this field is purely visual. `None` means the
+    /// engine had no summary to offer (e.g., generation failed) —
+    /// the app falls back to showing the run id.
+    pub title_summary: Option<String>,
 }
 
 #[derive(Debug)]
@@ -158,6 +164,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
                 workspace_path: input.workspace_path.display().to_string(),
                 initial_input: input.initial_input,
                 env,
+                summary: input.title_summary,
             }),
             Duration::from_secs(spawn_timeout.as_secs()),
         )
@@ -270,6 +277,7 @@ mod tests {
             boss_event_path: PathBuf::from("/tmp/boss-event"),
             initial_input: "claude\n".into(),
             extra_env: vec![],
+            title_summary: None,
         }
     }
 
@@ -446,6 +454,41 @@ mod tests {
             env.iter().find(|(k, _)| k == "CUBE_REPO").map(|(_, v)| v.as_str()),
             Some("mono"),
         );
+    }
+
+    #[tokio::test]
+    async fn title_summary_is_forwarded_to_spawn_request() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        let mut input = sample_input(&workspace);
+        input.title_summary = Some("Pane Titlebar Summary".to_owned());
+
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        match spawner.last_request.lock().unwrap().clone() {
+            Some(EngineToAppRequest::SpawnWorkerPane(input)) => {
+                assert_eq!(input.summary.as_deref(), Some("Pane Titlebar Summary"));
+            }
+            other => panic!("expected SpawnWorkerPane, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_title_summary_does_not_attach_one() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await
+            .unwrap();
+
+        match spawner.last_request.lock().unwrap().clone() {
+            Some(EngineToAppRequest::SpawnWorkerPane(input)) => {
+                assert!(input.summary.is_none());
+            }
+            other => panic!("expected SpawnWorkerPane, got {other:?}"),
+        }
     }
 
     #[tokio::test]
