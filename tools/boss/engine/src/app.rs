@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -238,6 +238,10 @@ struct ServerState {
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
+    /// Weak self-reference produced by `Arc::new_cyclic`. Kept so
+    /// late-bound consumers (the pane-spawn runner) can resolve back
+    /// to the live `Arc<ServerState>` without an outer allocation.
+    _self_weak: Weak<ServerState>,
 }
 
 /// Live state for the registered app session. The sink is used to
@@ -280,12 +284,15 @@ pub enum SendToAppError {
 }
 
 impl ServerState {
-    fn new(cfg: Arc<RuntimeConfig>) -> Result<Self> {
+    fn new_arc(cfg: Arc<RuntimeConfig>) -> Result<Arc<Self>> {
         let app_pid = current_parent_pid();
-        Self::new_with_app_pid(cfg, app_pid)
+        Self::new_arc_with_app_pid(cfg, app_pid)
     }
 
-    fn new_with_app_pid(cfg: Arc<RuntimeConfig>, app_pid: Option<libc::pid_t>) -> Result<Self> {
+    fn new_arc_with_app_pid(
+        cfg: Arc<RuntimeConfig>,
+        app_pid: Option<libc::pid_t>,
+    ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let topic_broker = Arc::new(TopicBroker::default());
@@ -294,25 +301,48 @@ impl ServerState {
             topic_broker: topic_broker.clone(),
             work_revision: work_revision.clone(),
         });
-        let execution_coordinator = Arc::new(ExecutionCoordinator::with_publisher(
-            work_db.clone(),
-            worker_pool,
-            Arc::new(CommandCubeClient::new(cfg.clone())),
-            Arc::new(AcpExecutionRunner::new(cfg.clone())),
-            publisher,
-        ));
-        Ok(Self {
-            work_db,
-            agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
-            execution_coordinator,
-            topic_broker,
-            worker_registry: WorkerRegistry::new(),
-            next_session_id: AtomicU64::new(1),
-            work_revision,
-            app_pid,
-            app_session: Arc::new(Mutex::new(None)),
-        })
+
+        // Build PaneSpawnRunner up front, hand its Weak<ServerState>
+        // pointer back via set_server_state once the Arc exists. The
+        // runner needs to call into ServerState (send_to_app +
+        // worker_registry) while ServerState owns the runner —
+        // Arc::new_cyclic breaks the cycle.
+        let pane_runner = Arc::new(crate::runner::PaneSpawnRunner::new(cfg.clone()));
+        let runner_for_coordinator = pane_runner.clone();
+
+        let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
+            let execution_coordinator = Arc::new(ExecutionCoordinator::with_publisher(
+                work_db.clone(),
+                worker_pool,
+                Arc::new(CommandCubeClient::new(cfg.clone())),
+                runner_for_coordinator,
+                publisher,
+            ));
+
+            ServerState {
+                work_db,
+                agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
+                execution_coordinator,
+                topic_broker,
+                worker_registry: WorkerRegistry::new(),
+                next_session_id: AtomicU64::new(1),
+                work_revision,
+                app_pid,
+                app_session: Arc::new(Mutex::new(None)),
+                _self_weak: weak_self.clone(),
+            }
+        });
+
+        // Late-bind the runner to the Arc<ServerState>. Going through
+        // the WorkerSpawner trait keeps the runner unaware of
+        // ServerState's private fields.
+        let weak_spawner: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&server_state) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        pane_runner.set_server_state(weak_spawner);
+
+        Ok(server_state)
     }
+
 
     /// Send a request to the registered app session and await the
     /// response. Returns `Err` if no app is registered, the app
@@ -875,7 +905,7 @@ pub async fn serve(
     pid_file_path: Option<std::path::PathBuf>,
     events_socket_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let server_state = Arc::new(ServerState::new(cfg.clone())?);
+    let server_state = ServerState::new_arc(cfg.clone())?;
 
     if socket_path.exists() {
         tokio::fs::remove_file(&socket_path)
@@ -2325,7 +2355,7 @@ mod tests {
         // Leak the temp dir for the lifetime of the test process; the
         // ServerState's WorkDb keeps a handle to a path inside it.
         std::mem::forget(temp);
-        Arc::new(ServerState::new_with_app_pid(cfg, None).unwrap())
+        ServerState::new_arc_with_app_pid(cfg, None).unwrap()
     }
 
     fn make_session_sink() -> Arc<SessionSink> {

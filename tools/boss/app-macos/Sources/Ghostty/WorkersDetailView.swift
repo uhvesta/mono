@@ -52,14 +52,14 @@ private struct WorkerSlotView: View {
         if let session = slot.session {
             WorkerPaneTerminalView(runtime: runtime, session: session)
         } else {
-            VStack {
+            VStack(spacing: 4) {
                 Spacer()
                 Text("Slot \(slot.slotId)")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(Color.white.opacity(0.45))
                 Text("Free")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.white.opacity(0.7))
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)

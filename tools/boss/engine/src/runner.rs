@@ -1,13 +1,15 @@
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+use std::time::Duration as StdDuration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::acp::{AcpClient, AcpEvent};
 use crate::config::RuntimeConfig;
+use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{Project, Task, WorkExecution, WorkItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +217,113 @@ impl ExecutionRunner for AcpExecutionRunner {
             wait_state: RunWaitState::WaitingHuman,
             result_summary,
             attention,
+        })
+    }
+}
+
+/// `ExecutionRunner` that drives the libghostty pane RPC: writes the
+/// per-lease worker config files, asks the macOS app to host a
+/// worker pane, and registers the returned shell pid against the
+/// run id so events-socket hook deliveries can correlate.
+///
+/// Returns `WaitingHuman` immediately on a successful spawn — the
+/// pane stays alive in the app and the workspace lease is retained
+/// until a human or follow-up flow concludes the run. Real lifecycle
+/// (the pane signaling "Stop" → run completes) lands once the
+/// events-socket consumer drives state transitions.
+pub struct PaneSpawnRunner {
+    cfg: Arc<RuntimeConfig>,
+    /// Set after construction via [`PaneSpawnRunner::set_server_state`].
+    /// Stored as `Weak` to avoid the runner ↔ ServerState reference
+    /// cycle. Resolved each call.
+    server_state: std::sync::OnceLock<Weak<dyn crate::spawn_flow::WorkerSpawner>>,
+}
+
+impl PaneSpawnRunner {
+    pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
+        Self {
+            cfg,
+            server_state: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub fn set_server_state(&self, server_state: Weak<dyn crate::spawn_flow::WorkerSpawner>) {
+        let _ = self.server_state.set(server_state);
+    }
+
+    fn events_socket_path(&self) -> PathBuf {
+        if let Ok(override_path) = std::env::var("BOSS_EVENTS_SOCKET") {
+            return override_path.into();
+        }
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        PathBuf::from(home).join("Library/Application Support/Boss/events.sock")
+    }
+
+    fn boss_event_binary(&self) -> PathBuf {
+        if let Ok(override_path) = std::env::var("BOSS_EVENT_BIN") {
+            return override_path.into();
+        }
+        // Fallback: assume bazel-built sibling binary in the runtime
+        // working directory layout. Not robust; the env override is
+        // the recommended path for production use.
+        PathBuf::from("boss-event")
+    }
+}
+
+#[async_trait]
+impl ExecutionRunner for PaneSpawnRunner {
+    async fn run_execution(
+        &self,
+        worker_id: &str,
+        execution: &WorkExecution,
+        _work_item: &WorkItem,
+        workspace_path: &Path,
+        _cube_change_id: Option<&str>,
+    ) -> Result<RunOutcome> {
+        let weak = self
+            .server_state
+            .get()
+            .ok_or_else(|| anyhow!("PaneSpawnRunner not bound to ServerState"))?;
+        let spawner = weak
+            .upgrade()
+            .ok_or_else(|| anyhow!("ServerState dropped before run_execution"))?;
+
+        let lease_id = execution
+            .cube_lease_id
+            .clone()
+            .context("execution missing cube_lease_id; coordinator must lease before spawn")?;
+
+        let started = start_worker(
+            spawner.as_ref(),
+            StartWorkerInput {
+                run_id: execution.id.clone(),
+                lease_id,
+                workspace_path: workspace_path.to_path_buf(),
+                events_socket_path: self.events_socket_path(),
+                boss_event_path: self.boss_event_binary(),
+                initial_input: "claude\n".to_owned(),
+                extra_env: vec![],
+            },
+            StdDuration::from_secs(30),
+        )
+        .await
+        .with_context(|| format!("spawning worker pane for run {}", execution.id))?;
+
+        tracing::info!(
+            worker_id,
+            execution_id = %execution.id,
+            slot_id = started.slot_id,
+            shell_pid = started.shell_pid,
+            "pane spawned for execution",
+        );
+
+        Ok(RunOutcome {
+            wait_state: RunWaitState::WaitingHuman,
+            result_summary: Some(format!(
+                "Spawned worker pane in slot {} (shell pid {}). Hook events from this run will surface on the engine events socket.",
+                started.slot_id, started.shell_pid,
+            )),
+            attention: None,
         })
     }
 }
