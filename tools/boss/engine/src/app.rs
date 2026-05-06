@@ -2102,16 +2102,26 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::RegisterAppSession => {
+                // Subtree-match auth: when the engine is launched via a
+                // `bazel run` (or any wrapper) the engine's `getppid()`
+                // points at the wrapper, not the macOS app. The app is
+                // the wrapper's parent, i.e., an ancestor of the engine
+                // process. Accept any peer whose pid appears in the
+                // engine's own ancestor chain.
+                let engine_pid = std::process::id() as libc::pid_t;
                 let trust_ok = match (server_state.app_pid, peer_pid) {
                     (None, _) => true, // tests / no-trust-root mode
-                    (Some(expected), Some(observed)) => expected == observed,
+                    (Some(_), Some(observed)) => {
+                        is_descendant_of_any(engine_pid, &[observed])
+                    }
                     (Some(_), None) => false,
                 };
                 if !trust_ok {
                     tracing::warn!(
                         peer_pid = ?peer_pid,
-                        expected = ?server_state.app_pid,
-                        "register_app_session rejected: peer pid mismatch",
+                        engine_pid,
+                        expected_direct_parent = ?server_state.app_pid,
+                        "register_app_session rejected: peer pid not in engine ancestor chain",
                     );
                     send_response(
                         &sink,
