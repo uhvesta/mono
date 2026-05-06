@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod app;
 pub mod cli;
+pub mod completion;
 pub mod config;
 pub mod coordinator;
 pub mod events_socket;
