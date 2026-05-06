@@ -189,6 +189,12 @@ pub enum FrontendRequest {
     /// engine's parent). After registration, `EngineRequest` events
     /// flow to this session only.
     RegisterAppSession,
+    /// App tells the engine which pid is the Boss session's shell.
+    /// Used to populate the second trust root for Boss-only RPCs.
+    /// Only the registered app session may call this.
+    RegisterBossSession {
+        shell_pid: i32,
+    },
     /// App's reply to a previous `FrontendEvent::EngineRequest`.
     /// `request_id` echoes the value the engine sent.
     EngineResponse {
@@ -348,6 +354,8 @@ pub enum FrontendEvent {
     /// Engine confirms the calling session is now the registered app
     /// session, and any prior registration was invalidated.
     AppSessionRegistered,
+    /// Engine confirms the Boss session pid was registered.
+    BossSessionRegistered,
     /// Engine asks the registered app session to perform a pane
     /// operation. The app must reply with a
     /// [`FrontendRequest::EngineResponse`] carrying the same

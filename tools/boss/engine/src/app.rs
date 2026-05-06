@@ -235,9 +235,30 @@ struct ServerState {
     /// succeed. `None` only in tests; production sets this from
     /// `getppid()` at startup.
     app_pid: Option<libc::pid_t>,
+    /// Pid of the Boss session's shell, set by the app via
+    /// `RegisterBossSession` once the Boss libghostty pane has spawned.
+    /// Used as the second trust root: a peer whose process tree
+    /// includes this pid as an ancestor is treated as the Boss tier
+    /// for RPC authorization.
+    boss_pid: StdMutex<Option<libc::pid_t>>,
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
+}
+
+/// Authorization tier for a frontend RPC.
+///
+/// - `User`: any local client (the human's `boss` CLI, the macOS app,
+///   read-only callers).
+/// - `AppOrBoss`: privileged operations the app and the Boss session
+///   may both invoke (e.g., engine→app pane RPC machinery).
+/// - `BossOnly`: control verbs only the Boss session may invoke
+///   (probe injection, agent send/interrupt, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcTier {
+    User,
+    AppOrBoss,
+    BossOnly,
 }
 
 /// Live state for the registered app session. The sink is used to
@@ -310,6 +331,7 @@ impl ServerState {
             next_session_id: AtomicU64::new(1),
             work_revision,
             app_pid,
+            boss_pid: StdMutex::new(None),
             app_session: Arc::new(Mutex::new(None)),
         })
     }
@@ -394,6 +416,49 @@ impl ServerState {
 
     pub fn worker_registry_handle(&self) -> &WorkerRegistry {
         &self.worker_registry
+    }
+
+    /// Set the Boss session's shell pid (the second trust root). Any
+    /// peer whose process tree includes this pid as an ancestor will
+    /// satisfy `BossOnly` / `AppOrBoss` checks.
+    pub fn set_boss_pid(&self, pid: libc::pid_t) {
+        *self.boss_pid.lock().expect("boss_pid mutex poisoned") = Some(pid);
+    }
+
+    pub fn current_boss_pid(&self) -> Option<libc::pid_t> {
+        *self.boss_pid.lock().expect("boss_pid mutex poisoned")
+    }
+
+    /// Authorize a peer-pid against an RPC tier. Walks up the peer's
+    /// process tree (bounded depth) looking for `app_pid` or
+    /// `boss_pid` registered as a trust root.
+    ///
+    /// Returns `true` when `tier == User`, when the trust root is
+    /// `None` (test mode), or when an ancestor of `peer_pid` matches
+    /// a relevant trust root.
+    pub fn authorize_rpc(&self, tier: RpcTier, peer_pid: Option<libc::pid_t>) -> bool {
+        if matches!(tier, RpcTier::User) {
+            return true;
+        }
+        let app_pid = self.app_pid;
+        let boss_pid = self.current_boss_pid();
+        if app_pid.is_none() && boss_pid.is_none() {
+            // No trust roots are configured at all — treat as
+            // permissive (used by in-process tests).
+            return true;
+        }
+        let Some(peer_pid) = peer_pid else {
+            return false;
+        };
+        let trust_set: Vec<libc::pid_t> = match tier {
+            RpcTier::User => return true,
+            RpcTier::AppOrBoss => [app_pid, boss_pid].into_iter().flatten().collect(),
+            RpcTier::BossOnly => boss_pid.into_iter().collect(),
+        };
+        if trust_set.is_empty() {
+            return false;
+        }
+        is_descendant_of_any(peer_pid, &trust_set)
     }
 
     /// Route an `EngineResponse` from the app back to the waiting
@@ -929,6 +994,26 @@ pub async fn serve(
             }
         });
     }
+}
+
+/// Walk up `pid`'s process tree (bounded depth) checking whether
+/// any ancestor matches one of `trust_roots`. Used to implement
+/// `LOCAL_PEERPID` subtree-match auth: a peer running inside a
+/// trusted process tree is treated as that tree's tier.
+fn is_descendant_of_any(pid: libc::pid_t, trust_roots: &[libc::pid_t]) -> bool {
+    use crate::worker_registry::parent_pid;
+    const TRUST_WALK_DEPTH: usize = 16;
+    let mut current = pid;
+    for _ in 0..TRUST_WALK_DEPTH {
+        if trust_roots.contains(&current) {
+            return true;
+        }
+        match parent_pid(current) {
+            Ok(Some(parent)) => current = parent,
+            Ok(None) | Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn current_parent_pid() -> Option<libc::pid_t> {
@@ -1933,6 +2018,38 @@ async fn handle_frontend_connection(
                 tracing::info!(session_id = %session_id, "app session registered");
                 send_response(&sink, &request_id, FrontendEvent::AppSessionRegistered);
             }
+            FrontendRequest::RegisterBossSession { shell_pid } => {
+                // Only the registered app session may install the
+                // Boss trust root.
+                let app_session_id = server_state
+                    .app_session
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|h| h.session_id.clone());
+                if app_session_id.as_deref() != Some(session_id.as_str()) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "register_boss_session rejected: caller is not the app session",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "register_boss_session: only the app session may install the Boss trust root"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                server_state.set_boss_pid(shell_pid as libc::pid_t);
+                tracing::info!(
+                    boss_pid = shell_pid,
+                    "boss session registered as second trust root",
+                );
+                send_response(&sink, &request_id, FrontendEvent::BossSessionRegistered);
+            }
             FrontendRequest::EngineResponse {
                 request_id: response_request_id,
                 response,
@@ -2511,5 +2628,31 @@ mod tests {
             } => {}
             other => panic!("expected AppDisconnected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn authorize_user_tier_always_allowed() {
+        let server_state = test_server_state();
+        assert!(server_state.authorize_rpc(RpcTier::User, None));
+        assert!(server_state.authorize_rpc(RpcTier::User, Some(1234)));
+    }
+
+    #[test]
+    fn authorize_no_trust_roots_is_permissive_for_test_mode() {
+        let server_state = test_server_state();
+        // In tests, both app_pid and boss_pid are None — the engine
+        // treats this as permissive so unit tests can drive any RPC.
+        assert!(server_state.authorize_rpc(RpcTier::AppOrBoss, Some(1234)));
+        assert!(server_state.authorize_rpc(RpcTier::BossOnly, Some(1234)));
+    }
+
+    #[test]
+    fn set_boss_pid_round_trips() {
+        let server_state = test_server_state();
+        assert_eq!(server_state.current_boss_pid(), None);
+        server_state.set_boss_pid(98765);
+        assert_eq!(server_state.current_boss_pid(), Some(98765));
+        server_state.set_boss_pid(11111);
+        assert_eq!(server_state.current_boss_pid(), Some(11111));
     }
 }
