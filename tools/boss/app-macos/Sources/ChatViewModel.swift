@@ -29,6 +29,7 @@ final class ChatViewModel: ObservableObject {
     @Published var workErrorMessage: String?
     @Published var workSearchText: String = ""
     @Published var isBossPanelCollapsed: Bool = false
+    @Published var bossPanelWidth: CGFloat = 380
 
     var bossAgent: Agent? {
         agents.first { $0.isBoss }
@@ -151,6 +152,7 @@ final class ChatViewModel: ObservableObject {
     private let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     private let workBoardGroupingDefaultsKey = "boss.work.grouping"
     private let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
+    private let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
 
     init(
         socketPath: String = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
@@ -178,6 +180,10 @@ final class ChatViewModel: ObservableObject {
             workBoardGrouping = grouping
         }
         isBossPanelCollapsed = defaults.bool(forKey: bossPanelCollapsedDefaultsKey)
+        let savedWidth = defaults.double(forKey: bossPanelWidthDefaultsKey)
+        if savedWidth > 0 {
+            bossPanelWidth = savedWidth
+        }
 
         processController.onOutputLine = { [weak self] line in
             self?.appendSystemMessage(line)
@@ -227,6 +233,11 @@ final class ChatViewModel: ObservableObject {
     func toggleBossPanelCollapsed() {
         isBossPanelCollapsed.toggle()
         defaults.set(isBossPanelCollapsed, forKey: bossPanelCollapsedDefaultsKey)
+    }
+
+    func setBossPanelWidth(_ width: CGFloat) {
+        bossPanelWidth = width
+        defaults.set(width, forKey: bossPanelWidthDefaultsKey)
     }
 
     func setNavigationMode(_ mode: NavigationMode) {

@@ -5,7 +5,9 @@ import Textual
 private let workBoardColumnWidth: CGFloat = 280
 private let workBoardColumnSpacing: CGFloat = 12
 private let workBoardHorizontalPadding: CGFloat = 20
-private let workBossPanelExpandedWidth: CGFloat = 380
+private let workBossPanelDefaultExpandedWidth: CGFloat = 380
+private let workBossPanelMinWidth: CGFloat = 280
+private let workBossPanelMaxWidth: CGFloat = 600
 private let workBossPanelCollapsedWidth: CGFloat = 88
 
 struct ContentView: View {
@@ -503,13 +505,24 @@ struct ContentView: View {
                 )
             }
         }
-        .frame(width: isCollapsed ? workBossPanelCollapsedWidth : workBossPanelExpandedWidth)
+        .frame(width: isCollapsed ? workBossPanelCollapsedWidth : model.bossPanelWidth)
         .frame(maxHeight: .infinity)
         .background(Color(nsColor: .underPageBackgroundColor))
         .overlay(alignment: .leading) {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor))
-                .frame(width: 1)
+            if !isCollapsed {
+                ResizeDivider(
+                    currentWidth: model.bossPanelWidth,
+                    minWidth: workBossPanelMinWidth,
+                    maxWidth: workBossPanelMaxWidth,
+                    onWidthChanged: { newWidth in
+                        model.setBossPanelWidth(newWidth)
+                    }
+                )
+            } else {
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor))
+                    .frame(width: 1)
+            }
         }
         .animation(.snappy(duration: 0.18), value: model.isBossPanelCollapsed)
     }
@@ -1784,5 +1797,87 @@ private struct TerminalViewportHeightPreferenceKey: PreferenceKey {
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+private struct ResizeDivider: NSViewRepresentable {
+    let currentWidth: CGFloat
+    let minWidth: CGFloat
+    let maxWidth: CGFloat
+    let onWidthChanged: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> ResizeDividerView {
+        let view = ResizeDividerView()
+        view.minWidth = minWidth
+        view.maxWidth = maxWidth
+        view.onWidthChanged = onWidthChanged
+        return view
+    }
+
+    func updateNSView(_ nsView: ResizeDividerView, context: Context) {
+        nsView.minWidth = minWidth
+        nsView.maxWidth = maxWidth
+        nsView.onWidthChanged = onWidthChanged
+    }
+}
+
+private class ResizeDividerView: NSView {
+    var minWidth: CGFloat = 280
+    var maxWidth: CGFloat = 600
+    var onWidthChanged: ((CGFloat) -> Void)?
+
+    private var initialWidth: CGFloat = 0
+    private var initialMouseX: CGFloat = 0
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setupTrackingArea()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupTrackingArea()
+    }
+
+    private func setupTrackingArea() {
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.separatorColor.setFill()
+        NSRect(x: 0, y: 0, width: 1, height: bounds.height).fill()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        NSCursor.resizeLeftRight.push()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.pop()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let parentView = superview else { return }
+        initialWidth = parentView.bounds.width
+        initialMouseX = event.locationInWindow.x
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let currentMouseX = event.locationInWindow.x
+        let deltaX = currentMouseX - initialMouseX
+        let newWidth = max(minWidth, min(maxWidth, initialWidth - deltaX))
+
+        onWidthChanged?(newWidth)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // Finalize resize
     }
 }
