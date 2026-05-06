@@ -27,7 +27,8 @@ final class WorkersWorkspaceModel: ObservableObject {
         let launchSpec = TerminalLaunchSpec(
             fontSize: 10.0,
             workingDirectory: request.workspacePath,
-            initialInput: request.initialInput
+            initialInput: request.initialInput,
+            env: request.env
         )
         let session = TerminalPaneSession(
             id: "run-\(request.runId)",

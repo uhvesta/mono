@@ -25,6 +25,24 @@ struct TerminalLaunchSpec {
     let fontSize: Float32
     let workingDirectory: String
     let initialInput: String
+    /// Env vars to set on the spawned shell, layered over the app's
+    /// inherited env. The engine builds a strict allowlist for worker
+    /// spawns (sanitized PATH excluding `bossctl`, plus
+    /// `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID`); the Boss pane and
+    /// ad-hoc test panes pass an empty array and inherit the app's env.
+    let env: [(String, String)]
+
+    init(
+        fontSize: Float32,
+        workingDirectory: String,
+        initialInput: String,
+        env: [(String, String)] = []
+    ) {
+        self.fontSize = fontSize
+        self.workingDirectory = workingDirectory
+        self.initialInput = initialInput
+        self.env = env
+    }
 }
 
 struct ClaudeMonitorSnapshot {

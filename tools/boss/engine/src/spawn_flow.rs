@@ -31,6 +31,30 @@ use crate::protocol::{
 use crate::worker_registry::WorkerRegistry;
 use crate::worker_setup::{WorkerSetupInput, WrittenFiles, write_workspace_files};
 
+/// Sanitized PATH for worker panes. Excludes `~/bin` (where the
+/// `bossctl` symlink lives in this user's setup) and any other
+/// per-user bin dir, so a worker that tries to invoke `bossctl`
+/// directly fails with a PATH miss. Per `v2-design-risks.md` R3.
+///
+/// Order: Homebrew first (modern Apple-silicon paths), then the
+/// system bins. `/usr/local/bin` is included for legacy x86 brew
+/// installs but Apple-silicon machines ignore it.
+const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+
+/// Env keys allowed to flow from the runner's `extra_env` into the
+/// worker pane. Anything outside this set is dropped with a warning;
+/// the goal is to prevent ambient env (e.g., a stray
+/// `BOSS_CONTROL_SOCKET` left over from an interactive run, or
+/// arbitrary tokens carried from the user's shell) from reaching
+/// workers. Standard env (HOME, USER, SHELL, TERM, LANG, locale)
+/// inherits naturally from the app process and is not in this list
+/// because we never set it explicitly here.
+const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
+    "BOSS_TASK_ID",
+    "CUBE_LEASE_ID",
+    "CUBE_REPO",
+];
+
 #[derive(Debug, Clone)]
 pub struct StartWorkerInput {
     pub run_id: String,
@@ -97,9 +121,16 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     };
     let written = write_workspace_files(&setup).map_err(StartWorkerError::WriteFiles)?;
 
-    // 2. Build the SpawnWorkerPane request, including standard env
-    //    vars plus any caller-provided extras.
+    // 2. Build the SpawnWorkerPane request. Workers get a strict env
+    //    allowlist (per `v2-design-risks.md` R3): a sanitized PATH
+    //    (no `bossctl`), the engine-injected `BOSS_EVENTS_SOCKET` and
+    //    `BOSS_LEASE_ID`, and any caller-provided `extra_env` keys
+    //    that survive the allowlist filter. Anything else is dropped.
     let mut env = vec![
+        EnvVar {
+            key: "PATH".into(),
+            value: WORKER_SANITIZED_PATH.into(),
+        },
         EnvVar {
             key: "BOSS_EVENTS_SOCKET".into(),
             value: input.events_socket_path.display().to_string(),
@@ -110,7 +141,14 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         },
     ];
     for (k, v) in input.extra_env {
-        env.push(EnvVar { key: k, value: v });
+        if WORKER_EXTRA_ENV_ALLOWLIST.contains(&k.as_str()) {
+            env.push(EnvVar { key: k, value: v });
+        } else {
+            tracing::warn!(
+                key = %k,
+                "spawn_flow: dropping non-allowlisted env key from worker spawn",
+            );
+        }
     }
 
     let response = spawner
@@ -185,16 +223,18 @@ mod tests {
         registry: WorkerRegistry,
         spawn_calls: Arc<AtomicUsize>,
         canned_response: Result<EngineToAppResponse, SendToAppError>,
+        last_request: std::sync::Mutex<Option<EngineToAppRequest>>,
     }
 
     #[async_trait::async_trait]
     impl WorkerSpawner for StubSpawner {
         async fn send_to_app_request(
             &self,
-            _request: EngineToAppRequest,
+            request: EngineToAppRequest,
             _timeout: Duration,
         ) -> Result<EngineToAppResponse, SendToAppError> {
             self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_request.lock().unwrap() = Some(request);
             self.canned_response.clone().map_err(|e| match e {
                 SendToAppError::NotRegistered => SendToAppError::NotRegistered,
                 SendToAppError::AppDisconnected => SendToAppError::AppDisconnected,
@@ -205,6 +245,19 @@ mod tests {
 
         fn worker_registry(&self) -> &WorkerRegistry {
             &self.registry
+        }
+    }
+
+    impl StubSpawner {
+        fn last_spawn_env(&self) -> Vec<(String, String)> {
+            match self.last_request.lock().unwrap().clone() {
+                Some(EngineToAppRequest::SpawnWorkerPane(input)) => input
+                    .env
+                    .into_iter()
+                    .map(|EnvVar { key, value }| (key, value))
+                    .collect(),
+                _ => panic!("last request was not SpawnWorkerPane"),
+            }
         }
     }
 
@@ -227,6 +280,7 @@ mod tests {
         let spawner = StubSpawner {
             registry: registry.clone(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
             canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
                 result: Ok(SpawnWorkerPaneResult {
                     slot_id: 3,
@@ -253,6 +307,7 @@ mod tests {
         let spawner = StubSpawner {
             registry: registry.clone(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
             canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
                 result: Ok(SpawnWorkerPaneResult {
                     slot_id: 1,
@@ -276,6 +331,7 @@ mod tests {
         let spawner = StubSpawner {
             registry: registry.clone(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
             canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
                 result: Err(EngineToAppError::NoAvailableSlot),
             }),
@@ -298,6 +354,7 @@ mod tests {
         let spawner = StubSpawner {
             registry,
             spawn_calls: spawn_calls.clone(),
+            last_request: std::sync::Mutex::new(None),
             canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
                 result: Ok(SpawnWorkerPaneResult {
                     slot_id: 1,
@@ -316,5 +373,106 @@ mod tests {
         let result = start_worker(&spawner, input, StdDuration::from_secs(1)).await;
         assert!(matches!(result, Err(StartWorkerError::WriteFiles(_))));
         assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn ok_spawner_capturing() -> StubSpawner {
+        StubSpawner {
+            registry: WorkerRegistry::new(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
+                result: Ok(SpawnWorkerPaneResult {
+                    slot_id: 1,
+                    shell_pid: 1,
+                }),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn env_includes_sanitized_path_and_engine_keys() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await
+            .unwrap();
+
+        let env = spawner.last_spawn_env();
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .expect("PATH should always be set on worker spawn")
+            .1
+            .clone();
+        assert_eq!(path, WORKER_SANITIZED_PATH);
+        assert!(!path.contains("/Users/"), "sanitized PATH must not contain user bin dir");
+        assert!(!path.contains(".cargo"), "sanitized PATH must not contain cargo bin");
+
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "BOSS_EVENTS_SOCKET").map(|(_, v)| v.as_str()),
+            Some("/tmp/events.sock"),
+        );
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "BOSS_LEASE_ID").map(|(_, v)| v.as_str()),
+            Some("lease-test"),
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_env_allowlist_keeps_known_keys() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        let mut input = sample_input(&workspace);
+        input.extra_env = vec![
+            ("BOSS_TASK_ID".into(), "T-42".into()),
+            ("CUBE_LEASE_ID".into(), "lease-cube".into()),
+            ("CUBE_REPO".into(), "mono".into()),
+        ];
+
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        let env = spawner.last_spawn_env();
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "BOSS_TASK_ID").map(|(_, v)| v.as_str()),
+            Some("T-42"),
+        );
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "CUBE_LEASE_ID").map(|(_, v)| v.as_str()),
+            Some("lease-cube"),
+        );
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "CUBE_REPO").map(|(_, v)| v.as_str()),
+            Some("mono"),
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_env_drops_non_allowlisted_keys() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        let mut input = sample_input(&workspace);
+        // Mix of clearly-dangerous keys and a fake one to confirm
+        // both get filtered. `BOSS_CONTROL_SOCKET` is the canonical
+        // example: even if some upstream caller tried to set it, the
+        // worker must never see it.
+        input.extra_env = vec![
+            ("BOSS_CONTROL_SOCKET".into(), "/tmp/should-not-leak".into()),
+            ("AWS_SESSION_TOKEN".into(), "secret".into()),
+            ("RANDOM_KEY".into(), "v".into()),
+            ("BOSS_TASK_ID".into(), "T-keep".into()),
+        ];
+
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        let env = spawner.last_spawn_env();
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(!keys.contains(&"BOSS_CONTROL_SOCKET"));
+        assert!(!keys.contains(&"AWS_SESSION_TOKEN"));
+        assert!(!keys.contains(&"RANDOM_KEY"));
+        // Allowlisted key still made it through.
+        assert!(keys.contains(&"BOSS_TASK_ID"));
     }
 }

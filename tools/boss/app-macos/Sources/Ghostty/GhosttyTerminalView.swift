@@ -46,19 +46,40 @@ final class GhosttyTerminalHostView: NSView {
         wantsLayer = true
         layer?.backgroundColor = backgroundColor.cgColor
 
+        // Build env_vars: each `ghostty_env_var_s` holds borrowed C
+        // pointers, so we strdup every string and free them after
+        // ghostty_surface_new returns (ghostty copies during init).
+        var allocatedEnvStrings: [UnsafeMutablePointer<CChar>] = []
+        var envVars: [ghostty_env_var_s] = launchSpec.env.map { (key, value) in
+            let keyPtr = strdup(key)!
+            let valPtr = strdup(value)!
+            allocatedEnvStrings.append(keyPtr)
+            allocatedEnvStrings.append(valPtr)
+            return ghostty_env_var_s(key: keyPtr, value: valPtr)
+        }
+        defer {
+            for ptr in allocatedEnvStrings {
+                free(ptr)
+            }
+        }
+
         let surface = launchSpec.workingDirectory.withCString { workingDirectory in
             launchSpec.initialInput.withCString { initialInput in
-                var config = ghostty_surface_config_new()
-                config.platform_tag = GHOSTTY_PLATFORM_MACOS
-                config.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
-                    nsview: Unmanaged.passUnretained(self).toOpaque()
-                ))
-                config.userdata = Unmanaged.passUnretained(self).toOpaque()
-                config.scale_factor = Double(NSScreen.main?.backingScaleFactor ?? 2.0)
-                config.font_size = launchSpec.fontSize
-                config.working_directory = workingDirectory
-                config.initial_input = initialInput
-                return ghostty_surface_new(runtime.app, &config)
+                envVars.withUnsafeMutableBufferPointer { envBuf in
+                    var config = ghostty_surface_config_new()
+                    config.platform_tag = GHOSTTY_PLATFORM_MACOS
+                    config.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
+                        nsview: Unmanaged.passUnretained(self).toOpaque()
+                    ))
+                    config.userdata = Unmanaged.passUnretained(self).toOpaque()
+                    config.scale_factor = Double(NSScreen.main?.backingScaleFactor ?? 2.0)
+                    config.font_size = launchSpec.fontSize
+                    config.working_directory = workingDirectory
+                    config.initial_input = initialInput
+                    config.env_vars = envBuf.baseAddress
+                    config.env_var_count = envBuf.count
+                    return ghostty_surface_new(runtime.app, &config)
+                }
             }
         }
 
