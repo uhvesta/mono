@@ -10,8 +10,6 @@ struct PendingPermission: Identifiable {
 final class ChatViewModel: ObservableObject {
     @Published var navigationMode: NavigationMode = .agents
     @Published var agents: [Agent] = []
-    @Published var selectedAgentID: String?
-    @Published var draft: String = ""
     @Published var bossDraft: String = ""
     @Published var isConnected: Bool = false
     @Published var pendingPermission: PendingPermission?
@@ -31,11 +29,6 @@ final class ChatViewModel: ObservableObject {
     @Published var workErrorMessage: String?
     @Published var workSearchText: String = ""
     @Published var isBossPanelCollapsed: Bool = false
-
-    var selectedAgent: Agent? {
-        guard let id = selectedAgentID else { return nil }
-        return agents.first { $0.id == id }
-    }
 
     var bossAgent: Agent? {
         agents.first { $0.isBoss }
@@ -65,18 +58,6 @@ final class ChatViewModel: ObservableObject {
 
     var isBossAgentReady: Bool {
         bossAgent?.isReady ?? false
-    }
-
-    var selectedAgentTimeline: [TranscriptItem] {
-        selectedAgent?.timeline ?? []
-    }
-
-    var isSelectedAgentSending: Bool {
-        selectedAgent?.isSending ?? false
-    }
-
-    var isSelectedAgentReady: Bool {
-        selectedAgent?.isReady ?? false
     }
 
     var selectedProduct: WorkProduct? {
@@ -229,18 +210,6 @@ final class ChatViewModel: ObservableObject {
     func ensureBossAgent() {
         guard bossAgent == nil, !pendingBossCreation else { return }
         createAgent(name: AgentRole.boss.title, role: .boss)
-    }
-
-    func sendDraft() {
-        guard let agentId = selectedAgentID else { return }
-        guard isSelectedAgentReady else { return }
-        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        appendMessage(agentId: agentId, role: .user, text: trimmed)
-        mutateAgent(agentId) { $0.isSending = true; $0.activeAssistantMessageID = nil }
-        engine.sendPrompt(agentId: agentId, text: trimmed)
-        draft = ""
     }
 
     func sendBossDraft() {
@@ -680,9 +649,6 @@ final class ChatViewModel: ObservableObject {
                 bossBootstrapErrorsByAgentID[agent.id] = nil
             }
             upsertAgent(agent)
-            if selectedAgentID == nil {
-                selectedAgentID = preferredDefaultAgentID()
-            }
         case .agentReady(let agentId):
             mutateAgent(agentId) { $0.isReady = true }
             startBossBootstrapIfNeeded(agentId: agentId)
@@ -696,17 +662,11 @@ final class ChatViewModel: ObservableObject {
                 }
             }
             ensureBossAgent()
-            if selectedAgentID == nil {
-                selectedAgentID = preferredDefaultAgentID()
-            }
         case .agentRemoved(let agentId):
             agents.removeAll { $0.id == agentId }
             bootstrappingBossAgentIDs.remove(agentId)
             bootstrappedBossAgentIDs.remove(agentId)
             bossBootstrapErrorsByAgentID[agentId] = nil
-            if selectedAgentID == agentId {
-                selectedAgentID = preferredDefaultAgentID()
-            }
         case .chunk(let agentId, let text):
             guard !isBossBootstrapping(agentId: agentId) else { return }
             appendAssistantChunk(agentId: agentId, text: text)
@@ -819,10 +779,6 @@ final class ChatViewModel: ObservableObject {
         agents.firstIndex { $0.id == agentId }
     }
 
-    private func preferredDefaultAgentID() -> String? {
-        bossAgentID ?? agents.first?.id
-    }
-
     private func upsertAgent(_ agent: Agent) {
         if let index = agentIndex(agent.id) {
             let existing = agents[index]
@@ -846,9 +802,6 @@ final class ChatViewModel: ObservableObject {
         agents.removeAll { !incomingIDs.contains($0.id) }
         for agent in incoming {
             upsertAgent(agent)
-        }
-        if let selectedAgentID, !agents.contains(where: { $0.id == selectedAgentID }) {
-            self.selectedAgentID = nil
         }
     }
 
