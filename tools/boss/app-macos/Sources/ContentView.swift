@@ -899,10 +899,7 @@ private struct WorkBoardCardView: View {
             }
 
             if let prURL = task.prURL, !prURL.isEmpty {
-                Text(prURL)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                PRURLLink(urlString: prURL, font: .caption)
             }
         }
         .padding(12)
@@ -997,7 +994,7 @@ private struct WorkCardPopoverView: View {
                 if let ordinal = task.ordinal, !task.isChore {
                     metadataRow("Phase", value: "\(ordinal)")
                 }
-                metadataRow("PR", value: task.prURL ?? "Not set")
+                metadataPRRow(prURL: task.prURL)
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -1051,6 +1048,53 @@ private struct WorkCardPopoverView: View {
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.body)
+        }
+    }
+
+    @ViewBuilder
+    private func metadataPRRow(prURL: String?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("PR")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let prURL, !prURL.isEmpty {
+                PRURLLink(urlString: prURL, font: .body)
+            } else {
+                Text("Not set")
+                    .font(.body)
+            }
+        }
+    }
+}
+
+private struct PRURLLink: View {
+    let urlString: String
+    let font: Font
+
+    var body: some View {
+        if let url = URL(string: urlString), url.scheme != nil {
+            Link(destination: url) {
+                Text(urlString)
+                    .font(font)
+                    .foregroundStyle(Color.accentColor)
+                    .underline()
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .buttonStyle(.plain)
+            .help(urlString)
+            .onHover { hovering in
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+        } else {
+            Text(urlString)
+                .font(font)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
     }
 }
