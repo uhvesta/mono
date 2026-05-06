@@ -495,6 +495,15 @@ struct ContentView: View {
                         model.setBossPanelWidth(newWidth)
                     }
                 )
+                // Constrain to a narrow grab strip at the leading
+                // edge. Without this, SwiftUI's overlay fills the
+                // entire Boss pane bounds, the divider's tracking
+                // area covers the whole pane, the cursor stays
+                // resize-left-right everywhere, and mouse clicks
+                // intercept the libghostty surface so the Boss
+                // pane never gains keyboard focus. 6pt is wide
+                // enough to grab without being a visible band.
+                .frame(width: 6)
             } else {
                 Rectangle()
                     .fill(Color(nsColor: .separatorColor))
@@ -1856,38 +1865,23 @@ private class ResizeDividerView: NSView {
     private var initialWidth: CGFloat = 0
     private var initialMouseX: CGFloat = 0
 
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        setupTrackingArea()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setupTrackingArea()
-    }
-
-    private func setupTrackingArea() {
-        let trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea)
-    }
-
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        // Visible 1pt line at the leading edge; the rest of the
+        // (narrow) view bounds is the grab strip — cursor + drag
+        // hit area, but not painted.
         NSColor.separatorColor.setFill()
         NSRect(x: 0, y: 0, width: 1, height: bounds.height).fill()
     }
 
-    override func mouseEntered(with event: NSEvent) {
-        NSCursor.resizeLeftRight.push()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        NSCursor.pop()
+    /// AppKit calls this whenever cursor rects need to be reset.
+    /// Using `addCursorRect` instead of `NSCursor.push/pop` so the
+    /// system manages cursor swapping — no stale resize cursor
+    /// surviving a layout change or window-key transition (the
+    /// "cursor stuck after the agent finished" symptom).
+    override func resetCursorRects() {
+        discardCursorRects()
+        addCursorRect(bounds, cursor: .resizeLeftRight)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1902,9 +1896,5 @@ private class ResizeDividerView: NSView {
         let newWidth = max(minWidth, min(maxWidth, initialWidth - deltaX))
 
         onWidthChanged?(newWidth)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        // Finalize resize
     }
 }
