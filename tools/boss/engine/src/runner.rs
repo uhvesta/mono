@@ -260,35 +260,66 @@ impl PaneSpawnRunner {
     }
 
     fn boss_event_binary(&self) -> PathBuf {
-        if let Ok(override_path) = std::env::var("BOSS_EVENT_BIN") {
-            return override_path.into();
-        }
-        // Try to resolve relative to the engine binary so workers
-        // get an absolute path that survives the sanitized PATH
-        // (which excludes ~/bin and other ambient dirs). Fall back
-        // candidates in order:
-        //   - sibling: <engine_dir>/boss-event (cargo / hand-built layouts)
-        //   - bazel sibling: <engine_dir>/../event-shim/boss-event
-        //     (`bazel-out/.../bin/tools/boss/{engine,event-shim}/`)
-        // If none resolve, fall back to the bare name and let the
-        // worker's PATH find it (today this fails — explicit
-        // `BOSS_EVENT_BIN` is the recommended override for prod).
-        if let Ok(engine_path) = std::env::current_exe() {
-            if let Some(engine_dir) = engine_path.parent() {
-                let sibling = engine_dir.join("boss-event");
-                if sibling.exists() {
-                    return sibling;
-                }
-                if let Some(parent_dir) = engine_dir.parent() {
-                    let bazel_layout = parent_dir.join("event-shim").join("boss-event");
-                    if bazel_layout.exists() {
-                        return bazel_layout;
-                    }
-                }
-            }
-        }
-        PathBuf::from("boss-event")
+        let engine_path = std::env::current_exe().unwrap_or_default();
+        let workspace = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
+        let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
+        resolve_boss_event_binary(&engine_path, workspace.as_deref(), env_override.as_deref())
     }
+}
+
+/// Pure resolver for the absolute path of the `boss-event` shim
+/// that the worker pane invokes from `settings.json`. Pulled out
+/// as a free function so tests can pass synthetic `engine_path` /
+/// `workspace_dir` / env values without monkey-patching globals.
+///
+/// Resolution order:
+///   1. `BOSS_EVENT_BIN` env override (caller-controlled).
+///   2. Bazel runfiles next to the engine binary
+///      (`<engine_path>.runfiles/_main/tools/boss/event-shim/boss-event`).
+///      Requires the engine `rust_binary` to declare a `data` dep
+///      on `//tools/boss/event-shim:boss-event` — without it bazel
+///      doesn't include the shim in the engine's runfiles.
+///   3. Workspace `bazel-bin` symlink
+///      (`<workspace>/bazel-bin/tools/boss/event-shim/boss-event`)
+///      when `BUILD_WORKSPACE_DIRECTORY` is set (i.e., the engine
+///      was launched via `bazel run` from a checkout).
+///   4. Cargo / hand-built sibling: `<engine_dir>/boss-event`.
+///   5. Bare name `boss-event` — only useful if the worker's PATH
+///      happens to include it (today it doesn't, on purpose).
+pub(crate) fn resolve_boss_event_binary(
+    engine_path: &Path,
+    workspace_dir: Option<&Path>,
+    env_override: Option<&Path>,
+) -> PathBuf {
+    if let Some(override_path) = env_override {
+        return override_path.to_path_buf();
+    }
+
+    // Bazel constructs runfiles at `<binary>.runfiles/_main/<workspace_relative_path>`.
+    let mut runfiles_root = engine_path.as_os_str().to_owned();
+    runfiles_root.push(".runfiles");
+    let runfiles_candidate = PathBuf::from(runfiles_root)
+        .join("_main")
+        .join("tools/boss/event-shim/boss-event");
+    if runfiles_candidate.exists() {
+        return runfiles_candidate;
+    }
+
+    if let Some(workspace) = workspace_dir {
+        let candidate = workspace.join("bazel-bin/tools/boss/event-shim/boss-event");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    if let Some(engine_dir) = engine_path.parent() {
+        let sibling = engine_dir.join("boss-event");
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+
+    PathBuf::from("boss-event")
 }
 
 #[async_trait]
@@ -779,5 +810,72 @@ mod pane_spawn_tests {
         );
 
         unsafe { std::env::remove_var("BOSS_EVENT_BIN") };
+    }
+
+    /// `BOSS_EVENT_BIN` short-circuits everything else.
+    #[test]
+    fn resolve_boss_event_prefers_env_override() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+        let override_path = PathBuf::from("/opt/whatever/boss-event");
+        let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path));
+        assert_eq!(resolved, override_path);
+    }
+
+    /// When the engine binary has runfiles at the bazel-conventional
+    /// path, the resolver must pick that up — this is the production
+    /// path under `bazel run //tools/boss/engine:engine` once the
+    /// engine `rust_binary` has the `data` dep on
+    /// `//tools/boss/event-shim:boss-event`. The original #174 fix
+    /// only covered the BOSS_EVENT_BIN branch; this test covers the
+    /// branch that actually fires in real launches.
+    #[test]
+    fn resolve_boss_event_uses_runfiles_when_present() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        // Synthesize the bazel runfiles tree the data dep produces.
+        let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
+        std::fs::create_dir_all(&runfiles).unwrap();
+        let shim = runfiles.join("boss-event");
+        std::fs::write(&shim, b"").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, None, None);
+        assert_eq!(resolved, shim);
+    }
+
+    /// Workspace `bazel-bin` symlink path is the secondary candidate
+    /// — covers `bazel build` + non-`bazel run` scenarios where the
+    /// engine binary is invoked directly but `BUILD_WORKSPACE_DIRECTORY`
+    /// is set.
+    #[test]
+    fn resolve_boss_event_falls_back_to_workspace_bazel_bin() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        let workspace = dir.path().join("workspace");
+        let bazel_bin = workspace.join("bazel-bin/tools/boss/event-shim");
+        std::fs::create_dir_all(&bazel_bin).unwrap();
+        let shim = bazel_bin.join("boss-event");
+        std::fs::write(&shim, b"").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None);
+        assert_eq!(resolved, shim);
+    }
+
+    /// When nothing resolves we still return *something* so the
+    /// system fails loud (worker logs `command not found`) rather
+    /// than the engine crashing on path-construction. The bare
+    /// fallback is intentional — see the resolver's doc comment.
+    #[test]
+    fn resolve_boss_event_falls_back_to_bare_name_when_nothing_resolves() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+        let resolved = resolve_boss_event_binary(&engine, None, None);
+        assert_eq!(resolved, PathBuf::from("boss-event"));
     }
 }

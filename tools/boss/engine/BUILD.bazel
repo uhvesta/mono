@@ -37,6 +37,13 @@ rust_binary(
     name = "engine",
     srcs = ["src/main.rs"],
     edition = "2024",
+    # Ship the boss-event hook shim alongside the engine binary so
+    # PaneSpawnRunner can resolve it via runfiles at runtime. Without
+    # this dep, `bazel run //tools/boss/engine:engine` builds only
+    # the engine and worker `settings.json` ends up referencing
+    # `boss-event` as a bare name that isn't on the worker's
+    # sanitized PATH — every hook fires `command not found`.
+    data = ["//tools/boss/event-shim:boss-event"],
     deps = [
         ":engine_lib",
     ] + all_crate_deps(normal = True),
