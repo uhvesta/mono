@@ -46,14 +46,16 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 10    | Transcripts and hardening                      | ❌ schema columns only       |
 | 11    | Bazel `GhosttyKit` integration                 | ❌ not started — hard prereq for shipping the post-6f Bazel `.app` |
 
-The biggest remaining piece in Phase 6 is the engine→app pane RPC
-chain (6f-4..8): protocol wire types, engine-side dispatch, app-side
-pane allocator, ExecutionCoordinator wiring, and PoC chat-code
-cutover. Until those land, the engine ingests hook events but no
-worker is ever spawned by the coordinator. Phases 7 and 9 still
-effectively wait on Phase 6 closing. Phase 8 has the data model but
-none of the live PR / poller / triage logic. Phase 10 hardening is
-essentially untouched. **Phase 11** is a build-system gap exposed
+The remaining piece in Phase 6 is **6f-7** — wiring `PaneSpawnRunner`
+as the production `ExecutionRunner` in `ServerState::new_arc`. The
+spawn-flow helper (`spawn_flow::start_worker`), engine→app dispatch,
+and app-side pane allocator are all in main; what's missing is the
+coordinator routing run starts through them instead of the legacy
+`AcpExecutionRunner`. Until that lands, `boss task create` still
+routes via ACP and no claude pane gets spawned by the coordinator.
+Phases 7 and 9 still effectively wait on Phase 6 closing. Phase 8
+has the data model but none of the live PR / poller / triage logic.
+Phase 10 hardening is essentially untouched. **Phase 11** is a build-system gap exposed
 by Phase 6a: the SwiftPM build includes the libghostty-driven Agents
 grid, but the Bazel build (the documented `bazel run //tools/boss/
 app-macos:BossMacApp` production path) excludes `Sources/Ghostty/`
@@ -392,7 +394,7 @@ workers in libghostty panes, workers do work, events flow back.
   - 6e: CLAUDE.md / settings.json templating in `boss-engine`
     (PR #141).
   - 6g: transcript tail-watcher in `boss-engine` (PR #142).
-- First three Phase-5-dependent slices (6f-1..3) shipped:
+- Phase-5-dependent slices (6f-1..6 and 6f-8) shipped:
   - 6f-1: `WorkerRegistry` with `proc_pidinfo` ancestor walk
     (PR #146).
   - 6f-2: events socket annotates `IncomingHookEvent.run_id` via
@@ -401,36 +403,48 @@ workers in libghostty panes, workers do work, events flow back.
   - 6f-3: engine `serve()` binds the events socket and runs the
     accept loop on startup (PR #151, originally #148 — same
     re-cut reason).
+  - 6f-4: protocol additions for the engine→app pane RPC —
+    `RegisterAppSession`, `EngineRequest` event variant,
+    `EngineResponse` request variant, `EngineToAppRequest /
+    Response / Error` enums in `boss-protocol` (PR #152).
+  - 6f-5: engine-side dispatch — `ServerState::send_to_app`,
+    `register_app_session`, `deliver_app_response`, app-disconnect
+    cleanup, `app_pid` trust check (PR #157, originally #153 —
+    re-cut after 6f-4 base deleted).
+  - 6f-6: app-side pane allocator — `WorkersWorkspaceModel`
+    refactored to slot allocation, Swift `EngineClient` parses
+    `engine_request` / `app_session_registered`, `ChatViewModel`
+    sends `RegisterAppSession` on connect (PR #158, originally
+    #154 — re-cut).
+  - 6f-7 helper only: `engine/src/spawn_flow.rs` with
+    `start_worker` (PR #159, originally #155 — re-cut). The
+    helper landed but the production-runner replacement was
+    deferred — see "Pending" below.
+  - 6f-8: PoC chat-code cutover — `selectedAgentID`, `draft`,
+    `sendDraft`, the `selectedAgent*` accessors, and
+    `preferredDefaultAgentID` removed from `ChatViewModel`
+    (PR #160).
 - Engine→app pane RPC design landed in
   [`designs/engine-app-rpc`](../../designs/engine-app-rpc.md)
   (PR #149).
 
-**Pending.** The remaining 6f sub-slices wire the design's RPC
-chain end-to-end. Each is a self-contained PR.
+**Pending.** Only 6f-7 remains, plus the deferred shell-pid
+follow-up that 6f-6 left as a TODO.
 
-- **6f-4: protocol additions.** `RegisterAppSession` request,
-  `EngineRequest` event variant, `EngineResponse` request variant,
-  `EngineToAppRequest` / `EngineToAppResponse` enums in
-  `boss-protocol`. Wire types only; no engine or app implementation.
-- **6f-5: engine-side dispatch.** `ServerState` tracks the registered
-  app session, pushes `EngineRequest` events to it, awaits matching
-  `EngineResponse` requests with timeout. Pending-request map keyed
-  by request id; on app-disconnect, every pending sender resolves as
-  `AppDisconnected`.
-- **6f-6: app-side pane allocator.** Refactor
-  `WorkersWorkspaceModel` to support on-demand allocation (currently
-  pre-spawns 8). Wire `EngineRequest` handling. Implement shell-pid
-  lookup via `proc_listpids` (best-effort; brittleness softened by
-  the registry's ancestor walk).
-- **6f-7: spawn-flow wiring.** `ExecutionCoordinator` calls
-  `engine.spawn_worker_pane()` when a run starts; registers the
-  returned `shell_pid`; releases the pane on terminal state. This
-  is the end-to-end vertical slice that closes Phase 6's acceptance
-  criterion.
-- **6f-8: PoC chat-code cutover.** Remove the chat-style Agents UI
-  references in `app-macos`. Boss panel in Work mode keeps using
-  `ChatViewModel` for now — Phase 7 replaces it with a Boss
-  libghostty pane.
+- **6f-7: spawn-flow wiring (in review as PR #161).** Replace
+  `AcpExecutionRunner` with `PaneSpawnRunner` in
+  `ServerState::new_arc` so the coordinator routes run starts
+  through the engine→app pane RPC. Returns `WaitingHuman`
+  immediately on a successful spawn — the run record stays in
+  `waiting_human` until a follow-up flow concludes it. Real
+  completion (`Stop` hook → run completes, lease released) is
+  Phase 8 work alongside the events-socket sequencer.
+- **6f-6 follow-up: shell-pid via `proc_listpids`.** The Swift
+  pane allocator currently returns `shell_pid: 0`, which means
+  `WorkerRegistry` skips registration with a warning and hook
+  events from spawned panes don't correlate to runs. Unblocks
+  the visible spawn-into-pane (which is what 6f-7 needs); hook
+  correlation to live run state is the missing piece.
 
 **Done when (acceptance).**
 
