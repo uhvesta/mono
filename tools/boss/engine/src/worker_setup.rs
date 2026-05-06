@@ -1,7 +1,7 @@
 //! Per-lease worker config files written into a leased cube workspace
 //! before `claude` is spawned.
 //!
-//! The engine writes two files into `<workspace_path>/.claude/`:
+//! The engine writes three files into `<workspace_path>/.claude/`:
 //!
 //! - `CLAUDE.md` — a worker-facing system prompt that constrains the
 //!   claude session: jj-first VCS rules, do-not-touch-sibling-workspaces
@@ -11,6 +11,12 @@
 //!   (`SessionStart` … `SessionEnd`) to the `boss-event` shim binary, so
 //!   the engine's events socket sees a structured stream of worker
 //!   activity.
+//! - `.gitignore` — single-pattern (`*`) gitignore that hides every
+//!   per-worker file the engine drops in `.claude/` (including the
+//!   `initial-prompt.txt` written by the runner) from `jj status` /
+//!   `git status`. Without this, workers regularly snapshot the engine
+//!   plumbing into their PRs. The pattern is self-excluding, so the
+//!   `.gitignore` itself doesn't show up either.
 //!
 //! This module is just the renderers and a tiny `write_workspace_files()`
 //! helper. Call-sites in the worker spawn flow are wired separately.
@@ -70,6 +76,10 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
            -b <bookmark>` to publish.\n\
          - Never run `jj git push --deleted` or `git push --delete`\n\
            without explicit user approval.\n\
+         - `.claude/` is gitignored by the engine on every spawn. Do\n\
+           not force-track or commit anything inside it (no\n\
+           `--force`, no `jj file track .claude/...`) — those files\n\
+           are per-worker plumbing, not part of the project.\n\
          \n\
          ## Boundaries\n\
          \n\
@@ -139,22 +149,32 @@ fn shell_escape(value: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Write CLAUDE.md and settings.json under `<workspace>/.claude/`,
-/// creating the directory if needed. Caller is responsible for ensuring
-/// the workspace itself exists.
+/// Single-pattern gitignore body. `*` matches every entry in
+/// `.claude/` — including dotfiles and the `.gitignore` itself, since
+/// gitignore globs apply to leading-dot names. Both git and jj (with a
+/// git backend) honor this in-tree gitignore, so worker setup files
+/// stop appearing in `jj status` / `git status`.
+const CLAUDE_DIR_GITIGNORE: &str = "*\n";
+
+/// Write CLAUDE.md, settings.json, and a self-excluding `.gitignore`
+/// under `<workspace>/.claude/`, creating the directory if needed.
+/// Caller is responsible for ensuring the workspace itself exists.
 pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFiles> {
     let claude_dir = input.workspace_path.join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
 
     let claude_md_path = claude_dir.join("CLAUDE.md");
     let settings_path = claude_dir.join("settings.json");
+    let gitignore_path = claude_dir.join(".gitignore");
 
     std::fs::write(&claude_md_path, render_claude_md(input))?;
     std::fs::write(&settings_path, render_settings_json(input))?;
+    std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)?;
 
     Ok(WrittenFiles {
         claude_md_path,
         settings_path,
+        gitignore_path,
     })
 }
 
@@ -162,6 +182,7 @@ pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFile
 pub struct WrittenFiles {
     pub claude_md_path: PathBuf,
     pub settings_path: PathBuf,
+    pub gitignore_path: PathBuf,
 }
 
 /// Convenience: absolute path to the per-lease `.claude/` dir.
@@ -256,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn write_workspace_files_creates_claude_dir_and_writes_both_files() {
+    fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
         let dir = TempDir::new().unwrap();
         let input = WorkerSetupInput {
             lease_id: "test-lease".into(),
@@ -269,9 +290,14 @@ mod tests {
 
         assert!(written.claude_md_path.exists());
         assert!(written.settings_path.exists());
+        assert!(written.gitignore_path.exists());
         assert_eq!(
             written.claude_md_path,
             dir.path().join(".claude").join("CLAUDE.md")
+        );
+        assert_eq!(
+            written.gitignore_path,
+            dir.path().join(".claude").join(".gitignore")
         );
 
         let claude_md_contents = std::fs::read_to_string(&written.claude_md_path).unwrap();
@@ -280,6 +306,24 @@ mod tests {
         // settings.json must be valid JSON on disk.
         let settings_contents = std::fs::read_to_string(&written.settings_path).unwrap();
         let _: serde_json::Value = serde_json::from_str(&settings_contents).unwrap();
+
+        // The .gitignore must use the catch-all `*` pattern so every
+        // engine-injected file in `.claude/` (including dotfiles and
+        // `.gitignore` itself) is hidden from `jj status` / `git status`.
+        let gitignore_contents = std::fs::read_to_string(&written.gitignore_path).unwrap();
+        assert_eq!(gitignore_contents, "*\n");
+    }
+
+    #[test]
+    fn claude_md_warns_against_force_tracking_dot_claude() {
+        let input = sample_input();
+        let rendered = render_claude_md(&input);
+        // The CLAUDE.md must remind workers not to override the
+        // engine's gitignore — otherwise a worker that runs into a
+        // status surprise might `jj file track` the engine plumbing
+        // back into its PR, undoing the fix.
+        assert!(rendered.contains(".claude/"));
+        assert!(rendered.contains("force") || rendered.contains("track"));
     }
 
     #[test]

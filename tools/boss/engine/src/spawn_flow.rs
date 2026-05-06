@@ -305,6 +305,7 @@ mod tests {
         assert_eq!(started.shell_pid, 42_111);
         assert!(started.written_files.claude_md_path.exists());
         assert!(started.written_files.settings_path.exists());
+        assert!(started.written_files.gitignore_path.exists());
         assert_eq!(registry.lookup(42_111).as_deref(), Some("run-test"));
     }
 
