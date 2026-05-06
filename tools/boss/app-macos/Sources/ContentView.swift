@@ -9,6 +9,7 @@ private let workBossPanelDefaultExpandedWidth: CGFloat = 380
 private let workBossPanelMinWidth: CGFloat = 280
 private let workBossPanelMaxWidth: CGFloat = 600
 private let workBossPanelCollapsedWidth: CGFloat = 88
+private let workBossPanelDividerHitWidth: CGFloat = 12
 
 struct ContentView: View {
     @StateObject private var model = ChatViewModel()
@@ -495,15 +496,22 @@ struct ContentView: View {
                         model.setBossPanelWidth(newWidth)
                     }
                 )
-                // Constrain to a narrow grab strip at the leading
-                // edge. Without this, SwiftUI's overlay fills the
-                // entire Boss pane bounds, the divider's tracking
-                // area covers the whole pane, the cursor stays
-                // resize-left-right everywhere, and mouse clicks
-                // intercept the libghostty surface so the Boss
-                // pane never gains keyboard focus. 6pt is wide
-                // enough to grab without being a visible band.
-                .frame(width: 6)
+                // Constrain the overlay to a narrow grab strip at
+                // the leading edge of the Boss pane. Without this,
+                // SwiftUI's overlay fills the whole pane and the
+                // divider's tracking area covers everything: cursor
+                // stays resize-left-right everywhere and clicks
+                // intercept the libghostty surface so the Boss pane
+                // never gains keyboard focus.
+                //
+                // The strip can't extend left of the Boss pane's
+                // bounds — those clicks would land on the workMain
+                // sibling instead of bubbling down to this overlay
+                // (NSView hit testing is bounded by parent bounds).
+                // 12pt wide on the Boss-pane side gives a much
+                // easier-to-grip target than 6pt while still being
+                // a small fraction of the panel.
+                .frame(width: workBossPanelDividerHitWidth)
             } else {
                 Rectangle()
                     .fill(Color(nsColor: .separatorColor))
@@ -1846,6 +1854,7 @@ private struct ResizeDivider: NSViewRepresentable {
         let view = ResizeDividerView()
         view.minWidth = minWidth
         view.maxWidth = maxWidth
+        view.currentWidth = currentWidth
         view.onWidthChanged = onWidthChanged
         return view
     }
@@ -1853,6 +1862,7 @@ private struct ResizeDivider: NSViewRepresentable {
     func updateNSView(_ nsView: ResizeDividerView, context: Context) {
         nsView.minWidth = minWidth
         nsView.maxWidth = maxWidth
+        nsView.currentWidth = currentWidth
         nsView.onWidthChanged = onWidthChanged
     }
 }
@@ -1860,18 +1870,55 @@ private struct ResizeDivider: NSViewRepresentable {
 private class ResizeDividerView: NSView {
     var minWidth: CGFloat = 280
     var maxWidth: CGFloat = 600
+    /// The Boss panel's current width, mirrored from the SwiftUI
+    /// model. The drag math anchors on this at mouseDown — see the
+    /// note in `mouseDown`.
+    var currentWidth: CGFloat = 0
     var onWidthChanged: ((CGFloat) -> Void)?
 
-    private var initialWidth: CGFloat = 0
-    private var initialMouseX: CGFloat = 0
+    private var dragStartWidth: CGFloat = 0
+    private var dragStartMouseX: CGFloat = 0
+    private var isHovering = false
+    private var isDragging = false
+
+    /// X offset of the visible 1pt separator line within the view's
+    /// bounds. The strip is anchored at the Boss pane's leading edge,
+    /// so x = 0 is the boundary and the rest of the strip extends
+    /// into the Boss pane as an invisible grip area.
+    private let visibleLineX: CGFloat = 0
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        // Visible 1pt line at the leading edge; the rest of the
-        // (narrow) view bounds is the grab strip — cursor + drag
-        // hit area, but not painted.
+        // Visible 1pt separator line at the boundary between the
+        // worker grid and the Boss pane. The rest of the view bounds
+        // is invisible grab strip — cursor + drag hit area, but not
+        // painted.
+        let lineX = visibleLineX
         NSColor.separatorColor.setFill()
-        NSRect(x: 0, y: 0, width: 1, height: bounds.height).fill()
+        NSRect(x: lineX, y: 0, width: 1, height: bounds.height).fill()
+
+        // Hover/active feedback: thicken and tint the line so the
+        // user can see that the divider is grabbable / being dragged.
+        // Drawn slightly inside the strip so it stays within bounds.
+        if isDragging || isHovering {
+            let alpha: CGFloat = isDragging ? 0.85 : 0.45
+            NSColor.controlAccentColor.withAlphaComponent(alpha).setFill()
+            NSRect(x: lineX, y: 0, width: 2, height: bounds.height).fill()
+        }
     }
 
     /// AppKit calls this whenever cursor rects need to be reset.
@@ -1884,17 +1931,40 @@ private class ResizeDividerView: NSView {
         addCursorRect(bounds, cursor: .resizeLeftRight)
     }
 
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+        needsDisplay = true
+    }
+
     override func mouseDown(with event: NSEvent) {
-        guard let parentView = superview else { return }
-        initialWidth = parentView.bounds.width
-        initialMouseX = event.locationInWindow.x
+        // Anchor on the panel's width as reported by the SwiftUI model
+        // rather than `superview.bounds.width` — the superview here is
+        // the SwiftUI host of the (narrow) divider strip itself, not
+        // the Boss panel. Using its width as the anchor produces a
+        // tiny initial value (≈ the strip width) and clamps every
+        // drag straight to `minWidth`, which is exactly the bug this
+        // change fixes.
+        dragStartWidth = currentWidth
+        dragStartMouseX = event.locationInWindow.x
+        isDragging = true
+        needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
-        let currentMouseX = event.locationInWindow.x
-        let deltaX = currentMouseX - initialMouseX
-        let newWidth = max(minWidth, min(maxWidth, initialWidth - deltaX))
-
+        let deltaX = event.locationInWindow.x - dragStartMouseX
+        // The Boss panel sits on the trailing side of the window, so
+        // dragging the divider right (positive deltaX) shrinks it.
+        let newWidth = max(minWidth, min(maxWidth, dragStartWidth - deltaX))
         onWidthChanged?(newWidth)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        isDragging = false
+        needsDisplay = true
     }
 }
