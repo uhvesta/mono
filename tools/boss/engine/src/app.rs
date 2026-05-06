@@ -1078,6 +1078,19 @@ fn is_descendant_of_any(pid: libc::pid_t, trust_roots: &[libc::pid_t]) -> bool {
 }
 
 fn current_parent_pid() -> Option<libc::pid_t> {
+    // Explicit override wins. Necessary when the engine is launched
+    // through `bazel run`, which daemonizes its server: the engine
+    // binary's actual parent ends up being `bazel`, reparented to
+    // launchd, so `getppid()` and any ancestor walk both miss the
+    // real app entirely. The macOS app sets `BOSS_APP_PID` to its own
+    // pid before spawning the engine.
+    if let Ok(raw) = std::env::var("BOSS_APP_PID") {
+        if let Ok(parsed) = raw.parse::<libc::pid_t>() {
+            if parsed > 1 {
+                return Some(parsed);
+            }
+        }
+    }
     // SAFETY: getppid() has no preconditions; the returned pid is
     // valid for the lifetime of the parent process (and thereafter
     // returns 1 / launchd, which we treat as no-app-detected via the
@@ -2102,17 +2115,23 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::RegisterAppSession => {
-                // Subtree-match auth: when the engine is launched via a
-                // `bazel run` (or any wrapper) the engine's `getppid()`
-                // points at the wrapper, not the macOS app. The app is
-                // the wrapper's parent, i.e., an ancestor of the engine
-                // process. Accept any peer whose pid appears in the
-                // engine's own ancestor chain.
+                // Trust the peer if either:
+                //   (a) it matches the declared app pid exactly. The
+                //       engine reads `BOSS_APP_PID` at startup; the
+                //       macOS app sets this before spawning the engine
+                //       (necessary because `bazel run` daemonizes,
+                //       which severs the engine's process tree from
+                //       the app and breaks ancestor-walk auth).
+                //   (b) the peer pid appears in the engine's ancestor
+                //       chain (covers direct-launch scenarios like
+                //       `swift run` where no daemonizing wrapper
+                //       exists).
                 let engine_pid = std::process::id() as libc::pid_t;
                 let trust_ok = match (server_state.app_pid, peer_pid) {
                     (None, _) => true, // tests / no-trust-root mode
-                    (Some(_), Some(observed)) => {
-                        is_descendant_of_any(engine_pid, &[observed])
+                    (Some(expected), Some(observed)) => {
+                        observed == expected
+                            || is_descendant_of_any(engine_pid, &[observed])
                     }
                     (Some(_), None) => false,
                 };
@@ -2120,8 +2139,8 @@ async fn handle_frontend_connection(
                     tracing::warn!(
                         peer_pid = ?peer_pid,
                         engine_pid,
-                        expected_direct_parent = ?server_state.app_pid,
-                        "register_app_session rejected: peer pid not in engine ancestor chain",
+                        expected_app_pid = ?server_state.app_pid,
+                        "register_app_session rejected: peer pid neither matches BOSS_APP_PID nor is an engine ancestor",
                     );
                     send_response(
                         &sink,

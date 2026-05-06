@@ -69,7 +69,14 @@ final class EngineProcessController: @unchecked Sendable {
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         proc.arguments = ["-c", "nohup \(command) >/dev/null 2>&1 &"]
         proc.currentDirectoryURL = URL(fileURLWithPath: launchDirectory, isDirectory: true)
-        proc.environment = ProcessInfo.processInfo.environment
+        // Tell the engine the app's pid explicitly. `bazel run`
+        // daemonizes its server, which reparents the engine binary
+        // away from the app's process tree, so `getppid()` and any
+        // ancestor walk both miss the real app. The engine reads
+        // BOSS_APP_PID to set its trust root for `RegisterAppSession`.
+        var env = ProcessInfo.processInfo.environment
+        env["BOSS_APP_PID"] = String(getpid())
+        proc.environment = env
         proc.standardOutput = Pipe()
         proc.standardError = Pipe()
 
