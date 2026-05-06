@@ -3,6 +3,9 @@ version = 1
 [tools.boss]
 target = "//tools/boss/cli:boss"
 
+[tools.bossctl]
+target = "//tools/boss/bossctl:bossctl"
+
 [tools.checkleft]
 target = "//tools/checkleft:checkleft"
 

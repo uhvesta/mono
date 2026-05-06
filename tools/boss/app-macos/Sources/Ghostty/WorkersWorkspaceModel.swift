@@ -8,7 +8,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     @Published private(set) var slots: [WorkerSlot]
 
     init() {
-        self.runtime = GhosttyRuntime()
+        self.runtime = GhosttyRuntime.shared
         self.slots = (1...Self.workerSlotCount).map { slot in
             WorkerSlot(slotId: slot)
         }

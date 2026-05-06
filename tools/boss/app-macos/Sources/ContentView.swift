@@ -12,6 +12,7 @@ struct ContentView: View {
     @StateObject private var model = ChatViewModel()
     #if canImport(GhosttyKit)
     @StateObject private var workersWorkspace = WorkersWorkspaceModel()
+    @StateObject private var bossPane = BossPaneModel()
     #endif
 
     var body: some View {
@@ -488,19 +489,21 @@ struct ContentView: View {
                 Spacer(minLength: 0)
             } else {
                 Divider()
-                messageList(
-                    items: model.bossTimeline,
-                    emptyState: "Ask The Boss to coordinate work or create and update Boss work items."
-                )
-                composer(
-                    draft: $model.bossDraft,
-                    agentID: model.bossAgentID,
-                    isReady: model.isBossAgentReady,
-                    isSending: model.isBossAgentSending,
-                    autoFocus: false,
-                    focusTrigger: model.bossAgentID,
-                    onSend: model.sendBossDraft
-                )
+                #if canImport(GhosttyKit)
+                BossPaneTerminalView(boss: bossPane)
+                #else
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Boss pane requires GhosttyKit.")
+                        .font(.callout.weight(.medium))
+                    Text("Run `tools/boss/app-macos/scripts/bootstrap-ghosttykit.sh` and rebuild with SwiftPM.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                #endif
             }
         }
         .frame(width: isCollapsed ? workBossPanelCollapsedWidth : workBossPanelExpandedWidth)

@@ -57,11 +57,16 @@ enum GhosttyBootstrap {
 }
 
 final class GhosttyRuntime: @unchecked Sendable {
+    /// Singleton instance. libghostty's app handle (`ghostty_app_t`)
+    /// owns global state — multiple instances would race on input
+    /// dispatch and the wakeup callback. All callers share `shared`.
+    static let shared = GhosttyRuntime()
+
     private let config: ghostty_config_t
     private(set) var app: ghostty_app_t! = nil
     private var observers: [NSObjectProtocol] = []
 
-    init() {
+    private init() {
         GhosttyBootstrap.ensureInitialized()
 
         guard let config = ghostty_config_new() else {
