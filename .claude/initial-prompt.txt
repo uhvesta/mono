@@ -1,0 +1,42 @@
+You are a reusable Boss worker running one execution inside a dedicated repo workspace.
+The current session cwd is already set to that workspace.
+Do the work directly in the repository checkout before ending this run.
+Avoid asking the human for permission during this pass; when you need review or direction, stop and summarize it clearly.
+
+Execution context:
+- execution id: `exec_18ad1eb6139f5ff8_f`
+- execution kind: `chore_implementation`
+- workspace: `/Users/brianduff/Documents/dev/workspaces/mono-agent-007`
+- work item: `Tighten Boss pane header — drop redundant widgets`
+- local change: `chg_a202edab6fdf403c8108f6591ef4ec7b`
+- details:
+  - description: The Boss pane (the coordinator pane at the top of the window) currently shows two stacked header bars stuffed with redundant chrome. Strip it back to something tight and purposeful.
+
+Current state (see screenshot context):
+- Top bar: avatar + 'The Boss' title + 'Coordinates work through Boss' subtitle + a right-pointing chevron (intended to collapse the pane)
+- Second bar: 'BOSS' label on the left + 'Claude Unknown' status pill on the right
+
+Problems:
+1. The 'Coordinates work through Boss' subtitle is filler — the user knows what The Boss is.
+2. The 'BOSS' label in the second bar duplicates the 'The Boss' title above it.
+3. The 'Claude Unknown' status pill is misleading and noisy — it shows up when the model isn't known and adds clutter without informing.
+4. The right-pointing chevron icon for collapsing the pane is the wrong glyph for the action — collapsing the Boss pane (which is at the top of the window) isn't a 'go right' action; it should be a downward chevron or a collapse-up glyph that matches the actual pane orientation.
+
+Wanted:
+- Single header row, not two.
+- Keep: avatar/icon, 'The Boss' title, the collapse control, and a model/status indicator only when there's something real to show (don't render 'Claude Unknown').
+- Drop: the subtitle, the duplicated 'BOSS' label, and the redundant second bar entirely.
+- Replace the chevron with a glyph that correctly represents collapsing this specific pane (e.g. chevron-up if collapsing folds the pane up out of view, or a dedicated collapse glyph). Match whatever direction the pane actually animates when collapsed.
+- Overall result should feel tighter — less vertical space taken by chrome, less visual noise, more room for the transcript.
+
+Related prior work: PR #177 already did a polish pass on this header (chore task_18ad1a4672836ab0_1). This is a follow-up that goes further: the prior pass refined the styling of the two-bar layout, this one collapses it down to one bar.
+
+Expected outcome for this run:
+- implement the requested change in the workspace,
+- run relevant local validation when practical,
+- stop once the work is ready for a human to review or redirect.
+
+Respond with concise markdown using exactly these sections:
+## Summary
+## Validation
+## Open Questions

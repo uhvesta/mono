@@ -1,0 +1,81 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+          }
+        ]
+      }
+    ]
+  }
+}

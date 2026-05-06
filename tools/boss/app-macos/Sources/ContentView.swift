@@ -534,25 +534,25 @@ struct ContentView: View {
             .frame(width: 26, height: 26)
 
             if !isCollapsed {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(AgentRole.boss.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Text(bossStatusText)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-            }
+                Text(AgentRole.boss.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
 
-            Spacer(minLength: 0)
+                Spacer(minLength: 8)
+
+                #if canImport(GhosttyKit)
+                BossClaudeStatusPill(session: bossPane.session)
+                #endif
+            } else {
+                Spacer(minLength: 0)
+            }
 
             Button {
                 model.toggleBossPanelCollapsed()
             } label: {
-                Image(systemName: isCollapsed ? "chevron.left" : "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
+                Image(systemName: "sidebar.right")
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .frame(width: 22, height: 22)
                     .contentShape(Rectangle())
@@ -569,28 +569,6 @@ struct ContentView: View {
                 .fill(Color(nsColor: .separatorColor).opacity(0.6))
                 .frame(height: 0.5)
         }
-    }
-
-    private var bossStatusText: String {
-        if !model.isConnected {
-            return "Disconnected"
-        }
-        if model.bossAgent == nil {
-            return "Starting coordinator…"
-        }
-        if !model.isBossAgentReady {
-            return "Starting coordinator…"
-        }
-        if model.isBossAgentBootstrapping {
-            return "Loading Boss CLI reference…"
-        }
-        if model.bossBootstrapErrorMessage != nil {
-            return "Boss CLI reference failed to load"
-        }
-        if model.isBossAgentSending {
-            return "Coordinating…"
-        }
-        return "Coordinates work through Boss"
     }
 
     private func workBoard(product: WorkProduct) -> some View {
