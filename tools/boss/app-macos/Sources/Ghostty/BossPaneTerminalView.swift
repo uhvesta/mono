@@ -11,7 +11,6 @@ struct BossPaneTerminalView: View {
     var body: some View {
         VStack(spacing: 0) {
             statusRow
-            Divider()
             BossTerminalSurface(runtime: boss.runtime, session: boss.session)
                 .background(Color(nsColor: .black))
         }
@@ -20,25 +19,45 @@ struct BossPaneTerminalView: View {
     private var statusRow: some View {
         HStack(spacing: 8) {
             Text(boss.session.displayTitle)
-                .font(.caption.weight(.medium))
+                .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(0.4)
                 .lineLimit(1)
             Spacer(minLength: 0)
             statusPill(boss.session.claudeState.label, color: claudeStateColor)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor).opacity(0.6))
+                .frame(height: 0.5)
+        }
     }
 
     private func statusPill(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption2.weight(.medium))
-            .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(color.opacity(0.14))
-            .foregroundStyle(color)
-            .clipShape(Capsule())
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Text(text)
+                .font(.caption2.weight(.semibold))
+                .lineLimit(1)
+                .foregroundStyle(color)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(
+            Capsule()
+                .fill(color.opacity(0.12))
+        )
+        .overlay(
+            Capsule()
+                .stroke(color.opacity(0.22), lineWidth: 0.5)
+        )
     }
 
     private var claudeStateColor: Color {

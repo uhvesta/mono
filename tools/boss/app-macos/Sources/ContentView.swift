@@ -455,35 +455,7 @@ struct ContentView: View {
         let isCollapsed = model.isBossPanelCollapsed
 
         return VStack(spacing: 0) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: AgentRole.boss.systemImage)
-                    .foregroundStyle(.secondary)
-                    .font(.system(size: 16, weight: .medium))
-
-                if !isCollapsed {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(AgentRole.boss.title)
-                            .font(.headline)
-                        Text(bossStatusText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                Button {
-                    model.toggleBossPanelCollapsed()
-                } label: {
-                    Image(systemName: isCollapsed ? "chevron.left" : "chevron.right")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            bossAgentHeader(isCollapsed: isCollapsed)
 
             if isCollapsed {
                 Spacer(minLength: 0)
@@ -493,7 +465,6 @@ struct ContentView: View {
                     .rotationEffect(.degrees(-90))
                 Spacer(minLength: 0)
             } else {
-                Divider()
                 #if canImport(GhosttyKit)
                 BossPaneTerminalView(boss: bossPane)
                 #else
@@ -513,7 +484,7 @@ struct ContentView: View {
         }
         .frame(width: isCollapsed ? workBossPanelCollapsedWidth : model.bossPanelWidth)
         .frame(maxHeight: .infinity)
-        .background(Color(nsColor: .underPageBackgroundColor))
+        .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .leading) {
             if !isCollapsed {
                 ResizeDivider(
@@ -531,6 +502,56 @@ struct ContentView: View {
             }
         }
         .animation(.snappy(duration: 0.18), value: model.isBossPanelCollapsed)
+    }
+
+    @ViewBuilder
+    private func bossAgentHeader(isCollapsed: Bool) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.14))
+                Image(systemName: AgentRole.boss.systemImage)
+                    .foregroundStyle(Color.accentColor)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .frame(width: 26, height: 26)
+
+            if !isCollapsed {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(AgentRole.boss.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(bossStatusText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            Button {
+                model.toggleBossPanelCollapsed()
+            } label: {
+                Image(systemName: isCollapsed ? "chevron.left" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isCollapsed ? "Expand Boss panel" : "Collapse Boss panel")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor).opacity(0.6))
+                .frame(height: 0.5)
+        }
     }
 
     private var bossStatusText: String {
