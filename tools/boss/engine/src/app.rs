@@ -11,11 +11,12 @@ use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
+use crate::completion::{CommandPrDetector, PrDetector, WorkerCompletionHandler};
 use crate::config::RuntimeConfig;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::worker_registry::WorkerRegistry;
 use crate::coordinator::{
-    CommandCubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
+    CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
 use crate::protocol::{
     AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FrontendEvent,
@@ -228,6 +229,7 @@ struct ServerState {
     work_db: Arc<WorkDb>,
     agent_registry: Arc<AgentRegistry>,
     execution_coordinator: Arc<ExecutionCoordinator>,
+    completion_handler: Arc<WorkerCompletionHandler>,
     topic_broker: Arc<TopicBroker>,
     worker_registry: WorkerRegistry,
     next_session_id: AtomicU64,
@@ -328,6 +330,14 @@ impl ServerState {
             topic_broker: topic_broker.clone(),
             work_revision: work_revision.clone(),
         });
+        let cube_client: Arc<dyn CubeClient> = Arc::new(CommandCubeClient::new(cfg.clone()));
+        let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
+        let completion_handler = Arc::new(WorkerCompletionHandler::new(
+            work_db.clone(),
+            pr_detector,
+            cube_client.clone(),
+            publisher.clone(),
+        ));
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
         // pointer back via set_server_state once the Arc exists. The
@@ -341,7 +351,7 @@ impl ServerState {
             let execution_coordinator = Arc::new(ExecutionCoordinator::with_publisher(
                 work_db.clone(),
                 worker_pool,
-                Arc::new(CommandCubeClient::new(cfg.clone())),
+                cube_client,
                 runner_for_coordinator,
                 publisher,
             ));
@@ -350,6 +360,7 @@ impl ServerState {
                 work_db,
                 agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
                 execution_coordinator,
+                completion_handler,
                 topic_broker,
                 worker_registry: WorkerRegistry::new(),
                 next_session_id: AtomicU64::new(1),
@@ -1144,6 +1155,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 "events socket: hook event received",
                             );
                             dispatch_probe_on_stop(&server_state, &incoming).await;
+                            dispatch_completion_on_stop(&server_state, &incoming).await;
                         }
                         Err(err) => {
                             tracing::warn!(?err, "events socket: failed to handle connection");
@@ -1205,6 +1217,30 @@ async fn dispatch_probe_on_stop(
             server_state.queue_probe(run_id.to_owned(), text);
         }
     }
+}
+
+/// On `Stop` hook events, ask the completion handler whether the
+/// worker has produced a PR for its workspace branch. If so, the
+/// linked task/chore moves to `in_review`, the execution finalises,
+/// and the cube workspace is released. If not, an `awaiting_input`
+/// signal is published for the execution topic so the pane indicator
+/// can reflect that the worker is idle without losing the active
+/// kanban state. Runs after `dispatch_probe_on_stop` so probe
+/// injection (which keeps the worker working) wins over completion
+/// (which assumes the worker is idle).
+async fn dispatch_completion_on_stop(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::protocol::WorkerEvent;
+    let WorkerEvent::Stop { .. } = incoming.event else {
+        return;
+    };
+    let Some(run_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+    let outcome = server_state.completion_handler.on_stop(run_id).await;
+    tracing::debug!(run_id, ?outcome, "completion handler stop result");
 }
 
 async fn handle_frontend_connection(

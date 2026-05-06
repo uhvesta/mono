@@ -1078,6 +1078,123 @@ impl WorkDb {
         tx.commit()?;
         Ok(task_to_item(updated))
     }
+
+    /// Record that a worker produced a PR for `execution_id`. In a single
+    /// transaction:
+    ///   - the linked task/chore moves to `in_review` and gets `pr_url`
+    ///     populated (no-ops if it's already in a terminal state),
+    ///   - the execution transitions from `waiting_human` (or `running`)
+    ///     to `completed`, the cube workspace lease columns are
+    ///     cleared, `finished_at` is stamped,
+    ///   - the run summary is updated if a fresh summary is provided
+    ///     and the run hasn't already captured one.
+    ///
+    /// Returns `Ok(None)` if the execution has already been finalised
+    /// (terminal status), making this safe to call from a hook handler
+    /// that may fire repeatedly.
+    pub fn record_worker_pr_completion(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        result_summary: Option<&str>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        if execution_status_is_terminal(&execution.status) {
+            return Ok(None);
+        }
+        if !matches!(execution.status.as_str(), "running" | "waiting_human") {
+            bail!(
+                "execution {execution_id} cannot complete from worker PR signal in status `{}`",
+                execution.status
+            );
+        }
+
+        let original_lease_id = execution.cube_lease_id.clone();
+        let original_workspace_id = execution.cube_workspace_id.clone();
+
+        let work_item_id = execution.work_item_id.clone();
+        let task = query_task(&tx, &work_item_id)?
+            .with_context(|| format!("unknown task for execution: {work_item_id}"))?;
+        if task.deleted_at.is_some() {
+            bail!("cannot complete a deleted task: {work_item_id}");
+        }
+
+        let now = now_string();
+        let task_already_review =
+            task.status == "in_review" || task.status == "done" || task.status == "archived";
+        let new_status = if task_already_review {
+            task.status.clone()
+        } else {
+            "in_review".to_owned()
+        };
+        tx.execute(
+            "UPDATE tasks
+             SET status = ?2,
+                 pr_url = ?3,
+                 updated_at = ?4
+             WHERE id = ?1",
+            params![task.id, new_status, pr_url, now],
+        )?;
+
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'completed',
+                 cube_lease_id = NULL,
+                 cube_workspace_id = NULL,
+                 workspace_path = NULL,
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+
+        // Update the most-recent run for this execution: if a summary is
+        // provided and the run's existing summary is empty, capture it.
+        // The run is typically already `completed` because the
+        // PaneSpawnRunner records completion immediately on spawn.
+        if let Some(summary) = result_summary {
+            let trimmed = summary.trim();
+            if !trimmed.is_empty() {
+                tx.execute(
+                    "UPDATE work_runs
+                     SET result_summary = COALESCE(NULLIF(result_summary, ''), ?2)
+                     WHERE execution_id = ?1
+                       AND id = (
+                           SELECT id FROM work_runs
+                           WHERE execution_id = ?1
+                           ORDER BY created_at DESC, id DESC
+                           LIMIT 1
+                       )",
+                    params![execution_id, trimmed],
+                )?;
+            }
+        }
+
+        let updated_execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let updated_task = query_task(&tx, &work_item_id)?
+            .with_context(|| format!("unknown task: {work_item_id}"))?;
+        tx.commit()?;
+        Ok(Some(WorkerPrCompletion {
+            execution: updated_execution,
+            work_item: task_to_item(updated_task),
+            released_lease_id: original_lease_id,
+            released_workspace_id: original_workspace_id,
+        }))
+    }
+}
+
+/// Result of a successful [`WorkDb::record_worker_pr_completion`] call.
+/// Carries the cube lease/workspace ids that were attached to the
+/// execution so the caller can drive cube release out-of-band.
+#[derive(Debug, Clone)]
+pub struct WorkerPrCompletion {
+    pub execution: WorkExecution,
+    pub work_item: WorkItem,
+    pub released_lease_id: Option<String>,
+    pub released_workspace_id: Option<String>,
 }
 
 fn collect_rows<T>(
