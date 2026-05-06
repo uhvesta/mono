@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod coordinator;
 pub mod events_socket;
+pub mod pane_summary;
 pub mod protocol;
 pub mod runner;
 pub mod spawn_flow;

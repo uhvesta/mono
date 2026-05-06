@@ -334,7 +334,10 @@ impl ServerState {
         // runner needs to call into ServerState (send_to_app +
         // worker_registry) while ServerState owns the runner —
         // Arc::new_cyclic breaks the cycle.
-        let pane_runner = Arc::new(crate::runner::PaneSpawnRunner::new(cfg.clone()));
+        let pane_runner = Arc::new(crate::runner::PaneSpawnRunner::new(
+            cfg.clone(),
+            work_db.clone(),
+        ));
         let runner_for_coordinator = pane_runner.clone();
 
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
@@ -2658,6 +2661,7 @@ mod tests {
                     workspace_path: "/tmp".into(),
                     initial_input: "claude\n".into(),
                     env: vec![],
+                    summary: None,
                 }),
                 Duration::from_millis(50),
             )
@@ -2682,6 +2686,7 @@ mod tests {
                         workspace_path: "/tmp".into(),
                         initial_input: "claude\n".into(),
                         env: vec![],
+                        summary: None,
                     }),
                     Duration::from_secs(2),
                 )
@@ -2781,6 +2786,7 @@ mod tests {
                     workspace_path: "/tmp".into(),
                     initial_input: "claude\n".into(),
                     env: vec![],
+                    summary: None,
                 }),
                 Duration::from_millis(50),
             )
@@ -2805,6 +2811,7 @@ mod tests {
                         workspace_path: "/tmp".into(),
                         initial_input: "claude\n".into(),
                         env: vec![],
+                        summary: None,
                     }),
                     Duration::from_secs(5),
                 )

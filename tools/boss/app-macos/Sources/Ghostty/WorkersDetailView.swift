@@ -75,17 +75,7 @@ private struct WorkerSlotView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
-                if let runId = slot.runId {
-                    Text(runId)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                } else {
-                    Text("idle")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
+                slotSubtitle
             }
 
             Spacer(minLength: 0)
@@ -96,6 +86,34 @@ private struct WorkerSlotView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
+    }
+
+    /// Second line in the titlebar. Prefers the engine-supplied
+    /// human-readable summary; falls back to the run id when no
+    /// summary is available so we never lose traceability. Either
+    /// way we attach the run id as a hover tooltip — the summary is
+    /// purely visual and the full id is what every log/api/taxonomy
+    /// elsewhere uses.
+    @ViewBuilder
+    private var slotSubtitle: some View {
+        if let summary = slot.summary, !summary.isEmpty {
+            Text(summary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .help(slot.runId ?? "")
+        } else if let runId = slot.runId {
+            Text(runId)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .help(runId)
+        } else {
+            Text("idle")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+        }
     }
 
     private func statusPill(_ text: String, color: Color) -> some View {

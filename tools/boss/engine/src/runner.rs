@@ -9,8 +9,9 @@ use tokio::sync::Mutex;
 
 use crate::acp::{AcpClient, AcpEvent};
 use crate::config::RuntimeConfig;
+use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
-use crate::work::{Project, Task, WorkExecution, WorkItem};
+use crate::work::{Project, Task, WorkDb, WorkExecution, WorkItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {
@@ -233,6 +234,10 @@ impl ExecutionRunner for AcpExecutionRunner {
 /// events-socket consumer drives state transitions.
 pub struct PaneSpawnRunner {
     cfg: Arc<RuntimeConfig>,
+    /// Backing store for the pane-titlebar summary cache. Looked up
+    /// in `run_execution` to compute a 2–4 word label for the work
+    /// item before asking the app to spawn the pane.
+    work_db: Arc<WorkDb>,
     /// Set after construction via [`PaneSpawnRunner::set_server_state`].
     /// Stored as `Weak` to avoid the runner ↔ ServerState reference
     /// cycle. Resolved each call.
@@ -240,9 +245,10 @@ pub struct PaneSpawnRunner {
 }
 
 impl PaneSpawnRunner {
-    pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
+    pub fn new(cfg: Arc<RuntimeConfig>, work_db: Arc<WorkDb>) -> Self {
         Self {
             cfg,
+            work_db,
             server_state: std::sync::OnceLock::new(),
         }
     }
@@ -368,6 +374,20 @@ impl ExecutionRunner for PaneSpawnRunner {
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
         let initial_input = "claude \"$(cat .claude/initial-prompt.txt)\"\n".to_owned();
 
+        // Look up (or generate) a 2–4 word pane-titlebar summary for
+        // this work item. The full run id is still used for logs and
+        // every other identifier — this label is purely visual. We
+        // resolve the API key lazily and let the helper handle every
+        // failure mode (missing key, API error, cache miss) so a
+        // slow or unreachable Anthropic never blocks the spawn.
+        let api_key = self
+            .cfg
+            .agent()
+            .ok()
+            .and_then(|agent| agent.acp.anthropic_api_key.clone());
+        let title_summary =
+            pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await;
+
         let started = start_worker(
             spawner.as_ref(),
             StartWorkerInput {
@@ -378,6 +398,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 boss_event_path: self.boss_event_binary(),
                 initial_input,
                 extra_env: vec![],
+                title_summary,
             },
             StdDuration::from_secs(30),
         )
@@ -681,7 +702,8 @@ mod pane_spawn_tests {
             },
             None,
         ));
-        let runner = PaneSpawnRunner::new(cfg);
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let runner = PaneSpawnRunner::new(cfg, work_db);
         runner.set_server_state(weak);
 
         runner

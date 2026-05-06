@@ -819,6 +819,45 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Look up a cached pane-titlebar summary for a work item.
+    /// Returns `(summary, basis_hash)` so callers can compare the
+    /// stored basis against a freshly computed one to decide whether
+    /// the cache is still valid.
+    pub fn get_pane_summary(&self, work_item_id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT summary, basis_hash FROM pane_summaries WHERE work_item_id = ?1",
+                params![work_item_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Insert or replace the cached pane summary for a work item.
+    /// `basis_hash` should be derived from the inputs that, if
+    /// changed, invalidate the cached summary (typically a hash of
+    /// name + description).
+    pub fn set_pane_summary(
+        &self,
+        work_item_id: &str,
+        summary: &str,
+        basis_hash: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO pane_summaries (work_item_id, summary, basis_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(work_item_id) DO UPDATE SET
+                 summary = excluded.summary,
+                 basis_hash = excluded.basis_hash,
+                 created_at = excluded.created_at",
+            params![work_item_id, summary, basis_hash, now_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_chores(&self, product_id: &str) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
@@ -942,6 +981,13 @@ impl WorkDb {
 
             CREATE INDEX IF NOT EXISTS work_attention_items_execution_idx
                 ON work_attention_items(execution_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS pane_summaries (
+                work_item_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                basis_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             ",
         )?;
         migrate_work_executions_v3(&conn)?;

@@ -27,6 +27,15 @@ pub struct SpawnWorkerPaneInput {
     /// `"claude\n"` so the shell types `claude` and runs the worker.
     pub initial_input: String,
     pub env: Vec<EnvVar>,
+    /// Short 2–4 word human-readable summary of what the worker is
+    /// doing (e.g. `"Fix fencer scraper"`). Rendered in the pane
+    /// titlebar in place of the run id. The full run id is still
+    /// surfaced as a tooltip for traceability. Optional so the app
+    /// can fall back to displaying the run id if the engine couldn't
+    /// produce a summary (e.g., API key missing or generation
+    /// failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// App's reply when allocation succeeds.
@@ -131,8 +140,26 @@ mod tests {
                 key: "BOSS_LEASE_ID".into(),
                 value: "lease-uuid".into(),
             }],
+            summary: Some("Fix fencer scraper".into()),
         });
         let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn spawn_request_without_summary_round_trips_and_omits_field() {
+        let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
+            run_id: "run-1".into(),
+            workspace_path: "/tmp/ws".into(),
+            initial_input: "claude\n".into(),
+            env: vec![],
+            summary: None,
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        // None should not serialize a `summary: null`; it should be
+        // omitted so apps that predate the field continue to parse.
+        assert!(!json.contains("summary"));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }
