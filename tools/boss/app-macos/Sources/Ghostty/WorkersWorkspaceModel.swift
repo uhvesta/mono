@@ -59,6 +59,23 @@ final class WorkersWorkspaceModel: ObservableObject {
         slots[index].runId = nil
         return .success
     }
+
+    /// Write text into the slot's libghostty surface as if user-typed.
+    /// Used for probe injection (Stop-boundary text from the engine)
+    /// and `bossctl agents send`.
+    func sendToPane(slotId: Int, text: String) -> EngineSendResult {
+        guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
+            return .failure(.unknownSlot)
+        }
+        guard let session = slots[index].session else {
+            return .failure(.unknownSlot)
+        }
+        guard let host = session.hostView else {
+            return .failure(.internalFailure("pane has no live surface"))
+        }
+        host.writeText(text)
+        return .success
+    }
 }
 
 struct WorkerSlot: Identifiable, Equatable {

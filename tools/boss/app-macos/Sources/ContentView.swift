@@ -46,6 +46,9 @@ struct ContentView: View {
             model.paneReleaseHandler = { [workspace = workersWorkspace] slotId, killGrace in
                 workspace.releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
             }
+            model.paneSendHandler = { [workspace = workersWorkspace] slotId, text in
+                workspace.sendToPane(slotId: slotId, text: text)
+            }
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)

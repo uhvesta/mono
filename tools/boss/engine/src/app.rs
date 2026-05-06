@@ -241,6 +241,10 @@ struct ServerState {
     /// includes this pid as an ancestor is treated as the Boss tier
     /// for RPC authorization.
     boss_pid: StdMutex<Option<libc::pid_t>>,
+    /// Pending probe text per run, FIFO. The events-socket consumer
+    /// pops one entry per `Stop` hook event for the matching run and
+    /// dispatches it as `SendToPane` to the app.
+    pending_probes: StdMutex<HashMap<String, VecDeque<String>>>,
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
@@ -332,6 +336,7 @@ impl ServerState {
             work_revision,
             app_pid,
             boss_pid: StdMutex::new(None),
+            pending_probes: StdMutex::new(HashMap::new()),
             app_session: Arc::new(Mutex::new(None)),
         })
     }
@@ -427,6 +432,33 @@ impl ServerState {
 
     pub fn current_boss_pid(&self) -> Option<libc::pid_t> {
         *self.boss_pid.lock().expect("boss_pid mutex poisoned")
+    }
+
+    /// Push probe text onto the FIFO for `run_id`. Multiple probes for
+    /// the same run queue in order; the events-socket consumer pops
+    /// one per `Stop` hook event.
+    pub fn queue_probe(&self, run_id: String, text: String) {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .entry(run_id)
+            .or_default()
+            .push_back(text);
+    }
+
+    /// Pop the next pending probe for `run_id`, if any. Called from
+    /// the events-socket consumer when a `Stop` event arrives.
+    pub fn pop_pending_probe(&self, run_id: &str) -> Option<String> {
+        let mut guard = self
+            .pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned");
+        let queue = guard.get_mut(run_id)?;
+        let text = queue.pop_front();
+        if queue.is_empty() {
+            guard.remove(run_id);
+        }
+        text
     }
 
     /// Authorize a peer-pid against an RPC tier. Walks up the peer's
@@ -967,12 +999,12 @@ pub async fn serve(
     println!("boss-engine listening on {}", socket_path.display());
 
     if let Some(path) = events_socket_path {
-        let registry = server_state.worker_registry.clone();
         let events_listener = bind_events_socket(&path)
             .with_context(|| format!("failed to bind events socket {}", path.display()))?;
         tracing::info!(events_socket_path = %path.display(), "events socket is ready");
+        let server_state_for_events = server_state.clone();
         tokio::spawn(async move {
-            run_events_accept_loop(events_listener, registry).await;
+            run_events_accept_loop(events_listener, server_state_for_events).await;
         });
     }
 
@@ -1025,12 +1057,13 @@ fn current_parent_pid() -> Option<libc::pid_t> {
     if ppid <= 1 { None } else { Some(ppid) }
 }
 
-async fn run_events_accept_loop(listener: UnixListener, registry: WorkerRegistry) {
+async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<ServerState>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let registry = registry.clone();
+                let server_state = server_state.clone();
                 tokio::spawn(async move {
+                    let registry = server_state.worker_registry.clone();
                     match handle_connection(stream, &registry).await {
                         Ok(incoming) => {
                             tracing::info!(
@@ -1039,6 +1072,7 @@ async fn run_events_accept_loop(listener: UnixListener, registry: WorkerRegistry
                                 event = ?incoming.event,
                                 "events socket: hook event received",
                             );
+                            dispatch_probe_on_stop(&server_state, &incoming).await;
                         }
                         Err(err) => {
                             tracing::warn!(?err, "events socket: failed to handle connection");
@@ -1049,6 +1083,55 @@ async fn run_events_accept_loop(listener: UnixListener, registry: WorkerRegistry
             Err(err) => {
                 tracing::error!(?err, "events socket accept failed");
             }
+        }
+    }
+}
+
+/// On `Stop` hook events, pop a pending probe for the run (if any)
+/// and `SendToPane` the text to the worker's slot. The injection
+/// arrives at the pane just as the worker becomes idle, so claude
+/// treats it as the next user prompt.
+async fn dispatch_probe_on_stop(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::protocol::{EngineToAppRequest, SendToPaneInput, WorkerEvent};
+    let WorkerEvent::Stop { .. } = incoming.event else {
+        return;
+    };
+    let Some(run_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+    let Some(text) = server_state.pop_pending_probe(run_id) else {
+        return;
+    };
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        tracing::warn!(
+            run_id,
+            "probe ready but no slot mapping; dropping probe text",
+        );
+        return;
+    };
+    let request = EngineToAppRequest::SendToPane(SendToPaneInput {
+        slot_id,
+        text: text.clone(),
+    });
+    match server_state
+        .send_to_app(request, Duration::from_secs(5))
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(run_id, slot_id, "probe injected into pane");
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                run_id,
+                slot_id,
+                "probe injection failed; pushing text back onto queue",
+            );
+            // Push back on the front so the next Stop retries.
+            server_state.queue_probe(run_id.to_owned(), text);
         }
     }
 }
@@ -2057,6 +2140,34 @@ async fn handle_frontend_connection(
                 server_state
                     .deliver_app_response(&session_id, &response_request_id, response)
                     .await;
+            }
+            FrontendRequest::ProbeRun {
+                run_id,
+                text,
+            } => {
+                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        run_id = %run_id,
+                        "probe_run rejected: caller not in Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "probe_run is BossOnly".to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                server_state.queue_probe(run_id.clone(), text);
+                tracing::info!(run_id = %run_id, "probe queued");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::ProbeQueued { run_id },
+                );
             }
         }
     }

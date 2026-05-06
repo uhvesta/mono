@@ -55,12 +55,26 @@ pub struct ReleaseWorkerPaneInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseWorkerPaneResult {}
 
+/// Engine asks the app to write text into a worker pane's pty as if
+/// it were typed by the user. Used for probe-injection on `Stop`
+/// boundaries and for `bossctl agents send`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SendToPaneInput {
+    pub slot_id: u8,
+    pub text: String,
+}
+
+/// App's reply when text injection succeeds. Empty for now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SendToPaneResult {}
+
 /// What the engine is asking the app to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineToAppRequest {
     SpawnWorkerPane(SpawnWorkerPaneInput),
     ReleaseWorkerPane(ReleaseWorkerPaneInput),
+    SendToPane(SendToPaneInput),
 }
 
 /// App's reply, paired with the `request_id` from the originating
@@ -78,6 +92,9 @@ pub enum EngineToAppResponse {
     },
     ReleaseWorkerPane {
         result: Result<ReleaseWorkerPaneResult, EngineToAppError>,
+    },
+    SendToPane {
+        result: Result<SendToPaneResult, EngineToAppError>,
     },
 }
 

@@ -228,6 +228,16 @@ final class GhosttyTerminalHostView: NSView {
         session.statusMessage = "Initial size \(size.width)x\(size.height)"
     }
 
+    /// Write `text` to the surface as if it were typed by the user.
+    /// Used by engine→app `SendToPane` requests (probe injection,
+    /// `bossctl agents send`).
+    func writeText(_ text: String) {
+        guard let surface else { return }
+        text.withCString { ptr in
+            ghostty_surface_text(surface, ptr, UInt(strlen(ptr)))
+        }
+    }
+
     func setCellSize(_ size: ghostty_action_cell_size_s) {
         session.statusMessage = "Cell \(size.width)x\(size.height)"
     }

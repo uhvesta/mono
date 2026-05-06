@@ -521,6 +521,7 @@ final class ChatViewModel: ObservableObject {
 
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
     var paneReleaseHandler: ((Int, UInt32) -> EngineReleaseResult)?
+    var paneSendHandler: ((Int, String) -> EngineSendResult)?
 
     private func handle(_ event: EngineEvent) {
         switch event {
@@ -561,6 +562,16 @@ final class ChatViewModel: ObservableObject {
                     ))
                 }
                 engine.sendReleaseWorkerPaneResponse(requestId: requestId, result: result)
+            case .sendToPane(let slotId, let text):
+                let result: EngineSendResult
+                if let handler = paneSendHandler {
+                    result = handler(slotId, text)
+                } else {
+                    result = .failure(.internalFailure(
+                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
+                    ))
+                }
+                engine.sendSendToPaneResponse(requestId: requestId, result: result)
             }
         case .disconnected:
             isConnected = false

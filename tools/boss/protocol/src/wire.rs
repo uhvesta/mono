@@ -201,6 +201,15 @@ pub enum FrontendRequest {
         request_id: String,
         response: EngineToAppResponse,
     },
+    /// Boss-tier RPC: queue a probe prompt for `run_id`. The engine
+    /// holds the text until the next `Stop` hook event for that run,
+    /// then writes it into the worker's pty as if it were typed by
+    /// the user. Returns immediately with a `ProbeQueued` event;
+    /// observation of the worker's reply is via the transcript.
+    ProbeRun {
+        run_id: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +365,10 @@ pub enum FrontendEvent {
     AppSessionRegistered,
     /// Engine confirms the Boss session pid was registered.
     BossSessionRegistered,
+    /// Engine confirms a probe was queued for the given run.
+    ProbeQueued {
+        run_id: String,
+    },
     /// Engine asks the registered app session to perform a pane
     /// operation. The app must reply with a
     /// [`FrontendRequest::EngineResponse`] carrying the same

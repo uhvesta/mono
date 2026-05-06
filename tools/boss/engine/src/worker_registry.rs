@@ -25,7 +25,13 @@ const ANCESTOR_WALK_DEPTH: usize = 8;
 
 #[derive(Clone, Default)]
 pub struct WorkerRegistry {
-    inner: Arc<Mutex<HashMap<libc::pid_t, String>>>,
+    inner: Arc<Mutex<RegistryInner>>,
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    pid_to_run: HashMap<libc::pid_t, String>,
+    run_to_slot: HashMap<String, u8>,
 }
 
 impl WorkerRegistry {
@@ -36,19 +42,55 @@ impl WorkerRegistry {
     /// Record that pid is the worker process for run `run_id`. Called by
     /// the spawn flow once it has both the run id and the spawned pid.
     pub fn register(&self, pid: libc::pid_t, run_id: impl Into<String>) {
-        self.inner.lock().expect("registry poisoned").insert(pid, run_id.into());
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .pid_to_run
+            .insert(pid, run_id.into());
+    }
+
+    /// Record the libghostty slot id the engine asked the app to host
+    /// `run_id` in. The engine uses this to route follow-up
+    /// `SendToPane` requests by run id.
+    pub fn register_run_slot(&self, run_id: impl Into<String>, slot_id: u8) {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .run_to_slot
+            .insert(run_id.into(), slot_id);
+    }
+
+    /// Look up the slot id for `run_id`. Returns `None` if the run
+    /// has not been registered (or has been released).
+    pub fn slot_for_run(&self, run_id: &str) -> Option<u8> {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .run_to_slot
+            .get(run_id)
+            .copied()
     }
 
     /// Drop the entry for `pid`. Called when a run terminates and the
     /// worker process exits.
     pub fn unregister(&self, pid: libc::pid_t) -> Option<String> {
-        self.inner.lock().expect("registry poisoned").remove(&pid)
+        let mut inner = self.inner.lock().expect("registry poisoned");
+        let run_id = inner.pid_to_run.remove(&pid);
+        if let Some(rid) = run_id.as_deref() {
+            inner.run_to_slot.remove(rid);
+        }
+        run_id
     }
 
     /// Direct pid lookup — no ancestor walk. Returns `None` if the pid
     /// is not a registered worker.
     pub fn lookup(&self, pid: libc::pid_t) -> Option<String> {
-        self.inner.lock().expect("registry poisoned").get(&pid).cloned()
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .pid_to_run
+            .get(&pid)
+            .cloned()
     }
 
     /// Walk up the process tree from `pid` until we find a registered
@@ -69,7 +111,11 @@ impl WorkerRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("registry poisoned").len()
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .pid_to_run
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {

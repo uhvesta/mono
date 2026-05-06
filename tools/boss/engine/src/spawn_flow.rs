@@ -130,14 +130,20 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             Ok(value) => value,
             Err(err) => return Err(StartWorkerError::AppError(err)),
         },
-        EngineToAppResponse::ReleaseWorkerPane { .. } => {
+        EngineToAppResponse::ReleaseWorkerPane { .. }
+        | EngineToAppResponse::SendToPane { .. } => {
             return Err(StartWorkerError::ResponseKindMismatch);
         }
     };
 
     // 3. Register the shell pid against the run id so the events
     //    socket can correlate hook events from descendants of the
-    //    spawned shell back to this run.
+    //    spawned shell back to this run, and remember the slot id so
+    //    follow-up `SendToPane` requests (e.g., probe injection) can
+    //    route by run id.
+    spawner
+        .worker_registry()
+        .register_run_slot(input.run_id.clone(), slot_id);
     if shell_pid > 0 {
         spawner.worker_registry().register(shell_pid, input.run_id);
     } else {

@@ -28,9 +28,20 @@ enum EngineReleaseResult: Sendable {
     case failure(EngineReleaseError)
 }
 
+enum EngineSendError: Sendable {
+    case unknownSlot
+    case internalFailure(String)
+}
+
+enum EngineSendResult: Sendable {
+    case success
+    case failure(EngineSendError)
+}
+
 enum EngineRequestKind: Sendable {
     case spawnWorkerPane(EngineSpawnRequest)
     case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
+    case sendToPane(slotId: Int, text: String)
 }
 
 enum EngineEvent {
@@ -297,6 +308,24 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendSendToPaneResponse(requestId: String, result: EngineSendResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success:
+            resultPayload = ["Ok": [String: Any]()]
+        case .failure(let error):
+            resultPayload = ["Err": sendEngineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "send_to_pane",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
     private func engineToAppErrorPayload(_ error: EngineSpawnError) -> [String: Any] {
         switch error {
         case .noAvailableSlot:
@@ -307,6 +336,15 @@ final class EngineClient: @unchecked Sendable {
     }
 
     private func releaseEngineToAppErrorPayload(_ error: EngineReleaseError) -> [String: Any] {
+        switch error {
+        case .unknownSlot:
+            return ["kind": "unknown_slot"]
+        case .internalFailure(let message):
+            return ["kind": "internal", "message": message]
+        }
+    }
+
+    private func sendEngineToAppErrorPayload(_ error: EngineSendError) -> [String: Any] {
         switch error {
         case .unknownSlot:
             return ["kind": "unknown_slot"]
@@ -538,6 +576,13 @@ final class EngineClient: @unchecked Sendable {
                     emit(.engineRequest(
                         requestId: requestId,
                         request: .releaseWorkerPane(slotId: slotId, killGraceSeconds: killGrace)
+                    ))
+                case "send_to_pane":
+                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
+                    let text = request["text"] as? String ?? ""
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .sendToPane(slotId: slotId, text: text)
                     ))
                 default:
                     emit(.error(agentId: nil, message: "engine_request unknown kind: \(kind)"))
