@@ -1560,6 +1560,75 @@ mod tests {
         assert_eq!(last_status.as_deref(), Some("waiting_human"));
     }
 
+    /// When `start_execution_run` auto-advances `tasks.status` to
+    /// `'active'`, the coordinator must also publish a work-tree
+    /// invalidation so kanban subscribers re-fetch the board. Without
+    /// this, the DB has the right value but the GUI never refreshes
+    /// — the bug surfaced manually that this test exists to prevent.
+    #[tokio::test]
+    async fn coordinator_publishes_work_item_changed_on_execution_start() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let coordinator = Arc::new(ExecutionCoordinator::with_publisher(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+            publisher.clone(),
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        // Work-item invalidation should have fired with the chore's
+        // product id and the chore's work-item id. Reason wording
+        // isn't load-bearing but we assert it's there to confirm the
+        // call site is the auto-advance one and not some unrelated
+        // future broadcast.
+        let work_item_events = publisher.work_item_events.lock().await;
+        assert!(
+            work_item_events.iter().any(|(product_id, work_item_id, reason)| {
+                product_id == &product.id
+                    && work_item_id == &chore.id
+                    && reason == "execution_started_auto_advance"
+            }),
+            "expected execution_started_auto_advance event for chore {} on product {}, got: {:?}",
+            chore.id,
+            product.id,
+            *work_item_events,
+        );
+
+        // And the DB-level auto-advance itself: the chore status must
+        // have flipped from `todo` to `active` when the execution
+        // started running.
+        let advanced = db.get_work_item(&chore.id).unwrap();
+        match advanced {
+            WorkItem::Chore(t) | WorkItem::Task(t) => {
+                assert_eq!(t.status, "active", "chore should auto-advance to active");
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn scheduler_respects_worker_pool_capacity() {
         let dir = tempdir().unwrap();
