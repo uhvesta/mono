@@ -317,6 +317,10 @@ struct ServerState {
     agent_registry: Arc<AgentRegistry>,
     execution_coordinator: Arc<ExecutionCoordinator>,
     completion_handler: Arc<WorkerCompletionHandler>,
+    /// Direct handle to the cube client, used by control verbs that
+    /// don't otherwise go through the execution coordinator (e.g.
+    /// `WorkspacePoolSummary`).
+    cube_client: Arc<dyn CubeClient>,
     topic_broker: Arc<TopicBroker>,
     worker_registry: WorkerRegistry,
     /// Live runtime state per allocated worker slot. Updated as hook
@@ -453,6 +457,7 @@ impl ServerState {
             work_db.clone(),
         ));
         let runner_for_coordinator = pane_runner.clone();
+        let cube_client_for_state = cube_client.clone();
 
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let execution_coordinator = Arc::new(ExecutionCoordinator::with_publisher(
@@ -468,6 +473,7 @@ impl ServerState {
                 agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
                 execution_coordinator,
                 completion_handler,
+                cube_client: cube_client_for_state,
                 topic_broker,
                 worker_registry: WorkerRegistry::new(),
                 live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
@@ -690,6 +696,19 @@ impl ServerState {
     /// Returns `true` when `tier == User`, when the trust root is
     /// `None` (test mode), or when an ancestor of `peer_pid` matches
     /// a relevant trust root.
+    ///
+    /// `BossOnly` semantics: the design names the registered Boss
+    /// session's shell pid as the canonical trust root. When that pid
+    /// is missing (the macOS app hasn't yet sent
+    /// `RegisterBossSession`, or runs that don't set up a Boss pane
+    /// at all), we fall back to "descendant of the app, not a
+    /// descendant of any registered worker shell". Workers each run
+    /// in their own libghostty pane whose shell pid is recorded in
+    /// `WorkerRegistry`; a `bossctl` invoked from inside a worker
+    /// pane therefore descends from a registered worker pid, while
+    /// the same call from the Boss pane (or directly under the app
+    /// shell) does not. That distinction is enough to keep workers
+    /// out of `BossOnly` even with an unregistered Boss pid.
     pub fn authorize_rpc(&self, tier: RpcTier, peer_pid: Option<libc::pid_t>) -> bool {
         if matches!(tier, RpcTier::User) {
             return true;
@@ -704,15 +723,37 @@ impl ServerState {
         let Some(peer_pid) = peer_pid else {
             return false;
         };
-        let trust_set: Vec<libc::pid_t> = match tier {
-            RpcTier::User => return true,
-            RpcTier::AppOrBoss => [app_pid, boss_pid].into_iter().flatten().collect(),
-            RpcTier::BossOnly => boss_pid.into_iter().collect(),
-        };
-        if trust_set.is_empty() {
-            return false;
+        match tier {
+            RpcTier::User => true,
+            RpcTier::AppOrBoss => {
+                let trust_set: Vec<libc::pid_t> =
+                    [app_pid, boss_pid].into_iter().flatten().collect();
+                if trust_set.is_empty() {
+                    return false;
+                }
+                is_descendant_of_any(peer_pid, &trust_set)
+            }
+            RpcTier::BossOnly => {
+                if let Some(boss_pid) = boss_pid {
+                    return is_descendant_of_any(peer_pid, &[boss_pid]);
+                }
+                // No Boss pid registered. Trust descendants of the
+                // app, but reject anyone descending from a registered
+                // worker pane shell — those are workers, not the
+                // Boss session.
+                let Some(app_pid) = app_pid else {
+                    return false;
+                };
+                if !is_descendant_of_any(peer_pid, &[app_pid]) {
+                    return false;
+                }
+                let worker_pids = self.worker_registry.registered_pids();
+                if worker_pids.is_empty() {
+                    return true;
+                }
+                !is_descendant_of_any(peer_pid, &worker_pids)
+            }
         }
-        is_descendant_of_any(peer_pid, &trust_set)
     }
 
     /// Route an `EngineResponse` from the app back to the waiting
@@ -2597,6 +2638,210 @@ async fn handle_frontend_connection(
                     FrontendEvent::WorkerLiveStatesList { states },
                 );
             }
+            FrontendRequest::CancelExecution { execution_id } => {
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        execution_id = %execution_id,
+                        "cancel_execution rejected: caller not in app/Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "cancel_execution requires app or Boss authority"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                match server_state.work_db.cancel_execution(&execution_id) {
+                    Ok(execution) => {
+                        tracing::info!(
+                            execution_id = %execution_id,
+                            "cancel_execution: marked cancelled",
+                        );
+                        // Pane releases are keyed by run_id (the slot
+                        // registry's key), not by execution_id — so
+                        // walk the execution's still-active runs and
+                        // release each. Idempotent on the registry side.
+                        let active_runs = server_state
+                            .work_db
+                            .active_run_ids_for_execution(&execution_id)
+                            .unwrap_or_default();
+                        let handler = server_state.completion_handler.clone();
+                        let exec_for_release = execution_id.clone();
+                        tokio::spawn(async move {
+                            for run_id in active_runs {
+                                handler.force_release(&run_id).await;
+                            }
+                            // Final pass keyed by execution_id so the
+                            // cube workspace lease (which is recorded
+                            // on the execution row) is released even
+                            // when the execution had no active run.
+                            handler.force_release(&exec_for_release).await;
+                        });
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ExecutionCancelled { execution },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::TailRunTranscript { run_id, lines } => {
+                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        run_id = %run_id,
+                        "tail_run_transcript rejected: caller not in Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "tail_run_transcript is BossOnly".to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                match server_state.work_db.get_run(&run_id) {
+                    Ok(run) => {
+                        let Some(transcript_path) = run.transcript_path.clone() else {
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: format!(
+                                        "run {run_id} has no transcript path recorded"
+                                    ),
+                                },
+                            );
+                            continue;
+                        };
+                        match read_transcript_tail(&transcript_path, lines).await {
+                            Ok((lines_out, truncated)) => {
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::RunTranscriptTail {
+                                        run_id,
+                                        transcript_path,
+                                        lines: lines_out,
+                                        truncated,
+                                    },
+                                );
+                            }
+                            Err(err) => {
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::WorkError {
+                                        message: format!(
+                                            "transcript read failed for {transcript_path}: {err}"
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::WorkspacePoolSummary => {
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        "workspace_pool_summary rejected: caller not in app/Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "workspace_pool_summary requires app or Boss authority"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                match server_state.cube_client.list_workspaces().await {
+                    Ok(rows) => {
+                        // Annotate each entry with the engine's view: which
+                        // execution row (if any) currently records this
+                        // workspace's lease. Drift (cube reports a lease the
+                        // engine has no execution for) shows as `None`.
+                        let lease_to_execution = match server_state
+                            .work_db
+                            .lease_to_execution_map()
+                        {
+                            Ok(map) => map,
+                            Err(err) => {
+                                tracing::warn!(
+                                    ?err,
+                                    "workspace_pool_summary: lease lookup failed; emitting cube view only",
+                                );
+                                std::collections::HashMap::new()
+                            }
+                        };
+                        let workspaces = rows
+                            .into_iter()
+                            .map(|w| {
+                                let execution_id = w
+                                    .lease_id
+                                    .as_ref()
+                                    .and_then(|lease_id| {
+                                        lease_to_execution.get(lease_id).cloned()
+                                    });
+                                crate::protocol::WorkspacePoolEntry {
+                                    workspace_id: w.workspace_id,
+                                    workspace_path: w.workspace_path.display().to_string(),
+                                    state: w.state,
+                                    lease_id: w.lease_id,
+                                    holder: w.holder,
+                                    task: w.task,
+                                    leased_at_epoch_s: w.leased_at_epoch_s,
+                                    lease_expires_at_epoch_s: w.lease_expires_at_epoch_s,
+                                    execution_id,
+                                }
+                            })
+                            .collect();
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkspacePoolSummaryResult { workspaces },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("cube workspace list failed: {err}"),
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2746,6 +2991,35 @@ fn terminal_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Option<String>
             None
         }
     }
+}
+
+/// Read the trailing `lines` lines of `transcript_path`. Returns the
+/// raw line contents (no trailing newline) plus a flag indicating
+/// whether the file held more lines than were returned.
+///
+/// The transcript file is expected to be JSONL the worker writes
+/// incrementally; this helper does not parse it, so the caller can
+/// decide how to render. A missing file is reported as an io error
+/// instead of returning an empty result so callers can distinguish
+/// "no transcript yet" from "transcript is empty".
+async fn read_transcript_tail(
+    transcript_path: &str,
+    lines: usize,
+) -> std::io::Result<(Vec<String>, bool)> {
+    let contents = tokio::fs::read_to_string(transcript_path).await?;
+    let split_lines: Vec<&str> = contents.lines().collect();
+    if lines == 0 {
+        return Ok((Vec::new(), !split_lines.is_empty()));
+    }
+    let total = split_lines.len();
+    let take = lines.min(total);
+    let truncated = total > take;
+    let tail = split_lines
+        .into_iter()
+        .skip(total - take)
+        .map(str::to_owned)
+        .collect();
+    Ok((tail, truncated))
 }
 
 async fn run_prompt(acp: &AcpClient, session_id: &str, prompt: &str) -> Result<()> {
@@ -3317,5 +3591,76 @@ mod tests {
         assert_eq!(server_state.current_boss_pid(), Some(98765));
         server_state.set_boss_pid(11111);
         assert_eq!(server_state.current_boss_pid(), Some(11111));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn server_state_with_app_pid(app_pid: libc::pid_t) -> Arc<ServerState> {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: temp.path().to_path_buf(),
+                db_path: temp.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        std::mem::forget(temp);
+        ServerState::new_arc_with_app_pid(cfg, Some(app_pid)).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn boss_only_admits_app_descendant_when_boss_pid_unregistered() {
+        // Repro for the production bug: macOS app hadn't registered the
+        // Boss session pid, so `RpcTier::BossOnly` saw `boss_pid =
+        // None`, built an empty trust set, and rejected every caller.
+        // The fix: fall back to "descendant of app, not descendant of
+        // any registered worker" when boss_pid is unset. The test pid
+        // is its own descendant; with app_pid set to it the BossOnly
+        // gate must let us through.
+        let self_pid = std::process::id() as libc::pid_t;
+        let server_state = server_state_with_app_pid(self_pid);
+        assert_eq!(server_state.current_boss_pid(), None);
+        assert!(
+            server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
+            "BossOnly must accept app-descendant callers when boss_pid is unregistered",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn boss_only_rejects_worker_descendant_when_boss_pid_unregistered() {
+        // Even with the boss_pid-missing fallback, anything descending
+        // from a registered worker pane must still be rejected as
+        // BossOnly — workers are siblings under the app and must not
+        // pass live-control checks.
+        let self_pid = std::process::id() as libc::pid_t;
+        let server_state = server_state_with_app_pid(self_pid);
+        // Mark the test process itself as a "worker" by registering its
+        // pid in the WorkerRegistry. The auth check walks its own
+        // ancestor chain looking for any registered worker pid; the
+        // self-as-worker case hits on the first walk step.
+        server_state
+            .worker_registry
+            .register(self_pid, "fake-run".to_owned());
+        assert!(
+            !server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
+            "BossOnly must reject callers descending from a registered worker pid",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn boss_only_uses_boss_pid_when_registered() {
+        let self_pid = std::process::id() as libc::pid_t;
+        // Use a clearly bogus pid for app — the BossOnly path should
+        // never reach the app-fallback when boss_pid is set. Setting
+        // boss_pid to self_pid lets the boss-pid descendant check pass.
+        let server_state = server_state_with_app_pid(1);
+        server_state.set_boss_pid(self_pid);
+        assert!(
+            server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
+            "BossOnly must accept boss_pid descendants",
+        );
     }
 }

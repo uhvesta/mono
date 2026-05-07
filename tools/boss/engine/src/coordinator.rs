@@ -65,6 +65,10 @@ pub trait CubeClient: Send + Sync {
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()>;
+    /// Snapshot every workspace cube knows about. Returns one entry
+    /// per workspace, the same shape `workspace_status` returns for a
+    /// single workspace.
+    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>>;
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +266,44 @@ impl CubeClient for CommandCubeClient {
         }
         let _ = self.run_json(&args).await?;
         Ok(())
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+        #[derive(Deserialize)]
+        struct ListPayload {
+            workspaces: Vec<ListWorkspace>,
+        }
+
+        #[derive(Deserialize)]
+        struct ListWorkspace {
+            workspace_id: String,
+            workspace_path: PathBuf,
+            state: String,
+            lease_id: Option<String>,
+            holder: Option<String>,
+            task: Option<String>,
+            leased_at_epoch_s: Option<i64>,
+            lease_expires_at_epoch_s: Option<i64>,
+        }
+
+        let payload: ListPayload = serde_json::from_value(
+            self.run_json(&["--json", "workspace", "list"]).await?,
+        )
+        .context("failed to decode `cube workspace list` payload")?;
+        Ok(payload
+            .workspaces
+            .into_iter()
+            .map(|w| CubeWorkspaceStatus {
+                workspace_id: w.workspace_id,
+                workspace_path: w.workspace_path,
+                state: w.state,
+                lease_id: w.lease_id,
+                holder: w.holder,
+                task: w.task,
+                leased_at_epoch_s: w.leased_at_epoch_s,
+                lease_expires_at_epoch_s: w.lease_expires_at_epoch_s,
+            })
+            .collect())
     }
 }
 
@@ -1101,6 +1143,10 @@ mod tests {
                 .await
                 .push((lease_id.to_owned(), reason.map(str::to_owned)));
             Ok(())
+        }
+
+        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+            Ok(Vec::new())
         }
     }
 
