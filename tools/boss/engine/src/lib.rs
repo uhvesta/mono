@@ -3,6 +3,7 @@ pub mod app;
 pub mod cli;
 pub mod completion;
 pub mod config;
+pub mod conflict_diagnosis;
 pub mod coordinator;
 pub mod events_socket;
 pub mod live_worker_state;
