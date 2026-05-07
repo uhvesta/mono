@@ -738,6 +738,25 @@ impl ExecutionCoordinator {
         {
             Ok(lease) => lease,
             Err(err) => {
+                // Cube returns every lease failure (stale-recovery
+                // exhausted, repo missing, db lock, fs error,
+                // network, …) as a single anyhow chain whose
+                // message embeds the verbatim cube stderr. Log the
+                // full chain at error level *before*
+                // `record_start_failure` runs, so operators see
+                // exactly what cube said instead of just the bare
+                // anyhow string that lands on the work record.
+                // Stale-working-copy recovery itself is owned by
+                // cube (see cube PR #254); the engine treats every
+                // cube lease failure as final and does not retry.
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_repo_id = %repo.repo_id,
+                    error = format!("{err:#}"),
+                    "cube workspace lease failed; marking execution start as failed"
+                );
                 self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)?;
                 return Err(err);
             }
@@ -1628,6 +1647,186 @@ mod tests {
             Some("cube workspace lease failed")
         );
         assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+    }
+
+    /// Operators previously saw lease failures show up as a vague
+    /// "no slot available" because the engine swallowed the cube
+    /// stderr. The dispatcher now logs the full anyhow chain at
+    /// `tracing::error!` *before* `record_start_failure` writes its
+    /// own warn line, so the verbatim cube stderr lands in the
+    /// engine log. Stale-working-copy recovery is owned by cube
+    /// (cube PR #254); this test only pins the loud-logging
+    /// contract.
+    #[tokio::test]
+    async fn lease_failure_logs_cube_stderr_at_error_before_recording_failure() {
+        let buffer = log_capture::install();
+        let starting_offset = buffer.lock().len();
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease: true,
+            ..FakeCubeClient::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+
+        // Slice out only the bytes written after the test started so
+        // we don't trip over events emitted by other parallel tests
+        // sharing the same global subscriber.
+        let captured =
+            String::from_utf8_lossy(&buffer.lock()[starting_offset..]).to_string();
+        let our_lines: Vec<&str> = captured
+            .lines()
+            .filter(|line| line.contains(&execution_id))
+            .collect();
+        assert!(
+            !our_lines.is_empty(),
+            "expected captured log lines for execution {execution_id}, got nothing.\n\
+             Full slice was:\n{captured}"
+        );
+
+        let error_idx = our_lines
+            .iter()
+            .position(|line| {
+                line.contains("ERROR")
+                    && line.contains(
+                        "cube workspace lease failed; marking execution start as failed",
+                    )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a tracing::error! log for the cube lease failure;\n\
+                     captured lines for this execution were:\n{:#?}",
+                    our_lines
+                )
+            });
+        let error_line = our_lines[error_idx];
+        // The fake's lease error message *is* the simulated cube
+        // stderr; the engine must surface it verbatim rather than
+        // truncating or pattern-matching.
+        assert!(
+            error_line.contains("cube workspace lease failed"),
+            "error log line must include the cube stderr verbatim, got:\n{error_line}"
+        );
+
+        let warn_idx = our_lines
+            .iter()
+            .position(|line| {
+                line.contains("WARN") && line.contains("recorded execution start failure")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a tracing::warn! log from record_start_failure;\n\
+                     captured lines for this execution were:\n{:#?}",
+                    our_lines
+                )
+            });
+
+        assert!(
+            error_idx < warn_idx,
+            "error log must precede record_start_failure's warn log; \
+             got error at {error_idx}, warn at {warn_idx}.\n\
+             Captured lines:\n{:#?}",
+            our_lines
+        );
+    }
+
+    /// Shared per-process tracing capture used by tests that need
+    /// to assert on log output. We can't install a per-test
+    /// subscriber because cargo runs library tests in parallel
+    /// threads of the same process and `set_global_default`
+    /// rejects a second installer. Tests that opt in slice the
+    /// shared buffer by execution_id (which is unique per test) to
+    /// isolate their own events.
+    mod log_capture {
+        use std::io;
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        pub(super) struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl SharedBuffer {
+            pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+                self.0.lock().expect("shared log buffer poisoned")
+            }
+        }
+
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl io::Write for SharedWriter {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("shared log buffer poisoned")
+                    .extend_from_slice(data);
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct SharedMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl<'a> MakeWriter<'a> for SharedMakeWriter {
+            type Writer = SharedWriter;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                SharedWriter(self.0.clone())
+            }
+        }
+
+        pub(super) fn install() -> SharedBuffer {
+            static BUFFER: OnceLock<SharedBuffer> = OnceLock::new();
+            BUFFER
+                .get_or_init(|| {
+                    let buffer = SharedBuffer(Arc::new(Mutex::new(Vec::new())));
+                    let subscriber = tracing_subscriber::fmt()
+                        .with_writer(SharedMakeWriter(buffer.0.clone()))
+                        .with_ansi(false)
+                        .with_target(false)
+                        .with_max_level(tracing::Level::TRACE)
+                        .finish();
+                    // Tolerate the "already set" race: another test
+                    // binary or a stray init in the same process
+                    // shouldn't sink the suite. The capture only
+                    // works if our subscriber wins, but if it
+                    // doesn't, the assertions below will fail
+                    // loudly with a clear "no captured lines"
+                    // message.
+                    let _ = tracing::subscriber::set_global_default(subscriber);
+                    buffer
+                })
+                .clone()
+        }
     }
 
     #[tokio::test]
