@@ -472,11 +472,64 @@ final class ChatViewModel: ObservableObject {
         engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id))
     }
 
+    /// Move a card between kanban columns. Two extra concerns vs. a
+    /// pure status edit, both per `tools/boss/docs/designs/work-kanban.md`:
+    ///
+    /// - Drop into Doing (target status `active`) also fires
+    ///   `RequestExecution` so the engine schedules a worker. The
+    ///   engine is idempotent — a non-terminal execution already
+    ///   running for this work item won't get a duplicate.
+    /// - Move OUT of Doing while a live worker is attached is
+    ///   blocked. The kanban must not show a card in a column whose
+    ///   status contradicts the live-worker reality. Terminal
+    ///   transitions (`done`, `archived`) are still allowed because
+    ///   those mirror the engine's own lifecycle resolutions.
     func moveTask(_ taskID: String, to column: WorkBoardColumnKey) {
         guard let task = task(withID: taskID) else { return }
         let targetStatus = column.targetStatus
         guard task.status != targetStatus else { return }
+
+        if task.status == "active"
+            && !Self.terminalKanbanStatuses.contains(targetStatus)
+            && hasLiveWorker(forTaskID: taskID)
+        {
+            appendSystemMessage(
+                "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing.",
+                alwaysShow: true
+            )
+            return
+        }
+
         engine.sendUpdateWorkItem(id: task.id, patch: ["status": targetStatus])
+
+        if targetStatus == "active" {
+            engine.sendRequestExecution(workItemId: task.id)
+        }
+    }
+
+    /// Statuses that the engine itself can drive a chore into at run
+    /// completion. The kanban must allow the human to mirror those
+    /// transitions even from `active` so a successful PR-merge flow
+    /// can move a card to Done without first stopping the worker.
+    private static let terminalKanbanStatuses: Set<String> = [
+        "done",
+        "archived",
+    ]
+
+    /// True iff the work item has a non-terminal worker currently
+    /// attached (running, paused on input, or idle between turns).
+    /// `WorkerActivity.terminated` and `.errored` count as "no live
+    /// worker" — the slot is no longer holding the run open.
+    private func hasLiveWorker(forTaskID taskID: String) -> Bool {
+        guard let live = workerLiveState(forTaskID: taskID) else {
+            return false
+        }
+        switch live.activity {
+        case .terminated, .errored:
+            return false
+        case .spawning, .working, .waitingForInput, .idle:
+            return true
+        }
     }
 
     func toggleBlocked(for taskID: String) {

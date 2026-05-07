@@ -1221,6 +1221,29 @@ pub async fn serve(
         });
     }
 
+    // Rehydrate dispatch for any work items that were in "Doing"
+    // (status=active) when the engine last shut down but whose
+    // executions ended without being moved out of the column. See
+    // `tools/boss/docs/designs/work-kanban.md` §3 — the Doing column
+    // is supposed to mirror "running or queued," and on startup we
+    // re-issue RequestExecution for items that no longer satisfy
+    // either half of that contract.
+    match server_state.work_db.reconcile_active_dispatch() {
+        Ok(redispatched) if !redispatched.is_empty() => {
+            tracing::info!(
+                count = redispatched.len(),
+                ids = ?redispatched,
+                "reconciled active-dispatch on startup",
+            );
+        }
+        Ok(_) => {
+            tracing::debug!("no active-dispatch reconcile needed at startup");
+        }
+        Err(err) => {
+            tracing::error!(?err, "active-dispatch reconcile failed; continuing");
+        }
+    }
+
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 

@@ -177,6 +177,52 @@ impl WorkDb {
         Ok(execution)
     }
 
+    /// Re-issue `RequestExecution` for every non-deleted task / chore
+    /// whose status is `active` but whose latest execution is terminal
+    /// (or which has no execution). This is the engine-startup
+    /// rehydration described in `work-kanban.md` §3 of the
+    /// Doing-column dispatch contract: the kanban Doing column is
+    /// supposed to mirror "running or queued," and after a crash the
+    /// only remaining signal of "this was supposed to be running" is
+    /// `tasks.status = 'active'`. Returns the work item ids that were
+    /// re-dispatched so the caller can log them.
+    pub fn reconcile_active_dispatch(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        // Active, non-deleted task/chore rows are the candidate set.
+        let candidate_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM tasks
+                 WHERE status = 'active' AND deleted_at IS NULL",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut redispatched = Vec::new();
+        for work_item_id in candidate_ids {
+            // Skip if a non-terminal execution already exists — that's
+            // a worker the engine is already tracking.
+            let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
+                Some(existing) => execution_status_is_terminal(&existing.status),
+                None => true,
+            };
+            if !needs_dispatch {
+                continue;
+            }
+            request_execution_in_tx(
+                &tx,
+                RequestExecutionInput {
+                    work_item_id: work_item_id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                },
+            )?;
+            redispatched.push(work_item_id);
+        }
+        tx.commit()?;
+        Ok(redispatched)
+    }
+
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         if let Some(work_item_id) = work_item_id {
@@ -2779,6 +2825,187 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Reconcile must redispatch an `active` chore that has no
+    /// execution at all — that's the "card sitting in Doing with no
+    /// worker" case after a crash where the user had dragged the card
+    /// into Doing but the engine never got to dispatch.
+    #[test]
+    fn reconcile_dispatches_active_chore_with_no_execution() {
+        let path = temp_db_path("reconcile-no-exec");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stranded chore".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        // Manually flip to active, mimicking a kanban drag that
+        // wrote tasks.status without ever dispatching.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let redispatched = db.reconcile_active_dispatch().unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        // A ready execution should now exist for the chore.
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1, "expected exactly one execution");
+        assert_eq!(executions[0].status, "ready");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Reconcile must redispatch when the only existing execution is
+    /// terminal (completed/failed/abandoned) — same "no live worker"
+    /// signal as having no execution at all.
+    #[test]
+    fn reconcile_redispatches_when_latest_execution_is_terminal() {
+        let path = temp_db_path("reconcile-terminal");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Bounced chore".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Create an existing execution and force it to a terminal
+        // status so the reconcile sees "latest execution is terminal."
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("failed".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let redispatched = db.reconcile_active_dispatch().unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 2, "expected the failed exec plus a fresh ready one");
+        let latest = executions.last().unwrap();
+        assert_eq!(latest.status, "ready");
+    }
+
+    /// Reconcile must NOT redispatch when a non-terminal execution
+    /// already exists — that's a worker either currently running or
+    /// queued, and re-dispatching would create a duplicate.
+    #[test]
+    fn reconcile_skips_active_chore_with_live_execution() {
+        let path = temp_db_path("reconcile-live");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Live chore".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A waiting_human execution counts as non-terminal — worker
+        // is paused but the slot is still owned.
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("waiting_human".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let redispatched = db.reconcile_active_dispatch().unwrap();
+        assert!(
+            redispatched.is_empty(),
+            "should not redispatch when a non-terminal execution exists, got {redispatched:?}",
+        );
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1, "no fresh execution should be inserted");
+    }
+
+    /// Reconcile must NOT touch chores that aren't `active`. A
+    /// `todo`/`done`/`archived` chore in the table is just data; the
+    /// kanban Doing contract only applies to `active`.
+    #[test]
+    fn reconcile_ignores_non_active_chores() {
+        let path = temp_db_path("reconcile-non-active");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let _todo_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stays in backlog".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        let done_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already done".to_owned(),
+                description: None,
+            })
+            .unwrap();
+        db.update_work_item(
+            &done_chore.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let redispatched = db.reconcile_active_dispatch().unwrap();
+        assert!(redispatched.is_empty());
     }
 
     #[test]

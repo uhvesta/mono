@@ -264,6 +264,19 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    /// Ask the engine to schedule an execution for `workItemId`.
+    /// Mirrors the bossctl `work start` path. Idempotent — the
+    /// engine treats a non-terminal latest execution as the current
+    /// owner and won't create a duplicate. Used by the kanban's
+    /// drop-into-Doing flow described in
+    /// `tools/boss/docs/designs/work-kanban.md` §1.
+    func sendRequestExecution(workItemId: String) {
+        sendLine([
+            "type": "request_execution",
+            "work_item_id": workItemId,
+        ])
+    }
+
     func sendDeleteWorkItem(id: String) {
         sendLine([
             "type": "delete_work_item",
