@@ -376,6 +376,89 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
     Ok(())
 }
 
+/// Mirrors what `boss task bind-pr` / `boss chore bind-pr` issue at the
+/// wire level: an `UpdateWorkItem` with only `pr_url` set, repeated
+/// across the add → re-bind same → re-bind different sequence. The CLI
+/// short-circuits the same-URL case before sending, but the engine
+/// must remain idempotent for the case where a caller (or a
+/// future client) does send it.
+#[tokio::test]
+async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Bindable".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Backfill PR".to_owned(),
+            description: None,
+            autostart: false,
+        },
+    )
+    .await?;
+    assert!(chore.pr_url.is_none());
+
+    let first = "https://github.com/spinyfin/mono/pull/238";
+    let second = "https://github.com/spinyfin/mono/pull/239";
+
+    // Add: status untouched, pr_url stamped.
+    let bound = expect_chore(
+        update_work_item(
+            &mut client,
+            &chore.id,
+            WorkItemPatch {
+                pr_url: Some(first.to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(bound.pr_url.as_deref(), Some(first));
+    assert_eq!(bound.status, chore.status, "bind-pr must not change status");
+
+    // Re-bind same URL: idempotent at the data layer.
+    let same = expect_chore(
+        update_work_item(
+            &mut client,
+            &chore.id,
+            WorkItemPatch {
+                pr_url: Some(first.to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(same.pr_url.as_deref(), Some(first));
+    assert_eq!(same.status, chore.status);
+
+    // Re-bind to a different URL: overwrites cleanly.
+    let switched = expect_chore(
+        update_work_item(
+            &mut client,
+            &chore.id,
+            WorkItemPatch {
+                pr_url: Some(second.to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(switched.pr_url.as_deref(), Some(second));
+    assert_eq!(switched.status, chore.status);
+
+    Ok(())
+}
+
 struct Invalidation {
     topic: String,
     event: TopicEventPayload,
