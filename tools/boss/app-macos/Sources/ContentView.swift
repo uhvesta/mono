@@ -880,9 +880,6 @@ private struct WorkBoardCardView: View {
                     WorkStatusBadge(text: "Blocked")
                 }
                 Spacer()
-                Text(task.status.replacingOccurrences(of: "_", with: " ").capitalized)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
 
             if let prURL = task.prURL, !prURL.isEmpty {
