@@ -639,53 +639,57 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
+                Spacer(minLength: 0)
             } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(sections) { section in
-                        if model.workBoardGrouping == .project {
-                            Text(section.title)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                        VStack(alignment: .leading, spacing: 10) {
-                            ForEach(section.items) { task in
-                                Button {
-                                    model.selectWorkCard(
-                                        model.selectedTask?.id == task.id ? nil : task.id
-                                    )
-                                } label: {
-                                    WorkBoardCardView(
-                                        task: task,
-                                        projectName: task.isChore ? nil : model.projectName(for: task.projectID),
-                                        isSelected: model.selectedTask?.id == task.id,
-                                        activityState: column == .doing
-                                            ? AgentActivityState(
-                                                runtime: model.taskRuntime(for: task.id),
-                                                liveState: model.workerLiveState(forTaskID: task.id)
-                                              )
-                                            : nil
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                                .popover(
-                                    isPresented: Binding(
-                                        get: { model.selectedTask?.id == task.id },
-                                        set: { isPresented in
-                                            if !isPresented, model.selectedTask?.id == task.id {
-                                                model.selectWorkCard(nil)
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(sections) { section in
+                            if model.workBoardGrouping == .project {
+                                Text(section.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(section.items) { task in
+                                    Button {
+                                        model.selectWorkCard(
+                                            model.selectedTask?.id == task.id ? nil : task.id
+                                        )
+                                    } label: {
+                                        WorkBoardCardView(
+                                            task: task,
+                                            projectName: task.isChore ? nil : model.projectName(for: task.projectID),
+                                            isSelected: model.selectedTask?.id == task.id,
+                                            activityState: column == .doing
+                                                ? AgentActivityState(
+                                                    runtime: model.taskRuntime(for: task.id),
+                                                    liveState: model.workerLiveState(forTaskID: task.id)
+                                                  )
+                                                : nil
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .popover(
+                                        isPresented: Binding(
+                                            get: { model.selectedTask?.id == task.id },
+                                            set: { isPresented in
+                                                if !isPresented, model.selectedTask?.id == task.id {
+                                                    model.selectWorkCard(nil)
+                                                }
                                             }
-                                        }
-                                    ),
-                                    arrowEdge: .trailing
-                                ) {
-                                    WorkCardPopoverView(model: model, task: task)
+                                        ),
+                                        arrowEdge: .trailing
+                                    ) {
+                                        WorkCardPopoverView(model: model, task: task)
+                                    }
                                 }
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
+                .frame(maxHeight: .infinity)
             }
-            Spacer(minLength: 0)
         }
         .padding(14)
         .frame(width: workBoardColumnWidth, alignment: .topLeading)
