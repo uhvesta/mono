@@ -463,6 +463,34 @@ async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
 }
 
 #[tokio::test]
+async fn agents_send_does_not_reject_local_caller_as_boss_only() -> Result<()> {
+    // `bossctl agents send` writes user-typed input into a sibling
+    // worker pane. Same auth class as `agents focus` / `probe` /
+    // `agents stop` (AppOrBoss). With no run seeded, the verb should
+    // pass auth and then fail the run-id lookup with a `WorkError`.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::SendInputToWorker {
+            run_id: "run-does-not-exist".to_owned(),
+            text: "hi\n".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { .. } => {}
+        FrontendEvent::Error { message, .. } => {
+            assert!(
+                !message.contains("BossOnly")
+                    && !message.contains("requires app or Boss authority"),
+                "send_input_to_worker must not reject local callers on auth grounds: {message}"
+            );
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn agents_transcript_does_not_reject_local_caller_as_boss_only() -> Result<()> {
     // `bossctl agents transcript` shares the BossOnly→AppOrBoss
     // downgrade with `bossctl probe` and `bossctl agents stop`. This

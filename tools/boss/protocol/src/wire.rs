@@ -228,6 +228,17 @@ pub enum FrontendRequest {
     FocusWorkerPane {
         run_id: String,
     },
+    /// Boss-tier RPC: write `text` into the worker pane hosting
+    /// `run_id` as if the user typed it. Resolves `run_id → slot_id`
+    /// via the worker registry and forwards a `SendToPane` engine→app
+    /// request, which the app routes through the same libghostty
+    /// surface a real keystroke takes. Used by `bossctl agents send`.
+    /// Returns `WorkError` if the run is unknown, has no allocated
+    /// pane, or the app rejects the injection.
+    SendInputToWorker {
+        run_id: String,
+        text: String,
+    },
     /// Snapshot of every allocated worker slot's live state — what
     /// model it's running, what activity (working / waiting / idle /
     /// errored / terminated), most recent tool, etc. Source of truth
@@ -450,6 +461,16 @@ pub enum FrontendEvent {
     /// slot was raised when the agent reference was a crew name or
     /// run id.
     WorkerPaneFocused {
+        run_id: String,
+        slot_id: u8,
+    },
+    /// Engine acknowledges a `SendInputToWorker` request — the text
+    /// has been written into the worker pane via the same surface a
+    /// user-typed keystroke takes. Carries the resolved `slot_id` so
+    /// the caller (e.g. `bossctl agents send`) can confirm which
+    /// pane was targeted when the agent reference was a crew name
+    /// or run id.
+    WorkerInputSent {
         run_id: String,
         slot_id: u8,
     },

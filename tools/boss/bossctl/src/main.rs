@@ -180,6 +180,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::Focus { agent },
         } => agents_focus(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
+            action: AgentsAction::Send { agent, text },
+        } => agents_send(&cli.socket_path, cli.json, agent, text).await,
+        Command::Agents {
             action: AgentsAction::Transcript { agent, lines },
         } => agents_transcript(&cli.socket_path, cli.json, agent, lines).await,
         Command::Agents {
@@ -217,10 +220,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: WorkspaceAction::Summary,
         } => workspace_summary(&cli.socket_path, cli.json).await,
         // The remaining verbs need engine surfaces that don't exist
-        // yet (interrupt key injection, focus pane, send keystrokes,
-        // explicit launch). They print a structured "not_implemented"
-        // so the Boss session can call them and see exactly which
-        // ones are pending.
+        // yet (interrupt key injection). They print a structured
+        // "not_implemented" so the Boss session can call them and see
+        // exactly which ones are pending.
         other => print_not_implemented(cli.json, &describe_verb(&other)),
     }
 }
@@ -498,6 +500,58 @@ async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected focus: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+/// Inject `text` into the worker pane referenced by `agent`, as if
+/// the user had typed it. A trailing newline is appended so the
+/// claude session treats the input as submitted (matching the
+/// "and pressing return" semantics in the verb's contract). Callers
+/// that need raw injection without an implicit submit should drive
+/// the engine RPC directly.
+async fn agents_send(
+    socket_path: &Option<String>,
+    json: bool,
+    agent: String,
+    text: String,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let mut payload = text;
+    if !payload.ends_with('\n') {
+        payload.push('\n');
+    }
+    let response = client
+        .send_request(&FrontendRequest::SendInputToWorker {
+            run_id: run_id.clone(),
+            text: payload,
+        })
+        .await
+        .context("sending SendInputToWorker")?;
+    match response {
+        FrontendEvent::WorkerInputSent {
+            run_id: returned,
+            slot_id,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "sent",
+                        "run_id": returned,
+                        "slot_id": slot_id,
+                    })
+                );
+            } else {
+                println!("sent input to slot {slot_id} (run {returned})");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected send: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }

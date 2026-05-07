@@ -25,7 +25,7 @@ use crate::coordinator::{
 use crate::protocol::{
     AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse,
     FocusWorkerPaneInput, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
-    FrontendRequestEnvelope, ReleaseWorkerPaneInput, TOPIC_WORK_PRODUCTS,
+    FrontendRequestEnvelope, ReleaseWorkerPaneInput, SendToPaneInput, TOPIC_WORK_PRODUCTS,
     TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, work_product_topic,
 };
 use tokio::time::{Duration, timeout};
@@ -446,6 +446,22 @@ pub enum FocusPaneError {
     ResponseKindMismatch(String),
 }
 
+/// Surfaced by [`ServerState::send_input_to_worker`]. Same shape as
+/// [`FocusPaneError`]: separates "no slot mapping for that run id"
+/// from app-side / transport failures so `bossctl agents send` can
+/// produce a precise error message.
+#[derive(Debug, thiserror::Error)]
+pub enum SendInputError {
+    #[error("no worker pane mapped for that run id")]
+    UnknownRun,
+    #[error("app reported error: {0:?}")]
+    App(EngineToAppError),
+    #[error(transparent)]
+    Send(#[from] SendToAppError),
+    #[error("app returned unexpected response: {0}")]
+    ResponseKindMismatch(String),
+}
+
 impl ServerState {
     fn new_arc(cfg: Arc<RuntimeConfig>) -> Result<Arc<Self>> {
         let app_pid = current_parent_pid();
@@ -662,6 +678,31 @@ impl ServerState {
             }
             Ok(other) => Err(FocusPaneError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(FocusPaneError::Send(err)),
+        }
+    }
+
+    /// Resolve `run_id → slot_id` and ask the app to write `text`
+    /// into that worker pane as if the user had typed it. Returns the
+    /// resolved slot on success so `bossctl agents send` can echo back
+    /// which pane was targeted (useful when the agent reference was a
+    /// crew name). Mirrors [`focus_worker_pane`] in shape; the only
+    /// behavioural difference is the engine→app request kind.
+    pub async fn send_input_to_worker(
+        &self,
+        run_id: &str,
+        text: String,
+    ) -> Result<u8, SendInputError> {
+        let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
+            return Err(SendInputError::UnknownRun);
+        };
+        let request = EngineToAppRequest::SendToPane(SendToPaneInput { slot_id, text });
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(slot_id),
+            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => {
+                Err(SendInputError::App(err))
+            }
+            Ok(other) => Err(SendInputError::ResponseKindMismatch(format!("{other:?}"))),
+            Err(err) => Err(SendInputError::Send(err)),
         }
     }
 
@@ -2860,6 +2901,56 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            FrontendRequest::SendInputToWorker { run_id, text } => {
+                // `bossctl agents send` writes user-typed input into a
+                // sibling worker pane. Same authority story as
+                // `focus_worker_pane` / `probe_run` / `stop_run`: the
+                // human invokes this from wherever they are (boss
+                // pane, app shell, or another worker pane), so the
+                // tier is `AppOrBoss` — caller must descend from the
+                // app or the Boss session.
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        run_id = %run_id,
+                        "send_input_to_worker rejected: caller not in app/Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "send_input_to_worker requires app or Boss authority"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                match server_state.send_input_to_worker(&run_id, text).await {
+                    Ok(slot_id) => {
+                        tracing::info!(
+                            run_id = %run_id,
+                            slot_id,
+                            "send_input_to_worker: text injected",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkerInputSent { run_id, slot_id },
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, run_id = %run_id, "send_input_to_worker failed");
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("send_input_to_worker: {err}"),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::ListWorkerLiveStates => {
                 let states = server_state.live_worker_states_snapshot();
                 send_response(
@@ -4073,6 +4164,115 @@ mod tests {
         let err = focus.await.expect("focus task").expect_err("expect err");
         match err {
             FocusPaneError::App(EngineToAppError::UnknownSlot) => {}
+            other => panic!("expected App(UnknownSlot), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_input_to_worker_unknown_run_returns_unknown_run() {
+        let server_state = test_server_state();
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink)
+            .await;
+        let err = server_state
+            .send_input_to_worker("never-allocated", "/help\n".into())
+            .await
+            .expect_err("unknown run should fail");
+        assert!(matches!(err, SendInputError::UnknownRun));
+    }
+
+    #[tokio::test]
+    async fn send_input_to_worker_round_trips_to_app() {
+        // End-to-end smoke: engine resolves run_id → slot via the
+        // worker registry, sends a SendToPane EngineRequest carrying
+        // the text payload to the registered app session, and
+        // surfaces the slot id once the app replies success.
+        let server_state = test_server_state();
+        server_state
+            .worker_registry
+            .register_run_slot("run-send", 7);
+
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let send = tokio::spawn(async move {
+            server_clone
+                .send_input_to_worker("run-send", "/help\n".into())
+                .await
+        });
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("an EngineRequest event should be enqueued");
+        let (request_id, request) = match envelope.payload {
+            FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        match request {
+            EngineToAppRequest::SendToPane(input) => {
+                assert_eq!(input.slot_id, 7);
+                assert_eq!(input.text, "/help\n");
+            }
+            other => panic!("expected SendToPane, got {other:?}"),
+        }
+
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+
+        let slot = send.await.expect("send task").expect("send ok");
+        assert_eq!(slot, 7);
+    }
+
+    #[tokio::test]
+    async fn send_input_to_worker_surfaces_app_error() {
+        let server_state = test_server_state();
+        server_state
+            .worker_registry
+            .register_run_slot("run-send", 2);
+
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let send = tokio::spawn(async move {
+            server_clone
+                .send_input_to_worker("run-send", "hi\n".into())
+                .await
+        });
+
+        let envelope = sink.next().await.expect("EngineRequest enqueued");
+        let request_id = match envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id,
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Err(EngineToAppError::UnknownSlot),
+                },
+            )
+            .await;
+
+        let err = send.await.expect("send task").expect_err("expect err");
+        match err {
+            SendInputError::App(EngineToAppError::UnknownSlot) => {}
             other => panic!("expected App(UnknownSlot), got {other:?}"),
         }
     }
