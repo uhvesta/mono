@@ -37,6 +37,16 @@ final class GhosttyTerminalHostView: NSView {
     private var backgroundColor = NSColor.black
     private var claudeMonitorTimer: Timer?
 
+    private var lastSyncedBackingSize: CGSize = .zero
+    private var lastSizeSyncTimestamp: TimeInterval = 0
+    private var pendingGeometrySync: DispatchWorkItem?
+    /// Cap on how often we forward layout-driven size changes to
+    /// libghostty. Reflowing the scrollback inside
+    /// `ghostty_surface_set_size` is O(history); without a cap, a
+    /// pane-divider drag fires the call on every layout tick (60–
+    /// 120 Hz) and blocks the main thread for the whole drag.
+    private static let geometrySyncMinInterval: TimeInterval = 1.0 / 30.0
+
     init(runtime: GhosttyRuntime, session: TerminalPaneSession, launchSpec: TerminalLaunchSpec) {
         self.runtime = runtime
         self.session = session
@@ -96,6 +106,10 @@ final class GhosttyTerminalHostView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        pendingGeometrySync?.cancel()
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -228,14 +242,48 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     func syncGeometry() {
+        guard surface != nil else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = now - lastSizeSyncTimestamp
+
+        if elapsed >= Self.geometrySyncMinInterval {
+            pendingGeometrySync?.cancel()
+            pendingGeometrySync = nil
+            applyGeometryNow(timestamp: now)
+            return
+        }
+
+        // We synced recently; coalesce until the throttle window
+        // expires so a rapid drag results in one trailing reflow
+        // rather than dozens.
+        if pendingGeometrySync != nil {
+            return
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingGeometrySync = nil
+            self.applyGeometryNow(timestamp: ProcessInfo.processInfo.systemUptime)
+        }
+        pendingGeometrySync = work
+        let delay = Self.geometrySyncMinInterval - elapsed
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func applyGeometryNow(timestamp: TimeInterval) {
         guard let surface else { return }
 
         let size = convertToBacking(bounds.size)
-        ghostty_surface_set_size(
-            surface,
-            UInt32(max(size.width, 1).rounded(.up)),
-            UInt32(max(size.height, 1).rounded(.up))
+        let target = CGSize(
+            width: max(size.width, 1).rounded(.up),
+            height: max(size.height, 1).rounded(.up)
         )
+
+        if target != lastSyncedBackingSize {
+            lastSyncedBackingSize = target
+            ghostty_surface_set_size(surface, UInt32(target.width), UInt32(target.height))
+        }
 
         if let window {
             ghostty_surface_set_content_scale(surface, window.backingScaleFactor, window.backingScaleFactor)
@@ -243,6 +291,8 @@ final class GhosttyTerminalHostView: NSView {
                 ghostty_surface_set_display_id(surface, screen.ghosttyDisplayID)
             }
         }
+
+        lastSizeSyncTimestamp = timestamp
     }
 
     func applyInitialSize(_ size: ghostty_action_initial_size_s) {
