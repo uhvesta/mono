@@ -30,21 +30,21 @@ brainstorm that started V2 and has been archived to `plans/done/`.
   commit-sized increments at implementation time; this doc is at the
   phase level.
 
-## Status at a glance (audited 2026-04-30 against `main`)
+## Status at a glance (audited 2026-05-06 against `main`)
 
 | Phase | Title                                          | Status                       |
 |-------|------------------------------------------------|------------------------------|
 | 1     | Engine and CLI foundations                     | 🟢 named deliverables shipped; CLI follow-ups (Product/Project delete+move) landed |
-| 2     | Multi-client subscriptions                     | 🟡 mostly shipped — outbound queue is unbounded, no coalescing or slow-client disconnect |
+| 2     | Multi-client subscriptions                     | 🟢 shipped — bounded outbound queue, same-topic coalescing, slow-client disconnect (PR #137) |
 | 3     | Kanban Work tab                                | 🟢 shipped                   |
-| 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers land in Phases 8-9 |
+| 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers for those land in Phase 9 |
 | 5     | ExecutionCoordinator                           | 🟢 named deliverables shipped — affinity-first/LRU worker selection, 8-worker hard cap, priority + FIFO ready queue, `executions.<id>` topic, `request_execution` RPC, `RunWaitState` enum |
 | 6     | libghostty embedding and worker spawn          | 🟢 named deliverables shipped — 6a–6g + 6f-1..8 all in main; PR #197 closed the BOSS_RUN_ID hook-correlation gap that the 6f-6 shell_pid TODO had left |
-| 7     | Boss session and bossctl                       | ❌ not started               |
-| 8     | Review and attention                           | 🟡 schema + manual PR-URL only — no auto-detect, no poller, no Triage UI, no re-engage |
+| 7     | Boss session and bossctl                       | 🟢 mostly shipped — Boss pane, `bossctl` binary, two-trust-root auth, probe model, coordinator system prompt, worker env hygiene all in `main`; some `bossctl` verbs (`agents focus/send/interrupt/launch/transcript`, `work cancel`, `workspace summary`) still print `not_implemented` |
+| 8     | Review and attention                           | 🟡 auto PR-detect on Stop landed (PR #184) — moves work item to `in_review` and finalises execution; poller for `waiting_review` / `waiting_merge`, Triage UI, and re-engagement still pending |
 | 9     | Resume and continuity                          | ❌ not started               |
 | 10    | Transcripts and hardening                      | ❌ schema columns only       |
-| 11    | Bazel `GhosttyKit` integration                 | ❌ not started — hard prereq for shipping the post-6f Bazel `.app` |
+| 11    | Bazel `GhosttyKit` integration                 | ❌ not started — Phase 6f cutover already shipped without it, so the Bazel `.app` currently has no working Agents mode |
 
 Phase 6 is closed: 6f-7 wiring (PaneSpawnRunner as production
 `ExecutionRunner`) shipped in PR #171, the BOSS_RUN_ID hook
@@ -494,49 +494,115 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
 
 ---
 
-### Phase 7: Boss session and bossctl — ❌ not started
+### Phase 7: Boss session and bossctl — 🟢 mostly shipped
 
 **Goal.** Add the coordinator role and the Boss-only CLI.
 
-**Status (done).** Nothing. There is no `bossctl` binary
-(`tools/boss/bin/` contains only `boss`); no Boss pane in the app;
-no probe model; no two-trust-root auth refinement; no worker spawn
-env hygiene (because there is no worker spawn yet).
+**Status (in `main`).**
 
-**Pending — full deliverables list.**
+- **Docked Boss libghostty pane in Work mode.** `BossPaneModel`
+  is allocated alongside `workersWorkspace` in
+  `app-macos/Sources/ContentView.swift:17-18`; the docked panel
+  renders at `ContentView.swift:455-521` with a resize divider
+  and collapse-to-bar header (PRs #178, #179, #191). Workers run
+  in the 8-slot `WorkersWorkspaceModel` grid alongside it.
+- **`bossctl` Rust binary** at `tools/boss/bossctl/` with its own
+  `Cargo.toml` and `BUILD.bazel`. The crate doc spells out the
+  two-CLI design: `boss` is the user-facing taxonomy CLI,
+  `bossctl` is the Boss-only control CLI. The binary's PATH
+  presence is itself part of the auth model — workers can't see
+  it (see worker env hygiene below).
+- **`bossctl` subcommand surface** declared in
+  `bossctl/src/main.rs`: `agents {list, status, focus, send,
+  interrupt, launch, stop, transcript}`, `probe <run_id> <text>`,
+  `work {start, cancel}`, `workspace summary`. Wired to engine
+  RPCs:
+  - `probe` → `FrontendRequest::ProbeRun`
+    (`main.rs:193`) → `FrontendEvent::ProbeQueued`.
+  - `agents list` and `agents status` →
+    `ListWorkerLiveStates` (`main.rs:229, 270`).
+  - `agents stop` → `StopRun` (`main.rs:302`).
+  - `work start` → `RequestExecution` (`main.rs:337`).
+  - The remaining verbs (`agents focus/send/interrupt/launch/
+    transcript`, `work cancel`, `workspace summary`) print a
+    structured `not_implemented` response so the Boss session can
+    discover gaps interactively
+    (`main.rs:445-458`). See **Pending**.
+- **Two-trust-root socket auth.**
+  `engine/src/app.rs:316-321` defines
+  `RpcTier::{User, AppOrBoss, BossOnly}`. `authorize_rpc`
+  (`app.rs:639-662`) resolves the peer pid via `LOCAL_PEERPID`,
+  builds a trust set per tier from `app_pid` (`:643`) and
+  `boss_pid` (`:644`), and calls `is_descendant_of_any` (`:661`)
+  to allow any process descended from a trusted root. The
+  `app_pid` discovery refinement (the app reports its pid via
+  `BOSS_APP_PID`; engine accepts any ancestor of the connecting
+  peer) landed in PRs #172, #173.
+- **Probe model — Stop-boundary injection.**
+  `pending_probes: HashMap<String, VecDeque<String>>` keyed by
+  run id (`app.rs:295-298`) holds queued probe text.
+  `queue_probe` (`:608-623`) appends; the consumer pops on the
+  next `Stop` hook boundary. `FrontendEvent::ProbeQueued
+  { run_id }` fires on enqueue (`:2455`). Distinct
+  `ProbeReplied` event is not yet wired (the reply lands in
+  transcript like any other turn).
+- **Coordinator system prompt** at `app.rs:38-75` —
+  `BOSS_AGENT_SYSTEM_PROMPT` teaches "do not make direct
+  implementation changes," "queue the work first," and
+  "auto-dispatches a worker on it," and explicitly delegates
+  investigation to workers. Selected via
+  `system_prompt_for_role(AgentRole::Boss)` (`:254`).
+- **Worker spawn env hygiene.**
+  `engine/src/spawn_flow.rs:35-43` defines
+  `WORKER_SANITIZED_PATH` excluding the bin dir where `bossctl`
+  lives — a worker that tries `bossctl` fails with a PATH miss.
+  `WORKER_EXTRA_ENV_ALLOWLIST` (`:45-57`) is a fixed list
+  (`BOSS_TASK_ID`, `CUBE_LEASE_ID`, `CUBE_REPO`, plus
+  `BOSS_RUN_ID` for hook correlation) so ambient env doesn't
+  leak into workers.
+- **Live worker state surfaced to bossctl.** PR #193 added
+  `engine/src/live_worker_state.rs` and the
+  `ListWorkerLiveStates` RPC; `bossctl agents list/status` reads
+  it. The activity enum
+  (`Spawning`/`Working`/`Idle`/`WaitingForInput`/`Errored`/`Terminated`)
+  is driven by `WorkerEvent`s and also drives the
+  activity-status dot on kanban Doing cards (PR #182).
 
-- App: spawn a 1 Boss libghostty pane in addition to the 8 worker
-  panes. Persistent docked Boss panel in Work mode.
-- `bossctl` Rust binary at `tools/boss/cli/bossctl` (or shared
-  crate with `boss`).
-- `bossctl agents list / status / focus / send / interrupt /
-  launch / stop / transcript`, `bossctl probe <id>`, `bossctl
-  workspace summary`.
-- `bossctl work start / cancel` aliases for symmetry with `boss`.
-- Engine: control socket auth refinement — two trust roots (app
-  pid + Boss session pid) via LOCAL_PEERPID subtree match; three
-  RPC authorization tiers (user / app+Boss / Boss-only).
-- Engine: probe model — Stop-boundary injection. Boss requests
-  probe via `bossctl`; engine queues; on next worker `Stop`,
-  engine injects probe text as the next prompt. The follow-up
-  `Stop` produces a `ProbeReplied` event.
-- Boss session bootstrap: a system prompt or session-init prompt
-  teaching the coordinator contract (delegate, don't implement;
-  auto-dispatch only inside `plan_and_start`; probe on low
-  confidence).
-- Worker spawn env hygiene: sanitized PATH excluding `bossctl`,
-  fixed allowlist of env keys.
+**Pending.**
 
-**Done when (acceptance).**
+- `bossctl agents focus` — needs an engine→app RPC to bring a
+  specific worker pane to the front.
+- `bossctl agents send` — needs an engine→app RPC that injects
+  user-typed input into a worker pane.
+- `bossctl agents interrupt` — needs an engine→app RPC for
+  Esc-equivalent into a worker pane.
+- `bossctl agents launch` — bypass the coordinator's
+  auto-dispatch and force-spawn a worker for a given work item.
+  The closest existing behaviour is `bossctl work start` (which
+  goes through `RequestExecution`); `launch` is meant to be the
+  "skip the queue" verb.
+- `bossctl agents transcript` — tail a worker transcript from
+  the Boss pane.
+- `bossctl work cancel` — needs a `CancelExecution` RPC (today
+  there is `StopRun` per-run but no execution-level cancel).
+- `bossctl workspace summary` — needs an engine surface that
+  reports cube workspace pool state.
+- `ProbeReplied` event on the follow-up `Stop` — queue+inject
+  side is in, but emitting a distinct event when the probe's
+  reply lands is not yet wired.
 
-- Boss session can fully drive a workflow:
-  human types planning prompt → Boss decomposes → Boss runs
-  `bossctl work start <id>` → engine picks up → worker runs → Boss
-  observes via `bossctl agents status` → on completion, Boss
-  reports to human.
-- A worker that tries to invoke `bossctl` fails (PATH miss). A
-  worker that tries the live RPCs over the socket fails
-  subtree-match auth.
+**Done when (acceptance, kept for the record).**
+
+- Boss session can fully drive a workflow: human types planning
+  prompt → Boss decomposes → Boss runs `bossctl work start <id>`
+  → engine picks up → worker runs → Boss observes via
+  `bossctl agents status` → on completion, Boss reports to human.
+  ✅ end-to-end works today; the fine-grained verbs
+  (focus/send/interrupt/transcript) still require swivel-chair
+  interaction with the worker pane.
+- A worker that tries to invoke `bossctl` fails (PATH miss). ✅
+- A worker that tries the live RPCs over the socket fails
+  subtree-match auth. ✅
 
 **Depends on.** Phase 6 (worker panes must exist first).
 
@@ -545,7 +611,7 @@ R3, R5, R8.
 
 ---
 
-### Phase 8: Review and attention — 🟡 schema + manual PR-URL only
+### Phase 8: Review and attention — 🟡 auto-detect-on-Stop landed; poller + Triage + re-engage still pending
 
 **Goal.** Close the human-in-the-loop review cycle.
 
@@ -562,49 +628,54 @@ R3, R5, R8.
 - `tasks.pr_url` column on the work-taxonomy schema
   (`engine/src/work.rs:1020`); settable via `boss task update
   --pr-url <url>` and via the app's task edit form
-  (`app-macos/Sources/ContentView.swift:1112`,
-  `:1119`).
-- PR URL is rendered in kanban card detail
-  (`ContentView.swift:914` metadata row) and shown as a label on
-  the card itself (`ContentView.swift:838-839`). This is the
-  Phase 3 kanban work, but it incidentally fills the "card detail
-  shows PR URL" half of one Phase 8 deliverable — only the
-  *display* half; see Pending below.
+  (`app-macos/Sources/ContentView.swift:1112`, `:1119`).
+- PR URL is rendered as an openable hyperlink on kanban cards /
+  card detail (`ContentView.swift:838-839, :914`; hyperlink
+  rendering landed in PR #183).
+- **Auto PR-detection on Stop** (`engine/src/completion.rs`,
+  PR #184). On every worker `Stop` hook, `CommandPrDetector`
+  shells out to `gh pr view --json url --jq .url` from the
+  worker's workspace. If a PR exists, the work item moves to
+  `in_review`, the execution finalises (`completed`, lease
+  cleared, `finished_at` stamped), and `WorkerPaneReleaser` tears
+  down the libghostty pane (PR #192 wires the releaser). If no
+  PR exists, an `awaiting_input` signal goes out on the
+  execution topic so the pane indicator can flag the worker as
+  idle. Regression tests at `completion.rs:560+` cover both
+  branches.
 
 **Pending.**
 
-- Engine: **automatic** PR detection — pattern-match worker
-  `last_assistant_text` for GitHub PR URL; periodic
-  `gh pr list --head <branch>` discovery using cube's deterministic
-  branch names. (`grep` for `last_assistant_text` and
-  `github.com/.*pull` in `engine/src/` returns nothing. The
-  `pr_url` field exists but only as a manual setter today.)
 - Engine: GitHub poller — every 60s, `gh pr view --json state,
   mergedAt, statusCheckRollup, reviews, comments` for each
-  execution in `waiting_review` or `waiting_merge`. (`grep` for
-  `"gh pr"` in `engine/src/` → nothing.)
+  execution in `waiting_review` / `waiting_merge`. The on-Stop
+  detector is not yet supplemented by ongoing polling, so once
+  the worker stops a PR's downstream state changes (review
+  comments, merge, failing checks) aren't observed.
 - Engine: extend attention-item creation to also fire on
-  `waiting_review`. (`grep` for `waiting_review` / `waiting_merge`
-  in `engine/src/` → nothing; only the `waiting_human` path
-  creates attention items.)
+  `waiting_review`. Today the `waiting_human` path creates
+  attention items (which covers the "no PR after Stop" case),
+  but a PR being opened doesn't itself produce a review-attention
+  item.
 - Engine: `request_re_engagement(work_item_id)` RPC: re-leases
   the workspace (with `preferred_workspace_id`), resumes the
   claude session via `--resume`, sends synthesized
-  comments-as-prompt. (`grep` for `re_engage` /
-  `request_re_engagement` → nothing.)
+  comments-as-prompt.
 - App: Triage / Needs Attention surface in Work mode. Lists
   attention items with primary action ("Open PR" / "Re-engage
-  worker" / "View blocker" / "Re-dispatch"). (`grep` for
-  `Triage` / `AttentionItem` / `attention` in
-  `app-macos/Sources/` → nothing — the attention-items table on
-  the engine has no consumer in the app.)
+  worker" / "View blocker" / "Re-dispatch"). The
+  attention-items table on the engine still has no consumer in
+  the app.
 - App: card detail additions on top of the existing PR URL line —
   status ribbon (PR open / draft / merged / failing checks),
   "Open in browser" button, "Re-engage worker (N comments)"
-  action. (None of these strings appear in `ContentView.swift`.)
+  action.
 - Engine: detect `state: MERGED` → execution `completed`, lease
-  released. (`grep` for `MERGED` / `mergedAt` in engine →
-  nothing.)
+  released. Today the on-Stop path closes the execution as soon
+  as a PR exists, which conflates "PR opened" with "work done."
+  The poller above is the correct place to wait for `MERGED`;
+  the on-Stop detector should stop short of `completed` once
+  `waiting_review` is wired.
 
 **Done when (acceptance).**
 
