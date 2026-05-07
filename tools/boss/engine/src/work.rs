@@ -1745,16 +1745,20 @@ impl WorkDb {
         }))
     }
 
-    /// Chores currently in `in_review` whose `pr_url` is set. The
-    /// merge poller iterates this list, asks GitHub whether each PR
-    /// is merged, and calls [`mark_chore_pr_merged`] for the ones
-    /// that are.
+    /// Chores and project_tasks currently in `in_review` whose
+    /// `pr_url` is set. The merge poller iterates this list, asks
+    /// GitHub whether each PR is merged, and calls
+    /// [`Self::mark_chore_pr_merged`] for the ones that are. Both
+    /// kinds share the `pr_url` / `status='in_review'` shape, so the
+    /// poller treats them identically; `kind = 'task'` is excluded
+    /// deliberately because non-project tasks don't share the
+    /// PR-on-merge lifecycle yet.
     pub fn list_chores_pending_merge_check(&self) -> Result<Vec<PendingMergeCheck>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind = 'chore'
+             WHERE kind IN ('chore', 'project_task')
                AND status = 'in_review'
                AND pr_url IS NOT NULL
                AND pr_url != ''
@@ -1771,11 +1775,15 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// Move the chore identified by `work_item_id` from `in_review`
-    /// to `done`, recording `pr_url` (no-op if it was already set to
-    /// the same value). Returns the updated task if a transition
-    /// happened; `Ok(None)` if the chore was already past `in_review`
-    /// (idempotent for late-arriving merge events).
+    /// Move the chore or project_task identified by `work_item_id`
+    /// from `in_review` to `done`, recording `pr_url` (no-op if it
+    /// was already set to the same value). Returns the updated task
+    /// if a transition happened; `Ok(None)` if the row was already
+    /// past `in_review` (idempotent for late-arriving merge events).
+    /// Callers are expected to pre-filter on `kind` via
+    /// [`Self::list_chores_pending_merge_check`]; this function
+    /// itself does not gate on kind so that the SQL filter remains
+    /// the single source of truth for what's mergeable.
     pub fn mark_chore_pr_merged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -1881,7 +1889,7 @@ pub struct WorkerPrCompletion {
 }
 
 /// One row from [`WorkDb::list_chores_pending_merge_check`]: a chore
-/// the merge poller still needs to ask GitHub about.
+/// or project_task the merge poller still needs to ask GitHub about.
 #[derive(Debug, Clone)]
 pub struct PendingMergeCheck {
     pub work_item_id: String,
