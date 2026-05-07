@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installMainMenu() {
-        let appName = ProcessInfo.processInfo.processName
+        let appName = "Boss"
         let mainMenu = NSMenu()
 
         let appMenuItem = NSMenuItem()
