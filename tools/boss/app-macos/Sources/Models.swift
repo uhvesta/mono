@@ -235,6 +235,8 @@ struct WorkBoardSection: Identifiable {
     let id: String
     let title: String
     let items: [WorkTask]
+    var isCollapsible: Bool = false
+    var defaultExpanded: Bool = true
 }
 
 extension WorkTask {

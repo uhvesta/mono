@@ -1212,6 +1212,9 @@ final class ChatViewModel: ObservableObject {
 
     func workSections(in column: WorkBoardColumnKey) -> [WorkBoardSection] {
         let items = workItems(in: column)
+        if column == .done {
+            return Self.doneSections(items: items)
+        }
         guard workBoardGrouping == .project else {
             return [WorkBoardSection(id: column.rawValue, title: column.title, items: items)]
         }
@@ -1224,6 +1227,132 @@ final class ChatViewModel: ObservableObject {
             guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
             return WorkBoardSection(id: "\(column.rawValue)-\(key)", title: key, items: sectionItems)
         }
+    }
+
+    /// Bucket completed tasks by recency for the Done lane:
+    ///   Today | Yesterday | <weekday names back to start of current week>
+    ///   | Last Week | Earlier
+    /// Bucketing uses `updated_at` because the engine doesn't yet record a
+    /// dedicated `done_at` (status-transition) timestamp — see PR description.
+    static func doneSections(
+        items: [WorkTask],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [WorkBoardSection] {
+        let isoFractional = ISO8601DateFormatter()
+        isoFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        isoPlain.formatOptions = [.withInternetDateTime]
+
+        let nowDay = calendar.startOfDay(for: now)
+        guard let yesterdayDay = calendar.date(byAdding: .day, value: -1, to: nowDay) else {
+            return [WorkBoardSection(id: "done-all", title: "Done", items: items)]
+        }
+        let weekday = calendar.component(.weekday, from: nowDay)
+        let firstWeekday = calendar.firstWeekday
+        let daysSinceStartOfWeek = (weekday - firstWeekday + 7) % 7
+        guard let startOfWeek = calendar.date(byAdding: .day, value: -daysSinceStartOfWeek, to: nowDay),
+              let startOfLastWeek = calendar.date(byAdding: .day, value: -7, to: startOfWeek)
+        else {
+            return [WorkBoardSection(id: "done-all", title: "Done", items: items)]
+        }
+
+        let weekdayFormatter = DateFormatter()
+        weekdayFormatter.locale = .current
+        weekdayFormatter.dateFormat = "EEEE"
+
+        struct BucketSpec {
+            let id: String
+            let title: String
+            let defaultExpanded: Bool
+        }
+
+        var bucketOrder: [BucketSpec] = [
+            BucketSpec(id: "today", title: "Today", defaultExpanded: true),
+            BucketSpec(id: "yesterday", title: "Yesterday", defaultExpanded: false),
+        ]
+        if daysSinceStartOfWeek >= 2 {
+            for daysAgo in 2...daysSinceStartOfWeek {
+                if let date = calendar.date(byAdding: .day, value: -daysAgo, to: nowDay) {
+                    bucketOrder.append(
+                        BucketSpec(
+                            id: "weekday-\(daysAgo)",
+                            title: weekdayFormatter.string(from: date),
+                            defaultExpanded: false
+                        )
+                    )
+                }
+            }
+        }
+        bucketOrder.append(BucketSpec(id: "last-week", title: "Last Week", defaultExpanded: false))
+        bucketOrder.append(BucketSpec(id: "earlier", title: "Earlier", defaultExpanded: false))
+
+        var buckets: [String: [WorkTask]] = [:]
+        for task in items {
+            let bucketID = bucketID(
+                for: task,
+                nowDay: nowDay,
+                yesterdayDay: yesterdayDay,
+                startOfWeek: startOfWeek,
+                startOfLastWeek: startOfLastWeek,
+                calendar: calendar,
+                formatters: [isoFractional, isoPlain]
+            )
+            buckets[bucketID, default: []].append(task)
+        }
+
+        return bucketOrder.compactMap { spec -> WorkBoardSection? in
+            guard let tasks = buckets[spec.id], !tasks.isEmpty else { return nil }
+            let sorted = tasks.sorted { $0.updatedAt > $1.updatedAt }
+            return WorkBoardSection(
+                id: "done-\(spec.id)",
+                title: spec.title,
+                items: sorted,
+                isCollapsible: true,
+                defaultExpanded: spec.defaultExpanded
+            )
+        }
+    }
+
+    private static func bucketID(
+        for task: WorkTask,
+        nowDay: Date,
+        yesterdayDay: Date,
+        startOfWeek: Date,
+        startOfLastWeek: Date,
+        calendar: Calendar,
+        formatters: [ISO8601DateFormatter]
+    ) -> String {
+        guard let parsed = parseISODate(task.updatedAt, formatters: formatters) else {
+            return "earlier"
+        }
+        let day = calendar.startOfDay(for: parsed)
+        if day >= nowDay {
+            return "today"
+        }
+        if day >= yesterdayDay {
+            return "yesterday"
+        }
+        if day >= startOfWeek {
+            let delta = calendar.dateComponents([.day], from: day, to: nowDay).day ?? 0
+            return "weekday-\(delta)"
+        }
+        if day >= startOfLastWeek {
+            return "last-week"
+        }
+        return "earlier"
+    }
+
+    private static func parseISODate(
+        _ string: String,
+        formatters: [ISO8601DateFormatter]
+    ) -> Date? {
+        for formatter in formatters {
+            if let date = formatter.date(from: string) {
+                return date
+            }
+        }
+        return nil
     }
 
     func isTaskVisible(_ task: WorkTask) -> Bool {

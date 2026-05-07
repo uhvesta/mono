@@ -640,49 +640,7 @@ struct ContentView: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 12) {
                         ForEach(sections) { section in
-                            if model.workBoardGrouping == .project {
-                                Text(section.title)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                            }
-                            VStack(alignment: .leading, spacing: 10) {
-                                ForEach(section.items) { task in
-                                    Button {
-                                        model.selectWorkCard(
-                                            model.selectedTask?.id == task.id ? nil : task.id
-                                        )
-                                    } label: {
-                                        WorkBoardCardView(
-                                            task: task,
-                                            projectName: task.isChore ? nil : model.projectName(for: task.projectID),
-                                            isSelected: model.selectedTask?.id == task.id,
-                                            activityState: column == .doing
-                                                ? AgentActivityState(
-                                                    runtime: model.taskRuntime(for: task.id),
-                                                    liveState: model.workerLiveState(forTaskID: task.id)
-                                                  )
-                                                : nil,
-                                            assignedSlotId: column == .doing
-                                                ? model.workerLiveState(forTaskID: task.id)?.slotId
-                                                : nil
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                    .popover(
-                                        isPresented: Binding(
-                                            get: { model.selectedTask?.id == task.id },
-                                            set: { isPresented in
-                                                if !isPresented, model.selectedTask?.id == task.id {
-                                                    model.selectWorkCard(nil)
-                                                }
-                                            }
-                                        ),
-                                        arrowEdge: .trailing
-                                    ) {
-                                        WorkCardPopoverView(model: model, task: task)
-                                    }
-                                }
-                            }
+                            workSectionView(section, column: column)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -707,11 +665,116 @@ struct ContentView: View {
     }
 
     @ViewBuilder
+    private func workSectionView(_ section: WorkBoardSection, column: WorkBoardColumnKey) -> some View {
+        if section.isCollapsible {
+            CollapsibleWorkBoardSection(
+                sectionID: section.id,
+                title: section.title,
+                count: section.items.count,
+                defaultExpanded: section.defaultExpanded
+            ) {
+                workSectionItems(section.items, column: column)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.workBoardGrouping == .project {
+                    Text(section.title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                workSectionItems(section.items, column: column)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func workSectionItems(_ items: [WorkTask], column: WorkBoardColumnKey) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(items) { task in
+                Button {
+                    model.selectWorkCard(
+                        model.selectedTask?.id == task.id ? nil : task.id
+                    )
+                } label: {
+                    WorkBoardCardView(
+                        task: task,
+                        projectName: task.isChore ? nil : model.projectName(for: task.projectID),
+                        isSelected: model.selectedTask?.id == task.id,
+                        activityState: column == .doing
+                            ? AgentActivityState(
+                                runtime: model.taskRuntime(for: task.id),
+                                liveState: model.workerLiveState(forTaskID: task.id)
+                              )
+                            : nil,
+                        assignedSlotId: column == .doing
+                            ? model.workerLiveState(forTaskID: task.id)?.slotId
+                            : nil
+                    )
+                }
+                .buttonStyle(.plain)
+                .popover(
+                    isPresented: Binding(
+                        get: { model.selectedTask?.id == task.id },
+                        set: { isPresented in
+                            if !isPresented, model.selectedTask?.id == task.id {
+                                model.selectWorkCard(nil)
+                            }
+                        }
+                    ),
+                    arrowEdge: .trailing
+                ) {
+                    WorkCardPopoverView(model: model, task: task)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
     private func workSidebarSectionTitle(_ title: String) -> some View {
         Text(title)
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .textCase(.uppercase)
+    }
+}
+
+private struct CollapsibleWorkBoardSection<Content: View>: View {
+    let sectionID: String
+    let title: String
+    let count: Int
+    let defaultExpanded: Bool
+    @ViewBuilder let content: () -> Content
+
+    @State private var userToggled: Bool = false
+
+    private var isExpanded: Bool {
+        userToggled ? !defaultExpanded : defaultExpanded
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                userToggled.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10)
+                    Text("\(title) (\(count))")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                content()
+            }
+        }
+        .id(sectionID)
     }
 }
 
