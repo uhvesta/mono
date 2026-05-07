@@ -69,6 +69,19 @@ pub trait CubeClient: Send + Sync {
     /// per workspace, the same shape `workspace_status` returns for a
     /// single workspace.
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>>;
+    /// Run `jj workspace update-stale` against every workspace cube
+    /// knows about. Cube's lease path runs `jj git fetch` inside the
+    /// claimed workspace and that fails with `Error: The working copy
+    /// is stale` whenever a sibling worker advanced the underlying
+    /// operation log — which happens routinely. The recovery is to
+    /// run `jj workspace update-stale` in the affected workspace and
+    /// retry the lease. Cube doesn't tell us *which* workspace it
+    /// tried, so we sweep all known workspace paths and let jj no-op
+    /// on the ones that aren't actually stale.
+    ///
+    /// Returns the workspace paths it attempted to update so the
+    /// caller can include them in tracing output.
+    async fn unstale_workspaces(&self) -> Result<Vec<PathBuf>>;
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +318,66 @@ impl CubeClient for CommandCubeClient {
             })
             .collect())
     }
+
+    async fn unstale_workspaces(&self) -> Result<Vec<PathBuf>> {
+        let workspaces = self.list_workspaces().await?;
+        let mut visited: Vec<PathBuf> = Vec::with_capacity(workspaces.len());
+        for ws in &workspaces {
+            visited.push(ws.workspace_path.clone());
+            // `jj workspace update-stale` is a no-op on workspaces that
+            // aren't actually stale, so we run it across every known
+            // path rather than trying to identify the stale one. Per-
+            // path failures are logged but don't abort the sweep — we
+            // want to give every workspace a chance before the retry.
+            let mut command = Command::new("jj");
+            command
+                .args(["workspace", "update-stale"])
+                .current_dir(&ws.workspace_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+
+            match command.output().await {
+                Ok(output) if output.status.success() => {
+                    tracing::debug!(
+                        workspace_id = %ws.workspace_id,
+                        path = %ws.workspace_path.display(),
+                        "ran `jj workspace update-stale`"
+                    );
+                }
+                Ok(output) => {
+                    tracing::warn!(
+                        workspace_id = %ws.workspace_id,
+                        path = %ws.workspace_path.display(),
+                        status = %output.status,
+                        stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                        "`jj workspace update-stale` returned a non-zero exit; \
+                         continuing the sweep"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        workspace_id = %ws.workspace_id,
+                        path = %ws.workspace_path.display(),
+                        error = %err,
+                        "failed to spawn `jj workspace update-stale`; \
+                         continuing the sweep"
+                    );
+                }
+            }
+        }
+        Ok(visited)
+    }
+}
+
+/// Heuristic match for the cube/jj "working copy is stale" error so we
+/// can run a targeted recovery (sweep `jj workspace update-stale` and
+/// retry) instead of letting a benign, expected condition sink an
+/// otherwise-fine dispatch attempt.
+fn lease_failure_is_stale_working_copy(error: &anyhow::Error) -> bool {
+    let chain = format!("{error:#}").to_lowercase();
+    chain.contains("working copy is stale")
 }
 
 #[derive(Debug, Clone)]
@@ -738,8 +811,101 @@ impl ExecutionCoordinator {
         {
             Ok(lease) => lease,
             Err(err) => {
-                self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)?;
-                return Err(err);
+                // Cube's lease path runs `jj git fetch` inside the
+                // claimed workspace; if a sibling worker advanced the
+                // operation log, jj reports `The working copy is
+                // stale`. That's a benign, expected condition — the
+                // historical bug was that the engine surfaced it as
+                // "no slot available", silently capping concurrency
+                // at whatever number of workspaces were still fresh.
+                // Surface the stderr loudly, sweep
+                // `jj workspace update-stale` across every known
+                // workspace, and try the lease one more time before
+                // giving up.
+                if lease_failure_is_stale_working_copy(&err) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id,
+                        cube_repo_id = %repo.repo_id,
+                        error = format!("{err:#}"),
+                        "cube workspace lease failed with stale working copy; \
+                         attempting `jj workspace update-stale` recovery and retrying"
+                    );
+                    match self.cube_client.unstale_workspaces().await {
+                        Ok(visited) => {
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                cube_repo_id = %repo.repo_id,
+                                visited_workspaces = visited.len(),
+                                "swept `jj workspace update-stale` across cube workspaces; \
+                                 retrying lease"
+                            );
+                        }
+                        Err(sweep_err) => {
+                            tracing::error!(
+                                execution_id = %execution.id,
+                                cube_repo_id = %repo.repo_id,
+                                error = format!("{sweep_err:#}"),
+                                "failed to sweep `jj workspace update-stale` across cube \
+                                 workspaces; retrying lease anyway"
+                            );
+                        }
+                    }
+                    match self
+                        .cube_client
+                        .lease_workspace(
+                            &repo.repo_id,
+                            &task,
+                            execution.preferred_workspace_id.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(lease) => {
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                cube_lease_id = %lease.lease_id,
+                                cube_workspace_id = %lease.workspace_id,
+                                "lease retry after stale-recovery sweep succeeded"
+                            );
+                            lease
+                        }
+                        Err(retry_err) => {
+                            tracing::error!(
+                                execution_id = %execution.id,
+                                work_item_id = %execution.work_item_id,
+                                worker_id,
+                                cube_repo_id = %repo.repo_id,
+                                error = format!("{retry_err:#}"),
+                                "cube workspace lease still failing after stale recovery; \
+                                 marking execution start as failed"
+                            );
+                            self.record_start_failure(
+                                execution,
+                                worker_id,
+                                Some(repo.repo_id.as_str()),
+                                &retry_err,
+                            )?;
+                            return Err(retry_err);
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id,
+                        cube_repo_id = %repo.repo_id,
+                        error = format!("{err:#}"),
+                        "cube workspace lease failed; marking execution start as failed"
+                    );
+                    self.record_start_failure(
+                        execution,
+                        worker_id,
+                        Some(repo.repo_id.as_str()),
+                        &err,
+                    )?;
+                    return Err(err);
+                }
             }
         };
         let change_title = execution_change_title(execution, &work_item);
@@ -1153,15 +1319,41 @@ mod tests {
         status_calls: Mutex<Vec<PathBuf>>,
         heartbeat_calls: Mutex<Vec<(String, Option<u64>)>>,
         force_release_calls: Mutex<Vec<(String, Option<String>)>>,
+        unstale_calls: Mutex<u32>,
         fail_ensure: bool,
         fail_lease: bool,
         fail_create: bool,
+        /// Per-call lease error queue. Each entry is the message a
+        /// `lease_workspace` call should fail with; once empty, leases
+        /// succeed normally. Lets tests script "first call fails with
+        /// a stale error, second call succeeds" without standing up a
+        /// stateful client.
+        scripted_lease_errors: Mutex<Vec<String>>,
+        /// Workspaces returned from `list_workspaces` /
+        /// `unstale_workspaces`. The recovery path sweeps every entry
+        /// here; tests use this to assert the sweep ran.
+        listed_workspaces: Mutex<Vec<CubeWorkspaceStatus>>,
         next_workspace_id: Mutex<Option<String>>,
     }
 
     impl FakeCubeClient {
         fn with_next_workspace_id(self, id: impl Into<String>) -> Self {
             *self.next_workspace_id.try_lock().expect("uncontended") = Some(id.into());
+            self
+        }
+
+        fn with_scripted_lease_errors<I, S>(self, errors: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            *self.scripted_lease_errors.try_lock().expect("uncontended") =
+                errors.into_iter().map(Into::into).collect();
+            self
+        }
+
+        fn with_listed_workspaces(self, workspaces: Vec<CubeWorkspaceStatus>) -> Self {
+            *self.listed_workspaces.try_lock().expect("uncontended") = workspaces;
             self
         }
     }
@@ -1189,6 +1381,16 @@ mod tests {
                 task.to_owned(),
                 prefer_workspace_id.map(str::to_owned),
             ));
+            // Scripted errors take priority over `fail_lease` so a
+            // test can mix "first attempt fails, second succeeds"
+            // shapes against the same fake.
+            {
+                let mut scripted = self.scripted_lease_errors.lock().await;
+                if !scripted.is_empty() {
+                    let message = scripted.remove(0);
+                    return Err(anyhow!(message));
+                }
+            }
             if self.fail_lease {
                 return Err(anyhow!("cube workspace lease failed"));
             }
@@ -1269,7 +1471,18 @@ mod tests {
         }
 
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            Ok(Vec::new())
+            Ok(self.listed_workspaces.lock().await.clone())
+        }
+
+        async fn unstale_workspaces(&self) -> Result<Vec<PathBuf>> {
+            *self.unstale_calls.lock().await += 1;
+            Ok(self
+                .listed_workspaces
+                .lock()
+                .await
+                .iter()
+                .map(|ws| ws.workspace_path.clone())
+                .collect())
         }
     }
 
@@ -1628,6 +1841,161 @@ mod tests {
             Some("cube workspace lease failed")
         );
         assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+    }
+
+    /// Regression: a stale-working-copy lease failure used to bubble
+    /// straight up to `record_start_failure` and silently capped
+    /// concurrency at whatever number of workspaces happened to be
+    /// fresh. The recovery path now sweeps `jj workspace update-stale`
+    /// across every cube workspace and retries the lease once.
+    ///
+    /// We script the fake to fail the first lease with the literal
+    /// stderr cube reports (`Error: The working copy is stale ...`)
+    /// and let the second attempt succeed. The execution should land
+    /// in `running` exactly as if the first attempt had worked, and
+    /// `unstale_workspaces` must have been invoked between attempts.
+    #[tokio::test]
+    async fn stale_lease_failure_triggers_unstale_sweep_and_retries_once() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let stale_stderr = "Cube command failed: Error: The working copy is stale \
+                            (not updated since operation de4201248950).";
+        let cube = Arc::new(
+            FakeCubeClient::default()
+                .with_scripted_lease_errors([stale_stderr])
+                .with_listed_workspaces(vec![CubeWorkspaceStatus {
+                    workspace_id: "mono-agent-005".to_owned(),
+                    workspace_path: PathBuf::from("/tmp/mono-agent-005"),
+                    state: "free".to_owned(),
+                    lease_id: None,
+                    holder: None,
+                    task: None,
+                    leased_at_epoch_s: None,
+                    lease_expires_at_epoch_s: None,
+                }]),
+        );
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+
+        wait_for_execution_status(
+            db.as_ref(),
+            &db.list_executions(Some(&chore.id)).unwrap()[0].id,
+            "running",
+        )
+        .await;
+
+        let lease_calls = cube.lease_calls.lock().await;
+        assert_eq!(
+            lease_calls.len(),
+            2,
+            "expected exactly two lease attempts (stale failure + retry), got {}",
+            lease_calls.len()
+        );
+        drop(lease_calls);
+
+        let unstale_calls = *cube.unstale_calls.lock().await;
+        assert_eq!(
+            unstale_calls, 1,
+            "expected the stale-recovery sweep to run exactly once, got {unstale_calls}"
+        );
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        assert_eq!(
+            execution.status, "running",
+            "execution must reach running after the auto-recovery retry"
+        );
+        assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
+    }
+
+    /// Non-stale lease failures must NOT trigger the recovery sweep —
+    /// otherwise we'd loop on every transient cube error and still
+    /// report success when the underlying problem is unrelated. The
+    /// historical bug had the engine swallow these too; we now log
+    /// loudly and surface the failure as before, but without the
+    /// retry. Asserts that `unstale_workspaces` was never called and
+    /// the execution lands in `failed`.
+    #[tokio::test]
+    async fn non_stale_lease_failure_does_not_trigger_recovery_sweep() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(
+            FakeCubeClient::default()
+                .with_scripted_lease_errors([
+                    "Cube command failed: Error: cube database busy",
+                ]),
+        );
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        coordinator.kick();
+
+        wait_for_execution_status(
+            db.as_ref(),
+            &db.list_executions(Some(&chore.id)).unwrap()[0].id,
+            "failed",
+        )
+        .await;
+
+        let lease_calls = cube.lease_calls.lock().await;
+        assert_eq!(
+            lease_calls.len(),
+            1,
+            "non-stale failure must not trigger a retry; got {} lease attempts",
+            lease_calls.len()
+        );
+        drop(lease_calls);
+
+        let unstale_calls = *cube.unstale_calls.lock().await;
+        assert_eq!(
+            unstale_calls, 0,
+            "unstale sweep must only fire for stale-working-copy errors"
+        );
     }
 
     #[tokio::test]

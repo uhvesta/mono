@@ -830,6 +830,9 @@ mod tests {
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
             Ok(Vec::new())
         }
+        async fn unstale_workspaces(&self) -> Result<Vec<std::path::PathBuf>> {
+            Ok(Vec::new())
+        }
     }
 
     #[derive(Default)]
