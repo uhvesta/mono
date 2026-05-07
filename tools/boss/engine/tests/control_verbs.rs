@@ -13,10 +13,12 @@
 //!   cube layer returns, plus engine-side annotations. The engine's
 //!   in-process cube client is a no-op stub here, so we mainly check
 //!   the wire shape and that the response decodes.
-//! - `stop_run` (agents stop): regression test for the BossOnly auth
-//!   check — when no Boss pid is registered (the v2 macOS app has
-//!   not yet wired `RegisterBossSession`), the engine must still let
-//!   trusted callers through without rejecting them as BossOnly.
+//! - `stop_run` (agents stop): regression test for the auth tier on
+//!   the StopRun verb. `bossctl agents stop` is the coordinator's
+//!   imperative kill switch; humans run it from the Boss pane, the
+//!   app shell, *and* from inside worker (slot) panes. The earlier
+//!   BossOnly tier rejected the worker-pane case; the verb now uses
+//!   AppOrBoss, which accepts worker descendants too.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -323,16 +325,16 @@ async fn workspace_summary_returns_pool_snapshot() -> Result<()> {
 
 #[tokio::test]
 async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
-    // Reproduces the bug from the work item: the BossOnly gate had
-    // `boss_pid.into_iter().collect()` as its trust set, which goes
-    // empty whenever the macOS app hasn't sent `RegisterBossSession`
-    // yet — and that includes every coordinator-session use case
-    // we've tested in the wild. The fix opens up the gate to
-    // descendants of the app trust root (excluding registered worker
-    // pids); in the in-process test harness, both app_pid and
-    // boss_pid are unset, which is treated as permissive — so a
-    // local client must still be allowed to call `stop_run` without
-    // hitting "stop_run is BossOnly".
+    // Reproduces the bug from the work item: even after the earlier
+    // BossOnly fallback fix, `bossctl agents stop` still hit
+    // "stop_run is BossOnly" when invoked from inside a worker
+    // (slot) pane — the BossOnly gate explicitly excludes callers
+    // that descend from a registered worker shell pid. The verb is
+    // now AppOrBoss, which accepts worker descendants too. In the
+    // in-process test harness app_pid and boss_pid are both unset
+    // (treated as permissive), so any local caller must succeed
+    // here; the worker-descendant case is locked in by the macOS
+    // unit test `app_or_boss_admits_worker_descendant`.
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
@@ -344,8 +346,9 @@ async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
         FrontendEvent::RunStopped { .. } => {}
         FrontendEvent::Error { message, .. } => {
             assert!(
-                !message.contains("BossOnly"),
-                "stop_run must not reject local callers as BossOnly: {message}"
+                !message.contains("BossOnly")
+                    && !message.contains("requires app or Boss authority"),
+                "stop_run must not reject local callers on auth grounds: {message}"
             );
         }
         other => return Err(anyhow!("unexpected response: {other:?}")),
