@@ -660,6 +660,23 @@ impl ExecutionCoordinator {
                     pool_capacity,
                     "worker pool exhausted; deferring dispatch until a worker is released"
                 );
+                // Invariant: every `tasks.status = 'active'` chore
+                // should be backed by a `running` execution / live
+                // worker. If the pool stalled with active chores that
+                // have no running execution, surface the gap so the
+                // ghost-active state isn't silent — the human can
+                // compare against `bossctl agents list`.
+                if let Ok(orphans) = self.work_db.list_active_chores_without_live_run() {
+                    if !orphans.is_empty() {
+                        tracing::warn!(
+                            ghost_active = ?orphans,
+                            pool_capacity,
+                            "active chores without a running execution after pool exhaustion \
+                             — `boss chore list --status active` and `bossctl agents list` will \
+                             diverge until a slot frees up"
+                        );
+                    }
+                }
                 break;
             };
 
@@ -2085,6 +2102,250 @@ mod tests {
             3
         );
         assert_eq!(coordinator.worker_pool().idle_count().await, 0);
+    }
+
+    /// Ghost-active regression: when the worker pool is exhausted,
+    /// chores that lost the dispatcher's claim race must NOT have
+    /// `tasks.status` flipped to `'active'`. They stay in `todo` so
+    /// `boss chore list --status active` and `bossctl agents list`
+    /// agree on which chores actually have a worker.
+    ///
+    /// Setup: pool capped at 1, three autostart chores reconciled into
+    /// `ready` executions back-to-back. Only one can be dispatched —
+    /// the other two must remain `todo` with no run record. This is
+    /// the test that would have caught the "6 active, 4 workers"
+    /// observation in the bug report.
+    #[tokio::test]
+    async fn pool_exhaustion_does_not_ghost_activate_chores() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        let mut chore_ids = Vec::new();
+        for index in 0..3 {
+            let chore = db
+                .create_chore(CreateChoreInput {
+                    product_id: product.id.clone(),
+                    name: format!("Chore {index}"),
+                    description: None,
+                    autostart: true,
+                })
+                .unwrap();
+            chore_ids.push(chore.id);
+        }
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        coordinator.kick();
+
+        // Wait for the dispatcher to settle on exactly one running
+        // execution. With pool=1 and 3 ready chores the loop must
+        // claim the first slot, then break on pool exhaustion.
+        for _ in 0..200 {
+            let executions = db.list_executions(None).unwrap();
+            if executions
+                .iter()
+                .filter(|execution| execution.status == "running")
+                .count()
+                == 1
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // One chore active with a run, two stay todo with no run.
+        let mut active_with_run = 0usize;
+        let mut still_todo = 0usize;
+        for chore_id in &chore_ids {
+            let item = db.get_work_item(chore_id).unwrap();
+            let status = match item {
+                WorkItem::Chore(t) | WorkItem::Task(t) => t.status,
+                other => panic!("expected chore/task, got {other:?}"),
+            };
+            let executions = db.list_executions(Some(chore_id)).unwrap();
+            assert_eq!(executions.len(), 1, "exactly one execution per chore");
+            let runs = db.list_runs(&executions[0].id).unwrap();
+            match status.as_str() {
+                "active" => {
+                    assert_eq!(executions[0].status, "running");
+                    assert_eq!(runs.len(), 1, "active chore must have a run record");
+                    assert_eq!(runs[0].status, "active");
+                    active_with_run += 1;
+                }
+                "todo" => {
+                    assert_eq!(executions[0].status, "ready");
+                    assert!(
+                        runs.is_empty(),
+                        "todo chore must not have a run record yet, got {runs:?}",
+                    );
+                    still_todo += 1;
+                }
+                other => panic!(
+                    "chore {chore_id} unexpectedly in status `{other}` — \
+                     `active` and `todo` are the only valid states for this \
+                     pool-exhausted scenario",
+                ),
+            }
+        }
+        assert_eq!(
+            active_with_run, 1,
+            "exactly one chore should be active with a run; got {active_with_run}",
+        );
+        assert_eq!(
+            still_todo, 2,
+            "two chores should stay `todo` with no run; got {still_todo}",
+        );
+        assert_eq!(coordinator.worker_pool().idle_count().await, 0);
+    }
+
+    /// Boot-time heal: a `tasks.status = 'active'` row whose
+    /// executions never produced a `work_runs` entry (e.g. previous
+    /// engine crashed between the kanban drag and the dispatch claim,
+    /// or a `RequestExecution` raced ahead of an exhausted pool) is
+    /// demoted back to `todo` on startup. Items WITH run history are
+    /// left alone — `reconcile_active_dispatch` is the right tool for
+    /// those.
+    #[tokio::test]
+    async fn heal_ghost_active_demotes_chores_without_run_history() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        // Ghost A: dragged to Doing but no execution exists at all.
+        let ghost_a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Ghost A".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        db.update_work_item(
+            &ghost_a.id,
+            crate::work::WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Ghost B: dragged to Doing, has a `ready` execution but no
+        // run yet — the "RequestExecution raced an exhausted pool"
+        // shape from the bug report.
+        let ghost_b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Ghost B".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        db.update_work_item(
+            &ghost_b.id,
+            crate::work::WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.request_execution(RequestExecutionInput {
+            work_item_id: ghost_b.id.clone(),
+            priority: None,
+            preferred_workspace_id: None,
+            force: false,
+        })
+        .unwrap();
+
+        // Real worker: started a run before the engine restarted,
+        // mimicking a crashed-mid-flight chore. heal must NOT touch
+        // this — `reconcile_active_dispatch` redispatches it.
+        let real = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Real worker".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        let real_exec = db
+            .create_execution(crate::work::CreateExecutionInput {
+                work_item_id: real.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        db.start_execution_run(
+            &real_exec.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+        let healed = db.heal_ghost_active_chores().unwrap();
+        let mut healed_sorted = healed.clone();
+        healed_sorted.sort();
+        let mut expected = vec![ghost_a.id.clone(), ghost_b.id.clone()];
+        expected.sort();
+        assert_eq!(healed_sorted, expected, "healed only the ghost rows");
+
+        // Demoted ghosts now sit in `todo`.
+        for id in &[&ghost_a.id, &ghost_b.id] {
+            match db.get_work_item(id).unwrap() {
+                WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "todo"),
+                other => panic!("expected chore/task, got {other:?}"),
+            }
+        }
+
+        // Ghost B's stranded `ready` execution was abandoned so the
+        // dispatcher won't claim a slot for a chore that just got
+        // pulled out of the Doing column.
+        let ghost_b_execs = db.list_executions(Some(&ghost_b.id)).unwrap();
+        assert_eq!(ghost_b_execs.len(), 1);
+        assert_eq!(ghost_b_execs[0].status, "abandoned");
+
+        // The real chore stays `active` with its `running` execution
+        // intact — heal is conservative.
+        match db.get_work_item(&real.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+            other => panic!("expected chore/task, got {other:?}"),
+        }
+        let real_execs = db.list_executions(Some(&real.id)).unwrap();
+        assert_eq!(real_execs.len(), 1);
+        assert_eq!(real_execs[0].status, "running");
     }
 
     /// Regression coverage for PR #228. Default-sized pool
