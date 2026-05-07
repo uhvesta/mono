@@ -391,6 +391,62 @@ impl WorkerPool {
         Some(worker.worker_id.clone())
     }
 
+    /// Skip-the-queue claim used by `bossctl agents launch`. Same
+    /// affinity-then-random selection as `claim_worker`, but if every
+    /// configured slot is busy and the pool is still below the hard
+    /// cap (`MAX_WORKER_POOL_SIZE`) we grow the pool by one fresh slot
+    /// and hand it back. Returns `None` only when the pool is already
+    /// at the hard cap with no idle slot — at that point there's no
+    /// pane the macOS app could render anyway, so the launch is
+    /// rejected rather than silently overcommitting.
+    pub async fn claim_worker_force(
+        &self,
+        execution_id: &str,
+        preferred_workspace_id: Option<&str>,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+
+        if let Some(target) = preferred_workspace_id {
+            if let Some(idx) = inner.workers.iter().position(|w| {
+                w.execution_id.is_none()
+                    && w.last_workspace_id.as_deref() == Some(target)
+            }) {
+                let worker = &mut inner.workers[idx];
+                worker.execution_id = Some(execution_id.to_owned());
+                return Some(worker.worker_id.clone());
+            }
+        }
+
+        let free: Vec<usize> = inner
+            .workers
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.execution_id.is_none())
+            .map(|(idx, _)| idx)
+            .collect();
+        if let Some(&idx) = inner.rng.choice(&free) {
+            let worker = &mut inner.workers[idx];
+            worker.execution_id = Some(execution_id.to_owned());
+            return Some(worker.worker_id.clone());
+        }
+
+        // Every existing slot is busy. Grow the pool — bounded by the
+        // hard cap so the app's 8-pane workspace can always render the
+        // forced worker.
+        if inner.workers.len() >= MAX_WORKER_POOL_SIZE {
+            return None;
+        }
+        let new_index = inner.workers.len();
+        let worker = WorkerSlot {
+            worker_id: format!("worker-{}", new_index + 1),
+            execution_id: Some(execution_id.to_owned()),
+            last_workspace_id: None,
+        };
+        let id = worker.worker_id.clone();
+        inner.workers.push(worker);
+        Some(id)
+    }
+
     /// Release `worker_id` back to the idle pool. If `last_workspace_id`
     /// is provided we record it as the worker's affinity for future
     /// preferred-workspace claims.
@@ -534,6 +590,48 @@ impl ExecutionCoordinator {
         tokio::spawn(async move {
             coordinator.run_scheduler().await;
         });
+    }
+
+    /// Skip-the-queue dispatch for `bossctl agents launch`. Looks the
+    /// execution up directly, claims a worker via
+    /// `WorkerPool::claim_worker_force` (which grows the pool by one
+    /// slot up to the hard cap when every configured slot is busy),
+    /// and runs the same `schedule_execution` path the auto-dispatcher
+    /// uses. Returns the worker id we landed on so callers can echo it
+    /// back to the human.
+    ///
+    /// Errors when the execution is not in `ready` (already claimed by
+    /// the auto-dispatcher in a race, terminal, or unknown), or when
+    /// the worker pool is already at the hard cap with no idle slot.
+    pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str) -> Result<String> {
+        let execution = self
+            .work_db
+            .get_execution(execution_id)
+            .with_context(|| format!("failed to look up execution {execution_id}"))?;
+        if execution.status != "ready" {
+            return Err(anyhow!(
+                "execution {execution_id} is in status {status:?}, not ready — cannot force-dispatch",
+                status = execution.status,
+            ));
+        }
+        let preferred_workspace_id = execution.preferred_workspace_id.clone();
+        let worker_id = self
+            .worker_pool
+            .claim_worker_force(&execution.id, preferred_workspace_id.as_deref())
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "worker pool already at hard cap ({MAX_WORKER_POOL_SIZE}); cannot \
+                     force-dispatch {execution_id}"
+                )
+            })?;
+        if let Err(err) = self.schedule_execution(&execution, &worker_id).await {
+            self.worker_pool
+                .release_worker(&worker_id, preferred_workspace_id.as_deref())
+                .await;
+            return Err(err);
+        }
+        Ok(worker_id)
     }
 
     async fn run_scheduler(self: Arc<Self>) {
@@ -1660,6 +1758,7 @@ mod tests {
             work_item_id: late.id.clone(),
             priority: Some(10),
             preferred_workspace_id: None,
+            force: false,
         })
         .unwrap();
 
@@ -1730,6 +1829,7 @@ mod tests {
             work_item_id: chore.id.clone(),
             priority: None,
             preferred_workspace_id: Some("mono-agent-007".to_owned()),
+            force: false,
         })
         .unwrap();
 
@@ -2060,5 +2160,143 @@ mod tests {
             "expected all 5 autostart chores to be dispatched concurrently, got {running} running",
         );
         assert_eq!(coordinator.worker_pool().idle_count().await, 3);
+    }
+
+    /// `bossctl agents launch` (Phase 7 of the v2 plan) must dispatch
+    /// even when every configured slot is busy — the verb's whole point
+    /// is to *skip the queue*. We mirror the cap test above
+    /// (`scheduler_respects_worker_pool_capacity`) but with a smaller
+    /// pool so we can sit under the hard cap, fill every slot, and
+    /// then prove `force_dispatch` grows the pool by one slot and runs
+    /// the launched item immediately rather than leaving it `ready`.
+    #[tokio::test]
+    async fn force_dispatch_bypasses_configured_pool_cap() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let busy = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already running".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        // A second chore that will sit in `ready` because the
+        // configured pool size is 1 and `busy` claimed it.
+        let queued = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Skip the queue".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        coordinator.kick();
+
+        // Wait for the first chore to actually be claimed by the lone
+        // worker slot — otherwise force_dispatch might race the
+        // scheduler and grow the pool unnecessarily.
+        for _ in 0..200 {
+            let busy_exec = db.list_executions(Some(&busy.id)).unwrap().pop().unwrap();
+            if busy_exec.status == "running" {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(coordinator.worker_pool().idle_count().await, 0);
+        assert_eq!(coordinator.worker_pool().capacity().await, 1);
+
+        // `bossctl agents launch <queued.id>` enters the engine via
+        // `RequestExecution { force: true }`. Promote `queued` to a
+        // `ready` execution (the auto-start opt-out kept it parked),
+        // then call the same coordinator entry point that `app.rs`
+        // hits when `force = true`.
+        let queued_exec = db
+            .request_execution(RequestExecutionInput {
+                work_item_id: queued.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: true,
+            })
+            .unwrap();
+        let worker_id = coordinator
+            .force_dispatch(&queued_exec.id)
+            .await
+            .expect("force_dispatch should bypass the cap and return a worker id");
+        assert_eq!(
+            worker_id, "worker-2",
+            "expected force_dispatch to grow the pool with a new slot",
+        );
+
+        for _ in 0..200 {
+            let queued_after = db
+                .list_executions(Some(&queued.id))
+                .unwrap()
+                .pop()
+                .unwrap();
+            if queued_after.status == "running" {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let queued_after = db
+            .list_executions(Some(&queued.id))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            queued_after.status, "running",
+            "force-launched execution should be dispatched immediately",
+        );
+        assert_eq!(
+            coordinator.worker_pool().capacity().await,
+            2,
+            "force_dispatch must grow the pool by one slot",
+        );
+        assert_eq!(coordinator.worker_pool().idle_count().await, 0);
+    }
+
+    /// The pool-grow path is hard-capped at `MAX_WORKER_POOL_SIZE`
+    /// because the macOS app only has eight panes. A force-launch
+    /// request that arrives with every hard-cap slot busy must surface
+    /// a real error instead of silently overcommitting.
+    #[tokio::test]
+    async fn force_dispatch_errors_at_hard_cap() {
+        let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE);
+        for i in 0..MAX_WORKER_POOL_SIZE {
+            pool.claim_worker(&format!("exec-{i}"), None)
+                .await
+                .expect("hard-cap pool should hand out one slot per claim");
+        }
+        assert_eq!(pool.idle_count().await, 0);
+        assert!(
+            pool.claim_worker_force("overflow", None).await.is_none(),
+            "claim_worker_force must reject when the pool is already at the hard cap",
+        );
+        assert_eq!(
+            pool.capacity().await,
+            MAX_WORKER_POOL_SIZE,
+            "rejected force-claim must not grow the pool past the hard cap",
+        );
     }
 }

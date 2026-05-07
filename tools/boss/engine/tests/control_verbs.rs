@@ -139,6 +139,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 work_item_id: chore.id.clone(),
                 priority: None,
                 preferred_workspace_id: None,
+                force: false,
             },
         })
         .await?

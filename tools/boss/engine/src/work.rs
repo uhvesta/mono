@@ -262,6 +262,7 @@ impl WorkDb {
                     work_item_id: work_item_id.clone(),
                     priority: None,
                     preferred_workspace_id: None,
+                    force: false,
                 },
                 |run_id| is_live(run_id),
             )?;
@@ -2162,6 +2163,11 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         work_item_id,
         priority,
         preferred_workspace_id,
+        // `force` is purely a dispatcher hint (handled by
+        // `ExecutionCoordinator::force_dispatch`); the DB layer just
+        // creates / refreshes a `ready` row the same way for both
+        // forced and queued requests.
+        force: _,
     } = input;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
@@ -3617,6 +3623,7 @@ mod tests {
                     work_item_id: chore.id.clone(),
                     priority: None,
                     preferred_workspace_id: None,
+                    force: false,
                 },
                 |_| false,
             )
@@ -3670,6 +3677,7 @@ mod tests {
                     work_item_id: chore.id.clone(),
                     priority: None,
                     preferred_workspace_id: None,
+                    force: false,
                 },
                 |_| true,
             )

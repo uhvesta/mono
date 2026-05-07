@@ -580,11 +580,17 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   user-typed input into a worker pane.
 - `bossctl agents interrupt` — needs an engine→app RPC for
   Esc-equivalent into a worker pane.
-- `bossctl agents launch` — bypass the coordinator's
-  auto-dispatch and force-spawn a worker for a given work item.
-  The closest existing behaviour is `bossctl work start` (which
-  goes through `RequestExecution`); `launch` is meant to be the
-  "skip the queue" verb.
+- ~~`bossctl agents launch`~~ — landed. Maps to
+  `RequestExecution { force: true, .. }`. The `force` flag flips
+  the engine path from `kick()` (let the auto-dispatcher pick
+  the next ready execution) to
+  `ExecutionCoordinator::force_dispatch`, which grows the worker
+  pool by one slot up to `MAX_WORKER_POOL_SIZE` when every
+  configured slot is busy. If the pool is already at the hard
+  cap the launch fails with a clear error rather than silently
+  overcommitting (the macOS app only renders eight panes).
+  Coverage: `coordinator::tests::force_dispatch_bypasses_configured_pool_cap`
+  and `force_dispatch_errors_at_hard_cap`.
 - `bossctl agents transcript` — tail a worker transcript from
   the Boss pane.
 - `bossctl workspace summary` — needs an engine surface that

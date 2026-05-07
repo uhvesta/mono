@@ -182,6 +182,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Agents {
             action: AgentsAction::Transcript { agent, lines },
         } => agents_transcript(&cli.socket_path, cli.json, agent, lines).await,
+        Command::Agents {
+            action:
+                AgentsAction::Launch {
+                    work_item_id,
+                    preferred_workspace_id,
+                },
+        } => agents_launch(
+            &cli.socket_path,
+            cli.json,
+            work_item_id,
+            preferred_workspace_id,
+        )
+        .await,
         Command::Work {
             action:
                 WorkAction::Start {
@@ -490,6 +503,44 @@ async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -
     }
 }
 
+/// Skip-the-queue spawn for `bossctl agents launch <work-item-id>`.
+/// Maps to `RequestExecution { force: true, .. }`: the engine grows
+/// the worker pool by one slot up to the hard cap when every
+/// configured slot is busy and dispatches the work item immediately,
+/// rather than letting the auto-dispatcher defer until a slot frees
+/// up.
+async fn agents_launch(
+    socket_path: &Option<String>,
+    json: bool,
+    work_item_id: String,
+    preferred_workspace_id: Option<String>,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::RequestExecution {
+            input: RequestExecutionInput {
+                work_item_id: work_item_id.clone(),
+                priority: None,
+                preferred_workspace_id,
+                force: true,
+            },
+        })
+        .await
+        .context("sending RequestExecution (force)")?;
+    match response {
+        FrontendEvent::ExecutionRequested { execution }
+        | FrontendEvent::ExecutionCreated { execution }
+        | FrontendEvent::ExecutionResult { execution } => {
+            print_execution(json, &execution);
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected agents launch: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
 async fn work_start(
     socket_path: &Option<String>,
     json: bool,
@@ -504,6 +555,7 @@ async fn work_start(
                 work_item_id: work_item_id.clone(),
                 priority,
                 preferred_workspace_id,
+                force: false,
             },
         })
         .await
