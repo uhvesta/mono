@@ -242,7 +242,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             Err(err) => return Err(StartWorkerError::AppError(err)),
         },
         EngineToAppResponse::ReleaseWorkerPane { .. }
-        | EngineToAppResponse::SendToPane { .. } => {
+        | EngineToAppResponse::SendToPane { .. }
+        | EngineToAppResponse::FocusWorkerPane { .. } => {
             return Err(StartWorkerError::ResponseKindMismatch);
         }
     };

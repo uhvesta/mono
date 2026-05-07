@@ -78,6 +78,20 @@ pub struct SendToPaneInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SendToPaneResult {}
 
+/// Engine asks the app to bring a worker pane to the front: select
+/// the pane in the Workers grid, focus its surface so keystrokes go
+/// to that pty, and raise the app window to the front of the
+/// window-server stack. Used by `bossctl agents focus`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FocusWorkerPaneInput {
+    pub slot_id: u8,
+}
+
+/// App's reply when focus succeeds. Empty for now; reserved for
+/// future fields (e.g., whether the window was already key).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FocusWorkerPaneResult {}
+
 /// What the engine is asking the app to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -85,6 +99,7 @@ pub enum EngineToAppRequest {
     SpawnWorkerPane(SpawnWorkerPaneInput),
     ReleaseWorkerPane(ReleaseWorkerPaneInput),
     SendToPane(SendToPaneInput),
+    FocusWorkerPane(FocusWorkerPaneInput),
 }
 
 /// App's reply, paired with the `request_id` from the originating
@@ -105,6 +120,9 @@ pub enum EngineToAppResponse {
     },
     SendToPane {
         result: Result<SendToPaneResult, EngineToAppError>,
+    },
+    FocusWorkerPane {
+        result: Result<FocusWorkerPaneResult, EngineToAppError>,
     },
 }
 
@@ -214,6 +232,36 @@ mod tests {
     fn release_response_round_trips() {
         let original = EngineToAppResponse::ReleaseWorkerPane {
             result: Ok(ReleaseWorkerPaneResult {}),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn focus_request_round_trips() {
+        let original =
+            EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 4 });
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("focus_worker_pane"));
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn focus_response_ok_round_trips() {
+        let original = EngineToAppResponse::FocusWorkerPane {
+            result: Ok(FocusWorkerPaneResult {}),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn focus_response_err_round_trips() {
+        let original = EngineToAppResponse::FocusWorkerPane {
+            result: Err(EngineToAppError::UnknownSlot),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();

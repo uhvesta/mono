@@ -219,6 +219,14 @@ pub enum FrontendRequest {
     StopRun {
         run_id: String,
     },
+    /// Boss-tier RPC: bring the worker pane hosting `run_id` to the
+    /// front in the macOS app. Resolves `run_id → slot_id` via the
+    /// engine's worker registry and forwards a `FocusWorkerPane`
+    /// engine→app request. Used by `bossctl agents focus`. Returns a
+    /// `WorkError` if the run is unknown or has no allocated pane.
+    FocusWorkerPane {
+        run_id: String,
+    },
     /// Snapshot of every allocated worker slot's live state — what
     /// model it's running, what activity (working / waiting / idle /
     /// errored / terminated), most recent tool, etc. Source of truth
@@ -414,6 +422,15 @@ pub enum FrontendEvent {
     /// fully drain; teardown is asynchronous.
     RunStopped {
         run_id: String,
+    },
+    /// Engine acknowledges a focus request — the worker pane has
+    /// been raised in the macOS app. Carries the resolved `slot_id`
+    /// so the caller (e.g. `bossctl agents focus`) can confirm which
+    /// slot was raised when the agent reference was a crew name or
+    /// run id.
+    WorkerPaneFocused {
+        run_id: String,
+        slot_id: u8,
     },
     /// Engine asks the registered app session to perform a pane
     /// operation. The app must reply with a

@@ -52,6 +52,9 @@ struct ContentView: View {
             model.paneSendHandler = { [workspace = workersWorkspace] slotId, text in
                 workspace.sendToPane(slotId: slotId, text: text)
             }
+            model.paneFocusHandler = { [workspace = workersWorkspace] slotId in
+                workspace.focusWorkerPane(slotId: slotId)
+            }
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)

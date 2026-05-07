@@ -23,10 +23,10 @@ use crate::coordinator::{
     CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
 use crate::protocol::{
-    AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FrontendEvent,
-    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, ReleaseWorkerPaneInput,
-    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic,
-    work_product_topic,
+    AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse,
+    FocusWorkerPaneInput, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
+    FrontendRequestEnvelope, ReleaseWorkerPaneInput, TOPIC_WORK_PRODUCTS,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, work_product_topic,
 };
 use tokio::time::{Duration, timeout};
 use crate::runner::AcpExecutionRunner;
@@ -430,6 +430,22 @@ pub enum SendToAppError {
     ResponseKindMismatch(&'static str),
 }
 
+/// Surfaced by [`ServerState::focus_worker_pane`]. Distinguishes
+/// engine-side resolution failures (run id has no allocated slot)
+/// from transport/app failures so the `bossctl` handler can produce
+/// a precise error message.
+#[derive(Debug, thiserror::Error)]
+pub enum FocusPaneError {
+    #[error("no worker pane mapped for that run id")]
+    UnknownRun,
+    #[error("app reported error: {0:?}")]
+    App(EngineToAppError),
+    #[error(transparent)]
+    Send(#[from] SendToAppError),
+    #[error("app returned unexpected response: {0}")]
+    ResponseKindMismatch(String),
+}
+
 impl ServerState {
     fn new_arc(cfg: Arc<RuntimeConfig>) -> Result<Arc<Self>> {
         let app_pid = current_parent_pid();
@@ -628,6 +644,25 @@ impl ServerState {
         // entry here would lie to the UI about the slot being live.
         self.live_worker_states.release_slot(slot_id);
         self.broadcast_live_worker_states().await;
+    }
+
+    /// Resolve `run_id → slot_id` and ask the app to bring that
+    /// worker pane to the front. Returns the resolved slot on success
+    /// so callers (`bossctl agents focus`) can confirm in JSON output
+    /// which slot was raised.
+    pub async fn focus_worker_pane(&self, run_id: &str) -> Result<u8, FocusPaneError> {
+        let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
+            return Err(FocusPaneError::UnknownRun);
+        };
+        let request = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id });
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::FocusWorkerPane { result: Ok(_) }) => Ok(slot_id),
+            Ok(EngineToAppResponse::FocusWorkerPane { result: Err(err) }) => {
+                Err(FocusPaneError::App(err))
+            }
+            Ok(other) => Err(FocusPaneError::ResponseKindMismatch(format!("{other:?}"))),
+            Err(err) => Err(FocusPaneError::Send(err)),
+        }
     }
 
     /// Register `session_id` as the app session. Any prior
@@ -2700,6 +2735,56 @@ async fn handle_frontend_connection(
                     FrontendEvent::RunStopped { run_id },
                 );
             }
+            FrontendRequest::FocusWorkerPane { run_id } => {
+                // `bossctl agents focus` is a coordinator verb that
+                // raises a sibling worker pane to the front. The
+                // human invokes it from wherever they are — boss
+                // pane, app shell, or another worker pane — so the
+                // tier is `AppOrBoss`, matching `probe_run` /
+                // `stop_run` (which are also legal from inside a
+                // worker pane).
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        run_id = %run_id,
+                        "focus_worker_pane rejected: caller not in app/Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "focus_worker_pane requires app or Boss authority"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                match server_state.focus_worker_pane(&run_id).await {
+                    Ok(slot_id) => {
+                        tracing::info!(
+                            run_id = %run_id,
+                            slot_id,
+                            "focus_worker_pane: pane raised",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkerPaneFocused { run_id, slot_id },
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, run_id = %run_id, "focus_worker_pane failed");
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("focus_worker_pane: {err}"),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::ListWorkerLiveStates => {
                 let states = server_state.live_worker_states_snapshot();
                 send_response(
@@ -3692,6 +3777,110 @@ mod tests {
         // chore-done firing for the same run) is a no-op.
         server_state.release_worker_pane("run-x").await;
         assert!(server_state.live_worker_states.get(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn focus_worker_pane_unknown_run_returns_unknown_run() {
+        let server_state = test_server_state();
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink)
+            .await;
+        let err = server_state
+            .focus_worker_pane("never-allocated")
+            .await
+            .expect_err("unknown run should fail");
+        assert!(matches!(err, FocusPaneError::UnknownRun));
+    }
+
+    #[tokio::test]
+    async fn focus_worker_pane_round_trips_to_app() {
+        // End-to-end smoke: engine resolves run_id → slot via the
+        // worker registry, sends a FocusWorkerPane EngineRequest to
+        // the registered app session, and surfaces the slot id once
+        // the app replies success.
+        let server_state = test_server_state();
+        server_state
+            .worker_registry
+            .register_run_slot("run-focus", 5);
+
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let focus = tokio::spawn(async move {
+            server_clone.focus_worker_pane("run-focus").await
+        });
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("an EngineRequest event should be enqueued");
+        let (request_id, request) = match envelope.payload {
+            FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        match request {
+            EngineToAppRequest::FocusWorkerPane(input) => {
+                assert_eq!(input.slot_id, 5);
+            }
+            other => panic!("expected FocusWorkerPane, got {other:?}"),
+        }
+
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::FocusWorkerPane {
+                    result: Ok(crate::protocol::FocusWorkerPaneResult {}),
+                },
+            )
+            .await;
+
+        let slot = focus.await.expect("focus task").expect("focus ok");
+        assert_eq!(slot, 5);
+    }
+
+    #[tokio::test]
+    async fn focus_worker_pane_surfaces_app_error() {
+        let server_state = test_server_state();
+        server_state
+            .worker_registry
+            .register_run_slot("run-focus", 3);
+
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let focus = tokio::spawn(async move {
+            server_clone.focus_worker_pane("run-focus").await
+        });
+
+        let envelope = sink.next().await.expect("EngineRequest enqueued");
+        let request_id = match envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id,
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::FocusWorkerPane {
+                    result: Err(EngineToAppError::UnknownSlot),
+                },
+            )
+            .await;
+
+        let err = focus.await.expect("focus task").expect_err("expect err");
+        match err {
+            FocusPaneError::App(EngineToAppError::UnknownSlot) => {}
+            other => panic!("expected App(UnknownSlot), got {other:?}"),
+        }
     }
 
     #[test]

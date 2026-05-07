@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 @MainActor
@@ -81,6 +82,38 @@ final class WorkersWorkspaceModel: ObservableObject {
             return .failure(.internalFailure("pane has no live surface"))
         }
         host.writeText(text)
+        return .success
+    }
+
+    /// Bring the slot's libghostty surface to first responder and
+    /// raise the host window. Mirrors the user-click path in
+    /// `GhosttyTerminalHostView.mouseDown` (which also calls
+    /// `makeFirstResponder(self)`), then activates the application so
+    /// the window is visible if it was minimised or behind another
+    /// app. Used by `bossctl agents focus`.
+    func focusWorkerPane(slotId: Int) -> EngineFocusResult {
+        guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
+            return .failure(.unknownSlot)
+        }
+        guard let session = slots[index].session else {
+            return .failure(.unknownSlot)
+        }
+        guard let host = session.hostView else {
+            return .failure(.internalFailure("pane has no live surface"))
+        }
+        guard let window = host.window else {
+            // No host window means the pane isn't on screen yet
+            // (NSView never moved into a window). The slot is
+            // allocated but unrenderable, so refuse instead of
+            // silently no-op'ing.
+            return .failure(.internalFailure("pane has no host window"))
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(host)
         return .success
     }
 }

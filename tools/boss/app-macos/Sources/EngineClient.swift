@@ -44,10 +44,21 @@ enum EngineSendResult: Sendable {
     case failure(EngineSendError)
 }
 
+enum EngineFocusError: Sendable {
+    case unknownSlot
+    case internalFailure(String)
+}
+
+enum EngineFocusResult: Sendable {
+    case success
+    case failure(EngineFocusError)
+}
+
 enum EngineRequestKind: Sendable {
     case spawnWorkerPane(EngineSpawnRequest)
     case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
     case sendToPane(slotId: Int, text: String)
+    case focusWorkerPane(slotId: Int)
 }
 
 enum EngineEvent {
@@ -357,6 +368,24 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendFocusWorkerPaneResponse(requestId: String, result: EngineFocusResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success:
+            resultPayload = ["Ok": [String: Any]()]
+        case .failure(let error):
+            resultPayload = ["Err": focusEngineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "focus_worker_pane",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
     private func engineToAppErrorPayload(_ error: EngineSpawnError) -> [String: Any] {
         switch error {
         case .noAvailableSlot:
@@ -376,6 +405,15 @@ final class EngineClient: @unchecked Sendable {
     }
 
     private func sendEngineToAppErrorPayload(_ error: EngineSendError) -> [String: Any] {
+        switch error {
+        case .unknownSlot:
+            return ["kind": "unknown_slot"]
+        case .internalFailure(let message):
+            return ["kind": "internal", "message": message]
+        }
+    }
+
+    private func focusEngineToAppErrorPayload(_ error: EngineFocusError) -> [String: Any] {
         switch error {
         case .unknownSlot:
             return ["kind": "unknown_slot"]
@@ -624,6 +662,12 @@ final class EngineClient: @unchecked Sendable {
                     emit(.engineRequest(
                         requestId: requestId,
                         request: .sendToPane(slotId: slotId, text: text)
+                    ))
+                case "focus_worker_pane":
+                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .focusWorkerPane(slotId: slotId)
                     ))
                 default:
                     emit(.error(agentId: nil, message: "engine_request unknown kind: \(kind)"))

@@ -177,6 +177,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::Stop { agent },
         } => agents_stop(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
+            action: AgentsAction::Focus { agent },
+        } => agents_focus(&cli.socket_path, cli.json, agent).await,
+        Command::Agents {
             action: AgentsAction::Transcript { agent, lines },
         } => agents_transcript(&cli.socket_path, cli.json, agent, lines).await,
         Command::Work {
@@ -446,6 +449,42 @@ async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) ->
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected stop: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let response = client
+        .send_request(&FrontendRequest::FocusWorkerPane {
+            run_id: run_id.clone(),
+        })
+        .await
+        .context("sending FocusWorkerPane")?;
+    match response {
+        FrontendEvent::WorkerPaneFocused {
+            run_id: returned,
+            slot_id,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "focused",
+                        "run_id": returned,
+                        "slot_id": slot_id,
+                    })
+                );
+            } else {
+                println!("focused slot {slot_id} (run {returned})");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected focus: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }

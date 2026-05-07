@@ -30,5 +30,10 @@ let package = Package(
                 .linkedLibrary("c++"),
             ]
         ),
+        .testTarget(
+            name: "BossMacAppTests",
+            dependencies: ["BossMacApp"],
+            path: "Tests/BossMacAppTests"
+        ),
     ]
 )
