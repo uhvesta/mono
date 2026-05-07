@@ -97,7 +97,17 @@ pub enum CubeError {
     },
     #[error("failed to serialize output: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("workspace `{workspace_path}` is stale and could not be auto-recovered: {cause}")]
+    StaleRecoveryFailed {
+        workspace_path: PathBuf,
+        cause: String,
+    },
 }
+
+/// Stable substring jj prints when a working copy is stale relative to
+/// the shared op log. Verified against the version pinned in
+/// `tools/jj/` — the wording has been stable across releases.
+const JJ_STALE_SIGNATURE: &str = "working copy is stale";
 
 impl CubeError {
     pub fn exit_code(&self) -> ExitCode {
@@ -109,9 +119,11 @@ impl CubeError {
                 ExitCode::from(5)
             }
             Self::SetupStepFailed { .. } => ExitCode::from(6),
-            Self::Storage(_) | Self::Io(_) | Self::CommandFailed { .. } | Self::Json(_) => {
-                ExitCode::FAILURE
-            }
+            Self::Storage(_)
+            | Self::Io(_)
+            | Self::CommandFailed { .. }
+            | Self::Json(_)
+            | Self::StaleRecoveryFailed { .. } => ExitCode::FAILURE,
         }
     }
 }
@@ -417,18 +429,24 @@ fn run_workspace(
                 return Err(CubeError::NoAvailableWorkspace(repo));
             }
 
-            if let Err(error) =
-                reset_workspace(runner, &workspace.workspace_path, &repo_record.main_branch)
-            {
+            if let Err(error) = reset_workspace(
+                runner,
+                database_path,
+                &workspace.workspace_path,
+                &repo_record.main_branch,
+            ) {
                 let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                 return Err(error);
             }
 
-            let head_commit = current_workspace_commit(runner, &workspace.workspace_path)?;
+            let head_commit =
+                current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
             store.update_workspace_head_commit(&lease_id, Some(&head_commit))?;
             workspace.head_commit = Some(head_commit);
 
-            audit!(database_path, "lease.acquired",
+            audit!(
+                database_path,
+                "lease.acquired",
                 repo = workspace.repo,
                 workspace_id = workspace.workspace_id,
                 lease_id = lease_id,
@@ -488,13 +506,20 @@ fn run_workspace(
                 let repo_record = store
                     .get_repo(&workspace.repo)?
                     .ok_or_else(|| CubeError::RepoNotFound(workspace.repo.clone()))?;
-                reset_workspace(runner, &workspace.workspace_path, &repo_record.main_branch)?;
+                reset_workspace(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repo_record.main_branch,
+                )?;
             }
             let released = store
                 .release_workspace(&lease, reason.as_deref())?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
 
-            audit!(database_path, "lease.released",
+            audit!(
+                database_path,
+                "lease.released",
                 repo = released.repo,
                 workspace_id = released.workspace_id,
                 lease_id = lease,
@@ -550,7 +575,9 @@ fn run_workspace(
                 .force_release_lease(&lease, Some(&reason))?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
 
-            audit!(database_path, "lease.force_released",
+            audit!(
+                database_path,
+                "lease.force_released",
                 repo = released.repo,
                 workspace_id = released.workspace_id,
                 lease_id = lease,
@@ -571,7 +598,11 @@ fn run_workspace(
             let path = PathBuf::from(&workspace);
             let record = find_workspace_record(&mut store, &path)?
                 .ok_or_else(|| CubeError::WorkspaceNotFound(workspace.clone()))?;
-            let jj_status = runner.run(&RealCommandRunner::invocation(&path, "jj", &["status"]))?;
+            let jj_status = run_jj(
+                runner,
+                database_path,
+                &RealCommandRunner::invocation(&path, "jj", &["status"]),
+            )?;
 
             RunResult::new(
                 human_workspace_detail(&record, &jj_status),
@@ -675,25 +706,33 @@ fn run_change(
                 let parent = store
                     .get_change(parent_change_id)?
                     .ok_or_else(|| CubeError::ChangeNotFound(parent_change_id.to_string()))?;
-                runner.run(&CommandInvocation {
-                    cwd: workspace_path.clone(),
-                    program: "jj".to_string(),
-                    args: vec![
-                        "new".to_string(),
-                        parent.jj_change_id,
-                        "-m".to_string(),
-                        args.title.clone(),
-                    ],
-                })?;
+                run_jj(
+                    runner,
+                    database_path,
+                    &CommandInvocation {
+                        cwd: workspace_path.clone(),
+                        program: "jj".to_string(),
+                        args: vec![
+                            "new".to_string(),
+                            parent.jj_change_id,
+                            "-m".to_string(),
+                            args.title.clone(),
+                        ],
+                    },
+                )?;
             } else {
-                runner.run(&CommandInvocation {
-                    cwd: workspace_path.clone(),
-                    program: "jj".to_string(),
-                    args: vec!["describe".to_string(), "-m".to_string(), args.title.clone()],
-                })?;
+                run_jj(
+                    runner,
+                    database_path,
+                    &CommandInvocation {
+                        cwd: workspace_path.clone(),
+                        program: "jj".to_string(),
+                        args: vec!["describe".to_string(), "-m".to_string(), args.title.clone()],
+                    },
+                )?;
             }
 
-            let identity = current_change_identity(runner, &workspace_path)?;
+            let identity = current_change_identity(runner, database_path, &workspace_path)?;
             let change_id = format!("chg_{}", Uuid::new_v4().simple());
             let record = store.insert_change(&ChangeRecord {
                 change_id,
@@ -899,53 +938,120 @@ fn find_workspace_record(
 
 fn reset_workspace(
     runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
     workspace_path: &Path,
     main_branch: &str,
 ) -> Result<()> {
-    runner.run(&RealCommandRunner::invocation(
-        workspace_path,
-        "jj",
-        &["git", "fetch"],
-    ))?;
-    runner.run(&RealCommandRunner::invocation(
-        workspace_path,
-        "jj",
-        &["new", main_branch],
-    ))?;
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
+    )?;
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &["new", main_branch]),
+    )?;
     Ok(())
 }
 
-fn current_workspace_commit(runner: &dyn CommandRunner, workspace_path: &Path) -> Result<String> {
-    runner.run(&CommandInvocation {
-        cwd: workspace_path.to_path_buf(),
-        program: "jj".to_string(),
-        args: vec![
-            "log".to_string(),
-            "--no-graph".to_string(),
-            "-r".to_string(),
-            "@".to_string(),
-            "-T".to_string(),
-            "commit_id.short()".to_string(),
-        ],
-    })
+/// Run a `jj` command against a workspace, transparently recovering
+/// from a stale working copy. If the underlying command fails with the
+/// `working copy is stale` signature, runs `jj workspace update-stale`
+/// once and retries. Non-stale failures and non-`jj` invocations pass
+/// through untouched.
+fn run_jj(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    invocation: &CommandInvocation,
+) -> Result<String> {
+    match runner.run(invocation) {
+        Ok(out) => Ok(out),
+        Err(err) => {
+            if !is_stale_working_copy_error(&err) {
+                return Err(err);
+            }
+            let update_stale = RealCommandRunner::invocation(
+                &invocation.cwd,
+                "jj",
+                &["workspace", "update-stale"],
+            );
+            if let Err(update_err) = runner.run(&update_stale) {
+                return Err(CubeError::StaleRecoveryFailed {
+                    workspace_path: invocation.cwd.clone(),
+                    cause: format!("jj workspace update-stale failed: {update_err}"),
+                });
+            }
+            audit!(
+                database_path,
+                "workspace.stale_recovered",
+                workspace_path = invocation.cwd.display().to_string(),
+                program = invocation.program,
+                args = invocation.args,
+            );
+            match runner.run(invocation) {
+                Ok(out) => Ok(out),
+                Err(retry_err) => Err(CubeError::StaleRecoveryFailed {
+                    workspace_path: invocation.cwd.clone(),
+                    cause: format!("retry after update-stale failed: {retry_err}"),
+                }),
+            }
+        }
+    }
+}
+
+fn is_stale_working_copy_error(err: &CubeError) -> bool {
+    matches!(
+        err,
+        CubeError::CommandFailed { program, stderr, .. }
+            if program == "jj" && stderr.to_lowercase().contains(JJ_STALE_SIGNATURE)
+    )
+}
+
+fn current_workspace_commit(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+) -> Result<String> {
+    run_jj(
+        runner,
+        database_path,
+        &CommandInvocation {
+            cwd: workspace_path.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec![
+                "log".to_string(),
+                "--no-graph".to_string(),
+                "-r".to_string(),
+                "@".to_string(),
+                "-T".to_string(),
+                "commit_id.short()".to_string(),
+            ],
+        },
+    )
 }
 
 fn current_change_identity(
     runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
     workspace_path: &Path,
 ) -> Result<ChangeIdentity> {
-    let output = runner.run(&CommandInvocation {
-        cwd: workspace_path.to_path_buf(),
-        program: "jj".to_string(),
-        args: vec![
-            "log".to_string(),
-            "--no-graph".to_string(),
-            "-r".to_string(),
-            "@".to_string(),
-            "-T".to_string(),
-            "change_id ++ \"\\n\" ++ commit_id.short()".to_string(),
-        ],
-    })?;
+    let output = run_jj(
+        runner,
+        database_path,
+        &CommandInvocation {
+            cwd: workspace_path.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec![
+                "log".to_string(),
+                "--no-graph".to_string(),
+                "-r".to_string(),
+                "@".to_string(),
+                "-T".to_string(),
+                "change_id ++ \"\\n\" ++ commit_id.short()".to_string(),
+            ],
+        },
+    )?;
     let mut lines = output
         .lines()
         .map(str::trim)
@@ -1050,11 +1156,7 @@ fn human_workspace_detail(record: &crate::metadata::WorkspaceRecord, jj_status: 
             dim.apply_to("workspace_path:"),
             abbreviate_path(&record.workspace_path),
         ),
-        format!(
-            "{} {}",
-            dim.apply_to("state:"),
-            style_state(record.state),
-        ),
+        format!("{} {}", dim.apply_to("state:"), style_state(record.state),),
     ];
     if let Some(lease_id) = &record.lease_id {
         lines.push(format!(
@@ -3281,6 +3383,162 @@ steps:
         assert!(record.lease_id.is_some());
     }
 
+    #[test]
+    fn workspace_lease_recovers_from_stale_jj_working_copy() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // First `jj git fetch` returns the stale-working-copy error.
+        // The wrapper should run `jj workspace update-stale` once, then
+        // retry the original command. The remainder of the lease then
+        // proceeds normally.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::stale(workspace_path.clone(), "jj", &["git", "fetch"]),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["workspace", "update-stale"],
+                "Working copy now at: abc1234",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "stale demo"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease should auto-recover from stale");
+        runner.assert_exhausted();
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-004"
+        );
+        assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
+
+        // The recovery is observable in the audit log.
+        let audit_dir = database_path.parent().unwrap().join("audit");
+        let logs = std::fs::read_dir(&audit_dir)
+            .expect("audit dir")
+            .filter_map(|e| e.ok())
+            .map(|e| std::fs::read_to_string(e.path()).expect("audit log"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            logs.contains("\"event\":\"workspace.stale_recovered\""),
+            "expected stale_recovered audit event, got: {logs}"
+        );
+        assert!(
+            logs.contains(workspace_path.display().to_string().as_str()),
+            "audit event should record the workspace path"
+        );
+    }
+
+    #[test]
+    fn workspace_lease_surfaces_stale_recovery_failure() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // `jj git fetch` reports stale; `jj workspace update-stale`
+        // itself fails. The lease must not pretend success — surface a
+        // distinct StaleRecoveryFailed error.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::stale(workspace_path.clone(), "jj", &["git", "fetch"]),
+            ExpectedCommand {
+                cwd: workspace_path.clone(),
+                program: "jj".to_string(),
+                args: vec!["workspace".to_string(), "update-stale".to_string()],
+                result: Err(CubeError::CommandFailed {
+                    program: "jj".to_string(),
+                    args: vec!["workspace".to_string(), "update-stale".to_string()],
+                    status: Some(1),
+                    stderr: "Error: workspace operation failed".to_string(),
+                }),
+                creates_dir: None,
+            },
+        ]);
+
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "stale fail"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("lease should fail when stale recovery itself fails");
+        runner.assert_exhausted();
+
+        match error {
+            CubeError::StaleRecoveryFailed {
+                workspace_path: path,
+                cause,
+            } => {
+                assert_eq!(path, workspace_path);
+                assert!(
+                    cause.contains("update-stale"),
+                    "cause should mention update-stale: {cause}"
+                );
+            }
+            other => panic!("expected StaleRecoveryFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_jj_propagates_non_stale_errors_unchanged() {
+        // Non-stale jj failures must not trigger recovery — only the
+        // specific stale signature is treated as recoverable.
+        use crate::command_runner::CommandInvocation;
+        let runner = FakeRunner::new(vec![ExpectedCommand {
+            cwd: PathBuf::from("/tmp/ws"),
+            program: "jj".to_string(),
+            args: vec!["status".to_string()],
+            result: Err(CubeError::CommandFailed {
+                program: "jj".to_string(),
+                args: vec!["status".to_string()],
+                status: Some(1),
+                stderr: "Error: something else entirely".to_string(),
+            }),
+            creates_dir: None,
+        }]);
+
+        let invocation = CommandInvocation {
+            cwd: PathBuf::from("/tmp/ws"),
+            program: "jj".to_string(),
+            args: vec!["status".to_string()],
+        };
+        let err = super::run_jj(&runner, None, &invocation)
+            .expect_err("non-stale failure should propagate");
+        runner.assert_exhausted();
+        assert!(
+            matches!(err, CubeError::CommandFailed { .. }),
+            "expected CommandFailed, got {err:?}"
+        );
+    }
+
     #[derive(Default)]
     struct FakeRunner {
         expectations: RefCell<VecDeque<ExpectedCommand>>,
@@ -3342,6 +3600,27 @@ steps:
         fn creating_dir(mut self, path: PathBuf) -> Self {
             self.creates_dir = Some(path);
             self
+        }
+
+        /// Build an expectation that simulates jj's stale-working-copy
+        /// failure. The wording matches what `cube`'s `run_jj` wrapper
+        /// looks for via `JJ_STALE_SIGNATURE`.
+        fn stale(cwd: PathBuf, program: &str, args: &[&str]) -> Self {
+            let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            Self {
+                cwd,
+                program: program.to_string(),
+                args: args_owned.clone(),
+                result: Err(CubeError::CommandFailed {
+                    program: program.to_string(),
+                    args: args_owned,
+                    status: Some(1),
+                    stderr: "Error: The working copy is stale (not updated since operation \
+                             0123456789ab). Run `jj workspace update-stale` to update it."
+                        .to_string(),
+                }),
+                creates_dir: None,
+            }
         }
     }
 }
