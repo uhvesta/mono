@@ -17,8 +17,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, LiveWorkerState, RequestExecutionInput, WorkExecution, WorkRun,
-    WorkspacePoolEntry,
+    FrontendEvent, FrontendRequest, LiveWorkerState, RequestExecutionInput, ROSTER, WorkExecution,
+    WorkRun, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -55,8 +55,10 @@ enum Command {
     /// Inject a probe prompt that a worker answers on its next Stop
     /// boundary; the reply is observed via the worker's transcript.
     Probe {
-        /// Run id to probe.
-        run_id: String,
+        /// Worker reference: run id, slot id, or crew name (e.g.
+        /// `Riker`). Crew names resolve only over currently-live
+        /// slots; case-insensitive.
+        agent: String,
         /// Probe text the worker will see as its next prompt.
         text: String,
     },
@@ -76,14 +78,31 @@ enum Command {
 enum AgentsAction {
     /// List worker sessions and their current state.
     List,
-    /// Show detailed status for a single worker.
-    Status { run_id: String },
+    /// Show detailed status for a single worker. Falls back to the
+    /// historical run record if the reference is a run id that is no
+    /// longer live.
+    Status {
+        /// Worker reference: run id, slot id, or crew name (e.g.
+        /// `Riker`). Crew names resolve only over currently-live
+        /// slots; case-insensitive.
+        agent: String,
+    },
     /// Bring a worker pane to the front.
-    Focus { run_id: String },
+    Focus {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+    },
     /// Send text to a worker as if user-typed.
-    Send { run_id: String, text: String },
+    Send {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+        text: String,
+    },
     /// Interrupt a worker (Esc-equivalent).
-    Interrupt { run_id: String },
+    Interrupt {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+    },
     /// Launch a worker session for a given work item without going
     /// through the coordinator's auto-dispatch path.
     Launch {
@@ -92,10 +111,14 @@ enum AgentsAction {
         preferred_workspace_id: Option<String>,
     },
     /// Stop a worker session and release its lease.
-    Stop { run_id: String },
+    Stop {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+    },
     /// Print the most recent transcript chunk from a worker.
     Transcript {
-        run_id: String,
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
         #[arg(long, default_value_t = 100)]
         lines: usize,
     },
@@ -141,19 +164,21 @@ fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Probe { run_id, text } => probe_run(&cli.socket_path, cli.json, run_id, text).await,
+        Command::Probe { agent, text } => {
+            probe_run(&cli.socket_path, cli.json, agent, text).await
+        }
         Command::Agents {
-            action: AgentsAction::Status { run_id },
-        } => agents_status(&cli.socket_path, cli.json, run_id).await,
+            action: AgentsAction::Status { agent },
+        } => agents_status(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
             action: AgentsAction::List,
         } => agents_list_live(&cli.socket_path, cli.json).await,
         Command::Agents {
-            action: AgentsAction::Stop { run_id },
-        } => agents_stop(&cli.socket_path, cli.json, run_id).await,
+            action: AgentsAction::Stop { agent },
+        } => agents_stop(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
-            action: AgentsAction::Transcript { run_id, lines },
-        } => agents_transcript(&cli.socket_path, cli.json, run_id, lines).await,
+            action: AgentsAction::Transcript { agent, lines },
+        } => agents_transcript(&cli.socket_path, cli.json, agent, lines).await,
         Command::Work {
             action:
                 WorkAction::Start {
@@ -192,13 +217,113 @@ async fn connect(socket_path: &Option<String>) -> Result<BossClient> {
         .context("connecting to engine")
 }
 
+/// Resolve a positional `agent` argument to a live worker entry.
+///
+/// Tries, in order: (a) exact match on `run_id`, (b) exact match on
+/// numeric `slot_id`, (c) case-insensitive exact match on crew
+/// `name`. The first non-empty tier wins; an ambiguous tier (more
+/// than one match) errors with the candidate list.
+///
+/// Names resolve only over currently-live slots — historical run
+/// ids stay run-id-only on purpose, so a typo'd crew name doesn't
+/// silently match a closed run.
+fn resolve_agent_ref<'a>(
+    reference: &str,
+    states: &'a [LiveWorkerState],
+) -> Result<&'a LiveWorkerState> {
+    let by_run: Vec<&LiveWorkerState> =
+        states.iter().filter(|s| s.run_id == reference).collect();
+    if !by_run.is_empty() {
+        return pick_unique(reference, by_run, states);
+    }
+    if let Ok(slot) = reference.parse::<u8>() {
+        let by_slot: Vec<&LiveWorkerState> =
+            states.iter().filter(|s| s.slot_id == slot).collect();
+        if !by_slot.is_empty() {
+            return pick_unique(reference, by_slot, states);
+        }
+    }
+    let by_name: Vec<&LiveWorkerState> = states
+        .iter()
+        .filter(|s| s.name.eq_ignore_ascii_case(reference))
+        .collect();
+    if !by_name.is_empty() {
+        return pick_unique(reference, by_name, states);
+    }
+    bail!(
+        "no live worker matches `{reference}`. {}",
+        live_candidates_summary(states),
+    )
+}
+
+fn pick_unique<'a>(
+    reference: &str,
+    matches: Vec<&'a LiveWorkerState>,
+    states: &'a [LiveWorkerState],
+) -> Result<&'a LiveWorkerState> {
+    if matches.len() == 1 {
+        return Ok(matches[0]);
+    }
+    bail!(
+        "`{reference}` matches multiple live workers: {}. {}",
+        matches
+            .iter()
+            .map(|s| format!("slot {} ({}) run {}", s.slot_id, s.name, s.run_id))
+            .collect::<Vec<_>>()
+            .join(", "),
+        live_candidates_summary(states),
+    )
+}
+
+fn live_candidates_summary(states: &[LiveWorkerState]) -> String {
+    if states.is_empty() {
+        return "no live workers".into();
+    }
+    let mut sorted: Vec<&LiveWorkerState> = states.iter().collect();
+    sorted.sort_by_key(|s| s.slot_id);
+    let labels: Vec<String> = sorted
+        .iter()
+        .map(|s| format!("slot {} ({})", s.slot_id, s.name))
+        .collect();
+    format!("Live: {}", labels.join(", "))
+}
+
+/// True if `reference` looks like a name or numeric slot id (so a
+/// resolver miss should be terminal rather than falling back to a
+/// historical run-id lookup). A run id like `exec_18ad...` falls
+/// through both checks.
+fn looks_like_name_or_slot(reference: &str) -> bool {
+    if reference.parse::<u8>().is_ok() {
+        return true;
+    }
+    ROSTER
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(reference))
+}
+
+async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<LiveWorkerState>> {
+    match client
+        .send_request(&FrontendRequest::ListWorkerLiveStates)
+        .await
+        .context("sending ListWorkerLiveStates")?
+    {
+        FrontendEvent::WorkerLiveStatesList { states } => Ok(states),
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected list: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
 async fn probe_run(
     socket_path: &Option<String>,
     json: bool,
-    run_id: String,
+    agent: String,
     text: String,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
     let response = client
         .send_request(&FrontendRequest::ProbeRun {
             run_id: run_id.clone(),
@@ -228,33 +353,32 @@ async fn probe_run(
     }
 }
 
-/// Show live runtime status for the worker associated with `run_id`.
-/// Falls back to the finalised `WorkRun` record (the historical
-/// snapshot the engine persists once the run row finalises) when no
-/// matching live entry is found — so the verb still works for runs
-/// that have already terminated.
-async fn agents_status(socket_path: &Option<String>, json: bool, run_id: String) -> Result<()> {
+/// Show live runtime status for the worker referenced by `agent`
+/// (run id, slot id, or crew name). Falls back to the finalised
+/// `WorkRun` record (the historical snapshot the engine persists
+/// once the run row finalises) when the reference looks like a
+/// run id and no matching live entry is found — so the verb still
+/// works for runs that have already terminated. Crew-name and
+/// slot-id references that miss are *not* fall through to the
+/// historical lookup; they error with the live candidate list to
+/// avoid silently matching a typo against a closed run.
+async fn agents_status(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
-    let states = match client
-        .send_request(&FrontendRequest::ListWorkerLiveStates)
-        .await
-        .context("sending ListWorkerLiveStates")?
-    {
-        FrontendEvent::WorkerLiveStatesList { states } => states,
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected status: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    };
+    let states = fetch_live_states(&mut client).await?;
 
-    if let Some(state) = states.into_iter().find(|s| s.run_id == run_id) {
-        print_live_state(json, &state);
-        return Ok(());
+    match resolve_agent_ref(&agent, &states) {
+        Ok(state) => {
+            print_live_state(json, state);
+            return Ok(());
+        }
+        Err(err) if looks_like_name_or_slot(&agent) => return Err(err),
+        Err(_) => {}
     }
 
-    // No live entry → look up the historical run record.
+    // No live entry and the reference doesn't look like a name or
+    // slot — assume it's a historical run id.
     let response = client
-        .send_request(&FrontendRequest::GetRun { id: run_id.clone() })
+        .send_request(&FrontendRequest::GetRun { id: agent.clone() })
         .await
         .context("sending GetRun")?;
     match response {
@@ -276,17 +400,7 @@ async fn agents_status(socket_path: &Option<String>, json: bool, run_id: String)
 /// and don't reflect the live worker.
 async fn agents_list_live(socket_path: &Option<String>, json: bool) -> Result<()> {
     let mut client = connect(socket_path).await?;
-    let states = match client
-        .send_request(&FrontendRequest::ListWorkerLiveStates)
-        .await
-        .context("sending ListWorkerLiveStates")?
-    {
-        FrontendEvent::WorkerLiveStatesList { states } => states,
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected list: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    };
+    let states = fetch_live_states(&mut client).await?;
 
     if json {
         println!(
@@ -305,8 +419,10 @@ async fn agents_list_live(socket_path: &Option<String>, json: bool) -> Result<()
     Ok(())
 }
 
-async fn agents_stop(socket_path: &Option<String>, json: bool, run_id: String) -> Result<()> {
+async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
     let response = client
         .send_request(&FrontendRequest::StopRun {
             run_id: run_id.clone(),
@@ -405,10 +521,12 @@ async fn work_cancel(
 async fn agents_transcript(
     socket_path: &Option<String>,
     json: bool,
-    run_id: String,
+    agent: String,
     lines: usize,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
     let response = client
         .send_request(&FrontendRequest::TailRunTranscript {
             run_id: run_id.clone(),
@@ -536,7 +654,7 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
         );
         return;
     }
-    println!("slot {}", state.slot_id);
+    println!("slot {} ({})", state.slot_id, state.name);
     println!("  run:           {}", state.run_id);
     println!("  model:         {}", state.model);
     println!("  activity:      {}", state.activity.as_str());
@@ -566,8 +684,9 @@ fn print_live_state_short(state: &LiveWorkerState) {
     let work_item = state.work_item_id.as_deref().unwrap_or("-");
     let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
     println!(
-        "slot {}  run={}  model={}  activity={}  tool={}  work_item={}  name=\"{}\"",
+        "slot {}  name={}  run={}  model={}  activity={}  tool={}  work_item={}  work_item_name=\"{}\"",
         state.slot_id,
+        state.name,
         state.run_id,
         state.model,
         state.activity.as_str(),
@@ -629,5 +748,102 @@ fn describe_verb(command: &Command) -> String {
         Command::Workspace { action } => match action {
             WorkspaceAction::Summary => "workspace summary".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boss_protocol::WorkerActivity;
+
+    fn live(slot: u8, run: &str) -> LiveWorkerState {
+        LiveWorkerState {
+            slot_id: slot,
+            name: boss_protocol::name_for_slot(slot),
+            run_id: run.into(),
+            model: "claude-opus-4-7".into(),
+            shell_pid: 0,
+            last_event_at: None,
+            current_tool: None,
+            last_tool_ended_at: None,
+            activity: WorkerActivity::Idle,
+            work_item_id: None,
+            work_item_name: None,
+            execution_id: None,
+        }
+    }
+
+    #[test]
+    fn resolves_by_run_id() {
+        let states = vec![live(1, "exec_a"), live(2, "exec_b")];
+        let hit = resolve_agent_ref("exec_b", &states).unwrap();
+        assert_eq!(hit.slot_id, 2);
+    }
+
+    #[test]
+    fn resolves_by_numeric_slot_id() {
+        let states = vec![live(1, "exec_a"), live(3, "exec_c")];
+        let hit = resolve_agent_ref("3", &states).unwrap();
+        assert_eq!(hit.run_id, "exec_c");
+    }
+
+    #[test]
+    fn resolves_by_crew_name_case_insensitive() {
+        let states = vec![live(1, "exec_a"), live(2, "exec_b")];
+        // slot 1 = Riker, slot 2 = Data
+        let hit = resolve_agent_ref("riker", &states).unwrap();
+        assert_eq!(hit.slot_id, 1);
+        let hit = resolve_agent_ref("DATA", &states).unwrap();
+        assert_eq!(hit.slot_id, 2);
+    }
+
+    #[test]
+    fn resolves_la_forge_with_space() {
+        // Slot 4 is "La Forge" — the space matters for exact match.
+        let states = vec![live(4, "exec_d")];
+        let hit = resolve_agent_ref("la forge", &states).unwrap();
+        assert_eq!(hit.slot_id, 4);
+    }
+
+    #[test]
+    fn unknown_reference_lists_live_candidates() {
+        let states = vec![live(1, "exec_a"), live(2, "exec_b")];
+        let err = resolve_agent_ref("Wesley", &states).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no live worker matches"), "msg: {msg}");
+        assert!(msg.contains("Riker"), "msg: {msg}");
+        assert!(msg.contains("Data"), "msg: {msg}");
+    }
+
+    #[test]
+    fn unknown_with_no_live_workers_says_so() {
+        let states: Vec<LiveWorkerState> = vec![];
+        let err = resolve_agent_ref("Riker", &states).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no live workers"), "msg: {msg}");
+    }
+
+    #[test]
+    fn run_id_takes_precedence_over_slot_match() {
+        // If a run_id happens to be the literal "1", the run_id tier
+        // wins before slot_id is even consulted (a defensive case
+        // since real run ids are not numeric strings).
+        let mut s1 = live(2, "1");
+        // Force a different slot so a slot match would resolve to a
+        // different worker; run_id "1" should still win.
+        s1.slot_id = 2;
+        let states = vec![s1, live(1, "exec_a")];
+        let hit = resolve_agent_ref("1", &states).unwrap();
+        assert_eq!(hit.run_id, "1");
+        assert_eq!(hit.slot_id, 2);
+    }
+
+    #[test]
+    fn looks_like_name_or_slot_recognises_roster_and_numbers() {
+        assert!(looks_like_name_or_slot("Riker"));
+        assert!(looks_like_name_or_slot("riker"));
+        assert!(looks_like_name_or_slot("La Forge"));
+        assert!(looks_like_name_or_slot("3"));
+        assert!(!looks_like_name_or_slot("exec_18ad6336fedcb190_12"));
     }
 }

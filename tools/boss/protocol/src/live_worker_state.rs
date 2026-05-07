@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::worker_names::name_for_slot;
+
 /// Where a worker is in its life. The engine derives this from hook
 /// events arriving on the events socket; UI code maps it to a colour
 /// or icon variant. Order is roughly "earlier in the lifecycle" →
@@ -93,6 +95,15 @@ pub struct WorkItemBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveWorkerState {
     pub slot_id: u8,
+    /// Stable display name for the slot, derived from `slot_id` via
+    /// the shared crew roster (`worker_names::name_for_slot`). The
+    /// macOS app renders the same name in the worker pane header and
+    /// on Doing cards; surfacing it on the wire lets the coordinator
+    /// session refer to a worker by name (e.g.
+    /// `bossctl agents focus Riker`) without independently
+    /// re-deriving the roster.
+    #[serde(default)]
+    pub name: String,
     pub run_id: String,
     /// Model identifier the worker is running on, e.g.
     /// `claude-opus-4-7`. Initially the engine-launched default; once
@@ -149,6 +160,7 @@ impl LiveWorkerState {
         };
         Self {
             slot_id,
+            name: name_for_slot(slot_id),
             run_id: run_id.into(),
             model: model.into(),
             shell_pid,
@@ -198,6 +210,7 @@ mod tests {
     fn new_spawning_sets_defaults() {
         let state = LiveWorkerState::new_spawning(3, "run-1", "claude-opus-4-7", 42, None);
         assert_eq!(state.slot_id, 3);
+        assert_eq!(state.name, "Worf");
         assert_eq!(state.run_id, "run-1");
         assert_eq!(state.model, "claude-opus-4-7");
         assert_eq!(state.shell_pid, 42);
@@ -208,6 +221,16 @@ mod tests {
         assert!(state.work_item_id.is_none());
         assert!(state.work_item_name.is_none());
         assert!(state.execution_id.is_none());
+    }
+
+    #[test]
+    fn new_spawning_stamps_name_from_slot_id() {
+        let s1 = LiveWorkerState::new_spawning(1, "r", "m", 0, None);
+        assert_eq!(s1.name, "Riker");
+        let s2 = LiveWorkerState::new_spawning(2, "r", "m", 0, None);
+        assert_eq!(s2.name, "Data");
+        let s8 = LiveWorkerState::new_spawning(8, "r", "m", 0, None);
+        assert_eq!(s8.name, "O'Brien");
     }
 
     #[test]
@@ -232,6 +255,7 @@ mod tests {
     fn live_worker_state_round_trips() {
         let original = LiveWorkerState {
             slot_id: 1,
+            name: "Riker".into(),
             run_id: "run-7".into(),
             model: "claude-sonnet-4-6".into(),
             shell_pid: 12345,
