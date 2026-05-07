@@ -1,9 +1,16 @@
+use std::env;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::app::RepobinError;
 use crate::bazel::BazelAdapter;
+use crate::cache::cache_root_from_env;
 use crate::config::{RepoConfig, load_repo_config};
+use crate::dispatch_cache;
+
+const TRACE_ENV: &str = "REPOBIN_TRACE";
+const NO_CACHE_ENV: &str = "REPOBIN_NO_DISPATCH_CACHE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchPlan {
@@ -42,8 +49,10 @@ pub fn prepare_dispatch_from_repo_config<B: BazelAdapter>(
                 config_path: repo_config.config_path.clone(),
             })?;
 
+    let cache_root = effective_cache_root();
     plan_from_target(
         bazel,
+        cache_root.as_deref(),
         &repo_config.repo_root,
         tool_name,
         &tool.target,
@@ -54,14 +63,42 @@ pub fn prepare_dispatch_from_repo_config<B: BazelAdapter>(
 
 fn plan_from_target<B: BazelAdapter>(
     bazel: &B,
+    cache_root: Option<&Path>,
     repo_root: &Path,
     tool_name: &str,
     target: &str,
     cwd: &Path,
     forwarded_args: &[OsString],
 ) -> Result<DispatchPlan, RepobinError> {
+    if let Some(root) = cache_root {
+        if let Some(executable_path) = dispatch_cache::lookup_in(root, repo_root, target) {
+            trace(format_args!(
+                "dispatch-cache hit target={target} repo_root={}",
+                repo_root.display()
+            ));
+            return Ok(DispatchPlan {
+                repo_root: repo_root.to_path_buf(),
+                tool_name: tool_name.to_string(),
+                target: target.to_string(),
+                executable_path,
+                original_cwd: cwd.to_path_buf(),
+                forwarded_args: forwarded_args.to_vec(),
+            });
+        }
+    }
+
+    trace(format_args!(
+        "dispatch-cache miss target={target} repo_root={} (running bazel build + cquery)",
+        repo_root.display()
+    ));
     bazel.build(repo_root, target)?;
     let executable_path = bazel.resolve_executable(repo_root, target)?;
+
+    if let Some(root) = cache_root {
+        if let Err(error) = dispatch_cache::record_in(root, repo_root, target, &executable_path) {
+            trace(format_args!("dispatch-cache record failed: {error}"));
+        }
+    }
 
     Ok(DispatchPlan {
         repo_root: repo_root.to_path_buf(),
@@ -73,16 +110,35 @@ fn plan_from_target<B: BazelAdapter>(
     })
 }
 
+fn effective_cache_root() -> Option<PathBuf> {
+    if env::var_os(NO_CACHE_ENV).is_some() {
+        return None;
+    }
+    cache_root_from_env().ok()
+}
+
+fn trace(args: std::fmt::Arguments<'_>) {
+    if env::var_os(TRACE_ENV).is_none() {
+        return;
+    }
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "repobin: {args}");
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
     use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
 
     use crate::bazel::BazelAdapter;
     use crate::config::{Config, RepoConfig, ToolConfig};
 
-    use super::prepare_dispatch_from_repo_config;
+    use super::{plan_from_target, prepare_dispatch_from_repo_config};
 
     #[derive(Default)]
     struct FakeBazel {
@@ -157,5 +213,181 @@ mod tests {
             bazel.queries.borrow().as_slice(),
             &[(PathBuf::from("/repo"), "//tools/boss/cli:boss".to_string())]
         );
+    }
+
+    #[test]
+    fn warm_dispatch_skips_bazel_calls() {
+        let temp = TempDir::new().unwrap();
+        let cache_root = temp.path().join("cache");
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/boss/cli:boss";
+        let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
+        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
+
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(build.parent().unwrap()).unwrap();
+        fs::write(&build, b"rust_binary(...)\n").unwrap();
+
+        let bazel = FakeBazel {
+            executable: exe.clone(),
+            ..FakeBazel::default()
+        };
+
+        let cold_plan = plan_from_target(
+            &bazel,
+            Some(&cache_root),
+            &repo_root,
+            "boss",
+            target,
+            &repo_root,
+            &[],
+        )
+        .expect("cold plan");
+        assert_eq!(cold_plan.executable_path, exe);
+        assert_eq!(bazel.builds.borrow().len(), 1);
+        assert_eq!(bazel.queries.borrow().len(), 1);
+
+        let warm_plan = plan_from_target(
+            &bazel,
+            Some(&cache_root),
+            &repo_root,
+            "boss",
+            target,
+            &repo_root,
+            &[],
+        )
+        .expect("warm plan");
+        assert_eq!(warm_plan.executable_path, exe);
+        // Counts must not increase on the warm hit.
+        assert_eq!(
+            bazel.builds.borrow().len(),
+            1,
+            "warm dispatch must not invoke bazel build"
+        );
+        assert_eq!(
+            bazel.queries.borrow().len(),
+            1,
+            "warm dispatch must not invoke bazel cquery"
+        );
+    }
+
+    #[test]
+    fn build_mtime_advance_invalidates_dispatch_cache() {
+        let temp = TempDir::new().unwrap();
+        let cache_root = temp.path().join("cache");
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/boss/cli:boss";
+        let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
+        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
+
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(build.parent().unwrap()).unwrap();
+        fs::write(&build, b"rust_binary(...)\n").unwrap();
+
+        let bazel = FakeBazel {
+            executable: exe.clone(),
+            ..FakeBazel::default()
+        };
+
+        plan_from_target(
+            &bazel,
+            Some(&cache_root),
+            &repo_root,
+            "boss",
+            target,
+            &repo_root,
+            &[],
+        )
+        .expect("first plan");
+        assert_eq!(bazel.builds.borrow().len(), 1);
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&build)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        plan_from_target(
+            &bazel,
+            Some(&cache_root),
+            &repo_root,
+            "boss",
+            target,
+            &repo_root,
+            &[],
+        )
+        .expect("invalidated plan");
+        assert_eq!(
+            bazel.builds.borrow().len(),
+            2,
+            "BUILD mtime advance should miss cache and re-run bazel"
+        );
+    }
+
+    #[test]
+    fn corrupt_cache_falls_through_without_error() {
+        let temp = TempDir::new().unwrap();
+        let cache_root = temp.path().join("cache");
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/boss/cli:boss";
+        let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
+
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"#!/bin/sh\n").unwrap();
+
+        // Pre-seed a corrupt cache entry at the expected location.
+        let entry_dir = cache_root.join("dispatch");
+        fs::create_dir_all(&entry_dir).unwrap();
+        // We don't know the hash; the corrupt-cache path is exhaustively
+        // covered in dispatch_cache::tests. Here we verify that an unrelated
+        // garbage file in the cache subdir does not break the slow path.
+        fs::write(entry_dir.join("garbage.json"), b"\xff\x00not json").unwrap();
+
+        let bazel = FakeBazel {
+            executable: exe.clone(),
+            ..FakeBazel::default()
+        };
+        let plan = plan_from_target(
+            &bazel,
+            Some(&cache_root),
+            &repo_root,
+            "boss",
+            target,
+            &repo_root,
+            &[OsString::from("--help")],
+        )
+        .expect("dispatch plan");
+        assert_eq!(plan.executable_path, exe);
+        assert_eq!(bazel.builds.borrow().len(), 1);
+    }
+
+    #[test]
+    fn disabled_cache_runs_bazel_every_time() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/boss/cli:boss";
+        let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
+        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
+
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(build.parent().unwrap()).unwrap();
+        fs::write(&build, b"rust_binary(...)\n").unwrap();
+
+        let bazel = FakeBazel {
+            executable: exe.clone(),
+            ..FakeBazel::default()
+        };
+
+        for _ in 0..3 {
+            plan_from_target(&bazel, None, &repo_root, "boss", target, &repo_root, &[])
+                .expect("plan");
+        }
+        assert_eq!(bazel.builds.borrow().len(), 3);
+        assert_eq!(bazel.queries.borrow().len(), 3);
     }
 }

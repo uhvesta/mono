@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod defaults;
 mod dispatch;
+mod dispatch_cache;
 mod install;
 mod shell;
 
