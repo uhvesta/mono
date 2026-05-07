@@ -3,6 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
+use crate::coordinator::MAX_WORKER_POOL_SIZE;
+
 const DEFAULT_ACP_COMMAND: &str = "npx -y @zed-industries/claude-code-acp@0.16.1";
 const DEFAULT_CUBE_COMMAND: &str = "bazel run //tools/cube:cube --";
 
@@ -33,6 +35,11 @@ impl WorkConfig {
             Some(path) => PathBuf::from(path),
             None => default_db_path()?,
         };
+        // Default to the hard cap so the engine pool tracks the macOS
+        // app's slot count (`WorkersWorkspaceModel.workerSlotCount = 8`).
+        // A smaller default left slots 5–8 idle while the dispatcher
+        // silently no-op'd new work. `BOSS_WORKER_POOL_SIZE` still
+        // overrides for callers that genuinely want fewer workers.
         let worker_pool_size = std::env::var("BOSS_WORKER_POOL_SIZE")
             .ok()
             .map(|raw| {
@@ -40,7 +47,7 @@ impl WorkConfig {
                     .with_context(|| format!("could not parse BOSS_WORKER_POOL_SIZE: {raw}"))
             })
             .transpose()?
-            .unwrap_or(1);
+            .unwrap_or(MAX_WORKER_POOL_SIZE);
         Ok(Self {
             cwd,
             db_path,
@@ -177,7 +184,7 @@ fn default_db_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_runtime_cwd;
+    use super::{MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd};
     use std::path::PathBuf;
 
     #[test]
@@ -198,6 +205,39 @@ mod tests {
             None => unsafe {
                 std::env::remove_var("BUILD_WORKSPACE_DIRECTORY");
             },
+        }
+    }
+
+    /// `WorkConfig::load_from_env` must default to the hard cap
+    /// (`MAX_WORKER_POOL_SIZE`) when `BOSS_WORKER_POOL_SIZE` is unset,
+    /// matching the macOS app's slot count. A lower default left
+    /// slots 5–8 unallocated and silently dropped any drag-to-Doing
+    /// dispatch once slots 1–4 were busy.
+    #[test]
+    fn worker_pool_size_defaults_to_max_when_env_unset() {
+        // Force the test to take the unset branch even when the host
+        // shell exports a custom pool size.
+        let original_pool = std::env::var_os("BOSS_WORKER_POOL_SIZE");
+        let original_db = std::env::var_os("BOSS_DB_PATH");
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+        unsafe {
+            std::env::remove_var("BOSS_WORKER_POOL_SIZE");
+            std::env::set_var("BOSS_DB_PATH", &db_path);
+        }
+
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.worker_pool_size, MAX_WORKER_POOL_SIZE);
+
+        unsafe {
+            match original_pool {
+                Some(value) => std::env::set_var("BOSS_WORKER_POOL_SIZE", value),
+                None => std::env::remove_var("BOSS_WORKER_POOL_SIZE"),
+            }
+            match original_db {
+                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
+                None => std::env::remove_var("BOSS_DB_PATH"),
+            }
         }
     }
 }

@@ -551,6 +551,17 @@ impl ExecutionCoordinator {
                 .claim_worker(&execution.id, preferred_workspace_id.as_deref())
                 .await
             else {
+                // Pool is fully claimed. The execution stays `ready`
+                // and re-kicks when a worker is released; surface the
+                // stall so an unexpectedly small pool is visible in
+                // the engine log instead of failing silently.
+                let pool_capacity = self.worker_pool.capacity().await;
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool_capacity,
+                    "worker pool exhausted; deferring dispatch until a worker is released"
+                );
                 break;
             };
 
