@@ -50,20 +50,48 @@ impl WorkerPaneReleaser for NoopWorkerPaneReleaser {
     async fn release_pane(&self, _run_id: &str) {}
 }
 
-/// Probes a workspace for an open PR on its current branch.
-#[async_trait]
-pub trait PrDetector: Send + Sync {
-    /// Returns `Ok(Some(url))` if `gh` reports a PR for the workspace's
-    /// current branch, `Ok(None)` if there is no PR yet, and `Err(_)`
-    /// only if `gh` itself failed in a way distinct from "no PR".
-    /// Implementations must treat "no PR" as `Ok(None)` to keep the
-    /// caller's idle-vs-completed logic clean.
-    async fn detect_pr(&self, workspace_path: &Path) -> Result<Option<String>>;
+/// What `gh` reports about the current branch's PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrStatus {
+    /// No PR exists for the current branch.
+    None,
+    /// PR exists and the local branch matches the PR's head commit —
+    /// nothing local is unpushed.
+    Fresh { url: String },
+    /// PR exists, but the local branch is ahead of the PR's pushed
+    /// head sha. The PR is stale until the worker pushes; treat as
+    /// "no PR yet" for completion purposes.
+    Stale { url: String, reason: String },
 }
 
-/// `PrDetector` that shells out to `gh pr view --json url`. The CLI's
-/// "no PR for branch" exit is treated as `Ok(None)`; any other
-/// non-success exit is propagated as an error so the caller can log it.
+impl PrStatus {
+    /// PR url, regardless of whether it is fresh or stale.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            PrStatus::None => None,
+            PrStatus::Fresh { url } | PrStatus::Stale { url, .. } => Some(url),
+        }
+    }
+}
+
+/// Probes a workspace for an open PR on its current branch and
+/// reports whether it reflects the local commit history.
+#[async_trait]
+pub trait PrDetector: Send + Sync {
+    /// Returns the workspace's PR status, or `Err(_)` only if `gh`
+    /// itself failed in a way distinct from "no PR".
+    /// Implementations must treat "no PR" as `Ok(PrStatus::None)` to
+    /// keep the caller's idle-vs-completed logic clean.
+    async fn detect_pr(&self, workspace_path: &Path) -> Result<PrStatus>;
+}
+
+/// `PrDetector` that shells out to `gh pr view` plus `git rev-parse`.
+/// The CLI's "no PR for branch" exit is treated as `Ok(PrStatus::None)`;
+/// any other non-success exit is propagated as an error so the caller
+/// can log it. When a PR exists, the local `HEAD` sha is compared
+/// against the PR's `headRefOid`; a mismatch yields
+/// `PrStatus::Stale` so the engine can re-probe the worker to push
+/// instead of marking the run complete with a stale PR.
 #[derive(Debug, Default)]
 pub struct CommandPrDetector;
 
@@ -75,9 +103,15 @@ impl CommandPrDetector {
 
 #[async_trait]
 impl PrDetector for CommandPrDetector {
-    async fn detect_pr(&self, workspace_path: &Path) -> Result<Option<String>> {
+    async fn detect_pr(&self, workspace_path: &Path) -> Result<PrStatus> {
+        // Single `gh pr view` call gets us both the URL and the PR's
+        // head sha so we can compare against the local rev without a
+        // second round-trip.
         let output = Command::new("gh")
-            .args(["pr", "view", "--json", "url", "--jq", ".url"])
+            .args([
+                "pr", "view", "--json", "url,headRefOid", "--jq",
+                "[.url, .headRefOid] | @tsv",
+            ])
             .current_dir(workspace_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -92,32 +126,128 @@ impl PrDetector for CommandPrDetector {
                 )
             })?;
 
-        if output.status.success() {
-            let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if url.is_empty() {
-                return Ok(None);
+        if !output.status.success() {
+            // `gh` exits non-zero when there is no PR for the current
+            // branch — that is the dominant case and must surface as
+            // `Ok(PrStatus::None)`, not an error. Heuristic: stderr
+            // mentions "no pull requests" or "no open pull requests".
+            let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+            if stderr.contains("no pull requests")
+                || stderr.contains("no open pull requests")
+                || stderr.contains("no pr found")
+            {
+                return Ok(PrStatus::None);
             }
-            return Ok(Some(url));
+            return Err(anyhow!(
+                "`gh pr view` failed in {}: {}",
+                workspace_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
 
-        // `gh` exits non-zero when there is no PR for the current
-        // branch — that is the dominant case and must surface as
-        // `Ok(None)`, not an error. Heuristic: stderr mentions "no
-        // pull requests" or "no open pull requests".
-        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        if stderr.contains("no pull requests")
-            || stderr.contains("no open pull requests")
-            || stderr.contains("no pr found")
-        {
-            return Ok(None);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return Ok(PrStatus::None);
         }
 
-        Err(anyhow!(
-            "`gh pr view` failed in {}: {}",
+        // `@tsv` joins fields with `\t` and emits a single line per row.
+        let mut parts = trimmed.split('\t');
+        let url = parts.next().unwrap_or("").trim().to_owned();
+        let pr_head = parts.next().unwrap_or("").trim().to_owned();
+        if url.is_empty() {
+            return Ok(PrStatus::None);
+        }
+
+        // `gh pr view` resolves the PR for the current branch, so
+        // `git rev-parse HEAD` gives us the right local rev to compare.
+        // We deliberately use `git` directly here even though the
+        // workspace is jj-managed: jj keeps a real git ref under the
+        // hood (the engine's leases sit on git remotes), and this is
+        // a read-only query.
+        let local_head = match local_head_sha(workspace_path).await {
+            Ok(sha) => sha,
+            Err(err) => {
+                // Couldn't read the local rev — fall back to "fresh"
+                // rather than blocking the worker on a bookkeeping
+                // glitch. The detector test boundary keeps the
+                // caller's contract (Fresh/Stale/None) clean.
+                tracing::debug!(
+                    workspace = %workspace_path.display(),
+                    ?err,
+                    "stale-PR check: could not read local HEAD; assuming fresh",
+                );
+                return Ok(PrStatus::Fresh { url });
+            }
+        };
+
+        if pr_head.is_empty() || local_head.eq_ignore_ascii_case(&pr_head) {
+            Ok(PrStatus::Fresh { url })
+        } else {
+            Ok(PrStatus::Stale {
+                url,
+                reason: format!(
+                    "local HEAD {local} is ahead of PR head {pr}",
+                    local = short_sha(&local_head),
+                    pr = short_sha(&pr_head),
+                ),
+            })
+        }
+    }
+}
+
+/// Read `git rev-parse HEAD` from `workspace_path`. Errors propagate;
+/// the caller decides whether to treat that as "fresh" or surface it.
+async fn local_head_sha(workspace_path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to spawn `git rev-parse HEAD` in {}",
+                workspace_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`git rev-parse HEAD` failed in {}: {}",
             workspace_path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        ));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+/// Queues an automatic probe for `run_id`. The shape mirrors
+/// `ServerState::queue_probe` but is exposed via a trait so the
+/// completion handler can be unit-tested without standing up the full
+/// app server. Implementations must be cheap and infallible — probes
+/// that can't be delivered are dropped silently at injection time
+/// (see `dispatch_probe_on_stop` in `app.rs`).
+pub trait ProbeQueuer: Send + Sync {
+    /// Push `text` onto the FIFO of probes for `run_id`. The next
+    /// `Stop` event for the run pops one and `SendToPane`'s it as if
+    /// the human had typed it.
+    fn queue_probe(&self, run_id: &str, text: &str);
+}
+
+/// `ProbeQueuer` that drops everything — used when the test harness
+/// doesn't need to assert on probe wiring.
+#[derive(Debug, Default)]
+pub struct NoopProbeQueuer;
+
+impl ProbeQueuer for NoopProbeQueuer {
+    fn queue_probe(&self, _run_id: &str, _text: &str) {}
 }
 
 /// Orchestrates the on-Stop completion flow: detect PR, transition
@@ -130,6 +260,7 @@ pub struct WorkerCompletionHandler {
     cube_client: Arc<dyn CubeClient>,
     publisher: Arc<dyn ExecutionPublisher>,
     pane_releaser: Arc<dyn WorkerPaneReleaser>,
+    probe_queuer: Arc<dyn ProbeQueuer>,
 }
 
 impl WorkerCompletionHandler {
@@ -139,6 +270,7 @@ impl WorkerCompletionHandler {
         cube_client: Arc<dyn CubeClient>,
         publisher: Arc<dyn ExecutionPublisher>,
         pane_releaser: Arc<dyn WorkerPaneReleaser>,
+        probe_queuer: Arc<dyn ProbeQueuer>,
     ) -> Self {
         Self {
             work_db,
@@ -146,6 +278,7 @@ impl WorkerCompletionHandler {
             cube_client,
             publisher,
             pane_releaser,
+            probe_queuer,
         }
     }
 
@@ -180,7 +313,7 @@ impl WorkerCompletionHandler {
             }
         };
 
-        let pr_url = match self.pr_detector.detect_pr(&workspace_path).await {
+        let pr_status = match self.pr_detector.detect_pr(&workspace_path).await {
             Ok(value) => value,
             Err(err) => {
                 tracing::warn!(
@@ -190,18 +323,38 @@ impl WorkerCompletionHandler {
                     "stop event: PR detection failed; surfacing as awaiting input"
                 );
                 self.publish_awaiting_input(&execution).await;
+                self.probe_queuer
+                    .queue_probe(execution_id, PROBE_DETECTOR_FAILURE);
                 return StopOutcome::DetectorFailed;
             }
         };
 
-        let Some(pr_url) = pr_url else {
-            tracing::info!(
-                execution_id,
-                workspace = %workspace_path.display(),
-                "stop event: worker idle without a PR — awaiting input"
-            );
-            self.publish_awaiting_input(&execution).await;
-            return StopOutcome::AwaitingInput;
+        let pr_url = match pr_status {
+            PrStatus::None => {
+                tracing::info!(
+                    execution_id,
+                    workspace = %workspace_path.display(),
+                    "stop event: worker idle without a PR — probing to push and open one"
+                );
+                self.publish_awaiting_pr(&execution).await;
+                self.probe_queuer
+                    .queue_probe(execution_id, PROBE_NO_PR);
+                return StopOutcome::AwaitingInput;
+            }
+            PrStatus::Stale { url, reason } => {
+                tracing::info!(
+                    execution_id,
+                    workspace = %workspace_path.display(),
+                    pr_url = %url,
+                    %reason,
+                    "stop event: PR exists but local commits are unpushed — probing to push"
+                );
+                self.publish_awaiting_pr(&execution).await;
+                self.probe_queuer
+                    .queue_probe(execution_id, PROBE_STALE_PR);
+                return StopOutcome::StalePr { pr_url: url, reason };
+            }
+            PrStatus::Fresh { url } => url,
         };
 
         let completion = match self.work_db.record_worker_pr_completion(
@@ -318,7 +471,44 @@ impl WorkerCompletionHandler {
             )
             .await;
     }
+
+    /// Publish the more specific "stopped without a PR" signal so the
+    /// frontend can paint a distinct activity icon (the live-state
+    /// chore picks this up). Falls back to the same status string as
+    /// `awaiting_input` because the execution row hasn't moved.
+    async fn publish_awaiting_pr(&self, execution: &crate::work::WorkExecution) {
+        self.publisher
+            .publish(
+                &execution.id,
+                &execution.work_item_id,
+                &execution.status,
+                "worker_awaiting_pr",
+            )
+            .await;
+    }
 }
+
+/// Probe text dispatched when a worker stops without producing any PR
+/// for its branch. Phrased so a worker that already finished the work
+/// will simply push and open one, but a worker that's blocked has an
+/// out to explain itself rather than churning.
+pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
+If the work is complete, push your branch and open the PR with `gh pr create`. \
+If you're blocked, explain what you need.";
+
+/// Probe text dispatched when a PR exists but the worker has local
+/// commits that haven't been pushed yet — the PR is stale.
+pub const PROBE_STALE_PR: &str = "A PR exists for this branch, but your local commits \
+are ahead of the PR's head. Push the new commits (`jj git push -b <bookmark>`) \
+so the PR reflects your latest work, or explain why the local commits should not \
+be pushed.";
+
+/// Probe text dispatched when the PR detector itself errored. We don't
+/// know whether a PR exists, so ask the worker to confirm.
+pub const PROBE_DETECTOR_FAILURE: &str = "I couldn't determine whether you've opened \
+a PR for this branch (the `gh` query failed). If a PR exists, paste its URL on its \
+own line. If not, push your branch and open one with `gh pr create`. If you're \
+blocked, explain what you need.";
 
 /// What happened during a stop event handler invocation. The runtime
 /// only logs this; tests assert on it.
@@ -337,6 +527,10 @@ pub enum StopOutcome {
     AwaitingInput,
     /// PR detected; work item moved to `in_review` and execution finalised.
     PrDetected { pr_url: String },
+    /// PR exists but local commits are ahead of its head sha. The
+    /// worker is probed to push the missing commits; the work item
+    /// stays in its current state until the next Stop reports a fresh PR.
+    StalePr { pr_url: String, reason: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }
@@ -376,13 +570,23 @@ mod tests {
     };
 
     struct StubPrDetector {
-        result: Mutex<Result<Option<String>, String>>,
+        result: Mutex<Result<PrStatus, String>>,
     }
 
     impl StubPrDetector {
         fn ok(value: Option<&str>) -> Arc<Self> {
+            let status = match value {
+                Some(url) => PrStatus::Fresh { url: url.to_owned() },
+                None => PrStatus::None,
+            };
             Arc::new(Self {
-                result: Mutex::new(Ok(value.map(str::to_owned))),
+                result: Mutex::new(Ok(status)),
+            })
+        }
+
+        fn ok_status(status: PrStatus) -> Arc<Self> {
+            Arc::new(Self {
+                result: Mutex::new(Ok(status)),
             })
         }
 
@@ -395,12 +599,35 @@ mod tests {
 
     #[async_trait]
     impl PrDetector for StubPrDetector {
-        async fn detect_pr(&self, _workspace_path: &Path) -> Result<Option<String>> {
+        async fn detect_pr(&self, _workspace_path: &Path) -> Result<PrStatus> {
             let guard = self.result.lock().await;
             match &*guard {
                 Ok(value) => Ok(value.clone()),
                 Err(msg) => Err(anyhow::anyhow!(msg.clone())),
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingProbeQueuer {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ProbeQueuer for RecordingProbeQueuer {
+        fn queue_probe(&self, run_id: &str, text: &str) {
+            self.calls
+                .lock()
+                .expect("RecordingProbeQueuer mutex poisoned")
+                .push((run_id.to_owned(), text.to_owned()));
+        }
+    }
+
+    impl RecordingProbeQueuer {
+        fn snapshot(&self) -> Vec<(String, String)> {
+            self.calls
+                .lock()
+                .expect("RecordingProbeQueuer mutex poisoned")
+                .clone()
         }
     }
 
@@ -564,6 +791,7 @@ mod tests {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -571,6 +799,7 @@ mod tests {
             cube.clone(),
             publisher.clone(),
             pane.clone(),
+            probes.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -612,16 +841,21 @@ mod tests {
             [execution_id.as_str()],
             "pane teardown must fire on PR completion so the libghostty slot returns to Free",
         );
+        assert!(
+            probes.snapshot().is_empty(),
+            "fresh-PR completion must NOT queue a probe — the worker is done",
+        );
     }
 
     #[tokio::test]
-    async fn pr_absent_publishes_awaiting_input_and_leaves_state_intact() {
+    async fn pr_absent_publishes_awaiting_pr_and_queues_probe() {
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -629,6 +863,7 @@ mod tests {
             cube.clone(),
             publisher.clone(),
             pane.clone(),
+            probes.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
 
@@ -650,13 +885,81 @@ mod tests {
         );
         let events = publisher.events.lock().await.clone();
         assert!(
-            events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_input"),
-            "expected worker_awaiting_input event, got {events:?}",
+            events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_pr"),
+            "expected worker_awaiting_pr event for the no-PR case, got {events:?}",
         );
         assert!(
             pane.calls.lock().await.is_empty(),
             "no PR must NOT release the pane",
         );
+        let queued = probes.snapshot();
+        assert_eq!(
+            queued.len(),
+            1,
+            "exactly one probe must be queued when the worker stops without a PR, got {queued:?}",
+        );
+        assert_eq!(queued[0].0, execution_id);
+        assert_eq!(queued[0].1, PROBE_NO_PR);
+    }
+
+    #[tokio::test]
+    async fn stale_pr_publishes_awaiting_pr_and_queues_push_probe() {
+        // PR exists but local commits are ahead of the PR's head sha.
+        // The work item must NOT move to in_review, the lease must
+        // stay held, and the worker gets probed to push the missing
+        // commits so the next Stop sees a fresh PR.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok_status(PrStatus::Stale {
+            url: "https://github.com/foo/bar/pull/42".into(),
+            reason: "local HEAD abcd1234 is ahead of PR head 9876fedc".into(),
+        });
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+
+        match outcome {
+            StopOutcome::StalePr { pr_url, .. } => {
+                assert_eq!(pr_url, "https://github.com/foo/bar/pull/42");
+            }
+            other => panic!("expected StalePr, got {other:?}"),
+        }
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(
+                    t.status, "active",
+                    "stale PR must NOT move the work item to in_review",
+                );
+                assert!(t.pr_url.is_none(), "stale PR must NOT stamp pr_url yet");
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
+
+        let events = publisher.events.lock().await.clone();
+        assert!(
+            events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_pr"),
+            "stale PR must publish worker_awaiting_pr, got {events:?}",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "expected one probe, got {queued:?}");
+        assert_eq!(queued[0].1, PROBE_STALE_PR);
     }
 
     #[tokio::test]
@@ -667,6 +970,7 @@ mod tests {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let handler = WorkerCompletionHandler::new(
             db,
@@ -674,6 +978,7 @@ mod tests {
             cube.clone(),
             publisher.clone(),
             pane.clone(),
+            probes.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
         assert_eq!(outcome, StopOutcome::DetectorFailed);
@@ -684,6 +989,9 @@ mod tests {
             events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_input"),
             "detector errors must surface as awaiting_input, got {events:?}",
         );
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "detector failures must still probe the worker");
+        assert_eq!(queued[0].1, PROBE_DETECTOR_FAILURE);
     }
 
     #[tokio::test]
@@ -692,6 +1000,7 @@ mod tests {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let handler = WorkerCompletionHandler::new(
@@ -700,12 +1009,17 @@ mod tests {
             cube.clone(),
             publisher.clone(),
             pane.clone(),
+            probes.clone(),
         );
         let outcome = handler.on_stop("not-an-execution").await;
         assert_eq!(outcome, StopOutcome::UnknownExecution);
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
         assert!(publisher.events.lock().await.is_empty());
+        assert!(
+            probes.snapshot().is_empty(),
+            "unknown executions must NOT queue probes",
+        );
     }
 
     #[tokio::test]
@@ -715,6 +1029,7 @@ mod tests {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -722,6 +1037,7 @@ mod tests {
             cube.clone(),
             publisher.clone(),
             pane.clone(),
+            probes.clone(),
         );
 
         handler.force_release(&execution_id).await;
@@ -753,6 +1069,7 @@ mod tests {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
 
         // Pre-clear the lease so force_release can confirm it skips
         // cube release when there's nothing to release.
@@ -764,6 +1081,7 @@ mod tests {
             cube.clone(),
             publisher.clone(),
             pane.clone(),
+            probes,
         );
 
         handler.force_release(&execution_id).await;
@@ -779,12 +1097,14 @@ mod tests {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
         let handler = WorkerCompletionHandler::new(
             db.clone(),
             detector,
             cube.clone(),
             publisher.clone(),
             pane.clone(),
+            probes,
         );
 
         assert!(matches!(

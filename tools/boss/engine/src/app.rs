@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::acp::{AcpClient, AcpEvent};
 use crate::cli::{Cli, Mode};
 use crate::completion::{
-    CommandPrDetector, PrDetector, WorkerCompletionHandler, WorkerPaneReleaser,
+    CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
@@ -137,6 +137,38 @@ impl WorkerPaneReleaser for ServerStatePaneReleaser {
             return;
         };
         server.release_worker_pane(run_id).await;
+    }
+}
+
+/// Adapter so the completion handler can queue probes onto
+/// `ServerState::pending_probes` without depending on `ServerState`
+/// directly. Same late-bind dance as `ServerStatePaneReleaser` — the
+/// completion handler is built before the `Arc<ServerState>` exists,
+/// then `set_server_state` plumbs the upgrade target in. The next
+/// `Stop` event for the run pops one queued entry and `SendToPane`s
+/// it as if the user had typed it (`dispatch_probe_on_stop`).
+#[derive(Default)]
+struct ServerStateProbeQueuer {
+    server: std::sync::OnceLock<Weak<ServerState>>,
+}
+
+impl ServerStateProbeQueuer {
+    fn set_server_state(&self, weak: Weak<ServerState>) {
+        let _ = self.server.set(weak);
+    }
+}
+
+impl ProbeQueuer for ServerStateProbeQueuer {
+    fn queue_probe(&self, run_id: &str, text: &str) {
+        let Some(weak) = self.server.get() else {
+            tracing::warn!(run_id, "probe queuer called before server state was bound");
+            return;
+        };
+        let Some(server) = weak.upgrade() else {
+            tracing::debug!(run_id, "probe queuer: server state already dropped");
+            return;
+        };
+        server.queue_probe(run_id.to_owned(), text.to_owned());
     }
 }
 
@@ -396,16 +428,19 @@ impl ServerState {
         });
         let cube_client: Arc<dyn CubeClient> = Arc::new(CommandCubeClient::new(cfg.clone()));
         let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
-        // The pane releaser needs a Weak<ServerState> to call back into
-        // `release_worker_pane`, so it's late-bound after the Arc<ServerState>
-        // exists. Same pattern as `PaneSpawnRunner` below.
+        // The pane releaser and probe queuer both need a Weak<ServerState>
+        // to call back into ServerState methods, so they're late-bound
+        // after the Arc<ServerState> exists. Same pattern as
+        // `PaneSpawnRunner` below.
         let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
+        let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
         let completion_handler = Arc::new(WorkerCompletionHandler::new(
             work_db.clone(),
             pr_detector,
             cube_client.clone(),
             publisher.clone(),
             pane_releaser.clone(),
+            probe_queuer.clone(),
         ));
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -454,6 +489,7 @@ impl ServerState {
             Arc::downgrade(&server_state) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         pane_runner.set_server_state(weak_spawner);
         pane_releaser.set_server_state(Arc::downgrade(&server_state));
+        probe_queuer.set_server_state(Arc::downgrade(&server_state));
 
         Ok(server_state)
     }

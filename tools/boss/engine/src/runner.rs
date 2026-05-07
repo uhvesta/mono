@@ -472,6 +472,24 @@ fn compose_execution_prompt(
             "Expected outcome for this run:\n- make concrete progress on the assigned work,\n- leave the workspace in a reviewable state,\n- stop with a concise review summary.\n"
         }
     });
+    if matches!(
+        execution.kind.as_str(),
+        "task_implementation" | "chore_implementation"
+    ) {
+        // Acceptance criterion: the engine watches for a PR URL on the
+        // run's branch when claude stops. If the worker stops without
+        // pushing/opening one, the run is treated as incomplete and
+        // the worker is automatically probed to produce a PR. Stating
+        // this up front avoids the probe round-trip when the worker
+        // would otherwise have stopped at "I made the changes" with
+        // nothing pushed.
+        prompt.push_str(
+            "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
+             - Push your branch (`jj git push -b <bookmark>`) and open a PR with `gh pr create` if one does not already exist for this branch.\n\
+             - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
+             - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n",
+        );
+    }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
@@ -748,6 +766,32 @@ mod pane_spawn_tests {
         assert!(
             prompt.contains("## Summary"),
             "prompt missing required output section header"
+        );
+    }
+
+    #[tokio::test]
+    async fn implementation_prompt_states_pr_url_acceptance_criterion() {
+        // Workers that stop without producing a PR are now blocked
+        // from completing — they get probed to push and open one. The
+        // dispatch prompt must telegraph that up front so the worker
+        // doesn't waste a round-trip discovering it from the probe.
+        let workspace = TempDir::new().unwrap();
+        let _spawner = run_once(&workspace).await.unwrap();
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+        assert!(
+            prompt.contains("the deliverable is a PR URL"),
+            "implementation prompt must state the PR-URL acceptance criterion: {prompt}",
+        );
+        assert!(
+            prompt.contains("on its own line"),
+            "implementation prompt must tell the worker to print the URL on its own line: {prompt}",
+        );
+        assert!(
+            prompt.contains("gh pr create") || prompt.contains("gh pr view"),
+            "implementation prompt must mention gh pr commands: {prompt}",
         );
     }
 

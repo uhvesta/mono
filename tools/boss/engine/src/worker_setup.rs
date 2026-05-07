@@ -64,6 +64,28 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          spawned you in a leased cube workspace and is observing this\n\
          session via claude hooks routed to its events socket.\n\
          \n\
+         ## Pull requests are the deliverable\n\
+         \n\
+         **A task is not complete until a PR exists for it.** Local\n\
+         commits are NOT enough. Workers that stop with only local\n\
+         commits are treated as incomplete and the engine will probe\n\
+         you to push and open a PR before transitioning the work item\n\
+         to review.\n\
+         \n\
+         - Push your branch and open a PR with `gh pr create` once\n\
+           your branch has commits and tests pass.\n\
+         - **If a PR for this branch already exists** (e.g. you are\n\
+           resuming work via `--prefer`, or addressing review\n\
+           comments), push your new commits to update it; do NOT\n\
+           open a duplicate PR. Check first with\n\
+           `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
+           or simply `gh pr view` from inside the workspace.\n\
+         - Do not hard-wrap PR bodies — GitHub renders single newlines\n\
+           inside paragraphs as visible breaks.\n\
+         - Before ending the run, print the PR URL on its own line as\n\
+           the final thing in your final response so the engine can\n\
+           pick it up automatically.\n\
+         \n\
          ## Your workspace\n\
          \n\
          - Workspace path: `{workspace}`\n\
@@ -106,12 +128,6 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
            and concurrent edits will corrupt their state.\n\
          - Do not modify cube's database, lease state, or workspace\n\
            registry. The engine reconciles state on its own.\n\
-         \n\
-         ## Pull requests\n\
-         \n\
-         Any task work must end in a PR — local commits are not enough.\n\
-         Use `gh pr create` once your branch has commits and tests pass.\n\
-         Do not hard-wrap PR bodies.\n\
          \n\
          ## Coordinator\n\
          \n\
@@ -397,6 +413,30 @@ mod tests {
         // back into its PR, undoing the fix.
         assert!(rendered.contains(".claude/"));
         assert!(rendered.contains("force") || rendered.contains("track"));
+    }
+
+    #[test]
+    fn claude_md_pr_section_is_front_and_centre() {
+        // The PR rule moved out from after Boundaries and now sits
+        // immediately after the intro. If a future edit buries it
+        // again, this test will fail and the writer can move it back.
+        let input = sample_input();
+        let rendered = render_claude_md(&input);
+        let pr_offset = rendered.find("Pull requests are the deliverable").expect(
+            "expected the strengthened PR heading to be present",
+        );
+        let workspace_offset = rendered
+            .find("## Your workspace")
+            .expect("expected the workspace heading to be present");
+        assert!(
+            pr_offset < workspace_offset,
+            "PR section must come before `## Your workspace`",
+        );
+        // Resuming-work guidance must mention how to detect an
+        // existing PR rather than just letting the worker open a duplicate.
+        assert!(rendered.contains("gh pr list --head"));
+        assert!(rendered.contains("not complete until a PR exists"));
+        assert!(rendered.contains("PR URL on its own line"));
     }
 
     #[test]
