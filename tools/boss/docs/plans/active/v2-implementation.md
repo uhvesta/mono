@@ -63,7 +63,7 @@ untouched. Phase 10 hardening is essentially untouched.
 
 **Phase 11** remains the lone build-system gap. The SwiftPM build
 includes the libghostty-driven Agents grid; the Bazel build
-(`bazel run //tools/boss/app-macos:BossMacApp`) excludes
+(`bazel run //tools/boss/app-macos:Boss`) excludes
 `Sources/Ghostty/` via a single-level glob and falls through to a
 placeholder. Phase 6f shipped without Phase 11, so the Bazel-built
 `.app` currently has no working Agents mode. SwiftPM is the dev
@@ -474,9 +474,9 @@ nice-to-have rather than a Phase 6 blocker.
   observes the full lifecycle via WorkerEvents.
 
 **Build-system gap (still tracked as Phase 11).** Phase 6f shipped
-without Phase 11. The SwiftPM build (`swift run BossMacApp`) links
+without Phase 11. The SwiftPM build (`swift run Boss`) links
 `GhosttyKit` and runs the live Workers grid. The Bazel build
-(`bazel run //tools/boss/app-macos:BossMacApp`) still excludes
+(`bazel run //tools/boss/app-macos:Boss`) still excludes
 `Sources/Ghostty/*.swift` via a single-level glob in
 `tools/boss/app-macos/BUILD.bazel` and falls through to a
 `#if canImport(GhosttyKit)` placeholder — meaning the Bazel-built
@@ -795,7 +795,7 @@ Phases F + G.
 
 **Goal.** Make the Bazel-built `.app` ship the same libghostty-driven
 Agents grid as the SwiftPM build, so the documented production path
-(`bazel run //tools/boss/app-macos:BossMacApp`) keeps working through
+(`bazel run //tools/boss/app-macos:Boss`) keeps working through
 and after the Phase 6f cutover.
 
 **Why this is its own phase.** Phase 6a got the Workers grid into the
@@ -858,10 +858,10 @@ mode at all. So Phase 11 is a hard prereq for 6f.
 
 **Done when (acceptance).**
 
-- `bazel build //tools/boss/app-macos:BossMacApp` succeeds without
+- `bazel build //tools/boss/app-macos:Boss` succeeds without
   the developer first running `bootstrap-ghosttykit.sh`.
 - The Bazel-built `.app`'s Agents tab shows the live 4 × 2 grid
-  (same as `swift run BossMacApp`), not the placeholder.
+  (same as `swift run Boss`), not the placeholder.
 - `bazel test`-able CI does not require a pre-installed `zig`
   (option (a) or (c) — option (b) accepts this cost).
 

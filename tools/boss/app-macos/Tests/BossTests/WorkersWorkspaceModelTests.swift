@@ -1,5 +1,5 @@
 import XCTest
-@testable import BossMacApp
+@testable import Boss
 
 @MainActor
 final class WorkersWorkspaceModelFocusTests: XCTestCase {

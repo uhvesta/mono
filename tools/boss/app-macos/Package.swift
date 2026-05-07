@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "BossMacApp",
+    name: "Boss",
     platforms: [.macOS(.v15)],
     products: [
-        .executable(name: "BossMacApp", targets: ["BossMacApp"]),
+        .executable(name: "Boss", targets: ["Boss"]),
     ],
     dependencies: [
         .package(url: "https://github.com/gonzalezreal/textual", from: "0.1.0"),
@@ -16,7 +16,7 @@ let package = Package(
             path: "ThirdParty/GhosttyKit.xcframework"
         ),
         .executableTarget(
-            name: "BossMacApp",
+            name: "Boss",
             dependencies: [
                 .product(name: "Textual", package: "textual"),
                 "GhosttyKit",
@@ -31,9 +31,9 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "BossMacAppTests",
-            dependencies: ["BossMacApp"],
-            path: "Tests/BossMacAppTests"
+            name: "BossTests",
+            dependencies: ["Boss"],
+            path: "Tests/BossTests"
         ),
     ]
 )
