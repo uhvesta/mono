@@ -551,6 +551,14 @@ impl ServerState {
     /// Errors talking to the app are logged and swallowed — the slot
     /// mapping has already been removed, so a future release can't
     /// retry without a fresh registration.
+    ///
+    /// Also drops the matching `LiveWorkerStateRegistry` entry and
+    /// broadcasts the snapshot so subscribers (the kanban Doing dot,
+    /// the pane titlebar pill) stop showing the worker as attached
+    /// to its work item. Without this step a chore-done update would
+    /// release the libghostty pane but leave the live state stuck on
+    /// `WaitingForInput`, making the UI think the worker was still
+    /// running.
     pub async fn release_worker_pane(&self, run_id: &str) {
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
             tracing::debug!(
@@ -595,6 +603,11 @@ impl ServerState {
                 tracing::warn!(?err, run_id, slot_id, "release_worker_pane: failed");
             }
         }
+        // Always drop the live-state entry — we've already given up
+        // ownership of the slot in the worker registry, so a stale
+        // entry here would lie to the UI about the slot being live.
+        self.live_worker_states.release_slot(slot_id);
+        self.broadcast_live_worker_states().await;
     }
 
     /// Register `session_id` as the app session. Any prior
@@ -3565,6 +3578,47 @@ mod tests {
             )
             .await;
         send_b.await.expect("send_b task").expect("ok response");
+    }
+
+    #[tokio::test]
+    async fn release_worker_pane_drops_live_worker_state() {
+        // Regression: chore-done (and other engine-driven release
+        // paths) must clear the live-state entry so the UI stops
+        // rendering the worker as attached to its work item. Without
+        // this, the kanban Doing dot and the pane titlebar pill stayed
+        // pinned at the worker's last activity (e.g. WaitingForInput)
+        // even after the libghostty pane was torn down.
+        let server_state = test_server_state();
+        server_state
+            .worker_registry
+            .register_run_slot("run-x", 1);
+        server_state
+            .live_worker_states
+            .register_spawn(1, "run-x", "claude-opus-4-7", 0, None);
+        assert!(
+            server_state.live_worker_states.get(1).is_some(),
+            "precondition: live state for slot 1 should be registered",
+        );
+
+        // No app session is registered, so the SendToApp call in
+        // release_worker_pane returns NotRegistered. The cleanup must
+        // run regardless.
+        server_state.release_worker_pane("run-x").await;
+
+        assert!(
+            server_state.live_worker_states.get(1).is_none(),
+            "release_worker_pane must drop the live-state entry alongside the libghostty pane",
+        );
+        assert_eq!(
+            server_state.worker_registry.slot_for_run("run-x"),
+            None,
+            "release_worker_pane must drop the worker_registry slot mapping",
+        );
+
+        // Idempotent: a second call (e.g. completion-detection then
+        // chore-done firing for the same run) is a no-op.
+        server_state.release_worker_pane("run-x").await;
+        assert!(server_state.live_worker_states.get(1).is_none());
     }
 
     #[test]
