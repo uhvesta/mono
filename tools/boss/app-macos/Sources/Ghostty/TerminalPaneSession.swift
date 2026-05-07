@@ -156,6 +156,13 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     @Published var statusMessage: String?
     @Published var terminalReady = false
     @Published var claudeState: ClaudeMonitorState = .unavailable
+    /// Gate for the per-pane 0.5s viewport screen-scrape that drives
+    /// `claudeState`. The host view subscribes to this and starts/stops
+    /// `claudeMonitorTimer` accordingly. Worker panes flip this off
+    /// once the engine-supplied `LiveWorkerState` arrives — the pill
+    /// then renders hook-driven activity and the scrape is redundant.
+    /// Boss panes never display `claudeState`, so they default off.
+    @Published var claudeMonitorEnabled: Bool
 
     weak var hostView: GhosttyTerminalHostView?
     private var claudeMonitorTracker = ClaudeMonitorTracker()
@@ -166,6 +173,7 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
         self.launchSpec = launchSpec
         self.displayTitle = role.defaultTitle
         self.workingDirectory = launchSpec.workingDirectory
+        self.claudeMonitorEnabled = role != .boss
     }
 
     func setTitle(_ title: String) {

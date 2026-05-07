@@ -22,6 +22,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
     func updateNSView(_ view: GhosttyTerminalHostView, context: Context) {
         view.syncGeometry()
+        view.reconcileClaudeMonitor()
     }
 }
 
@@ -100,7 +101,7 @@ final class GhosttyTerminalHostView: NSView {
         self.surface = surface
         session.attach(hostView: self)
         syncGeometry()
-        startClaudeMonitor()
+        reconcileClaudeMonitor()
     }
 
     @available(*, unavailable)
@@ -155,14 +156,7 @@ final class GhosttyTerminalHostView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
 
-        if window == nil {
-            claudeMonitorTimer?.invalidate()
-            claudeMonitorTimer = nil
-            session.updateClaudeMonitor(snapshot: nil)
-        } else if claudeMonitorTimer == nil {
-            startClaudeMonitor()
-        }
-
+        reconcileClaudeMonitor()
         syncGeometry()
     }
 
@@ -401,6 +395,24 @@ final class GhosttyTerminalHostView: NSView {
         NSCursor.setHiddenUntilMouseMoves(!visible)
     }
 
+    /// Converge `claudeMonitorTimer` on the desired state given the
+    /// pane's window attachment and the session's `claudeMonitorEnabled`
+    /// gate. Idempotent: safe to call from `init`, `viewDidMoveToWindow`,
+    /// and `NSViewRepresentable.updateNSView` without duplicating work.
+    /// The screen-scrape is the only main-thread cost in this view that
+    /// runs on a regular timer, so a worker pane drops to ~zero baseline
+    /// once the engine starts pushing `LiveWorkerState`.
+    func reconcileClaudeMonitor() {
+        let shouldRun = window != nil && session.claudeMonitorEnabled
+        if shouldRun {
+            if claudeMonitorTimer == nil {
+                startClaudeMonitor()
+            }
+        } else if claudeMonitorTimer != nil {
+            stopClaudeMonitor()
+        }
+    }
+
     private func startClaudeMonitor() {
         claudeMonitorTimer?.invalidate()
         claudeMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -410,6 +422,12 @@ final class GhosttyTerminalHostView: NSView {
         }
         claudeMonitorTimer?.tolerance = 0.1
         updateClaudeMonitorState()
+    }
+
+    private func stopClaudeMonitor() {
+        claudeMonitorTimer?.invalidate()
+        claudeMonitorTimer = nil
+        session.updateClaudeMonitor(snapshot: nil)
     }
 
     private func updateClaudeMonitorState() {
