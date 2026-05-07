@@ -222,6 +222,21 @@ Where:
 This gives chores first-class behavior in the UI while keeping backend storage
 simple.
 
+### Timestamp Format
+
+All `created_at`, `updated_at`, `deleted_at`, `started_at`, `finished_at`, and
+`resolved_at` columns store **Unix epoch seconds as a decimal string**
+(e.g. `"1778180145"`). This is the canonical wire format: every JSON response
+that includes one of these fields — `boss chore list --json`, the kanban tree
+broadcasts, etc. — emits the same shape, and consumers (CLIs, the macOS app)
+parse it as `i64` seconds since 1970-01-01T00:00:00Z.
+
+A pre-canonical write path produced ISO 8601 strings
+(`"2026-05-07T18:55:45.000Z"`) for some rows. The engine runs a one-time
+migration on startup that rewrites any ISO-format timestamp it finds back to
+epoch seconds, so older databases self-heal the first time a current engine
+opens them.
+
 ## Engine Responsibilities
 
 The engine should own:
