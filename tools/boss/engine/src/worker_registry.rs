@@ -130,6 +130,20 @@ impl WorkerRegistry {
             .len()
     }
 
+    /// Snapshot of every registered worker shell pid. Used by the
+    /// engine's RPC auth to decide "is this peer a worker?" — peers
+    /// whose process tree descends from one of these pids are workers,
+    /// not the Boss session.
+    pub fn registered_pids(&self) -> Vec<libc::pid_t> {
+        self.inner
+            .lock()
+            .expect("registry poisoned")
+            .pid_to_run
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

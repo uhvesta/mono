@@ -226,6 +226,27 @@ pub enum FrontendRequest {
     /// Subscribers can also listen on the `worker.live_states` topic
     /// for push updates whenever any slot's state changes.
     ListWorkerLiveStates,
+    /// Cancel a queued or running execution. Marks the execution row
+    /// `cancelled`, releases any cube workspace lease it still holds,
+    /// and tears down the libghostty pane (if one was allocated).
+    /// Idempotent on already-terminal rows (returns `WorkError`).
+    CancelExecution {
+        execution_id: String,
+    },
+    /// Tail the most recent transcript chunk for `run_id`. The engine
+    /// reads `WorkRun.transcript_path` and returns the trailing
+    /// `lines` lines (raw JSONL — the caller decides how to render).
+    /// Returns `WorkError` if the run is unknown or has no transcript
+    /// path recorded yet.
+    TailRunTranscript {
+        run_id: String,
+        lines: usize,
+    },
+    /// Snapshot the cube workspace pool. Proxies to
+    /// `cube --json workspace list`; the engine adds no editorial — the
+    /// returned vector mirrors cube's view, optionally annotated with
+    /// the engine's own knowledge of which leases back which executions.
+    WorkspacePoolSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +431,56 @@ pub enum FrontendEvent {
     WorkerLiveStatesList {
         states: Vec<LiveWorkerState>,
     },
+    /// Engine confirms an execution has been cancelled. The cancelled
+    /// row's status is now `cancelled`; resource teardown (pane
+    /// release, cube workspace release) is asynchronous.
+    ExecutionCancelled {
+        execution: WorkExecution,
+    },
+    /// Trailing transcript chunk for a run. `lines` are the raw JSONL
+    /// lines the engine read off the recorded transcript path
+    /// (newest-last). `truncated` is set when the file had more lines
+    /// than were returned.
+    RunTranscriptTail {
+        run_id: String,
+        transcript_path: String,
+        lines: Vec<String>,
+        truncated: bool,
+    },
+    /// Snapshot of the cube workspace pool. The engine proxies
+    /// `cube --json workspace list`; each entry corresponds to one
+    /// workspace cube knows about, annotated (when the engine has
+    /// matching state) with the execution id currently leasing it.
+    WorkspacePoolSummaryResult {
+        workspaces: Vec<WorkspacePoolEntry>,
+    },
+}
+
+/// One row of the cube workspace pool, as exposed via
+/// [`FrontendEvent::WorkspacePoolSummaryResult`]. Mirrors
+/// `CubeWorkspaceStatus` plus an optional engine-side annotation
+/// that maps a workspace's current lease to the execution holding it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspacePoolEntry {
+    pub workspace_id: String,
+    pub workspace_path: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leased_at_epoch_s: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_epoch_s: Option<i64>,
+    /// The execution id whose row currently records this lease, if
+    /// the engine knows about one. Null when cube reports the lease
+    /// but the engine has no matching execution row (drift) or the
+    /// workspace is idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

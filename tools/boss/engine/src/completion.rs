@@ -669,6 +669,9 @@ mod tests {
         async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
             Ok(())
         }
+        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+            Ok(Vec::new())
+        }
     }
 
     #[derive(Default)]

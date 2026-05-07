@@ -70,3 +70,21 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+rust_test(
+    name = "control_verbs_test",
+    srcs = ["tests/control_verbs.rs"],
+    edition = "2024",
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)

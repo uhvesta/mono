@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 use boss_protocol::{
     FrontendEvent, FrontendRequest, LiveWorkerState, RequestExecutionInput, WorkExecution, WorkRun,
+    WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -150,6 +151,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Agents {
             action: AgentsAction::Stop { run_id },
         } => agents_stop(&cli.socket_path, cli.json, run_id).await,
+        Command::Agents {
+            action: AgentsAction::Transcript { run_id, lines },
+        } => agents_transcript(&cli.socket_path, cli.json, run_id, lines).await,
         Command::Work {
             action:
                 WorkAction::Start {
@@ -165,11 +169,17 @@ async fn dispatch(cli: Cli) -> Result<()> {
             preferred_workspace_id,
         )
         .await,
+        Command::Work {
+            action: WorkAction::Cancel { execution_id },
+        } => work_cancel(&cli.socket_path, cli.json, execution_id).await,
+        Command::Workspace {
+            action: WorkspaceAction::Summary,
+        } => workspace_summary(&cli.socket_path, cli.json).await,
         // The remaining verbs need engine surfaces that don't exist
-        // yet (interrupt key injection, focus pane, list-all-runs,
-        // workspace pool summary, transcript tailing, etc.). They
-        // print a structured "not_implemented" so the Boss session
-        // can call them and see exactly which ones are pending.
+        // yet (interrupt key injection, focus pane, send keystrokes,
+        // explicit launch). They print a structured "not_implemented"
+        // so the Boss session can call them and see exactly which
+        // ones are pending.
         other => print_not_implemented(cli.json, &describe_verb(&other)),
     }
 }
@@ -355,6 +365,135 @@ async fn work_start(
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }
+}
+
+async fn work_cancel(
+    socket_path: &Option<String>,
+    json: bool,
+    execution_id: String,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::CancelExecution {
+            execution_id: execution_id.clone(),
+        })
+        .await
+        .context("sending CancelExecution")?;
+    match response {
+        FrontendEvent::ExecutionCancelled { execution } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&execution).expect("WorkExecution serializes")
+                );
+            } else {
+                println!("cancelled execution {}", execution.id);
+                println!("  status:    {}", execution.status);
+                if let Some(f) = &execution.finished_at {
+                    println!("  finished:  {f}");
+                }
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected work cancel: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn agents_transcript(
+    socket_path: &Option<String>,
+    json: bool,
+    run_id: String,
+    lines: usize,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::TailRunTranscript {
+            run_id: run_id.clone(),
+            lines,
+        })
+        .await
+        .context("sending TailRunTranscript")?;
+    match response {
+        FrontendEvent::RunTranscriptTail {
+            run_id: returned,
+            transcript_path,
+            lines: tail,
+            truncated,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "run_id": returned,
+                        "transcript_path": transcript_path,
+                        "lines": tail,
+                        "truncated": truncated,
+                    })
+                );
+            } else {
+                if truncated {
+                    println!(
+                        "transcript {transcript_path} (showing last {} lines; older content omitted)",
+                        tail.len()
+                    );
+                } else {
+                    println!("transcript {transcript_path} ({} lines)", tail.len());
+                }
+                for line in tail {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected transcript tail: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn workspace_summary(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::WorkspacePoolSummary)
+        .await
+        .context("sending WorkspacePoolSummary")?;
+    match response {
+        FrontendEvent::WorkspacePoolSummaryResult { workspaces } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "workspaces": workspaces,
+                    })
+                );
+            } else if workspaces.is_empty() {
+                println!("no workspaces in cube pool");
+            } else {
+                for ws in &workspaces {
+                    print_workspace_entry_short(ws);
+                }
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected workspace summary: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+fn print_workspace_entry_short(entry: &WorkspacePoolEntry) {
+    let lease = entry.lease_id.as_deref().unwrap_or("-");
+    let exec = entry.execution_id.as_deref().unwrap_or("-");
+    let task = entry.task.as_deref().unwrap_or("-");
+    println!(
+        "{}  state={}  lease={}  execution={}  task=\"{}\"  path={}",
+        entry.workspace_id, entry.state, lease, exec, task, entry.workspace_path,
+    );
 }
 
 fn print_run(json: bool, run: &WorkRun) {

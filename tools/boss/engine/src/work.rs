@@ -301,6 +301,84 @@ impl WorkDb {
         query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
     }
 
+    /// Mark an execution `cancelled` and stamp `finished_at`. Errors
+    /// when the execution is unknown or already in a terminal status
+    /// — callers shouldn't try to cancel a row that's already done.
+    ///
+    /// Workspace lease columns are intentionally left intact so the
+    /// caller can hand the execution id to
+    /// `WorkerCompletionHandler::force_release`, which transfers
+    /// lease ownership atomically by clearing the columns itself
+    /// before talking to the cube CLI. Trying to clear them inside
+    /// this transaction would race the same release path.
+    pub fn cancel_execution(&self, execution_id: &str) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let existing = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        if execution_status_is_terminal(&existing.status) {
+            bail!(
+                "execution {execution_id} is already in terminal status `{}` and cannot be cancelled",
+                existing.status
+            );
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'cancelled',
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now.as_str()],
+        )?;
+        let updated = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution after cancel: {execution_id}"))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Return the run ids that belong to `execution_id` and have not
+    /// yet finished. The cancel-execution flow uses this to find any
+    /// libghostty pane the execution still backs so the engine can
+    /// release it in addition to the cube workspace.
+    pub fn active_run_ids_for_execution(&self, execution_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_runs
+             WHERE execution_id = ?1
+               AND finished_at IS NULL",
+        )?;
+        let rows = stmt.query_map([execution_id], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Build a map from `cube_lease_id` → `execution_id` for every
+    /// execution row that currently records a lease. Used by
+    /// `WorkspacePoolSummary` to annotate cube's view of the pool with
+    /// the engine's own knowledge of which lease is backing which
+    /// execution. Rows without a lease (`cube_lease_id IS NULL`) are
+    /// skipped.
+    pub fn lease_to_execution_map(&self) -> Result<HashMap<String, String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT cube_lease_id, id
+             FROM work_executions
+             WHERE cube_lease_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (lease_id, execution_id) = row?;
+            map.insert(lease_id, execution_id);
+        }
+        Ok(map)
+    }
+
     pub fn list_ready_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1960,7 +2038,7 @@ fn can_reconcile_execution_status(status: &str) -> bool {
 }
 
 fn execution_status_is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "abandoned")
+    matches!(status, "completed" | "failed" | "abandoned" | "cancelled")
 }
 
 fn project_accepts_execution(project: &Project) -> bool {
