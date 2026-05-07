@@ -128,14 +128,13 @@ private struct WorkerSlotView: View {
 
             Spacer(minLength: 0)
 
-            // Prefer engine-supplied LiveWorkerState — it knows the
-            // real model name and the activity is driven by hook
-            // events rather than a screen-scrape that always rendered
-            // "Claude Unknown". Fall back to the legacy claudeState
-            // pill until the worker's first hook fires.
+            // Prefer engine-supplied LiveWorkerState — its activity is
+            // driven by hook events rather than a screen-scrape that
+            // always rendered "Claude Unknown". Fall back to the legacy
+            // claudeState pill until the worker's first hook fires.
             if let live = liveState {
                 statusPill(
-                    "\(live.model) · \(live.activity.label)",
+                    live.activity.label,
                     color: liveActivityColor(live.activity)
                 )
             } else if let state = slot.session?.claudeState {
