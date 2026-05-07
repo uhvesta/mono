@@ -165,10 +165,28 @@ final class GhosttyRuntime: @unchecked Sendable {
     }
 
     fileprivate static func action(target: ghostty_target_s, action: ghostty_action_s) -> Bool {
-        OperationQueue.main.addOperation {
-            MainActor.assumeIsolated {
-                handleAction(target: target, action: action)
-            }
+        // Handle synchronously on the calling thread.
+        //
+        // The `action` struct contains raw C pointers into memory
+        // libghostty owns (e.g. `set_title.title`, `pwd.pwd`). Those
+        // pointers are valid only for the duration of this callback —
+        // libghostty's `performPreAction` in `apprt/embedded.zig`
+        // literally `alloc.free()`s previous values when a follow-up
+        // action arrives. Deferring handling onto the main queue (the
+        // previous behaviour) let the pointers go stale before
+        // `handleAction` deref'd them, producing
+        // `EXC_BAD_ACCESS / EXC_ARM_DA_ALIGN` crashes inside
+        // `String(cString:)` — confirmed by minidump symbolication
+        // pointing at GhosttyRuntime.swift:170.
+        //
+        // libghostty invokes this from the macOS main runloop (it
+        // dispatches surface actions inline from the same thread that
+        // drives the NSView event handlers), so `MainActor.assumeIsolated`
+        // is safe to call directly. This matches upstream Ghostty.app's
+        // own `Ghostty.App.swift` which handles every action
+        // synchronously for the same lifetime reason.
+        MainActor.assumeIsolated {
+            handleAction(target: target, action: action)
         }
         return true
     }
