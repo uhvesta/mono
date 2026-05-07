@@ -116,6 +116,27 @@ final class WorkersWorkspaceModel: ObservableObject {
         window.makeFirstResponder(host)
         return .success
     }
+
+    /// Deliver an Esc keystroke to the slot's libghostty surface —
+    /// equivalent to the human pressing Esc with the pane focused.
+    /// Routes through the same `ghostty_surface_key` path used by
+    /// `keyDown(with:)`, so libghostty's keymap translation produces
+    /// the right ESC byte sequence in the pty (and Claude treats it
+    /// as an in-flight-turn cancel). Used by `bossctl agents
+    /// interrupt`.
+    func interruptWorkerPane(slotId: Int) -> EngineInterruptResult {
+        guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
+            return .failure(.unknownSlot)
+        }
+        guard let session = slots[index].session else {
+            return .failure(.unknownSlot)
+        }
+        guard let host = session.hostView else {
+            return .failure(.internalFailure("pane has no live surface"))
+        }
+        host.sendInterrupt()
+        return .success
+    }
 }
 
 struct WorkerSlot: Identifiable, Equatable {

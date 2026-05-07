@@ -183,6 +183,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::Send { agent, text },
         } => agents_send(&cli.socket_path, cli.json, agent, text).await,
         Command::Agents {
+            action: AgentsAction::Interrupt { agent },
+        } => agents_interrupt(&cli.socket_path, cli.json, agent).await,
+        Command::Agents {
             action: AgentsAction::Transcript { agent, lines },
         } => agents_transcript(&cli.socket_path, cli.json, agent, lines).await,
         Command::Agents {
@@ -219,10 +222,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Workspace {
             action: WorkspaceAction::Summary,
         } => workspace_summary(&cli.socket_path, cli.json).await,
-        // The remaining verbs need engine surfaces that don't exist
-        // yet (interrupt key injection). They print a structured
-        // "not_implemented" so the Boss session can call them and see
-        // exactly which ones are pending.
+        // Any remaining verbs that need engine surfaces that don't
+        // exist yet print a structured "not_implemented" so the Boss
+        // session can call them and see exactly which ones are
+        // pending.
         other => print_not_implemented(cli.json, &describe_verb(&other)),
     }
 }
@@ -552,6 +555,49 @@ async fn agents_send(
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected send: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+/// Interrupt the worker referenced by `agent` — equivalent to the
+/// human pressing Esc inside that worker's pane. Cancels the
+/// in-flight turn without killing the run.
+async fn agents_interrupt(
+    socket_path: &Option<String>,
+    json: bool,
+    agent: String,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let response = client
+        .send_request(&FrontendRequest::InterruptWorkerPane {
+            run_id: run_id.clone(),
+        })
+        .await
+        .context("sending InterruptWorkerPane")?;
+    match response {
+        FrontendEvent::WorkerPaneInterrupted {
+            run_id: returned,
+            slot_id,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "interrupted",
+                        "run_id": returned,
+                        "slot_id": slot_id,
+                    })
+                );
+            } else {
+                println!("interrupted slot {slot_id} (run {returned})");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected interrupt: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }

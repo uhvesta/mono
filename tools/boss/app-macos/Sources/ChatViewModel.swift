@@ -599,6 +599,7 @@ final class ChatViewModel: ObservableObject {
     var paneReleaseHandler: ((Int, UInt32) -> EngineReleaseResult)?
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
+    var paneInterruptHandler: ((Int) -> EngineInterruptResult)?
 
     private func handle(_ event: EngineEvent) {
         switch event {
@@ -660,6 +661,16 @@ final class ChatViewModel: ObservableObject {
                     ))
                 }
                 engine.sendFocusWorkerPaneResponse(requestId: requestId, result: result)
+            case .interruptWorkerPane(let slotId):
+                let result: EngineInterruptResult
+                if let handler = paneInterruptHandler {
+                    result = handler(slotId)
+                } else {
+                    result = .failure(.internalFailure(
+                        "no pane allocator wired into this build (Bazel without GhosttyKit)"
+                    ))
+                }
+                engine.sendInterruptWorkerPaneResponse(requestId: requestId, result: result)
             }
         case .disconnected:
             isConnected = false

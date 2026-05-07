@@ -318,6 +318,34 @@ final class GhosttyTerminalHostView: NSView {
         }
     }
 
+    /// Synthesise an Esc keypress on the surface — the same key path
+    /// used by `keyDown(with:)`, just sourced from a programmatic
+    /// caller instead of an NSEvent. libghostty translates the
+    /// keycode and writes the ESC byte sequence to the pty so the
+    /// child process (Claude) sees it as a real Esc. Used by the
+    /// engine→app `InterruptWorkerPane` request (`bossctl agents
+    /// interrupt`).
+    ///
+    /// `ghostty_surface_text` is *not* viable here — its docstring
+    /// is explicit that it's the paste pathway and intentionally
+    /// drops escape sequences.
+    func sendInterrupt() {
+        guard let surface else { return }
+        var keyEvent = ghostty_input_key_s()
+        keyEvent.action = GHOSTTY_ACTION_PRESS
+        keyEvent.mods = GHOSTTY_MODS_NONE
+        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+        // macOS hardware keycode for Escape (kVK_Escape = 0x35).
+        // libghostty's embedded apprt looks up the physical key by
+        // matching its native-keycode table, so passing the raw
+        // macOS keycode is the same shape `keyDown(with:)` produces.
+        keyEvent.keycode = 0x35
+        keyEvent.text = nil
+        keyEvent.composing = false
+        keyEvent.unshifted_codepoint = 0x1B
+        _ = ghostty_surface_key(surface, keyEvent)
+    }
+
     func setCellSize(_ size: ghostty_action_cell_size_s) {
         session.statusMessage = "Cell \(size.width)x\(size.height)"
     }

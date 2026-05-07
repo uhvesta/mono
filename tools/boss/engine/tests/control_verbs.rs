@@ -521,6 +521,36 @@ async fn agents_transcript_does_not_reject_local_caller_as_boss_only() -> Result
 }
 
 #[tokio::test]
+async fn agents_interrupt_does_not_reject_local_caller_as_boss_only() -> Result<()> {
+    // `bossctl agents interrupt` ships at the same AppOrBoss tier as
+    // `agents focus` / `agents stop` — humans run it from the Boss
+    // pane, the app shell, *and* from inside worker (slot) panes.
+    // This smoke guards against the verb regressing to BossOnly and
+    // silently locking the coordinator out of in-flight Esc.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::InterruptWorkerPane {
+            run_id: "run-does-not-exist".to_owned(),
+        })
+        .await?;
+    match response {
+        // Auth passed; the verb went on to fail the run lookup
+        // (expected — we did not seed a run).
+        FrontendEvent::WorkError { .. } => {}
+        FrontendEvent::Error { message, .. } => {
+            assert!(
+                !message.contains("BossOnly")
+                    && !message.contains("requires app or Boss authority"),
+                "interrupt_worker_pane must not reject local callers on auth grounds: {message}"
+            );
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()> {
     // Live-coordinator-session repro: `bossctl workspace summary` was
     // failing AppOrBoss when invoked from a shell that descended from

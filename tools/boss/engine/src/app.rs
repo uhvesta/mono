@@ -25,8 +25,9 @@ use crate::coordinator::{
 use crate::protocol::{
     AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse,
     FocusWorkerPaneInput, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
-    FrontendRequestEnvelope, ReleaseWorkerPaneInput, SendToPaneInput, TOPIC_WORK_PRODUCTS,
-    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, work_product_topic,
+    FrontendRequestEnvelope, InterruptWorkerPaneInput, ReleaseWorkerPaneInput, SendToPaneInput,
+    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic,
+    work_product_topic,
 };
 use tokio::time::{Duration, timeout};
 use crate::runner::AcpExecutionRunner;
@@ -462,6 +463,21 @@ pub enum SendInputError {
     ResponseKindMismatch(String),
 }
 
+/// Surfaced by [`ServerState::interrupt_worker_pane`]. Mirrors
+/// [`FocusPaneError`] — the same error tiers apply (resolution miss,
+/// app failure, transport, response shape).
+#[derive(Debug, thiserror::Error)]
+pub enum InterruptPaneError {
+    #[error("no worker pane mapped for that run id")]
+    UnknownRun,
+    #[error("app reported error: {0:?}")]
+    App(EngineToAppError),
+    #[error(transparent)]
+    Send(#[from] SendToAppError),
+    #[error("app returned unexpected response: {0}")]
+    ResponseKindMismatch(String),
+}
+
 impl ServerState {
     fn new_arc(cfg: Arc<RuntimeConfig>) -> Result<Arc<Self>> {
         let app_pid = current_parent_pid();
@@ -703,6 +719,29 @@ impl ServerState {
             }
             Ok(other) => Err(SendInputError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(SendInputError::Send(err)),
+        }
+    }
+
+    /// Resolve `run_id → slot_id` and ask the app to deliver an Esc
+    /// keystroke to that worker pane's pty — equivalent to the human
+    /// pressing Esc with the pane focused. The worker run stays
+    /// alive; only the in-flight turn is cancelled. Returns the
+    /// resolved slot on success so callers (`bossctl agents
+    /// interrupt`) can confirm in JSON output which slot received
+    /// the interrupt.
+    pub async fn interrupt_worker_pane(&self, run_id: &str) -> Result<u8, InterruptPaneError> {
+        let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
+            return Err(InterruptPaneError::UnknownRun);
+        };
+        let request =
+            EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
+            Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => {
+                Err(InterruptPaneError::App(err))
+            }
+            Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
+            Err(err) => Err(InterruptPaneError::Send(err)),
         }
     }
 
@@ -2951,6 +2990,55 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            FrontendRequest::InterruptWorkerPane { run_id } => {
+                // `bossctl agents interrupt` mirrors the keyboard Esc
+                // a human would press inside the worker pane. Same
+                // tier rationale as `focus_worker_pane`: the human
+                // may invoke it from the Boss pane, the app shell,
+                // or a sibling worker pane — `AppOrBoss` admits all
+                // three.
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        run_id = %run_id,
+                        "interrupt_worker_pane rejected: caller not in app/Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            agent_id: None,
+                            message: "interrupt_worker_pane requires app or Boss authority"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                match server_state.interrupt_worker_pane(&run_id).await {
+                    Ok(slot_id) => {
+                        tracing::info!(
+                            run_id = %run_id,
+                            slot_id,
+                            "interrupt_worker_pane: esc delivered",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkerPaneInterrupted { run_id, slot_id },
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, run_id = %run_id, "interrupt_worker_pane failed");
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("interrupt_worker_pane: {err}"),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::ListWorkerLiveStates => {
                 let states = server_state.live_worker_states_snapshot();
                 send_response(
@@ -4273,6 +4361,116 @@ mod tests {
         let err = send.await.expect("send task").expect_err("expect err");
         match err {
             SendInputError::App(EngineToAppError::UnknownSlot) => {}
+            other => panic!("expected App(UnknownSlot), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_worker_pane_unknown_run_returns_unknown_run() {
+        let server_state = test_server_state();
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink)
+            .await;
+        let err = server_state
+            .interrupt_worker_pane("never-allocated")
+            .await
+            .expect_err("unknown run should fail");
+        assert!(matches!(err, InterruptPaneError::UnknownRun));
+    }
+
+    #[tokio::test]
+    async fn interrupt_worker_pane_round_trips_to_app() {
+        // End-to-end smoke: engine resolves run_id → slot via the
+        // worker registry, sends an InterruptWorkerPane EngineRequest
+        // to the registered app session, and surfaces the slot id
+        // once the app replies success.
+        let server_state = test_server_state();
+        server_state
+            .worker_registry
+            .register_run_slot("run-int", 6);
+
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let interrupt = tokio::spawn(async move {
+            server_clone.interrupt_worker_pane("run-int").await
+        });
+
+        let envelope = sink
+            .next()
+            .await
+            .expect("an EngineRequest event should be enqueued");
+        let (request_id, request) = match envelope.payload {
+            FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        match request {
+            EngineToAppRequest::InterruptWorkerPane(input) => {
+                assert_eq!(input.slot_id, 6);
+            }
+            other => panic!("expected InterruptWorkerPane, got {other:?}"),
+        }
+
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::InterruptWorkerPane {
+                    result: Ok(crate::protocol::InterruptWorkerPaneResult {}),
+                },
+            )
+            .await;
+
+        let slot = interrupt
+            .await
+            .expect("interrupt task")
+            .expect("interrupt ok");
+        assert_eq!(slot, 6);
+    }
+
+    #[tokio::test]
+    async fn interrupt_worker_pane_surfaces_app_error() {
+        let server_state = test_server_state();
+        server_state
+            .worker_registry
+            .register_run_slot("run-int", 2);
+
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let server_clone = server_state.clone();
+        let interrupt = tokio::spawn(async move {
+            server_clone.interrupt_worker_pane("run-int").await
+        });
+
+        let envelope = sink.next().await.expect("EngineRequest enqueued");
+        let request_id = match envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id,
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::InterruptWorkerPane {
+                    result: Err(EngineToAppError::UnknownSlot),
+                },
+            )
+            .await;
+
+        let err = interrupt
+            .await
+            .expect("interrupt task")
+            .expect_err("expect err");
+        match err {
+            InterruptPaneError::App(EngineToAppError::UnknownSlot) => {}
             other => panic!("expected App(UnknownSlot), got {other:?}"),
         }
     }

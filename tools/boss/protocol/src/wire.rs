@@ -239,6 +239,16 @@ pub enum FrontendRequest {
         run_id: String,
         text: String,
     },
+    /// Boss-tier RPC: interrupt the worker pane hosting `run_id` —
+    /// equivalent to the human pressing Esc inside that pane.
+    /// Resolves `run_id → slot_id` and forwards an
+    /// `InterruptWorkerPane` engine→app request. Cancels the worker's
+    /// in-flight turn without killing the run. Used by `bossctl
+    /// agents interrupt`. Returns a `WorkError` if the run is unknown
+    /// or has no allocated pane.
+    InterruptWorkerPane {
+        run_id: String,
+    },
     /// Snapshot of every allocated worker slot's live state — what
     /// model it's running, what activity (working / waiting / idle /
     /// errored / terminated), most recent tool, etc. Source of truth
@@ -471,6 +481,15 @@ pub enum FrontendEvent {
     /// pane was targeted when the agent reference was a crew name
     /// or run id.
     WorkerInputSent {
+        run_id: String,
+        slot_id: u8,
+    },
+    /// Engine acknowledges an interrupt request — an Esc keystroke
+    /// has been delivered to the worker pane's pty. Carries the
+    /// resolved `slot_id` so the caller can confirm which slot was
+    /// interrupted when the agent reference was a crew name or run
+    /// id.
+    WorkerPaneInterrupted {
         run_id: String,
         slot_id: u8,
     },

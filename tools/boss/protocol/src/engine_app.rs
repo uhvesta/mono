@@ -92,6 +92,19 @@ pub struct FocusWorkerPaneInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FocusWorkerPaneResult {}
 
+/// Engine asks the app to deliver an Esc / interrupt key event to a
+/// worker pane's pty — equivalent to the human pressing Esc while
+/// the pane has keyboard focus. Used by `bossctl agents interrupt`
+/// to cancel a worker's in-flight turn without terminating the run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterruptWorkerPaneInput {
+    pub slot_id: u8,
+}
+
+/// App's reply when interrupt delivery succeeds. Empty for now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterruptWorkerPaneResult {}
+
 /// What the engine is asking the app to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -100,6 +113,7 @@ pub enum EngineToAppRequest {
     ReleaseWorkerPane(ReleaseWorkerPaneInput),
     SendToPane(SendToPaneInput),
     FocusWorkerPane(FocusWorkerPaneInput),
+    InterruptWorkerPane(InterruptWorkerPaneInput),
 }
 
 /// App's reply, paired with the `request_id` from the originating
@@ -123,6 +137,9 @@ pub enum EngineToAppResponse {
     },
     FocusWorkerPane {
         result: Result<FocusWorkerPaneResult, EngineToAppError>,
+    },
+    InterruptWorkerPane {
+        result: Result<InterruptWorkerPaneResult, EngineToAppError>,
     },
 }
 
@@ -261,6 +278,36 @@ mod tests {
     #[test]
     fn focus_response_err_round_trips() {
         let original = EngineToAppResponse::FocusWorkerPane {
+            result: Err(EngineToAppError::UnknownSlot),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn interrupt_request_round_trips() {
+        let original =
+            EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id: 7 });
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("interrupt_worker_pane"));
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn interrupt_response_ok_round_trips() {
+        let original = EngineToAppResponse::InterruptWorkerPane {
+            result: Ok(InterruptWorkerPaneResult {}),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn interrupt_response_err_round_trips() {
+        let original = EngineToAppResponse::InterruptWorkerPane {
             result: Err(EngineToAppError::UnknownSlot),
         };
         let json = serde_json::to_string(&original).unwrap();

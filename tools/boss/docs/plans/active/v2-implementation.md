@@ -40,7 +40,7 @@ brainstorm that started V2 and has been archived to `plans/done/`.
 | 4     | Execution layer + cube V2 prereqs              | 🟢 named deliverables shipped — cube driver covers `status` / `heartbeat` / `force-release`; live callers for those land in Phase 9 |
 | 5     | ExecutionCoordinator                           | 🟢 named deliverables shipped — affinity-first/LRU worker selection, 8-worker hard cap, priority + FIFO ready queue, `executions.<id>` topic, `request_execution` RPC, `RunWaitState` enum |
 | 6     | libghostty embedding and worker spawn          | 🟢 named deliverables shipped — 6a–6g + 6f-1..8 all in main; PR #197 closed the BOSS_RUN_ID hook-correlation gap that the 6f-6 shell_pid TODO had left |
-| 7     | Boss session and bossctl                       | 🟢 mostly shipped — Boss pane, `bossctl` binary, two-trust-root auth, probe model, coordinator system prompt, worker env hygiene all in `main`; some `bossctl` verbs (`agents focus/send/interrupt/launch/transcript`, `work cancel`, `workspace summary`) still print `not_implemented` |
+| 7     | Boss session and bossctl                       | 🟢 mostly shipped — Boss pane, `bossctl` binary, two-trust-root auth, probe model, coordinator system prompt, worker env hygiene all in `main`; some `bossctl` verbs (`agents focus/send/launch/transcript`, `work cancel`, `workspace summary`) still print `not_implemented` |
 | 8     | Review and attention                           | 🟡 auto PR-detect on Stop landed (PR #184) — moves work item to `in_review` and finalises execution; poller for `waiting_review` / `waiting_merge`, Triage UI, and re-engagement still pending |
 | 9     | Resume and continuity                          | ❌ not started               |
 | 10    | Transcripts and hardening                      | ❌ schema columns only       |
@@ -528,10 +528,9 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
     teardown), and resets the backing chore/task from `active`
     back to `todo` so the kanban card returns to the To-Do lane.
     `in_review`/`done`/`archived` are preserved.
-  - The remaining verbs (`agents focus/send/interrupt/launch/
-    transcript`, `workspace summary`) print a structured
+  - The remaining verbs (`agents send`) print a structured
     `not_implemented` response so the Boss session can discover
-    gaps interactively (`main.rs:445-458`). See **Pending**.
+    gaps interactively. See **Pending**.
 - **Two-trust-root socket auth.**
   `engine/src/app.rs:316-321` defines
   `RpcTier::{User, AppOrBoss, BossOnly}`. `authorize_rpc`
@@ -578,8 +577,20 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   specific worker pane to the front.
 - `bossctl agents send` — needs an engine→app RPC that injects
   user-typed input into a worker pane.
-- `bossctl agents interrupt` — needs an engine→app RPC for
-  Esc-equivalent into a worker pane.
+- ~~`bossctl agents interrupt`~~ — landed. Verb resolves
+  agent → run id → slot via `WorkerRegistry`, sends
+  `EngineToAppRequest::InterruptWorkerPane(slot_id)` over the
+  engine→app channel; the app synthesises an Esc keypress on
+  the slot's libghostty surface via `ghostty_surface_key` (the
+  same path `keyDown(with:)` uses), so libghostty's keymap
+  translation produces the ESC byte sequence in the pty and
+  Claude treats it as an in-flight-turn cancel. Worker run
+  stays alive — only the current turn is cancelled. Coverage:
+  `app::tests::interrupt_worker_pane_round_trips_to_app`,
+  `interrupt_worker_pane_unknown_run_returns_unknown_run`,
+  `interrupt_worker_pane_surfaces_app_error`, plus the
+  `agents_interrupt_does_not_reject_local_caller_as_boss_only`
+  integration smoke.
 - ~~`bossctl agents launch`~~ — landed. Maps to
   `RequestExecution { force: true, .. }`. The `force` flag flips
   the engine path from `kick()` (let the auto-dispatcher pick
@@ -605,9 +616,9 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   prompt → Boss decomposes → Boss runs `bossctl work start <id>`
   → engine picks up → worker runs → Boss observes via
   `bossctl agents status` → on completion, Boss reports to human.
-  ✅ end-to-end works today; the fine-grained verbs
-  (focus/send/interrupt/transcript) still require swivel-chair
-  interaction with the worker pane.
+  ✅ end-to-end works today; the remaining fine-grained verbs
+  (send/transcript) still require swivel-chair interaction
+  with the worker pane.
 - A worker that tries to invoke `bossctl` fails (PATH miss). ✅
 - A worker that tries the live RPCs over the socket fails
   subtree-match auth. ✅

@@ -55,6 +55,9 @@ struct ContentView: View {
             model.paneFocusHandler = { [workspace = workersWorkspace] slotId in
                 workspace.focusWorkerPane(slotId: slotId)
             }
+            model.paneInterruptHandler = { [workspace = workersWorkspace] slotId in
+                workspace.interruptWorkerPane(slotId: slotId)
+            }
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)
