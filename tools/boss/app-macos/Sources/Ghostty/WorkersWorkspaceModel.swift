@@ -10,7 +10,7 @@ final class WorkersWorkspaceModel: ObservableObject {
     init() {
         self.runtime = GhosttyRuntime.shared
         self.slots = (1...Self.workerSlotCount).map { slot in
-            WorkerSlot(slotId: slot)
+            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
         }
     }
 
@@ -60,6 +60,10 @@ final class WorkersWorkspaceModel: ObservableObject {
         slots[index].session = nil
         slots[index].runId = nil
         slots[index].summary = nil
+        // Re-roll the idle flavor so consecutive idle bouts on the same
+        // slot don't show the same line — fresh recreation each time
+        // the crew member clocks out.
+        slots[index].idleFlavorCycle &+= 1
         return .success
     }
 
@@ -89,6 +93,10 @@ struct WorkerSlot: Identifiable, Equatable {
     /// run. Shown in the pane titlebar in place of `runId` when
     /// present; the runId stays available as a tooltip.
     var summary: String?
+    /// Bumped every time the slot re-enters idle so the flavor line
+    /// changes between idle bouts; kept stable for the lifetime of a
+    /// single bout so renders don't flicker.
+    var idleFlavorCycle: Int = 0
 
     var id: Int { slotId }
 
@@ -96,6 +104,7 @@ struct WorkerSlot: Identifiable, Equatable {
         lhs.slotId == rhs.slotId
             && lhs.runId == rhs.runId
             && lhs.summary == rhs.summary
+            && lhs.idleFlavorCycle == rhs.idleFlavorCycle
             && lhs.session === rhs.session
     }
 }

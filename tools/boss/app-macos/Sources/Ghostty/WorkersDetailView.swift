@@ -59,23 +59,64 @@ private struct WorkerSlotView: View {
         if let session = slot.session {
             WorkerPaneTerminalView(runtime: runtime, session: session)
         } else {
-            VStack(spacing: 4) {
-                Spacer()
+            idlePaneView
+        }
+    }
+
+    /// Idle / free slot treatment: large character portrait + crew name
+    /// + a stable in-character recreational flavor line. The line is
+    /// keyed on `slot.idleFlavorCycle`, which the workspace model
+    /// bumps when the slot re-enters idle, so within one idle bout
+    /// the line never flickers.
+    @ViewBuilder
+    private var idlePaneView: some View {
+        let character = TrekCharacter.forSlot(slot.slotId)
+        VStack(spacing: 14) {
+            Spacer()
+            if let character {
+                if let nsImage = TrekIconAssets.image(character, size: .large) {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: 220, maxHeight: 240)
+                        .opacity(0.85)
+                }
+                Text(character.displayName)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                Text(TrekIdleFlavor.line(for: character, cycle: slot.idleFlavorCycle))
+                    .font(.callout)
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+                    .lineLimit(3)
+            } else {
                 Text("Slot \(slot.slotId)")
                     .font(.caption2)
                     .foregroundStyle(Color.white.opacity(0.45))
                 Text("Free")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(Color.white.opacity(0.7))
-                Spacer()
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .black))
+            Spacer()
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .black))
     }
 
     private var slotHeader: some View {
         HStack(spacing: 8) {
+            if let character = TrekCharacter.forSlot(slot.slotId),
+               let nsImage = TrekIconAssets.image(character, size: .small) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 22, height: 28)
+                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+            }
+
             VStack(alignment: .leading, spacing: 1) {
                 Text(WorkerNames.name(forSlot: slot.slotId))
                     .font(.caption.weight(.semibold))

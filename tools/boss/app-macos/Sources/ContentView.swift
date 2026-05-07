@@ -665,6 +665,9 @@ struct ContentView: View {
                                                     runtime: model.taskRuntime(for: task.id),
                                                     liveState: model.workerLiveState(forTaskID: task.id)
                                                   )
+                                                : nil,
+                                            assignedSlotId: column == .doing
+                                                ? model.workerLiveState(forTaskID: task.id)?.slotId
                                                 : nil
                                         )
                                     }
@@ -838,6 +841,11 @@ private struct WorkBoardCardView: View {
     let projectName: String?
     let isSelected: Bool
     let activityState: AgentActivityState?
+    /// Slot id of the worker currently bound to this card, when the
+    /// card lives in the Doing lane. Drives the small crew portrait
+    /// in the title row so a glance at the board tells you which
+    /// crew member is on which task.
+    let assignedSlotId: Int?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -845,6 +853,17 @@ private struct WorkBoardCardView: View {
                 if let activityState {
                     AgentActivityDot(state: activityState)
                         .padding(.top, 5)
+                }
+                if let slotId = assignedSlotId,
+                   let character = TrekCharacter.forSlot(slotId),
+                   let nsImage = TrekIconAssets.image(character, size: .small) {
+                    Image(nsImage: nsImage)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 20, height: 26)
+                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                        .help("\(character.displayName) (slot \(slotId))")
                 }
                 Text(task.name)
                     .font(.body.weight(.medium))

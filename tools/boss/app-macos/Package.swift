@@ -22,6 +22,9 @@ let package = Package(
                 "GhosttyKit",
             ],
             path: "Sources",
+            resources: [
+                .copy("Resources/TrekIcons"),
+            ],
             linkerSettings: [
                 .linkedFramework("Carbon"),
                 .linkedLibrary("c++"),
