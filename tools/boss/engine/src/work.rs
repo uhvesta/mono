@@ -1193,6 +1193,7 @@ impl WorkDb {
                 ON work_executions(status, priority, created_at)",
             [],
         )?;
+        migrate_timestamps_to_epoch(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '3')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1790,6 +1791,107 @@ fn migrate_work_executions_v3(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Canonicalize all timestamp columns to Unix epoch seconds (decimal
+/// string). Older rows in some databases hold ISO 8601 strings (e.g.
+/// `2026-05-07T18:55:45.000Z`) from a pre-canonical write path; this
+/// rewrites them in-place so consumers — `boss chore list --json`,
+/// the macOS app's Done-lane bucketing, and any future SQL ordering —
+/// see one shape. Idempotent: rows already in epoch form are skipped
+/// by the LIKE filter.
+fn migrate_timestamps_to_epoch(conn: &Connection) -> Result<()> {
+    const TIMESTAMP_COLUMNS: &[(&str, &str)] = &[
+        ("products", "created_at"),
+        ("products", "updated_at"),
+        ("projects", "created_at"),
+        ("projects", "updated_at"),
+        ("tasks", "created_at"),
+        ("tasks", "updated_at"),
+        ("tasks", "deleted_at"),
+        ("work_executions", "created_at"),
+        ("work_executions", "started_at"),
+        ("work_executions", "finished_at"),
+        ("work_runs", "created_at"),
+        ("work_runs", "started_at"),
+        ("work_runs", "finished_at"),
+        ("work_attention_items", "created_at"),
+        ("work_attention_items", "resolved_at"),
+        ("pane_summaries", "created_at"),
+    ];
+    for (table, column) in TIMESTAMP_COLUMNS {
+        // SQLite LIKE: `_` matches any single character, so this picks
+        // up `YYYY-MM-DD`-prefixed values without parsing every row.
+        let select_sql = format!(
+            "SELECT rowid, {column} FROM {table} \
+             WHERE {column} LIKE '____-__-__T%' OR {column} LIKE '____-__-__ %'"
+        );
+        let mut stmt = conn.prepare(&select_sql)?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (rowid, value) in rows {
+            if let Some(epoch) = parse_iso8601_to_epoch(&value) {
+                let update_sql =
+                    format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
+                conn.execute(&update_sql, params![epoch.to_string(), rowid])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse an ISO 8601 / RFC 3339 UTC timestamp like
+/// `YYYY-MM-DDTHH:MM:SS[.fff]Z` into Unix epoch seconds. Returns
+/// `None` for any other shape (already-canonical numeric strings,
+/// non-UTC offsets, malformed values) so the caller can leave them
+/// alone.
+fn parse_iso8601_to_epoch(value: &str) -> Option<i64> {
+    let s = value.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    if !s.ends_with('Z') {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u32 = s.get(11..13)?.parse().ok()?;
+    let minute: u32 = s.get(14..16)?.parse().ok()?;
+    let second: u32 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour >= 24 || minute >= 60 || second >= 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64)
+}
+
+/// Days from the Unix epoch (1970-01-01) for a (year, month, day)
+/// triple. Howard Hinnant's `days_from_civil`; see
+/// https://howardhinnant.github.io/date_algorithms.html.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let m = month as i64;
+    let y = if m <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
 }
 
 fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
@@ -3536,6 +3638,79 @@ mod tests {
         assert_eq!(run.status, "failed");
         assert_eq!(run.error_text.as_deref(), Some("agent run failed"));
         assert!(attention.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_iso8601_to_epoch_handles_canonical_shapes() {
+        // Reference epochs cross-checked with `date -u -d '...' +%s`.
+        assert_eq!(parse_iso8601_to_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_to_epoch("2026-05-07T18:55:45Z"),
+            Some(1_778_180_145)
+        );
+        // Fractional seconds are truncated, not rounded.
+        assert_eq!(
+            parse_iso8601_to_epoch("2026-05-07T18:55:45.000Z"),
+            Some(1_778_180_145)
+        );
+        assert_eq!(
+            parse_iso8601_to_epoch("2026-05-07T18:55:45.999Z"),
+            Some(1_778_180_145)
+        );
+        // Already-canonical numeric strings are left untouched.
+        assert_eq!(parse_iso8601_to_epoch("1778180145"), None);
+        assert_eq!(parse_iso8601_to_epoch(""), None);
+        // Non-UTC suffixes aren't supported (engine only writes Z).
+        assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45+00:00"), None);
+        // Malformed values fall through.
+        assert_eq!(parse_iso8601_to_epoch("2026/05/07T18:55:45Z"), None);
+        assert_eq!(parse_iso8601_to_epoch("2026-13-07T18:55:45Z"), None);
+    }
+
+    #[test]
+    fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
+        let path = temp_db_path("ts-migrate");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "ISO chore".to_owned(),
+                description: None,
+            })
+            .unwrap();
+
+        // Hand-roll an ISO 8601 timestamp into the row to mimic the
+        // pre-canonical write path that produced the mixed format.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                params!["2026-05-07T18:55:45.000Z", chore.id],
+            )
+            .unwrap();
+        }
+
+        // Re-opening runs `init` -> `migrate_timestamps_to_epoch`.
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        let updated_at: String = conn
+            .query_row(
+                "SELECT updated_at FROM tasks WHERE id = ?1",
+                params![chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at, "1778180145");
 
         let _ = std::fs::remove_file(path);
     }

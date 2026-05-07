@@ -767,6 +767,10 @@ work_attention_items
 - resolved_at TEXT
 ```
 
+All timestamp columns above store Unix epoch seconds as a decimal string,
+matching the canonical format defined in
+[`work-taxonomy.md`](work-taxonomy.md#timestamp-format).
+
 Follow-up fields that may be useful later:
 
 - `parent_execution_id`
