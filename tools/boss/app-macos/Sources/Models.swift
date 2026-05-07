@@ -9,7 +9,7 @@ enum AgentRole: String {
         case .standard:
             return "Agent"
         case .boss:
-            return "The Boss"
+            return "Picard"
         }
     }
 

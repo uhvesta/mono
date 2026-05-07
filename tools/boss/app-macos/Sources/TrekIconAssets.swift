@@ -1,9 +1,11 @@
 import AppKit
 import Foundation
 
-/// Asset keys for the eight TNG portraits vendored under
+/// Asset keys for the TNG portraits vendored under
 /// `Sources/Resources/TrekIcons/<size>/<key>.png`. The key matches the
-/// filename stem so the loader can build a path mechanically.
+/// filename stem so the loader can build a path mechanically. Eight
+/// of these (Riker..O'Brien) form the worker roster; `picard` is used
+/// for the Boss pane and is intentionally not part of `forSlot`.
 enum TrekCharacter: String, CaseIterable {
     case riker
     case data
@@ -13,6 +15,7 @@ enum TrekCharacter: String, CaseIterable {
     case crusher
     case yar
     case obrien
+    case picard
 
     /// Display name as rendered by `WorkerNames.roster` for the same
     /// slot. Kept in lock-step with that roster — slot 1 = Riker,
@@ -27,6 +30,7 @@ enum TrekCharacter: String, CaseIterable {
         case .crusher: "Crusher"
         case .yar: "Yar"
         case .obrien: "O'Brien"
+        case .picard: "Picard"
         }
     }
 

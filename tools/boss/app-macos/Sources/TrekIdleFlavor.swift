@@ -84,6 +84,16 @@ enum TrekIdleFlavor {
                 "O'Brien is muttering at a Cardassian conduit.",
                 "O'Brien is calling Keiko back, eventually.",
             ]
+        case .picard:
+            // Picard is the Boss pane and not part of the worker
+            // roster, so these lines aren't surfaced via `forSlot`
+            // today — the case exists only for exhaustiveness.
+            return [
+                "Picard is in his ready room with Earl Grey, hot.",
+                "Picard is rereading The Inner Light for the fourth time.",
+                "Picard is studying an obscure archaeological dig report.",
+                "Picard is on the bridge, making it so.",
+            ]
         }
     }
 

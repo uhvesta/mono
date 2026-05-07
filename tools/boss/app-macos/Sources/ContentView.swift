@@ -460,7 +460,7 @@ struct ContentView: View {
 
             if isCollapsed {
                 Spacer(minLength: 0)
-                Text("Boss")
+                Text("Picard")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .rotationEffect(.degrees(-90))
@@ -527,9 +527,18 @@ struct ContentView: View {
             ZStack {
                 Circle()
                     .fill(Color.accentColor.opacity(0.14))
-                Image(systemName: AgentRole.boss.systemImage)
-                    .foregroundStyle(Color.accentColor)
-                    .font(.system(size: 13, weight: .semibold))
+                if let portrait = TrekIconAssets.image(.picard, size: .small) {
+                    Image(nsImage: portrait)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 26, height: 26)
+                        .clipShape(Circle())
+                } else {
+                    Image(systemName: AgentRole.boss.systemImage)
+                        .foregroundStyle(Color.accentColor)
+                        .font(.system(size: 13, weight: .semibold))
+                }
             }
             .frame(width: 26, height: 26)
 
