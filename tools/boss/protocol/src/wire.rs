@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
-    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
-    CreateProjectInput, CreateRunInput, CreateTaskInput, Product, Project,
-    RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemPatch, WorkRun,
+    AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
+    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput,
+    ListDependenciesInput, Product, Project, RemoveDependencyInput, RequestExecutionInput, Task,
+    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -247,6 +248,26 @@ pub enum FrontendRequest {
     /// returned vector mirrors cube's view, optionally annotated with
     /// the engine's own knowledge of which leases back which executions.
     WorkspacePoolSummary,
+    /// Declare a `blocks` edge from `dependent` to `prerequisite`.
+    /// Idempotent: re-adding an existing edge is a no-op. Cycles are
+    /// rejected at the engine before insert.
+    AddDependency {
+        #[serde(flatten)]
+        input: AddDependencyInput,
+    },
+    /// Drop the `(dependent, prerequisite, relation)` edge. No-op if
+    /// the edge does not exist (mirrors `boss <kind> delete` on an
+    /// already-archived row).
+    RemoveDependency {
+        #[serde(flatten)]
+        input: RemoveDependencyInput,
+    },
+    /// Return the prerequisite and/or dependent edges for one work
+    /// item. `direction` defaults to `both`.
+    ListDependencies {
+        #[serde(flatten)]
+        input: ListDependenciesInput,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,6 +475,21 @@ pub enum FrontendEvent {
     WorkspacePoolSummaryResult {
         workspaces: Vec<WorkspacePoolEntry>,
     },
+    /// Engine confirms a dependency edge has been added. Returns the
+    /// row that was inserted (or the existing row if the call was an
+    /// idempotent re-add).
+    DependencyAdded { edge: WorkItemDependency },
+    /// Engine confirms a dependency edge has been removed (or that no
+    /// matching edge existed to begin with — also a success).
+    DependencyRemoved {
+        dependent_id: String,
+        prerequisite_id: String,
+        relation: String,
+        removed: bool,
+    },
+    /// Edge listing for a single work item, with prerequisites and
+    /// dependents in two parallel lists.
+    DependencyList { view: WorkItemDependencyView },
 }
 
 /// One row of the cube workspace pool, as exposed via

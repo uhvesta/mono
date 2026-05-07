@@ -7,10 +7,15 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 pub use boss_protocol::{
-    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
-    CreateProjectInput, CreateRunInput, CreateTaskInput, ExecutionReconcileResult, Product,
-    Project, RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemPatch, WorkRun, WorkTree,
+    AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
+    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection,
+    ExecutionReconcileResult, ListDependenciesInput, Product, Project, RemoveDependencyInput,
+    RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkTree,
+};
+
+use crate::work_dependencies::{
+    self as deps, EdgeInsertOutcome, RELATION_BLOCKS,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -75,7 +80,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at
+            "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
              FROM projects
              WHERE product_id = ?1
              ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -881,6 +886,15 @@ impl WorkDb {
                 if rows == 0 {
                     bail!("unknown task: {id}");
                 }
+                // Q10 (deleted prereq): drop every dependency edge that
+                // names this task as either endpoint. A row with a
+                // tombstoned prerequisite is the worst of both worlds —
+                // dependents stuck on a row that is no longer a thing.
+                tx.execute(
+                    "DELETE FROM work_item_dependencies
+                     WHERE dependent_id = ?1 OR prerequisite_id = ?1",
+                    params![id],
+                )?;
                 tx.commit()?;
                 Ok(())
             }
@@ -896,7 +910,7 @@ impl WorkDb {
 
         let projects = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at
+                "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
                  FROM projects
                  WHERE product_id = ?1
                  ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -907,7 +921,7 @@ impl WorkDb {
 
         let tasks = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -918,7 +932,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -994,7 +1008,7 @@ impl WorkDb {
         if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind = 'project_task' AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1004,7 +1018,7 @@ impl WorkDb {
         }
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
              FROM tasks
              WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
              ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1057,13 +1071,125 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([product_id], map_task)?;
         collect_rows(rows)
+    }
+
+    /// Declare a `relation` edge from `dependent` to `prerequisite`.
+    /// Validates both endpoints resolve to live work items in the
+    /// same product, refuses self-edges and cycles, and is
+    /// idempotent on a re-add of an existing edge.
+    ///
+    /// v1 ships only `relation = 'blocks'`. The CLI accepts an
+    /// explicit `--relation` flag but rejects anything else; the
+    /// column accepts any TEXT value at the schema level so future
+    /// relation types can ship without a re-migration.
+    pub fn add_dependency(&self, input: AddDependencyInput) -> Result<WorkItemDependency> {
+        let relation = input
+            .relation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(RELATION_BLOCKS);
+        if relation != RELATION_BLOCKS {
+            bail!(
+                "unsupported dependency relation `{relation}`; only `blocks` is implemented in v1"
+            );
+        }
+        let dependent_id = input.dependent.trim();
+        let prerequisite_id = input.prerequisite.trim();
+        if dependent_id.is_empty() || prerequisite_id.is_empty() {
+            bail!("dependent and prerequisite ids are required");
+        }
+        if dependent_id == prerequisite_id {
+            bail!("a work item cannot depend on itself: {dependent_id}");
+        }
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        // Both ids must resolve and live in the same product. Cross-
+        // product edges are tracked separately (see proj_18a2bbe20fc03718_8).
+        let dependent_product = product_id_for_work_item(&tx, dependent_id)?;
+        let prerequisite_product = product_id_for_work_item(&tx, prerequisite_id)?;
+        if dependent_product != prerequisite_product {
+            bail!(
+                "dependency edges must stay within a single product; cross-product edges are tracked in proj_18a2bbe20fc03718_8"
+            );
+        }
+        if deps::would_create_cycle(&tx, dependent_id, prerequisite_id)? {
+            bail!(
+                "creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}"
+            );
+        }
+        let now = now_string();
+        let (edge, _outcome): (WorkItemDependency, EdgeInsertOutcome) =
+            deps::insert_edge(&tx, dependent_id, prerequisite_id, relation, &now)?;
+        tx.commit()?;
+        Ok(edge)
+    }
+
+    /// Drop the named edge if it exists. No-op success when the edge
+    /// is already absent (mirrors `boss <kind> delete` on an
+    /// already-archived row).
+    pub fn remove_dependency(&self, input: RemoveDependencyInput) -> Result<bool> {
+        let relation = input
+            .relation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(RELATION_BLOCKS);
+        let dependent_id = input.dependent.trim();
+        let prerequisite_id = input.prerequisite.trim();
+        if dependent_id.is_empty() || prerequisite_id.is_empty() {
+            bail!("dependent and prerequisite ids are required");
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let removed = deps::delete_edge(&tx, dependent_id, prerequisite_id, relation)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Return the prerequisites and/or dependents of a single work
+    /// item. Empty lists when nothing matches; errors only when the
+    /// work item id itself is unknown.
+    pub fn list_dependencies(
+        &self,
+        input: ListDependenciesInput,
+    ) -> Result<WorkItemDependencyView> {
+        let work_item_id = input.work_item.trim();
+        if work_item_id.is_empty() {
+            bail!("work_item id is required");
+        }
+        let conn = self.connect()?;
+        // Validate the work item exists by classifying its id and
+        // looking it up. Surfaces a clear error rather than returning
+        // an empty list for typos.
+        let _ = product_id_for_work_item(&conn, work_item_id)?;
+
+        let direction = input.direction.unwrap_or_default();
+        let prerequisites = match direction {
+            DependencyDirection::Dependents => Vec::new(),
+            DependencyDirection::Prereqs | DependencyDirection::Both => {
+                deps::prerequisites_of(&conn, work_item_id, None)?
+            }
+        };
+        let dependents = match direction {
+            DependencyDirection::Prereqs => Vec::new(),
+            DependencyDirection::Dependents | DependencyDirection::Both => {
+                deps::dependents_of(&conn, work_item_id, None)?
+            }
+        };
+        Ok(WorkItemDependencyView {
+            work_item_id: work_item_id.to_owned(),
+            prerequisites,
+            dependents,
+        })
     }
 
     fn init(&self) -> Result<()> {
@@ -1183,10 +1309,26 @@ impl WorkDb {
                 basis_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS work_item_dependencies (
+                dependent_id     TEXT NOT NULL,
+                prerequisite_id  TEXT NOT NULL,
+                relation         TEXT NOT NULL DEFAULT 'blocks',
+                created_at       TEXT NOT NULL,
+                PRIMARY KEY (dependent_id, prerequisite_id, relation),
+                CHECK (dependent_id <> prerequisite_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS work_item_dependencies_prereq_idx
+                ON work_item_dependencies(prerequisite_id, relation);
+
+            CREATE INDEX IF NOT EXISTS work_item_dependencies_dependent_idx
+                ON work_item_dependencies(dependent_id, relation);
             ",
         )?;
         migrate_work_executions_v3(&conn)?;
         migrate_tasks_autostart(&conn)?;
+        migrate_last_status_actor(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
         // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
@@ -1199,7 +1341,7 @@ impl WorkDb {
         )?;
         migrate_timestamps_to_epoch(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '3')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '4')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -1615,6 +1757,7 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         priority: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+        last_status_actor: row.get(10)?,
     })
 }
 
@@ -1633,6 +1776,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         autostart: row.get::<_, i64>(12)? != 0,
+        last_status_actor: row.get(13)?,
     })
 }
 
@@ -1743,7 +1887,7 @@ fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
 
 fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
     conn.query_row(
-        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at
+        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
          FROM projects
          WHERE id = ?1",
         [id],
@@ -1755,7 +1899,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -1806,7 +1950,7 @@ fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttent
 
 fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at
+        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
          FROM projects
          WHERE product_id = ?1
          ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -1817,7 +1961,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -2015,6 +2159,25 @@ fn migrate_tasks_autostart(conn: &Connection) -> Result<()> {
             "ALTER TABLE tasks ADD COLUMN autostart INTEGER NOT NULL DEFAULT 1",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// Add `last_status_actor` to `tasks` and `projects` so the engine
+/// can distinguish a status it set itself (`'engine'`) from one a
+/// human typed at the CLI / kanban (`'human'`). The dependencies
+/// auto-unblock path only flips a `blocked` row back to `todo` when
+/// the engine put it there; manual blocks stay until the human
+/// clears them. Existing rows default to `'human'` so legacy blocks
+/// keep manual semantics across the upgrade.
+fn migrate_last_status_actor(conn: &Connection) -> Result<()> {
+    for table in ["tasks", "projects"] {
+        if !table_has_column(conn, table, "last_status_actor")? {
+            let ddl = format!(
+                "ALTER TABLE {table} ADD COLUMN last_status_actor TEXT NOT NULL DEFAULT 'human'"
+            );
+            conn.execute(&ddl, [])?;
+        }
     }
     Ok(())
 }
@@ -3932,6 +4095,276 @@ mod tests {
             .unwrap();
         assert_eq!(updated_at, "1778180145");
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Smoke test for the new dependency CRUD path. Adds an edge,
+    /// re-adds it (idempotent), lists in both directions, then drops
+    /// it. Cycles and self-loops are rejected at the engine boundary.
+    #[test]
+    fn dependency_add_list_and_remove_round_trip() {
+        let path = temp_db_path("deps-crud");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+
+        let edge = db
+            .add_dependency(AddDependencyInput {
+                dependent: a.id.clone(),
+                prerequisite: b.id.clone(),
+                relation: None,
+            })
+            .unwrap();
+        assert_eq!(edge.dependent_id, a.id);
+        assert_eq!(edge.prerequisite_id, b.id);
+        assert_eq!(edge.relation, "blocks");
+
+        // Idempotent re-add: same edge, no error, no duplicate row.
+        let edge2 = db
+            .add_dependency(AddDependencyInput {
+                dependent: a.id.clone(),
+                prerequisite: b.id.clone(),
+                relation: Some("blocks".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(edge2, edge);
+
+        // Cycle: B → A would close the loop A → B → A.
+        let cycle = db.add_dependency(AddDependencyInput {
+            dependent: b.id.clone(),
+            prerequisite: a.id.clone(),
+            relation: None,
+        });
+        assert!(cycle.is_err(), "expected cycle rejection");
+        assert!(cycle.unwrap_err().to_string().contains("cycle"));
+
+        // Self-loop: rejected at the engine before hitting the schema.
+        let self_loop = db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: a.id.clone(),
+            relation: None,
+        });
+        assert!(self_loop.is_err());
+
+        // List in both directions.
+        let view = db
+            .list_dependencies(ListDependenciesInput {
+                work_item: a.id.clone(),
+                direction: None,
+            })
+            .unwrap();
+        assert_eq!(view.prerequisites.len(), 1);
+        assert_eq!(view.prerequisites[0].prerequisite_id, b.id);
+        assert!(view.dependents.is_empty());
+
+        let view_b = db
+            .list_dependencies(ListDependenciesInput {
+                work_item: b.id.clone(),
+                direction: None,
+            })
+            .unwrap();
+        assert!(view_b.prerequisites.is_empty());
+        assert_eq!(view_b.dependents.len(), 1);
+        assert_eq!(view_b.dependents[0].dependent_id, a.id);
+
+        // Remove returns true; second remove returns false (no error).
+        let removed = db
+            .remove_dependency(RemoveDependencyInput {
+                dependent: a.id.clone(),
+                prerequisite: b.id.clone(),
+                relation: None,
+            })
+            .unwrap();
+        assert!(removed);
+        let removed_again = db
+            .remove_dependency(RemoveDependencyInput {
+                dependent: a.id.clone(),
+                prerequisite: b.id.clone(),
+                relation: None,
+            })
+            .unwrap();
+        assert!(!removed_again);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Cross-product edges are refused at the engine boundary
+    /// (Q3-iii — same-product, cross-project, cross-kind is the v1
+    /// scope).
+    #[test]
+    fn dependency_add_refuses_cross_product_edges() {
+        let path = temp_db_path("deps-cross-product");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let p1 = db
+            .create_product(CreateProductInput {
+                name: "Alpha".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/alpha.git".to_owned()),
+            })
+            .unwrap();
+        let p2 = db
+            .create_product(CreateProductInput {
+                name: "Beta".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/beta.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: p1.id,
+                name: "Alpha task".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: p2.id,
+                name: "Beta task".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let err = db
+            .add_dependency(AddDependencyInput {
+                dependent: a.id,
+                prerequisite: b.id,
+                relation: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cross-product"));
+        assert!(err.contains("proj_18a2bbe20fc03718_8"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Q10: deleting a prereq drops every edge that names it as
+    /// either endpoint. The dependent's row stays where it is — its
+    /// status will be reconciled on the next pass — but the gating
+    /// relationship is cleared so it isn't stuck on a tombstone.
+    #[test]
+    fn deleting_a_task_drops_its_dependency_edges() {
+        let path = temp_db_path("deps-delete-cascade");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        db.delete_work_item(&b.id).unwrap();
+
+        let view = db
+            .list_dependencies(ListDependenciesInput {
+                work_item: a.id.clone(),
+                direction: None,
+            })
+            .unwrap();
+        assert!(
+            view.prerequisites.is_empty(),
+            "expected dangling edge to be dropped on prereq delete"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Pre-v3 / pre-v4 databases should pick up the new dependency
+    /// table and `last_status_actor` columns transparently on open;
+    /// the engine writes `schema_version = 4`.
+    #[test]
+    fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
+        let path = temp_db_path("deps-migrate");
+        // Stand up a minimal v3 schema: just `tasks`, `projects`,
+        // `metadata`, no dep table, no last_status_actor.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1);
+             INSERT INTO metadata(key, value) VALUES ('schema_version','3');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        // The new table exists.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type='table' AND name='work_item_dependencies')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        assert!(table_has_column(&conn, "tasks", "last_status_actor").unwrap());
+        assert!(table_has_column(&conn, "projects", "last_status_actor").unwrap());
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "4");
         let _ = std::fs::remove_file(path);
     }
 }

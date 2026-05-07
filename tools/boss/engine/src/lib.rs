@@ -13,5 +13,6 @@ pub mod runner;
 pub mod spawn_flow;
 pub mod transcript_tail;
 pub mod work;
+pub mod work_dependencies;
 pub mod worker_registry;
 pub mod worker_setup;

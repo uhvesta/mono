@@ -7,8 +7,10 @@ use boss_client::{
     stop_engine,
 };
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent,
-    FrontendRequest, Product, Project, Task, WorkItem, WorkItemPatch,
+    AddDependencyInput, CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
+    DependencyDirection, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
+    RemoveDependencyInput, Task, WorkItem, WorkItemDependency, WorkItemDependencyView,
+    WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -103,6 +105,11 @@ enum ProjectCommand {
     /// Move a project into a different lifecycle status
     /// (planned/active/blocked/done/archived).
     Move(ProjectMoveArgs),
+    /// Manage dependency edges (`A depends on B` ⇒ B gates A).
+    Depend {
+        #[command(subcommand)]
+        command: DependCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -114,6 +121,11 @@ enum TaskCommand {
     Move(TaskMoveArgs),
     Delete(TaskDeleteArgs),
     Reorder(TaskReorderArgs),
+    /// Manage dependency edges (`A depends on B` ⇒ B gates A).
+    Depend {
+        #[command(subcommand)]
+        command: DependCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -124,6 +136,71 @@ enum ChoreCommand {
     Update(TaskUpdateArgs),
     Move(TaskMoveArgs),
     Delete(TaskDeleteArgs),
+    /// Manage dependency edges (`A depends on B` ⇒ B gates A).
+    Depend {
+        #[command(subcommand)]
+        command: DependCommand,
+    },
+}
+
+/// Shared subcommands for dependency CRUD. The engine doesn't care
+/// about the parent kind — same verbs live under task / chore /
+/// project so the CLI grammar stays consistent (`boss task ...`,
+/// `boss chore ...`, `boss project ...`).
+#[derive(Debug, Subcommand)]
+enum DependCommand {
+    /// Declare an edge: `dependent` becomes gated until `prerequisite`
+    /// reaches a satisfied status.
+    Add(DependAddArgs),
+    /// Drop the named edge. No-op if the edge does not exist.
+    Rm(DependRmArgs),
+    /// List the prerequisites and/or dependents of a single work item.
+    List(DependListArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct DependAddArgs {
+    /// Id of the work item that becomes gated.
+    dependent: String,
+    /// Id of the work item that gates it.
+    prerequisite: String,
+    /// Edge type. Only `blocks` is supported in v1.
+    #[arg(long, default_value = "blocks")]
+    relation: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct DependRmArgs {
+    dependent: String,
+    prerequisite: String,
+    #[arg(long, default_value = "blocks")]
+    relation: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct DependListArgs {
+    /// Id of the work item to inspect.
+    selector: String,
+    /// Which side(s) of the edge to return. Defaults to `both`.
+    #[arg(long, value_enum, default_value_t = DependDirectionArg::Both)]
+    direction: DependDirectionArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DependDirectionArg {
+    Prereqs,
+    Dependents,
+    Both,
+}
+
+impl From<DependDirectionArg> for DependencyDirection {
+    fn from(value: DependDirectionArg) -> Self {
+        match value {
+            DependDirectionArg::Prereqs => DependencyDirection::Prereqs,
+            DependDirectionArg::Dependents => DependencyDirection::Dependents,
+            DependDirectionArg::Both => DependencyDirection::Both,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -959,6 +1036,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 print_project_details("Moved project", &moved);
             })
         }
+        ProjectCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
     }
 }
 
@@ -1070,6 +1148,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 },
             )
         }
+        TaskCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
     }
 }
 
@@ -1154,6 +1233,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 },
             )
         }
+        ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
     }
 }
 
@@ -1398,6 +1478,153 @@ async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<(), CliEr
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("work item delete", &other)),
+    }
+}
+
+async fn run_depend_command(
+    command: DependCommand,
+    client: &mut BossClient,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    match command {
+        DependCommand::Add(args) => {
+            let edge = add_dependency(
+                client,
+                AddDependencyInput {
+                    dependent: args.dependent,
+                    prerequisite: args.prerequisite,
+                    relation: Some(args.relation),
+                },
+            )
+            .await?;
+            print_entity(ctx, &serde_json::json!({ "edge": edge }), || {
+                if !ctx.quiet {
+                    println!(
+                        "Declared dependency: {} → {} ({})",
+                        edge.dependent_id, edge.prerequisite_id, edge.relation
+                    );
+                }
+            })
+        }
+        DependCommand::Rm(args) => {
+            let removed = remove_dependency(
+                client,
+                RemoveDependencyInput {
+                    dependent: args.dependent.clone(),
+                    prerequisite: args.prerequisite.clone(),
+                    relation: Some(args.relation.clone()),
+                },
+            )
+            .await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "dependent_id": args.dependent,
+                    "prerequisite_id": args.prerequisite,
+                    "relation": args.relation,
+                    "removed": removed,
+                }),
+                || {
+                    if !ctx.quiet {
+                        if removed {
+                            println!(
+                                "Removed dependency: {} → {}",
+                                args.dependent, args.prerequisite,
+                            );
+                        } else {
+                            println!(
+                                "No dependency {} → {} (no-op)",
+                                args.dependent, args.prerequisite,
+                            );
+                        }
+                    }
+                },
+            )
+        }
+        DependCommand::List(args) => {
+            let view = list_dependencies(
+                client,
+                ListDependenciesInput {
+                    work_item: args.selector.clone(),
+                    direction: Some(args.direction.into()),
+                },
+            )
+            .await?;
+            print_entity(ctx, &serde_json::json!({ "dependencies": view }), || {
+                print_dependency_view(&view);
+            })
+        }
+    }
+}
+
+async fn add_dependency(
+    client: &mut BossClient,
+    input: AddDependencyInput,
+) -> Result<WorkItemDependency, CliError> {
+    match client
+        .send_request(&FrontendRequest::AddDependency { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::DependencyAdded { edge } => Ok(edge),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("dependency add", &other)),
+    }
+}
+
+async fn remove_dependency(
+    client: &mut BossClient,
+    input: RemoveDependencyInput,
+) -> Result<bool, CliError> {
+    match client
+        .send_request(&FrontendRequest::RemoveDependency { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::DependencyRemoved { removed, .. } => Ok(removed),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("dependency remove", &other)),
+    }
+}
+
+async fn list_dependencies(
+    client: &mut BossClient,
+    input: ListDependenciesInput,
+) -> Result<WorkItemDependencyView, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListDependencies { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::DependencyList { view } => Ok(view),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("dependency list", &other)),
+    }
+}
+
+fn print_dependency_view(view: &WorkItemDependencyView) {
+    println!("Dependencies for {}:", view.work_item_id);
+    if view.prerequisites.is_empty() && view.dependents.is_empty() {
+        println!("  (none)");
+        return;
+    }
+    if !view.prerequisites.is_empty() {
+        println!("  Prerequisites ({}):", view.prerequisites.len());
+        for edge in &view.prerequisites {
+            println!("    {} ({})", edge.prerequisite_id, edge.relation);
+        }
+    }
+    if !view.dependents.is_empty() {
+        println!("  Dependents ({}):", view.dependents.len());
+        for edge in &view.dependents {
+            println!("    {} ({})", edge.dependent_id, edge.relation);
+        }
     }
 }
 

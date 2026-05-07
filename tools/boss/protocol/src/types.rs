@@ -24,6 +24,13 @@ pub struct Project {
     pub priority: String,
     pub created_at: String,
     pub updated_at: String,
+    /// `'human'` (default) when the most recent status change came
+    /// from a CLI / app caller; `'engine'` when the engine flipped
+    /// the status itself (e.g. dependency auto-block / unblock). The
+    /// dependencies auto-unblock path only flips a `blocked` row
+    /// back to `todo` when this is `'engine'` — manual blocks stick.
+    #[serde(default = "default_human_actor")]
+    pub last_status_actor: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,10 +53,16 @@ pub struct Task {
     /// to `true` so legacy callers keep their old auto-start behavior.
     #[serde(default = "default_true")]
     pub autostart: bool,
+    #[serde(default = "default_human_actor")]
+    pub last_status_actor: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+pub fn default_human_actor() -> String {
+    "human".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,4 +253,74 @@ pub struct WorkItemPatch {
     pub repo_remote_url: Option<String>,
     pub pr_url: Option<String>,
     pub ordinal: Option<i64>,
+}
+
+/// One row of the `work_item_dependencies` table — an edge from a
+/// dependent to a prerequisite. `relation` is `"blocks"` for v1; the
+/// column exists so future relation types (`"relates-to"`,
+/// `"duplicates"`, …) can ship without a re-migration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkItemDependency {
+    pub dependent_id: String,
+    pub prerequisite_id: String,
+    #[serde(default = "default_relation")]
+    pub relation: String,
+    pub created_at: String,
+}
+
+pub fn default_relation() -> String {
+    "blocks".to_owned()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AddDependencyInput {
+    /// Selector or id of the work item that becomes gated.
+    pub dependent: String,
+    /// Selector or id of the work item that gates it.
+    pub prerequisite: String,
+    /// Defaults to `"blocks"` if omitted.
+    #[serde(default)]
+    pub relation: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoveDependencyInput {
+    pub dependent: String,
+    pub prerequisite: String,
+    #[serde(default)]
+    pub relation: Option<String>,
+}
+
+/// Direction of a dependency listing — incoming (prereqs of the
+/// named row), outgoing (dependents), or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyDirection {
+    Prereqs,
+    Dependents,
+    Both,
+}
+
+impl Default for DependencyDirection {
+    fn default() -> Self {
+        Self::Both
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListDependenciesInput {
+    /// Selector or id of the work item to list edges for.
+    pub work_item: String,
+    #[serde(default)]
+    pub direction: Option<DependencyDirection>,
+}
+
+/// Two parallel edge lists for one work item — incoming (rows that
+/// gate me) and outgoing (rows that I gate). Returned by
+/// `ListDependencies` and embedded in `boss <kind> show`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkItemDependencyView {
+    pub work_item_id: String,
+    pub prerequisites: Vec<WorkItemDependency>,
+    pub dependents: Vec<WorkItemDependency>,
 }

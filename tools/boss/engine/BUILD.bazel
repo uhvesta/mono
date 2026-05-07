@@ -21,6 +21,7 @@ rust_library(
         "src/spawn_flow.rs",
         "src/transcript_tail.rs",
         "src/work.rs",
+        "src/work_dependencies.rs",
         "src/worker_registry.rs",
         "src/worker_setup.rs",
     ],

@@ -11,9 +11,10 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent,
-    FrontendRequest, Product, Project, Task, TopicEventPayload, WorkItem, WorkItemPatch,
-    work_product_topic,
+    AddDependencyInput, CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
+    DependencyDirection, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
+    RemoveDependencyInput, Task, TopicEventPayload, WorkItem, WorkItemDependency,
+    WorkItemDependencyView, WorkItemPatch, work_product_topic,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -631,4 +632,160 @@ fn unexpected_event(context: &str, event: FrontendEvent) -> anyhow::Error {
         "unexpected engine event for {context}: {}",
         serde_json::to_string(&event).unwrap_or_else(|_| "<unserializable>".to_owned())
     )
+}
+
+async fn add_dependency(
+    client: &mut BossClient,
+    input: AddDependencyInput,
+) -> Result<WorkItemDependency> {
+    match client
+        .send_request(&FrontendRequest::AddDependency { input })
+        .await?
+    {
+        FrontendEvent::DependencyAdded { edge } => Ok(edge),
+        other => Err(unexpected_event("add dependency", other)),
+    }
+}
+
+async fn remove_dependency(
+    client: &mut BossClient,
+    input: RemoveDependencyInput,
+) -> Result<bool> {
+    match client
+        .send_request(&FrontendRequest::RemoveDependency { input })
+        .await?
+    {
+        FrontendEvent::DependencyRemoved { removed, .. } => Ok(removed),
+        other => Err(unexpected_event("remove dependency", other)),
+    }
+}
+
+async fn list_dependencies(
+    client: &mut BossClient,
+    input: ListDependenciesInput,
+) -> Result<WorkItemDependencyView> {
+    match client
+        .send_request(&FrontendRequest::ListDependencies { input })
+        .await?
+    {
+        FrontendEvent::DependencyList { view } => Ok(view),
+        other => Err(unexpected_event("list dependencies", other)),
+    }
+}
+
+/// Round-trip the new dependency RPCs through the wire layer:
+/// add → list → remove. Cycles and self-loops surface as
+/// `WorkError`. Existing CRUD verbs keep working alongside.
+#[tokio::test]
+async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+        },
+    )
+    .await?;
+    let a = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "A".to_owned(),
+            description: None,
+            autostart: true,
+        },
+    )
+    .await?;
+    let b = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "B".to_owned(),
+            description: None,
+            autostart: true,
+        },
+    )
+    .await?;
+
+    let edge = add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+    assert_eq!(edge.dependent_id, a.id);
+    assert_eq!(edge.prerequisite_id, b.id);
+    assert_eq!(edge.relation, "blocks");
+
+    // Idempotent re-add returns the same row.
+    let edge2 = add_dependency(
+        &mut client,
+        AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+    assert_eq!(edge2, edge);
+
+    // Cycle add returns a WorkError.
+    let cycle = client
+        .send_request(&FrontendRequest::AddDependency {
+            input: AddDependencyInput {
+                dependent: b.id.clone(),
+                prerequisite: a.id.clone(),
+                relation: None,
+            },
+        })
+        .await?;
+    match cycle {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("cycle"), "expected cycle error: {message}");
+        }
+        other => return Err(unexpected_event("cycle add", other)),
+    }
+
+    // List in both directions.
+    let view = list_dependencies(
+        &mut client,
+        ListDependenciesInput {
+            work_item: a.id.clone(),
+            direction: Some(DependencyDirection::Both),
+        },
+    )
+    .await?;
+    assert_eq!(view.prerequisites.len(), 1);
+    assert!(view.dependents.is_empty());
+
+    let removed = remove_dependency(
+        &mut client,
+        RemoveDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+    assert!(removed);
+
+    let removed_again = remove_dependency(
+        &mut client,
+        RemoveDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        },
+    )
+    .await?;
+    assert!(!removed_again);
+
+    Ok(())
 }
