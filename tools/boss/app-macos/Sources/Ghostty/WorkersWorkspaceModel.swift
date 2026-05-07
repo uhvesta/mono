@@ -89,9 +89,10 @@ struct WorkerSlot: Identifiable, Equatable {
     let slotId: Int
     var session: TerminalPaneSession?
     var runId: String?
-    /// Short 2–4 word task summary the engine generated for this
-    /// run. Shown in the pane titlebar in place of `runId` when
-    /// present; the runId stays available as a tooltip.
+    /// Short lowercase gerund phrase the engine generated for this
+    /// run (e.g. `"fixing the fencer scraper"`). Rendered in the pane
+    /// titlebar as `"<WorkerName> is <phrase>"` in place of `runId`
+    /// when present; the runId stays available as a tooltip.
     var summary: String?
     /// Bumped every time the slot re-enters idle so the flavor line
     /// changes between idle bouts; kept stable for the lifetime of a
