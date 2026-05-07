@@ -5,11 +5,13 @@
 //! crate so that engine and clients link against the same types.
 
 mod engine_app;
+mod live_worker_state;
 mod types;
 mod wire;
 mod worker_event;
 
 pub use engine_app::*;
+pub use live_worker_state::*;
 pub use types::*;
 pub use wire::*;
 pub use worker_event::*;

@@ -6,8 +6,8 @@ session via claude hooks routed to its events socket.
 
 ## Your workspace
 
-- Workspace path: `/Users/brianduff/Documents/dev/workspaces/mono-agent-007`
-- Cube lease id: `d3918f9a-367d-48df-94e8-d049e194a419`
+- Workspace path: `/Users/brianduff/Documents/dev/workspaces/mono-agent-008`
+- Cube lease id: `dd59ee4c-4ec0-44ea-84e7-6d69ffebad74`
 
 The lease is held for the lifetime of this run. Do not lease,
 release, or otherwise mutate cube state — the engine owns lease

@@ -97,11 +97,18 @@ pub struct ExecutionReconcileResult {
 /// Live runtime status for a single task/chore — the current execution
 /// and most recent run, summarized for the kanban view. `None` fields
 /// mean no execution (or no run) exists yet for the work item.
+///
+/// `execution_id` is the active or most recent execution row; the
+/// engine uses the same value as `run_id` when registering live
+/// worker state, so UI consumers can join `task → execution_id →
+/// LiveWorkerState`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRuntime {
     pub work_item_id: String,
     pub execution_status: Option<String>,
     pub run_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

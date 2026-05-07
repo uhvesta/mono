@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='dd59ee4c-4ec0-44ea-84e7-6d69ffebad74' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
           }
         ]
       }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='dd59ee4c-4ec0-44ea-84e7-6d69ffebad74' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='dd59ee4c-4ec0-44ea-84e7-6d69ffebad74' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
           }
         ]
       }
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='dd59ee4c-4ec0-44ea-84e7-6d69ffebad74' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
           }
         ]
       }
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='dd59ee4c-4ec0-44ea-84e7-6d69ffebad74' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
           }
         ]
       }
@@ -61,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='dd59ee4c-4ec0-44ea-84e7-6d69ffebad74' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
           }
         ]
       }
@@ -72,7 +72,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='d3918f9a-367d-48df-94e8-d049e194a419' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='dd59ee4c-4ec0-44ea-84e7-6d69ffebad74' '/private/var/tmp/_bazel_brianduff/69f67ea3f56f6456bcf4f64ecadb553f/execroot/_main/bazel-out/darwin_arm64-fastbuild/bin/tools/boss/engine/engine.runfiles/_main/tools/boss/event-shim/boss-event'"
           }
         ]
       }

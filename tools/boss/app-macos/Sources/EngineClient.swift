@@ -76,6 +76,11 @@ enum EngineEvent {
     case permissionRequest(agentId: String, id: String, title: String)
     case agentReady(agentId: String)
     case error(agentId: String?, message: String)
+    /// Snapshot of every allocated worker slot's live runtime state.
+    /// Delivered both as a one-shot reply to
+    /// `list_worker_live_states` and as a topic push on
+    /// `worker.live_states` whenever any slot changes.
+    case workerLiveStatesList(states: [WorkerLiveState])
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -183,6 +188,13 @@ final class EngineClient: @unchecked Sendable {
 
     func sendListProducts() {
         sendLine(["type": "list_products"])
+    }
+
+    /// Ask the engine for the current live runtime snapshot of every
+    /// allocated worker slot. Pair this with a subscription to the
+    /// `worker.live_states` topic to keep up to date in real time.
+    func sendListWorkerLiveStates() {
+        sendLine(["type": "list_worker_live_states"])
     }
 
     func sendSubscribe(topics: [String]) {
@@ -603,6 +615,10 @@ final class EngineClient: @unchecked Sendable {
                 default:
                     emit(.error(agentId: nil, message: "engine_request unknown kind: \(kind)"))
                 }
+            case "worker_live_states_list":
+                let raw = payload["states"] as? [[String: Any]] ?? []
+                let states = raw.compactMap(parseWorkerLiveState)
+                emit(.workerLiveStatesList(states: states))
             default:
                 break
             }
@@ -719,7 +735,8 @@ final class EngineClient: @unchecked Sendable {
         return WorkTaskRuntime(
             workItemID: workItemID,
             executionStatus: payload["execution_status"] as? String,
-            runStatus: payload["run_status"] as? String
+            runStatus: payload["run_status"] as? String,
+            executionID: payload["execution_id"] as? String
         )
     }
 
@@ -756,5 +773,28 @@ final class EngineClient: @unchecked Sendable {
         default:
             return nil
         }
+    }
+
+    private func parseWorkerLiveState(_ payload: [String: Any]) -> WorkerLiveState? {
+        guard
+            let slotId = (payload["slot_id"] as? NSNumber)?.intValue,
+            let runId = payload["run_id"] as? String,
+            let model = payload["model"] as? String,
+            let activityRaw = payload["activity"] as? String,
+            let activity = WorkerActivity(rawValue: activityRaw)
+        else {
+            return nil
+        }
+        let shellPid = (payload["shell_pid"] as? NSNumber)?.int32Value ?? 0
+        return WorkerLiveState(
+            slotId: slotId,
+            runId: runId,
+            model: model,
+            shellPid: shellPid,
+            lastEventAt: payload["last_event_at"] as? String,
+            currentTool: payload["current_tool"] as? String,
+            lastToolEndedAt: payload["last_tool_ended_at"] as? String,
+            activity: activity
+        )
     }
 }

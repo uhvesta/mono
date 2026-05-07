@@ -3,9 +3,10 @@ import SwiftUI
 
 struct WorkersDetailView: View {
     @ObservedObject var workspace: WorkersWorkspaceModel
+    @ObservedObject var chat: ChatViewModel
 
     var body: some View {
-        WorkerGrid(runtime: workspace.runtime, slots: workspace.slots)
+        WorkerGrid(runtime: workspace.runtime, slots: workspace.slots, chat: chat)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .separatorColor))
     }
@@ -14,6 +15,7 @@ struct WorkersDetailView: View {
 private struct WorkerGrid: View {
     let runtime: GhosttyRuntime
     let slots: [WorkerSlot]
+    @ObservedObject var chat: ChatViewModel
 
     var body: some View {
         let columns = 4
@@ -25,8 +27,12 @@ private struct WorkerGrid: View {
             ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 1) {
                     ForEach(row) { slot in
-                        WorkerSlotView(runtime: runtime, slot: slot)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        WorkerSlotView(
+                            runtime: runtime,
+                            slot: slot,
+                            liveState: chat.workerLiveStatesBySlot[slot.slotId]
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
             }
@@ -37,6 +43,7 @@ private struct WorkerGrid: View {
 private struct WorkerSlotView: View {
     let runtime: GhosttyRuntime
     let slot: WorkerSlot
+    let liveState: WorkerLiveState?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -80,13 +87,34 @@ private struct WorkerSlotView: View {
 
             Spacer(minLength: 0)
 
-            if let state = slot.session?.claudeState {
+            // Prefer engine-supplied LiveWorkerState — it knows the
+            // real model name and the activity is driven by hook
+            // events rather than a screen-scrape that always rendered
+            // "Claude Unknown". Fall back to the legacy claudeState
+            // pill until the worker's first hook fires.
+            if let live = liveState {
+                statusPill(
+                    "\(live.model) · \(live.activity.label)",
+                    color: liveActivityColor(live.activity)
+                )
+            } else if let state = slot.session?.claudeState {
                 statusPill(state.label, color: claudeStateColor(state))
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .help(slotTooltip)
+    }
+
+    private func liveActivityColor(_ activity: WorkerActivity) -> Color {
+        switch activity {
+        case .working: .blue
+        case .waitingForInput: .orange
+        case .idle: .green
+        case .spawning: .secondary
+        case .errored: .red
+        case .terminated: .secondary
+        }
     }
 
     private var slotTooltip: String {

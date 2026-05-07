@@ -31,6 +31,17 @@ final class ChatViewModel: ObservableObject {
     @Published var workSearchText: String = ""
     @Published var isBossPanelCollapsed: Bool = false
     @Published var bossPanelWidth: CGFloat = 380
+    /// Live runtime state for every active worker, keyed by run id.
+    /// Sourced from the engine's LiveWorkerState snapshot
+    /// (`worker_live_states_list` event); refreshed on each push from
+    /// the `worker.live_states` topic. Used to drive the kanban Doing
+    /// icon (working / waiting / idle / errored) and the per-pane
+    /// titlebar pill — replaces the screen-scrape-only signal that
+    /// always rendered "Claude Unknown".
+    @Published var workerLiveStatesByRunID: [String: WorkerLiveState] = [:]
+    /// Same data, keyed by slot id, for components that bind by slot
+    /// (e.g., the libghostty pane row).
+    @Published var workerLiveStatesBySlot: [Int: WorkerLiveState] = [:]
 
     var bossAgent: Agent? {
         agents.first { $0.isBoss }
@@ -545,6 +556,7 @@ final class ChatViewModel: ObservableObject {
             engine.sendListAgents()
             refreshWorkSubscriptions()
             engine.sendListProducts()
+            engine.sendListWorkerLiveStates()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
@@ -741,6 +753,13 @@ final class ChatViewModel: ObservableObject {
             } else {
                 workErrorMessage = message
             }
+        case .workerLiveStatesList(let states):
+            workerLiveStatesByRunID = Dictionary(
+                uniqueKeysWithValues: states.map { ($0.runId, $0) }
+            )
+            workerLiveStatesBySlot = Dictionary(
+                uniqueKeysWithValues: states.map { ($0.slotId, $0) }
+            )
         }
     }
 
@@ -765,7 +784,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private var desiredWorkTopics: Set<String> {
-        var topics: Set<String> = ["work.products"]
+        var topics: Set<String> = ["work.products", "worker.live_states"]
         if let productID = currentSelectedProductID {
             topics.insert(workTopic(forProductID: productID))
         }
@@ -1173,6 +1192,19 @@ final class ChatViewModel: ObservableObject {
 
     func taskRuntime(for taskID: String) -> WorkTaskRuntime? {
         taskRuntimesByID[taskID]
+    }
+
+    /// Resolve a task to its current LiveWorkerState by joining
+    /// `task → execution_id → run_id`. Returns `nil` when the task
+    /// has no active execution or the engine has not yet seen any
+    /// hook events for the run (so the live state map is empty).
+    func workerLiveState(forTaskID taskID: String) -> WorkerLiveState? {
+        guard let runtime = taskRuntimesByID[taskID],
+              let executionID = runtime.executionID
+        else {
+            return nil
+        }
+        return workerLiveStatesByRunID[executionID]
     }
 
     private func upsertProduct(_ product: WorkProduct) {

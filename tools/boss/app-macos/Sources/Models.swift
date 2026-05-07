@@ -256,13 +256,60 @@ struct WorkTaskRuntime: Hashable {
     let workItemID: String
     let executionStatus: String?
     let runStatus: String?
+    /// Active or most recent execution id for this work item. Used to
+    /// join task → LiveWorkerState (engine registers LiveWorkerState
+    /// with `run_id == execution_id`).
+    let executionID: String?
+}
+
+/// Live runtime state for one allocated worker slot, mirroring the
+/// engine's `LiveWorkerState`. Keyed by `slotId` (1..=8) — survives
+/// run-record finalisation, which happens within a second of spawn.
+struct WorkerLiveState: Hashable {
+    let slotId: Int
+    let runId: String
+    let model: String
+    let shellPid: Int32
+    let lastEventAt: String?
+    let currentTool: String?
+    let lastToolEndedAt: String?
+    let activity: WorkerActivity
+}
+
+enum WorkerActivity: String, Hashable {
+    case spawning
+    case working
+    case waitingForInput = "waiting_for_input"
+    case idle
+    case errored
+    case terminated
+
+    /// Short human-readable label suitable for the pane titlebar pill.
+    /// We pair this with the model name (e.g., "claude-opus-4-7") so
+    /// the user sees both `Claude Opus 4.7 · Working` rather than
+    /// the legacy "Claude Unknown".
+    var label: String {
+        switch self {
+        case .spawning: "Spawning"
+        case .working: "Working"
+        case .waitingForInput: "Waiting"
+        case .idle: "Idle"
+        case .errored: "Errored"
+        case .terminated: "Terminated"
+        }
+    }
 }
 
 enum AgentActivityState {
     case active
     case waiting(reason: String)
+    case errored(reason: String)
     case none
 
+    /// Build from the persisted task runtime status alone. Used as
+    /// the fallback when no LiveWorkerState is available (worker
+    /// hasn't emitted any hook events yet, or run is no longer
+    /// active).
     init(runtime: WorkTaskRuntime?) {
         guard let runtime, let executionStatus = runtime.executionStatus else {
             self = .none
@@ -294,11 +341,39 @@ enum AgentActivityState {
         }
     }
 
+    /// Build by preferring engine-supplied LiveWorkerState (sourced
+    /// from hook events) when available, falling back to the
+    /// persisted task runtime status. The dot color now distinguishes
+    /// working / waiting-on-input / idle / errored rather than always
+    /// rendering the same yellow `running` indicator.
+    init(runtime: WorkTaskRuntime?, liveState: WorkerLiveState?) {
+        if let liveState {
+            switch liveState.activity {
+            case .working:
+                self = .active
+            case .waitingForInput:
+                self = .waiting(reason: "Waiting on user input")
+            case .idle:
+                self = .waiting(reason: "Worker idle between turns")
+            case .spawning:
+                self = .waiting(reason: "Worker spawning")
+            case .errored:
+                self = .errored(reason: "Worker reported an error")
+            case .terminated:
+                self = .none
+            }
+            return
+        }
+        self.init(runtime: runtime)
+    }
+
     var tooltip: String {
         switch self {
         case .active:
             return "Agent is actively working"
         case .waiting(let reason):
+            return reason
+        case .errored(let reason):
             return reason
         case .none:
             return "No agent attached"

@@ -4,32 +4,37 @@ Do the work directly in the repository checkout before ending this run.
 Avoid asking the human for permission during this pass; when you need review or direction, stop and summarize it clearly.
 
 Execution context:
-- execution id: `exec_18ad1eb6139f5ff8_f`
+- execution id: `exec_18ad1ed2f1934d30_12`
 - execution kind: `chore_implementation`
-- workspace: `/Users/brianduff/Documents/dev/workspaces/mono-agent-007`
-- work item: `Tighten Boss pane header — drop redundant widgets`
-- local change: `chg_a202edab6fdf403c8108f6591ef4ec7b`
+- workspace: `/Users/brianduff/Documents/dev/workspaces/mono-agent-008`
+- work item: `Plumb worker live state (model + activity) from hook events to UI`
+- local change: `chg_2d1408fcb1c24a7eb3a4dcfc45668c40`
 - details:
-  - description: The Boss pane (the coordinator pane at the top of the window) currently shows two stacked header bars stuffed with redundant chrome. Strip it back to something tight and purposeful.
+  - description: Today the engine has near-zero visibility into a worker session after it's spawned. Concrete observations:
 
-Current state (see screenshot context):
-- Top bar: avatar + 'The Boss' title + 'Coordinates work through Boss' subtitle + a right-pointing chevron (intended to collapse the pane)
-- Second bar: 'BOSS' label on the left + 'Claude Unknown' status pill on the right
+- Every run record finalises within ~1 second of spawn: status flips to 'completed' with result_summary 'Spawned worker pane in slot N (shell pid 0). Hook events from this run will surface on the engine events socket.' The run only models the spawn act, not the worker's life.
+- 'bossctl agents status <run-id>' returns 'unknown run' for any recently-spawned worker — the engine isn't keeping a live record per worker.
+- shell pid is recorded as 0 for every worker.
+- The 'agent activity status icon' on Doing cards (PR #182, chore task_18ad1bb8fd502778_11) is therefore always the same colour — there's no real signal feeding it, only a binary 'is in Doing lane' state.
+- Every worker pane titlebar shows 'Claude Unknown' as the model/status pill because nothing is ever captured for it.
 
-Problems:
-1. The 'Coordinates work through Boss' subtitle is filler — the user knows what The Boss is.
-2. The 'BOSS' label in the second bar duplicates the 'The Boss' title above it.
-3. The 'Claude Unknown' status pill is misleading and noisy — it shows up when the model isn't known and adds clutter without informing.
-4. The right-pointing chevron icon for collapsing the pane is the wrong glyph for the action — collapsing the Boss pane (which is at the top of the window) isn't a 'go right' action; it should be a downward chevron or a collapse-up glyph that matches the actual pane orientation.
+Investigate and then implement:
 
-Wanted:
-- Single header row, not two.
-- Keep: avatar/icon, 'The Boss' title, the collapse control, and a model/status indicator only when there's something real to show (don't render 'Claude Unknown').
-- Drop: the subtitle, the duplicated 'BOSS' label, and the redundant second bar entirely.
-- Replace the chevron with a glyph that correctly represents collapsing this specific pane (e.g. chevron-up if collapsing folds the pane up out of view, or a dedicated collapse glyph). Match whatever direction the pane actually animates when collapsed.
-- Overall result should feel tighter — less vertical space taken by chrome, less visual noise, more room for the transcript.
+1. **Events socket audit.** The result_summary references an 'engine events socket' for hook events. Find it. Document: what events fire (PreToolUse, PostToolUse, Stop, Notification, SessionStart, etc.), what payloads they carry, where it's bound, and crucially — is anyone listening? If nothing is consuming the socket, that's the root cause for everything below.
 
-Related prior work: PR #177 already did a polish pass on this header (chore task_18ad1a4672836ab0_1). This is a follow-up that goes further: the prior pass refined the styling of the two-bar layout, this one collapses it down to one bar.
+2. **Live worker state model.** Define a per-slot LiveWorkerState in the engine: { slotId, runId, model (e.g. 'claude-opus-4-7'), shellPid, lastEventAt, currentTool?, lastToolEndedAt?, activity ∈ { spawning, working, waiting_for_input, idle, errored, terminated } }. Persist it in-memory keyed by slot, not by run-id, so it survives the run-record finalisation that already happens at spawn.
+
+3. **Event consumer.** Wire a listener on the events socket that updates LiveWorkerState as hook events arrive: SessionStart sets model + shellPid, PreToolUse marks 'working' with currentTool, PostToolUse clears currentTool, Stop transitions to 'idle' or 'waiting_for_input' depending on whether a probe/prompt is pending, Notification can flag 'waiting_for_input', errors transition to 'errored'.
+
+4. **Surface to bossctl.** Extend 'bossctl agents list' / 'bossctl agents status' to return LiveWorkerState (replace the current snapshot of finalised run records with a live snapshot per slot). Keep the historical run records too — they remain useful for audit — but they should not be the source of truth for 'what is this worker doing right now'.
+
+5. **Surface to the app UI.** Plumb LiveWorkerState into the kanban Doing-icon (so it actually distinguishes working / waiting / idle / errored — fix the always-yellow problem) and into the per-pane titlebar status pill (replace 'Claude Unknown' with the real model name; show activity separately, e.g. a small spinner when working, a 'waiting' indicator when idle waiting on user input).
+
+6. **Model identification.** The 'Claude Unknown' label specifically is because the engine never learns which model the worker is running. Capture this on SessionStart hook (Claude Code emits this) and stamp it on LiveWorkerState. Fall back to whatever model the engine launched the worker with if the hook hasn't fired yet — don't render 'Unknown' if we know the launch config.
+
+Related work: this is a prerequisite to chore task_18ad1c2364dd8088_1d (completion detection) being meaningful — without live state, completion is also guessed. Coordinate with chore task_18ad1cd54ca2f248_26 (slot id on run record), but don't block on it; LiveWorkerState should be keyed by slot regardless.
+
+Validation: dispatch a worker, observe in 'bossctl agents list' that activity transitions through spawning → working → idle as the worker moves through tool calls and Stop boundaries; observe the Doing icon and titlebar pill in the UI reflect each transition within ~1s; observe model name appears (not 'Unknown') as soon as SessionStart fires.
 
 Expected outcome for this run:
 - implement the requested change in the workspace,

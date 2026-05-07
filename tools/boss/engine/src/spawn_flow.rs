@@ -24,6 +24,7 @@ use std::time::Duration as StdDuration;
 use thiserror::Error;
 use tokio::time::Duration;
 
+use crate::live_worker_state::{DEFAULT_LAUNCH_MODEL, LiveWorkerStateRegistry};
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
     SpawnWorkerPaneResult,
@@ -116,6 +117,19 @@ pub trait WorkerSpawner: Send + Sync {
     ) -> Result<EngineToAppResponse, crate::app::SendToAppError>;
 
     fn worker_registry(&self) -> &WorkerRegistry;
+
+    /// Engine's live per-slot state registry. Implementations return
+    /// `None` from in-process tests that don't care about the live
+    /// state surface; the spawn flow then skips the registration
+    /// step. Production `ServerState` always returns `Some`.
+    fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
+        None
+    }
+
+    /// Hook called after `LiveWorkerStateRegistry` is updated so the
+    /// caller can broadcast the snapshot on the worker live-state
+    /// topic. Default no-op for tests.
+    async fn publish_live_worker_states(&self) {}
 }
 
 /// Render the worker-config files, ask the app to spawn a pane,
@@ -221,12 +235,22 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         .worker_registry()
         .register_run_slot(input.run_id.clone(), slot_id);
     if shell_pid > 0 {
-        spawner.worker_registry().register(shell_pid, input.run_id);
+        spawner
+            .worker_registry()
+            .register(shell_pid, input.run_id.clone());
     } else {
         tracing::warn!(
             slot_id,
             "spawn returned shell_pid 0; hook-event correlation will fail until a real pid is wired (TODO: proc_listpids in app)",
         );
+    }
+
+    // 4. Stamp the initial LiveWorkerState so bossctl/UI immediately
+    //    see "Spawning" with the launch-default model — no more
+    //    "Claude Unknown" while we wait for SessionStart to fire.
+    if let Some(live_states) = spawner.live_worker_state_registry() {
+        live_states.register_spawn(slot_id, input.run_id, DEFAULT_LAUNCH_MODEL, shell_pid);
+        spawner.publish_live_worker_states().await;
     }
 
     Ok(StartedWorker {

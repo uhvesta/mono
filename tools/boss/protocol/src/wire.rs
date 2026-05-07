@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
+use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
     CreateProjectInput, CreateRunInput, CreateTaskInput, Product, Project,
@@ -218,6 +219,13 @@ pub enum FrontendRequest {
     StopRun {
         run_id: String,
     },
+    /// Snapshot of every allocated worker slot's live state — what
+    /// model it's running, what activity (working / waiting / idle /
+    /// errored / terminated), most recent tool, etc. Source of truth
+    /// for the kanban Doing-icon and the per-pane titlebar pill.
+    /// Subscribers can also listen on the `worker.live_states` topic
+    /// for push updates whenever any slot's state changes.
+    ListWorkerLiveStates,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +401,14 @@ pub enum FrontendEvent {
     EngineRequest {
         request_id: String,
         request: EngineToAppRequest,
+    },
+    /// Snapshot of every allocated worker slot's live state. Used as
+    /// both the response to [`FrontendRequest::ListWorkerLiveStates`]
+    /// and the body of pushes on the `worker.live_states` topic. The
+    /// list is the entire snapshot, not a delta — receivers can
+    /// blindly replace their local map.
+    WorkerLiveStatesList {
+        states: Vec<LiveWorkerState>,
     },
 }
 

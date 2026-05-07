@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, RequestExecutionInput, WorkExecution, WorkRun,
+    FrontendEvent, FrontendRequest, LiveWorkerState, RequestExecutionInput, WorkExecution, WorkRun,
 };
 use clap::{Parser, Subcommand};
 
@@ -146,7 +146,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => agents_status(&cli.socket_path, cli.json, run_id).await,
         Command::Agents {
             action: AgentsAction::List,
-        } => agents_list(&cli.socket_path, cli.json).await,
+        } => agents_list_live(&cli.socket_path, cli.json).await,
         Command::Agents {
             action: AgentsAction::Stop { run_id },
         } => agents_stop(&cli.socket_path, cli.json, run_id).await,
@@ -218,8 +218,31 @@ async fn probe_run(
     }
 }
 
+/// Show live runtime status for the worker associated with `run_id`.
+/// Falls back to the finalised `WorkRun` record (the historical
+/// snapshot the engine persists once the run row finalises) when no
+/// matching live entry is found — so the verb still works for runs
+/// that have already terminated.
 async fn agents_status(socket_path: &Option<String>, json: bool, run_id: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    let states = match client
+        .send_request(&FrontendRequest::ListWorkerLiveStates)
+        .await
+        .context("sending ListWorkerLiveStates")?
+    {
+        FrontendEvent::WorkerLiveStatesList { states } => states,
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected status: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    };
+
+    if let Some(state) = states.into_iter().find(|s| s.run_id == run_id) {
+        print_live_state(json, &state);
+        return Ok(());
+    }
+
+    // No live entry → look up the historical run record.
     let response = client
         .send_request(&FrontendRequest::GetRun { id: run_id.clone() })
         .await
@@ -236,54 +259,37 @@ async fn agents_status(socket_path: &Option<String>, json: bool, run_id: String)
     }
 }
 
-async fn agents_list(socket_path: &Option<String>, json: bool) -> Result<()> {
-    // No `ListAllRuns` RPC exists yet, so we fan out: list all
-    // executions, then list the runs for each. This is best-effort
-    // and not paginated — fine for the V2 scale (≤8 active workers).
+/// List every live worker slot (model, activity, current tool, last
+/// event time). Unlike the previous `agents list`, this is sourced
+/// from the engine's in-memory LiveWorkerState rather than from the
+/// finalised WorkRun records — those finalise within ~1s of spawn
+/// and don't reflect the live worker.
+async fn agents_list_live(socket_path: &Option<String>, json: bool) -> Result<()> {
     let mut client = connect(socket_path).await?;
-    let executions = match client
-        .send_request(&FrontendRequest::ListExecutions { work_item_id: None })
+    let states = match client
+        .send_request(&FrontendRequest::ListWorkerLiveStates)
         .await
-        .context("sending ListExecutions")?
+        .context("sending ListWorkerLiveStates")?
     {
-        FrontendEvent::ExecutionsList { executions, .. } => executions,
+        FrontendEvent::WorkerLiveStatesList { states } => states,
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected list: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     };
 
-    let mut all_runs: Vec<WorkRun> = Vec::new();
-    for execution in &executions {
-        let runs = match client
-            .send_request(&FrontendRequest::ListRuns {
-                execution_id: execution.id.clone(),
-            })
-            .await
-            .with_context(|| format!("listing runs for execution {}", execution.id))?
-        {
-            FrontendEvent::RunsList { runs, .. } => runs,
-            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-                bail!("engine rejected ListRuns: {message}")
-            }
-            other => bail!("engine returned unexpected response: {other:?}"),
-        };
-        all_runs.extend(runs);
-    }
-
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "runs": all_runs,
-                "executions": executions,
+                "live_worker_states": states,
             })
         );
-    } else if all_runs.is_empty() {
-        println!("no runs");
+    } else if states.is_empty() {
+        println!("no active workers");
     } else {
-        for run in &all_runs {
-            print_run_short(run);
+        for state in &states {
+            print_live_state_short(state);
         }
     }
     Ok(())
@@ -374,11 +380,48 @@ fn print_run(json: bool, run: &WorkRun) {
     }
 }
 
+#[allow(dead_code)]
 fn print_run_short(run: &WorkRun) {
     let started = run.started_at.as_deref().unwrap_or("-");
     println!(
         "{}  agent={}  {}  {}  exec={}",
         run.id, run.agent_id, run.status, started, run.execution_id
+    );
+}
+
+fn print_live_state(json: bool, state: &LiveWorkerState) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(state).expect("LiveWorkerState serializes")
+        );
+        return;
+    }
+    println!("slot {}", state.slot_id);
+    println!("  run:           {}", state.run_id);
+    println!("  model:         {}", state.model);
+    println!("  activity:      {}", state.activity.as_str());
+    println!("  shell_pid:     {}", state.shell_pid);
+    if let Some(tool) = &state.current_tool {
+        println!("  current_tool:  {tool}");
+    }
+    if let Some(ts) = &state.last_event_at {
+        println!("  last_event_at: {ts}");
+    }
+    if let Some(ts) = &state.last_tool_ended_at {
+        println!("  last_tool_end: {ts}");
+    }
+}
+
+fn print_live_state_short(state: &LiveWorkerState) {
+    let tool = state.current_tool.as_deref().unwrap_or("-");
+    println!(
+        "slot {}  run={}  model={}  activity={}  tool={}",
+        state.slot_id,
+        state.run_id,
+        state.model,
+        state.activity.as_str(),
+        tool,
     );
 }
 

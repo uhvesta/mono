@@ -16,6 +16,7 @@ use crate::completion::{
 };
 use crate::config::RuntimeConfig;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
+use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::worker_registry::WorkerRegistry;
 use crate::coordinator::{
     CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
@@ -23,7 +24,8 @@ use crate::coordinator::{
 use crate::protocol::{
     AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FrontendEvent,
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, ReleaseWorkerPaneInput,
-    TOPIC_WORK_PRODUCTS, TopicEventPayload, execution_topic, work_product_topic,
+    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic,
+    work_product_topic,
 };
 use tokio::time::{Duration, timeout};
 use crate::runner::AcpExecutionRunner;
@@ -84,6 +86,14 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
 
     fn worker_registry(&self) -> &WorkerRegistry {
         &self.worker_registry
+    }
+
+    fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
+        Some(&self.live_worker_states)
+    }
+
+    async fn publish_live_worker_states(&self) {
+        self.broadcast_live_worker_states().await;
     }
 }
 
@@ -264,6 +274,11 @@ struct ServerState {
     completion_handler: Arc<WorkerCompletionHandler>,
     topic_broker: Arc<TopicBroker>,
     worker_registry: WorkerRegistry,
+    /// Live runtime state per allocated worker slot. Updated as hook
+    /// events arrive on the events socket; surfaced to bossctl/UI via
+    /// `ListWorkerLiveStates` and pushed on the
+    /// `worker.live_states` topic whenever any slot changes.
+    live_worker_states: Arc<LiveWorkerStateRegistry>,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
     /// Pid of the process the engine trusts as the macOS app — must
@@ -403,6 +418,7 @@ impl ServerState {
                 completion_handler,
                 topic_broker,
                 worker_registry: WorkerRegistry::new(),
+                live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
                 next_session_id: AtomicU64::new(1),
                 work_revision,
                 app_pid,
@@ -557,6 +573,22 @@ impl ServerState {
 
     pub fn worker_registry_handle(&self) -> &WorkerRegistry {
         &self.worker_registry
+    }
+
+    /// Snapshot of every allocated worker slot's live runtime state.
+    pub fn live_worker_states_snapshot(&self) -> Vec<crate::protocol::LiveWorkerState> {
+        self.live_worker_states.snapshot()
+    }
+
+    /// Push the current live-worker-state snapshot on the
+    /// `worker.live_states` topic. Called whenever the events-socket
+    /// consumer or the spawn flow mutates the registry.
+    pub async fn broadcast_live_worker_states(&self) {
+        let states = self.live_worker_states.snapshot();
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList { states });
+        self.topic_broker
+            .publish(TOPIC_WORKER_LIVE_STATES, envelope)
+            .await;
     }
 
     /// Set the Boss session's shell pid (the second trust root). Any
@@ -1248,6 +1280,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 event = ?incoming.event,
                                 "events socket: hook event received",
                             );
+                            dispatch_live_worker_state(&server_state, &incoming).await;
                             dispatch_probe_on_stop(&server_state, &incoming).await;
                             dispatch_completion_on_stop(&server_state, &incoming).await;
                         }
@@ -1261,6 +1294,30 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                 tracing::error!(?err, "events socket accept failed");
             }
         }
+    }
+}
+
+/// Update the per-slot LiveWorkerState for the run this hook event
+/// belongs to and push the new snapshot on the
+/// `worker.live_states` topic if anything changed. Hook events that
+/// arrive before the run has been registered (e.g., the spawn flow
+/// hasn't recorded the slot yet) are silently dropped — once the
+/// registration lands, subsequent events will hit the live entry.
+async fn dispatch_live_worker_state(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    let Some(run_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        return;
+    };
+    let changed = server_state
+        .live_worker_states
+        .apply_event(slot_id, &incoming.event);
+    if changed {
+        server_state.broadcast_live_worker_states().await;
     }
 }
 
@@ -2430,6 +2487,14 @@ async fn handle_frontend_connection(
                     &sink,
                     &request_id,
                     FrontendEvent::RunStopped { run_id },
+                );
+            }
+            FrontendRequest::ListWorkerLiveStates => {
+                let states = server_state.live_worker_states_snapshot();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkerLiveStatesList { states },
                 );
             }
         }

@@ -1653,16 +1653,17 @@ fn collect_task_runtimes(
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     for task in tasks.iter().chain(chores.iter()) {
         let execution = query_latest_execution_for_work_item(conn, &task.id)?;
-        let (execution_status, run_status) = if let Some(execution) = execution {
+        let (execution_status, run_status, execution_id) = if let Some(execution) = execution {
             let run_status = query_latest_run_status(conn, &execution.id)?;
-            (Some(execution.status), run_status)
+            (Some(execution.status), run_status, Some(execution.id))
         } else {
-            (None, None)
+            (None, None, None)
         };
         runtimes.push(TaskRuntime {
             work_item_id: task.id.clone(),
             execution_status,
             run_status,
+            execution_id,
         });
     }
     Ok(runtimes)

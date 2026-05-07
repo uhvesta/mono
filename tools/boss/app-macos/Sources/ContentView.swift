@@ -176,7 +176,7 @@ struct ContentView: View {
 
     private var agentsView: some View {
         #if canImport(GhosttyKit)
-        WorkersDetailView(workspace: workersWorkspace)
+        WorkersDetailView(workspace: workersWorkspace, chat: model)
             .background(Color(nsColor: .windowBackgroundColor))
         #else
         VStack(alignment: .leading, spacing: 12) {
@@ -674,7 +674,10 @@ struct ContentView: View {
                                         projectName: task.isChore ? nil : model.projectName(for: task.projectID),
                                         isSelected: model.selectedTask?.id == task.id,
                                         activityState: column == .doing
-                                            ? AgentActivityState(runtime: model.taskRuntime(for: task.id))
+                                            ? AgentActivityState(
+                                                runtime: model.taskRuntime(for: task.id),
+                                                liveState: model.workerLiveState(forTaskID: task.id)
+                                              )
                                             : nil
                                     )
                                 }
@@ -931,6 +934,8 @@ private struct AgentActivityDot: View {
             return .green
         case .waiting:
             return .yellow
+        case .errored:
+            return .red
         case .none:
             return Color(nsColor: .tertiaryLabelColor)
         }
