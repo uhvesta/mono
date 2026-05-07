@@ -1366,6 +1366,29 @@ pub async fn serve(
         });
     }
 
+    // First, sweep "ghost active" rows that the previous engine left
+    // behind without ever spawning a worker — `tasks.status = 'active'`
+    // with no `work_runs` history at all. These are demoted back to
+    // `todo` so `boss chore list --status active` and
+    // `bossctl agents list` can't drift apart on the strength of a
+    // chore that never reached a slot. Items with run history are
+    // left alone for `reconcile_active_dispatch` below to redispatch.
+    match server_state.work_db.heal_ghost_active_chores() {
+        Ok(healed) if !healed.is_empty() => {
+            tracing::warn!(
+                count = healed.len(),
+                ids = ?healed,
+                "demoted ghost-active chores with no run history",
+            );
+        }
+        Ok(_) => {
+            tracing::debug!("no ghost-active chores to demote at startup");
+        }
+        Err(err) => {
+            tracing::error!(?err, "ghost-active sweep failed; continuing");
+        }
+    }
+
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
     // executions ended without being moved out of the column. See

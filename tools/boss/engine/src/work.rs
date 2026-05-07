@@ -207,6 +207,75 @@ impl WorkDb {
         Ok(execution)
     }
 
+    /// Demote `tasks.status = 'active'` rows that never made it past
+    /// dispatch — i.e., no `work_runs` row was ever recorded for any
+    /// of the work item's executions — back to `todo`. Any non-terminal
+    /// executions on those work items are stamped `abandoned` in the
+    /// same transaction so the dispatcher won't pick them up after the
+    /// demote.
+    ///
+    /// This is the boot-time "ghost active" sweep: a chore can land in
+    /// `tasks.status = 'active'` without ever spawning a worker if the
+    /// previous engine crashed between flipping the kanban status and
+    /// claiming a slot, or if a `RequestExecution` raced ahead of the
+    /// dispatcher and no slot was free. The Doing column should not
+    /// show those — they have no run history and should fall back to
+    /// the To-Do lane so the human can retry.
+    ///
+    /// Returns the work item ids that were demoted. Items whose
+    /// executions already produced a run (active worker that crashed,
+    /// terminated cleanly, or is still executing) are left alone —
+    /// `reconcile_active_dispatch` handles those via re-dispatch.
+    pub fn heal_ghost_active_chores(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let candidate_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT t.id FROM tasks t
+                 WHERE t.status = 'active'
+                   AND t.deleted_at IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM work_runs wr
+                       JOIN work_executions we ON wr.execution_id = we.id
+                       WHERE we.work_item_id = t.id
+                   )",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut healed = Vec::new();
+        let now = now_string();
+        for work_item_id in candidate_ids {
+            // Abandon any non-terminal executions so they don't get
+            // picked up by the dispatcher after the demote. Terminal
+            // executions are left alone — they're already settled.
+            tx.execute(
+                "UPDATE work_executions
+                 SET status = 'abandoned',
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE work_item_id = ?1
+                   AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled')",
+                params![work_item_id, now],
+            )?;
+            // Demote the kanban status. Use a guarded update so we
+            // don't race a concurrent move to `done`/`archived`.
+            let updated = tx.execute(
+                "UPDATE tasks
+                 SET status = 'todo',
+                     updated_at = ?2
+                 WHERE id = ?1
+                   AND status = 'active'
+                   AND deleted_at IS NULL",
+                params![work_item_id, now],
+            )?;
+            if updated > 0 {
+                healed.push(work_item_id);
+            }
+        }
+        tx.commit()?;
+        Ok(healed)
+    }
+
     /// Re-issue `RequestExecution` for every non-deleted task / chore
     /// whose status is `active` but whose latest execution is terminal
     /// (or which has no execution). This is the engine-startup
@@ -270,6 +339,36 @@ impl WorkDb {
         }
         tx.commit()?;
         Ok(redispatched)
+    }
+
+    /// Return the work item ids whose `tasks.status = 'active'` but
+    /// whose latest execution is NOT in `running` (no live worker is
+    /// currently driving the slot). Used by the dispatcher to surface
+    /// the "active vs slot" invariant when the worker pool stalls so a
+    /// human reviewing the engine log can spot a divergence between
+    /// `boss chore list --status active` and `bossctl agents list`.
+    ///
+    /// Items whose latest execution is `ready` (queued behind a full
+    /// pool) are included — they're the canonical "queued ghost" the
+    /// invariant is meant to catch.
+    pub fn list_active_chores_without_live_run(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id FROM tasks t
+             WHERE t.status = 'active'
+               AND t.deleted_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_executions we
+                   WHERE we.work_item_id = t.id
+                     AND we.status = 'running'
+               )",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
