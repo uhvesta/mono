@@ -70,6 +70,23 @@ impl WorkerActivity {
     }
 }
 
+/// Identifies the work item a worker slot was dispatched against.
+/// Stamped onto [`LiveWorkerState`] at spawn time so the coordinator
+/// can resolve "the worker on chore X" without prompting the user
+/// for a slot number — see `bossctl agents list` / `agents status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkItemBinding {
+    /// `task_*` / `chore_*` id of the work item powering this run.
+    pub work_item_id: String,
+    /// Short human-readable name (the work item's `name` column),
+    /// useful when the coordinator renders text output.
+    pub work_item_name: String,
+    /// `work_executions` row id powering this run. The engine
+    /// currently uses the same value for `LiveWorkerState.run_id`,
+    /// but exposing it under its semantic name keeps callers honest.
+    pub execution_id: String,
+}
+
 /// Live runtime status for one allocated worker slot. The shape is
 /// flat so it serializes cleanly into both the bossctl JSON output
 /// and a frontend-socket push.
@@ -96,19 +113,40 @@ pub struct LiveWorkerState {
     /// callers compute "tool runtime" or detect a wedged tool.
     pub last_tool_ended_at: Option<String>,
     pub activity: WorkerActivity,
+    /// Work item this run was dispatched against. `None` for spawns
+    /// that happen outside the work-item dispatch path (today: tests
+    /// and any future direct-launch flow that bypasses the work
+    /// tables).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 impl LiveWorkerState {
     /// Initial state for a freshly-spawned slot. Activity is
     /// `Spawning`; the model is whatever the engine launched the
     /// worker with (later replaced by the `SessionStart`-reported
-    /// value once a hook arrives).
+    /// value once a hook arrives). `binding` is the work-item
+    /// linkage for the run — pass `None` from call sites that don't
+    /// have one (tests; future direct-launch).
     pub fn new_spawning(
         slot_id: u8,
         run_id: impl Into<String>,
         model: impl Into<String>,
         shell_pid: i32,
+        binding: Option<WorkItemBinding>,
     ) -> Self {
+        let (work_item_id, work_item_name, execution_id) = match binding {
+            Some(b) => (
+                Some(b.work_item_id),
+                Some(b.work_item_name),
+                Some(b.execution_id),
+            ),
+            None => (None, None, None),
+        };
         Self {
             slot_id,
             run_id: run_id.into(),
@@ -118,6 +156,9 @@ impl LiveWorkerState {
             current_tool: None,
             last_tool_ended_at: None,
             activity: WorkerActivity::Spawning,
+            work_item_id,
+            work_item_name,
+            execution_id,
         }
     }
 }
@@ -155,7 +196,7 @@ mod tests {
 
     #[test]
     fn new_spawning_sets_defaults() {
-        let state = LiveWorkerState::new_spawning(3, "run-1", "claude-opus-4-7", 42);
+        let state = LiveWorkerState::new_spawning(3, "run-1", "claude-opus-4-7", 42, None);
         assert_eq!(state.slot_id, 3);
         assert_eq!(state.run_id, "run-1");
         assert_eq!(state.model, "claude-opus-4-7");
@@ -164,6 +205,27 @@ mod tests {
         assert!(state.current_tool.is_none());
         assert!(state.last_event_at.is_none());
         assert!(state.last_tool_ended_at.is_none());
+        assert!(state.work_item_id.is_none());
+        assert!(state.work_item_name.is_none());
+        assert!(state.execution_id.is_none());
+    }
+
+    #[test]
+    fn new_spawning_with_binding_carries_work_item_fields() {
+        let state = LiveWorkerState::new_spawning(
+            2,
+            "exec-9",
+            "claude-opus-4-7",
+            0,
+            Some(WorkItemBinding {
+                work_item_id: "task_abc".into(),
+                work_item_name: "Fix fencer scraping".into(),
+                execution_id: "exec-9".into(),
+            }),
+        );
+        assert_eq!(state.work_item_id.as_deref(), Some("task_abc"));
+        assert_eq!(state.work_item_name.as_deref(), Some("Fix fencer scraping"));
+        assert_eq!(state.execution_id.as_deref(), Some("exec-9"));
     }
 
     #[test]
@@ -177,9 +239,21 @@ mod tests {
             current_tool: Some("Bash".into()),
             last_tool_ended_at: Some("2026-05-06T11:59:50Z".into()),
             activity: WorkerActivity::Working,
+            work_item_id: Some("task_42".into()),
+            work_item_name: Some("Fix fencer scraping".into()),
+            execution_id: Some("run-7".into()),
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn live_worker_state_omits_unbound_fields_when_serializing() {
+        let state = LiveWorkerState::new_spawning(1, "exec-1", "claude-opus-4-7", 0, None);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("work_item_id"), "json: {json}");
+        assert!(!json.contains("work_item_name"), "json: {json}");
+        assert!(!json.contains("execution_id"), "json: {json}");
     }
 }

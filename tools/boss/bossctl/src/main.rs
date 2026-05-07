@@ -402,6 +402,15 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     println!("  model:         {}", state.model);
     println!("  activity:      {}", state.activity.as_str());
     println!("  shell_pid:     {}", state.shell_pid);
+    if let Some(id) = &state.work_item_id {
+        println!("  work_item:     {id}");
+    }
+    if let Some(name) = &state.work_item_name {
+        println!("  work_item_name:{name}");
+    }
+    if let Some(id) = &state.execution_id {
+        println!("  execution:     {id}");
+    }
     if let Some(tool) = &state.current_tool {
         println!("  current_tool:  {tool}");
     }
@@ -415,13 +424,17 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
 
 fn print_live_state_short(state: &LiveWorkerState) {
     let tool = state.current_tool.as_deref().unwrap_or("-");
+    let work_item = state.work_item_id.as_deref().unwrap_or("-");
+    let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
     println!(
-        "slot {}  run={}  model={}  activity={}  tool={}",
+        "slot {}  run={}  model={}  activity={}  tool={}  work_item={}  name=\"{}\"",
         state.slot_id,
         state.run_id,
         state.model,
         state.activity.as_str(),
         tool,
+        work_item,
+        work_item_name,
     );
 }
 

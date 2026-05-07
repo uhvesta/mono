@@ -12,6 +12,7 @@ use crate::config::RuntimeConfig;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{Project, Task, WorkDb, WorkExecution, WorkItem};
+use boss_protocol::WorkItemBinding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {
@@ -397,6 +398,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         let title_summary =
             pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await;
 
+        let work_item_binding = Some(WorkItemBinding {
+            work_item_id: work_item_id(work_item).to_owned(),
+            work_item_name: work_item_name(work_item).to_owned(),
+            execution_id: execution.id.clone(),
+        });
+
         let started = start_worker(
             spawner.as_ref(),
             StartWorkerInput {
@@ -408,6 +415,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 initial_input,
                 extra_env: vec![],
                 title_summary,
+                work_item_binding,
             },
             StdDuration::from_secs(30),
         )
@@ -482,6 +490,14 @@ fn work_item_name(work_item: &WorkItem) -> &str {
         WorkItem::Product(product) => &product.name,
         WorkItem::Project(project) => &project.name,
         WorkItem::Task(task) | WorkItem::Chore(task) => &task.name,
+    }
+}
+
+fn work_item_id(work_item: &WorkItem) -> &str {
+    match work_item {
+        WorkItem::Product(product) => &product.id,
+        WorkItem::Project(project) => &project.id,
+        WorkItem::Task(task) | WorkItem::Chore(task) => &task.id,
     }
 }
 
@@ -602,6 +618,7 @@ mod pane_spawn_tests {
         EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
         SpawnWorkerPaneResult,
     };
+    use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::work::{Task, WorkExecution, WorkItem};
     use crate::worker_registry::WorkerRegistry;
     use std::sync::Mutex as StdMutex;
@@ -611,6 +628,7 @@ mod pane_spawn_tests {
     /// on env, initial_input, etc.
     struct CapturingSpawner {
         registry: WorkerRegistry,
+        live_states: LiveWorkerStateRegistry,
         last: StdMutex<Option<SpawnWorkerPaneInput>>,
     }
 
@@ -618,6 +636,7 @@ mod pane_spawn_tests {
         fn new() -> Self {
             Self {
                 registry: WorkerRegistry::new(),
+                live_states: LiveWorkerStateRegistry::new(),
                 last: StdMutex::new(None),
             }
         }
@@ -654,6 +673,10 @@ mod pane_spawn_tests {
 
         fn worker_registry(&self) -> &WorkerRegistry {
             &self.registry
+        }
+
+        fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
+            Some(&self.live_states)
         }
     }
 
@@ -809,6 +832,36 @@ mod pane_spawn_tests {
                 .iter()
                 .any(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET"),
             "expected BOSS_EVENTS_SOCKET to be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_execution_stamps_work_item_binding_on_live_state() {
+        // The bossctl coordinator joins `agents list` output back to a
+        // chore via these fields — without them, asking "stop the
+        // worker on chore X" forces the user to disambiguate slot
+        // numbers manually.
+        let workspace = TempDir::new().unwrap();
+        let spawner = run_once(&workspace).await.unwrap();
+
+        let state = spawner
+            .live_states
+            .get(1)
+            .expect("expected live state for slot 1 after run_execution");
+        assert_eq!(
+            state.work_item_id.as_deref(),
+            Some("task-1"),
+            "work_item_id should match the chore the runner was driven against"
+        );
+        assert_eq!(
+            state.work_item_name.as_deref(),
+            Some("Improve top header (agent card) styling"),
+            "work_item_name should be the chore's display name"
+        );
+        assert_eq!(
+            state.execution_id.as_deref(),
+            Some("exec-test-1"),
+            "execution_id should match the WorkExecution row id"
         );
     }
 

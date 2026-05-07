@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use boss_protocol::{LiveWorkerState, SessionStartSource, WorkerActivity, WorkerEvent};
+use boss_protocol::{
+    LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent,
+};
 
 /// The model identifier the engine uses when no `SessionStart` hook
 /// has yet reported one — this is the model the launcher *asked* for,
@@ -46,14 +48,20 @@ impl LiveWorkerStateRegistry {
     /// is `Spawning` until the first hook arrives. Any prior entry
     /// for this slot is replaced — the previous worker has been
     /// released, so its terminal state isn't useful.
+    ///
+    /// `binding` is the work-item linkage for the run. Production
+    /// dispatch always passes `Some`; in-process tests and any
+    /// future direct-launch path that bypasses the work tables may
+    /// pass `None`.
     pub fn register_spawn(
         &self,
         slot_id: u8,
         run_id: impl Into<String>,
         model: impl Into<String>,
         shell_pid: i32,
+        binding: Option<WorkItemBinding>,
     ) {
-        let state = LiveWorkerState::new_spawning(slot_id, run_id, model, shell_pid);
+        let state = LiveWorkerState::new_spawning(slot_id, run_id, model, shell_pid, binding);
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
@@ -287,19 +295,45 @@ mod tests {
     #[test]
     fn register_spawn_creates_entry_with_spawning_activity() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(2, "run-1", "claude-opus-4-7", 12345);
+        reg.register_spawn(2, "run-1", "claude-opus-4-7", 12345, None);
         let state = reg.get(2).unwrap();
         assert_eq!(state.slot_id, 2);
         assert_eq!(state.run_id, "run-1");
         assert_eq!(state.model, "claude-opus-4-7");
         assert_eq!(state.shell_pid, 12345);
         assert_eq!(state.activity, WorkerActivity::Spawning);
+        assert!(state.work_item_id.is_none());
+        assert!(state.work_item_name.is_none());
+        assert!(state.execution_id.is_none());
+    }
+
+    #[test]
+    fn register_spawn_with_binding_records_work_item_fields() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(
+            2,
+            "exec-1",
+            "claude-opus-4-7",
+            12345,
+            Some(WorkItemBinding {
+                work_item_id: "task_18ad1b81532ac910_4".into(),
+                work_item_name: "Fix fencer scraping".into(),
+                execution_id: "exec-1".into(),
+            }),
+        );
+        let state = reg.get(2).unwrap();
+        assert_eq!(
+            state.work_item_id.as_deref(),
+            Some("task_18ad1b81532ac910_4")
+        );
+        assert_eq!(state.work_item_name.as_deref(), Some("Fix fencer scraping"));
+        assert_eq!(state.execution_id.as_deref(), Some("exec-1"));
     }
 
     #[test]
     fn release_slot_clears_entry() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         assert!(reg.get(1).is_some());
         reg.release_slot(1);
         assert!(reg.get(1).is_none());
@@ -308,7 +342,7 @@ mod tests {
     #[test]
     fn pre_tool_use_marks_working_with_tool_name() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         let changed = reg.apply_event(1, &pre_tool("Bash"));
         assert!(changed);
         let state = reg.get(1).unwrap();
@@ -320,7 +354,7 @@ mod tests {
     #[test]
     fn post_tool_use_clears_current_tool_and_records_end_time() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         reg.apply_event(1, &pre_tool("Bash"));
         reg.apply_event(1, &post_tool("Bash"));
         let state = reg.get(1).unwrap();
@@ -332,7 +366,7 @@ mod tests {
     #[test]
     fn stop_after_tools_transitions_to_idle() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         reg.apply_event(1, &pre_tool("Bash"));
         reg.apply_event(1, &post_tool("Bash"));
         reg.apply_event(1, &stop_event());
@@ -344,7 +378,7 @@ mod tests {
     #[test]
     fn notification_then_stop_marks_waiting_for_input() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         reg.apply_event(
             1,
             &WorkerEvent::Notification {
@@ -360,7 +394,7 @@ mod tests {
     #[test]
     fn pretooluse_after_notification_clears_pending_flag_and_marks_working() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         reg.apply_event(
             1,
             &WorkerEvent::Notification {
@@ -378,7 +412,7 @@ mod tests {
     #[test]
     fn session_end_marks_terminated() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         reg.apply_event(
             1,
             &WorkerEvent::SessionEnd {
@@ -393,7 +427,7 @@ mod tests {
     #[test]
     fn session_start_startup_promotes_spawning_to_idle() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         reg.apply_event(
             1,
             &WorkerEvent::SessionStart {
@@ -415,9 +449,9 @@ mod tests {
     #[test]
     fn snapshot_returns_entries_sorted_by_slot() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(3, "run-3", "claude-opus-4-7", 0);
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 0);
-        reg.register_spawn(2, "run-2", "claude-opus-4-7", 0);
+        reg.register_spawn(3, "run-3", "claude-opus-4-7", 0, None);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 0, None);
+        reg.register_spawn(2, "run-2", "claude-opus-4-7", 0, None);
         let states = reg.snapshot();
         assert_eq!(states.len(), 3);
         assert_eq!(states[0].slot_id, 1);
@@ -428,7 +462,7 @@ mod tests {
     #[test]
     fn mark_errored_transitions_and_returns_changed() {
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1);
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         assert!(reg.mark_errored(1));
         assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Errored);
         // Idempotent.

@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
+use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
@@ -82,6 +83,11 @@ pub struct StartWorkerInput {
     /// engine had no summary to offer (e.g., generation failed) —
     /// the app falls back to showing the run id.
     pub title_summary: Option<String>,
+    /// Work-item linkage stamped onto the resulting `LiveWorkerState`
+    /// so `bossctl agents list` / `agents status` can resolve "the
+    /// worker on chore X" without prompting for a slot. `None` from
+    /// callers that don't have a work item (tests).
+    pub work_item_binding: Option<WorkItemBinding>,
 }
 
 #[derive(Debug)]
@@ -264,7 +270,13 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    see "Spawning" with the launch-default model — no more
     //    "Claude Unknown" while we wait for SessionStart to fire.
     if let Some(live_states) = spawner.live_worker_state_registry() {
-        live_states.register_spawn(slot_id, input.run_id, DEFAULT_LAUNCH_MODEL, shell_pid);
+        live_states.register_spawn(
+            slot_id,
+            input.run_id,
+            DEFAULT_LAUNCH_MODEL,
+            shell_pid,
+            input.work_item_binding,
+        );
         spawner.publish_live_worker_states().await;
     }
 
@@ -348,6 +360,7 @@ mod tests {
             initial_input: "claude\n".into(),
             extra_env: vec![],
             title_summary: None,
+            work_item_binding: None,
         }
     }
 
