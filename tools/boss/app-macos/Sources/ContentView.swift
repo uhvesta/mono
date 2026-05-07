@@ -1468,11 +1468,15 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
     private let horizontalPadding: CGFloat = workBoardHorizontalPadding
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(
+            columnWidth: columnWidth,
+            spacing: spacing,
+            horizontalPadding: horizontalPadding
+        )
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = WorkBoardScrollView()
         let clipView = HorizontalOnlyClipView()
         clipView.drawsBackground = false
 
@@ -1485,6 +1489,12 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
         scrollView.verticalScrollElasticity = .none
         scrollView.contentView = clipView
         scrollView.documentView = context.coordinator.documentView
+
+        let coordinator = context.coordinator
+        scrollView.onLayout = { [weak scrollView] in
+            guard let scrollView else { return }
+            coordinator.layoutColumns(in: scrollView)
+        }
         return scrollView
     }
 
@@ -1495,62 +1505,24 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
         }
 
         coordinator.sync(columns: columns)
-
-        var clipWidth = nsView.contentView.bounds.width
-        var clipHeight = nsView.contentView.bounds.height
-        let contentWidth = totalContentWidth(for: columns.count)
-        let hasOverflow = contentWidth > clipWidth + 0.5
-        if nsView.hasHorizontalScroller != hasOverflow {
-            nsView.hasHorizontalScroller = hasOverflow
-            nsView.tile()
-            clipWidth = nsView.contentView.bounds.width
-            clipHeight = nsView.contentView.bounds.height
-        }
-
-        coordinator.documentView.frame = NSRect(
-            origin: .zero,
-            size: NSSize(width: max(contentWidth, clipWidth), height: clipHeight)
-        )
-
-        var x = horizontalPadding
-        for hostingView in coordinator.hostingViews {
-            hostingView.frame = NSRect(
-                x: x,
-                y: 0,
-                width: columnWidth,
-                height: clipHeight
-            )
-            x += columnWidth + spacing
-        }
-
-        // The board only scrolls horizontally. Clamp any stale vertical offset
-        // back to zero so project/filter changes can't hide the column headers.
-        let currentOrigin = nsView.contentView.bounds.origin
-        let maxHorizontalOffset = max(0, coordinator.documentView.frame.width - clipWidth)
-        let clampedOrigin = NSPoint(
-            x: min(max(currentOrigin.x, 0), maxHorizontalOffset),
-            y: 0
-        )
-        if abs(currentOrigin.x - clampedOrigin.x) > 0.5
-            || abs(currentOrigin.y - clampedOrigin.y) > 0.5
-        {
-            nsView.contentView.scroll(to: clampedOrigin)
-            nsView.reflectScrolledClipView(nsView.contentView)
-        }
-    }
-
-    private func totalContentWidth(for columnCount: Int) -> CGFloat {
-        guard columnCount > 0 else { return 0 }
-        return horizontalPadding
-            + (CGFloat(columnCount) * columnWidth)
-            + (CGFloat(max(columnCount - 1, 0)) * spacing)
-            + horizontalPadding
+        coordinator.layoutColumns(in: nsView)
     }
 
     @MainActor
     final class Coordinator {
         let documentView = FlippedContentView()
         var hostingViews: [NSHostingView<AnyView>] = []
+
+        private let columnWidth: CGFloat
+        private let spacing: CGFloat
+        private let horizontalPadding: CGFloat
+        private var isLayingOut = false
+
+        init(columnWidth: CGFloat, spacing: CGFloat, horizontalPadding: CGFloat) {
+            self.columnWidth = columnWidth
+            self.spacing = spacing
+            self.horizontalPadding = horizontalPadding
+        }
 
         func sync(columns: [NativeWorkBoardColumn]) {
             while hostingViews.count > columns.count {
@@ -1567,6 +1539,75 @@ private struct NativeWorkBoardScrollView: NSViewRepresentable {
                 hostingView.rootView = column.view
             }
         }
+
+        func layoutColumns(in scrollView: NSScrollView) {
+            guard !isLayingOut else { return }
+            isLayingOut = true
+            defer { isLayingOut = false }
+
+            var clipWidth = scrollView.contentView.bounds.width
+            var clipHeight = scrollView.contentView.bounds.height
+            let contentWidth = totalContentWidth(for: hostingViews.count)
+            let hasOverflow = contentWidth > clipWidth + 0.5
+            if scrollView.hasHorizontalScroller != hasOverflow {
+                scrollView.hasHorizontalScroller = hasOverflow
+                scrollView.tile()
+                clipWidth = scrollView.contentView.bounds.width
+                clipHeight = scrollView.contentView.bounds.height
+            }
+
+            documentView.frame = NSRect(
+                origin: .zero,
+                size: NSSize(width: max(contentWidth, clipWidth), height: clipHeight)
+            )
+
+            var x = horizontalPadding
+            for hostingView in hostingViews {
+                hostingView.frame = NSRect(
+                    x: x,
+                    y: 0,
+                    width: columnWidth,
+                    height: clipHeight
+                )
+                x += columnWidth + spacing
+            }
+
+            // The board only scrolls horizontally. Clamp any stale vertical offset
+            // back to zero so project/filter changes can't hide the column headers.
+            let currentOrigin = scrollView.contentView.bounds.origin
+            let maxHorizontalOffset = max(0, documentView.frame.width - clipWidth)
+            let clampedOrigin = NSPoint(
+                x: min(max(currentOrigin.x, 0), maxHorizontalOffset),
+                y: 0
+            )
+            if abs(currentOrigin.x - clampedOrigin.x) > 0.5
+                || abs(currentOrigin.y - clampedOrigin.y) > 0.5
+            {
+                scrollView.contentView.scroll(to: clampedOrigin)
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
+        }
+
+        private func totalContentWidth(for columnCount: Int) -> CGFloat {
+            guard columnCount > 0 else { return 0 }
+            return horizontalPadding
+                + (CGFloat(columnCount) * columnWidth)
+                + (CGFloat(max(columnCount - 1, 0)) * spacing)
+                + horizontalPadding
+        }
+    }
+}
+
+/// NSScrollView subclass that calls back on every geometry change so the
+/// embedded column hosting views can be re-laid out. Without this the lanes
+/// stay at the height they had when SwiftUI last sent a state update, so
+/// resizing the window vertically would not grow the lanes.
+private final class WorkBoardScrollView: NSScrollView {
+    var onLayout: (() -> Void)?
+
+    override func tile() {
+        super.tile()
+        onLayout?()
     }
 }
 
