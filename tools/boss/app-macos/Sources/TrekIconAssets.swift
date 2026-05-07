@@ -59,7 +59,46 @@ enum TrekIconSize: String {
 /// (`Bundle.module`). The Bazel build path doesn't bundle them today
 /// — callers must tolerate `nil` (the UI keeps text-only fallback).
 enum TrekIconAssets {
+    private struct CacheKey: Hashable {
+        let character: TrekCharacter
+        let size: TrekIconSize
+    }
+
+    // Decoded NSImages are immutable for our consumers (they only
+    // render via SwiftUI `Image(nsImage:)`), so handing the same
+    // instance to many views is safe. The roster has <20 distinct
+    // (character, size) pairs over the app lifetime — no eviction
+    // needed.
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cache: [CacheKey: NSImage] = [:]
+    nonisolated(unsafe) private static var negativeCache: Set<CacheKey> = []
+
     static func image(_ character: TrekCharacter, size: TrekIconSize) -> NSImage? {
+        let key = CacheKey(character: character, size: size)
+        lock.lock()
+        if let cached = cache[key] {
+            lock.unlock()
+            return cached
+        }
+        if negativeCache.contains(key) {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+
+        let loaded = loadFromBundle(character: character, size: size)
+
+        lock.lock()
+        if let loaded {
+            cache[key] = loaded
+        } else {
+            negativeCache.insert(key)
+        }
+        lock.unlock()
+        return loaded
+    }
+
+    private static func loadFromBundle(character: TrekCharacter, size: TrekIconSize) -> NSImage? {
         let resource = "TrekIcons/\(size.rawValue)/\(character.rawValue)"
         #if SWIFT_PACKAGE
         if let url = Bundle.module.url(forResource: resource, withExtension: "png"),
