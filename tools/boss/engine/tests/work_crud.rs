@@ -11,10 +11,11 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    AddDependencyInput, CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
-    DependencyDirection, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
-    RemoveDependencyInput, Task, TopicEventPayload, WorkItem, WorkItemDependency,
-    WorkItemDependencyView, WorkItemPatch, work_product_topic,
+    AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, FrontendEvent,
+    FrontendRequest, ListDependenciesInput, Product, Project, RemoveDependencyInput, Task,
+    TopicEventPayload, WorkItem, WorkItemDependency, WorkItemDependencyView, WorkItemPatch,
+    work_product_topic,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -730,10 +731,7 @@ async fn add_dependency(
     }
 }
 
-async fn remove_dependency(
-    client: &mut BossClient,
-    input: RemoveDependencyInput,
-) -> Result<bool> {
+async fn remove_dependency(client: &mut BossClient, input: RemoveDependencyInput) -> Result<bool> {
     match client
         .send_request(&FrontendRequest::RemoveDependency { input })
         .await?
@@ -869,6 +867,121 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     )
     .await?;
     assert!(!removed_again);
+
+    Ok(())
+}
+
+/// Round-trip the new bulk-create RPCs through the wire layer:
+/// `CreateManyTasks` and `CreateManyChores` insert all items in one
+/// engine round-trip and reply with `WorkItemsCreated`. A bad item in
+/// the middle of the batch must roll back the whole transaction.
+#[tokio::test]
+async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 1".to_owned(),
+            description: None,
+            goal: None,
+        },
+    )
+    .await?;
+
+    let task_inputs: Vec<CreateTaskInput> = (0..4)
+        .map(|i| CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: format!("Bulk task {i}"),
+            description: Some(format!("desc {i}")),
+            autostart: false,
+        })
+        .collect();
+    let created_tasks = match client
+        .send_request(&FrontendRequest::CreateManyTasks {
+            input: CreateManyTasksInput { items: task_inputs },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemsCreated { items } => items
+            .into_iter()
+            .map(expect_task)
+            .collect::<Result<Vec<_>>>()?,
+        other => return Err(unexpected_event("create-many tasks", other)),
+    };
+    assert_eq!(created_tasks.len(), 4);
+    let listed_tasks = list_tasks(&mut client, &product.id, Some(&project.id)).await?;
+    assert_eq!(listed_tasks.len(), 4);
+
+    let chore_inputs: Vec<CreateChoreInput> = (0..3)
+        .map(|i| CreateChoreInput {
+            product_id: product.id.clone(),
+            name: format!("Bulk chore {i}"),
+            description: None,
+            autostart: i == 0,
+        })
+        .collect();
+    let created_chores = match client
+        .send_request(&FrontendRequest::CreateManyChores {
+            input: CreateManyChoresInput {
+                items: chore_inputs,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemsCreated { items } => items
+            .into_iter()
+            .map(expect_chore)
+            .collect::<Result<Vec<_>>>()?,
+        other => return Err(unexpected_event("create-many chores", other)),
+    };
+    assert_eq!(created_chores.len(), 3);
+    let listed_chores = list_chores(&mut client, &product.id).await?;
+    assert_eq!(listed_chores.len(), 3);
+
+    // A bad item in the batch (unknown project) rolls back the whole
+    // transaction — no new tasks land.
+    let bad_inputs = vec![
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Should not survive".to_owned(),
+            description: None,
+            autostart: false,
+        },
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: "proj_nope".to_owned(),
+            name: "Bad ref".to_owned(),
+            description: None,
+            autostart: false,
+        },
+    ];
+    match client
+        .send_request(&FrontendRequest::CreateManyTasks {
+            input: CreateManyTasksInput { items: bad_inputs },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("item 1"), "{message}");
+        }
+        other => return Err(unexpected_event("expected WorkError", other)),
+    }
+    let listed_after = list_tasks(&mut client, &product.id, Some(&project.id)).await?;
+    assert_eq!(listed_after.len(), 4, "rollback must not leak rows");
 
     Ok(())
 }

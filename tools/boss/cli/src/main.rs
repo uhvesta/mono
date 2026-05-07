@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -7,10 +7,10 @@ use boss_client::{
     stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
-    DependencyDirection, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
-    RemoveDependencyInput, Task, WorkItem, WorkItemDependency, WorkItemDependencyView,
-    WorkItemPatch,
+    AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, FrontendEvent,
+    FrontendRequest, ListDependenciesInput, Product, Project, RemoveDependencyInput, Task,
+    WorkItem, WorkItemDependency, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -115,6 +115,12 @@ enum ProjectCommand {
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
     Create(TaskCreateArgs),
+    /// Bulk-create N tasks from a JSON array. Sidesteps the per-call
+    /// CLI startup overhead of running `task create` N times — one
+    /// invocation, one engine round-trip, atomic transaction. See
+    /// `--help` for the input schema.
+    #[command(name = "create-many")]
+    CreateMany(TaskCreateManyArgs),
     List(TaskListArgs),
     Show(TaskIdArg),
     Update(TaskUpdateArgs),
@@ -144,6 +150,10 @@ enum TaskCommand {
 #[derive(Debug, Subcommand)]
 enum ChoreCommand {
     Create(ChoreCreateArgs),
+    /// Bulk-create N chores from a JSON array. See `boss task
+    /// create-many --help` for the schema; chores omit `project_id`.
+    #[command(name = "create-many")]
+    CreateMany(ChoreCreateManyArgs),
     List(ChoreListArgs),
     Show(TaskIdArg),
     Update(TaskUpdateArgs),
@@ -379,6 +389,50 @@ struct ChoreCreateArgs {
 
     #[arg(long)]
     description: Option<String>,
+}
+
+/// Args for `boss task create-many`. The CLI reads a JSON array of
+/// item objects from `--from-file <path>` (use `-` for stdin) and
+/// fans them out into a single batched engine request. Top-level
+/// `--product` / `--project` plus the global `--no-autostart` act as
+/// defaults applied to every item; per-item fields override.
+///
+/// Item schema (per array entry):
+/// ```json
+/// {
+///   "name": "...",                 // required, non-empty
+///   "description": "...",          // required (may be empty string)
+///   "autostart": true,             // optional, defaults to top-level
+///   "project_id": "proj_..."       // optional override of --project
+/// }
+/// ```
+#[derive(Debug, Clone, Args)]
+struct TaskCreateManyArgs {
+    /// Path to a JSON file containing the array of items. Use `-` to
+    /// read from stdin.
+    #[arg(long = "from-file")]
+    from_file: String,
+
+    /// Default product for items that don't specify one. Required
+    /// unless every item carries a fully-resolved engine `product_id`.
+    #[arg(long)]
+    product: Option<String>,
+
+    /// Default project for items that don't specify one. Items may
+    /// override via per-item `project_id`.
+    #[arg(long)]
+    project: Option<String>,
+}
+
+/// Args for `boss chore create-many`. Identical to
+/// [`TaskCreateManyArgs`] but with no project axis.
+#[derive(Debug, Clone, Args)]
+struct ChoreCreateManyArgs {
+    #[arg(long = "from-file")]
+    from_file: String,
+
+    #[arg(long)]
+    product: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -922,7 +976,8 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 status: Some(ProductStatus::Archived.as_str().to_owned()),
                 ..WorkItemPatch::default()
             };
-            let archived = expect_product(update_work_item(&mut client, &product.id, patch).await?)?;
+            let archived =
+                expect_product(update_work_item(&mut client, &product.id, patch).await?)?;
             print_entity(
                 ctx,
                 &serde_json::json!({
@@ -1032,7 +1087,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 status: Some(ProjectStatus::Archived.as_str().to_owned()),
                 ..WorkItemPatch::default()
             };
-            let archived = expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
+            let archived =
+                expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
             print_entity(
                 ctx,
                 &serde_json::json!({
@@ -1176,9 +1232,8 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             )
         }
         TaskCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
-        TaskCommand::BindPr(args) => {
-            run_bind_pr(&mut client, ctx, args, BindPrKind::Task).await
-        }
+        TaskCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args, BindPrKind::Task).await,
+        TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,
     }
 }
 
@@ -1264,9 +1319,8 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             )
         }
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
-        ChoreCommand::BindPr(args) => {
-            run_bind_pr(&mut client, ctx, args, BindPrKind::Chore).await
-        }
+        ChoreCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args, BindPrKind::Chore).await,
+        ChoreCommand::CreateMany(args) => run_chore_create_many(&mut client, ctx, args).await,
     }
 }
 
@@ -1606,17 +1660,224 @@ async fn run_bind_pr(
     )
 }
 
+/// One entry in a bulk-create input file. Mirrors the documented
+/// schema: `name` and `description` are required; `autostart` and
+/// `project_id` (tasks only) are optional per-item overrides of the
+/// top-level CLI defaults. Unknown fields are rejected so a typo
+/// doesn't silently drop data on the floor.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BulkCreateItem {
+    name: String,
+    description: String,
+    #[serde(default)]
+    autostart: Option<bool>,
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+fn read_bulk_input(from_file: &str) -> Result<Vec<BulkCreateItem>, CliError> {
+    let raw = if from_file == "-" {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|err| CliError::usage(format!("failed to read stdin: {err}")))?;
+        buf
+    } else {
+        std::fs::read_to_string(from_file)
+            .map_err(|err| CliError::usage(format!("failed to read {from_file}: {err}")))?
+    };
+    let items: Vec<BulkCreateItem> = serde_json::from_str(&raw).map_err(|err| {
+        CliError::usage(format!(
+            "failed to parse {} as a JSON array of items (line {}, column {}): {}",
+            display_input_source(from_file),
+            err.line(),
+            err.column(),
+            err,
+        ))
+    })?;
+    if items.is_empty() {
+        return Err(CliError::usage(format!(
+            "{} contained an empty array; nothing to create",
+            display_input_source(from_file),
+        )));
+    }
+    for (index, item) in items.iter().enumerate() {
+        if item.name.trim().is_empty() {
+            return Err(CliError::usage(format!(
+                "item {index}: `name` is required and must not be empty"
+            )));
+        }
+    }
+    Ok(items)
+}
+
+fn display_input_source(from_file: &str) -> String {
+    if from_file == "-" {
+        "stdin".to_owned()
+    } else {
+        from_file.to_owned()
+    }
+}
+
+async fn run_task_create_many(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskCreateManyArgs,
+) -> Result<(), CliError> {
+    let items = read_bulk_input(&args.from_file)?;
+
+    // Resolve --product / --project once; per-item project_id (if
+    // present) is treated as an already-resolved engine id so we
+    // don't pay an extra round-trip per row.
+    let product = resolve_product(client, args.product, ctx).await?;
+    let default_project = match args.project {
+        Some(selector) => Some(resolve_project(client, &product.id, Some(selector), ctx).await?),
+        None => None,
+    };
+
+    let default_autostart = !ctx.no_autostart;
+
+    let mut inputs = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let project_id = match item.project_id {
+            Some(id) => id,
+            None => match default_project.as_ref() {
+                Some(project) => project.id.clone(),
+                None => {
+                    return Err(CliError::usage(format!(
+                        "item {index}: no project specified — pass --project as a default or set `project_id` on the item"
+                    )));
+                }
+            },
+        };
+        inputs.push(CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id,
+            name: item.name,
+            description: normalize_non_empty(Some(item.description)),
+            autostart: item.autostart.unwrap_or(default_autostart),
+        });
+    }
+
+    let count = inputs.len();
+    let created = create_many_tasks(client, CreateManyTasksInput { items: inputs }).await?;
+
+    print_entity(
+        ctx,
+        &serde_json::json!({ "tasks": created, "count": created.len() }),
+        || {
+            if !ctx.quiet {
+                println!("Created {} tasks:", created.len());
+                print_tasks_table(&created);
+            }
+        },
+    )?;
+    debug_assert_eq!(created.len(), count);
+    Ok(())
+}
+
+async fn run_chore_create_many(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: ChoreCreateManyArgs,
+) -> Result<(), CliError> {
+    let items = read_bulk_input(&args.from_file)?;
+    let product = resolve_product(client, args.product, ctx).await?;
+    let default_autostart = !ctx.no_autostart;
+
+    let mut inputs = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        if item.project_id.is_some() {
+            return Err(CliError::usage(format!(
+                "item {index}: chores do not have a project — remove `project_id`"
+            )));
+        }
+        inputs.push(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: item.name,
+            description: normalize_non_empty(Some(item.description)),
+            autostart: item.autostart.unwrap_or(default_autostart),
+        });
+    }
+
+    let created = create_many_chores(client, CreateManyChoresInput { items: inputs }).await?;
+    print_entity(
+        ctx,
+        &serde_json::json!({ "chores": created, "count": created.len() }),
+        || {
+            if !ctx.quiet {
+                println!("Created {} chores:", created.len());
+                print_tasks_table(&created);
+            }
+        },
+    )
+}
+
+async fn create_many_tasks(
+    client: &mut BossClient,
+    input: CreateManyTasksInput,
+) -> Result<Vec<Task>, CliError> {
+    handle_create_many_response(
+        client
+            .send_request(&FrontendRequest::CreateManyTasks { input })
+            .await
+            .map_err(CliError::internal)?,
+        "tasks create-many",
+        |item| match item {
+            WorkItem::Task(t) => Ok(t),
+            other => Err(CliError::conflict(format!(
+                "engine returned non-task item in tasks batch: {:?}",
+                std::mem::discriminant(&other),
+            ))),
+        },
+    )
+}
+
+async fn create_many_chores(
+    client: &mut BossClient,
+    input: CreateManyChoresInput,
+) -> Result<Vec<Task>, CliError> {
+    handle_create_many_response(
+        client
+            .send_request(&FrontendRequest::CreateManyChores { input })
+            .await
+            .map_err(CliError::internal)?,
+        "chores create-many",
+        |item| match item {
+            WorkItem::Chore(t) => Ok(t),
+            other => Err(CliError::conflict(format!(
+                "engine returned non-chore item in chores batch: {:?}",
+                std::mem::discriminant(&other),
+            ))),
+        },
+    )
+}
+
+fn handle_create_many_response<F>(
+    event: FrontendEvent,
+    context: &str,
+    extract: F,
+) -> Result<Vec<Task>, CliError>
+where
+    F: Fn(WorkItem) -> Result<Task, CliError>,
+{
+    match event {
+        FrontendEvent::WorkItemsCreated { items } => items.into_iter().map(extract).collect(),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event(context, &other)),
+    }
+}
+
 /// Accept only `https://github.com/<org>/<repo>/pull/<n>`. Returns the
 /// trimmed canonical form on success.
 fn validate_github_pr_url(raw: &str) -> Result<&str, CliError> {
     let trimmed = raw.trim();
-    let rest = trimmed
-        .strip_prefix("https://github.com/")
-        .ok_or_else(|| {
-            CliError::usage(
-                "PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>",
-            )
-        })?;
+    let rest = trimmed.strip_prefix("https://github.com/").ok_or_else(|| {
+        CliError::usage("PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>")
+    })?;
     let mut parts = rest.split('/');
     let org = parts.next().unwrap_or("");
     let repo = parts.next().unwrap_or("");
@@ -2112,8 +2373,7 @@ fn apply_project_list_filters(
     items
         .into_iter()
         .filter(|project| {
-            if !allowed_statuses.is_empty()
-                && !allowed_statuses.contains(&project.status.as_str())
+            if !allowed_statuses.is_empty() && !allowed_statuses.contains(&project.status.as_str())
             {
                 return false;
             }
@@ -2261,8 +2521,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        BindPrAction, ChoreCommand, Cli, Commands, MoveTarget, ProductCommand, ProductStatus,
-        ProjectCommand, ProjectStatus, TaskCommand, classify_bind_pr, pick_by_index,
+        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, ProductCommand,
+        ProductStatus, ProjectCommand, ProjectStatus, TaskCommand, classify_bind_pr, pick_by_index,
         validate_github_pr_url,
     };
 
@@ -2329,9 +2589,7 @@ mod tests {
 
     #[test]
     fn parses_project_delete_command() {
-        let cli = Cli::parse_from([
-            "boss", "project", "delete", "work-cli", "--product", "boss",
-        ]);
+        let cli = Cli::parse_from(["boss", "project", "delete", "work-cli", "--product", "boss"]);
         match cli.command {
             Commands::Project {
                 command: ProjectCommand::Delete(args),
@@ -2346,7 +2604,14 @@ mod tests {
     #[test]
     fn parses_project_move_command() {
         let cli = Cli::parse_from([
-            "boss", "project", "move", "work-cli", "--product", "boss", "--to", "done",
+            "boss",
+            "project",
+            "move",
+            "work-cli",
+            "--product",
+            "boss",
+            "--to",
+            "done",
         ]);
         match cli.command {
             Commands::Project {
@@ -2400,15 +2665,15 @@ mod tests {
         for bad in [
             "",
             "not-a-url",
-            "http://github.com/a/b/pull/1",      // wrong scheme
-            "https://gitlab.com/a/b/pull/1",     // wrong host
-            "https://github.com/a/b/pulls/1",    // typo
-            "https://github.com/a/b/issues/1",   // wrong noun
-            "https://github.com/a/b/pull/",      // missing number
-            "https://github.com/a/b/pull/abc",   // non-numeric
+            "http://github.com/a/b/pull/1",        // wrong scheme
+            "https://gitlab.com/a/b/pull/1",       // wrong host
+            "https://github.com/a/b/pulls/1",      // typo
+            "https://github.com/a/b/issues/1",     // wrong noun
+            "https://github.com/a/b/pull/",        // missing number
+            "https://github.com/a/b/pull/abc",     // non-numeric
             "https://github.com/a/b/pull/1/files", // trailing path
-            "https://github.com//repo/pull/1",   // empty org
-            "https://github.com/org//pull/1",    // empty repo
+            "https://github.com//repo/pull/1",     // empty org
+            "https://github.com/org//pull/1",      // empty repo
         ] {
             assert!(
                 validate_github_pr_url(bad).is_err(),
@@ -2485,5 +2750,74 @@ mod tests {
             }
             _ => panic!("expected chore bind-pr command"),
         }
+    }
+
+    #[test]
+    fn parses_task_create_many_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "create-many",
+            "--from-file",
+            "tasks.json",
+            "--product",
+            "boss",
+            "--project",
+            "plan",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::CreateMany(args),
+            } => {
+                assert_eq!(args.from_file, "tasks.json");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(args.project.as_deref(), Some("plan"));
+            }
+            _ => panic!("expected task create-many command"),
+        }
+    }
+
+    #[test]
+    fn parses_chore_create_many_with_stdin() {
+        let cli = Cli::parse_from([
+            "boss",
+            "chore",
+            "create-many",
+            "--from-file",
+            "-",
+            "--product",
+            "boss",
+        ]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::CreateMany(args),
+            } => {
+                assert_eq!(args.from_file, "-");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+            }
+            _ => panic!("expected chore create-many command"),
+        }
+    }
+
+    #[test]
+    fn bulk_create_item_deserializes_full_form() {
+        let raw = r#"{
+            "name": "do thing",
+            "description": "details",
+            "autostart": false,
+            "project_id": "proj_abc"
+        }"#;
+        let item: BulkCreateItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.name, "do thing");
+        assert_eq!(item.description, "details");
+        assert_eq!(item.autostart, Some(false));
+        assert_eq!(item.project_id.as_deref(), Some("proj_abc"));
+    }
+
+    #[test]
+    fn bulk_create_item_rejects_unknown_fields() {
+        let raw = r#"{ "name": "x", "description": "y", "autosatrt": true }"#;
+        let err = serde_json::from_str::<BulkCreateItem>(raw).expect_err("typo must fail");
+        assert!(err.to_string().contains("autosatrt"), "{err}");
     }
 }

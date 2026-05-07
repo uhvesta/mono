@@ -4,10 +4,10 @@ use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
     AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
-    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput,
-    ListDependenciesInput, Product, Project, RemoveDependencyInput, RequestExecutionInput, Task,
-    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyView, WorkItemPatch, WorkRun,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRunInput, CreateTaskInput, ListDependenciesInput, Product, Project,
+    RemoveDependencyInput, RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -119,6 +119,20 @@ pub enum FrontendRequest {
     CreateChore {
         #[serde(flatten)]
         input: CreateChoreInput,
+    },
+    /// Batch create N tasks in one engine round-trip. Atomic: the
+    /// whole batch is wrapped in a single sqlite transaction and
+    /// rolled back on the first per-item failure. Replies with
+    /// `WorkItemsCreated` carrying the full list of inserted rows.
+    CreateManyTasks {
+        #[serde(flatten)]
+        input: CreateManyTasksInput,
+    },
+    /// Batch create N chores in one engine round-trip. See
+    /// `CreateManyTasks` for atomicity semantics.
+    CreateManyChores {
+        #[serde(flatten)]
+        input: CreateManyChoresInput,
     },
     UpdateWorkItem {
         id: String,
@@ -349,6 +363,16 @@ pub enum FrontendEvent {
     WorkItemCreated {
         item: WorkItem,
     },
+    /// Response to a batch create (`CreateManyTasks` /
+    /// `CreateManyChores`). Carries every row inserted by the batch in
+    /// the order the caller submitted them. Per-item subscribers can
+    /// keep treating each entry as if it had arrived via a regular
+    /// `WorkItemCreated` event — the engine also publishes the usual
+    /// `work_invalidated` topic event covering the full id list, so
+    /// kanban consumers reload once.
+    WorkItemsCreated {
+        items: Vec<WorkItem>,
+    },
     WorkItemUpdated {
         item: WorkItem,
     },
@@ -535,7 +559,9 @@ pub enum FrontendEvent {
     /// Engine confirms a dependency edge has been added. Returns the
     /// row that was inserted (or the existing row if the call was an
     /// idempotent re-add).
-    DependencyAdded { edge: WorkItemDependency },
+    DependencyAdded {
+        edge: WorkItemDependency,
+    },
     /// Engine confirms a dependency edge has been removed (or that no
     /// matching edge existed to begin with — also a success).
     DependencyRemoved {
@@ -546,7 +572,9 @@ pub enum FrontendEvent {
     },
     /// Edge listing for a single work item, with prerequisites and
     /// dependents in two parallel lists.
-    DependencyList { view: WorkItemDependencyView },
+    DependencyList {
+        view: WorkItemDependencyView,
+    },
 }
 
 /// One row of the cube workspace pool, as exposed via

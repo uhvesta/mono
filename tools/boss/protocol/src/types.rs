@@ -197,6 +197,25 @@ pub struct CreateChoreInput {
     pub autostart: bool,
 }
 
+/// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved
+/// inputs — the CLI merges any top-level `--product` / `--project` /
+/// `--no-autostart` defaults into each entry before sending. The
+/// engine inserts every item in one sqlite transaction and emits one
+/// `WorkItemsCreated` response carrying the full list. On any
+/// per-item validation failure the entire transaction is rolled back
+/// — there is no partial state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateManyTasksInput {
+    pub items: Vec<CreateTaskInput>,
+}
+
+/// Batch counterpart of [`CreateChoreInput`]. See
+/// [`CreateManyTasksInput`] for atomicity / event semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateManyChoresInput {
+    pub items: Vec<CreateChoreInput>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateExecutionInput {
     pub work_item_id: String,

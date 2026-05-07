@@ -8,15 +8,14 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 pub use boss_protocol::{
     AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
-    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection,
-    ExecutionReconcileResult, ListDependenciesInput, Product, Project, RemoveDependencyInput,
-    RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkTree,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRunInput, CreateTaskInput, DependencyDirection, ExecutionReconcileResult,
+    ListDependenciesInput, Product, Project, RemoveDependencyInput, RequestExecutionInput, Task,
+    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyView, WorkItemPatch, WorkRun, WorkTree,
 };
 
-use crate::work_dependencies::{
-    self as deps, EdgeInsertOutcome, RELATION_BLOCKS,
-};
+use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -115,23 +114,7 @@ impl WorkDb {
     pub fn create_task(&self, input: CreateTaskInput) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        ensure_product_exists(&tx, &input.product_id)?;
-        ensure_project_belongs_to_product(&tx, &input.project_id, &input.product_id)?;
-
-        let id = next_id("task");
-        let now = now_string();
-        let ordinal = next_task_ordinal(&tx, &input.project_id)?;
-        let description = input.description.unwrap_or_default();
-
-        let autostart_value: i64 = if input.autostart { 1 } else { 0 };
-        tx.execute(
-            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
-             VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8)",
-            params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value],
-        )?;
-
-        let task =
-            query_task(&tx, &id)?.with_context(|| format!("missing task after insert: {id}"))?;
+        let task = insert_task_in_tx(&tx, input)?;
         tx.commit()?;
         Ok(task)
     }
@@ -139,23 +122,40 @@ impl WorkDb {
     pub fn create_chore(&self, input: CreateChoreInput) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        ensure_product_exists(&tx, &input.product_id)?;
-
-        let id = next_id("task");
-        let now = now_string();
-        let description = input.description.unwrap_or_default();
-        let autostart_value: i64 = if input.autostart { 1 } else { 0 };
-
-        tx.execute(
-            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
-             VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6)",
-            params![id, input.product_id, input.name, description, now, autostart_value],
-        )?;
-
-        let task =
-            query_task(&tx, &id)?.with_context(|| format!("missing chore after insert: {id}"))?;
+        let chore = insert_chore_in_tx(&tx, input)?;
         tx.commit()?;
-        Ok(task)
+        Ok(chore)
+    }
+
+    /// Insert N tasks atomically. The whole batch is wrapped in a
+    /// single sqlite transaction; any per-item validation failure
+    /// rolls back the entire batch (no partial state). Errors are
+    /// annotated with the offending item index so the CLI can map
+    /// them back to the input file.
+    pub fn create_many_tasks(&self, input: CreateManyTasksInput) -> Result<Vec<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let mut created = Vec::with_capacity(input.items.len());
+        for (index, item) in input.items.into_iter().enumerate() {
+            let task = insert_task_in_tx(&tx, item).with_context(|| format!("item {index}"))?;
+            created.push(task);
+        }
+        tx.commit()?;
+        Ok(created)
+    }
+
+    /// Insert N chores atomically. See [`Self::create_many_tasks`] for
+    /// atomicity contract.
+    pub fn create_many_chores(&self, input: CreateManyChoresInput) -> Result<Vec<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let mut created = Vec::with_capacity(input.items.len());
+        for (index, item) in input.items.into_iter().enumerate() {
+            let chore = insert_chore_in_tx(&tx, item).with_context(|| format!("item {index}"))?;
+            created.push(chore);
+        }
+        tx.commit()?;
+        Ok(created)
     }
 
     pub fn create_execution(&self, input: CreateExecutionInput) -> Result<WorkExecution> {
@@ -173,10 +173,7 @@ impl WorkDb {
     /// (`ready` / `running` / `waiting_*`) we update its priority and
     /// preferred_workspace_id rather than creating a duplicate. If it is
     /// terminal (or absent), we insert a fresh `ready` execution.
-    pub fn request_execution(
-        &self,
-        input: RequestExecutionInput,
-    ) -> Result<WorkExecution> {
+    pub fn request_execution(&self, input: RequestExecutionInput) -> Result<WorkExecution> {
         // No live-worker oracle → assume every non-terminal execution
         // is genuinely live (the historical behaviour, kept for tests
         // that don't stand up the live registry).
@@ -1250,9 +1247,7 @@ impl WorkDb {
             );
         }
         if deps::would_create_cycle(&tx, dependent_id, prerequisite_id)? {
-            bail!(
-                "creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}"
-            );
+            bail!("creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}");
         }
         let now = now_string();
         let (edge, _outcome): (WorkItemDependency, EdgeInsertOutcome) =
@@ -1624,12 +1619,7 @@ impl WorkDb {
         )?;
 
         if status_changed && previous_status != task.status {
-            cascade_dependents_after_prereq_status_change(
-                &tx,
-                id,
-                &task.status,
-                &task.updated_at,
-            )?;
+            cascade_dependents_after_prereq_status_change(&tx, id, &task.status, &task.updated_at)?;
         }
 
         let updated = query_task(&tx, id)?.with_context(|| format!("unknown task: {id}"))?;
@@ -1691,9 +1681,7 @@ impl WorkDb {
         // keep the existing status.
         let new_status = match target {
             _ if task.status == "done" || task.status == "archived" => task.status.clone(),
-            WorkerPrCompletionTarget::InReview if task.status == "in_review" => {
-                task.status.clone()
-            }
+            WorkerPrCompletionTarget::InReview if task.status == "in_review" => task.status.clone(),
             WorkerPrCompletionTarget::InReview => "in_review".to_owned(),
             WorkerPrCompletionTarget::Done => "done".to_owned(),
         };
@@ -1708,12 +1696,7 @@ impl WorkDb {
         )?;
 
         if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(
-                &tx,
-                &task.id,
-                &new_status,
-                &now,
-            )?;
+            cascade_dependents_after_prereq_status_change(&tx, &task.id, &new_status, &now)?;
         }
 
         tx.execute(
@@ -1793,11 +1776,7 @@ impl WorkDb {
     /// the same value). Returns the updated task if a transition
     /// happened; `Ok(None)` if the chore was already past `in_review`
     /// (idempotent for late-arriving merge events).
-    pub fn mark_chore_pr_merged(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    pub fn mark_chore_pr_merged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let Some(task) = query_task(&tx, work_item_id)? else {
@@ -2014,6 +1993,42 @@ fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
         created_at: row.get(6)?,
         resolved_at: row.get(7)?,
     })
+}
+
+fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> {
+    ensure_product_exists(conn, &input.product_id)?;
+    ensure_project_belongs_to_product(conn, &input.project_id, &input.product_id)?;
+
+    let id = next_id("task");
+    let now = now_string();
+    let ordinal = next_task_ordinal(conn, &input.project_id)?;
+    let description = input.description.unwrap_or_default();
+    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value],
+    )?;
+
+    query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
+}
+
+fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
+    ensure_product_exists(conn, &input.product_id)?;
+
+    let id = next_id("task");
+    let now = now_string();
+    let description = input.description.unwrap_or_default();
+    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
+         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6)",
+        params![id, input.product_id, input.name, description, now, autostart_value],
+    )?;
+
+    query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
 }
 
 fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<WorkExecution> {
@@ -2255,13 +2270,14 @@ fn migrate_timestamps_to_epoch(conn: &Connection) -> Result<()> {
         );
         let mut stmt = conn.prepare(&select_sql)?;
         let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (rowid, value) in rows {
             if let Some(epoch) = parse_iso8601_to_epoch(&value) {
-                let update_sql =
-                    format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
+                let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
                 conn.execute(&update_sql, params![epoch.to_string(), rowid])?;
             }
         }
@@ -3076,6 +3092,144 @@ mod tests {
         db.delete_work_item(&chore.id).unwrap();
         let tree = db.get_work_tree(&product.id).unwrap();
         assert!(tree.chores.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_many_tasks_inserts_all_in_one_transaction() {
+        let path = temp_db_path("create-many-tasks");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Plan".to_owned(),
+                description: None,
+                goal: None,
+            })
+            .unwrap();
+
+        let inputs = (0..5)
+            .map(|i| CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: format!("Task {i}"),
+                description: Some(format!("d{i}")),
+                autostart: i % 2 == 0,
+            })
+            .collect::<Vec<_>>();
+        let created = db
+            .create_many_tasks(CreateManyTasksInput { items: inputs })
+            .unwrap();
+
+        assert_eq!(created.len(), 5);
+        // ordinals must be contiguous 1..=5 — the in-tx
+        // next_task_ordinal call has to see prior inserts.
+        let mut ords: Vec<i64> = created.iter().map(|t| t.ordinal.unwrap()).collect();
+        ords.sort();
+        assert_eq!(ords, vec![1, 2, 3, 4, 5]);
+        for (i, task) in created.iter().enumerate() {
+            assert_eq!(task.name, format!("Task {i}"));
+            assert_eq!(task.autostart, i % 2 == 0);
+        }
+
+        let tasks = db.list_tasks(&product.id, Some(&project.id)).unwrap();
+        assert_eq!(tasks.len(), 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_many_tasks_rolls_back_on_invalid_item() {
+        let path = temp_db_path("create-many-tasks-rollback");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Plan".to_owned(),
+                description: None,
+                goal: None,
+            })
+            .unwrap();
+
+        // Item 1 references a non-existent project. The whole batch
+        // must roll back — no rows visible after the failure.
+        let inputs = vec![
+            CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Good".to_owned(),
+                description: None,
+                autostart: true,
+            },
+            CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: "proj_does_not_exist".to_owned(),
+                name: "Bad".to_owned(),
+                description: None,
+                autostart: true,
+            },
+        ];
+        let err = db
+            .create_many_tasks(CreateManyTasksInput { items: inputs })
+            .expect_err("expected rollback");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("item 1"),
+            "error must name failing index: {msg}"
+        );
+
+        let tasks = db.list_tasks(&product.id, Some(&project.id)).unwrap();
+        assert!(tasks.is_empty(), "rollback must leave no rows");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_many_chores_inserts_all_atomically() {
+        let path = temp_db_path("create-many-chores");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+
+        let inputs = (0..3)
+            .map(|i| CreateChoreInput {
+                product_id: product.id.clone(),
+                name: format!("Chore {i}"),
+                description: None,
+                autostart: false,
+            })
+            .collect::<Vec<_>>();
+        let created = db
+            .create_many_chores(CreateManyChoresInput { items: inputs })
+            .unwrap();
+        assert_eq!(created.len(), 3);
+        for chore in &created {
+            assert_eq!(chore.kind, "chore");
+            assert!(!chore.autostart);
+        }
 
         let _ = std::fs::remove_file(path);
     }
@@ -3984,7 +4138,11 @@ mod tests {
         assert_eq!(redispatched, vec![chore.id.clone()]);
 
         let executions = db.list_executions(Some(&chore.id)).unwrap();
-        assert_eq!(executions.len(), 2, "expected the failed exec plus a fresh ready one");
+        assert_eq!(
+            executions.len(),
+            2,
+            "expected the failed exec plus a fresh ready one"
+        );
         let latest = executions.last().unwrap();
         assert_eq!(latest.status, "ready");
     }
@@ -4273,7 +4431,10 @@ mod tests {
                 autostart: false,
             })
             .unwrap();
-        assert!(!chore.autostart, "create_chore must persist autostart=false");
+        assert!(
+            !chore.autostart,
+            "create_chore must persist autostart=false"
+        );
 
         // First reconcile right after create — must not create a
         // ready execution for the parked chore.
@@ -4933,7 +5094,9 @@ mod tests {
         .unwrap();
 
         let a_after = db.get_work_item(&a.id).unwrap();
-        let WorkItem::Chore(t) = a_after else { panic!() };
+        let WorkItem::Chore(t) = a_after else {
+            panic!()
+        };
         assert_eq!(t.status, "todo");
         assert_eq!(t.last_status_actor, "engine");
         let _ = std::fs::remove_file(path);
@@ -5007,7 +5170,9 @@ mod tests {
         .unwrap();
 
         let a_after = db.get_work_item(&a.id).unwrap();
-        let WorkItem::Chore(t) = a_after else { panic!() };
+        let WorkItem::Chore(t) = a_after else {
+            panic!()
+        };
         assert_eq!(t.status, "blocked");
         assert_eq!(t.last_status_actor, "human");
         let _ = std::fs::remove_file(path);

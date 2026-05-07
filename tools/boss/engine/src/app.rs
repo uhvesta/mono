@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
-use std::sync::{Arc, Weak};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,13 +15,12 @@ use crate::completion::{
     CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
-use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
-use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
-use crate::worker_registry::WorkerRegistry;
 use crate::coordinator::{
     CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
+use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
+use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::protocol::{
     AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse,
     FocusWorkerPaneInput, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
@@ -29,10 +28,11 @@ use crate::protocol::{
     TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic,
     work_product_topic,
 };
-use tokio::time::{Duration, timeout};
 use crate::runner::AcpExecutionRunner;
-use crate::work::{WorkDb, WorkItem};
+use crate::work::{Task, WorkDb, WorkItem};
+use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
+use tokio::time::{Duration, timeout};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
@@ -584,12 +584,12 @@ impl ServerState {
             };
             let request_id = handle.allocate_request_id();
             handle.pending.insert(request_id.clone(), tx);
-            handle.sink.enqueue(FrontendEventEnvelope::push(
-                FrontendEvent::EngineRequest {
+            handle
+                .sink
+                .enqueue(FrontendEventEnvelope::push(FrontendEvent::EngineRequest {
                     request_id: request_id.clone(),
                     request: request.clone(),
-                },
-            ));
+                }));
             request_id
         };
 
@@ -963,13 +963,7 @@ struct BrokerExecutionPublisher {
 
 #[async_trait]
 impl ExecutionPublisher for BrokerExecutionPublisher {
-    async fn publish(
-        &self,
-        execution_id: &str,
-        work_item_id: &str,
-        status: &str,
-        reason: &str,
-    ) {
+    async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str) {
         let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
         let topic = execution_topic(execution_id);
         let event = FrontendEvent::TopicEvent {
@@ -992,12 +986,7 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
             .await;
     }
 
-    async fn publish_work_item_changed(
-        &self,
-        product_id: &str,
-        work_item_id: &str,
-        reason: &str,
-    ) {
+    async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
         let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
         let topic = work_product_topic(product_id);
         let event = FrontendEvent::TopicEvent {
@@ -1299,9 +1288,7 @@ impl TopicBroker {
         let mut slow = Vec::new();
         for (session_id, sink) in sinks {
             match sink.enqueue(envelope.clone()) {
-                EnqueueOutcome::Enqueued
-                | EnqueueOutcome::Coalesced
-                | EnqueueOutcome::Closed => {}
+                EnqueueOutcome::Enqueued | EnqueueOutcome::Coalesced | EnqueueOutcome::Closed => {}
                 EnqueueOutcome::Slow => slow.push((session_id, sink)),
             }
         }
@@ -1415,7 +1402,9 @@ pub async fn serve(
     if socket_path.exists() {
         tokio::fs::remove_file(&socket_path)
             .await
-            .with_context(|| format!("failed to remove existing socket {}", socket_path.display()))?;
+            .with_context(|| {
+                format!("failed to remove existing socket {}", socket_path.display())
+            })?;
     }
 
     let listener = UnixListener::bind(&socket_path)
@@ -1428,7 +1417,10 @@ pub async fn serve(
             std::fs::write(&path, format!("{pid}\n"))
                 .with_context(|| format!("failed to write pid file {path_str}"))?;
             tracing::info!(pid, pid_file = %path_str, "engine pid file is ready");
-            Some(PidFileGuard { path: path_str, pid })
+            Some(PidFileGuard {
+                path: path_str,
+                pid,
+            })
         }
         None => None,
     };
@@ -1528,8 +1520,7 @@ pub async fn serve(
         let peer_pid_value = peer_pid(&stream).ok();
         let server_state = server_state.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_frontend_connection(stream, server_state, peer_pid_value).await
+            if let Err(err) = handle_frontend_connection(stream, server_state, peer_pid_value).await
             {
                 tracing::error!(?err, "frontend connection failed");
             }
@@ -1812,11 +1803,7 @@ async fn handle_frontend_connection(
                     .topic_broker
                     .unsubscribe(&session_id, &topics)
                     .await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::Unsubscribed { topics },
-                );
+                send_response(&sink, &request_id, FrontendEvent::Unsubscribed { topics });
             }
             FrontendRequest::CreateProduct { input } => match work_db.create_product(input) {
                 Ok(product) => {
@@ -2051,6 +2038,30 @@ async fn handle_frontend_connection(
                     );
                 }
             },
+            FrontendRequest::CreateManyTasks { input } => {
+                handle_create_many(
+                    work_db.create_many_tasks(input),
+                    "tasks_created",
+                    WorkItem::Task,
+                    &server_state,
+                    &session_id,
+                    &request_id,
+                    &sink,
+                )
+                .await;
+            }
+            FrontendRequest::CreateManyChores { input } => {
+                handle_create_many(
+                    work_db.create_many_chores(input),
+                    "chores_created",
+                    WorkItem::Chore,
+                    &server_state,
+                    &session_id,
+                    &request_id,
+                    &sink,
+                )
+                .await;
+            }
             FrontendRequest::UpdateWorkItem { id, patch } => {
                 match work_db.update_work_item(&id, patch) {
                     Ok(item) => {
@@ -2067,9 +2078,7 @@ async fn handle_frontend_connection(
                         // Idempotent — duplicate or no-op cases
                         // (already released, never spawned, not a
                         // task/chore) collapse inside force_release.
-                        if let Some(execution_id) =
-                            terminal_chore_execution(&work_db, &item)
-                        {
+                        if let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
                             let handler = server_state.completion_handler.clone();
                             tokio::spawn(async move {
                                 handler.force_release(&execution_id).await;
@@ -2269,8 +2278,7 @@ async fn handle_frontend_connection(
                             // force-dispatch — there's no second
                             // worker to spawn.
                             if execution.status == "ready" {
-                                let coordinator =
-                                    server_state.execution_coordinator.clone();
+                                let coordinator = server_state.execution_coordinator.clone();
                                 let execution_id = execution.id.clone();
                                 match coordinator.force_dispatch(&execution_id).await {
                                     Ok(_worker_id) => {}
@@ -2510,11 +2518,7 @@ async fn handle_frontend_connection(
             FrontendRequest::RemoveAgent { agent_id } => {
                 match registry.remove_agent(&agent_id).await {
                     Ok(()) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AgentRemoved { agent_id },
-                        );
+                        send_response(&sink, &request_id, FrontendEvent::AgentRemoved { agent_id });
                     }
                     Err(err) => {
                         tracing::error!(?err, agent_id = %agent_id, "failed to remove agent");
@@ -2743,8 +2747,7 @@ async fn handle_frontend_connection(
                 let trust_ok = match (server_state.app_pid, peer_pid) {
                     (None, _) => true, // tests / no-trust-root mode
                     (Some(expected), Some(observed)) => {
-                        observed == expected
-                            || is_descendant_of_any(engine_pid, &[observed])
+                        observed == expected || is_descendant_of_any(engine_pid, &[observed])
                     }
                     (Some(_), None) => false,
                 };
@@ -2812,10 +2815,7 @@ async fn handle_frontend_connection(
                     .deliver_app_response(&session_id, &response_request_id, response)
                     .await;
             }
-            FrontendRequest::ProbeRun {
-                run_id,
-                text,
-            } => {
+            FrontendRequest::ProbeRun { run_id, text } => {
                 // `bossctl probe` is a coordinator-essential verb (the
                 // coordinator contract names probing as the right tool
                 // for low-confidence handoffs). The earlier BossOnly
@@ -2843,11 +2843,7 @@ async fn handle_frontend_connection(
                 }
                 server_state.queue_probe(run_id.clone(), text);
                 tracing::info!(run_id = %run_id, "probe queued");
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::ProbeQueued { run_id },
-                );
+                send_response(&sink, &request_id, FrontendEvent::ProbeQueued { run_id });
             }
             FrontendRequest::StopRun { run_id } => {
                 // `bossctl agents stop` is the coordinator superset's
@@ -2884,11 +2880,7 @@ async fn handle_frontend_connection(
                 tokio::spawn(async move {
                     handler.force_release(&run_id_for_release).await;
                 });
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::RunStopped { run_id },
-                );
+                send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
             }
             FrontendRequest::FocusWorkerPane { run_id } => {
                 // `bossctl agents focus` is a coordinator verb that
@@ -2909,8 +2901,7 @@ async fn handle_frontend_connection(
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: None,
-                            message: "focus_worker_pane requires app or Boss authority"
-                                .to_owned(),
+                            message: "focus_worker_pane requires app or Boss authority".to_owned(),
                         },
                     );
                     continue;
@@ -3059,8 +3050,7 @@ async fn handle_frontend_connection(
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: None,
-                            message: "cancel_execution requires app or Boss authority"
-                                .to_owned(),
+                            message: "cancel_execution requires app or Boss authority".to_owned(),
                         },
                     );
                     continue;
@@ -3203,8 +3193,7 @@ async fn handle_frontend_connection(
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: None,
-                            message: "workspace_pool_summary failed user-tier check"
-                                .to_owned(),
+                            message: "workspace_pool_summary failed user-tier check".to_owned(),
                         },
                     );
                     continue;
@@ -3215,9 +3204,7 @@ async fn handle_frontend_connection(
                         // execution row (if any) currently records this
                         // workspace's lease. Drift (cube reports a lease the
                         // engine has no execution for) shows as `None`.
-                        let lease_to_execution = match server_state
-                            .work_db
-                            .lease_to_execution_map()
+                        let lease_to_execution = match server_state.work_db.lease_to_execution_map()
                         {
                             Ok(map) => map,
                             Err(err) => {
@@ -3228,28 +3215,25 @@ async fn handle_frontend_connection(
                                 std::collections::HashMap::new()
                             }
                         };
-                        let workspaces = rows
-                            .into_iter()
-                            .map(|w| {
-                                let execution_id = w
-                                    .lease_id
-                                    .as_ref()
-                                    .and_then(|lease_id| {
+                        let workspaces =
+                            rows.into_iter()
+                                .map(|w| {
+                                    let execution_id = w.lease_id.as_ref().and_then(|lease_id| {
                                         lease_to_execution.get(lease_id).cloned()
                                     });
-                                crate::protocol::WorkspacePoolEntry {
-                                    workspace_id: w.workspace_id,
-                                    workspace_path: w.workspace_path.display().to_string(),
-                                    state: w.state,
-                                    lease_id: w.lease_id,
-                                    holder: w.holder,
-                                    task: w.task,
-                                    leased_at_epoch_s: w.leased_at_epoch_s,
-                                    lease_expires_at_epoch_s: w.lease_expires_at_epoch_s,
-                                    execution_id,
-                                }
-                            })
-                            .collect();
+                                    crate::protocol::WorkspacePoolEntry {
+                                        workspace_id: w.workspace_id,
+                                        workspace_path: w.workspace_path.display().to_string(),
+                                        state: w.state,
+                                        lease_id: w.lease_id,
+                                        holder: w.holder,
+                                        task: w.task,
+                                        leased_at_epoch_s: w.leased_at_epoch_s,
+                                        lease_expires_at_epoch_s: w.lease_expires_at_epoch_s,
+                                        execution_id,
+                                    }
+                                })
+                                .collect();
                         send_response(
                             &sink,
                             &request_id,
@@ -3275,9 +3259,7 @@ async fn handle_frontend_connection(
                         // follow-up phase), but we still publish a
                         // work-invalidation so subscribers re-render the
                         // dependency surfaces (kanban badge, show view).
-                        let product_id = match work_db
-                            .get_work_item(&edge.dependent_id)
-                        {
+                        let product_id = match work_db.get_work_item(&edge.dependent_id) {
                             Ok(item) => Some(work_item_product_id(&item)),
                             Err(_) => None,
                         };
@@ -3289,10 +3271,7 @@ async fn handle_frontend_connection(
                                 vec![work_product_topic(pid)],
                                 "dependency_added",
                                 Some(pid.to_owned()),
-                                vec![
-                                    edge.dependent_id.clone(),
-                                    edge.prerequisite_id.clone(),
-                                ],
+                                vec![edge.dependent_id.clone(), edge.prerequisite_id.clone()],
                             )
                             .await
                         } else {
@@ -3325,11 +3304,10 @@ async fn handle_frontend_connection(
                     .unwrap_or_else(|| "blocks".to_owned());
                 match work_db.remove_dependency(input) {
                     Ok(removed) => {
-                        let product_id =
-                            match work_db.get_work_item(&dependent_id) {
-                                Ok(item) => Some(work_item_product_id(&item)),
-                                Err(_) => None,
-                            };
+                        let product_id = match work_db.get_work_item(&dependent_id) {
+                            Ok(item) => Some(work_item_product_id(&item)),
+                            Err(_) => None,
+                        };
                         let revision = if let Some(pid) = product_id.as_deref() {
                             publish_work_invalidation(
                                 &server_state,
@@ -3338,10 +3316,7 @@ async fn handle_frontend_connection(
                                 vec![work_product_topic(pid)],
                                 "dependency_removed",
                                 Some(pid.to_owned()),
-                                vec![
-                                    dependent_id.clone(),
-                                    prerequisite_id.clone(),
-                                ],
+                                vec![dependent_id.clone(), prerequisite_id.clone()],
                             )
                             .await
                         } else {
@@ -3370,22 +3345,18 @@ async fn handle_frontend_connection(
                     }
                 }
             }
-            FrontendRequest::ListDependencies { input } => {
-                match work_db.list_dependencies(input) {
-                    Ok(view) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::DependencyList { view },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
+            FrontendRequest::ListDependencies { input } => match work_db.list_dependencies(input) {
+                Ok(view) => {
+                    send_response(&sink, &request_id, FrontendEvent::DependencyList { view })
                 }
-            }
+                Err(err) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                ),
+            },
         }
     }
 
@@ -3492,6 +3463,126 @@ async fn publish_work_invalidation(
     }
 
     revision
+}
+
+/// Bulk counterpart of [`publish_work_invalidation`]. Emits one
+/// `WorkInvalidated` topic event per distinct `product_id` carrying
+/// only that product's item ids, all at the same fresh revision —
+/// kanban consumers reload their product once. Returns the shared
+/// revision so the caller can stamp it on the unicast response.
+async fn publish_batch_work_invalidation(
+    server_state: &ServerState,
+    origin_session_id: &str,
+    origin_request_id: &str,
+    reason: &str,
+    items: &[WorkItem],
+) -> u64 {
+    let mut by_product: HashMap<String, Vec<String>> = HashMap::new();
+    for item in items {
+        by_product
+            .entry(work_item_product_id(item))
+            .or_default()
+            .push(work_item_id(item));
+    }
+
+    for product_id in by_product.keys() {
+        match server_state
+            .work_db
+            .reconcile_product_executions(product_id)
+        {
+            Ok(result) => {
+                if !result.created.is_empty() || !result.updated.is_empty() {
+                    tracing::info!(
+                        product_id,
+                        created = result.created.len(),
+                        updated = result.updated.len(),
+                        "reconciled product executions",
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    product_id,
+                    "failed to reconcile product executions after batch create",
+                );
+            }
+        }
+    }
+
+    if !by_product.is_empty() {
+        server_state.execution_coordinator.clone().kick();
+    }
+
+    let revision = server_state.bump_work_revision();
+    for (product_id, item_ids) in by_product {
+        let topic = work_product_topic(&product_id);
+        let event = FrontendEvent::TopicEvent {
+            topic: topic.clone(),
+            revision,
+            origin_session_id: origin_session_id.to_owned(),
+            origin_request_id: Some(origin_request_id.to_owned()),
+            event: TopicEventPayload::WorkInvalidated {
+                reason: reason.to_owned(),
+                product_id: Some(product_id),
+                item_ids,
+            },
+        };
+        server_state
+            .topic_broker
+            .publish(
+                &topic,
+                FrontendEventEnvelope::push_with_revision(revision, event),
+            )
+            .await;
+    }
+
+    revision
+}
+
+/// Common dispatch for the two batch-create requests. Wraps the
+/// engine-level result, builds the per-item `WorkItem` list, fans
+/// out a `WorkInvalidated` topic event per distinct product, and
+/// replies to the caller with a single `WorkItemsCreated` event
+/// (or a `WorkError` on failure — the engine work_db rolled the
+/// transaction back atomically).
+async fn handle_create_many(
+    db_result: anyhow::Result<Vec<Task>>,
+    reason: &str,
+    wrap: fn(Task) -> WorkItem,
+    server_state: &Arc<ServerState>,
+    session_id: &str,
+    request_id: &str,
+    sink: &SessionSink,
+) {
+    match db_result {
+        Ok(rows) => {
+            let items: Vec<WorkItem> = rows.into_iter().map(wrap).collect();
+            let revision = publish_batch_work_invalidation(
+                server_state,
+                session_id,
+                request_id,
+                reason,
+                &items,
+            )
+            .await;
+            send_response_with_revision(
+                sink,
+                request_id,
+                revision,
+                FrontendEvent::WorkItemsCreated { items },
+            );
+        }
+        Err(err) => {
+            send_response(
+                sink,
+                request_id,
+                FrontendEvent::WorkError {
+                    message: format!("{err:#}"),
+                },
+            );
+        }
+    }
 }
 
 fn work_item_id(item: &WorkItem) -> String {
@@ -3708,10 +3799,7 @@ mod tests {
         // the earlier "b" sitting at the (now-front) of the queue.
         let popped = q.pop_front().unwrap();
         assert_eq!(topic_of(&popped).as_deref(), Some("a"));
-        assert_eq!(
-            q.enqueue(topic_envelope("b", 3)),
-            EnqueueOutcome::Coalesced
-        );
+        assert_eq!(q.enqueue(topic_envelope("b", 3)), EnqueueOutcome::Coalesced);
         assert_eq!(q.items.len(), 1);
         assert_eq!(q.pop_front().unwrap().revision, Some(3));
     }
@@ -3742,10 +3830,7 @@ mod tests {
     fn enqueue_returns_closed_after_close() {
         let mut q = SessionQueue::new();
         q.closed = true;
-        assert_eq!(
-            q.enqueue(response_envelope("r-1")),
-            EnqueueOutcome::Closed
-        );
+        assert_eq!(q.enqueue(response_envelope("r-1")), EnqueueOutcome::Closed);
     }
 
     #[tokio::test]
@@ -3795,7 +3880,9 @@ mod tests {
 
         let broker = TopicBroker::default();
         broker.register_session("session-1", sink.clone()).await;
-        broker.subscribe("session-1", &["work.products".to_owned()]).await;
+        broker
+            .subscribe("session-1", &["work.products".to_owned()])
+            .await;
 
         // Publishing one more event should overflow and trigger shutdown.
         broker
@@ -3940,7 +4027,9 @@ mod tests {
         let _ = sink.next().await;
 
         // Simulate the app session disconnecting.
-        server_state.drop_app_session_if_matches("session-app").await;
+        server_state
+            .drop_app_session_if_matches("session-app")
+            .await;
 
         let response = send.await.expect("send task panicked").expect("ok");
         match response {
@@ -4120,9 +4209,7 @@ mod tests {
         // pinned at the worker's last activity (e.g. WaitingForInput)
         // even after the libghostty pane was torn down.
         let server_state = test_server_state();
-        server_state
-            .worker_registry
-            .register_run_slot("run-x", 1);
+        server_state.worker_registry.register_run_slot("run-x", 1);
         server_state
             .live_worker_states
             .register_spawn(1, "run-x", "claude-opus-4-7", 0, None);
@@ -4183,16 +4270,17 @@ mod tests {
             .await;
 
         let server_clone = server_state.clone();
-        let focus = tokio::spawn(async move {
-            server_clone.focus_worker_pane("run-focus").await
-        });
+        let focus = tokio::spawn(async move { server_clone.focus_worker_pane("run-focus").await });
 
         let envelope = sink
             .next()
             .await
             .expect("an EngineRequest event should be enqueued");
         let (request_id, request) = match envelope.payload {
-            FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+            FrontendEvent::EngineRequest {
+                request_id,
+                request,
+            } => (request_id, request),
             other => panic!("expected EngineRequest, got {other:?}"),
         };
         match request {
@@ -4229,9 +4317,7 @@ mod tests {
             .await;
 
         let server_clone = server_state.clone();
-        let focus = tokio::spawn(async move {
-            server_clone.focus_worker_pane("run-focus").await
-        });
+        let focus = tokio::spawn(async move { server_clone.focus_worker_pane("run-focus").await });
 
         let envelope = sink.next().await.expect("EngineRequest enqueued");
         let request_id = match envelope.payload {
@@ -4298,7 +4384,10 @@ mod tests {
             .await
             .expect("an EngineRequest event should be enqueued");
         let (request_id, request) = match envelope.payload {
-            FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+            FrontendEvent::EngineRequest {
+                request_id,
+                request,
+            } => (request_id, request),
             other => panic!("expected EngineRequest, got {other:?}"),
         };
         match request {
