@@ -200,6 +200,7 @@ dependencies = [
  "boss-client",
  "boss-protocol",
  "clap",
+ "fastrand 2.3.0",
  "libc",
  "reqwest",
  "rusqlite",

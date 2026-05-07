@@ -315,10 +315,10 @@ pub struct WorkerPool {
 #[derive(Debug)]
 struct WorkerPoolInner {
     workers: Vec<WorkerSlot>,
-    /// Monotonic counter; the smallest `last_used_seq` among idle workers
-    /// is the LRU pick. Workers that have never run a task carry
-    /// `last_used_seq = 0`, which sorts ahead of any used worker.
-    next_seq: u64,
+    /// Per-pool RNG used to pick a uniformly-random free worker when
+    /// no workspace-affinity match is available. Seeded once at pool
+    /// construction; advanced on each claim.
+    rng: fastrand::Rng,
 }
 
 #[derive(Debug, Clone)]
@@ -326,7 +326,6 @@ struct WorkerSlot {
     worker_id: String,
     execution_id: Option<String>,
     last_workspace_id: Option<String>,
-    last_used_seq: u64,
 }
 
 impl WorkerPool {
@@ -346,21 +345,21 @@ impl WorkerPool {
                 worker_id: format!("worker-{}", index + 1),
                 execution_id: None,
                 last_workspace_id: None,
-                last_used_seq: 0,
             })
             .collect();
         Self {
             inner: Arc::new(Mutex::new(WorkerPoolInner {
                 workers,
-                next_seq: 1,
+                rng: fastrand::Rng::new(),
             })),
         }
     }
 
     /// Claim an idle worker for `execution_id`. Selection is affinity-first:
     /// if `preferred_workspace_id` is set and an idle worker last ran in
-    /// that workspace, that worker is chosen. Otherwise the least-recently-
-    /// used idle worker wins (workers that have never run sort first).
+    /// that workspace, that worker is chosen. Otherwise a free slot is
+    /// picked uniformly at random — a cosmetic spread so we don't always
+    /// hammer slot 1.
     pub async fn claim_worker(
         &self,
         execution_id: &str,
@@ -379,14 +378,15 @@ impl WorkerPool {
             }
         }
 
-        let lru_idx = inner
+        let free: Vec<usize> = inner
             .workers
             .iter()
             .enumerate()
             .filter(|(_, w)| w.execution_id.is_none())
-            .min_by_key(|(idx, w)| (w.last_used_seq, *idx))
-            .map(|(idx, _)| idx)?;
-        let worker = &mut inner.workers[lru_idx];
+            .map(|(idx, _)| idx)
+            .collect();
+        let chosen_idx = *inner.rng.choice(&free)?;
+        let worker = &mut inner.workers[chosen_idx];
         worker.execution_id = Some(execution_id.to_owned());
         Some(worker.worker_id.clone())
     }
@@ -396,15 +396,12 @@ impl WorkerPool {
     /// preferred-workspace claims.
     pub async fn release_worker(&self, worker_id: &str, last_workspace_id: Option<&str>) {
         let mut inner = self.inner.lock().await;
-        let seq = inner.next_seq;
-        inner.next_seq = inner.next_seq.wrapping_add(1).max(1);
         if let Some(worker) = inner
             .workers
             .iter_mut()
             .find(|worker| worker.worker_id == worker_id)
         {
             worker.execution_id = None;
-            worker.last_used_seq = seq;
             if let Some(workspace_id) = last_workspace_id {
                 worker.last_workspace_id = Some(workspace_id.to_owned());
             }
@@ -1556,29 +1553,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pool_prefers_workspace_affinity_over_lru() {
+    async fn worker_pool_prefers_workspace_affinity_over_random() {
         let pool = WorkerPool::new(2);
 
-        // worker-1 picks up exec-a → records affinity to ws-a
-        let first = pool.claim_worker("exec-a", None).await.unwrap();
-        assert_eq!(first, "worker-1");
-        pool.release_worker(&first, Some("ws-a")).await;
+        // Take both slots at once so we can record distinct affinities
+        // without depending on which slot random selection lands on.
+        let w_a = pool.claim_worker("exec-a", None).await.unwrap();
+        let w_b = pool.claim_worker("exec-b", None).await.unwrap();
+        assert_ne!(w_a, w_b, "second claim must fill the other free slot");
+        pool.release_worker(&w_a, Some("ws-a")).await;
+        pool.release_worker(&w_b, Some("ws-b")).await;
 
-        // worker-2 picks up exec-b → records affinity to ws-b
-        let second = pool.claim_worker("exec-b", None).await.unwrap();
-        assert_eq!(second, "worker-2");
-        pool.release_worker(&second, Some("ws-b")).await;
-
-        // worker-1 was used first, so by LRU it would win. But preferring
-        // ws-b should pick worker-2 instead.
+        // Preferring ws-b must pick whichever worker recorded ws-b
+        // affinity, even though random selection from the free pool
+        // would otherwise be a coin flip.
         let claimed = pool.claim_worker("exec-c", Some("ws-b")).await.unwrap();
-        assert_eq!(claimed, "worker-2");
+        assert_eq!(claimed, w_b);
         pool.release_worker(&claimed, Some("ws-b")).await;
 
-        // Without preference, LRU picks the worker that was idle longest;
-        // worker-1 has been idle since the first release, so it wins.
-        let lru = pool.claim_worker("exec-d", None).await.unwrap();
-        assert_eq!(lru, "worker-1");
+        // Preferring an unknown workspace falls through to random
+        // selection from the free pool — either worker is a valid pick.
+        let fallback = pool.claim_worker("exec-d", Some("ws-unknown")).await.unwrap();
+        assert!(fallback == w_a || fallback == w_b);
+    }
+
+    #[tokio::test]
+    async fn worker_pool_random_fallback_spreads_across_free_slots() {
+        // With M free slots and N >> M claims, every slot should be
+        // hit at least once. This is the cosmetic guarantee the
+        // randomization is for: don't always start at slot 1.
+        let pool_size = 4;
+        let trials = 200;
+        let pool = WorkerPool::new(pool_size);
+        let mut hits = vec![0usize; pool_size];
+        for i in 0..trials {
+            let claimed = pool
+                .claim_worker(&format!("exec-{i}"), None)
+                .await
+                .unwrap();
+            let slot: usize = claimed
+                .strip_prefix("worker-")
+                .unwrap()
+                .parse()
+                .unwrap();
+            hits[slot - 1] += 1;
+            pool.release_worker(&claimed, None).await;
+        }
+        for (slot, count) in hits.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "slot worker-{} was never picked across {trials} claims",
+                slot + 1
+            );
+        }
     }
 
     #[tokio::test]

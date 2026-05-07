@@ -27,6 +27,7 @@ flate2 = "1.1.5"
 fs4 = "0.13"
 comfy-table = "7.2.2"
 console = "0.15.11"
+fastrand = "2.3.0"
 globset = "0.4.18"
 hashbrown = { version = "0.15.5", features = ["default-hasher", "serde"] }
 indicatif = "0.17.11"
