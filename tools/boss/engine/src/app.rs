@@ -2615,18 +2615,30 @@ async fn handle_frontend_connection(
                 );
             }
             FrontendRequest::StopRun { run_id } => {
-                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+                // `bossctl agents stop` is the coordinator superset's
+                // imperative kill switch, and the human invokes it
+                // from wherever they happen to be — including the
+                // boss pane, the macOS app shell, or *inside a worker
+                // pane* (e.g. tab over to slot 1, type `bossctl
+                // agents stop <id>`). The earlier BossOnly gate
+                // rejected the worker-pane case because callers
+                // descending from a registered worker shell pid are
+                // explicitly excluded from BossOnly. Downgrade to
+                // AppOrBoss to match `cancel_execution`: any caller
+                // descending from the app or the Boss session is
+                // accepted, which covers worker panes too.
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
                     tracing::warn!(
                         peer_pid = ?peer_pid,
                         run_id = %run_id,
-                        "stop_run rejected: caller not in Boss subtree",
+                        "stop_run rejected: caller not in app/Boss subtree",
                     );
                     send_response(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
                             agent_id: None,
-                            message: "stop_run is BossOnly".to_owned(),
+                            message: "stop_run requires app or Boss authority".to_owned(),
                         },
                     );
                     continue;
@@ -3678,6 +3690,31 @@ mod tests {
         assert!(
             server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
             "BossOnly must accept app-descendant callers when boss_pid is unregistered",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_or_boss_admits_worker_descendant() {
+        // Regression for `bossctl agents stop` rejecting calls made
+        // from inside a worker pane. The fix downgrades stop_run from
+        // BossOnly to AppOrBoss; AppOrBoss must accept callers that
+        // descend from a registered worker shell (workers are
+        // siblings under the app), even though BossOnly does not.
+        let self_pid = std::process::id() as libc::pid_t;
+        let server_state = server_state_with_app_pid(self_pid);
+        server_state
+            .worker_registry
+            .register(self_pid, "fake-run".to_owned());
+        assert!(
+            server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
+            "AppOrBoss must accept worker-pane descendants so `bossctl agents stop` works from a slot",
+        );
+        // Sanity check: BossOnly still rejects the same caller, so
+        // we know the AppOrBoss admission isn't an accidental hole.
+        assert!(
+            !server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
+            "BossOnly must continue to reject worker-pane descendants",
         );
     }
 
