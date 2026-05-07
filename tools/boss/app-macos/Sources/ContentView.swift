@@ -540,10 +540,6 @@ struct ContentView: View {
                     .lineLimit(1)
 
                 Spacer(minLength: 8)
-
-                #if canImport(GhosttyKit)
-                BossClaudeStatusPill(session: bossPane.session)
-                #endif
             } else {
                 Spacer(minLength: 0)
             }
