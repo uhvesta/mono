@@ -119,6 +119,19 @@ final class GhosttyTerminalHostView: NSView {
     @MainActor
     deinit {
         pendingGeometrySync?.cancel()
+        claudeMonitorTimer?.invalidate()
+        if let surface {
+            // Clear focus before freeing so libghostty's
+            // focused-surface bookkeeping doesn't dangle into a
+            // freed surface, then run the destructor. libghostty
+            // action callbacks fire synchronously on the main
+            // thread (see PR #209), so by the time we reach this
+            // MainActor deinit no callback can be mid-flight racing
+            // the free, and the userdata pointer (this view) stays
+            // valid until deinit returns.
+            ghostty_surface_set_focus(surface, false)
+            ghostty_surface_free(surface)
+        }
     }
 
     override var acceptsFirstResponder: Bool { true }
