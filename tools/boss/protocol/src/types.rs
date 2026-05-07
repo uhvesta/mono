@@ -205,6 +205,15 @@ pub struct RequestExecutionInput {
     pub work_item_id: String,
     pub priority: Option<i64>,
     pub preferred_workspace_id: Option<String>,
+    /// Skip the dispatcher's pool-cap deferral. With `force = false`
+    /// (the default), `RequestExecution` is the soft "queue this and
+    /// dispatch when a slot frees up" verb. With `force = true`
+    /// (`bossctl agents launch`), the engine grows the worker pool by
+    /// one slot — bounded by the hard cap `MAX_WORKER_POOL_SIZE` — so
+    /// the work item starts immediately even when every configured
+    /// slot is busy.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

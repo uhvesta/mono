@@ -2141,18 +2141,70 @@ async fn handle_frontend_connection(
                 // — the kanban drag fires RequestExecution, the engine
                 // says "still running," coordinator polls for `ready`
                 // and sees nothing, no new spawn ever happens.
+                //
+                // `force = true` is the `bossctl agents launch`
+                // entry point: same DB row creation, but we hand the
+                // ready execution straight to
+                // `ExecutionCoordinator::force_dispatch` instead of
+                // kicking the auto-dispatcher. force_dispatch grows
+                // the worker pool by one slot (bounded by the hard
+                // cap) when every configured slot is busy, so the
+                // launch verb skips the cap-deferral the normal
+                // request path would otherwise hit.
+                let force = input.force;
                 let live_states = server_state.live_worker_states.clone();
                 let result = work_db.request_execution_with_live_check(input, |run_id| {
                     live_states.is_run_live(run_id)
                 });
                 match result {
                     Ok(execution) => {
-                        server_state.execution_coordinator.kick();
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ExecutionRequested { execution },
-                        );
+                        if force {
+                            // If the request landed on an existing
+                            // non-terminal execution (idempotent path
+                            // when a live worker already runs the
+                            // item), just refresh the row and skip
+                            // force-dispatch — there's no second
+                            // worker to spawn.
+                            if execution.status == "ready" {
+                                let coordinator =
+                                    server_state.execution_coordinator.clone();
+                                let execution_id = execution.id.clone();
+                                match coordinator.force_dispatch(&execution_id).await {
+                                    Ok(_worker_id) => {}
+                                    Err(err) => {
+                                        send_response(
+                                            &sink,
+                                            &request_id,
+                                            FrontendEvent::WorkError {
+                                                message: err.to_string(),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Re-read the execution after force_dispatch
+                            // so the response carries the row's now-
+                            // running status (and worker / lease ids).
+                            let refreshed = match work_db.get_execution(&execution.id) {
+                                Ok(execution) => execution,
+                                Err(_) => execution,
+                            };
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::ExecutionRequested {
+                                    execution: refreshed,
+                                },
+                            );
+                        } else {
+                            server_state.execution_coordinator.kick();
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::ExecutionRequested { execution },
+                            );
+                        }
                     }
                     Err(err) => {
                         send_response(
