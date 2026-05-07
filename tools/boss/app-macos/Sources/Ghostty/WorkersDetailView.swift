@@ -165,16 +165,18 @@ private struct WorkerSlotView: View {
         return "\(base) · idle"
     }
 
-    /// Second line in the titlebar. Prefers the engine-supplied
-    /// human-readable summary; falls back to the run id when no
-    /// summary is available so we never lose traceability. Either
-    /// way we attach the run id as a hover tooltip — the summary is
-    /// purely visual and the full id is what every log/api/taxonomy
-    /// elsewhere uses.
+    /// Second line in the titlebar. The engine ships a lowercase
+    /// gerund phrase (e.g. `"fixing bossctl and agent stops"`) which
+    /// we render as a natural-language sentence under the worker's
+    /// display name (`"Riker is fixing bossctl and agent stops"`).
+    /// Falls back to the run id when no summary is available so we
+    /// never lose traceability. Either way we attach the run id as a
+    /// hover tooltip — the sentence is purely visual and the full id
+    /// is what every log/api/taxonomy elsewhere uses.
     @ViewBuilder
     private var slotSubtitle: some View {
         if let summary = slot.summary, !summary.isEmpty {
-            Text(summary)
+            Text("\(WorkerNames.name(forSlot: slot.slotId)) is \(summary)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)

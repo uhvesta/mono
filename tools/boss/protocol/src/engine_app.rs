@@ -27,13 +27,14 @@ pub struct SpawnWorkerPaneInput {
     /// `"claude\n"` so the shell types `claude` and runs the worker.
     pub initial_input: String,
     pub env: Vec<EnvVar>,
-    /// Short 2–4 word human-readable summary of what the worker is
-    /// doing (e.g. `"Fix fencer scraper"`). Rendered in the pane
-    /// titlebar in place of the run id. The full run id is still
-    /// surfaced as a tooltip for traceability. Optional so the app
-    /// can fall back to displaying the run id if the engine couldn't
-    /// produce a summary (e.g., API key missing or generation
-    /// failed).
+    /// Short lowercase present-continuous verb phrase describing
+    /// what the worker is doing (e.g. `"fixing the fencer scraper"`).
+    /// The app renders this under the worker's display name as a
+    /// natural-language sentence: `"Riker is fixing the fencer
+    /// scraper"`. The full run id is still surfaced as a tooltip for
+    /// traceability. Optional so the app can fall back to displaying
+    /// the run id if the engine couldn't produce a summary (e.g.,
+    /// API key missing or generation failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
@@ -140,7 +141,7 @@ mod tests {
                 key: "BOSS_LEASE_ID".into(),
                 value: "lease-uuid".into(),
             }],
-            summary: Some("Fix fencer scraper".into()),
+            summary: Some("fixing the fencer scraper".into()),
         });
         let json = serde_json::to_string(&original).unwrap();
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
