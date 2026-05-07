@@ -9,9 +9,11 @@ mod live_worker_state;
 mod types;
 mod wire;
 mod worker_event;
+mod worker_names;
 
 pub use engine_app::*;
 pub use live_worker_state::*;
 pub use types::*;
 pub use wire::*;
 pub use worker_event::*;
+pub use worker_names::*;
