@@ -928,28 +928,27 @@ private struct WorkBoardCardView: View {
                     .font(.body.weight(.medium))
                     .foregroundStyle(.primary)
                     .multilineTextAlignment(.leading)
-                Spacer(minLength: 8)
-                Image(systemName: task.isChore ? "wrench.and.screwdriver" : "circle.hexagongrid")
-                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
             }
 
-            HStack {
-                if let projectName, !projectName.isEmpty {
-                    WorkStatusBadge(text: projectName)
-                } else {
-                    WorkStatusBadge(text: "Chore")
+            if hasFooterContent {
+                HStack {
+                    if let projectName, !projectName.isEmpty {
+                        WorkStatusBadge(text: projectName)
+                    }
+                    if task.status == "blocked" {
+                        WorkStatusBadge(text: "Blocked")
+                    }
+                    Spacer()
                 }
-                if task.status == "blocked" {
-                    WorkStatusBadge(text: "Blocked")
-                }
-                Spacer()
             }
 
             if let prURL = task.prURL, !prURL.isEmpty {
                 PRURLLink(urlString: prURL, font: .caption)
             }
         }
-        .padding(12)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -958,6 +957,13 @@ private struct WorkBoardCardView: View {
                 .stroke(borderColor, lineWidth: isSelected ? 2 : 1)
         )
         .draggable(task.id)
+    }
+
+    private var hasFooterContent: Bool {
+        if let projectName, !projectName.isEmpty {
+            return true
+        }
+        return task.status == "blocked"
     }
 
     private var cardBackground: Color {
