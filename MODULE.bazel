@@ -42,7 +42,7 @@ npm.npm_translate_lock(
 use_repo(
     npm,
     "npm",
-    "npm__at_zed-industries_claude-code-acp__0.16.1_zod_4.3.6",
+    "npm__at_zed-industries_claude-code-acp__0.16.2_zod_4.3.6",
 )
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")

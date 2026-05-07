@@ -7,6 +7,6 @@
     "acp": "claude-code-acp"
   },
   "dependencies": {
-    "@zed-industries/claude-code-acp": "0.16.1"
+    "@zed-industries/claude-code-acp": "0.16.2"
   }
 }

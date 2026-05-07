@@ -1,6 +1,6 @@
 load("@npm//:defs.bzl", "npm_link_all_packages")
 load(
-    "@npm__at_zed-industries_claude-code-acp__0.16.1_zod_4.3.6//tools/boss/js/claude-code-acp:package_json.bzl",
+    "@npm__at_zed-industries_claude-code-acp__0.16.2_zod_4.3.6//tools/boss/js/claude-code-acp:package_json.bzl",
     claude_code_acp_bin = "bin",
 )
 
