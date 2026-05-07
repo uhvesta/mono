@@ -307,6 +307,13 @@ impl WorkDb {
     /// when the execution is unknown or already in a terminal status
     /// — callers shouldn't try to cancel a row that's already done.
     ///
+    /// If the backing work item is currently `active` (the kanban
+    /// Doing column), it's reset to `todo` so the card returns to the
+    /// To-Do lane. `in_review`, `done`, and `archived` are preserved:
+    /// `in_review` means a PR exists and cancel doesn't retract that
+    /// PR, and `done`/`archived` are explicit human transitions that
+    /// the auto-dispatch path is forbidden from downgrading.
+    ///
     /// Workspace lease columns are intentionally left intact so the
     /// caller can hand the execution id to
     /// `WorkerCompletionHandler::force_release`, which transfers
@@ -331,6 +338,18 @@ impl WorkDb {
                  finished_at = ?2
              WHERE id = ?1",
             params![execution_id, now.as_str()],
+        )?;
+        // Move the kanban card back to To-Do for tasks/chores that
+        // were `active` (Doing). Scoped to `active` only so we don't
+        // clobber a `done`/`archived`/`in_review` transition.
+        tx.execute(
+            "UPDATE tasks
+             SET status = 'todo',
+                 updated_at = ?2
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status = 'active'",
+            params![existing.work_item_id, now.as_str()],
         )?;
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("unknown execution after cancel: {execution_id}"))?;
@@ -3150,6 +3169,144 @@ mod tests {
         let unknown = db.set_run_agent_id("run-does-not-exist", "worker-1");
         assert!(unknown.is_err());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
+        let path = temp_db_path("cancel-active");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        // Drive the chore into the Doing column by starting the run —
+        // this is the state cancel is supposed to undo.
+        db.start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+        match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+            other => panic!("expected chore/task, got {other:?}"),
+        }
+
+        let cancelled = db.cancel_execution(&execution.id).unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.finished_at.is_some());
+
+        // Active → todo so the kanban card returns to the To-Do lane.
+        match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "todo"),
+            other => panic!("expected chore/task, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancel_execution_preserves_in_review_and_done_status() {
+        let path = temp_db_path("cancel-preserve");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Has PR".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("running".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        // The worker opened a PR before the human asked to cancel.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        db.cancel_execution(&execution.id).unwrap();
+
+        // `in_review` survives — the PR still exists; cancel only
+        // tears down the worker session, not the PR.
+        match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "in_review"),
+            other => panic!("expected chore/task, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancel_execution_errors_on_unknown_id() {
+        let path = temp_db_path("cancel-unknown");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let err = db
+            .cancel_execution("exec_does_not_exist")
+            .expect_err("cancelling an unknown execution must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown execution"),
+            "expected unknown-execution message, got: {msg}",
+        );
         let _ = std::fs::remove_file(path);
     }
 

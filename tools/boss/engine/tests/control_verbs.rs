@@ -31,7 +31,7 @@ use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::WorkDb;
 use boss_protocol::{
     CreateChoreInput, CreateProductInput, CreateRunInput, FrontendEvent, FrontendRequest,
-    RequestExecutionInput,
+    RequestExecutionInput, WorkItem, WorkItemPatch,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,10 +84,19 @@ impl Drop for TestEngine {
     }
 }
 
-/// Create a product + chore + ready execution and return the
-/// execution id. Workers don't run in these tests; we just want a row
-/// in `work_executions` we can then cancel / inspect.
-async fn seed_execution(client: &mut BossClient) -> Result<String> {
+/// Returned by `seed_execution` so the test can verify both
+/// execution-row state (status flip) and work-item state (kanban
+/// column) in the same round-trip.
+struct SeededExecution {
+    work_item_id: String,
+    execution_id: String,
+}
+
+/// Create a product + chore + ready execution and return both the
+/// chore id and the execution id. Workers don't run in these tests;
+/// we just want a row in `work_executions` we can then cancel /
+/// inspect, plus the backing work item for kanban-status assertions.
+async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
     let product = match client
         .send_request(&FrontendRequest::CreateProduct {
             input: CreateProductInput {
@@ -143,14 +152,51 @@ async fn seed_execution(client: &mut BossClient) -> Result<String> {
             ))
         }
     };
-    Ok(execution.id)
+    Ok(SeededExecution {
+        work_item_id: chore.id,
+        execution_id: execution.id,
+    })
+}
+
+async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Result<String> {
+    let response = client
+        .send_request(&FrontendRequest::GetWorkItem {
+            id: work_item_id.to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkItemResult {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemResult {
+            item: WorkItem::Task(t),
+        } => Ok(t.status),
+        other => Err(anyhow!("unexpected GetWorkItem response: {other:?}")),
+    }
 }
 
 #[tokio::test]
 async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let execution_id = seed_execution(&mut client).await?;
+    let SeededExecution {
+        work_item_id,
+        execution_id,
+    } = seed_execution(&mut client).await?;
+
+    // Drive the chore into the Doing column the same way real workers
+    // do — manual `active` status flip — so we can verify cancel
+    // resets the kanban state. The seed leaves it `todo`.
+    client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: work_item_id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, "active");
 
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
@@ -164,6 +210,10 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     assert_eq!(cancelled.id, execution_id);
     assert_eq!(cancelled.status, "cancelled");
     assert!(cancelled.finished_at.is_some(), "cancel must stamp finished_at");
+
+    // Active → todo: the kanban card returns to To-Do because the
+    // execution backing it is gone.
+    assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, "todo");
 
     // Cancelling a row that's already terminal should error rather than
     // silently no-op — this is what guards the engine against double
@@ -184,10 +234,32 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
 }
 
 #[tokio::test]
+async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let response = client
+        .send_request(&FrontendRequest::CancelExecution {
+            execution_id: "exec_does_not_exist".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("unknown execution"),
+                "expected unknown-execution message, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn agents_transcript_returns_tail_lines() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let execution_id = seed_execution(&mut client).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
     // The Run record is the carrier for `transcript_path`; create one
     // directly via WorkDb (no real worker available in this test) and
@@ -261,7 +333,7 @@ async fn agents_transcript_returns_tail_lines() -> Result<()> {
 async fn agents_transcript_errors_when_run_has_no_transcript_path() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let execution_id = seed_execution(&mut client).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
 
     let work_db = WorkDb::open(engine.db_path.clone())?;
     let run = work_db.create_run(CreateRunInput {

@@ -523,11 +523,15 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
     `ListWorkerLiveStates` (`main.rs:229, 270`).
   - `agents stop` → `StopRun` (`main.rs:302`).
   - `work start` → `RequestExecution` (`main.rs:337`).
+  - `work cancel` → `CancelExecution`. Marks the execution row
+    `cancelled`, fires `force_release` (workspace lease + pane
+    teardown), and resets the backing chore/task from `active`
+    back to `todo` so the kanban card returns to the To-Do lane.
+    `in_review`/`done`/`archived` are preserved.
   - The remaining verbs (`agents focus/send/interrupt/launch/
-    transcript`, `work cancel`, `workspace summary`) print a
-    structured `not_implemented` response so the Boss session can
-    discover gaps interactively
-    (`main.rs:445-458`). See **Pending**.
+    transcript`, `workspace summary`) print a structured
+    `not_implemented` response so the Boss session can discover
+    gaps interactively (`main.rs:445-458`). See **Pending**.
 - **Two-trust-root socket auth.**
   `engine/src/app.rs:316-321` defines
   `RpcTier::{User, AppOrBoss, BossOnly}`. `authorize_rpc`
@@ -583,8 +587,6 @@ R1, R2, R4; [`work-execution`](../../designs/work-execution.md).
   "skip the queue" verb.
 - `bossctl agents transcript` — tail a worker transcript from
   the Boss pane.
-- `bossctl work cancel` — needs a `CancelExecution` RPC (today
-  there is `StopRun` per-run but no execution-level cancel).
 - `bossctl workspace summary` — needs an engine surface that
   reports cube workspace pool state.
 - `ProbeReplied` event on the follow-up `Stop` — queue+inject
