@@ -1296,7 +1296,7 @@ final class ChatViewModel: ObservableObject {
                 startOfWeek: startOfWeek,
                 startOfLastWeek: startOfLastWeek,
                 calendar: calendar,
-                formatters: [isoFractional, isoPlain]
+                isoFormatters: [isoFractional, isoPlain]
             )
             buckets[bucketID, default: []].append(task)
         }
@@ -1321,9 +1321,9 @@ final class ChatViewModel: ObservableObject {
         startOfWeek: Date,
         startOfLastWeek: Date,
         calendar: Calendar,
-        formatters: [ISO8601DateFormatter]
+        isoFormatters: [ISO8601DateFormatter]
     ) -> String {
-        guard let parsed = parseISODate(task.updatedAt, formatters: formatters) else {
+        guard let parsed = parseUpdatedAt(task.updatedAt, isoFormatters: isoFormatters) else {
             return "earlier"
         }
         let day = calendar.startOfDay(for: parsed)
@@ -1343,12 +1343,23 @@ final class ChatViewModel: ObservableObject {
         return "earlier"
     }
 
-    private static func parseISODate(
+    /// `boss chore list --json` currently emits `updated_at` in two
+    /// shapes — Unix epoch seconds as a digit string for older rows
+    /// and ISO 8601 for newer ones. The UI must handle both until the
+    /// data-shape canonicalization chore lands; treat all-digit
+    /// strings as Unix seconds, otherwise fall back to ISO parsing.
+    static func parseUpdatedAt(
         _ string: String,
-        formatters: [ISO8601DateFormatter]
+        isoFormatters: [ISO8601DateFormatter]
     ) -> Date? {
-        for formatter in formatters {
-            if let date = formatter.date(from: string) {
+        let trimmed = string.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty,
+           trimmed.allSatisfy({ $0.isASCII && $0.isNumber }),
+           let seconds = TimeInterval(trimmed) {
+            return Date(timeIntervalSince1970: seconds)
+        }
+        for formatter in isoFormatters {
+            if let date = formatter.date(from: trimmed) {
                 return date
             }
         }
