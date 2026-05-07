@@ -81,6 +81,19 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         request: EngineToAppRequest,
         timeout: Duration,
     ) -> Result<EngineToAppResponse, SendToAppError> {
+        // Serialize SpawnWorkerPane round-trips. Concurrent bursts of
+        // surface_new on the macOS side crashed the app
+        // (slot 4 spawned, then 3 follow-ups timed out into a dead
+        // process). The app reasonably allocates panes one at a time,
+        // and there's no benefit to dispatching parallel spawns —
+        // gating the engine side keeps libghostty from being asked to
+        // stand up multiple surfaces inside a single runloop tick.
+        // ReleaseWorkerPane / SendToPane don't share this hazard, so
+        // they go through unsynchronized.
+        if matches!(request, EngineToAppRequest::SpawnWorkerPane(_)) {
+            let _guard = self.spawn_pane_lock.lock().await;
+            return self.send_to_app(request, timeout).await;
+        }
         self.send_to_app(request, timeout).await
     }
 
@@ -299,6 +312,10 @@ struct ServerState {
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
+    /// Serializes outbound `SpawnWorkerPane` round-trips so the app
+    /// only ever sees one pane allocation in flight at a time. See the
+    /// `WorkerSpawner` impl for the why.
+    spawn_pane_lock: Arc<Mutex<()>>,
     /// Weak self-reference produced by `Arc::new_cyclic`. Kept so
     /// late-bound consumers (the pane-spawn runner) can resolve back
     /// to the live `Arc<ServerState>` without an outer allocation.
@@ -425,6 +442,7 @@ impl ServerState {
                 boss_pid: StdMutex::new(None),
                 pending_probes: StdMutex::new(HashMap::new()),
                 app_session: Arc::new(Mutex::new(None)),
+                spawn_pane_lock: Arc::new(Mutex::new(())),
                 _self_weak: weak_self.clone(),
             }
         });
@@ -3098,6 +3116,99 @@ mod tests {
             } => {}
             other => panic!("expected AppDisconnected, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_pane_requests_are_serialized() {
+        // Two concurrent SpawnWorkerPane calls go through
+        // `WorkerSpawner::send_to_app_request`. The mutex inside that
+        // path should ensure only one is enqueued on the sink before
+        // the first response is delivered. The second request must
+        // not appear in the queue until after the first has resolved.
+        use crate::spawn_flow::WorkerSpawner;
+
+        let server_state = test_server_state();
+        let sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), sink.clone())
+            .await;
+
+        let make_request = |run: &str| {
+            EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
+                run_id: run.to_owned(),
+                workspace_path: "/tmp".into(),
+                initial_input: "claude\n".into(),
+                env: vec![],
+                summary: None,
+            })
+        };
+
+        let server_a = server_state.clone();
+        let send_a = tokio::spawn(async move {
+            server_a
+                .send_to_app_request(make_request("run-a"), Duration::from_secs(5))
+                .await
+        });
+        let server_b = server_state.clone();
+        let send_b = tokio::spawn(async move {
+            server_b
+                .send_to_app_request(make_request("run-b"), Duration::from_secs(5))
+                .await
+        });
+
+        // The first request must be on the sink; the second must be
+        // gated behind the spawn_pane_lock until the first resolves.
+        let first = sink.next().await.expect("first EngineRequest enqueued");
+        let first_request_id = match &first.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+
+        // Give the runtime time to schedule the second task. With
+        // serialization the sink stays empty; without it the second
+        // request would already be enqueued and `sink.next()` would
+        // resolve before the timeout fires.
+        let peek = tokio::time::timeout(Duration::from_millis(100), sink.next()).await;
+        assert!(
+            peek.is_err(),
+            "second SpawnWorkerPane should not be in flight while the first is pending; got {:?}",
+            peek.ok().flatten().map(|env| env.payload),
+        );
+
+        // Resolve the first response — this releases the mutex and
+        // lets the second request go.
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &first_request_id,
+                EngineToAppResponse::SpawnWorkerPane {
+                    result: Ok(crate::protocol::SpawnWorkerPaneResult {
+                        slot_id: 1,
+                        shell_pid: 0,
+                    }),
+                },
+            )
+            .await;
+        send_a.await.expect("send_a task").expect("ok response");
+
+        let second = sink.next().await.expect("second EngineRequest enqueued");
+        let second_request_id = match &second.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &second_request_id,
+                EngineToAppResponse::SpawnWorkerPane {
+                    result: Ok(crate::protocol::SpawnWorkerPaneResult {
+                        slot_id: 2,
+                        shell_pid: 0,
+                    }),
+                },
+            )
+            .await;
+        send_b.await.expect("send_b task").expect("ok response");
     }
 
     #[test]
