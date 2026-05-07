@@ -126,6 +126,19 @@ enum TaskCommand {
         #[command(subcommand)]
         command: DependCommand,
     },
+    /// Attach a GitHub PR URL to an existing task.
+    ///
+    /// Use this when the engine's auto-detection (worker stop hook
+    /// or merge poller) didn't pick up a PR — for example, if the
+    /// PR was opened before its task existed, the work was started
+    /// outside the worker spawn path, or a multi-phase task was
+    /// split into per-phase tasks after the original PR was open.
+    /// Idempotent: re-binding the same URL is a no-op. Re-binding to
+    /// a different URL overwrites with a stderr warning. Status is
+    /// not changed; move the task explicitly with `boss task move`
+    /// if needed.
+    #[command(name = "bind-pr")]
+    BindPr(BindPrArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -141,6 +154,10 @@ enum ChoreCommand {
         #[command(subcommand)]
         command: DependCommand,
     },
+    /// Attach a GitHub PR URL to an existing chore. See `boss task
+    /// bind-pr --help` for behaviour and rationale.
+    #[command(name = "bind-pr")]
+    BindPr(BindPrArgs),
 }
 
 /// Shared subcommands for dependency CRUD. The engine doesn't care
@@ -423,6 +440,16 @@ struct TaskMoveArgs {
 
     #[arg(long = "to")]
     target: MoveTarget,
+}
+
+#[derive(Debug, Clone, Args)]
+struct BindPrArgs {
+    /// Task or chore id to attach the PR to.
+    id: String,
+
+    /// GitHub PR URL of the form
+    /// `https://github.com/<org>/<repo>/pull/<n>`.
+    pr_url: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1149,6 +1176,9 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             )
         }
         TaskCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
+        TaskCommand::BindPr(args) => {
+            run_bind_pr(&mut client, ctx, args, BindPrKind::Task).await
+        }
     }
 }
 
@@ -1234,6 +1264,9 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             )
         }
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
+        ChoreCommand::BindPr(args) => {
+            run_bind_pr(&mut client, ctx, args, BindPrKind::Chore).await
+        }
     }
 }
 
@@ -1465,6 +1498,143 @@ async fn update_work_item(
         }
         other => Err(unexpected_event("work item update", &other)),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BindPrKind {
+    Task,
+    Chore,
+}
+
+impl BindPrKind {
+    fn label(self) -> &'static str {
+        match self {
+            BindPrKind::Task => "task",
+            BindPrKind::Chore => "chore",
+        }
+    }
+}
+
+/// Decide what bind-pr should do given the prior `pr_url` value on
+/// the work item. Pure function so it can be unit-tested without an
+/// engine round-trip.
+#[derive(Debug, PartialEq, Eq)]
+enum BindPrAction<'a> {
+    /// pr_url already matches `new`: skip the engine round-trip and
+    /// report no-op without printing a warning.
+    Idempotent,
+    /// pr_url is unset (or empty): apply the update silently.
+    FirstTime,
+    /// pr_url is set to a different value: apply the update and emit
+    /// a stderr warning naming the old URL.
+    Overwrite { previous: &'a str },
+}
+
+fn classify_bind_pr<'a>(prior: Option<&'a str>, new: &str) -> BindPrAction<'a> {
+    match prior {
+        Some(p) if p == new => BindPrAction::Idempotent,
+        Some(p) if p.is_empty() => BindPrAction::FirstTime,
+        Some(p) => BindPrAction::Overwrite { previous: p },
+        None => BindPrAction::FirstTime,
+    }
+}
+
+async fn run_bind_pr(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: BindPrArgs,
+    kind: BindPrKind,
+) -> Result<(), CliError> {
+    let new_url = validate_github_pr_url(&args.pr_url)?;
+
+    let existing_item = get_work_item(client, &args.id).await?;
+    let existing = match kind {
+        BindPrKind::Task => expect_task(existing_item)?,
+        BindPrKind::Chore => expect_chore(existing_item)?,
+    };
+    let prior_url = existing.pr_url.clone();
+
+    let label = kind.label();
+    match classify_bind_pr(prior_url.as_deref(), new_url) {
+        BindPrAction::Idempotent => {
+            let id_for_print = existing.id.clone();
+            return print_entity(
+                ctx,
+                &serde_json::json!({
+                    label: existing,
+                    "rebinding": false,
+                    "previous_pr_url": prior_url,
+                }),
+                || {
+                    if !ctx.quiet {
+                        println!("{} {} already bound to {}", label, id_for_print, new_url);
+                    }
+                },
+            );
+        }
+        BindPrAction::Overwrite { previous } => {
+            eprintln!(
+                "warning: replacing existing PR URL on {} {} (was {}, now {})",
+                label, existing.id, previous, new_url,
+            );
+        }
+        BindPrAction::FirstTime => {}
+    }
+
+    let patch = WorkItemPatch {
+        pr_url: Some(new_url.to_owned()),
+        ..WorkItemPatch::default()
+    };
+    let updated = update_work_item(client, &args.id, patch).await?;
+    let updated = match kind {
+        BindPrKind::Task => expect_task(updated)?,
+        BindPrKind::Chore => expect_chore(updated)?,
+    };
+
+    let title = match kind {
+        BindPrKind::Task => "Bound PR to task",
+        BindPrKind::Chore => "Bound PR to chore",
+    };
+    print_entity(
+        ctx,
+        &serde_json::json!({
+            label: updated,
+            "rebinding": prior_url.is_some(),
+            "previous_pr_url": prior_url,
+        }),
+        || print_task_details(title, &updated),
+    )
+}
+
+/// Accept only `https://github.com/<org>/<repo>/pull/<n>`. Returns the
+/// trimmed canonical form on success.
+fn validate_github_pr_url(raw: &str) -> Result<&str, CliError> {
+    let trimmed = raw.trim();
+    let rest = trimmed
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| {
+            CliError::usage(
+                "PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>",
+            )
+        })?;
+    let mut parts = rest.split('/');
+    let org = parts.next().unwrap_or("");
+    let repo = parts.next().unwrap_or("");
+    let pull = parts.next().unwrap_or("");
+    let number = parts.next().unwrap_or("");
+    let extra = parts.next();
+    let well_formed = !org.is_empty()
+        && !repo.is_empty()
+        && pull == "pull"
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit())
+        && extra.is_none();
+    if !well_formed {
+        return Err(CliError::usage(format!(
+            "PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>, got `{trimmed}`"
+        )));
+    }
+    Ok(trimmed)
 }
 
 async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<(), CliError> {
@@ -2091,8 +2261,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Commands, MoveTarget, ProductCommand, ProductStatus, ProjectCommand, ProjectStatus,
-        TaskCommand, pick_by_index,
+        BindPrAction, ChoreCommand, Cli, Commands, MoveTarget, ProductCommand, ProductStatus,
+        ProjectCommand, ProjectStatus, TaskCommand, classify_bind_pr, pick_by_index,
+        validate_github_pr_url,
     };
 
     #[test]
@@ -2211,5 +2382,108 @@ mod tests {
             Some("beta".to_owned())
         );
         assert!(pick_by_index(&values, "0").is_err());
+    }
+
+    #[test]
+    fn validate_github_pr_url_accepts_canonical_form() {
+        let url = "https://github.com/spinyfin/mono/pull/238";
+        assert_eq!(validate_github_pr_url(url).unwrap(), url);
+        // surrounding whitespace is trimmed
+        assert_eq!(
+            validate_github_pr_url("  https://github.com/a/b/pull/1\n").unwrap(),
+            "https://github.com/a/b/pull/1"
+        );
+    }
+
+    #[test]
+    fn validate_github_pr_url_rejects_malformed() {
+        for bad in [
+            "",
+            "not-a-url",
+            "http://github.com/a/b/pull/1",      // wrong scheme
+            "https://gitlab.com/a/b/pull/1",     // wrong host
+            "https://github.com/a/b/pulls/1",    // typo
+            "https://github.com/a/b/issues/1",   // wrong noun
+            "https://github.com/a/b/pull/",      // missing number
+            "https://github.com/a/b/pull/abc",   // non-numeric
+            "https://github.com/a/b/pull/1/files", // trailing path
+            "https://github.com//repo/pull/1",   // empty org
+            "https://github.com/org//pull/1",    // empty repo
+        ] {
+            assert!(
+                validate_github_pr_url(bad).is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_bind_pr_first_time_when_unset() {
+        assert_eq!(
+            classify_bind_pr(None, "https://github.com/a/b/pull/1"),
+            BindPrAction::FirstTime
+        );
+        // Empty-string prior (engine normalizes empty → None, but defend
+        // against the wire-format edge case) is treated as unset.
+        assert_eq!(
+            classify_bind_pr(Some(""), "https://github.com/a/b/pull/1"),
+            BindPrAction::FirstTime
+        );
+    }
+
+    #[test]
+    fn classify_bind_pr_idempotent_on_same_url() {
+        let url = "https://github.com/a/b/pull/1";
+        assert_eq!(classify_bind_pr(Some(url), url), BindPrAction::Idempotent);
+    }
+
+    #[test]
+    fn classify_bind_pr_overwrite_on_different_url() {
+        let prior = "https://github.com/a/b/pull/1";
+        let new = "https://github.com/a/b/pull/2";
+        assert_eq!(
+            classify_bind_pr(Some(prior), new),
+            BindPrAction::Overwrite { previous: prior }
+        );
+    }
+
+    #[test]
+    fn parses_task_bind_pr_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "bind-pr",
+            "task_1",
+            "https://github.com/a/b/pull/9",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::BindPr(args),
+            } => {
+                assert_eq!(args.id, "task_1");
+                assert_eq!(args.pr_url, "https://github.com/a/b/pull/9");
+            }
+            _ => panic!("expected task bind-pr command"),
+        }
+    }
+
+    #[test]
+    fn parses_chore_bind_pr_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "chore",
+            "bind-pr",
+            "task_2",
+            "https://github.com/a/b/pull/10",
+        ]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::BindPr(args),
+            } => {
+                assert_eq!(args.id, "task_2");
+                assert_eq!(args.pr_url, "https://github.com/a/b/pull/10");
+            }
+            _ => panic!("expected chore bind-pr command"),
+        }
     }
 }
