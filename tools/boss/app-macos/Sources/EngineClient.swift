@@ -98,7 +98,7 @@ final class EngineClient: @unchecked Sendable {
     var onEvent: (@MainActor @Sendable (EngineEvent) -> Void)?
 
     private let socketPath: String
-    private let queue = DispatchQueue(label: "BossMacApp.EngineClient")
+    private let queue = DispatchQueue(label: "Boss.EngineClient")
     private var connection: NWConnection?
     private var buffer = Data()
     private var shouldReconnect = false

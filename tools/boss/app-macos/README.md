@@ -23,7 +23,7 @@ Internal system status messages are hidden by default. Set
 Run the app and let it launch the engine automatically:
 
 ```bash
-ANTHROPIC_API_KEY=... bazel run //tools/boss/app-macos:BossMacApp
+ANTHROPIC_API_KEY=... bazel run //tools/boss/app-macos:Boss
 ```
 
 By default the app launches:
@@ -56,7 +56,7 @@ ANTHROPIC_API_KEY=... bazel run //tools/boss/engine:engine -- --mode=server --so
 ```
 
 ```bash
-BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools/boss/app-macos:BossMacApp
+BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools/boss/app-macos:Boss
 ```
 
 ## Overrides
@@ -103,7 +103,7 @@ Agents-mode panes are currently SwiftPM-only:
 
 ```bash
 cd tools/boss/app-macos
-swift run BossMacApp
+swift run Boss
 ```
 
 The Bazel build does not include `Sources/Ghostty/*.swift`; under Bazel

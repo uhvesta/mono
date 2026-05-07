@@ -10,7 +10,7 @@ exports_files([
 
 swift_library(
     name = "boss_mac_app_lib",
-    module_name = "BossMacApp",
+    module_name = "Boss",
     # Single-level glob: Sources/Ghostty/*.swift is intentionally excluded
     # from the Bazel build. Those files require GhosttyKit.xcframework, which
     # is built out-of-band by scripts/bootstrap-ghosttykit.sh and only wired
@@ -23,7 +23,7 @@ swift_library(
 )
 
 macos_application(
-    name = "BossMacApp",
+    name = "Boss",
     bundle_id = "dev.spinyfin.bossmacapp",
     infoplists = ["Info.plist"],
     minimum_os_version = "15.0",

@@ -103,4 +103,4 @@ echo "  $FRAMEWORK_DIR"
 echo
 echo "Next:"
 echo "  cd $ROOT_DIR"
-echo "  swift run BossMacApp"
+echo "  swift run Boss"

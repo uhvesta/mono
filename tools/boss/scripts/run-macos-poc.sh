@@ -67,7 +67,7 @@ export BOSS_ENGINE_STOP_ON_EXIT="${BOSS_ENGINE_STOP_ON_EXIT:-0}"
 export BOSS_SHOW_SYSTEM_MESSAGES="${BOSS_SHOW_SYSTEM_MESSAGES:-0}"
 export RUST_LOG="${RUST_LOG:-info,acp_stderr=debug}"
 
-echo "Launching BossMacApp..."
+echo "Launching Boss..."
 echo "Repo: $repo_root"
 echo "BOSS_ACP_CMD: $BOSS_ACP_CMD"
 echo "BOSS_ENGINE_PID_PATH: $BOSS_ENGINE_PID_PATH"
@@ -78,4 +78,4 @@ echo "BOSS_SHOW_SYSTEM_MESSAGES: $BOSS_SHOW_SYSTEM_MESSAGES"
 echo "RUST_LOG: $RUST_LOG"
 
 cd "$repo_root"
-exec bazel run //tools/boss/app-macos:BossMacApp
+exec bazel run //tools/boss/app-macos:Boss

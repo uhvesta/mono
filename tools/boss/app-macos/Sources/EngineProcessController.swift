@@ -84,7 +84,7 @@ final class EngineProcessController: @unchecked Sendable {
         proc.waitUntilExit()
         if proc.terminationStatus != 0 {
             throw NSError(
-                domain: "BossMacApp.EngineProcessController",
+                domain: "Boss.EngineProcessController",
                 code: Int(proc.terminationStatus),
                 userInfo: [NSLocalizedDescriptionKey: "failed to launch detached engine process"]
             )
@@ -202,7 +202,7 @@ final class EngineProcessController: @unchecked Sendable {
         let fd = open(lockFilePath, O_CREAT | O_RDWR, 0o600)
         guard fd >= 0 else {
             throw NSError(
-                domain: "BossMacApp.EngineProcessController",
+                domain: "Boss.EngineProcessController",
                 code: Int(errno),
                 userInfo: [NSLocalizedDescriptionKey: "failed to open lock file: \(lockFilePath)"]
             )
@@ -214,7 +214,7 @@ final class EngineProcessController: @unchecked Sendable {
 
         guard flock(fd, LOCK_EX) == 0 else {
             throw NSError(
-                domain: "BossMacApp.EngineProcessController",
+                domain: "Boss.EngineProcessController",
                 code: Int(errno),
                 userInfo: [NSLocalizedDescriptionKey: "failed to acquire engine start lock"]
             )
