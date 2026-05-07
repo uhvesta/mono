@@ -1143,9 +1143,10 @@ private struct PRURLLink: View {
     let font: Font
 
     var body: some View {
+        let label = shortLabel(for: urlString) ?? urlString
         if let url = URL(string: urlString), url.scheme != nil {
             Link(destination: url) {
-                Text(urlString)
+                Text(label)
                     .font(font)
                     .foregroundStyle(Color.accentColor)
                     .underline()
@@ -1162,11 +1163,31 @@ private struct PRURLLink: View {
                 }
             }
         } else {
-            Text(urlString)
+            Text(label)
                 .font(font)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
+    }
+
+    private func shortLabel(for urlString: String) -> String? {
+        guard let url = URL(string: urlString),
+              let host = url.host?.lowercased(),
+              host == "github.com" || host == "www.github.com"
+        else {
+            return nil
+        }
+        let parts = url.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard parts.count == 4,
+              parts[2] == "pull",
+              !parts[0].isEmpty,
+              !parts[1].isEmpty,
+              !parts[3].isEmpty,
+              parts[3].allSatisfy(\.isNumber)
+        else {
+            return nil
+        }
+        return "\(parts[0])/\(parts[1])#\(parts[3])"
     }
 }
 
