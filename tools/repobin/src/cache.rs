@@ -1,7 +1,8 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use fs4::fs_std::FileExt;
@@ -147,21 +148,24 @@ impl RepoCacheLock {
                 }
             })?;
         }
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("clone")
             .arg("--depth=1")
             .arg("--single-branch")
             .arg(&self.cache.url)
             .arg(&self.cache.checkout)
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output()
             .map_err(|source| RepobinError::SpawnGit {
                 action: "clone".to_string(),
                 source,
             })?;
-        if !status.success() {
+        forward_to_stderr(&output.stdout);
+        if !output.status.success() {
             return Err(RepobinError::GitFailed {
                 action: format!("clone {}", self.cache.url),
-                status: status.code(),
+                status: output.status.code(),
             });
         }
         let url_path = self.cache.dir.join("url");
@@ -253,40 +257,53 @@ fn ls_remote_head(checkout: &Path) -> Result<String, RepobinError> {
 }
 
 fn fetch_and_reset(checkout: &Path) -> Result<(), RepobinError> {
-    let status = Command::new("git")
+    let fetch = Command::new("git")
         .arg("fetch")
         .arg("--depth=1")
         .arg("origin")
         .arg("HEAD")
         .current_dir(checkout)
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
         .map_err(|source| RepobinError::SpawnGit {
             action: "fetch".to_string(),
             source,
         })?;
-    if !status.success() {
+    forward_to_stderr(&fetch.stdout);
+    if !fetch.status.success() {
         return Err(RepobinError::GitFailed {
             action: "fetch origin HEAD".to_string(),
-            status: status.code(),
+            status: fetch.status.code(),
         });
     }
-    let status = Command::new("git")
+    let reset = Command::new("git")
         .arg("reset")
         .arg("--hard")
         .arg("FETCH_HEAD")
         .current_dir(checkout)
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
         .map_err(|source| RepobinError::SpawnGit {
             action: "reset".to_string(),
             source,
         })?;
-    if !status.success() {
+    forward_to_stderr(&reset.stdout);
+    if !reset.status.success() {
         return Err(RepobinError::GitFailed {
             action: "reset --hard FETCH_HEAD".to_string(),
-            status: status.code(),
+            status: reset.status.code(),
         });
     }
     Ok(())
+}
+
+fn forward_to_stderr(buf: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    let _ = io::stderr().write_all(buf);
 }
 
 fn repo_dir_name(url: &str) -> String {

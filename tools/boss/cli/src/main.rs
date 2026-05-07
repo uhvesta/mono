@@ -192,6 +192,22 @@ struct ProjectCreateArgs {
 struct ProjectListArgs {
     #[arg(long)]
     product: Option<String>,
+
+    /// Filter by status. Repeat the flag or use a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    status: Vec<ProjectStatus>,
+
+    /// Case-insensitive substring match against name and description.
+    #[arg(long = "match")]
+    match_term: Option<String>,
+
+    /// Cap the number of returned rows (applied after filtering).
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// Filter to specific id(s); repeatable.
+    #[arg(long)]
+    id: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -265,6 +281,22 @@ struct ChoreCreateArgs {
 struct ChoreListArgs {
     #[arg(long)]
     product: Option<String>,
+
+    /// Filter by status. Repeat the flag or use a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    status: Vec<TaskStatus>,
+
+    /// Case-insensitive substring match against name and description.
+    #[arg(long = "match")]
+    match_term: Option<String>,
+
+    /// Cap the number of returned rows (applied after filtering).
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// Filter to specific id(s); repeatable.
+    #[arg(long)]
+    id: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -823,6 +855,13 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
         ProjectCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let projects = list_projects(&mut client, &product.id).await?;
+            let projects = apply_project_list_filters(
+                projects,
+                &args.status,
+                args.match_term.as_deref(),
+                &args.id,
+                args.limit,
+            );
             print_entity(
                 ctx,
                 &serde_json::json!({ "product": product, "projects": projects }),
@@ -1034,6 +1073,13 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
         ChoreCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let chores = list_chores(&mut client, &product.id).await?;
+            let chores = apply_task_list_filters(
+                chores,
+                &args.status,
+                args.match_term.as_deref(),
+                &args.id,
+                args.limit,
+            );
             print_entity(ctx, &serde_json::json!({ "chores": chores }), || {
                 print_tasks_table(&chores)
             })
@@ -1598,6 +1644,72 @@ fn unexpected_event(context: &str, event: &FrontendEvent) -> CliError {
         "unexpected engine event for {context}: {}",
         serde_json::to_string(event).unwrap_or_else(|_| "<unserializable>".to_owned())
     ))
+}
+
+fn apply_task_list_filters(
+    items: Vec<Task>,
+    statuses: &[TaskStatus],
+    match_term: Option<&str>,
+    ids: &[String],
+    limit: Option<usize>,
+) -> Vec<Task> {
+    let allowed_statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+    let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let lc_term = match_term.map(str::to_lowercase);
+    items
+        .into_iter()
+        .filter(|task| {
+            if !allowed_statuses.is_empty() && !allowed_statuses.contains(&task.status.as_str()) {
+                return false;
+            }
+            if !id_set.is_empty() && !id_set.contains(task.id.as_str()) {
+                return false;
+            }
+            if let Some(term) = &lc_term {
+                let name = task.name.to_lowercase();
+                let desc = task.description.to_lowercase();
+                if !name.contains(term.as_str()) && !desc.contains(term.as_str()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
+}
+
+fn apply_project_list_filters(
+    items: Vec<Project>,
+    statuses: &[ProjectStatus],
+    match_term: Option<&str>,
+    ids: &[String],
+    limit: Option<usize>,
+) -> Vec<Project> {
+    let allowed_statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+    let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let lc_term = match_term.map(str::to_lowercase);
+    items
+        .into_iter()
+        .filter(|project| {
+            if !allowed_statuses.is_empty()
+                && !allowed_statuses.contains(&project.status.as_str())
+            {
+                return false;
+            }
+            if !id_set.is_empty() && !id_set.contains(project.id.as_str()) {
+                return false;
+            }
+            if let Some(term) = &lc_term {
+                let name = project.name.to_lowercase();
+                let desc = project.description.to_lowercase();
+                if !name.contains(term.as_str()) && !desc.contains(term.as_str()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
 }
 
 fn print_entity<T, F>(ctx: &RunContext, json_value: &T, human: F) -> Result<(), CliError>
