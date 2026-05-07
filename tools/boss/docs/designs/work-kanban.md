@@ -89,6 +89,12 @@ kind of `Doing` card:
 This keeps the board aligned with the requested four-column workflow while
 preserving operational signal.
 
+`active` is also a load-bearing dispatch state, not just a column label — see
+[Doing column = "live or queued"](#doing-column--live-or-queued). The kanban
+treats `Doing` membership as authoritative for "the engine is running or
+queueing this," so moving a card into or out of `Doing` has dispatch side
+effects beyond the status update.
+
 ## Information Architecture
 
 Recommended layout:
@@ -221,6 +227,106 @@ Column moves should update canonical item status:
 
 Blocking and unblocking should be a separate action from column movement.
 
+The `Doing` column has additional dispatch semantics — see
+[Doing column = "live or queued"](#doing-column--live-or-queued) below — so
+moves into and out of `Doing` are not pure metadata edits.
+
+### Doing column = "live or queued"
+
+The `Doing` column is the only column whose membership is required to mirror
+the engine's actual execution state. Cards in `Doing` are either being worked
+on by a worker right now, or queued waiting for a free worker; cards outside
+`Doing` are not. The board must not show "active" work that the engine isn't
+actually running.
+
+This adds three invariants on top of the simple
+"drop -> set tasks.status" behavior described above. They apply equally to
+human moves (drag, menu, inspector edit) and to engine-driven moves (Boss
+session calling `bossctl work start`).
+
+#### 1. Dropping a card into `Doing` schedules it.
+
+When the human drops a chore or task into `Doing` (or sets its status to
+`active` via the inspector), the kanban must do two things in one user-visible
+operation:
+
+1. update `tasks.status` to `active`, as today, and
+2. ask the engine to dispatch an execution for that work item.
+
+The dispatch path is the existing `RequestExecution` RPC the Boss session
+already uses via `bossctl work start`. The engine's coordinator handles
+worker-pool capacity, lease acquisition, and the actual spawn; the kanban does
+not need its own scheduler.
+
+If a worker is already running for the work item (the existing execution is
+`running` or `waiting_human`), `RequestExecution` is a no-op on the dispatch
+side — the engine already treats a non-terminal execution for the same work
+item as the one that owns the slot. The status update still fires. The kanban
+move is therefore safe to retry without spawning duplicates.
+
+If no worker pool slot is free, the execution lands in `ready` and the
+coordinator picks it up when capacity opens. The card stays in `Doing` the
+whole time — that's the "queued" half of the column's contract.
+
+This is a deliberate addition to the dispatch model. The Boss session remains a
+dispatcher, but the human can also dispatch directly from the board for cases
+that don't need Boss-side decomposition or planning. The two paths converge on
+the same `RequestExecution` RPC, so the engine sees a single authoritative
+flow regardless of who initiated it.
+
+#### 2. A card cannot leave `Doing` while a worker is actively running it.
+
+Manually moving a chore out of `Doing` (drag back to `Backlog`, drag forward
+to `Review`/`Done`, or status-edit to anything other than `active`) is
+disallowed while the chore has a `running` or `waiting_human` execution with a
+live worker pane. The kanban surfaces this as one of:
+
+- the drag is rejected with a tooltip explaining a worker is active and
+  pointing at "Stop worker" / "Cancel execution" affordances,
+- the inspector status field is read-only with a similar explanation, or
+- attempting the move opens a confirmation dialog that, on accept, first
+  issues a stop/cancel, then performs the move.
+
+The exact UX should follow the macOS HIG; what matters for the design is the
+invariant: the kanban must never show a card in a column whose status
+contradicts the live worker reality.
+
+`done`, `archived`, and `failed` are not blocked — those are valid
+`active`-to-terminal transitions the engine itself drives at run completion;
+the human flowing the card the same way after a successful PR merge is
+allowed.
+
+#### 3. On engine startup, `Doing` rehydrates dispatch.
+
+When the engine starts (or restarts after a crash), it scans for work items in
+status `active` whose latest execution is in a terminal state (or that have no
+execution at all). Those items are in `Doing` per the kanban but no worker is
+running them, which violates the column's contract. The startup reconcile
+must re-issue `RequestExecution` for each so they re-enter the dispatch queue.
+
+The opposite case — `tasks.status != 'active'` but a non-terminal execution
+exists — is handled by the existing auto-advance path:
+`start_execution_run` already flips `tasks.status` to `active` whenever an
+execution moves to `running`, and the new broadcast (PR #171, PR #174) fires
+a work-tree invalidation so the board reflects it. So that direction
+self-heals; only the `active`-without-worker direction needs the new startup
+reconcile.
+
+The reconcile must distinguish "card is in `Doing` because the human dropped
+it there post-restart, before the engine could re-dispatch" from "card is in
+`Doing` because someone manually set status to `active` to bypass dispatch
+entirely." A `tasks.dispatch_intent` column or equivalent could disambiguate;
+in the simpler reading, every `active` chore without a live worker is a
+dispatch candidate and the human's escape hatch is to first drag the card
+elsewhere. The simpler reading is preferred unless it produces footguns in
+practice.
+
+#### Invariant in one line
+
+A chore is in `Doing` iff the engine is actively running it, or has it queued
+ready, or is in the act of rehydrating dispatch for it on startup. Any other
+state is a bug.
+
 ### Inspect and Edit
 
 Selecting a card should open a detail inspector without navigating away from
@@ -317,6 +423,21 @@ but it should no longer drive the overall layout of the Work tab.
 9. Persist selected product, filters, and grouping mode.
 10. Add richer project grouping visuals and counts.
 11. Add keyboard shortcuts and better empty states.
+
+### Phase 4: Doing-column dispatch (new)
+
+12. Drop into `Doing` (drag, menu, or inspector status edit) sends
+    `RequestExecution` after the status update.
+13. Block moves out of `Doing` while the chore has a non-terminal execution
+    backed by a live worker pane, with a "stop worker first" escape hatch.
+14. On engine start, reconcile `active`-with-no-live-worker work items by
+    re-issuing `RequestExecution` so they re-enter the dispatch queue.
+
+These three together promote `Doing` from a passive status label to an
+authoritative view of what the engine is actually running or queuing. See
+[Doing column = "live or queued"](#doing-column--live-or-queued) above for
+the invariants and the interactions with the existing Boss-session dispatch
+path (`bossctl work start`).
 
 ## Design Decisions
 
