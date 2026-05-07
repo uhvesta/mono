@@ -1100,6 +1100,15 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Read the unsatisfied prerequisites of `work_item_id` outside
+    /// of any in-flight transaction. Used by the engine app to refuse
+    /// `RequestExecution` against a gated work item (see
+    /// `boss::engine::app`).
+    pub fn gating_prereqs_for(&self, work_item_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        deps::gating_prereqs_for(&conn, work_item_id)
+    }
+
     /// Declare a `relation` edge from `dependent` to `prerequisite`.
     /// Validates both endpoints resolve to live work items in the
     /// same product, refuses self-edges and cycles, and is
@@ -1149,6 +1158,12 @@ impl WorkDb {
         let now = now_string();
         let (edge, _outcome): (WorkItemDependency, EdgeInsertOutcome) =
             deps::insert_edge(&tx, dependent_id, prerequisite_id, relation, &now)?;
+        // Auto-block (Q4): if the dependent isn't already `blocked`
+        // and the new edge introduces a gating prereq, the engine
+        // flips it to `blocked` and stamps `last_status_actor =
+        // 'engine'` so the eventual auto-unblock knows the engine
+        // owns this transition.
+        maybe_engine_block_dependent(&tx, dependent_id, &now)?;
         tx.commit()?;
         Ok(edge)
     }
@@ -1171,6 +1186,12 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let removed = deps::delete_edge(&tx, dependent_id, prerequisite_id, relation)?;
+        // Auto-unblock (Q4): when the only remaining gating reason is
+        // gone and the engine itself put this row in `blocked`, flip
+        // it back to `todo`. Manual blocks (last_status_actor =
+        // 'human') stick — the user still has to clear them.
+        let now = now_string();
+        maybe_engine_unblock_dependent(&tx, dependent_id, &now)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -1413,6 +1434,8 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let mut project =
             query_project(&tx, id)?.with_context(|| format!("unknown project: {id}"))?;
+        let previous_status = project.status.clone();
+        let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut project.name, patch.name);
         apply_text_patch(&mut project.description, patch.description);
@@ -1423,9 +1446,15 @@ impl WorkDb {
             unique_project_slug_for_update(&tx, &project.product_id, id, &slugify(&project.name))?;
         project.updated_at = now_string();
 
+        if status_changed {
+            refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &project.status)?;
+        }
+        let actor = if status_changed { "human" } else { "" };
+
         tx.execute(
             "UPDATE projects
-             SET name = ?2, slug = ?3, description = ?4, goal = ?5, status = ?6, priority = ?7, updated_at = ?8
+             SET name = ?2, slug = ?3, description = ?4, goal = ?5, status = ?6, priority = ?7, updated_at = ?8,
+                 last_status_actor = CASE WHEN ?9 = '' THEN last_status_actor ELSE ?9 END
              WHERE id = ?1",
             params![
                 project.id,
@@ -1436,8 +1465,18 @@ impl WorkDb {
                 project.status,
                 project.priority,
                 project.updated_at,
+                actor,
             ],
         )?;
+
+        if status_changed && previous_status != project.status {
+            cascade_dependents_after_prereq_status_change(
+                &tx,
+                id,
+                &project.status,
+                &project.updated_at,
+            )?;
+        }
 
         let updated = query_project(&tx, id)?.with_context(|| format!("unknown project: {id}"))?;
         tx.commit()?;
@@ -1451,6 +1490,8 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             bail!("cannot update a deleted task: {id}");
         }
+        let previous_status = task.status.clone();
+        let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut task.name, patch.name);
         apply_text_patch(&mut task.description, patch.description);
@@ -1461,9 +1502,15 @@ impl WorkDb {
         }
         task.updated_at = now_string();
 
+        if status_changed {
+            refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &task.status)?;
+        }
+        let actor = if status_changed { "human" } else { "" };
+
         tx.execute(
             "UPDATE tasks
-             SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7
+             SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
+                 last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
              WHERE id = ?1",
             params![
                 task.id,
@@ -1473,8 +1520,18 @@ impl WorkDb {
                 task.ordinal,
                 task.pr_url,
                 task.updated_at,
+                actor,
             ],
         )?;
+
+        if status_changed && previous_status != task.status {
+            cascade_dependents_after_prereq_status_change(
+                &tx,
+                id,
+                &task.status,
+                &task.updated_at,
+            )?;
+        }
 
         let updated = query_task(&tx, id)?.with_context(|| format!("unknown task: {id}"))?;
         tx.commit()?;
@@ -1545,10 +1602,20 @@ impl WorkDb {
             "UPDATE tasks
              SET status = ?2,
                  pr_url = ?3,
-                 updated_at = ?4
+                 updated_at = ?4,
+                 last_status_actor = 'engine'
              WHERE id = ?1",
             params![task.id, new_status, pr_url, now],
         )?;
+
+        if new_status != task.status {
+            cascade_dependents_after_prereq_status_change(
+                &tx,
+                &task.id,
+                &new_status,
+                &now,
+            )?;
+        }
 
         tx.execute(
             "UPDATE work_executions
@@ -1648,10 +1715,12 @@ impl WorkDb {
             "UPDATE tasks
              SET status = 'done',
                  pr_url = ?2,
-                 updated_at = ?3
+                 updated_at = ?3,
+                 last_status_actor = 'engine'
              WHERE id = ?1",
             params![task.id, pr_url, now],
         )?;
+        cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
         let updated = query_task(&tx, work_item_id)?
             .with_context(|| format!("unknown task after update: {work_item_id}"))?;
         tx.commit()?;
@@ -2279,13 +2348,24 @@ fn reconcile_work_item_execution(
     desired_status: &str,
     repo_remote_url: Option<&str>,
 ) -> Result<()> {
+    // Dispatcher gate (Q8): if the work item has any unmet `blocks`
+    // prereq, downgrade its desired execution status to
+    // `waiting_dependency` regardless of what the caller asked for.
+    // This keeps gated dependents out of `ready` and therefore out
+    // of the dispatcher's pickup pool.
+    let gated = !deps::gating_prereqs_for(conn, work_item_id)?.is_empty();
+    let effective_status = if gated && desired_status == "ready" {
+        "waiting_dependency"
+    } else {
+        desired_status
+    };
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
             if execution.kind == kind
                 && can_reconcile_execution_status(&execution.status)
-                && execution.status != desired_status
+                && execution.status != effective_status
             {
-                let updated = update_execution_status(conn, &execution.id, desired_status)?;
+                let updated = update_execution_status(conn, &execution.id, effective_status)?;
                 result.updated.push(updated);
             }
         }
@@ -2298,7 +2378,7 @@ fn reconcile_work_item_execution(
                 CreateExecutionInput {
                     work_item_id: work_item_id.to_owned(),
                     kind: kind.to_owned(),
-                    status: Some(desired_status.to_owned()),
+                    status: Some(effective_status.to_owned()),
                     repo_remote_url: Some(repo_remote_url.to_owned()),
                     cube_repo_id: None,
                     cube_lease_id: None,
@@ -2335,6 +2415,18 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     let kind = execution_kind_for_work_item(conn, &work_item_id)?;
+
+    // Q8: explicit `RequestExecution` against a gated work item is
+    // refused with a clear error rather than silently overridden. A
+    // future `--force` may relax this; for v1, the user removes the
+    // edge or waits for the prereq to land.
+    let gating = deps::gating_prereqs_for(conn, &work_item_id)?;
+    if !gating.is_empty() {
+        let names = gating.join(", ");
+        bail!(
+            "cannot start {work_item_id}: gated by [{names}] — use `boss <kind> depend rm` to remove the edge or wait for the prereq to complete"
+        );
+    }
 
     if let Some(existing) = query_latest_execution_for_work_item(conn, &work_item_id)? {
         if !execution_status_is_terminal(&existing.status) {
@@ -2669,6 +2761,163 @@ fn classify_id(id: &str) -> Result<ItemKind> {
         return Ok(ItemKind::Task);
     }
     bail!("unknown work item id format: {id}")
+}
+
+/// Stamp a dependent's status to `blocked` and `last_status_actor`
+/// to `'engine'` if (a) the dependent is currently in a status
+/// other than `blocked`, `done`, `archived`, and (b) it has at least
+/// one unmet gating prereq. No-op otherwise.
+///
+/// Used by `add_dependency` (an edge that introduces a gating
+/// prereq) and by status cascades on a *prereq* moving away from a
+/// satisfied status.
+fn maybe_engine_block_dependent(
+    conn: &Connection,
+    dependent_id: &str,
+    now_epoch: &str,
+) -> Result<()> {
+    let gating = deps::gating_prereqs_for(conn, dependent_id)?;
+    if gating.is_empty() {
+        return Ok(());
+    }
+    let current_status = deps::lookup_work_item_status(conn, dependent_id)?;
+    let Some(current) = current_status else {
+        return Ok(());
+    };
+    if matches!(current.as_str(), "blocked" | "done" | "archived") {
+        return Ok(());
+    }
+    write_engine_status(conn, dependent_id, "blocked", now_epoch)?;
+    Ok(())
+}
+
+/// Flip a dependent off `blocked` if (a) its current status is
+/// `blocked`, (b) `last_status_actor = 'engine'` (the engine put it
+/// there), and (c) no gating prereqs remain. The unblocked status
+/// is `todo` — the design's recommendation in Q4. Items that were
+/// manually blocked by a human are left alone.
+fn maybe_engine_unblock_dependent(
+    conn: &Connection,
+    dependent_id: &str,
+    now_epoch: &str,
+) -> Result<()> {
+    let current = match deps::lookup_work_item_status(conn, dependent_id)? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    if current != "blocked" {
+        return Ok(());
+    }
+    let actor = lookup_last_status_actor(conn, dependent_id)?;
+    if actor.as_deref() != Some("engine") {
+        return Ok(());
+    }
+    let gating = deps::gating_prereqs_for(conn, dependent_id)?;
+    if !gating.is_empty() {
+        return Ok(());
+    }
+    write_engine_status(conn, dependent_id, "todo", now_epoch)?;
+    Ok(())
+}
+
+/// Walk every dependent of `prereq_id` and apply the appropriate
+/// auto-{block,unblock} cascade, depending on whether the prereq's
+/// new status is satisfying or not. Used after a status change on
+/// a prereq.
+fn cascade_dependents_after_prereq_status_change(
+    conn: &Connection,
+    prereq_id: &str,
+    new_prereq_status: &str,
+    now_epoch: &str,
+) -> Result<()> {
+    let dependents = deps::dependents_of(conn, prereq_id, Some("blocks"))?;
+    let satisfying = deps::status_satisfies(prereq_id, new_prereq_status);
+    for edge in dependents {
+        if satisfying {
+            maybe_engine_unblock_dependent(conn, &edge.dependent_id, now_epoch)?;
+        } else {
+            maybe_engine_block_dependent(conn, &edge.dependent_id, now_epoch)?;
+        }
+    }
+    Ok(())
+}
+
+/// Internal write that stamps `last_status_actor = 'engine'` on the
+/// row. Used by the auto-block / unblock paths. Returns the new
+/// status.
+fn write_engine_status(
+    conn: &Connection,
+    work_item_id: &str,
+    new_status: &str,
+    now_epoch: &str,
+) -> Result<()> {
+    if work_item_id.starts_with("proj_") {
+        conn.execute(
+            "UPDATE projects
+             SET status = ?2, last_status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1",
+            params![work_item_id, new_status, now_epoch],
+        )?;
+    } else if work_item_id.starts_with("task_") {
+        conn.execute(
+            "UPDATE tasks
+             SET status = ?2, last_status_actor = 'engine', updated_at = ?3
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, new_status, now_epoch],
+        )?;
+    }
+    Ok(())
+}
+
+/// Q4 case 1: refuse a manual move from `blocked` to anything else
+/// while the row still has at least one unmet `blocks` prereq. The
+/// alternative — letting the user override and run anyway —
+/// recreates the original ambiguous "blocked" flag, which the design
+/// explicitly rejects.
+///
+/// Manual moves *into* `blocked`, and any move when no edges gate
+/// the row, are allowed.
+fn refuse_manual_move_off_blocked_while_gated(
+    conn: &Connection,
+    work_item_id: &str,
+    previous_status: &str,
+    new_status: &str,
+) -> Result<()> {
+    if previous_status != "blocked" || new_status == "blocked" {
+        return Ok(());
+    }
+    let gating = deps::gating_prereqs_for(conn, work_item_id)?;
+    if gating.is_empty() {
+        return Ok(());
+    }
+    let names = gating.join(", ");
+    bail!(
+        "cannot move {work_item_id} to {new_status}: gated by [{names}] (use `boss <kind> depend rm` to remove)"
+    );
+}
+
+fn lookup_last_status_actor(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+    if work_item_id.starts_with("proj_") {
+        return conn
+            .query_row(
+                "SELECT last_status_actor FROM projects WHERE id = ?1",
+                params![work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    if work_item_id.starts_with("task_") {
+        return conn
+            .query_row(
+                "SELECT last_status_actor FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -4473,6 +4722,351 @@ mod tests {
             view.prerequisites.is_empty(),
             "expected dangling edge to be dropped on prereq delete"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Adding an edge against an unsatisfied prereq flips the
+    /// dependent to `blocked` and stamps `last_status_actor = engine`.
+    /// Dropping the edge (with no remaining gating) unblocks it back
+    /// to `todo`. Manual blocks (a human-set status) are not touched.
+    #[test]
+    fn auto_block_and_unblock_follow_edge_lifecycle() {
+        let path = temp_db_path("deps-auto-block");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        // Sanity: A starts as `todo` (default).
+        let a0 = db.get_work_item(&a.id).unwrap();
+        let WorkItem::Chore(t) = a0 else { panic!() };
+        assert_eq!(t.status, "todo");
+
+        // Adding A → B (B not satisfied) auto-blocks A.
+        db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        let a1 = db.get_work_item(&a.id).unwrap();
+        let WorkItem::Chore(t1) = a1 else { panic!() };
+        assert_eq!(t1.status, "blocked");
+        assert_eq!(t1.last_status_actor, "engine");
+
+        // Removing the edge auto-unblocks A back to `todo`.
+        db.remove_dependency(RemoveDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        let a2 = db.get_work_item(&a.id).unwrap();
+        let WorkItem::Chore(t2) = a2 else { panic!() };
+        assert_eq!(t2.status, "todo");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// When the prereq's status flips to `done`, dependents on it
+    /// auto-unblock if the engine put them in `blocked`. A manual
+    /// block stays.
+    #[test]
+    fn dependent_auto_unblocks_when_prereq_marked_done() {
+        let path = temp_db_path("deps-cascade-done");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Move B to `done` via UpdateWorkItem.
+        db.update_work_item(
+            &b.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let a_after = db.get_work_item(&a.id).unwrap();
+        let WorkItem::Chore(t) = a_after else { panic!() };
+        assert_eq!(t.status, "todo");
+        assert_eq!(t.last_status_actor, "engine");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A human-blocked dependent (no edges) is not touched by the
+    /// auto-unblock path — the user has to clear it themselves.
+    #[test]
+    fn manual_block_is_not_auto_unblocked() {
+        let path = temp_db_path("deps-manual-block");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        // Human moves A to `blocked` (no edges yet).
+        db.update_work_item(
+            &a.id,
+            WorkItemPatch {
+                status: Some("blocked".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let a1 = db.get_work_item(&a.id).unwrap();
+        let WorkItem::Chore(t1) = a1 else { panic!() };
+        assert_eq!(t1.status, "blocked");
+        assert_eq!(t1.last_status_actor, "human");
+
+        // Adding then removing an edge against an already-satisfied
+        // prereq should not flip the manually-blocked row off
+        // `blocked` (last_status_actor stays `human`).
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.update_work_item(
+            &b.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        db.remove_dependency(RemoveDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        let a_after = db.get_work_item(&a.id).unwrap();
+        let WorkItem::Chore(t) = a_after else { panic!() };
+        assert_eq!(t.status, "blocked");
+        assert_eq!(t.last_status_actor, "human");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A manual move from `blocked` to anything else is refused
+    /// while gating prereqs remain (Q4 case 1).
+    #[test]
+    fn refuses_manual_move_off_blocked_while_gated() {
+        let path = temp_db_path("deps-refuse-move");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        let err = db
+            .update_work_item(
+                &a.id,
+                WorkItemPatch {
+                    status: Some("active".to_owned()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gated by"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Reconcile downgrades a gated dependent's execution to
+    /// `waiting_dependency` instead of `ready`. When the prereq
+    /// completes, a follow-up reconcile promotes it back to `ready`.
+    #[test]
+    fn dispatcher_holds_gated_dependents_in_waiting_dependency() {
+        let path = temp_db_path("deps-dispatcher");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        db.reconcile_product_executions(&product.id).unwrap();
+        let exec_a = db.list_executions(Some(&a.id)).unwrap().pop().unwrap();
+        assert_eq!(exec_a.status, "waiting_dependency");
+        let exec_b = db.list_executions(Some(&b.id)).unwrap().pop().unwrap();
+        assert_eq!(exec_b.status, "ready");
+
+        // Move B to done. Reconcile then promotes A's execution to ready.
+        db.update_work_item(
+            &b.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        let exec_a_after = db.list_executions(Some(&a.id)).unwrap().pop().unwrap();
+        assert_eq!(exec_a_after.status, "ready");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Explicit `RequestExecution` against a gated work item is
+    /// refused (Q8) — the user removes the edge or waits for the
+    /// prereq to complete.
+    #[test]
+    fn request_execution_refuses_gated_work_item() {
+        let path = temp_db_path("deps-req-gated");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: a.id.clone(),
+            prerequisite: b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        let err = db
+            .request_execution(RequestExecutionInput {
+                work_item_id: a.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gated by"), "unexpected error: {err}");
         let _ = std::fs::remove_file(path);
     }
 

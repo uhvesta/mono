@@ -232,6 +232,72 @@ fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemDependency> {
     })
 }
 
+/// Whether `status` counts as a "satisfied" prerequisite for the
+/// dependency rule (Q4 / Q10). Tasks and chores satisfy on `done`;
+/// projects also satisfy on `archived` (a wound-down project should
+/// not perpetually gate downstream work). The function is on `id`
+/// prefix because `tasks.kind` is not visible to callers that walk
+/// the edge table.
+pub fn status_satisfies(work_item_id: &str, status: &str) -> bool {
+    if work_item_id.starts_with("proj_") {
+        matches!(status, "done" | "archived")
+    } else {
+        status == "done"
+    }
+}
+
+/// Look up the current status of a work item in either `tasks` or
+/// `projects`. Returns `None` for unknown / soft-deleted ids; the
+/// caller decides whether that's an error or a "treat as satisfied"
+/// signal (a soft-deleted prereq has its edge dropped immediately,
+/// so this code path should rarely see one).
+pub fn lookup_work_item_status(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<String>> {
+    if work_item_id.starts_with("proj_") {
+        return conn
+            .query_row(
+                "SELECT status FROM projects WHERE id = ?1",
+                params![work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    if work_item_id.starts_with("task_") {
+        return conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    Ok(None)
+}
+
+/// Return the prerequisite ids that currently *gate* `work_item_id`
+/// — `blocks` edges whose prereq has not reached a satisfied
+/// status. Used by both the dispatcher (to demote a gated dependent
+/// to `waiting_dependency`) and the auto-block / unblock path.
+pub fn gating_prereqs_for(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Vec<String>> {
+    let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
+    let mut gating = Vec::new();
+    for edge in edges {
+        let status = lookup_work_item_status(conn, &edge.prerequisite_id)?;
+        match status {
+            Some(s) if status_satisfies(&edge.prerequisite_id, &s) => {}
+            _ => gating.push(edge.prerequisite_id),
+        }
+    }
+    Ok(gating)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
