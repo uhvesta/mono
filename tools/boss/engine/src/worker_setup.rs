@@ -10,7 +10,16 @@
 //! - `settings.json` — claude hooks config that wires every hook event
 //!   (`SessionStart` … `SessionEnd`) to the `boss-event` shim binary, so
 //!   the engine's events socket sees a structured stream of worker
-//!   activity.
+//!   activity. Also pins `permissions.defaultMode` to
+//!   `bypassPermissions` so the spawned claude session runs in auto
+//!   mode and does not block on tool-use prompts. The cube lease is
+//!   the security boundary for worker activity, so the soft "avoid
+//!   asking the human for permission" instruction in the system
+//!   prompt is reinforced here at the harness level. Project-local
+//!   `.claude/settings.json` overrides the user's global default
+//!   permission mode on a per-key basis, so a user whose global
+//!   setting is `default` (interactive) still gets a worker that
+//!   runs unattended.
 //! - `.gitignore` — single-pattern (`*`) gitignore that hides every
 //!   per-worker file the engine drops in `.claude/` (including the
 //!   `initial-prompt.txt` written by the runner) from `jj status` /
@@ -174,6 +183,18 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
     });
 
     serde_json::json!({
+        // Auto-mode for the worker pane. Workers are spawned inside a
+        // cube-leased workspace which is the sandbox; the engine's
+        // worker prompt already instructs claude not to ask for human
+        // permission, but that instruction is soft and cannot stop
+        // claude from blocking on a tool-use prompt if the harness
+        // permission mode is interactive. `bypassPermissions` is the
+        // shape that maps to claude's "auto mode" and lets the worker
+        // execute tool calls without prompting. Project-local
+        // settings override user-global per key, so this wins even
+        // when the human's `~/.claude/settings.json` defaults to
+        // interactive.
+        "permissions": { "defaultMode": "bypassPermissions" },
         "hooks": {
             "SessionStart":     [hook.clone()],
             "UserPromptSubmit": [hook.clone()],
@@ -340,6 +361,26 @@ mod tests {
                 "{hook_name} command missing BOSS_RUN_ID=<run_id>: {command}",
             );
         }
+    }
+
+    #[test]
+    fn settings_json_pins_permissions_default_mode_to_bypass() {
+        // Workers must spawn in claude's "auto mode" so the soft
+        // do-not-ask-the-human-for-permission instruction in the
+        // system prompt is enforced at the harness level — without
+        // this, a worker whose user has a global `default`
+        // permission mode hangs on the first tool call and the
+        // execution stalls until a human clicks yes. The cube lease
+        // is the security boundary, so bypassPermissions is the
+        // intended shape, not a policy violation.
+        let input = sample_input();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        assert_eq!(
+            parsed["permissions"]["defaultMode"],
+            serde_json::Value::String("bypassPermissions".into()),
+            "expected permissions.defaultMode == 'bypassPermissions', got: {parsed}",
+        );
     }
 
     #[test]
