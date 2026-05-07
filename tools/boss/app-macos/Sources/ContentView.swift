@@ -969,11 +969,13 @@ private struct WorkBoardCardView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
+        .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(borderColor, lineWidth: isSelected ? 2 : 1)
+                .fill(cardBackground)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(borderColor, lineWidth: isSelected ? 2 : 1)
+                )
         )
         .draggable(task.id)
     }
