@@ -639,6 +639,30 @@ impl ExecutionCoordinator {
             active: &self.scheduling_active,
         };
 
+        // Free-up redispatch: a work item that's still `active` (in
+        // the kanban Doing column) but whose latest execution is
+        // terminal has nothing the ready-queue scan below will pick
+        // up. The card just sits there until a human nudges it. Run
+        // a conservative scan now — only items with terminal/absent
+        // executions get a fresh `ready` row, so we never race a
+        // running or waiting_human execution that genuinely owns its
+        // worker. Startup recovery still owns the
+        // stale-`waiting_human`-after-crash path via
+        // reconcile_active_dispatch.
+        match self.work_db.redispatch_terminated_active_items() {
+            Ok(redispatched) if !redispatched.is_empty() => {
+                tracing::info!(
+                    count = redispatched.len(),
+                    ids = ?redispatched,
+                    "redispatched stranded active items on scheduler entry",
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(?err, "free-up redispatch scan failed; continuing");
+            }
+        }
+
         loop {
             let Some(execution) = self.next_ready_execution() else {
                 break;
@@ -2734,6 +2758,168 @@ mod tests {
             "force_dispatch must grow the pool by one slot",
         );
         assert_eq!(coordinator.worker_pool().idle_count().await, 0);
+    }
+
+    /// End-to-end: a chore that's already in the `active` (Doing)
+    /// column with a terminal `failed` execution must be picked up
+    /// and dispatched the next time the scheduler runs. This is the
+    /// "agent freed up while items waited in active" path the
+    /// auto-dispatch-on-free-up trigger is meant to drain — the kick
+    /// the runtime fires after `release_worker` lands here, and the
+    /// new redispatch step inside `run_scheduler` gets the stranded
+    /// chore moving without a human nudge.
+    #[tokio::test]
+    async fn scheduler_redispatches_active_chore_with_terminal_execution() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let stranded = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stranded".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        // Stage the "stuck in Doing with a terminal latest execution"
+        // shape directly: kanban status `active`, latest exec
+        // `failed`. No fresh ready row exists, so the scheduler's
+        // ready-queue scan would otherwise leave it untouched.
+        db.update_work_item(
+            &stranded.id,
+            crate::work::WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_execution(crate::work::CreateExecutionInput {
+            work_item_id: stranded.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("failed".to_owned()),
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            cube_repo_id: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            workspace_path: None,
+            priority: None,
+            preferred_workspace_id: None,
+            started_at: None,
+            finished_at: Some("2026-05-07T00:00:00Z".to_owned()),
+        })
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        coordinator.kick();
+
+        // Wait for the scheduler to insert a fresh ready exec and run
+        // it. Without the free-up redispatch this loop times out
+        // because list_ready_executions returns empty forever.
+        for _ in 0..200 {
+            let executions = db.list_executions(Some(&stranded.id)).unwrap();
+            if executions.iter().any(|e| e.status == "waiting_human") {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let executions = db.list_executions(Some(&stranded.id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            2,
+            "expected the original failed exec plus a fresh dispatched one, got {executions:#?}",
+        );
+        let latest = executions.last().unwrap();
+        assert_eq!(
+            latest.status, "waiting_human",
+            "fresh execution should have been dispatched and run to waiting_human",
+        );
+    }
+
+    /// Negative case: items whose latest execution is non-terminal
+    /// (the `running` worker, or a paused `waiting_human` slot) must
+    /// not be touched by the free-up redispatch path. Otherwise the
+    /// scheduler would race the live worker mid-spawn and end up
+    /// with two executions racing for the same item.
+    #[tokio::test]
+    async fn scheduler_leaves_running_active_items_alone_on_free_up() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        // Chore that's already running (active + execution=running).
+        let live = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Live".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.update_work_item(
+            &live.id,
+            crate::work::WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let live_exec = db
+            .create_execution(crate::work::CreateExecutionInput {
+                work_item_id: live.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("running".to_owned()),
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                cube_repo_id: Some("mono".to_owned()),
+                cube_lease_id: Some("lease-existing".to_owned()),
+                cube_workspace_id: Some("mono-agent-007".to_owned()),
+                workspace_path: Some("/tmp/mono-agent-007".to_owned()),
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: Some("2026-05-07T00:00:00Z".to_owned()),
+                finished_at: None,
+            })
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        coordinator.kick();
+
+        // Give the scheduler enough cycles to misbehave if it's
+        // going to. There's nothing for it to dispatch here; the
+        // running execution should stay exactly as-is.
+        sleep(Duration::from_millis(100)).await;
+
+        let executions = db.list_executions(Some(&live.id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "free-up redispatch must not double-create when latest exec is non-terminal, got {executions:#?}",
+        );
+        assert_eq!(executions[0].id, live_exec.id);
+        assert_eq!(executions[0].status, "running");
     }
 
     /// The pool-grow path is hard-capped at `MAX_WORKER_POOL_SIZE`

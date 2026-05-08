@@ -352,6 +352,88 @@ impl WorkDb {
         Ok(redispatched)
     }
 
+    /// Runtime counterpart of [`reconcile_active_dispatch`] that the
+    /// scheduler invokes each time it spins up. The startup reconcile
+    /// is aggressive — every non-terminal execution is treated as
+    /// stale because the engine has just rebooted and no workers are
+    /// alive — but inside a running engine we must not touch a
+    /// `running` / `waiting_human` execution that genuinely belongs to
+    /// a live worker, even momentarily, or we double-spawn.
+    ///
+    /// This variant therefore restricts itself to the "stranded"
+    /// shape: a work item whose `tasks.status = 'active'` but whose
+    /// latest execution is *terminal* (`completed` / `failed` /
+    /// `abandoned` / `cancelled`) or absent. Those are the cards
+    /// stuck in the Doing column with nothing the scheduler will
+    /// pick up — exactly the case the auto-dispatch-on-free-up
+    /// trigger needs to drain. Non-terminal executions are left
+    /// alone; the boot-time reconcile owns the
+    /// stale-`waiting_human`-after-crash recovery.
+    ///
+    /// Items are processed oldest-active-first (`tasks.updated_at
+    /// ASC, id ASC`) so the new ready rows the scheduler sees come
+    /// out FIFO with respect to the kanban transition that put each
+    /// card into Doing — fairer than insertion order when several
+    /// items have been waiting different amounts of time.
+    ///
+    /// Returns the work item ids that received a fresh ready
+    /// execution so the caller can log them.
+    pub fn redispatch_terminated_active_items(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let candidate_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM tasks
+                 WHERE status = 'active' AND deleted_at IS NULL
+                 ORDER BY updated_at ASC, id ASC",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut redispatched = Vec::new();
+        for work_item_id in candidate_ids {
+            // Conservative: only act when the latest execution is
+            // terminal (or there is none). Anything non-terminal —
+            // `ready`, `running`, `waiting_human`, `waiting_review`,
+            // `waiting_merge`, `waiting_dependency` — is left to the
+            // existing scheduler flow, the merge poller, or the
+            // startup reconcile, none of which we want to race here.
+            let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
+                Some(existing) => execution_status_is_terminal(&existing.status),
+                None => true,
+            };
+            if !needs_dispatch {
+                continue;
+            }
+            // Gated dependents (unmet `blocks` prereq) bail out of
+            // request_execution_in_tx_with_live_check with an error.
+            // Skip them silently — they'll get their ready row when
+            // their prereq finishes and reconcile_product_executions
+            // promotes them back to `ready`.
+            match request_execution_in_tx_with_live_check(
+                &tx,
+                RequestExecutionInput {
+                    work_item_id: work_item_id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| false,
+            ) {
+                Ok(_) => redispatched.push(work_item_id),
+                Err(err) => {
+                    tracing::debug!(
+                        %work_item_id,
+                        ?err,
+                        "skipping free-up redispatch (likely gated by an unmet prereq)",
+                    );
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(redispatched)
+    }
+
     /// Return the work item ids whose `tasks.status = 'active'` but
     /// whose latest execution is NOT in `running` (no live worker is
     /// currently driving the slot). Used by the dispatcher to surface
@@ -4372,6 +4454,209 @@ mod tests {
         );
         let latest = executions.last().unwrap();
         assert_eq!(latest.status, "ready");
+    }
+
+    /// `redispatch_terminated_active_items` is the runtime
+    /// counterpart that the scheduler invokes on every kick. It is
+    /// strictly more conservative than the startup reconcile: only
+    /// terminal/absent latest-executions are redispatched, every
+    /// non-terminal status is left intact (no `is_live` predicate
+    /// involvement) so a running execution mid-spawn cannot be
+    /// stomped.
+    #[test]
+    fn runtime_redispatch_creates_ready_for_terminated_active_chore() {
+        let path = temp_db_path("runtime-redispatch-terminal");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stuck chore".to_owned(),
+                description: None,
+                autostart: true,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("failed".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let redispatched = db.redispatch_terminated_active_items().unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            2,
+            "expected failed exec plus a fresh ready one"
+        );
+        let latest = executions.last().unwrap();
+        assert_eq!(latest.status, "ready");
+    }
+
+    /// `running` and `waiting_human` executions must be left alone by
+    /// the runtime free-up path. The startup reconcile is the right
+    /// place to catch stale non-terminals after a crash; doing it
+    /// here would race the live worker that actually owns the slot.
+    #[test]
+    fn runtime_redispatch_skips_active_with_non_terminal_execution() {
+        let path = temp_db_path("runtime-redispatch-non-terminal");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        for (name, status) in [
+            ("Running chore", "running"),
+            ("Paused chore", "waiting_human"),
+            ("Queued chore", "ready"),
+        ] {
+            let chore = db
+                .create_chore(CreateChoreInput {
+                    product_id: product.id.clone(),
+                    name: name.to_owned(),
+                    description: None,
+                    autostart: true,
+                })
+                .unwrap();
+            db.update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("active".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some(status.to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        let redispatched = db.redispatch_terminated_active_items().unwrap();
+        assert!(
+            redispatched.is_empty(),
+            "non-terminal executions must be left alone, got {redispatched:?}",
+        );
+    }
+
+    /// Items missing every execution row are also redispatched —
+    /// matches `reconcile_active_dispatch`. This is the "card
+    /// dragged into Doing while pool was full and the ready row got
+    /// abandoned by a concurrent reconcile" shape.
+    #[test]
+    fn runtime_redispatch_creates_ready_when_no_execution_exists() {
+        let path = temp_db_path("runtime-redispatch-absent");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Bare chore".to_owned(),
+                description: None,
+                autostart: false,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let redispatched = db.redispatch_terminated_active_items().unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].status, "ready");
+    }
+
+    /// FIFO: oldest active transition first. With several stranded
+    /// items the new ready rows must come out in `tasks.updated_at
+    /// ASC` order so the scheduler picks the earliest-stuck card
+    /// first.
+    #[test]
+    fn runtime_redispatch_orders_by_updated_at_ascending() {
+        let path = temp_db_path("runtime-redispatch-fifo");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let chore = db
+                .create_chore(CreateChoreInput {
+                    product_id: product.id.clone(),
+                    name: format!("Chore {index}"),
+                    description: None,
+                    autostart: true,
+                })
+                .unwrap();
+            // Staggered updated_at by sleeping a millisecond so the
+            // ORDER BY can resolve. now_string()'s resolution is
+            // sub-millisecond; a small sleep makes the sort
+            // deterministic.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            db.update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("active".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("failed".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+            ids.push(chore.id);
+        }
+
+        let redispatched = db.redispatch_terminated_active_items().unwrap();
+        assert_eq!(
+            redispatched, ids,
+            "expected oldest-active-first FIFO ordering",
+        );
     }
 
     /// Reconcile must NOT redispatch when a non-terminal execution
