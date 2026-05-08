@@ -3420,9 +3420,12 @@ fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<String>> {
 /// other than `blocked`, `done`, `archived`, and (b) it has at least
 /// one unmet gating prereq. No-op otherwise.
 ///
-/// Used by `add_dependency` (an edge that introduces a gating
-/// prereq) and by status cascades on a *prereq* moving away from a
-/// satisfied status.
+/// Used at edge-creation time (`add_dependency`): a brand-new edge
+/// that introduces a gating prereq must move its dependent to
+/// `blocked` so the kanban and dispatcher reflect the new gate.
+/// The reverse (cascade-on-prereq-regression) deliberately does NOT
+/// call this — see the comment on
+/// [`cascade_dependents_after_prereq_status_change`].
 fn maybe_engine_block_dependent(
     conn: &Connection,
     dependent_id: &str,
@@ -3448,6 +3451,12 @@ fn maybe_engine_block_dependent(
 /// there), and (c) no gating prereqs remain. The unblocked status
 /// is `todo` — the design's recommendation in Q4. Items that were
 /// manually blocked by a human are left alone.
+///
+/// Emits a `tracing::info!` line on each successful unblock so the
+/// chain `prereq → done → dependent unblocked` is visible after the
+/// fact in the engine log — without it, an auto-unblock that races
+/// past a sleeping observer is invisible and the next bug report
+/// degenerates into "did the cascade fire or not?".
 fn maybe_engine_unblock_dependent(
     conn: &Connection,
     dependent_id: &str,
@@ -3469,27 +3478,35 @@ fn maybe_engine_unblock_dependent(
         return Ok(());
     }
     write_engine_status(conn, dependent_id, "todo", now_epoch)?;
+    tracing::info!(
+        dependent_id,
+        "engine: auto-unblocked dependent — all gating prereqs satisfied",
+    );
     Ok(())
 }
 
-/// Walk every dependent of `prereq_id` and apply the appropriate
-/// auto-{block,unblock} cascade, depending on whether the prereq's
-/// new status is satisfying or not. Used after a status change on
-/// a prereq.
+/// Walk every `blocks` dependent of `prereq_id` and run the
+/// auto-unblock check when the prereq has just reached a satisfied
+/// status. Non-satisfying transitions (e.g. a prereq dragged from
+/// `done` back to `backlog`) intentionally do *not* re-block the
+/// dependent: a row that has already been unblocked may be running
+/// or in `in_review`, and yanking it back to `blocked` from under
+/// a worker would lose state. The dispatcher's `gating_prereqs_for`
+/// check is the safety net — a regressed prereq immediately re-gates
+/// any future dispatch of its dependents — so the cascade can stay
+/// purely additive.
 fn cascade_dependents_after_prereq_status_change(
     conn: &Connection,
     prereq_id: &str,
     new_prereq_status: &str,
     now_epoch: &str,
 ) -> Result<()> {
+    if !deps::status_satisfies(prereq_id, new_prereq_status) {
+        return Ok(());
+    }
     let dependents = deps::dependents_of(conn, prereq_id, Some("blocks"))?;
-    let satisfying = deps::status_satisfies(prereq_id, new_prereq_status);
     for edge in dependents {
-        if satisfying {
-            maybe_engine_unblock_dependent(conn, &edge.dependent_id, now_epoch)?;
-        } else {
-            maybe_engine_block_dependent(conn, &edge.dependent_id, now_epoch)?;
-        }
+        maybe_engine_unblock_dependent(conn, &edge.dependent_id, now_epoch)?;
     }
     Ok(())
 }
@@ -6580,6 +6597,262 @@ mod tests {
         };
         assert_eq!(t.status, "todo");
         assert_eq!(t.last_status_actor, "engine");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Multi-prereq case (case b in the auto-unblock spec): a
+    /// dependent with N gating prereqs auto-unblocks only after the
+    /// LAST one reaches `done`. Marking N-1 prereqs done must leave
+    /// the dependent in `blocked`; the final transition is what
+    /// flips it to `todo`. Without this, two-prereq chores would
+    /// kick off as soon as either side landed and start running on
+    /// half-finished context.
+    #[test]
+    fn dependent_stays_blocked_until_all_multi_prereqs_done() {
+        let path = temp_db_path("deps-cascade-multi-prereq");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let dependent = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let prereq_b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let prereq_c = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "C".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq_b.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq_c.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Sanity: dependent is auto-blocked by the engine because at
+        // least one prereq is still gating.
+        let blocked = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(t) = blocked else { panic!() };
+        assert_eq!(t.status, "blocked");
+        assert_eq!(t.last_status_actor, "engine");
+
+        // First prereq lands. The dependent must stay blocked
+        // because the second one is still gating.
+        db.update_work_item(
+            &prereq_b.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let still_blocked = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(t) = still_blocked else { panic!() };
+        assert_eq!(
+            t.status, "blocked",
+            "dependent must stay blocked while at least one prereq is still gating",
+        );
+        assert_eq!(t.last_status_actor, "engine");
+
+        // Last prereq lands. NOW the dependent flips to `todo`.
+        db.update_work_item(
+            &prereq_c.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let unblocked = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(t) = unblocked else { panic!() };
+        assert_eq!(t.status, "todo", "all prereqs done — dependent must auto-unblock");
+        assert_eq!(t.last_status_actor, "engine");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression case (case c in the auto-unblock spec): once a
+    /// dependent has been auto-unblocked, dragging the prereq
+    /// backwards out of `done` (e.g. someone realised it wasn't
+    /// done after all and moved it back to `backlog`/`todo`) must
+    /// NOT yank the dependent back to `blocked`. The dependent may
+    /// already be running or in `in_review`; re-blocking it would
+    /// lose state. The dispatcher's gating check is the safety net —
+    /// a regressed prereq immediately re-gates any future dispatch
+    /// of its dependents.
+    #[test]
+    fn prereq_regression_does_not_re_block_dependents() {
+        let path = temp_db_path("deps-cascade-regression");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let dependent = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Drive the prereq to `done` so the dependent auto-unblocks
+        // to `todo`.
+        db.update_work_item(
+            &prereq.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let unblocked = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(t) = unblocked else { panic!() };
+        assert_eq!(t.status, "todo");
+        assert_eq!(t.last_status_actor, "engine");
+
+        // Regression: prereq goes back to `backlog`. The dependent
+        // must stay where it is (`todo`), NOT slide back to
+        // `blocked`. The dispatcher will refuse to launch it via the
+        // separate `gating_prereqs_for` gate.
+        db.update_work_item(
+            &prereq.id,
+            WorkItemPatch {
+                status: Some("backlog".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let after_regression = db.get_work_item(&dependent.id).unwrap();
+        let WorkItem::Chore(t) = after_regression else { panic!() };
+        assert_eq!(
+            t.status, "todo",
+            "prereq regressing out of `done` must NOT yank the dependent back to `blocked`",
+        );
+        // The dispatcher gate must still see the regressed prereq as
+        // gating, so a future RequestExecution against the dependent
+        // is refused even though the kanban shows it in `todo`.
+        let conn = db.connect().unwrap();
+        let gating = deps::gating_prereqs_for(&conn, &dependent.id).unwrap();
+        assert_eq!(
+            gating, [prereq.id.clone()],
+            "regressed prereq must re-appear in gating_prereqs_for",
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Hardening case (case d in the auto-unblock spec): a cyclic
+    /// edge graph (only constructible by bypassing the engine's
+    /// `would_create_cycle` check, e.g. raw SQL) must not cause the
+    /// cascade to loop. The cascade walks `dependents_of` exactly
+    /// one step; recursion is the dispatcher's job, not the
+    /// transition cascade's. This test inserts a cycle directly
+    /// into the DB and confirms `mark_chore_pr_merged` returns
+    /// without spinning forever.
+    #[test]
+    fn cyclic_edges_do_not_loop_the_cascade() {
+        let path = temp_db_path("deps-cascade-cycle");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            })
+            .unwrap();
+        let a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "A".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "B".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+
+        // Insert both edges directly to bypass `would_create_cycle`
+        // and forge a 2-cycle. (The engine refuses to create this
+        // shape via `add_dependency`, but a corrupted DB or future
+        // schema change could still produce it; the cascade must be
+        // robust regardless.)
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_item_dependencies
+                (dependent_id, prerequisite_id, relation, created_at)
+             VALUES (?1, ?2, 'blocks', '0'), (?2, ?1, 'blocks', '0')",
+            rusqlite::params![a.id, b.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Drive B to `done` via the merge poller's path — the same
+        // entry point the production bug reported. Must return
+        // promptly; if the cascade looped, this would hang.
+        let updated = db.mark_chore_pr_merged(&b.id, "https://example.test/pr/1").unwrap();
+        assert!(
+            updated.is_some(),
+            "mark_chore_pr_merged should report a transition for the cycle prereq",
+        );
+        let b_after = db.get_work_item(&b.id).unwrap();
+        let WorkItem::Chore(t) = b_after else { panic!() };
+        assert_eq!(t.status, "done");
         let _ = std::fs::remove_file(path);
     }
 
