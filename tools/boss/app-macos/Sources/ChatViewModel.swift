@@ -1,18 +1,9 @@
 import Foundation
 
-struct PendingPermission: Identifiable {
-    let id: String
-    let agentId: String
-    let title: String
-}
-
 @MainActor
 final class ChatViewModel: ObservableObject {
     @Published var navigationMode: NavigationMode = .agents
-    @Published var agents: [Agent] = []
-    @Published var bossDraft: String = ""
     @Published var isConnected: Bool = false
-    @Published var pendingPermission: PendingPermission?
     @Published var products: [WorkProduct] = []
     @Published var projectsByProductID: [String: [WorkProject]] = [:] {
         didSet { invalidateWorkCache() }
@@ -71,32 +62,6 @@ final class ChatViewModel: ObservableObject {
     /// panel, ContentView root). Only the views that actually read
     /// live state subscribe to the store.
     let liveWorkerStates = LiveWorkerStateStore()
-
-    var bossAgent: Agent? {
-        agents.first { $0.isBoss }
-    }
-
-    var bossAgentID: String? {
-        bossAgent?.id
-    }
-
-    var isBossAgentSending: Bool {
-        bossAgent?.isSending ?? false
-    }
-
-    var isBossAgentBootstrapping: Bool {
-        guard let agentId = bossAgentID else { return false }
-        return bootstrappingBossAgentIDs.contains(agentId)
-    }
-
-    var bossBootstrapErrorMessage: String? {
-        guard let agentId = bossAgentID else { return nil }
-        return bossBootstrapErrorsByAgentID[agentId]
-    }
-
-    var isBossAgentReady: Bool {
-        bossAgent?.isReady ?? false
-    }
 
     var selectedProduct: WorkProduct? {
         guard let productID = currentSelectedProductID else { return nil }
@@ -207,11 +172,6 @@ final class ChatViewModel: ObservableObject {
     private var didStart = false
     private var didStartEngine = false
     private var hasConnectedOnce = false
-    private var pendingBossCreation = false
-    private var bootstrappingBossAgentIDs: Set<String> = []
-    private var bootstrappedBossAgentIDs: Set<String> = []
-    private var bossBootstrapErrorsByAgentID: [String: String] = [:]
-    private var permissionQueue: [PendingPermission] = []
     private var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
 
@@ -276,29 +236,6 @@ final class ChatViewModel: ObservableObject {
     deinit {
         processController.stop()
         engine.stop()
-    }
-
-    func createAgent(name: String? = nil, role: AgentRole = .standard) {
-        if role == .boss {
-            pendingBossCreation = true
-        }
-        engine.sendCreateAgent(name: name, role: role)
-    }
-
-    func ensureBossAgent() {
-        guard bossAgent == nil, !pendingBossCreation else { return }
-        createAgent(name: AgentRole.boss.title, role: .boss)
-    }
-
-    func sendBossDraft() {
-        guard let agentId = bossAgentID else { return }
-        guard isBossAgentReady else { return }
-        let trimmed = bossDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        mutateAgent(agentId) { $0.isSending = true }
-        engine.sendPrompt(agentId: agentId, text: bossPromptText(for: trimmed))
-        bossDraft = ""
     }
 
     func toggleBossPanelCollapsed() {
@@ -654,17 +591,6 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    func respondToPendingPermission(granted: Bool) {
-        guard let pending = pendingPermission else { return }
-        engine.sendPermissionResponse(agentId: pending.agentId, id: pending.id, granted: granted)
-        appendSystemMessage(
-            "[permission] \(granted ? "allowed" : "denied"): \(pending.title)",
-            agentId: pending.agentId
-        )
-        pendingPermission = nil
-        showNextPermissionIfNeeded()
-    }
-
     func refreshWork() {
         guard isConnected else { return }
         engine.sendListProducts()
@@ -686,9 +612,7 @@ final class ChatViewModel: ObservableObject {
         case .connected:
             isConnected = true
             hasConnectedOnce = true
-            pendingBossCreation = false
             engine.sendRegisterAppSession()
-            engine.sendListAgents()
             refreshWorkSubscriptions()
             engine.sendListProducts()
             engine.sendListWorkerLiveStates()
@@ -755,12 +679,6 @@ final class ChatViewModel: ObservableObject {
         case .disconnected:
             isConnected = false
             subscribedWorkTopics.removeAll()
-            bootstrappingBossAgentIDs.removeAll()
-            bootstrappedBossAgentIDs.removeAll()
-            bossBootstrapErrorsByAgentID.removeAll()
-            for i in agents.indices {
-                agents[i].isSending = false
-            }
         case .workInvalidated(let topic, let productId, _):
             if topic == "work.products" {
                 engine.sendListProducts()
@@ -834,74 +752,9 @@ final class ChatViewModel: ObservableObject {
             }
         case .workError(let message):
             workErrorMessage = message
-        case .agentCreated(let agent):
-            pendingBossCreation = pendingBossCreation && !agent.isBoss
-            if agent.isBoss {
-                bossBootstrapErrorsByAgentID[agent.id] = nil
-            }
-            upsertAgent(agent)
-        case .agentReady(let agentId):
-            mutateAgent(agentId) { $0.isReady = true }
-            startBossBootstrapIfNeeded(agentId: agentId)
-        case .agentList(let list):
-            pendingBossCreation = false
-            synchronizeAgents(with: list)
-            for agent in list {
-                mutateAgent(agent.id) { $0.isReady = true }
-                if agent.isBoss {
-                    startBossBootstrapIfNeeded(agentId: agent.id)
-                }
-            }
-            ensureBossAgent()
-        case .agentRemoved(let agentId):
-            agents.removeAll { $0.id == agentId }
-            bootstrappingBossAgentIDs.remove(agentId)
-            bootstrappedBossAgentIDs.remove(agentId)
-            bossBootstrapErrorsByAgentID[agentId] = nil
-        case .chunk(let agentId, _):
-            guard !isBossBootstrapping(agentId: agentId) else { return }
-            mutateAgent(agentId) { $0.isSending = true }
-        case .done(let agentId, let stopReason):
-            if isBossBootstrapping(agentId: agentId) {
-                completeBossBootstrap(agentId: agentId)
-                return
-            }
-            mutateAgent(agentId) { $0.isSending = false }
-            appendSystemMessage("[done] \(stopReason)", agentId: agentId)
-        case .toolCall(let agentId, let name, let status):
-            guard !isBossBootstrapping(agentId: agentId) else { return }
-            appendSystemMessage("[tool] \(name) (\(status))", agentId: agentId)
-        case .terminalStarted, .terminalOutput, .terminalDone:
-            // Live tool output is rendered by the libghostty worker pane;
-            // these wire events no longer drive any UI state on the model.
-            return
-        case .permissionRequest(let agentId, let id, let title):
-            guard !isBossBootstrapping(agentId: agentId) else {
-                if isExpectedBossBootstrapPermission(title: title) {
-                    engine.sendPermissionResponse(agentId: agentId, id: id, granted: true)
-                } else {
-                    completeBossBootstrap(
-                        agentId: agentId,
-                        error: "Boss bootstrap unexpectedly requested permission."
-                    )
-                }
-                return
-            }
-            enqueuePermission(agentId: agentId, id: id, title: title)
-        case .error(let agentId, let message):
-            if let agentId, isBossBootstrapping(agentId: agentId) {
-                completeBossBootstrap(agentId: agentId, error: message)
-                return
-            }
-            if let agentId {
-                mutateAgent(agentId) { $0.isSending = false }
-            }
+        case .error(let message):
             if shouldSuppressSocketStartupError(message) { return }
-            if let agentId {
-                appendSystemMessage("[error] \(message)", agentId: agentId, alwaysShow: true)
-            } else {
-                workErrorMessage = message
-            }
+            workErrorMessage = message
         case .workerLiveStatesList(let states):
             liveWorkerStates.update(states: states)
         }
@@ -962,198 +815,9 @@ final class ChatViewModel: ObservableObject {
         return message.hasPrefix("socket failed:") || message.hasPrefix("socket waiting:")
     }
 
-    private func agentIndex(_ agentId: String) -> Int? {
-        agents.firstIndex { $0.id == agentId }
-    }
-
-    private func upsertAgent(_ agent: Agent) {
-        if let index = agentIndex(agent.id) {
-            let existing = agents[index]
-            agents[index].name = agent.name
-            agents[index].role = agent.role
-            agents[index].isReady = existing.isReady || agent.isReady
-            return
-        }
-
-        agents.append(agent)
-        agents.sort { lhs, rhs in
-            if lhs.role != rhs.role {
-                return lhs.role == .boss
-            }
-            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-        }
-    }
-
-    private func synchronizeAgents(with incoming: [Agent]) {
-        let incomingIDs = Set(incoming.map(\.id))
-        agents.removeAll { !incomingIDs.contains($0.id) }
-        for agent in incoming {
-            upsertAgent(agent)
-        }
-    }
-
-    private func mutateAgent(_ agentId: String, _ body: (inout Agent) -> Void) {
-        guard let index = agentIndex(agentId) else { return }
-        body(&agents[index])
-    }
-
-    private func startBossBootstrapIfNeeded(agentId: String) {
-        guard bossAgentID == agentId || agents.contains(where: { $0.id == agentId && $0.isBoss }) else {
-            return
-        }
-        guard !bootstrappedBossAgentIDs.contains(agentId) else { return }
-        guard !bootstrappingBossAgentIDs.contains(agentId) else { return }
-
-        bootstrappingBossAgentIDs.insert(agentId)
-        bossBootstrapErrorsByAgentID[agentId] = nil
-        mutateAgent(agentId) { $0.isSending = true }
-        engine.sendPrompt(agentId: agentId, text: bossBootstrapPrompt())
-    }
-
-    private func completeBossBootstrap(agentId: String, error: String? = nil) {
-        bootstrappingBossAgentIDs.remove(agentId)
-        if let error {
-            bossBootstrapErrorsByAgentID[agentId] = error
-        } else {
-            bootstrappedBossAgentIDs.insert(agentId)
-            bossBootstrapErrorsByAgentID[agentId] = nil
-        }
-        mutateAgent(agentId) { $0.isSending = false }
-    }
-
-    private func isBossBootstrapping(agentId: String) -> Bool {
-        bootstrappingBossAgentIDs.contains(agentId)
-    }
-
-    private func isExpectedBossBootstrapPermission(title: String) -> Bool {
-        title.localizedCaseInsensitiveContains("boss reference")
-    }
-
-    private func bossPromptText(for userText: String) -> String {
-        """
-        <boss_ui_context>
-        \(bossRuntimeContext())
-        </boss_ui_context>
-
-        <user_request>
-        \(userText)
-        </user_request>
-        """
-    }
-
-    private func bossBootstrapPrompt() -> String {
-        """
-        This is hidden session bootstrap work for The Boss.
-
-        Before interacting with the user, run `boss reference --json --no-input` once and read it carefully. Treat that output as the authoritative Boss CLI reference for this session.
-
-        Rules:
-        - Do not use `boss ... --help` for syntax discovery during this bootstrap.
-        - Do not ask the user anything.
-        - Do not create or update any Boss work items.
-        - Do not inspect the repository.
-        - Your task is not complete until you have actually run the command and read its output.
-
-        After you have loaded the reference, reply with a very short acknowledgement.
-        """
-    }
-
-    private func bossRuntimeContext() -> String {
-        var lines: [String] = []
-
-        if let selectedProduct {
-            lines.append("current_product_id: \(selectedProduct.id)")
-            lines.append("current_product_name: \(selectedProduct.name)")
-            lines.append("current_product_slug: \(selectedProduct.slug)")
-            lines.append("current_product_status: \(selectedProduct.status)")
-            if let repoRemoteURL = selectedProduct.repoRemoteURL, !repoRemoteURL.isEmpty {
-                lines.append("current_product_repo: \(repoRemoteURL)")
-            }
-            if !selectedProduct.description.isEmpty {
-                lines.append(
-                    "current_product_description: \(bossContextSnippet(selectedProduct.description))"
-                )
-            }
-        } else {
-            lines.append("current_product: none_selected")
-            if !products.isEmpty {
-                lines.append("available_products:")
-                for product in products.prefix(8) {
-                    lines.append(
-                        "- \(product.name) [slug=\(product.slug), status=\(product.status)]"
-                    )
-                }
-                if products.count > 8 {
-                    lines.append("- ... and \(products.count - 8) more products")
-                }
-            }
-        }
-
-        if let selectedProject {
-            lines.append("current_project_filter: \(selectedProject.name)")
-            lines.append("current_project_filter_id: \(selectedProject.id)")
-        } else {
-            lines.append("current_project_filter: all_projects")
-        }
-
-        let projects = allProjectsForSelectedProduct
-        if projects.isEmpty {
-            lines.append("existing_projects: none")
-        } else {
-            lines.append("existing_projects:")
-            for project in projects.prefix(12) {
-                let taskCount = (tasksByProjectID[project.id] ?? []).count
-                var summary = "- \(project.name) [id=\(project.id), status=\(project.status), priority=\(project.priority), tasks=\(taskCount)]"
-                if !project.goal.isEmpty {
-                    summary += " goal=\(bossContextSnippet(project.goal))"
-                }
-                lines.append(summary)
-            }
-            if projects.count > 12 {
-                lines.append("- ... and \(projects.count - 12) more projects")
-            }
-        }
-
-        if let chores = currentSelectedProductID.flatMap({ choresByProductID[$0] }) {
-            lines.append("current_product_chore_count: \(chores.count)")
-        }
-
-        if let selectedTask {
-            lines.append("selected_work_item: \(selectedTask.name) [kind=\(selectedTask.kind), status=\(selectedTask.status)]")
-        }
-
-        lines.append("instruction: use this context when deciding whether work belongs in an existing project, should be represented as a chore, or should become a new project.")
-
-        return lines.joined(separator: "\n")
-    }
-
-    private func bossContextSnippet(_ text: String, limit: Int = 140) -> String {
-        let normalized = text
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalized.count > limit else { return normalized }
-        let end = normalized.index(normalized.startIndex, offsetBy: limit)
-        return normalized[..<end].trimmingCharacters(in: .whitespacesAndNewlines) + "..."
-    }
-
-    private func appendSystemMessage(_ text: String, agentId: String? = nil, alwaysShow: Bool = false) {
+    private func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {
         guard alwaysShow || showSystemMessages else { return }
-        let prefix = agentId.map { "[\($0)] " } ?? ""
-        FileHandle.standardError.write(Data("\(prefix)\(text)\n".utf8))
-    }
-
-    private func enqueuePermission(agentId: String, id: String, title: String) {
-        let request = PendingPermission(id: id, agentId: agentId, title: title)
-        if pendingPermission == nil {
-            pendingPermission = request
-        } else {
-            permissionQueue.append(request)
-        }
-    }
-
-    private func showNextPermissionIfNeeded() {
-        guard pendingPermission == nil, !permissionQueue.isEmpty else { return }
-        pendingPermission = permissionQueue.removeFirst()
+        FileHandle.standardError.write(Data("\(text)\n".utf8))
     }
 
     private func product(withID id: String) -> WorkProduct? {

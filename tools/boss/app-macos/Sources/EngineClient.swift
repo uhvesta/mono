@@ -86,18 +86,7 @@ enum EngineEvent {
     case projectTasksReordered(projectId: String, taskIds: [String])
     case workItemDeleted(id: String)
     case workError(message: String)
-    case agentCreated(agent: Agent)
-    case agentList(agents: [Agent])
-    case agentRemoved(agentId: String)
-    case chunk(agentId: String, text: String)
-    case done(agentId: String, stopReason: String)
-    case toolCall(agentId: String, name: String, status: String)
-    case terminalStarted(agentId: String, id: String, title: String, command: String, cwd: String?)
-    case terminalOutput(agentId: String, id: String, text: String)
-    case terminalDone(agentId: String, id: String, exitCode: Int?, signal: String?)
-    case permissionRequest(agentId: String, id: String, title: String)
-    case agentReady(agentId: String)
-    case error(agentId: String?, message: String)
+    case error(message: String)
     /// Snapshot of every allocated worker slot's live runtime state.
     /// Delivered both as a one-shot reply to
     /// `list_worker_live_states` and as a topic push on
@@ -113,19 +102,6 @@ final class EngineClient: @unchecked Sendable {
     private var connection: NWConnection?
     private var buffer = Data()
     private var shouldReconnect = false
-
-    /// Insertion-ordered list of agent ids with buffered chunk text
-    /// awaiting a MainActor hop. Confined to `queue`.
-    private var pendingChunkAgents: [String] = []
-    /// Per-agent buffered chunk text. Confined to `queue`.
-    private var pendingChunkText: [String: String] = [:]
-    /// Whether a 16ms flush is already scheduled. Confined to `queue`.
-    private var pendingChunkFlushScheduled = false
-    /// Flush cadence for buffered chunks — one display frame at 60Hz.
-    /// Non-chunk events flush synchronously regardless, so this only
-    /// caps how long pure-chunk streams can sit on the queue before
-    /// reaching the UI.
-    private static let chunkFlushInterval: DispatchTimeInterval = .milliseconds(16)
 
     init(socketPath: String) {
         self.socketPath = socketPath
@@ -160,13 +136,13 @@ final class EngineClient: @unchecked Sendable {
                 self.emit(.connected)
                 self.receiveNext()
             case .waiting(let error):
-                self.emit(.error(agentId: nil, message: "socket waiting: \(error.localizedDescription)"))
+                self.emit(.error(message: "socket waiting: \(error.localizedDescription)"))
                 self.connection = nil
                 connection.cancel()
                 self.emit(.disconnected)
                 self.scheduleReconnect()
             case .failed(let error):
-                self.emit(.error(agentId: nil, message: "socket failed: \(error.localizedDescription)"))
+                self.emit(.error(message: "socket failed: \(error.localizedDescription)"))
                 self.connection = nil
                 self.emit(.disconnected)
                 self.scheduleReconnect()
@@ -180,45 +156,6 @@ final class EngineClient: @unchecked Sendable {
         }
 
         connection.start(queue: queue)
-    }
-
-    func sendCreateAgent(name: String?, role: AgentRole = .standard) {
-        var payload: [String: Any] = [
-            "type": "create_agent",
-            "role": role.rawValue,
-        ]
-        if let name {
-            payload["name"] = name
-        }
-        sendLine(payload)
-    }
-
-    func sendListAgents() {
-        sendLine(["type": "list_agents"])
-    }
-
-    func sendRemoveAgent(agentId: String) {
-        sendLine([
-            "type": "remove_agent",
-            "agent_id": agentId,
-        ])
-    }
-
-    func sendPrompt(agentId: String, text: String) {
-        sendLine([
-            "type": "prompt",
-            "agent_id": agentId,
-            "text": text,
-        ])
-    }
-
-    func sendPermissionResponse(agentId: String, id: String, granted: Bool) {
-        sendLine([
-            "type": "permission_response",
-            "agent_id": agentId,
-            "id": id,
-            "granted": granted,
-        ])
     }
 
     func sendListProducts() {
@@ -475,7 +412,7 @@ final class EngineClient: @unchecked Sendable {
 
     private func sendLine(_ payload: [String: Any]) {
         guard let connection else {
-            emit(.error(agentId: nil, message: "engine connection is not established"))
+            emit(.error(message:"engine connection is not established"))
             return
         }
 
@@ -490,11 +427,11 @@ final class EngineClient: @unchecked Sendable {
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if let error {
-                    self.emit(.error(agentId: nil, message: "socket send failed: \(error.localizedDescription)"))
+                    self.emit(.error(message:"socket send failed: \(error.localizedDescription)"))
                 }
             })
         } catch {
-            emit(.error(agentId: nil, message: "failed to encode payload: \(error.localizedDescription)"))
+            emit(.error(message:"failed to encode payload: \(error.localizedDescription)"))
         }
     }
 
@@ -504,7 +441,7 @@ final class EngineClient: @unchecked Sendable {
             guard let self else { return }
 
             if let error {
-                self.emit(.error(agentId: nil, message: "socket receive failed: \(error.localizedDescription)"))
+                self.emit(.error(message:"socket receive failed: \(error.localizedDescription)"))
                 self.connection = nil
                 self.emit(.disconnected)
                 self.scheduleReconnect()
@@ -540,11 +477,9 @@ final class EngineClient: @unchecked Sendable {
                 let payload = envelope["payload"] as? [String: Any],
                 let type = payload["type"] as? String
             else {
-                emit(.error(agentId: nil, message: "received invalid JSON message from engine"))
+                emit(.error(message:"received invalid JSON message from engine"))
                 continue
             }
-
-            let agentId = payload["agent_id"] as? String
 
             switch type {
             case "topic_event":
@@ -570,7 +505,7 @@ final class EngineClient: @unchecked Sendable {
                 guard let productPayload = payload["product"] as? [String: Any],
                       let product = parseProduct(productPayload)
                 else {
-                    emit(.error(agentId: nil, message: "received invalid work tree payload from engine"))
+                    emit(.error(message:"received invalid work tree payload from engine"))
                     break
                 }
                 let projects = (payload["projects"] as? [[String: Any]] ?? []).compactMap(parseProject)
@@ -592,7 +527,7 @@ final class EngineClient: @unchecked Sendable {
                 guard let itemPayload = payload["item"] as? [String: Any],
                       let item = parseWorkItem(itemPayload)
                 else {
-                    emit(.error(agentId: nil, message: "received invalid work item payload from engine"))
+                    emit(.error(message: "received invalid work item payload from engine"))
                     break
                 }
                 emit(.workItemCreated(item: item))
@@ -600,7 +535,7 @@ final class EngineClient: @unchecked Sendable {
                 guard let itemPayload = payload["item"] as? [String: Any],
                       let item = parseWorkItem(itemPayload)
                 else {
-                    emit(.error(agentId: nil, message: "received invalid work item payload from engine"))
+                    emit(.error(message: "received invalid work item payload from engine"))
                     break
                 }
                 emit(.workItemUpdated(item: item))
@@ -617,60 +552,9 @@ final class EngineClient: @unchecked Sendable {
             case "work_error":
                 let message = payload["message"] as? String ?? "unknown work error"
                 emit(.workError(message: message))
-            case "agent_created":
-                guard let agent = parseAgent(payload) else {
-                    emit(.error(agentId: nil, message: "received invalid agent payload from engine"))
-                    break
-                }
-                emit(.agentCreated(agent: agent))
-            case "agent_ready":
-                emit(.agentReady(agentId: agentId ?? ""))
-            case "agent_list":
-                let agents = (payload["agents"] as? [[String: Any]] ?? []).compactMap {
-                    parseAgent($0, isReady: true)
-                }
-                emit(.agentList(agents: agents))
-            case "agent_removed":
-                emit(.agentRemoved(agentId: agentId ?? ""))
-            case "chunk":
-                if let text = payload["text"] as? String, let aid = agentId {
-                    emit(.chunk(agentId: aid, text: text))
-                }
-            case "done":
-                let stopReason = payload["stop_reason"] as? String ?? "unknown"
-                emit(.done(agentId: agentId ?? "", stopReason: stopReason))
-            case "tool_call":
-                let name = payload["name"] as? String ?? "tool"
-                let status = payload["status"] as? String ?? "update"
-                emit(.toolCall(agentId: agentId ?? "", name: name, status: status))
-            case "terminal_started":
-                let id = payload["id"] as? String ?? UUID().uuidString
-                let title = payload["title"] as? String ?? "Terminal"
-                let command = payload["command"] as? String ?? ""
-                let cwd = payload["cwd"] as? String
-                emit(.terminalStarted(agentId: agentId ?? "", id: id, title: title, command: command, cwd: cwd))
-            case "terminal_output":
-                let id = payload["id"] as? String ?? ""
-                let text = payload["text"] as? String ?? ""
-                guard !id.isEmpty, !text.isEmpty else {
-                    break
-                }
-                emit(.terminalOutput(agentId: agentId ?? "", id: id, text: text))
-            case "terminal_done":
-                let id = payload["id"] as? String ?? ""
-                guard !id.isEmpty else {
-                    break
-                }
-                let exitCode = (payload["exit_code"] as? NSNumber)?.intValue
-                let signal = payload["signal"] as? String
-                emit(.terminalDone(agentId: agentId ?? "", id: id, exitCode: exitCode, signal: signal))
-            case "permission_request":
-                let id = payload["id"] as? String ?? ""
-                let title = payload["title"] as? String ?? "Permission"
-                emit(.permissionRequest(agentId: agentId ?? "", id: id, title: title))
             case "error":
                 let message = payload["message"] as? String ?? "unknown engine error"
-                emit(.error(agentId: agentId, message: message))
+                emit(.error(message: message))
             case "app_session_registered":
                 emit(.appSessionRegistered)
             case "engine_request":
@@ -679,7 +563,7 @@ final class EngineClient: @unchecked Sendable {
                     let request = payload["request"] as? [String: Any],
                     let kind = request["kind"] as? String
                 else {
-                    emit(.error(agentId: nil, message: "engine_request missing required fields"))
+                    emit(.error(message:"engine_request missing required fields"))
                     break
                 }
                 switch kind {
@@ -730,7 +614,7 @@ final class EngineClient: @unchecked Sendable {
                         request: .interruptWorkerPane(slotId: slotId)
                     ))
                 default:
-                    emit(.error(agentId: nil, message: "engine_request unknown kind: \(kind)"))
+                    emit(.error(message:"engine_request unknown kind: \(kind)"))
                 }
             case "worker_live_states_list":
                 let raw = payload["states"] as? [[String: Any]] ?? []
@@ -743,75 +627,9 @@ final class EngineClient: @unchecked Sendable {
     }
 
     private func emit(_ event: EngineEvent) {
-        // Coalesce consecutive `chunk` events for the same agent into a
-        // single MainActor hop. A high-frequency Claude stream can push
-        // dozens of chunks per second; without batching each one would
-        // allocate its own `Task { @MainActor in ... }`. Non-chunk
-        // events still hop immediately so UI state transitions
-        // (live_states, hook events, tool calls, done, etc.) stay
-        // responsive.
-        if case .chunk(let agentId, let text) = event {
-            bufferChunk(agentId: agentId, text: text)
-            return
-        }
-
-        // Drain any buffered chunks first so they reach the main actor
-        // ahead of this event, preserving the engine's emission order.
-        let drained = drainPendingChunks()
         Task { @MainActor in
-            for chunk in drained {
-                self.onEvent?(.chunk(agentId: chunk.agentId, text: chunk.text))
-            }
             self.onEvent?(event)
         }
-    }
-
-    private struct PendingChunk {
-        let agentId: String
-        let text: String
-    }
-
-    private func bufferChunk(agentId: String, text: String) {
-        if pendingChunkText[agentId] == nil {
-            pendingChunkAgents.append(agentId)
-            pendingChunkText[agentId] = text
-        } else {
-            pendingChunkText[agentId, default: ""].append(text)
-        }
-        schedulePendingChunkFlush()
-    }
-
-    private func schedulePendingChunkFlush() {
-        guard !pendingChunkFlushScheduled else { return }
-        pendingChunkFlushScheduled = true
-        queue.asyncAfter(deadline: .now() + Self.chunkFlushInterval) { [weak self] in
-            self?.flushPendingChunksFromTimer()
-        }
-    }
-
-    private func flushPendingChunksFromTimer() {
-        pendingChunkFlushScheduled = false
-        let drained = drainPendingChunks()
-        guard !drained.isEmpty else { return }
-        Task { @MainActor in
-            for chunk in drained {
-                self.onEvent?(.chunk(agentId: chunk.agentId, text: chunk.text))
-            }
-        }
-    }
-
-    private func drainPendingChunks() -> [PendingChunk] {
-        guard !pendingChunkAgents.isEmpty else { return [] }
-        var drained: [PendingChunk] = []
-        drained.reserveCapacity(pendingChunkAgents.count)
-        for agentId in pendingChunkAgents {
-            if let text = pendingChunkText[agentId] {
-                drained.append(PendingChunk(agentId: agentId, text: text))
-            }
-        }
-        pendingChunkAgents.removeAll(keepingCapacity: true)
-        pendingChunkText.removeAll(keepingCapacity: true)
-        return drained
     }
 
     private func scheduleReconnect() {
@@ -942,17 +760,6 @@ final class EngineClient: @unchecked Sendable {
         )
     }
 
-    private func parseAgent(_ payload: [String: Any], isReady: Bool = false) -> Agent? {
-        guard let id = payload["agent_id"] as? String,
-              let name = payload["name"] as? String
-        else {
-            return nil
-        }
-
-        let rawRole = payload["role"] as? String ?? AgentRole.standard.rawValue
-        let role = AgentRole(rawValue: rawRole) ?? .standard
-        return Agent(id: id, name: name, role: role, isReady: isReady)
-    }
 
     private func parseWorkItem(_ payload: [String: Any]) -> WorkItemPayload? {
         guard let itemType = payload["item_type"] as? String else {

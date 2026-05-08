@@ -5,15 +5,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::coordinator::MAX_WORKER_POOL_SIZE;
 
-const DEFAULT_ACP_COMMAND: &str = "npx -y @zed-industries/claude-code-acp@0.16.1";
 const DEFAULT_CUBE_COMMAND: &str = "bazel run //tools/cube:cube --";
-
-#[derive(Debug, Clone)]
-pub struct AcpConfig {
-    pub anthropic_api_key: Option<String>,
-    pub command: String,
-    pub args: Vec<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct CubeConfig {
@@ -58,7 +50,7 @@ impl WorkConfig {
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    pub acp: AcpConfig,
+    pub anthropic_api_key: Option<String>,
     pub cube: CubeConfig,
     pub cwd: PathBuf,
 }
@@ -67,46 +59,19 @@ impl AgentConfig {
     pub fn load_from_env(work: &WorkConfig) -> Result<Self> {
         let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").ok();
 
-        let (acp_command, acp_args) = parse_command_line(
-            "BOSS_ACP_CMD",
-            std::env::var("BOSS_ACP_CMD").unwrap_or_else(|_| DEFAULT_ACP_COMMAND.to_owned()),
-        )?;
         let (cube_command, cube_args) = parse_command_line(
             "BOSS_CUBE_CMD",
             std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| DEFAULT_CUBE_COMMAND.to_owned()),
         )?;
 
         Ok(Self {
-            acp: AcpConfig {
-                anthropic_api_key,
-                command: acp_command,
-                args: acp_args,
-            },
+            anthropic_api_key,
             cube: CubeConfig {
                 command: cube_command,
                 args: cube_args,
             },
             cwd: work.cwd.clone(),
         })
-    }
-
-    pub fn preflight_acp(&self) -> Result<()> {
-        if self.acp.command.contains('/') {
-            let candidate = PathBuf::from(&self.acp.command);
-            if !candidate.exists() {
-                bail!("ACP command does not exist: {}", candidate.display());
-            }
-            return Ok(());
-        }
-
-        which::which(&self.acp.command).with_context(|| {
-            format!(
-                "ACP command not found on PATH: {} (set BOSS_ACP_CMD to override)",
-                self.acp.command
-            )
-        })?;
-
-        Ok(())
     }
 }
 

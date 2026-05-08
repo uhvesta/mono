@@ -35,17 +35,10 @@ ANTHROPIC_API_KEY=... bazel run //tools/boss/app-macos:Boss
 By default the app launches:
 
 ```bash
-bazel run //tools/boss/engine:engine -- --mode=server --socket-path /tmp/boss-engine.sock
+bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-engine.sock
 ```
 
-By default, the engine uses:
-
-```bash
-npx -y @zed-industries/claude-code-acp@0.16.1
-```
-
-The engine runs from the workspace root and prefers `NVM_BIN` on `PATH` when
-spawning the ACP adapter.
+The engine runs from the workspace root.
 
 When auto-start is enabled, the app will:
 
@@ -58,7 +51,7 @@ When auto-start is enabled, the app will:
 Disable auto-start and point the app to an existing socket:
 
 ```bash
-ANTHROPIC_API_KEY=... bazel run //tools/boss/engine:engine -- --mode=server --socket-path /tmp/boss-engine.sock
+ANTHROPIC_API_KEY=... bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-engine.sock
 ```
 
 ```bash
@@ -77,7 +70,7 @@ BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools
 - `BOSS_ENGINE_LOG_PATH`: log file path (default `/tmp/boss-engine.log`)
 - `BOSS_ENGINE_AUDIT_PATH`: audit log file path (default
   `~/Library/Application Support/Boss/engine-audit.log`)
-- `RUST_LOG`: tracing filter for engine logs (default `info,acp_stderr=debug`)
+- `RUST_LOG`: tracing filter for engine logs (default `info`)
 
 ## Forensic / audit log
 

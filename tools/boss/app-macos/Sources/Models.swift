@@ -1,40 +1,5 @@
 import Foundation
 
-enum AgentRole: String {
-    case standard
-    case boss
-
-    var title: String {
-        switch self {
-        case .standard:
-            return "Agent"
-        case .boss:
-            return "Picard"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .standard:
-            return "person.circle"
-        case .boss:
-            return "person.crop.circle.badge.checkmark"
-        }
-    }
-}
-
-struct Agent: Identifiable {
-    let id: String
-    var name: String
-    var role: AgentRole = .standard
-    var isReady: Bool = false
-    var isSending: Bool = false
-
-    var isBoss: Bool {
-        role == .boss
-    }
-}
-
 enum NavigationMode: String, CaseIterable, Identifiable {
     case agents = "Agents"
     case work = "Work"

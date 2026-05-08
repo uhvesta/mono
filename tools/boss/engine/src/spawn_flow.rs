@@ -13,10 +13,8 @@
 //!    events from the boss-event shim can be correlated back to the
 //!    run via the registry's ancestor walk.
 //!
-//! This module is just the helper. Replacing `AcpExecutionRunner` with
-//! a pane-driven runner that calls into it is left as a follow-up —
-//! the run-lifecycle question (*when does a pane-driven run end?*)
-//! needs more design before it ships.
+//! This module is just the helper; the pane-driven runner that drives
+//! it lives in `runner::PaneSpawnRunner`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;

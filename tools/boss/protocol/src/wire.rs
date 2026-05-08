@@ -30,14 +30,6 @@ pub fn probe_topic(run_id: &str) -> String {
     format!("probes.{run_id}")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentRole {
-    #[default]
-    Standard,
-    Boss,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendRequestEnvelope {
     pub request_id: String,
@@ -204,24 +196,6 @@ pub enum FrontendRequest {
     },
     GetAttentionItem {
         id: String,
-    },
-    CreateAgent {
-        name: Option<String>,
-        #[serde(default)]
-        role: AgentRole,
-    },
-    ListAgents,
-    RemoveAgent {
-        agent_id: String,
-    },
-    Prompt {
-        agent_id: String,
-        text: String,
-    },
-    PermissionResponse {
-        agent_id: String,
-        id: String,
-        granted: bool,
     },
     /// App self-identifies as the singleton app session. The engine
     /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
@@ -455,58 +429,7 @@ pub enum FrontendEvent {
     WorkError {
         message: String,
     },
-    AgentCreated {
-        agent_id: String,
-        name: String,
-        role: AgentRole,
-    },
-    AgentReady {
-        agent_id: String,
-    },
-    AgentList {
-        agents: Vec<AgentInfo>,
-    },
-    AgentRemoved {
-        agent_id: String,
-    },
-    Chunk {
-        agent_id: String,
-        text: String,
-    },
-    Done {
-        agent_id: String,
-        stop_reason: String,
-    },
-    ToolCall {
-        agent_id: String,
-        name: String,
-        status: String,
-    },
-    TerminalStarted {
-        agent_id: String,
-        id: String,
-        title: String,
-        command: String,
-        cwd: Option<String>,
-    },
-    TerminalOutput {
-        agent_id: String,
-        id: String,
-        text: String,
-    },
-    TerminalDone {
-        agent_id: String,
-        id: String,
-        exit_code: Option<i64>,
-        signal: Option<String>,
-    },
-    PermissionRequest {
-        agent_id: String,
-        id: String,
-        title: String,
-    },
     Error {
-        agent_id: Option<String>,
         message: String,
     },
     /// Engine confirms the calling session is now the registered app
@@ -662,14 +585,6 @@ pub struct WorkspacePoolEntry {
     /// workspace is idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentInfo {
-    pub agent_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub role: AgentRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

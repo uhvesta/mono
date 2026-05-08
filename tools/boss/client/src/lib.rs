@@ -386,11 +386,7 @@ fn non_empty_env(name: &str) -> Option<String> {
 }
 
 fn default_engine_args(socket_path: &str) -> Vec<String> {
-    vec![
-        "--mode=server".to_owned(),
-        "--socket-path".to_owned(),
-        socket_path.to_owned(),
-    ]
+    vec!["--socket-path".to_owned(), socket_path.to_owned()]
 }
 
 fn sibling_engine_binary(exe: &Path) -> Option<(String, PathBuf)> {
@@ -498,11 +494,7 @@ mod tests {
         assert_eq!(cmd.program, "/explicit/engine");
         assert_eq!(
             cmd.args,
-            vec![
-                "--mode=server".to_owned(),
-                "--socket-path".to_owned(),
-                "/tmp/sock".to_owned(),
-            ]
+            vec!["--socket-path".to_owned(), "/tmp/sock".to_owned(),]
         );
         assert_eq!(cmd.source, "BOSS_ENGINE_BIN env var");
     }

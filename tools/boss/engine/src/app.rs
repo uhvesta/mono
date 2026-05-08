@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -9,8 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, oneshot};
 
-use crate::acp::{AcpClient, AcpEvent};
-use crate::cli::{Cli, Mode};
+use crate::cli::Cli;
 use crate::completion::{
     CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
@@ -22,13 +20,11 @@ use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::protocol::{
-    AgentInfo, AgentRole, EngineToAppError, EngineToAppRequest, EngineToAppResponse,
-    FocusWorkerPaneInput, FrontendEvent, FrontendEventEnvelope, FrontendRequest,
-    FrontendRequestEnvelope, InterruptWorkerPaneInput, ReleaseWorkerPaneInput, SendToPaneInput,
-    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic,
-    probe_topic, work_product_topic,
+    EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
+    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, InterruptWorkerPaneInput,
+    ReleaseWorkerPaneInput, SendToPaneInput, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES,
+    TopicEventPayload, execution_topic, probe_topic, work_product_topic,
 };
-use crate::runner::AcpExecutionRunner;
 use crate::work::{Task, WorkDb, WorkItem};
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -36,45 +32,6 @@ use tokio::time::{Duration, timeout};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
-const BOSS_AGENT_NAME: &str = "The Boss";
-const BOSS_AGENT_SYSTEM_PROMPT: &str = r#"You are The Boss, the overall coordinator and primary interface with the user inside Boss.
-
-Your role is to coordinate work and keep Boss's representation of work accurate.
-
-You may use the `boss` CLI to create and update products, projects, tasks, and chores when the user explicitly asks for that work or when it is strongly implied by the request. Prefer non-interactive CLI usage when possible. Infer the most likely work item shape yourself. Ask a concise clarifying question only when you truly cannot infer a usable product or the request is impossible to place without more information.
-
-If a user request looks like implementation work, bug fixing, feature work, cleanup, follow-up work, or investigation that might turn into a task or project, do not inspect the repository or perform detailed technical analysis before capturing it in Boss. Queue the work first.
-
-Treat investigation, scoping, and discovery as work items for another agent. If the user asks to investigate something, or if investigation is the obvious next step, create an investigation task or project instead of doing the investigation yourself.
-
-When work is strongly implied, bias toward creating the appropriate Boss work item quickly, even if some implementation details are still unknown. If you are uncertain, make the best inference and create the item anyway rather than asking the user to choose the type.
-
-Use the current Boss UI context, especially the current product and its existing projects, when deciding how to represent work.
-
-When you need authoritative Boss CLI syntax or selector/status rules, use `boss reference --json --no-input`. Treat that output as the current source of truth for this build. Do not use `boss ... --help` for syntax discovery unless `boss reference` is unavailable.
-
-Routing rules:
-- If there is a current selected product, use that product by default unless the user clearly names a different product.
-- If the request clearly fits an existing project, create a task in that project instead of creating a new project or a chore.
-- If the request does not fit an existing project and seems small, self-contained, operational, or maintenance-oriented, create a chore.
-- If the request does not fit an existing project and seems broad, ambiguous, exploratory, or likely to require multiple stages or multiple tasks, create a project.
-- If the request is to investigate something and that investigation belongs under an existing project, create an investigation task in that project. Otherwise, prefer a new project when the investigation is broad or likely to branch into multiple follow-up tasks.
-- If you are deciding between chore and project and both seem plausible, default to chore unless the work clearly looks multi-stage, broad, or exploratory.
-- If you are deciding whether a small fix belongs in an existing project and there is no obvious fit, default to chore.
-- Do not ask the user whether something should be a task, chore, or project when a reasonable inference is available. It is acceptable to be wrong because the work can be moved later.
-
-Do not make direct implementation changes yourself. Do not edit code, modify files, or carry out the underlying work directly unless the user explicitly overrides this rule. Instead, act as the coordinator of the work and the steward of its representation in Boss.
-
-After creating a work item, the Boss engine auto-dispatches a worker on it. Do not ask the user whether to dispatch a worker now or leave it in the backlog — that question is always redundant. Do not append generic follow-ups like "Want me to dispatch a worker on it now, or leave it in the backlog?". A successful creation reply should simply state that the item was queued (id and status) and stop. Only surface a follow-up when there is a specifically-actionable issue: dispatch failed, configuration is missing, a sequencing or dependency decision is needed, or the user genuinely has to choose between concrete options. Never invent a follow-up question for the sake of offering one.
-
-Default behavior:
-- clarify goals and scope,
-- queue likely work immediately, including investigation work,
-- ask only when you cannot reasonably infer the destination product or representation,
-- use the current product and existing project context before choosing task, chore, or project,
-- avoid repo inspection and detailed technical analysis before the work is queued,
-- keep status and structure accurate,
-- suggest or assign implementation and investigation work rather than doing it yourself."#;
 
 #[async_trait]
 impl crate::spawn_flow::WorkerSpawner for ServerState {
@@ -223,130 +180,8 @@ impl Drop for PidFileGuard {
     }
 }
 
-struct Agent {
-    id: String,
-    name: String,
-    role: AgentRole,
-    acp_client: Arc<AcpClient>,
-    session_id: String,
-    prompt_lock: Arc<Mutex<()>>,
-    system_prompt: Option<String>,
-}
-
-struct AgentRegistry {
-    agents: Mutex<HashMap<String, Agent>>,
-    next_id: AtomicU64,
-    cfg: Arc<RuntimeConfig>,
-}
-
-impl AgentRegistry {
-    fn new(cfg: Arc<RuntimeConfig>) -> Self {
-        Self {
-            agents: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            cfg,
-        }
-    }
-
-    fn allocate_agent(&self, name: Option<String>, role: AgentRole) -> (String, String, AgentRole) {
-        let id = format!("agent-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let name = match role {
-            AgentRole::Boss => name.unwrap_or_else(|| BOSS_AGENT_NAME.to_owned()),
-            AgentRole::Standard => name
-                .unwrap_or_else(|| format!("Agent {}", id.strip_prefix("agent-").unwrap_or(&id))),
-        };
-        (id, name, role)
-    }
-
-    async fn initialize_agent(&self, id: &str, name: &str, role: AgentRole) -> Result<()> {
-        let acp_client = Arc::new(AcpClient::connect_with_external_permissions(&self.cfg).await?);
-        acp_client.initialize().await?;
-        let session_id = acp_client.new_session(&self.cfg.work.cwd).await?;
-        let system_prompt = system_prompt_for_role(role);
-
-        tracing::info!(
-            agent_id = %id,
-            name = %name,
-            ?role,
-            session_id = %session_id,
-            "agent ready"
-        );
-
-        let agent = Agent {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            role,
-            acp_client,
-            session_id,
-            prompt_lock: Arc::new(Mutex::new(())),
-            system_prompt,
-        };
-
-        self.agents.lock().await.insert(id.to_owned(), agent);
-        Ok(())
-    }
-
-    async fn remove_agent(&self, agent_id: &str) -> Result<()> {
-        let removed = self.agents.lock().await.remove(agent_id);
-        if removed.is_none() {
-            bail!("unknown agent: {agent_id}");
-        }
-        tracing::info!(agent_id = %agent_id, "agent removed");
-        Ok(())
-    }
-
-    async fn list_agents(&self) -> Vec<AgentInfo> {
-        self.agents
-            .lock()
-            .await
-            .values()
-            .map(|agent| AgentInfo {
-                agent_id: agent.id.clone(),
-                name: agent.name.clone(),
-                role: agent.role,
-            })
-            .collect()
-    }
-
-    async fn get_acp_and_session(
-        &self,
-        agent_id: &str,
-    ) -> Result<(Arc<AcpClient>, String, Arc<Mutex<()>>, Option<String>)> {
-        let agents = self.agents.lock().await;
-        let agent = agents
-            .get(agent_id)
-            .with_context(|| format!("unknown agent: {agent_id}"))?;
-        Ok((
-            agent.acp_client.clone(),
-            agent.session_id.clone(),
-            agent.prompt_lock.clone(),
-            agent.system_prompt.clone(),
-        ))
-    }
-}
-
-fn system_prompt_for_role(role: AgentRole) -> Option<String> {
-    match role {
-        AgentRole::Standard => None,
-        AgentRole::Boss => Some(BOSS_AGENT_SYSTEM_PROMPT.to_owned()),
-    }
-}
-
-fn compose_agent_prompt(system_prompt: Option<&str>, user_text: &str) -> String {
-    match system_prompt {
-        // The current ACP prompt surface is plain text only, so role-specific
-        // instructions are wrapped into each prompt instead of being sent over
-        // a dedicated system channel.
-        Some(system_prompt) => {
-            format!("<system>\n{system_prompt}\n</system>\n\n<user>\n{user_text}\n</user>")
-        }
-        None => user_text.to_owned(),
-    }
-}
-
 struct ServerState {
     work_db: Arc<WorkDb>,
-    agent_registry: Arc<AgentRegistry>,
     execution_coordinator: Arc<ExecutionCoordinator>,
     completion_handler: Arc<WorkerCompletionHandler>,
     /// Direct handle to the cube client, used by control verbs that
@@ -588,7 +423,6 @@ impl ServerState {
 
             ServerState {
                 work_db,
-                agent_registry: Arc::new(AgentRegistry::new(cfg.clone())),
                 execution_coordinator,
                 completion_handler,
                 cube_client: cube_client_for_state,
@@ -1515,46 +1349,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         "starting boss-engine runtime",
     );
 
-    match cli.mode {
-        Mode::Cli => run_cli(cli, cfg).await,
-        Mode::Server => run_server(cli, cfg).await,
-    }
-}
-
-async fn run_cli(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
-    let agent = cfg.agent()?;
-    agent.preflight_acp()?;
-    let acp = AcpClient::connect(&cfg).await?;
-    acp.initialize().await?;
-    let session_id = acp.new_session(&cfg.work.cwd).await?;
-
-    println!("Connected to ACP adapter. Session: {session_id}");
-
-    if let Some(prompt) = cli.prompt {
-        run_prompt(&acp, &session_id, &prompt).await?;
-        return Ok(());
-    }
-
-    println!("Enter a prompt (Ctrl-D to exit):");
-    print!("> ");
-    std::io::stdout().flush()?;
-
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
-        let prompt = line.trim();
-        if prompt.is_empty() {
-            print!("> ");
-            std::io::stdout().flush()?;
-            continue;
-        }
-
-        run_prompt(&acp, &session_id, prompt).await?;
-        println!();
-        print!("> ");
-        std::io::stdout().flush()?;
-    }
-
-    Ok(())
+    run_server(cli, cfg).await
 }
 
 async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>) -> Result<()> {
@@ -2270,7 +2065,6 @@ async fn handle_frontend_connection(
     peer_pid: Option<libc::pid_t>,
 ) -> Result<()> {
     tracing::info!("frontend connected");
-    let registry = server_state.agent_registry.clone();
     let work_db = server_state.work_db.clone();
     let session_id = server_state.allocate_session_id();
 
@@ -2338,7 +2132,6 @@ async fn handle_frontend_connection(
                 send_push(
                     &sink,
                     FrontendEvent::Error {
-                        agent_id: None,
                         message: format!("invalid request payload: {err}"),
                     },
                 );
@@ -3049,261 +2842,6 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::CreateAgent { name, role } => {
-                let (agent_id, agent_name, role) = registry.allocate_agent(name, role);
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::AgentCreated {
-                        agent_id: agent_id.clone(),
-                        name: agent_name.clone(),
-                        role,
-                    },
-                );
-
-                let sink = sink.clone();
-                let registry = registry.clone();
-                tokio::spawn(async move {
-                    match registry
-                        .initialize_agent(&agent_id, &agent_name, role)
-                        .await
-                    {
-                        Ok(()) => {
-                            send_push(&sink, FrontendEvent::AgentReady { agent_id });
-                        }
-                        Err(err) => {
-                            tracing::error!(?err, agent_id = %agent_id, "failed to initialize agent");
-                            send_push(
-                                &sink,
-                                FrontendEvent::Error {
-                                    agent_id: Some(agent_id),
-                                    message: format!("failed to initialize agent: {err}"),
-                                },
-                            );
-                        }
-                    }
-                });
-            }
-            FrontendRequest::ListAgents => {
-                let agents = registry.list_agents().await;
-                send_response(&sink, &request_id, FrontendEvent::AgentList { agents });
-            }
-            FrontendRequest::RemoveAgent { agent_id } => {
-                match registry.remove_agent(&agent_id).await {
-                    Ok(()) => {
-                        send_response(&sink, &request_id, FrontendEvent::AgentRemoved { agent_id });
-                    }
-                    Err(err) => {
-                        tracing::error!(?err, agent_id = %agent_id, "failed to remove agent");
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::Error {
-                                agent_id: Some(agent_id),
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::Prompt { agent_id, text } => {
-                tracing::info!(
-                    agent_id = %agent_id,
-                    prompt_chars = text.chars().count(),
-                    "received prompt from frontend"
-                );
-
-                let (acp, session_id, prompt_lock, system_prompt) =
-                    match registry.get_acp_and_session(&agent_id).await {
-                        Ok(tuple) => tuple,
-                        Err(err) => {
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::Error {
-                                    agent_id: Some(agent_id),
-                                    message: err.to_string(),
-                                },
-                            );
-                            continue;
-                        }
-                    };
-
-                let sink = sink.clone();
-                let agent_id_owned = agent_id.clone();
-                let prompt_text = compose_agent_prompt(system_prompt.as_deref(), &text);
-
-                tokio::spawn(async move {
-                    let _guard = prompt_lock.lock().await;
-                    let aid = agent_id_owned.clone();
-
-                    let result = acp
-                        .prompt_streaming(&session_id, &prompt_text, |event| match event {
-                            AcpEvent::AgentMessageChunk { text, .. } => {
-                                send_push(
-                                    &sink,
-                                    FrontendEvent::Chunk {
-                                        agent_id: aid.clone(),
-                                        text,
-                                    },
-                                );
-                            }
-                            AcpEvent::ToolCall { title, status, .. } => {
-                                send_push(
-                                    &sink,
-                                    FrontendEvent::ToolCall {
-                                        agent_id: aid.clone(),
-                                        name: title,
-                                        status: status.unwrap_or_else(|| "started".to_owned()),
-                                    },
-                                );
-                            }
-                            AcpEvent::ToolCallUpdate {
-                                tool_call_id,
-                                title,
-                                status,
-                                ..
-                            } => {
-                                let label = title.unwrap_or_else(|| {
-                                    tool_call_id.unwrap_or_else(|| "tool".to_owned())
-                                });
-                                send_push(
-                                    &sink,
-                                    FrontendEvent::ToolCall {
-                                        agent_id: aid.clone(),
-                                        name: label,
-                                        status: status.unwrap_or_else(|| "update".to_owned()),
-                                    },
-                                );
-                            }
-                            AcpEvent::PermissionRequest {
-                                permission_id,
-                                title,
-                                ..
-                            } => {
-                                send_push(
-                                    &sink,
-                                    FrontendEvent::PermissionRequest {
-                                        agent_id: aid.clone(),
-                                        id: permission_id,
-                                        title,
-                                    },
-                                );
-                            }
-                            AcpEvent::TerminalStarted {
-                                id,
-                                title,
-                                command,
-                                cwd,
-                                ..
-                            } => {
-                                send_push(
-                                    &sink,
-                                    FrontendEvent::TerminalStarted {
-                                        agent_id: aid.clone(),
-                                        id,
-                                        title,
-                                        command,
-                                        cwd,
-                                    },
-                                );
-                            }
-                            AcpEvent::TerminalOutput { id, text, .. } => {
-                                send_push(
-                                    &sink,
-                                    FrontendEvent::TerminalOutput {
-                                        agent_id: aid.clone(),
-                                        id,
-                                        text,
-                                    },
-                                );
-                            }
-                            AcpEvent::TerminalDone {
-                                id,
-                                exit_code,
-                                signal,
-                                ..
-                            } => {
-                                send_push(
-                                    &sink,
-                                    FrontendEvent::TerminalDone {
-                                        agent_id: aid.clone(),
-                                        id,
-                                        exit_code,
-                                        signal,
-                                    },
-                                );
-                            }
-                        })
-                        .await;
-
-                    match result {
-                        Ok(response) => {
-                            tracing::info!(
-                                agent_id = %agent_id_owned,
-                                stop_reason = %response.stop_reason,
-                                "prompt completed"
-                            );
-                            send_push(
-                                &sink,
-                                FrontendEvent::Done {
-                                    agent_id: agent_id_owned,
-                                    stop_reason: response.stop_reason,
-                                },
-                            );
-                        }
-                        Err(err) => {
-                            tracing::error!(?err, agent_id = %agent_id_owned, "prompt failed");
-                            send_push(
-                                &sink,
-                                FrontendEvent::Error {
-                                    agent_id: Some(agent_id_owned),
-                                    message: err.to_string(),
-                                },
-                            );
-                        }
-                    }
-                });
-            }
-            FrontendRequest::PermissionResponse {
-                agent_id,
-                id,
-                granted,
-            } => {
-                tracing::info!(
-                    agent_id = %agent_id,
-                    permission_id = %id,
-                    granted,
-                    "received permission response"
-                );
-
-                let acp = match registry.get_acp_and_session(&agent_id).await {
-                    Ok((acp, _, _, _)) => acp,
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::Error {
-                                agent_id: Some(agent_id),
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-
-                if let Err(err) = acp.respond_permission(&id, granted).await {
-                    tracing::error!(?err, permission_id = %id, "failed to apply permission response");
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            agent_id: Some(agent_id),
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            }
             FrontendRequest::RegisterAppSession => {
                 // Trust the peer if either:
                 //   (a) it matches the declared app pid exactly. The
@@ -3335,7 +2873,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "register_app_session: peer pid does not match app_pid"
                                 .to_owned(),
                         },
@@ -3366,7 +2903,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "register_boss_session: only the app session may install the Boss trust root"
                                 .to_owned(),
                         },
@@ -3408,7 +2944,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "probe_run requires app or Boss authority".to_owned(),
                         },
                     );
@@ -3441,7 +2976,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "stop_run requires app or Boss authority".to_owned(),
                         },
                     );
@@ -3473,7 +3007,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "focus_worker_pane requires app or Boss authority".to_owned(),
                         },
                     );
@@ -3522,7 +3055,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "send_input_to_worker requires app or Boss authority"
                                 .to_owned(),
                         },
@@ -3571,7 +3103,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "interrupt_worker_pane requires app or Boss authority"
                                 .to_owned(),
                         },
@@ -3622,7 +3153,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "cancel_execution requires app or Boss authority".to_owned(),
                         },
                     );
@@ -3691,7 +3221,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "tail_run_transcript requires app or Boss authority"
                                 .to_owned(),
                         },
@@ -3768,7 +3297,6 @@ async fn handle_frontend_connection(
                         &sink,
                         &request_id,
                         FrontendEvent::Error {
-                            agent_id: None,
                             message: "workspace_pool_summary failed user-tier check".to_owned(),
                         },
                     );
@@ -4247,69 +3775,6 @@ async fn read_transcript_tail(
         .map(str::to_owned)
         .collect();
     Ok((tail, truncated))
-}
-
-async fn run_prompt(acp: &AcpClient, session_id: &str, prompt: &str) -> Result<()> {
-    let response = acp
-        .prompt_streaming(session_id, prompt, |event| match event {
-            AcpEvent::AgentMessageChunk { text, .. } => {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-            AcpEvent::ToolCall { title, status, .. } => {
-                eprintln!(
-                    "\n[tool] {title} ({})",
-                    status.unwrap_or_else(|| "started".to_owned())
-                );
-            }
-            AcpEvent::ToolCallUpdate {
-                tool_call_id,
-                title,
-                status,
-                ..
-            } => {
-                let label =
-                    title.unwrap_or_else(|| tool_call_id.unwrap_or_else(|| "tool".to_owned()));
-                eprintln!(
-                    "\n[tool-update] {label} ({})",
-                    status.unwrap_or_else(|| "update".to_owned())
-                );
-            }
-            AcpEvent::PermissionRequest { title, .. } => {
-                eprintln!("\n[permission] auto-approving: {title}");
-            }
-            AcpEvent::TerminalStarted {
-                title,
-                command,
-                cwd,
-                ..
-            } => {
-                if let Some(cwd) = cwd {
-                    eprintln!("\n[terminal] {title} (cwd={cwd})");
-                } else {
-                    eprintln!("\n[terminal] {title}");
-                }
-                eprintln!("{command}");
-            }
-            AcpEvent::TerminalOutput { text, .. } => {
-                eprint!("{text}");
-            }
-            AcpEvent::TerminalDone {
-                exit_code, signal, ..
-            } => {
-                if let Some(code) = exit_code {
-                    eprintln!("\n[terminal done] exit={code}");
-                } else if let Some(signal) = signal {
-                    eprintln!("\n[terminal done] signal={signal}");
-                } else {
-                    eprintln!("\n[terminal done]");
-                }
-            }
-        })
-        .await?;
-
-    eprintln!("\n[done] {}", response.stop_reason);
-    Ok(())
 }
 
 #[cfg(test)]

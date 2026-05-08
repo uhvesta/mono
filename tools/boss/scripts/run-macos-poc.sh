@@ -8,10 +8,9 @@ Usage: run-macos-poc.sh
 Starts the Boss macOS PoC app and auto-launches the engine.
 
 Required environment variables:
-  ANTHROPIC_API_KEY   API key for Claude ACP.
+  ANTHROPIC_API_KEY   API key for Claude (used for pane summaries).
 
 Optional environment variables:
-  BOSS_ACP_CMD        ACP adapter command override.
   BOSS_ENGINE_PID_PATH
   BOSS_ENGINE_LOG_PATH
   BOSS_SOCKET_PATH    Unix socket path (default /tmp/boss-engine.sock).
@@ -55,21 +54,15 @@ done
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
-if [[ -n "${NVM_BIN:-}" ]]; then
-  export PATH="${NVM_BIN}:$PATH"
-fi
-
-export BOSS_ACP_CMD="${BOSS_ACP_CMD:-npx -y @zed-industries/claude-code-acp@0.16.1}"
 export BOSS_ENGINE_PID_PATH="${BOSS_ENGINE_PID_PATH:-/tmp/boss-engine.pid}"
 export BOSS_ENGINE_LOG_PATH="${BOSS_ENGINE_LOG_PATH:-/tmp/boss-engine.log}"
 export BOSS_ENGINE_FORCE_RESTART="${BOSS_ENGINE_FORCE_RESTART:-0}"
 export BOSS_ENGINE_STOP_ON_EXIT="${BOSS_ENGINE_STOP_ON_EXIT:-0}"
 export BOSS_SHOW_SYSTEM_MESSAGES="${BOSS_SHOW_SYSTEM_MESSAGES:-0}"
-export RUST_LOG="${RUST_LOG:-info,acp_stderr=debug}"
+export RUST_LOG="${RUST_LOG:-info}"
 
 echo "Launching Boss..."
 echo "Repo: $repo_root"
-echo "BOSS_ACP_CMD: $BOSS_ACP_CMD"
 echo "BOSS_ENGINE_PID_PATH: $BOSS_ENGINE_PID_PATH"
 echo "BOSS_ENGINE_LOG_PATH: $BOSS_ENGINE_LOG_PATH"
 echo "BOSS_ENGINE_FORCE_RESTART: $BOSS_ENGINE_FORCE_RESTART"
