@@ -69,10 +69,6 @@ final class ChatViewModel: ObservableObject {
         bossAgent?.id
     }
 
-    var bossTimeline: [TranscriptItem] {
-        bossAgent?.timeline ?? []
-    }
-
     var isBossAgentSending: Bool {
         bossAgent?.isSending ?? false
     }
@@ -183,7 +179,6 @@ final class ChatViewModel: ObservableObject {
     private var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
 
-    private let maxTerminalOutputChars = 200_000
     private let navigationModeDefaultsKey = "boss.navigationMode"
     private let selectedWorkProductDefaultsKey = "boss.work.selectedProductID"
     private let selectedProjectFilterIDsDefaultsKey = "boss.work.projectFilterIDs"
@@ -224,10 +219,6 @@ final class ChatViewModel: ObservableObject {
             bossPanelWidth = savedWidth
         }
 
-        processController.onOutputLine = { [weak self] line in
-            self?.appendSystemMessage(line)
-        }
-
         engine.onEvent = { [weak self] event in
             self?.handle(event)
         }
@@ -263,8 +254,7 @@ final class ChatViewModel: ObservableObject {
         let trimmed = bossDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        appendMessage(agentId: agentId, role: .user, text: trimmed)
-        mutateAgent(agentId) { $0.isSending = true; $0.activeAssistantMessageID = nil }
+        mutateAgent(agentId) { $0.isSending = true }
         engine.sendPrompt(agentId: agentId, text: bossPromptText(for: trimmed))
         bossDraft = ""
     }
@@ -520,10 +510,7 @@ final class ChatViewModel: ObservableObject {
             && !Self.terminalKanbanStatuses.contains(targetStatus)
             && hasLiveWorker(forTaskID: taskID)
         {
-            appendSystemMessage(
-                "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing.",
-                alwaysShow: true
-            )
+            workErrorMessage = "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing."
             return
         }
 
@@ -589,10 +576,7 @@ final class ChatViewModel: ObservableObject {
                     }
                 } catch {
                     DispatchQueue.main.async {
-                        self?.appendSystemMessage(
-                            "Failed to launch engine: \(error.localizedDescription)",
-                            alwaysShow: true
-                        )
+                        self?.workErrorMessage = "Failed to launch engine: \(error.localizedDescription)"
                     }
                 }
             }
@@ -604,10 +588,6 @@ final class ChatViewModel: ObservableObject {
     func respondToPendingPermission(granted: Bool) {
         guard let pending = pendingPermission else { return }
         engine.sendPermissionResponse(agentId: pending.agentId, id: pending.id, granted: granted)
-        appendSystemMessage(
-            "[permission] \(granted ? "allowed" : "denied"): \(pending.title)",
-            agentId: pending.agentId
-        )
         pendingPermission = nil
         showNextPermissionIfNeeded()
     }
@@ -707,7 +687,6 @@ final class ChatViewModel: ObservableObject {
             bossBootstrapErrorsByAgentID.removeAll()
             for i in agents.indices {
                 agents[i].isSending = false
-                agents[i].activeAssistantMessageID = nil
             }
         case .workInvalidated(let topic, let productId, _):
             if topic == "work.products" {
@@ -805,29 +784,14 @@ final class ChatViewModel: ObservableObject {
             bootstrappingBossAgentIDs.remove(agentId)
             bootstrappedBossAgentIDs.remove(agentId)
             bossBootstrapErrorsByAgentID[agentId] = nil
-        case .chunk(let agentId, let text):
-            guard !isBossBootstrapping(agentId: agentId) else { return }
-            appendAssistantChunk(agentId: agentId, text: text)
-        case .done(let agentId, let stopReason):
+        case .chunk, .toolCall, .terminalStarted, .terminalOutput, .terminalDone:
+            return
+        case .done(let agentId, _):
             if isBossBootstrapping(agentId: agentId) {
                 completeBossBootstrap(agentId: agentId)
                 return
             }
-            mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
-            appendSystemMessage("[done] \(stopReason)", agentId: agentId)
-        case .toolCall(let agentId, let name, let status):
-            guard !isBossBootstrapping(agentId: agentId) else { return }
-            appendSystemMessage("[tool] \(name) (\(status))", agentId: agentId)
-        case .terminalStarted(let agentId, let id, let title, let command, let cwd):
-            guard !isBossBootstrapping(agentId: agentId) else { return }
-            mutateAgent(agentId) { $0.activeAssistantMessageID = nil }
-            upsertTerminalActivity(agentId: agentId, id: id, title: title, command: command, cwd: cwd)
-        case .terminalOutput(let agentId, let id, let text):
-            guard !isBossBootstrapping(agentId: agentId) else { return }
-            appendTerminalOutput(agentId: agentId, id: id, text: text)
-        case .terminalDone(let agentId, let id, let exitCode, let signal):
-            guard !isBossBootstrapping(agentId: agentId) else { return }
-            completeTerminalActivity(agentId: agentId, id: id, exitCode: exitCode, signal: signal)
+            mutateAgent(agentId) { $0.isSending = false }
         case .permissionRequest(let agentId, let id, let title):
             guard !isBossBootstrapping(agentId: agentId) else {
                 if isExpectedBossBootstrapPermission(title: title) {
@@ -847,14 +811,10 @@ final class ChatViewModel: ObservableObject {
                 return
             }
             if let agentId {
-                mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
+                mutateAgent(agentId) { $0.isSending = false }
             }
             if shouldSuppressSocketStartupError(message) { return }
-            if let agentId {
-                appendSystemMessage("[error] \(message)", agentId: agentId, alwaysShow: true)
-            } else {
-                workErrorMessage = message
-            }
+            workErrorMessage = message
         case .workerLiveStatesList(let states):
             workerLiveStatesByRunID = Dictionary(
                 uniqueKeysWithValues: states.map { ($0.runId, $0) }
@@ -955,12 +915,6 @@ final class ChatViewModel: ObservableObject {
         body(&agents[index])
     }
 
-    private func appendMessage(agentId: String, role: ChatRole, text: String) {
-        mutateAgent(agentId) {
-            $0.timeline.append(.message(ChatMessage(role: role, text: text)))
-        }
-    }
-
     private func startBossBootstrapIfNeeded(agentId: String) {
         guard bossAgentID == agentId || agents.contains(where: { $0.id == agentId && $0.isBoss }) else {
             return
@@ -970,7 +924,7 @@ final class ChatViewModel: ObservableObject {
 
         bootstrappingBossAgentIDs.insert(agentId)
         bossBootstrapErrorsByAgentID[agentId] = nil
-        mutateAgent(agentId) { $0.isSending = true; $0.activeAssistantMessageID = nil }
+        mutateAgent(agentId) { $0.isSending = true }
         engine.sendPrompt(agentId: agentId, text: bossBootstrapPrompt())
     }
 
@@ -982,7 +936,7 @@ final class ChatViewModel: ObservableObject {
             bootstrappedBossAgentIDs.insert(agentId)
             bossBootstrapErrorsByAgentID[agentId] = nil
         }
-        mutateAgent(agentId) { $0.isSending = false; $0.activeAssistantMessageID = nil }
+        mutateAgent(agentId) { $0.isSending = false }
     }
 
     private func isBossBootstrapping(agentId: String) -> Bool {
@@ -1100,13 +1054,6 @@ final class ChatViewModel: ObservableObject {
         return normalized[..<end].trimmingCharacters(in: .whitespacesAndNewlines) + "..."
     }
 
-    private func appendSystemMessage(_ text: String, agentId: String? = nil, alwaysShow: Bool = false) {
-        guard alwaysShow || showSystemMessages else { return }
-        if let agentId {
-            appendMessage(agentId: agentId, role: .system, text: text)
-        }
-    }
-
     private func enqueuePermission(agentId: String, id: String, title: String) {
         let request = PendingPermission(id: id, agentId: agentId, title: title)
         if pendingPermission == nil {
@@ -1119,89 +1066,6 @@ final class ChatViewModel: ObservableObject {
     private func showNextPermissionIfNeeded() {
         guard pendingPermission == nil, !permissionQueue.isEmpty else { return }
         pendingPermission = permissionQueue.removeFirst()
-    }
-
-    private func appendAssistantChunk(agentId: String, text: String) {
-        guard let agentIdx = agentIndex(agentId) else { return }
-        let agent = agents[agentIdx]
-
-        if let msgId = agent.activeAssistantMessageID,
-           let timelineIdx = messageIndex(in: agents[agentIdx].timeline, for: msgId) {
-            guard case .message(var message) = agents[agentIdx].timeline[timelineIdx] else { return }
-            message.text += text
-            agents[agentIdx].timeline[timelineIdx] = .message(message)
-            return
-        }
-
-        let message = ChatMessage(role: .assistant, text: text)
-        agents[agentIdx].activeAssistantMessageID = message.id
-        agents[agentIdx].timeline.append(.message(message))
-    }
-
-    private func messageIndex(in timeline: [TranscriptItem], for id: UUID) -> Int? {
-        timeline.firstIndex { item in
-            guard case .message(let message) = item else { return false }
-            return message.id == id
-        }
-    }
-
-    private func upsertTerminalActivity(agentId: String, id: String, title: String, command: String, cwd: String?) {
-        let index = ensureTerminalActivity(agentId: agentId, id: id)
-        guard let agentIdx = agentIndex(agentId),
-              case .terminal(var activity) = agents[agentIdx].timeline[index] else { return }
-        activity.title = title
-        if !command.isEmpty { activity.command = command }
-        if let cwd { activity.cwd = cwd }
-        activity.status = "Running…"
-        agents[agentIdx].timeline[index] = .terminal(activity)
-    }
-
-    private func appendTerminalOutput(agentId: String, id: String, text: String) {
-        let index = ensureTerminalActivity(agentId: agentId, id: id)
-        guard let agentIdx = agentIndex(agentId),
-              case .terminal(var activity) = agents[agentIdx].timeline[index] else { return }
-        activity.output += text
-        if activity.output.count > maxTerminalOutputChars {
-            let overflow = activity.output.count - maxTerminalOutputChars
-            activity.output.removeFirst(overflow)
-        }
-        agents[agentIdx].timeline[index] = .terminal(activity)
-    }
-
-    private func completeTerminalActivity(agentId: String, id: String, exitCode: Int?, signal: String?) {
-        let index = ensureTerminalActivity(agentId: agentId, id: id)
-        guard let agentIdx = agentIndex(agentId),
-              case .terminal(var activity) = agents[agentIdx].timeline[index] else { return }
-        if let exitCode {
-            activity.status = exitCode == 0 ? "Done" : "Failed (exit \(exitCode))"
-        } else if let signal, !signal.isEmpty {
-            activity.status = "Terminated (signal \(signal))"
-        } else {
-            activity.status = "Done"
-        }
-        agents[agentIdx].timeline[index] = .terminal(activity)
-    }
-
-    private func ensureTerminalActivity(agentId: String, id: String) -> Int {
-        guard let agentIdx = agentIndex(agentId) else {
-            let agent = Agent(id: agentId, name: agentId)
-            agents.append(agent)
-            return ensureTerminalActivity(agentId: agentId, id: id)
-        }
-
-        if let index = agents[agentIdx].terminalEntryIndexByID[id],
-           index < agents[agentIdx].timeline.count,
-           case .terminal = agents[agentIdx].timeline[index] {
-            return index
-        }
-
-        let activity = TerminalActivity(
-            id: id, title: "Terminal command", command: "", cwd: nil, output: "", status: "Running…"
-        )
-        let index = agents[agentIdx].timeline.count
-        agents[agentIdx].timeline.append(.terminal(activity))
-        agents[agentIdx].terminalEntryIndexByID[id] = index
-        return index
     }
 
     private func product(withID id: String) -> WorkProduct? {
