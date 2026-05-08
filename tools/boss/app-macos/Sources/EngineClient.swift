@@ -114,6 +114,19 @@ final class EngineClient: @unchecked Sendable {
     private var buffer = Data()
     private var shouldReconnect = false
 
+    /// Insertion-ordered list of agent ids with buffered chunk text
+    /// awaiting a MainActor hop. Confined to `queue`.
+    private var pendingChunkAgents: [String] = []
+    /// Per-agent buffered chunk text. Confined to `queue`.
+    private var pendingChunkText: [String: String] = [:]
+    /// Whether a 16ms flush is already scheduled. Confined to `queue`.
+    private var pendingChunkFlushScheduled = false
+    /// Flush cadence for buffered chunks — one display frame at 60Hz.
+    /// Non-chunk events flush synchronously regardless, so this only
+    /// caps how long pure-chunk streams can sit on the queue before
+    /// reaching the UI.
+    private static let chunkFlushInterval: DispatchTimeInterval = .milliseconds(16)
+
     init(socketPath: String) {
         self.socketPath = socketPath
     }
@@ -727,9 +740,75 @@ final class EngineClient: @unchecked Sendable {
     }
 
     private func emit(_ event: EngineEvent) {
-        Task { @MainActor in
-            onEvent?(event)
+        // Coalesce consecutive `chunk` events for the same agent into a
+        // single MainActor hop. A high-frequency Claude stream can push
+        // dozens of chunks per second; without batching each one would
+        // allocate its own `Task { @MainActor in ... }`. Non-chunk
+        // events still hop immediately so UI state transitions
+        // (live_states, hook events, tool calls, done, etc.) stay
+        // responsive.
+        if case .chunk(let agentId, let text) = event {
+            bufferChunk(agentId: agentId, text: text)
+            return
         }
+
+        // Drain any buffered chunks first so they reach the main actor
+        // ahead of this event, preserving the engine's emission order.
+        let drained = drainPendingChunks()
+        Task { @MainActor in
+            for chunk in drained {
+                self.onEvent?(.chunk(agentId: chunk.agentId, text: chunk.text))
+            }
+            self.onEvent?(event)
+        }
+    }
+
+    private struct PendingChunk {
+        let agentId: String
+        let text: String
+    }
+
+    private func bufferChunk(agentId: String, text: String) {
+        if pendingChunkText[agentId] == nil {
+            pendingChunkAgents.append(agentId)
+            pendingChunkText[agentId] = text
+        } else {
+            pendingChunkText[agentId, default: ""].append(text)
+        }
+        schedulePendingChunkFlush()
+    }
+
+    private func schedulePendingChunkFlush() {
+        guard !pendingChunkFlushScheduled else { return }
+        pendingChunkFlushScheduled = true
+        queue.asyncAfter(deadline: .now() + Self.chunkFlushInterval) { [weak self] in
+            self?.flushPendingChunksFromTimer()
+        }
+    }
+
+    private func flushPendingChunksFromTimer() {
+        pendingChunkFlushScheduled = false
+        let drained = drainPendingChunks()
+        guard !drained.isEmpty else { return }
+        Task { @MainActor in
+            for chunk in drained {
+                self.onEvent?(.chunk(agentId: chunk.agentId, text: chunk.text))
+            }
+        }
+    }
+
+    private func drainPendingChunks() -> [PendingChunk] {
+        guard !pendingChunkAgents.isEmpty else { return [] }
+        var drained: [PendingChunk] = []
+        drained.reserveCapacity(pendingChunkAgents.count)
+        for agentId in pendingChunkAgents {
+            if let text = pendingChunkText[agentId] {
+                drained.append(PendingChunk(agentId: agentId, text: text))
+            }
+        }
+        pendingChunkAgents.removeAll(keepingCapacity: true)
+        pendingChunkText.removeAll(keepingCapacity: true)
+        return drained
     }
 
     private func scheduleReconnect() {
