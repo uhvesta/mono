@@ -187,6 +187,7 @@ dependencies = [
  "boss-protocol",
  "serde_json",
  "shlex",
+ "tempfile",
  "tokio",
  "tracing",
 ]
