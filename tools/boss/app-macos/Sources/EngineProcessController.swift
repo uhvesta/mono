@@ -39,7 +39,7 @@ final class EngineProcessController: @unchecked Sendable {
             }
 
             let command = ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"]
-                ?? "bazel run //tools/boss/engine:engine -- --mode=server --socket-path \(socketPath)"
+                ?? "bazel run //tools/boss/engine:engine -- --socket-path \(socketPath)"
 
             try launchDetached(command: command)
             if let pid = waitForEnginePID(timeoutSeconds: 5.0) {
@@ -151,8 +151,8 @@ final class EngineProcessController: @unchecked Sendable {
             return false
         }
 
-        return command.contains("/tools/boss/engine/engine --mode=server")
-            || command.contains("bazel run //tools/boss/engine:engine -- --mode=server")
+        return command.contains("/tools/boss/engine/engine")
+            || command.contains("bazel run //tools/boss/engine:engine")
     }
 
     private func commandLine(for pid: pid_t) -> String? {

@@ -917,12 +917,12 @@ impl ExecutionCoordinator {
         match run_outcome {
             Ok(outcome) => {
                 // If the runner allocated a real pane slot for this
-                // run (the PaneSpawnRunner case), stamp it onto the
-                // run record's agent_id so `bossctl agents list` and
-                // related views show one entry per active pane. Pure
-                // in-process runners (e.g., AcpExecutionRunner) leave
-                // slot_id as None and the worker-pool placeholder
-                // (worker_id) stays as the agent_id.
+                // run, stamp it onto the run record's agent_id so
+                // `bossctl agents list` and related views show one
+                // entry per active pane. Test runners that don't
+                // allocate a pane leave slot_id as None and the
+                // worker-pool placeholder (worker_id) stays as the
+                // agent_id.
                 let run = if let Some(slot_id) = outcome.slot_id {
                     let agent_id = format!("worker-{}", slot_id);
                     match self.work_db.set_run_agent_id(&run.id, &agent_id) {
@@ -1552,10 +1552,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_slot_id_leaves_worker_pool_placeholder_in_agent_id() {
-        // Runners without a pane (e.g., AcpExecutionRunner) leave
-        // slot_id = None. The coordinator must not touch agent_id in
-        // that case — the worker-pool placeholder set at run-create
-        // time stays.
+        // Runners without a pane leave slot_id = None. The coordinator
+        // must not touch agent_id in that case — the worker-pool
+        // placeholder set at run-create time stays.
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = db

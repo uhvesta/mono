@@ -105,18 +105,6 @@ struct ContentView: View {
                 }
             }
         }
-        .alert(item: $model.pendingPermission) { request in
-            Alert(
-                title: Text("Permission Request"),
-                message: Text(request.title),
-                primaryButton: .default(Text("Allow")) {
-                    model.respondToPendingPermission(granted: true)
-                },
-                secondaryButton: .destructive(Text("Deny")) {
-                    model.respondToPendingPermission(granted: false)
-                }
-            )
-        }
         .alert(
             "Work Error",
             isPresented: Binding(
@@ -367,68 +355,6 @@ struct ContentView: View {
         }
     }
 
-    private func composer(
-        draft: Binding<String>,
-        agentID: String?,
-        isReady: Bool,
-        isSending: Bool,
-        autoFocus: Bool,
-        focusTrigger: String?,
-        onSend: @escaping () -> Void
-    ) -> some View {
-        let isDraftEmpty = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let canSend = agentID != nil && !isDraftEmpty && !isSending && isReady
-
-        return VStack(spacing: 0) {
-            HStack(alignment: .center, spacing: 10) {
-                ComposerTextView(
-                    text: draft,
-                    placeholder: isReady ? "Type a message…" : "Agent starting…",
-                    autoFocus: autoFocus,
-                    focusTrigger: focusTrigger,
-                    onSubmit: onSend
-                )
-                .frame(height: 36)
-                .frame(maxWidth: .infinity)
-
-                Button(action: onSend) {
-                    Image(systemName: "paperplane.fill")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(canSend ? .primary : .secondary)
-                        .frame(width: 18, height: 18)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(!canSend)
-                .help("Send")
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(Color(nsColor: .controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-            )
-            .padding(.horizontal, 16)
-            .padding(.bottom, 12)
-            .padding(.top, 4)
-
-            if isSending {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text("Working…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 8)
-            }
-        }
-    }
-
     private var workBossPanel: some View {
         let isCollapsed = model.isBossPanelCollapsed
 
@@ -519,7 +445,7 @@ struct ContentView: View {
                         .frame(width: 26, height: 26, alignment: .top)
                         .clipShape(Circle())
                 } else {
-                    Image(systemName: AgentRole.boss.systemImage)
+                    Image(systemName: "person.crop.circle.badge.checkmark")
                         .foregroundStyle(Color.accentColor)
                         .font(.system(size: 13, weight: .semibold))
                 }
@@ -527,7 +453,7 @@ struct ContentView: View {
             .frame(width: 26, height: 26)
 
             if !isCollapsed {
-                Text(AgentRole.boss.title)
+                Text("Picard")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
@@ -1527,111 +1453,6 @@ private struct PriorityChip: View {
     }
 }
 
-private struct ComposerTextView: NSViewRepresentable {
-    @Binding var text: String
-    let placeholder: String
-    let autoFocus: Bool
-    var focusTrigger: String?
-    let onSubmit: () -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
-    }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
-
-        let textView = ComposerNSTextView()
-        textView.delegate = context.coordinator
-        textView.isEditable = true
-        textView.isSelectable = true
-        textView.isRichText = false
-        textView.importsGraphics = false
-        textView.allowsUndo = true
-        textView.font = .preferredFont(forTextStyle: .body)
-        textView.textColor = .labelColor
-        textView.backgroundColor = .clear
-        textView.drawsBackground = false
-        textView.focusRingType = .none
-        textView.textContainer?.lineFragmentPadding = 0
-        textView.isHorizontallyResizable = false
-        textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
-        textView.maxSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.minSize = NSSize(width: 0, height: 0)
-        textView.textContainer?.widthTracksTextView = true
-        textView.submitHandler = onSubmit
-        textView.placeholder = placeholder
-        textView.string = text
-
-        scrollView.documentView = textView
-        context.coordinator.textView = textView
-        context.coordinator.didAutoFocus = false
-        return scrollView
-    }
-
-    func updateNSView(_ nsView: NSScrollView, context: Context) {
-        context.coordinator.parent = self
-        guard let textView = context.coordinator.textView else {
-            return
-        }
-
-        textView.submitHandler = onSubmit
-        textView.placeholder = placeholder
-        if textView.string != text {
-            textView.string = text
-            textView.needsDisplay = true
-        }
-
-        let shouldFocus: Bool
-        if !context.coordinator.didAutoFocus, autoFocus {
-            context.coordinator.didAutoFocus = true
-            shouldFocus = true
-        } else if focusTrigger != context.coordinator.lastFocusTrigger {
-            context.coordinator.lastFocusTrigger = focusTrigger
-            shouldFocus = true
-        } else {
-            shouldFocus = false
-        }
-
-        if shouldFocus {
-            DispatchQueue.main.async {
-                guard let window = textView.window else {
-                    return
-                }
-                window.makeFirstResponder(textView)
-            }
-        }
-    }
-
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        var parent: ComposerTextView
-        weak var textView: ComposerNSTextView?
-        var didAutoFocus = false
-        var lastFocusTrigger: String?
-
-        init(parent: ComposerTextView) {
-            self.parent = parent
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else {
-                return
-            }
-            parent.text = textView.string
-            textView.needsDisplay = true
-        }
-    }
-}
-
 private struct NativeWorkBoardColumn: Identifiable {
     let id: String
     let view: AnyView
@@ -1796,104 +1617,6 @@ private final class HorizontalOnlyClipView: NSClipView {
         var constrained = super.constrainBoundsRect(proposedBounds)
         constrained.origin.y = 0
         return constrained
-    }
-}
-
-private final class ComposerNSTextView: NSTextView {
-    var submitHandler: (() -> Void)?
-    var placeholder: String = "" {
-        didSet {
-            needsDisplay = true
-        }
-    }
-
-    override func layout() {
-        super.layout()
-        guard let layoutManager, let textContainer, let scrollView = enclosingScrollView else { return }
-        layoutManager.ensureLayout(for: textContainer)
-        let textHeight = layoutManager.usedRect(for: textContainer).height
-        let visibleHeight = scrollView.contentSize.height
-        let topInset = max(0, (visibleHeight - textHeight) / 2)
-        if abs(textContainerInset.height - topInset) > 0.5 {
-            textContainerInset = NSSize(width: 0, height: topInset)
-        }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        guard string.isEmpty, !placeholder.isEmpty, let font else {
-            return
-        }
-
-        let origin = textContainerOrigin
-        let x = origin.x + (textContainer?.lineFragmentPadding ?? 0)
-        let y = origin.y
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.placeholderTextColor,
-        ]
-        (placeholder as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        guard event.type == .keyDown else {
-            return super.performKeyEquivalent(with: event)
-        }
-
-        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-        guard modifiers == [.command], let chars = event.charactersIgnoringModifiers else {
-            return super.performKeyEquivalent(with: event)
-        }
-
-        switch chars.lowercased() {
-        case "a":
-            selectAll(nil)
-            return true
-        case "c":
-            copy(nil)
-            return true
-        case "v":
-            paste(nil)
-            return true
-        case "x":
-            cut(nil)
-            return true
-        case "z":
-            undoManager?.undo()
-            return true
-        default:
-            return super.performKeyEquivalent(with: event)
-        }
-    }
-
-    override func doCommand(by selector: Selector) {
-        let isNewlineCommand = selector == #selector(insertNewline(_:))
-            || selector == #selector(insertLineBreak(_:))
-            || selector == #selector(insertNewlineIgnoringFieldEditor(_:))
-        guard isNewlineCommand, !hasMarkedText() else {
-            super.doCommand(by: selector)
-            return
-        }
-
-        let modifiers = NSApp.currentEvent?.modifierFlags.intersection([
-            .shift,
-            .control,
-            .option,
-            .command,
-        ]) ?? []
-
-        if modifiers == [.shift] {
-            insertNewline(nil)
-            return
-        }
-
-        if modifiers.isEmpty {
-            submitHandler?()
-            return
-        }
-
-        super.doCommand(by: selector)
     }
 }
 

@@ -18,7 +18,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 shlex = { workspace = true }
 rusqlite = { workspace = true }
-which = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
 sha2 = { workspace = true }

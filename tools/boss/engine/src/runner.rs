@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
-use crate::acp::{AcpClient, AcpEvent};
 use crate::config::RuntimeConfig;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
@@ -69,8 +66,8 @@ pub struct RunOutcome {
     /// run record's `agent_id` (as `worker-{slot_id}`) so `bossctl
     /// agents list` shows one entry per active pane instead of
     /// collapsing every run into the worker-pool placeholder. `None`
-    /// means the runner doesn't have a pane (e.g., the in-process
-    /// `AcpExecutionRunner`); the coordinator leaves agent_id alone.
+    /// means the runner doesn't have a pane (e.g., a test fake);
+    /// the coordinator leaves agent_id alone.
     pub slot_id: Option<u8>,
 }
 
@@ -84,152 +81,6 @@ pub trait ExecutionRunner: Send + Sync {
         workspace_path: &Path,
         cube_change_id: Option<&str>,
     ) -> Result<RunOutcome>;
-}
-
-pub struct AcpExecutionRunner {
-    cfg: Arc<RuntimeConfig>,
-    workers: Mutex<HashMap<String, Arc<WorkerClient>>>,
-}
-
-struct WorkerClient {
-    acp: Arc<AcpClient>,
-    prompt_lock: Mutex<()>,
-}
-
-impl AcpExecutionRunner {
-    pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
-        Self {
-            cfg,
-            workers: Mutex::new(HashMap::new()),
-        }
-    }
-
-    async fn worker_client(&self, worker_id: &str) -> Result<Arc<WorkerClient>> {
-        if let Some(worker) = self.workers.lock().await.get(worker_id).cloned() {
-            return Ok(worker);
-        }
-
-        let acp = Arc::new(AcpClient::connect(&self.cfg).await?);
-        acp.initialize().await?;
-        let worker = Arc::new(WorkerClient {
-            acp,
-            prompt_lock: Mutex::new(()),
-        });
-
-        let mut workers = self.workers.lock().await;
-        Ok(workers
-            .entry(worker_id.to_owned())
-            .or_insert_with(|| worker.clone())
-            .clone())
-    }
-}
-
-#[async_trait]
-impl ExecutionRunner for AcpExecutionRunner {
-    async fn run_execution(
-        &self,
-        worker_id: &str,
-        execution: &WorkExecution,
-        work_item: &WorkItem,
-        workspace_path: &Path,
-        cube_change_id: Option<&str>,
-    ) -> Result<RunOutcome> {
-        let worker = self.worker_client(worker_id).await?;
-        let _guard = worker.prompt_lock.lock().await;
-        let session_id = worker.acp.new_session(workspace_path).await?;
-        let prompt = compose_execution_prompt(execution, work_item, workspace_path, cube_change_id);
-        let mut transcript = String::new();
-
-        let response = worker
-            .acp
-            .prompt_streaming(&session_id, &prompt, |event| match event {
-                AcpEvent::AgentMessageChunk { text, .. } => {
-                    transcript.push_str(&text);
-                }
-                AcpEvent::ToolCall { title, status, .. } => {
-                    tracing::info!(
-                        worker_id,
-                        execution_id = %execution.id,
-                        tool = %title,
-                        status = ?status,
-                        "execution worker tool call"
-                    );
-                }
-                AcpEvent::ToolCallUpdate {
-                    tool_call_id,
-                    title,
-                    status,
-                    ..
-                } => {
-                    tracing::info!(
-                        worker_id,
-                        execution_id = %execution.id,
-                        tool_call_id = ?tool_call_id,
-                        title = ?title,
-                        status = ?status,
-                        "execution worker tool update"
-                    );
-                }
-                AcpEvent::PermissionRequest { title, .. } => {
-                    tracing::warn!(
-                        worker_id,
-                        execution_id = %execution.id,
-                        title,
-                        "execution worker requested interactive permission"
-                    );
-                }
-                AcpEvent::TerminalStarted {
-                    id,
-                    title,
-                    command,
-                    cwd,
-                    ..
-                } => {
-                    tracing::info!(
-                        worker_id,
-                        execution_id = %execution.id,
-                        terminal_id = %id,
-                        title,
-                        command,
-                        cwd = ?cwd,
-                        "execution worker terminal started"
-                    );
-                }
-                AcpEvent::TerminalOutput { .. } => {}
-                AcpEvent::TerminalDone {
-                    id,
-                    exit_code,
-                    signal,
-                    ..
-                } => {
-                    tracing::info!(
-                        worker_id,
-                        execution_id = %execution.id,
-                        terminal_id = %id,
-                        exit_code = ?exit_code,
-                        signal = ?signal,
-                        "execution worker terminal finished"
-                    );
-                }
-            })
-            .await?;
-
-        let result_summary = summarize_run_output(&transcript, &response.stop_reason);
-        let attention = Some(review_attention(
-            execution,
-            work_item,
-            workspace_path,
-            result_summary.as_deref(),
-            cube_change_id,
-        ));
-
-        Ok(RunOutcome {
-            wait_state: RunWaitState::WaitingHuman,
-            result_summary,
-            attention,
-            slot_id: None,
-        })
-    }
 }
 
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
@@ -394,7 +245,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             .cfg
             .agent()
             .ok()
-            .and_then(|agent| agent.acp.anthropic_api_key.clone());
+            .and_then(|agent| agent.anthropic_api_key.clone());
         let title_summary =
             pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await;
 
@@ -555,66 +406,6 @@ fn task_details(task: &Task) -> Option<String> {
         }
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-fn summarize_run_output(transcript: &str, stop_reason: &str) -> Option<String> {
-    let trimmed = transcript.trim();
-    if trimmed.is_empty() {
-        return Some(format!(
-            "Worker run ended with stop reason `{stop_reason}` and did not return a textual summary."
-        ));
-    }
-
-    Some(truncate_chars(trimmed, 4000))
-}
-
-fn review_attention(
-    execution: &WorkExecution,
-    work_item: &WorkItem,
-    workspace_path: &Path,
-    result_summary: Option<&str>,
-    cube_change_id: Option<&str>,
-) -> RunAttention {
-    let title = match execution.kind.as_str() {
-        "project_design" => format!("Review design output for {}", work_item_name(work_item)),
-        _ => format!(
-            "Review implementation output for {}",
-            work_item_name(work_item)
-        ),
-    };
-
-    let summary = result_summary.unwrap_or("_No summary was captured for this run._");
-    let local_change = cube_change_id
-        .map(|change_id| format!("- local change: `{change_id}`\n"))
-        .unwrap_or_default();
-    let body_markdown = format!(
-        "Execution `{}` is waiting for human review.\n\n- work item: `{}`\n- execution kind: `{}`\n- workspace: `{}`\n{}\
-\n## Run Summary\n{}\n",
-        execution.id,
-        work_item_name(work_item),
-        execution.kind,
-        workspace_path.display(),
-        local_change,
-        summary,
-    );
-
-    RunAttention {
-        kind: "review_required".to_owned(),
-        title,
-        body_markdown,
-    }
-}
-
-fn truncate_chars(text: &str, limit: usize) -> String {
-    let mut truncated = String::new();
-    for (count, ch) in text.chars().enumerate() {
-        if count >= limit {
-            truncated.push_str("\n\n...[truncated]");
-            return truncated;
-        }
-        truncated.push(ch);
-    }
-    truncated
 }
 
 #[cfg(test)]
