@@ -60,16 +60,55 @@ pub enum SocketError {
     Normalize(#[from] NormalizeError),
 }
 
-/// Bind the events socket at `path`, removing any stale file there,
-/// then chmod to 0600 so only the boss-engine user can connect.
+/// Bind+listen on the events socket at `path` and chmod the file to
+/// 0600. This is synchronous — when this function returns Ok, the
+/// socket is in the kernel's listening state, so a `connect()` from
+/// another process will be queued in the accept backlog (not refused
+/// with `ECONNREFUSED`) even before the caller polls `accept()` for
+/// the first time. tokio's `UnixListener::bind` calls
+/// `socket(2)` + `bind(2)` + `listen(2)` together; if `listen()`
+/// fails the whole call returns the error, so there is no observable
+/// "bound but not listening" intermediate state from the caller's
+/// side.
+///
+/// Steps:
+///   1. Ensure the parent directory exists.
+///   2. Unconditionally try to unlink the path. A previous engine
+///      that crashed without cleanup leaves a stale socket file
+///      behind; if a fresh `bind()` ran without unlinking, on macOS
+///      it would either return `EADDRINUSE` (if the kernel still
+///      considers the inode bound) or — and this is the failure mode
+///      the 2026-05-07 incident chased — the file would be replaced
+///      but the new socket might never be put into the listen state
+///      if some startup path reused the old fd. Just remove first.
+///      `ENOENT` is the normal fresh-start case and is ignored;
+///      every other error is fatal.
+///   3. `UnixListener::bind` — atomic socket+bind+listen.
+///   4. `chmod 0600` so only the boss-engine user can connect.
+///
+/// Errors are returned to the caller; the engine's `serve` propagates
+/// them up to `main`, which records the failure in the audit log and
+/// exits non-zero. A partially-bound socket never reaches the
+/// dispatch loop.
 pub fn bind_events_socket(path: &Path) -> io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!(
+                events_socket_path = %path.display(),
+                "events socket: unlinked stale file before bind",
+            );
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
     let listener = UnixListener::bind(path)?;
+    tracing::info!(
+        events_socket_path = %path.display(),
+        "events socket: bind+listen succeeded",
+    );
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(0o600);
     std::fs::set_permissions(path, perms)?;
@@ -194,6 +233,62 @@ mod tests {
         let path = nested.join("events.sock");
         let _listener = bind_events_socket(&path).unwrap();
         assert!(path.exists());
+    }
+
+    /// Regression test for the 2026-05-07 incident: after
+    /// `bind_events_socket` returns, the kernel must already be in the
+    /// listen state. A `connect()` from a separate thread must
+    /// succeed (not return ECONNREFUSED) even before the caller polls
+    /// `accept()`. tokio's `UnixListener::bind` covers this — this
+    /// test pins the contract so a refactor that splits bind from
+    /// listen across async hops fails loudly.
+    #[tokio::test]
+    async fn connect_succeeds_immediately_after_bind() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let _listener = bind_events_socket(&path).unwrap();
+        // No `accept()` yet — the connect must be queued in the
+        // backlog by the kernel, not refused.
+        let path_for_thread = path.clone();
+        let connected = std::thread::spawn(move || StdUnixStream::connect(&path_for_thread))
+            .join()
+            .unwrap();
+        assert!(
+            connected.is_ok(),
+            "connect() right after bind must succeed, got {:?}",
+            connected.err()
+        );
+    }
+
+    /// A previous engine that crashed without cleanup leaves a
+    /// dangling socket file. The new engine must unlink it cleanly
+    /// and the rebound socket must be in the listen state. (The
+    /// `bind_replaces_stale_socket_file` test above checks the file
+    /// type swap; this one checks the listen-state of the rebound
+    /// socket — the bug's load-bearing assertion.)
+    #[tokio::test]
+    async fn rebind_after_stale_file_listens() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+
+        // Round 1: bind, then drop the listener. The on-disk socket
+        // file persists (close(2) doesn't unlink AF_UNIX paths).
+        {
+            let _listener = bind_events_socket(&path).unwrap();
+        }
+        assert!(path.exists(), "stale socket file should remain after drop");
+
+        // Round 2: rebind. Must unlink + listen successfully.
+        let _listener = bind_events_socket(&path).unwrap();
+        let path_for_thread = path.clone();
+        let connected = std::thread::spawn(move || StdUnixStream::connect(&path_for_thread))
+            .join()
+            .unwrap();
+        assert!(
+            connected.is_ok(),
+            "connect() after rebind must succeed, got {:?}",
+            connected.err()
+        );
     }
 
     #[tokio::test]

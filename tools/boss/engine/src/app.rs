@@ -1395,12 +1395,25 @@ pub async fn serve(
 ) -> Result<()> {
     let server_state = ServerState::new_arc(cfg.clone())?;
 
-    if socket_path.exists() {
-        tokio::fs::remove_file(&socket_path)
-            .await
-            .with_context(|| {
-                format!("failed to remove existing socket {}", socket_path.display())
-            })?;
+    // Always attempt to unlink any existing file at the path before
+    // binding. `path.exists()` lies for dangling symlinks and races
+    // with concurrent file ops; just call `remove_file` and ignore
+    // `NotFound`. A stale file from a previous engine that crashed
+    // without cleanup is the exact failure shape the 2026-05-07
+    // incident left behind on `events.sock`; mirror the defensive
+    // unlink here so the frontend socket can't develop the same drift.
+    match tokio::fs::remove_file(&socket_path).await {
+        Ok(()) => {
+            tracing::info!(
+                socket_path = %socket_path.display(),
+                "frontend socket: unlinked stale file before bind",
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("failed to remove existing socket {}", socket_path.display())));
+        }
     }
 
     let listener = match UnixListener::bind(&socket_path) {
@@ -1545,6 +1558,12 @@ pub async fn serve(
     coordinator.kick();
 
     install_panic_hook(&server_state);
+
+    tracing::info!(
+        socket_path = %socket_path.display(),
+        "frontend socket: accept loop started",
+    );
+    crate::audit::record_accept_loop_started("frontend", &socket_path);
 
     loop {
         tokio::select! {
@@ -1721,6 +1740,19 @@ async fn graceful_shutdown_signal() -> &'static str {
 }
 
 async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<ServerState>) {
+    let local_addr = listener.local_addr().ok();
+    let path_display = local_addr
+        .as_ref()
+        .and_then(|a| a.as_pathname())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    tracing::info!(
+        events_socket_path = %path_display,
+        "events socket: accept loop started",
+    );
+    if let Some(p) = local_addr.as_ref().and_then(|a| a.as_pathname()) {
+        crate::audit::record_accept_loop_started("events", p);
+    }
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

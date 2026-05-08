@@ -200,6 +200,21 @@ pub fn record_socket_bind(kind: &str, path: &Path, result: SocketBindResult<'_>)
     write_record(now, event, fields);
 }
 
+/// Record that an accept loop is now running on a socket. Emitted
+/// once per socket immediately before the first `accept()` poll, so
+/// the audit log captures the full lifecycle (`socket_bound` →
+/// `accept_loop_started`) instead of leaving the next person
+/// triaging an incident with only mtime archaeology to figure out
+/// when (or whether) the engine actually entered the listen loop.
+pub fn record_accept_loop_started(kind: &str, path: &Path) {
+    let now = epoch_now_s();
+    let mut fields = Map::new();
+    fields.insert("pid".into(), json!(std::process::id()));
+    fields.insert("socket_kind".into(), Value::String(kind.to_owned()));
+    fields.insert("socket_path".into(), Value::String(path.display().to_string()));
+    write_record(now, "accept_loop_started", fields);
+}
+
 /// Record an arbitrary auxiliary event. Reserved for future expansion
 /// (e.g. socket teardown, accept errors). Keeps a single funnel into
 /// the file format.
