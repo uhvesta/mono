@@ -725,6 +725,57 @@ impl ServerState {
         self.broadcast_live_worker_states().await;
     }
 
+    /// Release every live worker pane the engine knows about. Called
+    /// from the engine-shutdown path: walks
+    /// `LiveWorkerStateRegistry::snapshot()` and dispatches
+    /// [`ServerState::release_worker_pane`] for each `run_id` in
+    /// parallel. The app teardown is the primary mechanism — once the
+    /// pane is released the worker shell exits and `claude` exits
+    /// with it.
+    ///
+    /// `total_timeout` bounds the whole walk. Each individual
+    /// `release_worker_pane` call already has its own ~5s round-trip
+    /// budget against the app, but on shutdown we'd rather forcibly
+    /// move on than block the engine exit on an unresponsive app.
+    ///
+    /// After the bounded join we send a best-effort `SIGTERM` (then
+    /// `SIGKILL` after `kill_grace`) to every recorded `shell_pid > 0`
+    /// — covers the case where the app is gone or didn't ack in time
+    /// and the shell would otherwise be reparented to launchd.
+    pub async fn shutdown_workers(self: &Arc<Self>, total_timeout: Duration, kill_grace: Duration) {
+        let snapshot = self.live_worker_states.snapshot();
+        if snapshot.is_empty() {
+            tracing::info!("shutdown_workers: no live workers to release");
+            return;
+        }
+        tracing::info!(
+            count = snapshot.len(),
+            "shutdown_workers: releasing live worker panes",
+        );
+        let mut set = tokio::task::JoinSet::new();
+        for state in &snapshot {
+            let server = Arc::clone(self);
+            let run_id = state.run_id.clone();
+            set.spawn(async move {
+                server.release_worker_pane(&run_id).await;
+            });
+        }
+        let join_all = async {
+            while set.join_next().await.is_some() {}
+        };
+        if tokio::time::timeout(total_timeout, join_all).await.is_err() {
+            tracing::warn!(
+                timeout_secs = total_timeout.as_secs(),
+                "shutdown_workers: release timed out; falling back to direct kill",
+            );
+        }
+        let pids: Vec<libc::pid_t> = snapshot
+            .iter()
+            .filter_map(|s| (s.shell_pid > 0).then_some(s.shell_pid as libc::pid_t))
+            .collect();
+        signal_shell_pids(&pids, kill_grace);
+    }
+
     /// Resolve `run_id → slot_id` and ask the app to bring that
     /// worker pane to the front. Returns the resolved slot on success
     /// so callers (`bossctl agents focus`) can confirm in JSON output
@@ -1625,19 +1676,35 @@ pub async fn serve(
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
+    install_panic_hook(&server_state);
+
     loop {
-        let (stream, _) = listener.accept().await.context("socket accept failed")?;
-        // Capture peer pid synchronously before any async yield so the
-        // shim's quick-close (or any other peer that doesn't linger)
-        // can't race us into ENOTCONN.
-        let peer_pid_value = peer_pid(&stream).ok();
-        let server_state = server_state.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_frontend_connection(stream, server_state, peer_pid_value).await
-            {
-                tracing::error!(?err, "frontend connection failed");
+        tokio::select! {
+            biased;
+            signal = graceful_shutdown_signal() => {
+                tracing::info!(signal, "shutdown signal received; releasing worker panes");
+                server_state
+                    .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
+                    .await;
+                tracing::info!("engine shutdown complete");
+                return Ok(());
             }
-        });
+            accept = listener.accept() => {
+                let (stream, _) = accept.context("socket accept failed")?;
+                // Capture peer pid synchronously before any async yield so the
+                // shim's quick-close (or any other peer that doesn't linger)
+                // can't race us into ENOTCONN.
+                let peer_pid_value = peer_pid(&stream).ok();
+                let server_state = server_state.clone();
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        handle_frontend_connection(stream, server_state, peer_pid_value).await
+                    {
+                        tracing::error!(?err, "frontend connection failed");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -1685,6 +1752,103 @@ fn current_parent_pid() -> Option<libc::pid_t> {
         .ok()
         .and_then(|raw| raw.parse::<libc::pid_t>().ok())
         .filter(|&pid| pid > 1)
+}
+
+/// Send `SIGTERM` to every pid in `pids`, sleep `grace`, then send
+/// `SIGKILL` to anything still alive. Used as the shutdown fallback
+/// when the app teardown path didn't release the worker shell — and
+/// from the panic hook, where we must not touch the runtime. The
+/// loop keeps going past `EPERM` / `ESRCH` because the worker may
+/// already be dead (good) or owned by another uid (we can't help).
+fn signal_shell_pids(pids: &[libc::pid_t], grace: Duration) {
+    if pids.is_empty() {
+        return;
+    }
+    for &pid in pids {
+        // SAFETY: `kill` with a pid we recorded ourselves; failure is
+        // logged but not fatal.
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if rc != 0 {
+            tracing::debug!(
+                pid,
+                errno = std::io::Error::last_os_error().raw_os_error(),
+                "shutdown_workers: SIGTERM returned non-zero (likely already exited)",
+            );
+        }
+    }
+    if grace > Duration::from_secs(0) {
+        std::thread::sleep(grace);
+    }
+    for &pid in pids {
+        // SAFETY: same as above.
+        let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+        if rc != 0 {
+            tracing::debug!(
+                pid,
+                errno = std::io::Error::last_os_error().raw_os_error(),
+                "shutdown_workers: SIGKILL returned non-zero",
+            );
+        }
+    }
+}
+
+/// Snapshot of the (slot_id, shell_pid) pairs currently registered as
+/// live workers, intended for the panic-hook path: pulls just enough
+/// state to fire `SIGTERM`/`SIGKILL` without touching the runtime,
+/// async, or Tokio internals (any of which could deadlock during
+/// unwind).
+fn snapshot_live_shell_pids(server_state: &ServerState) -> Vec<libc::pid_t> {
+    server_state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .filter_map(|s| (s.shell_pid > 0).then_some(s.shell_pid as libc::pid_t))
+        .collect()
+}
+
+/// Install a panic hook that emergency-kills every recorded worker
+/// shell pid before delegating to the previously-installed hook. The
+/// async `release_worker_pane` path is unsafe inside an unwinding
+/// runtime — we settle for the synchronous SIGTERM/SIGKILL fallback
+/// so the worker tree doesn't outlive the engine.
+///
+/// We hold a `Weak` so the hook never keeps `ServerState` alive past
+/// a normal shutdown.
+fn install_panic_hook(server_state: &Arc<ServerState>) {
+    let weak = Arc::downgrade(server_state);
+    let prior = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(server) = weak.upgrade() {
+            let pids = snapshot_live_shell_pids(&server);
+            if !pids.is_empty() {
+                tracing::error!(
+                    count = pids.len(),
+                    "engine panic: emergency-killing worker shells before unwind",
+                );
+                signal_shell_pids(&pids, Duration::from_millis(500));
+            }
+        }
+        prior(info);
+    }));
+}
+
+/// Future that resolves when a graceful-shutdown signal arrives
+/// (`SIGINT` or `SIGTERM`). Resolves to a static label naming which
+/// signal fired so the caller can log it.
+async fn graceful_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(?err, "failed to install SIGTERM handler; only SIGINT will trigger graceful shutdown");
+            tokio::signal::ctrl_c().await.ok();
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
 }
 
 async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<ServerState>) {
@@ -5334,5 +5498,110 @@ mod tests {
                 None => std::env::remove_var("BOSS_APP_PID"),
             }
         }
+    }
+
+    /// Graceful shutdown must walk every live worker the engine knows
+    /// about and ask the app to release its pane. This is the
+    /// regression test for `engine kills its claude workers on
+    /// shutdown` — without it, a clean engine exit leaves the worker
+    /// shells reparented to launchd and `claude` keeps burning tokens.
+    #[tokio::test]
+    async fn shutdown_workers_releases_each_live_worker_via_release_worker_pane() {
+        let server_state = test_server_state();
+
+        // Two workers, both registered against slot ids and the
+        // live-state registry — exactly the shape `release_worker_pane`
+        // walks (worker_registry → take_slot_for_run; live_states →
+        // release_slot).
+        server_state
+            .worker_registry
+            .register_run_slot("run-a", 1);
+        server_state
+            .worker_registry
+            .register_run_slot("run-b", 2);
+        server_state
+            .live_worker_states
+            .register_spawn(1, "run-a", "claude-opus-4-7", 0, None);
+        server_state
+            .live_worker_states
+            .register_spawn(2, "run-b", "claude-opus-4-7", 0, None);
+
+        // Stand up a fake app session and a responder task: the
+        // engine sends `ReleaseWorkerPane` requests onto its sink, the
+        // responder pulls them off, and we assert on the slot ids
+        // emitted. Without an ack the engine logs and moves on — but
+        // `shutdown_workers` would hit its 5s budget on a real run, so
+        // we ack each one to keep the test fast and to verify the
+        // engine round-trips correctly.
+        let app_sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), app_sink.clone())
+            .await;
+
+        let server_for_app = server_state.clone();
+        let observed_slots: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+        let observed_for_task = observed_slots.clone();
+        let app_responder = tokio::spawn(async move {
+            // Two workers => two ReleaseWorkerPane requests.
+            for _ in 0..2 {
+                let envelope = app_sink
+                    .next()
+                    .await
+                    .expect("ReleaseWorkerPane EngineRequest should be enqueued");
+                let (request_id, slot_id) = match &envelope.payload {
+                    FrontendEvent::EngineRequest { request_id, request } => match request {
+                        EngineToAppRequest::ReleaseWorkerPane(input) => {
+                            (request_id.clone(), input.slot_id)
+                        }
+                        other => panic!("expected ReleaseWorkerPane, got {other:?}"),
+                    },
+                    other => panic!("expected EngineRequest, got {other:?}"),
+                };
+                observed_for_task.lock().unwrap().push(slot_id);
+                server_for_app
+                    .deliver_app_response(
+                        "session-app",
+                        &request_id,
+                        EngineToAppResponse::ReleaseWorkerPane {
+                            result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+                        },
+                    )
+                    .await;
+            }
+        });
+
+        server_state
+            .shutdown_workers(Duration::from_secs(2), Duration::from_millis(0))
+            .await;
+
+        app_responder
+            .await
+            .expect("app responder task panicked");
+
+        let mut slots = observed_slots.lock().unwrap().clone();
+        slots.sort();
+        assert_eq!(
+            slots,
+            vec![1, 2],
+            "shutdown_workers must dispatch ReleaseWorkerPane for every registered slot",
+        );
+
+        // Slot mappings and live-state entries must be drained — a
+        // future re-spawn into the same slot id has to start clean.
+        assert_eq!(server_state.worker_registry.slot_for_run("run-a"), None);
+        assert_eq!(server_state.worker_registry.slot_for_run("run-b"), None);
+        assert!(server_state.live_worker_states.snapshot().is_empty());
+    }
+
+    /// Empty registry → no-op. Guards against `shutdown_workers`
+    /// hanging on `JoinSet::join_next` when there's nothing to await,
+    /// and against gratuitous SIGTERMs at idle shutdown.
+    #[tokio::test]
+    async fn shutdown_workers_is_noop_when_no_workers_registered() {
+        let server_state = test_server_state();
+        // No app session, no slot registrations — must still return.
+        server_state
+            .shutdown_workers(Duration::from_millis(50), Duration::from_millis(0))
+            .await;
     }
 }
