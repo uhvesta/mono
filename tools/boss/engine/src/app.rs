@@ -1608,8 +1608,26 @@ pub async fn serve(
             })?;
     }
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind unix socket {}", socket_path.display()))?;
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => {
+            crate::audit::record_socket_bind(
+                "frontend",
+                &socket_path,
+                crate::audit::SocketBindResult::Succeeded,
+            );
+            listener
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            crate::audit::record_socket_bind(
+                "frontend",
+                &socket_path,
+                crate::audit::SocketBindResult::Failed(&msg),
+            );
+            return Err(anyhow::Error::new(err)
+                .context(format!("failed to bind unix socket {}", socket_path.display())));
+        }
+    };
 
     let _pid_guard = match pid_file_path {
         Some(path) => {
@@ -1630,8 +1648,26 @@ pub async fn serve(
     println!("boss-engine listening on {}", socket_path.display());
 
     if let Some(path) = events_socket_path {
-        let events_listener = bind_events_socket(&path)
-            .with_context(|| format!("failed to bind events socket {}", path.display()))?;
+        let events_listener = match bind_events_socket(&path) {
+            Ok(listener) => {
+                crate::audit::record_socket_bind(
+                    "events",
+                    &path,
+                    crate::audit::SocketBindResult::Succeeded,
+                );
+                listener
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                crate::audit::record_socket_bind(
+                    "events",
+                    &path,
+                    crate::audit::SocketBindResult::Failed(&msg),
+                );
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed to bind events socket {}", path.display())));
+            }
+        };
         tracing::info!(events_socket_path = %path.display(), "events socket is ready");
         let server_state_for_events = server_state.clone();
         tokio::spawn(async move {
@@ -1720,6 +1756,7 @@ pub async fn serve(
             biased;
             signal = graceful_shutdown_signal() => {
                 tracing::info!(signal, "shutdown signal received; releasing worker panes");
+                crate::audit::record_shutdown(format!("signal:{signal}"));
                 server_state
                     .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
                     .await;

@@ -15,6 +15,12 @@ Engine logs are written to `/tmp/boss-engine.log` by default (override with
 `BOSS_ENGINE_LOG_PATH`).
 Engine PID is written to `/tmp/boss-engine.pid` by default (override with
 `BOSS_ENGINE_PID_PATH`).
+Engine lifecycle events (start, every socket bind, shutdown — clean,
+signalled, or panic) are appended as JSON lines to
+`~/Library/Application Support/Boss/engine-audit.log` (override with
+`BOSS_ENGINE_AUDIT_PATH`). The file lives outside `state.db` so it
+survives db wipes; the engine rotates it in-place when it grows past
+2 MiB. See [Forensic / audit log](#forensic--audit-log) below.
 Internal system status messages are hidden by default. Set
 `BOSS_SHOW_SYSTEM_MESSAGES=1` to show them in the chat transcript.
 
@@ -69,7 +75,35 @@ BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools
 - `BOSS_ENGINE_STOP_ON_EXIT`: set `1` to stop engine when app exits
 - `BOSS_SHOW_SYSTEM_MESSAGES`: set `1` to include internal system status messages
 - `BOSS_ENGINE_LOG_PATH`: log file path (default `/tmp/boss-engine.log`)
+- `BOSS_ENGINE_AUDIT_PATH`: audit log file path (default
+  `~/Library/Application Support/Boss/engine-audit.log`)
 - `RUST_LOG`: tracing filter for engine logs (default `info,acp_stderr=debug`)
+
+## Forensic / audit log
+
+Every engine process appends one JSON line per lifecycle transition to
+`~/Library/Application Support/Boss/engine-audit.log`:
+
+- **`start`** — written before any work runs. Carries `pid`, `ppid`,
+  `argv`, `parent_command` (best-effort `ps -o command=` of the
+  parent), `engine_version`, `socket_paths` (the frontend and events
+  sockets the engine *intends* to bind), `state_db_path`, and
+  `prior_state_db_size`.
+- **`socket_bound` / `socket_bind_failed`** — emitted at each
+  `UnixListener::bind` site. `socket_kind` is `frontend` or `events`.
+  Failures include the formatted error.
+- **`shutdown`** — written when a graceful-shutdown signal fires
+  (`reason="signal:SIGINT"` / `signal:SIGTERM`), when `app::run`
+  returns an error (`reason="error:<first line>"`), or when the
+  process panics (`reason="crash:<first line>"`). Carries
+  `uptime_sec` derived from the start record. A `start` line with no
+  matching `shutdown` is itself the signal that the prior instance
+  died unrecoverably (e.g. `SIGKILL`).
+
+The file is bounded at ~2 MiB; on overflow the engine drops the
+oldest half on the next append. Inspect it with `tail` or
+`jq -c . engine-audit.log | tail`. To override the path (tests,
+out-of-tree installs) export `BOSS_ENGINE_AUDIT_PATH`.
 
 ## Agents mode (Phase 6a libghostty embedding)
 

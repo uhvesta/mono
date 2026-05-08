@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod app;
+pub mod audit;
 pub mod cli;
 pub mod completion;
 pub mod config;
