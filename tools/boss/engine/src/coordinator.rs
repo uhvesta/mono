@@ -469,6 +469,14 @@ impl WorkerPool {
         inner.workers.len()
     }
 
+    /// Format a worker id for slot `slot_id`. Inverse of
+    /// [`slot_id_from_worker_id`]; both sides of the
+    /// engine-owns-allocation refactor lean on this string format
+    /// being stable so `worker-{N}` and slot N stay 1:1.
+    pub fn worker_id_for_slot(slot_id: u8) -> String {
+        format!("worker-{}", slot_id)
+    }
+
     #[cfg(test)]
     async fn idle_count(&self) -> usize {
         let inner = self.inner.lock().await;
@@ -488,6 +496,23 @@ impl WorkerPool {
             .find(|worker| worker.worker_id == worker_id)
             .and_then(|worker| worker.last_workspace_id.clone())
     }
+}
+
+/// Parse the trailing 1-indexed slot number out of a `worker-{N}`
+/// id. Both numbers refer to the same physical pane (the engine
+/// owns allocation; the app hosts the pane in slot N), so we
+/// normalize on this single conversion at the engine→app boundary.
+///
+/// Returns `None` for ids that don't match the `worker-{N}` shape
+/// or whose suffix isn't a positive `u8`. Callers should treat
+/// `None` as a programming error — the only producer is
+/// [`WorkerPool::claim_worker`].
+pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
+    worker_id
+        .strip_prefix("worker-")?
+        .parse::<u8>()
+        .ok()
+        .filter(|n| *n >= 1)
 }
 
 /// Sink for `executions.<id>` topic invalidations. The engine wires this
@@ -1190,6 +1215,7 @@ mod tests {
     use super::{
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
         ExecutionCoordinator, ExecutionPublisher, MAX_WORKER_POOL_SIZE, WorkerPool,
+        slot_id_from_worker_id,
     };
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
@@ -1946,6 +1972,31 @@ mod tests {
         // selection from the free pool — either worker is a valid pick.
         let fallback = pool.claim_worker("exec-d", Some("ws-unknown")).await.unwrap();
         assert!(fallback == w_a || fallback == w_b);
+    }
+
+    /// `worker-{N}` and slot N must round-trip 1:1. The
+    /// engine-owns-slots refactor depends on this — the runner
+    /// derives the pane slot it sends to the app from the worker
+    /// id the coordinator handed it. A regression in either format
+    /// or parse would silently re-introduce two independent
+    /// numbering systems.
+    #[test]
+    fn worker_id_and_slot_id_round_trip() {
+        for slot in 1u8..=8 {
+            let worker_id = WorkerPool::worker_id_for_slot(slot);
+            assert_eq!(worker_id, format!("worker-{slot}"));
+            assert_eq!(slot_id_from_worker_id(&worker_id), Some(slot));
+        }
+    }
+
+    #[test]
+    fn slot_id_from_worker_id_rejects_garbage() {
+        assert_eq!(slot_id_from_worker_id(""), None);
+        assert_eq!(slot_id_from_worker_id("worker"), None);
+        assert_eq!(slot_id_from_worker_id("worker-"), None);
+        assert_eq!(slot_id_from_worker_id("worker-0"), None);
+        assert_eq!(slot_id_from_worker_id("worker-abc"), None);
+        assert_eq!(slot_id_from_worker_id("agent-1"), None);
     }
 
     #[tokio::test]

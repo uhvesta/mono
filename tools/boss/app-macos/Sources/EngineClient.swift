@@ -4,6 +4,12 @@ import Network
 struct EngineSpawnRequest: Sendable {
     let runId: String
     let workspacePath: String
+    /// 1-indexed slot the engine has claimed for this worker. The
+    /// app must host the pane in this exact slot or fail with
+    /// `.slotBusy`. The engine is the source of truth for slot
+    /// allocation; the previous `firstIndex(where:)` heuristic in
+    /// the app has been removed.
+    let slotId: Int
     let initialInput: String
     let env: [(String, String)]
     /// Engine-supplied 2–4 word summary of the task this worker is
@@ -16,6 +22,12 @@ struct EngineSpawnRequest: Sendable {
 
 enum EngineSpawnError: Sendable {
     case noAvailableSlot
+    /// Engine asked us to host the pane in a slot that already has a
+    /// session. Surfaces engine↔app disagreement explicitly instead
+    /// of silently re-allocating to a different slot, which would
+    /// re-introduce the dual-allocator bug the engine-owns-slots
+    /// refactor exists to fix.
+    case slotBusy
     case internalFailure(String)
 }
 
@@ -369,6 +381,8 @@ final class EngineClient: @unchecked Sendable {
         switch error {
         case .noAvailableSlot:
             return ["kind": "no_available_slot"]
+        case .slotBusy:
+            return ["kind": "slot_busy"]
         case .internalFailure(let message):
             return ["kind": "internal", "message": message]
         }
@@ -570,6 +584,7 @@ final class EngineClient: @unchecked Sendable {
                 case "spawn_worker_pane":
                     let runId = request["run_id"] as? String ?? ""
                     let workspacePath = request["workspace_path"] as? String ?? ""
+                    let slotId = (request["slot_id"] as? NSNumber)?.intValue ?? 0
                     let initialInput = request["initial_input"] as? String ?? ""
                     let env = (request["env"] as? [[String: Any]] ?? []).compactMap {
                         item -> (String, String)? in
@@ -582,6 +597,7 @@ final class EngineClient: @unchecked Sendable {
                     let spawn = EngineSpawnRequest(
                         runId: runId,
                         workspacePath: workspacePath,
+                        slotId: slotId,
                         initialInput: initialInput,
                         env: env,
                         summary: summary

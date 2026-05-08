@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 
 use crate::config::RuntimeConfig;
+use crate::coordinator::slot_id_from_worker_id;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{Project, Task, WorkDb, WorkExecution, WorkItem};
@@ -212,6 +213,17 @@ impl ExecutionRunner for PaneSpawnRunner {
             .clone()
             .context("execution missing cube_lease_id; coordinator must lease before spawn")?;
 
+        // The coordinator already claimed a slot via WorkerPool —
+        // `worker_id` is `worker-{N}` and N is the slot the engine
+        // owns. Decode it here and thread it into the spawn so the
+        // app hosts the pane in this exact slot rather than running
+        // its own (now-deleted) firstIndex(where:) heuristic.
+        let slot_id = slot_id_from_worker_id(worker_id).ok_or_else(|| {
+            anyhow!(
+                "PaneSpawnRunner received worker_id {worker_id:?} that does not parse as worker-{{N}}"
+            )
+        })?;
+
         // Compose the worker prompt and stash it on disk so the
         // libghostty pane can `claude "$(cat .claude/initial-prompt.txt)"`
         // — Claude Code's positional arg is treated as the first user
@@ -277,6 +289,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             StartWorkerInput {
                 run_id: execution.id.clone(),
                 lease_id,
+                slot_id,
                 workspace_path: workspace_path.to_path_buf(),
                 events_socket_path: self.events_socket_path(),
                 boss_event_path: self.boss_event_binary(),
@@ -500,10 +513,15 @@ mod pane_spawn_tests {
         ) -> Result<EngineToAppResponse, SendToAppError> {
             match request {
                 EngineToAppRequest::SpawnWorkerPane(input) => {
+                    // Echo the slot the engine claimed; the
+                    // engine-owns-slots refactor makes the response
+                    // slot a confirmation echo rather than an
+                    // independent allocator pick.
+                    let slot_id = input.slot_id;
                     *self.last.lock().unwrap() = Some(input);
                     Ok(EngineToAppResponse::SpawnWorkerPane {
                         result: Ok(SpawnWorkerPaneResult {
-                            slot_id: 1,
+                            slot_id,
                             shell_pid: 0,
                         }),
                     })
@@ -702,6 +720,54 @@ mod pane_spawn_tests {
                 .iter()
                 .any(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET"),
             "expected BOSS_EVENTS_SOCKET to be set"
+        );
+    }
+
+    /// The engine is now the source of truth for which slot a
+    /// worker lands in. The runner derives the slot from the
+    /// `worker-{N}` id the coordinator passes in and forwards it on
+    /// `SpawnWorkerPaneInput.slot_id`. The app honors that slot
+    /// rather than running its own allocator. This test pins down
+    /// that wiring so a regression that drops the slot from the
+    /// request (or computes it wrong) doesn't silently re-introduce
+    /// the dual-allocator bug.
+    #[tokio::test]
+    async fn spawn_request_includes_engine_claimed_slot() {
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 8,
+            },
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+        let runner = PaneSpawnRunner::new(cfg, work_db);
+        runner.set_server_state(weak);
+
+        // Engine claimed slot 6 (i.e. handed `worker-6` to the
+        // runner). The spawn request must carry slot 6 — not 1, not
+        // some random pick, not the lowest free.
+        runner
+            .run_execution(
+                "worker-6",
+                &sample_execution(workspace.path()),
+                &sample_chore(),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await
+            .unwrap();
+
+        let input = spawner.spawn_input();
+        assert_eq!(
+            input.slot_id, 6,
+            "engine-claimed slot must reach the app verbatim, got {}",
+            input.slot_id,
         );
     }
 

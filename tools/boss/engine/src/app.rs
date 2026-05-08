@@ -4066,6 +4066,7 @@ mod tests {
                 EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
                     run_id: "r".into(),
                     workspace_path: "/tmp".into(),
+                    slot_id: 1,
                     initial_input: "claude\n".into(),
                     env: vec![],
                     summary: None,
@@ -4091,6 +4092,7 @@ mod tests {
                     EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
                         run_id: "run-7".into(),
                         workspace_path: "/tmp".into(),
+                        slot_id: 1,
                         initial_input: "claude\n".into(),
                         env: vec![],
                         summary: None,
@@ -4193,6 +4195,7 @@ mod tests {
                 EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
                     run_id: "r".into(),
                     workspace_path: "/tmp".into(),
+                    slot_id: 1,
                     initial_input: "claude\n".into(),
                     env: vec![],
                     summary: None,
@@ -4218,6 +4221,7 @@ mod tests {
                     EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
                         run_id: "r".into(),
                         workspace_path: "/tmp".into(),
+                        slot_id: 1,
                         initial_input: "claude\n".into(),
                         env: vec![],
                         summary: None,
@@ -4263,6 +4267,7 @@ mod tests {
             EngineToAppRequest::SpawnWorkerPane(crate::protocol::SpawnWorkerPaneInput {
                 run_id: run.to_owned(),
                 workspace_path: "/tmp".into(),
+                slot_id: 1,
                 initial_input: "claude\n".into(),
                 env: vec![],
                 summary: None,

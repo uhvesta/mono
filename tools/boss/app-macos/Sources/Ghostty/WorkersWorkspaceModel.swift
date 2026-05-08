@@ -15,13 +15,29 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
     }
 
-    /// Allocate a free slot, configure a `TerminalPaneSession` with
-    /// the given workspace + env + initial input, and return the
-    /// slot id + shell pid. Returns `.failure(.noAvailableSlot)` if
-    /// all 8 slots are occupied.
+    /// Host a worker pane in the slot the engine has claimed for
+    /// this worker (`request.slotId`). The engine is the source of
+    /// truth for slot allocation: this method honors the requested
+    /// slot or fails — it never picks a different slot.
+    ///
+    /// Returns:
+    ///  - `.failure(.internalFailure)` if `slotId` is outside
+    ///    `1...workerSlotCount` (engine asked for a slot that
+    ///    doesn't exist on this app).
+    ///  - `.failure(.slotBusy)` if the requested slot already hosts
+    ///    a session (engine and app disagree about what's free —
+    ///    the engine should reconcile rather than retry blindly).
     func spawnWorkerPane(_ request: EngineSpawnRequest) -> EngineSpawnResult {
-        guard let index = slots.firstIndex(where: { $0.session == nil }) else {
-            return .failure(.noAvailableSlot)
+        let requestedSlot = request.slotId
+        guard requestedSlot >= 1, requestedSlot <= Self.workerSlotCount,
+              let index = slots.firstIndex(where: { $0.slotId == requestedSlot })
+        else {
+            return .failure(.internalFailure(
+                "engine requested slot \(requestedSlot), valid range is 1...\(Self.workerSlotCount)"
+            ))
+        }
+        guard slots[index].session == nil else {
+            return .failure(.slotBusy)
         }
 
         let slotId = slots[index].slotId

@@ -67,6 +67,12 @@ const WORKER_EDITOR_NOOP: &str = "false";
 pub struct StartWorkerInput {
     pub run_id: String,
     pub lease_id: String,
+    /// Slot the engine has already claimed for this worker (1-indexed,
+    /// matches the app's WorkersWorkspaceModel slot numbering). The
+    /// engine is the source of truth for slot allocation; the app's
+    /// job is to host the pane in this exact slot or fail with
+    /// `EngineToAppError::SlotBusy`.
+    pub slot_id: u8,
     pub workspace_path: PathBuf,
     pub events_socket_path: PathBuf,
     pub boss_event_path: PathBuf,
@@ -221,11 +227,13 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         }
     }
 
+    let claimed_slot = input.slot_id;
     let response = spawner
         .send_to_app_request(
             EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
                 run_id: input.run_id.clone(),
                 workspace_path: input.workspace_path.display().to_string(),
+                slot_id: claimed_slot,
                 initial_input: input.initial_input,
                 env,
                 summary: input.title_summary,
@@ -246,6 +254,15 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             return Err(StartWorkerError::ResponseKindMismatch);
         }
     };
+
+    // The engine dictates the slot; the app's response slot is just a
+    // confirmation echo. A mismatch means the app picked a different
+    // slot than we asked for, which would re-introduce the dual
+    // allocator the engine-owns-slots refactor exists to remove.
+    debug_assert_eq!(
+        slot_id, claimed_slot,
+        "app honored a different slot ({slot_id}) than the engine claimed ({claimed_slot})"
+    );
 
     // 3. Register the shell pid against the run id so the events
     //    socket can correlate hook events from descendants of the
@@ -354,6 +371,7 @@ mod tests {
         StartWorkerInput {
             run_id: "run-test".into(),
             lease_id: "lease-test".into(),
+            slot_id: 3,
             workspace_path: workspace.path().to_path_buf(),
             events_socket_path: PathBuf::from("/tmp/events.sock"),
             boss_event_path: PathBuf::from("/tmp/boss-event"),
@@ -402,7 +420,7 @@ mod tests {
             last_request: std::sync::Mutex::new(None),
             canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
                 result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 1,
+                    slot_id: 3,
                     shell_pid: 0,
                 }),
             }),
@@ -436,6 +454,74 @@ mod tests {
             Err(StartWorkerError::AppError(EngineToAppError::NoAvailableSlot))
         ));
         assert!(registry.is_empty());
+    }
+
+    /// Engine-owns-slots invariant: the slot the runner claimed for
+    /// this worker (set on `StartWorkerInput.slot_id`) must reach
+    /// the app verbatim on `SpawnWorkerPaneInput.slot_id`. A drop
+    /// here would re-allow the app's old firstIndex(where:) heuristic
+    /// to silently override the engine's pick.
+    #[tokio::test]
+    async fn spawn_request_carries_engine_claimed_slot_id() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = StubSpawner {
+            registry: WorkerRegistry::new(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
+                result: Ok(SpawnWorkerPaneResult {
+                    slot_id: 7,
+                    shell_pid: 99,
+                }),
+            }),
+        };
+        let mut input = sample_input(&workspace);
+        input.slot_id = 7;
+
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        let last = spawner.last_request.lock().unwrap().clone().unwrap();
+        match last {
+            EngineToAppRequest::SpawnWorkerPane(req) => {
+                assert_eq!(req.slot_id, 7);
+            }
+            other => panic!("expected SpawnWorkerPane request, got {other:?}"),
+        }
+    }
+
+    /// If the app and the engine disagree about which slot is free
+    /// (engine asks for slot N; app already hosts a session there),
+    /// the app returns `SlotBusy` and the spawn flow surfaces it as
+    /// `StartWorkerError::AppError(SlotBusy)` without registering a
+    /// pid for the run. The coordinator can then handle the
+    /// disagreement explicitly instead of the app silently picking a
+    /// different slot.
+    #[tokio::test]
+    async fn slot_busy_error_propagates_without_registering_pid() {
+        let workspace = TempDir::new().unwrap();
+        let registry = WorkerRegistry::new();
+        let spawner = StubSpawner {
+            registry: registry.clone(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
+                result: Err(EngineToAppError::SlotBusy),
+            }),
+        };
+
+        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(StartWorkerError::AppError(EngineToAppError::SlotBusy))
+            ),
+            "expected SlotBusy app error, got {result:?}",
+        );
+        assert!(
+            registry.is_empty(),
+            "registry must be empty when the app rejects the spawn — no pid to track",
+        );
     }
 
     #[tokio::test]
@@ -472,9 +558,12 @@ mod tests {
             registry: WorkerRegistry::new(),
             spawn_calls: Arc::new(AtomicUsize::new(0)),
             last_request: std::sync::Mutex::new(None),
+            // Echo whatever sample_input claims (slot 3) so the
+            // engine-side debug_assert that the app honored the
+            // claimed slot doesn't fire in tests.
             canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
                 result: Ok(SpawnWorkerPaneResult {
-                    slot_id: 1,
+                    slot_id: 3,
                     shell_pid: 1,
                 }),
             }),

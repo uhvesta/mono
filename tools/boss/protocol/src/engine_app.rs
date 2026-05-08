@@ -18,11 +18,28 @@ pub struct EnvVar {
     pub value: String,
 }
 
-/// Engine asks the app to allocate a worker pane.
+/// Engine asks the app to host a worker pane in a specific slot.
+///
+/// The engine is the source of truth for which slot a worker lands
+/// in: it picks the slot via [`crate::WorkerPool::claim_worker`] and
+/// passes the result here as `slot_id`. The app's job is to honor
+/// that slot — no fallback / re-allocation. If the slot is already
+/// occupied (engine and app disagree), the app returns
+/// [`EngineToAppError::SlotBusy`] rather than silently picking a
+/// different slot, which would re-introduce the dual-allocator bug
+/// the engine-owns-slots refactor exists to fix.
+///
+/// Naming: `worker-{N}` (engine side) and slot `N` (app side, also
+/// 1-indexed) refer to the same physical pane. There is one and
+/// only one numbering.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpawnWorkerPaneInput {
     pub run_id: String,
     pub workspace_path: String,
+    /// 1-indexed slot the engine has claimed for this worker. The
+    /// app must host the pane in this exact slot or fail with
+    /// [`EngineToAppError::SlotBusy`] / `UnknownSlot`.
+    pub slot_id: u8,
     /// Text written into the pty after the shell starts. Typically
     /// `"claude\n"` so the shell types `claude` and runs the worker.
     pub initial_input: String,
@@ -39,10 +56,14 @@ pub struct SpawnWorkerPaneInput {
     pub summary: Option<String>,
 }
 
-/// App's reply when allocation succeeds.
+/// App's reply when allocation succeeds. The slot is dictated by
+/// the engine in [`SpawnWorkerPaneInput::slot_id`]; the app echoes
+/// it back here purely as a confirmation aid.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnWorkerPaneResult {
-    /// One of 1..=8.
+    /// Confirmation echo of [`SpawnWorkerPaneInput::slot_id`]. Engine
+    /// callers can debug-assert equality, but should otherwise treat
+    /// the slot they sent as authoritative.
     pub slot_id: u8,
     /// Pid of the shell the surface spawned. The actual `claude`
     /// process will be a descendant of this pid; the engine registers
@@ -146,12 +167,21 @@ pub enum EngineToAppResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineToAppError {
-    /// All 8 worker slots are in use.
+    /// All 8 worker slots are in use. Retained for completeness;
+    /// since the engine now picks the slot, this is effectively
+    /// unreachable from `SpawnWorkerPane` (the engine returns
+    /// before the request is even sent when the pool is full).
     NoAvailableSlot,
-    /// `ReleaseWorkerPane` referred to a slot the app does not
+    /// `ReleaseWorkerPane` / `SendToPane` / `FocusWorkerPane` /
+    /// `InterruptWorkerPane` referred to a slot the app does not
     /// recognise — already released, never allocated, or stale after
     /// an app restart.
     UnknownSlot,
+    /// `SpawnWorkerPane` requested a slot the app considers already
+    /// in use (a session is hosted there). Surfaces engine↔app
+    /// disagreement instead of silently re-allocating; the engine
+    /// must reconcile rather than retry blindly.
+    SlotBusy,
     /// App lost its connection to the engine before responding. The
     /// engine synthesises this on the caller's side; the app never
     /// sends it on the wire.
@@ -171,6 +201,7 @@ mod tests {
         let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
             run_id: "run-1".into(),
             workspace_path: "/tmp/ws".into(),
+            slot_id: 3,
             initial_input: "claude\n".into(),
             env: vec![EnvVar {
                 key: "BOSS_LEASE_ID".into(),
@@ -179,6 +210,7 @@ mod tests {
             summary: Some("fixing the fencer scraper".into()),
         });
         let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"slot_id\":3"));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }
@@ -188,6 +220,7 @@ mod tests {
         let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
             run_id: "run-1".into(),
             workspace_path: "/tmp/ws".into(),
+            slot_id: 1,
             initial_input: "claude\n".into(),
             env: vec![],
             summary: None,
@@ -197,6 +230,17 @@ mod tests {
         // omitted so apps that predate the field continue to parse.
         assert!(!json.contains("summary"));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn slot_busy_error_round_trips() {
+        let original = EngineToAppResponse::SpawnWorkerPane {
+            result: Err(EngineToAppError::SlotBusy),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("slot_busy"));
+        let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }
 
