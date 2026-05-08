@@ -1594,6 +1594,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_id_independent_of_cube_workspace_id_even_when_scrambled() {
+        // Regression pin for the boss-vs-cube identity audit
+        // (`tools/boss/docs/investigations/
+        // boss-worker-identity-vs-workspace-id-2026-05-07.md`):
+        // even when cube hands out a workspace whose id collides
+        // with a *different* slot number, the coordinator must
+        // stamp `agent_id` from the pane slot the runner reports —
+        // not from the cube workspace id. A future change that
+        // accidentally sourced agent_id from `lease.workspace_id`
+        // would assert as `worker-7` here instead of `worker-2`.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Cube hands out workspace 007. The runner reports slot 2.
+        // The two numbers are intentionally different: a successful
+        // assertion proves the audited invariant — agent_id is the
+        // pane slot, not the workspace number.
+        let cube =
+            Arc::new(FakeCubeClient::default().with_next_workspace_id("mono-agent-007"));
+        let runner = Arc::new(FakeExecutionRunner {
+            slot_id: Some(2),
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner,
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        let execution = db.get_execution(&execution.id).unwrap();
+        assert_eq!(
+            execution.cube_workspace_id.as_deref(),
+            Some("mono-agent-007"),
+            "cube workspace id should land on the execution row",
+        );
+
+        let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
+        assert_eq!(
+            run.agent_id, "worker-2",
+            "agent_id must be derived from the pane slot id (2), \
+             not from the cube workspace number (7)",
+        );
+    }
+
+    #[tokio::test]
     async fn successful_run_moves_execution_to_waiting_human_and_releases_worker() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
