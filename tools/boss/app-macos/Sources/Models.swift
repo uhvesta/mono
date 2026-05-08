@@ -3,6 +3,7 @@ import Foundation
 enum NavigationMode: String, CaseIterable, Identifiable {
     case agents = "Agents"
     case work = "Work"
+    case designs = "Designs"
 
     var id: String { rawValue }
 }

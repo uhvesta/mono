@@ -34,6 +34,10 @@ struct ContentView: View {
             agentsView
                 .opacity(model.navigationMode == .agents ? 1 : 0)
                 .allowsHitTesting(model.navigationMode == .agents)
+
+            DesignsView(chat: model)
+                .opacity(model.navigationMode == .designs ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .designs)
         }
         #if canImport(GhosttyKit)
         .task {
@@ -74,7 +78,7 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 170)
+                .frame(width: 260)
             }
 
             ToolbarItem {
@@ -748,7 +752,7 @@ private struct WorkSidebarFilterRow: View {
     }
 }
 
-private struct SidebarProductPicker: NSViewRepresentable {
+struct SidebarProductPicker: NSViewRepresentable {
     @Binding var selection: String?
     let products: [WorkProduct]
 
