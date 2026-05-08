@@ -3,10 +3,10 @@ import SwiftUI
 
 struct WorkersDetailView: View {
     @ObservedObject var workspace: WorkersWorkspaceModel
-    @ObservedObject var chat: ChatViewModel
+    @ObservedObject var liveStates: LiveWorkerStateStore
 
     var body: some View {
-        WorkerGrid(runtime: workspace.runtime, slots: workspace.slots, chat: chat)
+        WorkerGrid(runtime: workspace.runtime, slots: workspace.slots, liveStates: liveStates)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .separatorColor))
     }
@@ -15,7 +15,7 @@ struct WorkersDetailView: View {
 private struct WorkerGrid: View {
     let runtime: GhosttyRuntime
     let slots: [WorkerSlot]
-    @ObservedObject var chat: ChatViewModel
+    @ObservedObject var liveStates: LiveWorkerStateStore
 
     var body: some View {
         let columns = 4
@@ -30,7 +30,7 @@ private struct WorkerGrid: View {
                         WorkerSlotView(
                             runtime: runtime,
                             slot: slot,
-                            liveState: chat.workerLiveStatesBySlot[slot.slotId]
+                            liveState: liveStates.bySlot[slot.slotId]
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }

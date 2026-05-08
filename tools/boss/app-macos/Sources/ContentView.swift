@@ -182,7 +182,7 @@ struct ContentView: View {
 
     private var agentsView: some View {
         #if canImport(GhosttyKit)
-        WorkersDetailView(workspace: workersWorkspace, chat: model)
+        WorkersDetailView(workspace: workersWorkspace, liveStates: model.liveWorkerStates)
             .background(Color(nsColor: .windowBackgroundColor))
         #else
         VStack(alignment: .leading, spacing: 12) {
@@ -713,40 +713,15 @@ struct ContentView: View {
     private func workSectionItems(_ items: [WorkTask], column: WorkBoardColumnKey) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
-                Button {
-                    model.selectWorkCard(
-                        model.selectedTask?.id == task.id ? nil : task.id
-                    )
-                } label: {
-                    WorkBoardCardView(
-                        task: task,
-                        projectName: task.isChore ? nil : model.projectName(for: task.projectID),
-                        isSelected: model.selectedTask?.id == task.id,
-                        activityState: column == .doing
-                            ? AgentActivityState(
-                                runtime: model.taskRuntime(for: task.id),
-                                liveState: model.workerLiveState(forTaskID: task.id)
-                              )
-                            : nil,
-                        assignedSlotId: column == .doing
-                            ? model.workerLiveState(forTaskID: task.id)?.slotId
-                            : nil
-                    )
-                }
-                .buttonStyle(.plain)
-                .popover(
-                    isPresented: Binding(
-                        get: { model.selectedTask?.id == task.id },
-                        set: { isPresented in
-                            if !isPresented, model.selectedTask?.id == task.id {
-                                model.selectWorkCard(nil)
-                            }
-                        }
-                    ),
-                    arrowEdge: .trailing
-                ) {
-                    WorkCardPopoverView(model: model, task: task)
-                }
+                WorkBoardCardItem(
+                    task: task,
+                    projectName: task.isChore ? nil : model.projectName(for: task.projectID),
+                    column: column,
+                    runtime: column == .doing ? model.taskRuntime(for: task.id) : nil,
+                    isSelected: model.selectedTask?.id == task.id,
+                    model: model,
+                    liveStates: model.liveWorkerStates
+                )
             }
         }
     }
@@ -913,6 +888,58 @@ private struct SidebarProductPicker: NSViewRepresentable {
             if selection.wrappedValue != selectedID {
                 selection.wrappedValue = selectedID
             }
+        }
+    }
+}
+
+/// Wrapper for a single kanban card. Observes `LiveWorkerStateStore`
+/// so live-state pushes invalidate the card without touching
+/// `ContentView` or `ChatViewModel`. Doing-column cards re-resolve
+/// their live state on every store publish; other columns ignore the
+/// store entirely.
+private struct WorkBoardCardItem: View {
+    let task: WorkTask
+    let projectName: String?
+    let column: WorkBoardColumnKey
+    let runtime: WorkTaskRuntime?
+    let isSelected: Bool
+    @ObservedObject var model: ChatViewModel
+    @ObservedObject var liveStates: LiveWorkerStateStore
+
+    var body: some View {
+        let liveState: WorkerLiveState? = {
+            guard column == .doing,
+                  let executionID = runtime?.executionID
+            else { return nil }
+            return liveStates.byRunID[executionID]
+        }()
+
+        Button {
+            model.selectWorkCard(isSelected ? nil : task.id)
+        } label: {
+            WorkBoardCardView(
+                task: task,
+                projectName: projectName,
+                isSelected: isSelected,
+                activityState: column == .doing
+                    ? AgentActivityState(runtime: runtime, liveState: liveState)
+                    : nil,
+                assignedSlotId: column == .doing ? liveState?.slotId : nil
+            )
+        }
+        .buttonStyle(.plain)
+        .popover(
+            isPresented: Binding(
+                get: { isSelected },
+                set: { isPresented in
+                    if !isPresented, isSelected {
+                        model.selectWorkCard(nil)
+                    }
+                }
+            ),
+            arrowEdge: .trailing
+        ) {
+            WorkCardPopoverView(model: model, task: task)
         }
     }
 }

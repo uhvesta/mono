@@ -49,17 +49,20 @@ final class ChatViewModel: ObservableObject {
     }
     @Published var isBossPanelCollapsed: Bool = false
     @Published var bossPanelWidth: CGFloat = 380
-    /// Live runtime state for every active worker, keyed by run id.
-    /// Sourced from the engine's LiveWorkerState snapshot
-    /// (`worker_live_states_list` event); refreshed on each push from
-    /// the `worker.live_states` topic. Used to drive the kanban Doing
-    /// icon (working / waiting / idle / errored) and the per-pane
-    /// titlebar pill — replaces the screen-scrape-only signal that
-    /// always rendered "Claude Unknown".
-    @Published var workerLiveStatesByRunID: [String: WorkerLiveState] = [:]
-    /// Same data, keyed by slot id, for components that bind by slot
-    /// (e.g., the libghostty pane row).
-    @Published var workerLiveStatesBySlot: [Int: WorkerLiveState] = [:]
+    /// Live runtime state for every active worker, sourced from the
+    /// engine's LiveWorkerState snapshot (`worker_live_states_list`
+    /// event) and refreshed on each push from the `worker.live_states`
+    /// topic. Drives the kanban Doing icon (working / waiting / idle
+    /// / errored) and the per-pane titlebar pill — replaces the
+    /// screen-scrape-only signal that always rendered "Claude
+    /// Unknown".
+    ///
+    /// Held on its own `ObservableObject` so the high-rate hook
+    /// traffic that drives this snapshot doesn't invalidate every
+    /// view that observes `ChatViewModel` (toolbar, sidebar, Boss
+    /// panel, ContentView root). Only the views that actually read
+    /// live state subscribe to the store.
+    let liveWorkerStates = LiveWorkerStateStore()
 
     var bossAgent: Agent? {
         agents.first { $0.isBoss }
@@ -856,12 +859,7 @@ final class ChatViewModel: ObservableObject {
                 workErrorMessage = message
             }
         case .workerLiveStatesList(let states):
-            workerLiveStatesByRunID = Dictionary(
-                uniqueKeysWithValues: states.map { ($0.runId, $0) }
-            )
-            workerLiveStatesBySlot = Dictionary(
-                uniqueKeysWithValues: states.map { ($0.slotId, $0) }
-            )
+            liveWorkerStates.update(states: states)
         }
     }
 
@@ -1474,7 +1472,7 @@ final class ChatViewModel: ObservableObject {
         else {
             return nil
         }
-        return workerLiveStatesByRunID[executionID]
+        return liveWorkerStates.byRunID[executionID]
     }
 
     private func upsertProduct(_ product: WorkProduct) {
