@@ -694,7 +694,8 @@ final class EngineClient: @unchecked Sendable {
             status: status,
             priority: priority,
             createdAt: createdAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            lastStatusActor: (payload["last_status_actor"] as? String) ?? "human"
         )
     }
 
@@ -730,7 +731,8 @@ final class EngineClient: @unchecked Sendable {
             prURL: payload["pr_url"] as? String,
             deletedAt: payload["deleted_at"] as? String,
             createdAt: createdAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            lastStatusActor: (payload["last_status_actor"] as? String) ?? "human"
         )
     }
 

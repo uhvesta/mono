@@ -578,8 +578,7 @@ struct ContentView: View {
         )
         .dropDestination(for: String.self) { items, _ in
             guard let taskID = items.first else { return false }
-            model.moveTask(taskID, to: column)
-            return true
+            return model.attemptMoveTask(taskID, to: column)
         }
     }
 
@@ -828,38 +827,92 @@ private struct WorkBoardCardItem: View {
             ? model.blockedByLabel(for: task)
             : nil
 
-        Button {
-            model.selectWorkCard(isSelected ? nil : task.id)
-        } label: {
-            WorkBoardCardView(
-                task: task,
-                projectName: projectName,
-                isSelected: isSelected,
-                activityState: column == .doing
-                    ? AgentActivityState(runtime: runtime, liveState: liveState)
-                    : nil,
-                assignedSlotId: column == .doing ? liveState?.slotId : nil,
-                blockedBy: blockedBy
-            )
-        }
-        .buttonStyle(.plain)
-        .popover(
-            isPresented: Binding(
-                get: { isSelected },
-                set: { isPresented in
-                    if !isPresented, isSelected {
-                        model.selectWorkCard(nil)
+        let gatingPrereqs = model.gatingPrereqs(for: task.id)
+        let isAutoBlocked = model.isAutoBlocked(task)
+        let dragRefusal: String? = (model.dragRefusalNotice?.taskID == task.id)
+            ? model.dragRefusalNotice?.message
+            : nil
+
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                model.selectWorkCard(isSelected ? nil : task.id)
+            } label: {
+                WorkBoardCardView(
+                    task: task,
+                    projectName: projectName,
+                    isSelected: isSelected,
+                    activityState: column == .doing
+                        ? AgentActivityState(runtime: runtime, liveState: liveState)
+                        : nil,
+                    assignedSlotId: column == .doing ? liveState?.slotId : nil,
+                    blockedBy: blockedBy,
+                    isAutoBlocked: isAutoBlocked,
+                    gatingPrereqs: gatingPrereqs
+                )
+            }
+            .buttonStyle(.plain)
+            .popover(
+                isPresented: Binding(
+                    get: { isSelected },
+                    set: { isPresented in
+                        if !isPresented, isSelected {
+                            model.selectWorkCard(nil)
+                        }
                     }
+                ),
+                arrowEdge: .trailing
+            ) {
+                WorkCardPopoverView(model: model, task: task)
+            }
+
+            if let dragRefusal {
+                WorkDragRefusalBanner(message: dragRefusal) {
+                    model.clearDragRefusal()
                 }
-            ),
-            arrowEdge: .trailing
-        ) {
-            WorkCardPopoverView(model: model, task: task)
+            }
         }
     }
 }
 
-private struct WorkBoardCardView: View {
+private struct WorkDragRefusalBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.caption)
+                .padding(.top, 1)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss drag refusal")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.orange.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.orange.opacity(0.4), lineWidth: 1)
+                )
+        )
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct WorkBoardCardView: View {
     let task: WorkTask
     let projectName: String?
     let isSelected: Bool
@@ -875,6 +928,15 @@ private struct WorkBoardCardView: View {
     /// reader can tell at a glance which Backlog items are gated and
     /// by what.
     let blockedBy: String?
+    /// True when the row is engine-blocked (auto-block) rather than a
+    /// human choice. Drives the chain badge in the footer per design
+    /// Q7 — manual blocks already get the lane and would double up.
+    var isAutoBlocked: Bool = false
+    /// Resolved prereq rows used by the chain badge's hover tooltip.
+    /// Empty for cards that aren't gated; populated regardless of
+    /// `isAutoBlocked` because the popover Dependencies subsection
+    /// reuses this list to render hyperlinks.
+    var gatingPrereqs: [WorkDependencyRow] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -927,6 +989,14 @@ private struct WorkBoardCardView: View {
                     if task.status == "blocked" {
                         WorkStatusBadge(text: "Blocked")
                     }
+                    if isAutoBlocked {
+                        Image(systemName: "link")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .help(autoBlockTooltip)
+                            .accessibilityLabel("Auto-blocked by dependencies")
+                            .accessibilityValue(autoBlockTooltip)
+                    }
                     Spacer()
                 }
             }
@@ -955,6 +1025,19 @@ private struct WorkBoardCardView: View {
     /// elements (project tag, blocked tag) appear conditionally.
     private var hasFooterContent: Bool {
         true
+    }
+
+    /// Tooltip body for the chain badge. Mirrors the CLI `show`
+    /// output's prereq list so a hover tells the reader the same
+    /// thing without opening the popover.
+    var autoBlockTooltip: String {
+        guard !gatingPrereqs.isEmpty else {
+            return "Auto-blocked by dependencies"
+        }
+        let summary = gatingPrereqs
+            .map { "\($0.title) (\($0.status.replacingOccurrences(of: "_", with: " ")))" }
+            .joined(separator: ", ")
+        return "Gated by: \(summary)"
     }
 
     private var cardBackground: Color {
@@ -1043,6 +1126,8 @@ private struct WorkCardPopoverView: View {
                 }
                 metadataPRRow(prURL: task.prURL)
             }
+
+            WorkDependenciesSection(model: model, taskID: task.id)
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Move")
@@ -1141,6 +1226,118 @@ private struct WorkCardPopoverView: View {
                     .font(.body)
             }
         }
+    }
+}
+
+/// Dependencies subsection rendered inside the card detail popover.
+/// Mirrors the CLI `boss <kind> show` output: incoming edges
+/// (prerequisites) and outgoing edges (dependents) as two short
+/// lists, each row hyperlinked to the corresponding card. Collapses
+/// to nothing when both lists are empty so the popover doesn't grow
+/// taller for cards with no dependencies (design item 12).
+struct WorkDependenciesSection: View {
+    @ObservedObject var model: ChatViewModel
+    let taskID: String
+
+    var body: some View {
+        let prereqs = model.dependencyPrereqs(for: taskID)
+        let dependents = model.dependencyDependents(for: taskID)
+
+        if prereqs.isEmpty && dependents.isEmpty {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Dependencies")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+
+                if !prereqs.isEmpty {
+                    dependencyList(title: "Prerequisites", rows: prereqs)
+                }
+                if !dependents.isEmpty {
+                    dependencyList(title: "Dependents", rows: dependents)
+                }
+            }
+            .accessibilityIdentifier("work-dependencies-section")
+        }
+    }
+
+    @ViewBuilder
+    private func dependencyList(title: String, rows: [WorkDependencyRow]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(rows) { row in
+                    WorkDependencyRowView(row: row) {
+                        model.selectWorkCard(row.id)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct WorkDependencyRowView: View {
+    let row: WorkDependencyRow
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 6) {
+                Image(systemName: kindSymbol)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+                Text(row.title)
+                    .font(.body)
+                    .foregroundStyle(linkColor)
+                    .underline(isLinkable)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 6)
+                Text(statusLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
+                    )
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isLinkable)
+        .help(row.title)
+    }
+
+    private var isLinkable: Bool {
+        row.kind != .unknown
+    }
+
+    private var linkColor: Color {
+        isLinkable ? Color.accentColor : .primary
+    }
+
+    private var kindSymbol: String {
+        switch row.kind {
+        case .task:
+            return "checkmark.circle"
+        case .chore:
+            return "wrench.and.screwdriver"
+        case .project:
+            return "folder"
+        case .unknown:
+            return "questionmark.circle"
+        }
+    }
+
+    private var statusLabel: String {
+        row.status.replacingOccurrences(of: "_", with: " ").capitalized
     }
 }
 
