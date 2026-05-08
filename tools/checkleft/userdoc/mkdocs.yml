@@ -15,6 +15,7 @@ nav:
   - Running checks: cli.md
   - Writing checks: check-author-api.md
   - Built-in checks: canned-checks.md
+  - Protobuf Starlark: protobuf-starlark.md
   - Bypassing checks: bypass.md
 markdown_extensions:
   - tables
