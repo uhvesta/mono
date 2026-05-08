@@ -1,5 +1,7 @@
 # Boss V2 — Design Risks
 
+> **Status:** Archived — all eight risks resolved on 2026-04-29. Canonical V2 spec: [main.md](main.md). This doc is kept for historical decision-record value only.
+
 ## Purpose
 
 The Boss V2 plan ([swiftui-boss-v2.md](../plans/done/swiftui-boss-v2.md))
