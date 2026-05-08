@@ -311,7 +311,7 @@ impl Store {
                         SELECT workspace_id, workspace_path
                         FROM workspaces
                         WHERE repo = ?1 AND state = ?2
-                        ORDER BY workspace_id
+                        ORDER BY RANDOM()
                         LIMIT 1
                         "#,
                         params![repo, WorkspaceState::Free.as_str()],
@@ -327,7 +327,7 @@ impl Store {
                     SELECT workspace_id, workspace_path
                     FROM workspaces
                     WHERE repo = ?1 AND state = ?2
-                    ORDER BY workspace_id
+                    ORDER BY RANDOM()
                     LIMIT 1
                     "#,
                     params![repo, WorkspaceState::Free.as_str()],
@@ -1019,7 +1019,7 @@ mod tests {
         }
 
         // lease one workspace in each repo with distinct holders
-        store
+        let claimed_mono = store
             .claim_workspace(
                 "mono",
                 "boss/worker-7",
@@ -1029,7 +1029,8 @@ mod tests {
                 Some(1900),
                 None,
             )
-            .expect("claim mono");
+            .expect("claim mono")
+            .expect("got record");
         store
             .claim_workspace(
                 "flunge",
@@ -1098,7 +1099,7 @@ mod tests {
             })
             .expect("list mono free");
         assert_eq!(mono_free.len(), 1);
-        assert_eq!(mono_free[0].workspace_id, "mono-agent-002");
+        assert_ne!(mono_free[0].workspace_id, claimed_mono.workspace_id);
     }
 
     #[test]
@@ -1165,11 +1166,11 @@ mod tests {
             .map(|r| (r.workspace_id.as_str(), r))
             .collect();
 
-        let a = by_id["mono-agent-001"];
+        let a = by_id[lease_a.workspace_id.as_str()];
         assert_eq!(a.state, WorkspaceState::Leased);
         assert_eq!(a.lease_id.as_deref(), Some("lease-a"));
 
-        let b = by_id["mono-agent-002"];
+        let b = by_id[lease_b.workspace_id.as_str()];
         assert_eq!(b.state, WorkspaceState::Free);
         assert!(b.lease_id.is_none());
         assert_eq!(b.last_release_reason.as_deref(), Some("expired"));

@@ -1629,11 +1629,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_lease_claims_first_free_workspace_and_records_head_commit() {
+    fn workspace_lease_claims_a_free_workspace_and_records_head_commit() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -1769,10 +1768,20 @@ mod tests {
         ]);
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
-        // Lease both existing workspaces first so the pool is exhausted
-        for (path, task) in [
-            (workspace_root.join("mono-agent-001"), "first"),
-            (workspace_root.join("mono-agent-007"), "second"),
+        // Lease both existing workspaces first so the pool is exhausted.
+        // Use --prefer to pin which workspace each lease takes, since
+        // claim_workspace's free-pick order is randomized.
+        for (id, path, task) in [
+            (
+                "mono-agent-001",
+                workspace_root.join("mono-agent-001"),
+                "first",
+            ),
+            (
+                "mono-agent-007",
+                workspace_root.join("mono-agent-007"),
+                "second",
+            ),
         ] {
             let runner = FakeRunner::new(vec![
                 ExpectedCommand::ok(path.clone(), "jj", &["git", "fetch"], ""),
@@ -1784,7 +1793,16 @@ mod tests {
                     "deadbee",
                 ),
             ]);
-            let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", task]);
+            let lease = Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                task,
+                "--prefer",
+                id,
+            ]);
             run_with_dependencies(lease, Some(&database_path), &runner).expect("seed lease");
         }
 
@@ -1994,11 +2012,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_lease_with_unknown_prefer_falls_back_to_first_free() {
+    fn workspace_lease_with_unknown_prefer_falls_back_to_a_free_workspace() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -2661,7 +2678,16 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]);
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "demo",
+            "--prefer",
+            "mono-agent-001",
+        ]);
         run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
         // global list returns both rows
