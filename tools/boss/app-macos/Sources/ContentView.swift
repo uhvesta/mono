@@ -876,6 +876,10 @@ private struct WorkBoardCardItem: View {
             return liveStates.byRunID[executionID]
         }()
 
+        let blockedBy: String? = task.status == "blocked"
+            ? model.blockedByLabel(for: task)
+            : nil
+
         Button {
             model.selectWorkCard(isSelected ? nil : task.id)
         } label: {
@@ -886,7 +890,8 @@ private struct WorkBoardCardItem: View {
                 activityState: column == .doing
                     ? AgentActivityState(runtime: runtime, liveState: liveState)
                     : nil,
-                assignedSlotId: column == .doing ? liveState?.slotId : nil
+                assignedSlotId: column == .doing ? liveState?.slotId : nil,
+                blockedBy: blockedBy
             )
         }
         .buttonStyle(.plain)
@@ -916,6 +921,12 @@ private struct WorkBoardCardView: View {
     /// in the title row so a glance at the board tells you which
     /// crew member is on which task.
     let assignedSlotId: Int?
+    /// Comma-joined names of the prereqs currently gating this card.
+    /// Non-nil only on `blocked` rows — the kanban surfaces these in
+    /// the Backlog column with a lock + "Blocked by …" subtitle so the
+    /// reader can tell at a glance which Backlog items are gated and
+    /// by what.
+    let blockedBy: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -935,10 +946,27 @@ private struct WorkBoardCardView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
                         .help("\(character.displayName) (slot \(slotId))")
                 }
-                Text(task.name)
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        if task.status == "blocked" {
+                            Image(systemName: "lock.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .accessibilityLabel("Blocked")
+                        }
+                        Text(task.name)
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+                    }
+                    if let blockedBy, !blockedBy.isEmpty {
+                        Text("Blocked by \(blockedBy)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .help("Blocked by \(blockedBy)")
+                    }
+                }
                 Spacer(minLength: 0)
             }
 

@@ -2738,6 +2738,7 @@ async fn handle_frontend_connection(
                             tasks: tree.tasks,
                             chores: tree.chores,
                             task_runtimes: tree.task_runtimes,
+                            dependencies: tree.dependencies,
                         },
                     );
                 }

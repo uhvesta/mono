@@ -227,9 +227,17 @@ struct WorkBoardSection: Identifiable {
 }
 
 extension WorkTask {
+    /// Canonical mapping from engine status → kanban column.
+    ///
+    /// Tasks/chores carry one of `todo`, `active`, `blocked`,
+    /// `in_review`, `done` (plus `archived`, which is filtered out by
+    /// `deleted_at`). `blocked` belongs in Backlog: the worker can't
+    /// start a gated row, so from the user's perspective it sits with
+    /// the not-yet-active pile rather than with Doing. The card itself
+    /// surfaces the gating with an icon + "Blocked by …" subtitle.
     var boardColumn: WorkBoardColumnKey {
         switch status {
-        case "active", "blocked":
+        case "active":
             return .doing
         case "in_review":
             return .review
@@ -249,6 +257,16 @@ struct WorkTaskRuntime: Hashable {
     /// join task → LiveWorkerState (engine registers LiveWorkerState
     /// with `run_id == execution_id`).
     let executionID: String?
+}
+
+/// One row from `work_item_dependencies` — the dependent is gated by
+/// the prerequisite for `relation` ("blocks" today). Carried in the
+/// work tree so the kanban can render "Blocked by <prereq title>" on
+/// blocked cards without an N+1 round trip.
+struct WorkItemDependency: Hashable {
+    let dependentID: String
+    let prerequisiteID: String
+    let relation: String
 }
 
 /// Live runtime state for one allocated worker slot, mirroring the

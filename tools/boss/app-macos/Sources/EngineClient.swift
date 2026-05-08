@@ -80,7 +80,7 @@ enum EngineEvent {
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
-    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime])
+    case workTree(product: WorkProduct, projects: [WorkProject], tasks: [WorkTask], chores: [WorkTask], taskRuntimes: [WorkTaskRuntime], dependencies: [WorkItemDependency])
     case workItemCreated(item: WorkItemPayload)
     case workItemUpdated(item: WorkItemPayload)
     case projectTasksReordered(projectId: String, taskIds: [String])
@@ -578,12 +578,15 @@ final class EngineClient: @unchecked Sendable {
                 let chores = (payload["chores"] as? [[String: Any]] ?? []).compactMap(parseTask)
                 let taskRuntimes = (payload["task_runtimes"] as? [[String: Any]] ?? [])
                     .compactMap(parseTaskRuntime)
+                let dependencies = (payload["dependencies"] as? [[String: Any]] ?? [])
+                    .compactMap(parseWorkItemDependency)
                 emit(.workTree(
                     product: product,
                     projects: projects,
                     tasks: tasks,
                     chores: chores,
-                    taskRuntimes: taskRuntimes
+                    taskRuntimes: taskRuntimes,
+                    dependencies: dependencies
                 ))
             case "work_item_created":
                 guard let itemPayload = payload["item"] as? [String: Any],
@@ -922,6 +925,20 @@ final class EngineClient: @unchecked Sendable {
             executionStatus: payload["execution_status"] as? String,
             runStatus: payload["run_status"] as? String,
             executionID: payload["execution_id"] as? String
+        )
+    }
+
+    private func parseWorkItemDependency(_ payload: [String: Any]) -> WorkItemDependency? {
+        guard let dependentID = payload["dependent_id"] as? String,
+              let prerequisiteID = payload["prerequisite_id"] as? String
+        else {
+            return nil
+        }
+        let relation = payload["relation"] as? String ?? "blocks"
+        return WorkItemDependency(
+            dependentID: dependentID,
+            prerequisiteID: prerequisiteID,
+            relation: relation
         )
     }
 

@@ -390,6 +390,8 @@ pub enum FrontendEvent {
         chores: Vec<Task>,
         #[serde(default)]
         task_runtimes: Vec<TaskRuntime>,
+        #[serde(default)]
+        dependencies: Vec<WorkItemDependency>,
     },
     WorkItemResult {
         item: WorkItem,

@@ -24,6 +24,11 @@ final class ChatViewModel: ObservableObject {
         didSet { invalidateWorkCache() }
     }
     @Published var taskRuntimesByID: [String: WorkTaskRuntime] = [:]
+    /// Dependency edges keyed by product. Refreshed whenever the engine
+    /// pushes a fresh `WorkTree` for that product. The kanban joins
+    /// these against the task/chore/project name maps to render
+    /// "Blocked by <prereq title>" on gated cards.
+    @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:]
     @Published var selectedWorkProductID: String? {
         didSet { invalidateWorkCache() }
     }
@@ -752,7 +757,7 @@ final class ChatViewModel: ObservableObject {
             refreshWorkSubscriptions()
         case .projectsList(let productId, let projects):
             projectsByProductID[productId] = projects.sorted(by: projectSort)
-        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes):
+        case .workTree(let product, let projects, let tasks, let chores, let taskRuntimes, let dependencies):
             upsertProduct(product)
             if currentSelectedProductID == nil {
                 selectedWorkProductID = product.id
@@ -771,6 +776,7 @@ final class ChatViewModel: ObservableObject {
             }
             choresByProductID[product.id] = chores.sorted(by: taskSort)
             mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
+            dependenciesByProductID[product.id] = dependencies
             reconcileWorkSelection()
             refreshWorkSubscriptions()
             workErrorMessage = nil
@@ -1372,6 +1378,51 @@ final class ChatViewModel: ObservableObject {
 
     func taskRuntime(for taskID: String) -> WorkTaskRuntime? {
         taskRuntimesByID[taskID]
+    }
+
+    /// Resolve the human-readable label for the rows currently gating
+    /// `task` — i.e. its incomplete `blocks` prerequisites. Used by
+    /// the kanban card to show "Blocked by <prereq title>" under the
+    /// task name when the engine has parked the row in `blocked`. The
+    /// caller is expected to gate on `task.status == "blocked"` so we
+    /// don't compute this for cards that aren't rendering the badge.
+    func blockedByLabel(for task: WorkTask) -> String? {
+        let edges = dependenciesByProductID[task.productID] ?? []
+        guard !edges.isEmpty else { return nil }
+        let names: [String] = edges.compactMap { edge in
+            guard edge.dependentID == task.id, edge.relation == "blocks" else {
+                return nil
+            }
+            guard let name = workItemName(for: edge.prerequisiteID),
+                  !isWorkItemSatisfied(edge.prerequisiteID)
+            else {
+                return nil
+            }
+            return name
+        }
+        guard !names.isEmpty else { return nil }
+        return names.joined(separator: ", ")
+    }
+
+    private func workItemName(for id: String) -> String? {
+        if id.hasPrefix("proj_") {
+            return project(withID: id)?.name
+        }
+        return task(withID: id)?.name
+    }
+
+    /// Mirrors the engine's `status_satisfies` rule: a task/chore is
+    /// satisfied at `done`; a project is satisfied at `done` or
+    /// `archived`. Used to hide already-finished prereqs from the
+    /// "Blocked by …" label on the off-chance an edge survives a
+    /// status change momentarily.
+    private func isWorkItemSatisfied(_ id: String) -> Bool {
+        if id.hasPrefix("proj_") {
+            guard let status = project(withID: id)?.status else { return false }
+            return status == "done" || status == "archived"
+        }
+        guard let status = task(withID: id)?.status else { return false }
+        return status == "done"
     }
 
     /// Resolve a task to its current LiveWorkerState by joining

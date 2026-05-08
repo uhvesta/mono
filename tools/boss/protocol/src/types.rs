@@ -152,6 +152,12 @@ pub struct WorkTree {
     pub chores: Vec<Task>,
     #[serde(default)]
     pub task_runtimes: Vec<TaskRuntime>,
+    /// Every `work_item_dependencies` edge whose dependent belongs to
+    /// this product. Lets the kanban resolve "blocked by <prereq>"
+    /// labels (and any future dep affordance) without an N+1 round
+    /// trip — clients already have every task/chore/project name.
+    #[serde(default)]
+    pub dependencies: Vec<WorkItemDependency>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1149,6 +1149,7 @@ impl WorkDb {
         };
 
         let task_runtimes = collect_task_runtimes(&conn, &tasks, &chores)?;
+        let dependencies = collect_product_dependencies(&conn, product_id)?;
 
         Ok(WorkTree {
             product,
@@ -1156,6 +1157,7 @@ impl WorkDb {
             tasks,
             chores,
             task_runtimes,
+            dependencies,
         })
     }
 
@@ -2619,6 +2621,42 @@ fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> 
     Ok(())
 }
 
+/// Edges where the dependent belongs to `product_id`. Joins
+/// `work_item_dependencies` against `tasks` (live rows only) and
+/// `projects` so cross-product or stale-by-deletion edges never leak
+/// into a kanban payload. Sorted to match `prerequisites_of` /
+/// `dependents_of` so consumers see a stable order.
+fn collect_product_dependencies(
+    conn: &Connection,
+    product_id: &str,
+) -> Result<Vec<WorkItemDependency>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.dependent_id, d.prerequisite_id, d.relation, d.created_at
+         FROM work_item_dependencies d
+         WHERE EXISTS (
+             SELECT 1 FROM tasks t
+             WHERE t.id = d.dependent_id
+               AND t.product_id = ?1
+               AND t.deleted_at IS NULL
+         )
+         OR EXISTS (
+             SELECT 1 FROM projects p
+             WHERE p.id = d.dependent_id
+               AND p.product_id = ?1
+         )
+         ORDER BY d.created_at ASC, d.dependent_id ASC, d.prerequisite_id ASC",
+    )?;
+    let rows = stmt.query_map([product_id], |row| {
+        Ok(WorkItemDependency {
+            dependent_id: row.get(0)?,
+            prerequisite_id: row.get(1)?,
+            relation: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn collect_task_runtimes(
     conn: &Connection,
     tasks: &[Task],
@@ -3662,6 +3700,96 @@ mod tests {
             .expect("missing running runtime entry");
         assert_eq!(runtime_running.execution_status.as_deref(), Some("running"));
         assert_eq!(runtime_running.run_status.as_deref(), Some("active"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `get_work_tree` should ship the product's `work_item_dependencies`
+    /// edges so the kanban can render "Blocked by <prereq title>" on
+    /// gated cards without an extra round trip. The query is scoped
+    /// to the product (cross-product edges and edges referencing
+    /// soft-deleted dependents must not leak).
+    #[test]
+    fn work_tree_includes_product_scoped_dependency_edges() {
+        let path = temp_db_path("deps");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Prereq".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+            })
+            .unwrap();
+        let dependent = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Dependent".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // A second product with its own edge — must NOT leak into the
+        // first product's tree.
+        let other_product = db
+            .create_product(CreateProductInput {
+                name: "Other".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
+            })
+            .unwrap();
+        let other_prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: other_product.id.clone(),
+                name: "Other Prereq".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+            })
+            .unwrap();
+        let other_dependent = db
+            .create_chore(CreateChoreInput {
+                product_id: other_product.id.clone(),
+                name: "Other Dependent".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: other_dependent.id.clone(),
+            prerequisite: other_prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        let tree = db.get_work_tree(&product.id).unwrap();
+        assert_eq!(tree.dependencies.len(), 1, "{:?}", tree.dependencies);
+        let edge = &tree.dependencies[0];
+        assert_eq!(edge.dependent_id, dependent.id);
+        assert_eq!(edge.prerequisite_id, prereq.id);
+        assert_eq!(edge.relation, "blocks");
+
+        let other_tree = db.get_work_tree(&other_product.id).unwrap();
+        assert_eq!(other_tree.dependencies.len(), 1);
+        assert_eq!(other_tree.dependencies[0].dependent_id, other_dependent.id);
 
         let _ = std::fs::remove_file(path);
     }
