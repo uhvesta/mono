@@ -665,6 +665,7 @@ fn run_workspace(
             workspace,
             repo,
             force,
+            expunge,
         } => {
             let matches = store.list_workspaces_filtered(&WorkspaceListFilter {
                 repo: repo.as_deref(),
@@ -697,6 +698,14 @@ fn run_workspace(
 
             store.forget_workspace(&record.repo, &record.workspace_id)?;
 
+            if expunge {
+                match fs::remove_dir_all(&record.workspace_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(CubeError::Io(err)),
+                }
+            }
+
             audit!(
                 database_path,
                 "workspace.removed",
@@ -706,19 +715,30 @@ fn run_workspace(
                 lease_id = record.lease_id,
                 holder = record.holder,
                 forced = force,
+                expunged = expunge,
             );
 
-            let message = format!(
-                "Removed {}/{} from the registry (workspace directory left intact at {}).",
-                record.repo,
-                record.workspace_id,
-                record.workspace_path.display(),
-            );
+            let message = if expunge {
+                format!(
+                    "Removed {}/{} from the registry and deleted workspace directory at {}.",
+                    record.repo,
+                    record.workspace_id,
+                    record.workspace_path.display(),
+                )
+            } else {
+                format!(
+                    "Removed {}/{} from the registry (workspace directory left intact at {}).",
+                    record.repo,
+                    record.workspace_id,
+                    record.workspace_path.display(),
+                )
+            };
             RunResult::new(
                 message,
                 json!({
                     "workspace": record,
                     "forced": force,
+                    "expunged": expunge,
                 }),
             )
         }
@@ -2817,6 +2837,399 @@ mod tests {
         assert_eq!(event["workspace_id"], "mono-agent-007");
         assert_eq!(event["prior_state"], "free");
         assert_eq!(event["forced"], false);
+        assert_eq!(event["expunged"], false);
+    }
+
+    #[test]
+    fn workspace_remove_expunge_deletes_row_and_directory() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::write(workspace_path.join("marker"), "x").expect("marker file");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "remove",
+                "mono-agent-007",
+                "--expunge",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("expunge remove");
+
+        assert_eq!(result.payload["expunged"], true);
+        assert!(result.message.contains("deleted workspace directory"));
+        assert!(
+            !workspace_path.exists(),
+            "expected on-disk directory to be removed"
+        );
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(remaining.is_empty(), "row should be deleted");
+    }
+
+    #[test]
+    fn workspace_remove_expunge_tolerates_missing_directory() {
+        // The directory may already be gone (operator wiped it manually);
+        // --expunge should still succeed and clean up the row.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        std::fs::remove_dir_all(&workspace_path).unwrap();
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "remove",
+                "mono-agent-007",
+                "--expunge",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("expunge tolerates missing dir");
+
+        assert_eq!(result.payload["expunged"], true);
+        assert!(!workspace_path.exists());
+    }
+
+    #[test]
+    fn workspace_remove_without_expunge_leaves_directory_intact() {
+        // Regression check on PR #291's default behaviour: omitting
+        // --expunge must keep the on-disk workspace directory.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::write(workspace_path.join("marker"), "x").expect("marker file");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("remove");
+
+        assert_eq!(result.payload["expunged"], false);
+        assert!(
+            workspace_path.is_dir(),
+            "directory must remain when --expunge is not passed"
+        );
+        assert!(
+            workspace_path.join("marker").is_file(),
+            "directory contents must be preserved"
+        );
+    }
+
+    #[test]
+    fn workspace_remove_expunge_makes_removal_durable_against_lease_resync() {
+        // After --expunge, a follow-up lease's discover/sync round must
+        // NOT resurrect the row (that was the gap that motivated the
+        // flag).
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "remove",
+                "mono-agent-007",
+                "--expunge",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("expunge remove");
+
+        // A subsequent lease must not see the just-expunged workspace.
+        // It will auto-create a fresh `mono-agent-001` instead via the
+        // FakeRunner's `jj git clone` expectation. (The fake runner just
+        // records the invocation; we manually create the resulting
+        // directory.)
+        let new_path = workspace_root.join("mono-agent-001");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let lease_result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "after-expunge",
+            ]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease after expunge");
+
+        assert_eq!(
+            lease_result.payload["workspace"]["workspace_id"],
+            "mono-agent-001",
+            "lease should auto-create a fresh slot, not resurrect the expunged one"
+        );
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let rows = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.workspace_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"mono-agent-007"),
+            "expunged workspace must not reappear; saw {ids:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_remove_without_expunge_resurrects_on_next_lease() {
+        // Documents the without-expunge gap: PR #291 removed the row but
+        // left the directory, so the next lease's discover/sync brings
+        // the row back as state=Free. This test pins that behaviour;
+        // operators who want durable removal must use --expunge.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("remove");
+
+        // Without --expunge the dir is still there, so the next lease
+        // discovers it and re-syncs the row.
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "resync"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease re-syncs row");
+
+        assert_eq!(
+            lease_result.payload["workspace"]["workspace_id"],
+            "mono-agent-007",
+            "without --expunge the discovered directory resurrects the row"
+        );
     }
 
     #[test]

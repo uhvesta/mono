@@ -178,10 +178,17 @@ pub enum WorkspaceCommand {
     /// Remove a workspace row from the registry.
     ///
     /// Deletes the `workspaces` row (and cascades `workspace_setup`)
-    /// for the given workspace id. The on-disk workspace directory is
-    /// left untouched — it may already be gone, or the operator may
-    /// want to inspect it. Use this to clean up dangling registry rows
-    /// after a workspace directory has been wiped manually.
+    /// for the given workspace id. By default the on-disk workspace
+    /// directory is left untouched — it may already be gone, or the
+    /// operator may want to inspect it. Use this to clean up dangling
+    /// registry rows after a workspace directory has been wiped
+    /// manually.
+    ///
+    /// Pass `--expunge` to also `rm -rf` the workspace directory after
+    /// the row is deleted. Without `--expunge`, the next lease against
+    /// the same repo will rediscover the directory via
+    /// `discover_workspaces` + `sync_workspaces` and resurrect the row
+    /// as `state=Free`. The `--expunge` form makes the removal durable.
     ///
     /// Refuses leased rows unless `--force`. The safer surgical default
     /// is to `cube workspace force-release` first, then `remove`.
@@ -195,6 +202,11 @@ pub enum WorkspaceCommand {
         /// Remove even if the row is currently leased.
         #[arg(long)]
         force: bool,
+        /// Also delete the on-disk workspace directory after the row
+        /// is removed. Without this flag the next lease will
+        /// rediscover the directory and resurrect the row.
+        #[arg(long)]
+        expunge: bool,
     },
 }
 
@@ -606,11 +618,13 @@ mod tests {
                         workspace,
                         repo,
                         force,
+                        expunge,
                     },
             } => {
                 assert_eq!(workspace, "mono-agent-004");
                 assert!(repo.is_none());
                 assert!(!force);
+                assert!(!expunge);
             }
             _ => panic!("expected workspace remove command"),
         }
@@ -634,11 +648,40 @@ mod tests {
                         workspace,
                         repo,
                         force,
+                        expunge,
                     },
             } => {
                 assert_eq!(workspace, "mono-agent-004");
                 assert_eq!(repo.as_deref(), Some("mono"));
                 assert!(force);
+                assert!(!expunge);
+            }
+            _ => panic!("expected workspace remove command"),
+        }
+    }
+
+    #[test]
+    fn workspace_remove_accepts_expunge_flag() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "remove",
+            "mono-agent-004",
+            "--expunge",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Remove {
+                        workspace,
+                        force,
+                        expunge,
+                        ..
+                    },
+            } => {
+                assert_eq!(workspace, "mono-agent-004");
+                assert!(!force);
+                assert!(expunge);
             }
             _ => panic!("expected workspace remove command"),
         }
