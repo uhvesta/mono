@@ -120,6 +120,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 name: "test chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             },
         })
         .await?

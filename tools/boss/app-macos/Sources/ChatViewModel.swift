@@ -468,6 +468,12 @@ final class ChatViewModel: ObservableObject {
         case .task(let task), .chore(let task):
             id = task.id
             patch["pr_url"] = prURL
+            // Only send a priority patch when the user actually
+            // touched the picker — keeps unrelated edits from
+            // bouncing the field through serde-validation noise.
+            if !priority.isEmpty, priority != task.priority {
+                patch["priority"] = priority
+            }
         }
 
         engine.sendUpdateWorkItem(id: id, patch: patch)
@@ -568,6 +574,15 @@ final class ChatViewModel: ObservableObject {
             return
         }
         engine.sendUpdateWorkItem(id: task.id, patch: ["status": nextStatus])
+    }
+
+    /// Update a task or chore's priority via the inline picker on the
+    /// detail popover. No-ops when the new value matches the current
+    /// one so an idle picker tap doesn't generate write traffic.
+    func setPriority(for taskID: String, to priority: WorkPriority) {
+        guard let task = task(withID: taskID) else { return }
+        guard task.priority != priority.rawValue else { return }
+        engine.sendUpdateWorkItem(id: task.id, patch: ["priority": priority.rawValue])
     }
 
     func startIfNeeded() {

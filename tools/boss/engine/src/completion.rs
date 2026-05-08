@@ -898,6 +898,7 @@ mod tests {
                 name: "Detect worker stop".into(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let execution = db

@@ -108,6 +108,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             name: "Wire socket client".to_owned(),
             description: Some("extract reusable BossClient".to_owned()),
             autostart: true,
+            priority: None,
         },
     )
     .await?;
@@ -122,6 +123,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             name: "Trim stale work".to_owned(),
             description: None,
             autostart: true,
+            priority: None,
         },
     )
     .await?;
@@ -191,6 +193,87 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
         .await?,
     )?;
     assert_eq!(archived_product.status, "archived");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
+    // Exercises the first-class `priority` field on tasks / chores:
+    // the create flow honors `Some("high")`, the omitted-priority
+    // path lands on the schema default `medium`, and a
+    // `WorkItemPatch::priority` re-routes through `update_work_item`
+    // so the engine persists the new value rather than dropping it.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Priorities".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Slice".to_owned(),
+            description: None,
+            goal: None,
+        },
+    )
+    .await?;
+
+    let high_task = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "High-priority task".to_owned(),
+            description: None,
+            autostart: true,
+            priority: Some("high".to_owned()),
+        },
+    )
+    .await?;
+    assert_eq!(high_task.priority, "high");
+
+    let default_chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Default-priority chore".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+        },
+    )
+    .await?;
+    assert_eq!(default_chore.priority, "medium");
+
+    let patched = expect_chore(
+        update_work_item(
+            &mut client,
+            &default_chore.id,
+            WorkItemPatch {
+                priority: Some("low".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(patched.priority, "low");
+
+    // Confirm the priority survives a list round-trip.
+    let listed_chores = list_chores(&mut client, &product.id).await?;
+    let refetched = listed_chores
+        .into_iter()
+        .find(|c| c.id == default_chore.id)
+        .expect("chore missing from list");
+    assert_eq!(refetched.priority, "low");
 
     Ok(())
 }
@@ -279,6 +362,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             name: "Wire subscription".to_owned(),
             description: None,
             autostart: true,
+            priority: None,
         },
     )
     .await?;
@@ -360,6 +444,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             name: "C".to_owned(),
             description: None,
             autostart: true,
+            priority: None,
         },
     )
     .await?;
@@ -404,6 +489,7 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
             name: "Backfill PR".to_owned(),
             description: None,
             autostart: false,
+            priority: None,
         },
     )
     .await?;
@@ -819,6 +905,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             name: "A".to_owned(),
             description: None,
             autostart: true,
+            priority: None,
         },
     )
     .await?;
@@ -829,6 +916,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             name: "B".to_owned(),
             description: None,
             autostart: true,
+            priority: None,
         },
     )
     .await?;
@@ -950,6 +1038,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             name: "Land migration".to_owned(),
             description: None,
             autostart: false,
+            priority: None,
         },
     )
     .await?;
@@ -961,6 +1050,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             name: "Tune retries".to_owned(),
             description: None,
             autostart: false,
+            priority: None,
         },
     )
     .await?;
@@ -972,6 +1062,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             name: "Roll out feature".to_owned(),
             description: None,
             autostart: false,
+            priority: None,
         },
     )
     .await?;
@@ -982,6 +1073,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             name: "Update docs".to_owned(),
             description: None,
             autostart: false,
+            priority: None,
         },
     )
     .await?;
@@ -1171,6 +1263,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             name: format!("Bulk task {i}"),
             description: Some(format!("desc {i}")),
             autostart: false,
+            priority: None,
         })
         .collect();
     let created_tasks = match client
@@ -1195,6 +1288,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             name: format!("Bulk chore {i}"),
             description: None,
             autostart: i == 0,
+            priority: None,
         })
         .collect();
     let created_chores = match client
@@ -1224,6 +1318,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             name: "Should not survive".to_owned(),
             description: None,
             autostart: false,
+            priority: None,
         },
         CreateTaskInput {
             product_id: product.id.clone(),
@@ -1231,6 +1326,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             name: "Bad ref".to_owned(),
             description: None,
             autostart: false,
+            priority: None,
         },
     ];
     match client

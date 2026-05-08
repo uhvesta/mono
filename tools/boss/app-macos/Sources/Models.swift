@@ -74,6 +74,7 @@ struct WorkTask: Identifiable, Hashable {
     var name: String
     var description: String
     var status: String
+    var priority: String
     var ordinal: Int?
     var prURL: String?
     var deletedAt: String?
@@ -82,6 +83,36 @@ struct WorkTask: Identifiable, Hashable {
 
     var isChore: Bool {
         kind == "chore"
+    }
+}
+
+/// Canonical priority vocabulary shared by tasks, chores, and
+/// projects. Lives in one place so kanban chips, edit pickers, and
+/// any future filter UI all speak the same dialect.
+enum WorkPriority: String, CaseIterable, Identifiable {
+    case low
+    case medium
+    case high
+
+    var id: String { rawValue }
+
+    /// Tolerant decoder. Pre-priority rows arrive without the field
+    /// (older engines, unmigrated DBs, hand-built JSON in tests); we
+    /// fall back to `.medium` to match the schema default rather than
+    /// surfacing `nil` and forcing every call site to special-case it.
+    static func parse(_ raw: String?) -> WorkPriority {
+        guard let raw, let value = WorkPriority(rawValue: raw.lowercased()) else {
+            return .medium
+        }
+        return value
+    }
+
+    var label: String {
+        switch self {
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        }
     }
 }
 

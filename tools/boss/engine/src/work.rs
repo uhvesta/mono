@@ -1128,7 +1128,7 @@ impl WorkDb {
 
         let tasks = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1139,7 +1139,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -1220,7 +1220,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind = 'project_task' AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1229,7 +1229,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1298,7 +1298,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -1548,7 +1548,8 @@ impl WorkDb {
                 deleted_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                autostart INTEGER NOT NULL DEFAULT 1
+                autostart INTEGER NOT NULL DEFAULT 1,
+                priority TEXT NOT NULL DEFAULT 'medium'
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -1634,6 +1635,7 @@ impl WorkDb {
         migrate_work_executions_v3(&conn)?;
         migrate_tasks_autostart(&conn)?;
         migrate_last_status_actor(&conn)?;
+        migrate_tasks_priority(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
         // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
@@ -1761,6 +1763,9 @@ impl WorkDb {
         apply_text_patch(&mut task.description, patch.description);
         apply_text_patch(&mut task.status, patch.status);
         apply_optional_patch(&mut task.pr_url, patch.pr_url);
+        if let Some(priority_patch) = patch.priority {
+            task.priority = normalize_priority(Some(&priority_patch))?;
+        }
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
         }
@@ -1774,6 +1779,7 @@ impl WorkDb {
         tx.execute(
             "UPDATE tasks
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
+                 priority = ?9,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
              WHERE id = ?1",
             params![
@@ -1785,6 +1791,7 @@ impl WorkDb {
                 task.pr_url,
                 task.updated_at,
                 actor,
+                task.priority,
             ],
         )?;
 
@@ -2122,6 +2129,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         updated_at: row.get(11)?,
         autostart: row.get::<_, i64>(12)? != 0,
         last_status_actor: row.get(13)?,
+        priority: row.get(14)?,
     })
 }
 
@@ -2182,11 +2190,12 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
     let ordinal = next_task_ordinal(conn, &input.project_id)?;
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+    let priority = normalize_priority(input.priority.as_deref())?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
@@ -2199,14 +2208,33 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
     let now = now_string();
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+    let priority = normalize_priority(input.priority.as_deref())?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart)
-         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6)",
-        params![id, input.product_id, input.name, description, now, autostart_value],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
+         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7)",
+        params![id, input.product_id, input.name, description, now, autostart_value, priority],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
+}
+
+/// Validate a caller-supplied priority and return the canonical
+/// lower-case value. `None`, the empty string, and pure whitespace
+/// resolve to the schema default (`medium`) so callers never have
+/// to type `--priority medium` explicitly. Anything outside
+/// `low` / `medium` / `high` is rejected up-front so the engine
+/// stays the single source of truth for the vocabulary.
+pub fn normalize_priority(value: Option<&str>) -> Result<String> {
+    let trimmed = value.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return Ok("medium".to_owned());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "low" | "medium" | "high" => Ok(lower),
+        other => bail!("invalid priority `{other}`; expected one of low, medium, high"),
+    }
 }
 
 fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<WorkExecution> {
@@ -2280,7 +2308,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -2342,7 +2370,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -2560,6 +2588,21 @@ fn migrate_last_status_actor(conn: &Connection) -> Result<()> {
             );
             conn.execute(&ddl, [])?;
         }
+    }
+    Ok(())
+}
+
+/// Add `priority` to `tasks` so chores and project_tasks have the
+/// same first-class priority field that `projects` already had.
+/// Existing rows default to `medium`. The vocabulary mirrors
+/// `projects.priority` exactly (`low` / `medium` / `high`) so kanban
+/// surfaces can render every work-item kind with one chip palette.
+fn migrate_tasks_priority(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "priority")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -3376,6 +3419,7 @@ mod tests {
                 name: "Backend schema".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let chore = db
@@ -3384,6 +3428,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -3429,6 +3474,7 @@ mod tests {
                 name: format!("Task {i}"),
                 description: Some(format!("d{i}")),
                 autostart: i % 2 == 0,
+                priority: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -3484,6 +3530,7 @@ mod tests {
                 name: "Good".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             },
             CreateTaskInput {
                 product_id: product.id.clone(),
@@ -3491,6 +3538,7 @@ mod tests {
                 name: "Bad".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             },
         ];
         let err = db
@@ -3529,6 +3577,7 @@ mod tests {
                 name: format!("Chore {i}"),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -3566,6 +3615,7 @@ mod tests {
                 name: "Idle".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let chore_running = db
@@ -3574,6 +3624,7 @@ mod tests {
                 name: "Running".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3703,6 +3754,7 @@ mod tests {
                 name: "One".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let second = db
@@ -3712,6 +3764,7 @@ mod tests {
                 name: "Two".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -3752,6 +3805,7 @@ mod tests {
                 name: "Schema".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -3909,6 +3963,7 @@ mod tests {
                 name: "First".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let second_task = db
@@ -3918,6 +3973,7 @@ mod tests {
                 name: "Second".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let chore = db
@@ -3926,6 +3982,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -3981,6 +4038,7 @@ mod tests {
                 name: "First".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let second_task = db
@@ -3990,6 +4048,7 @@ mod tests {
                 name: "Second".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -4042,6 +4101,7 @@ mod tests {
                 name: "First".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -4085,6 +4145,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let execution = db
@@ -4170,6 +4231,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let execution = db
@@ -4235,6 +4297,7 @@ mod tests {
                 name: "Has PR".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let execution = db
@@ -4308,6 +4371,7 @@ mod tests {
                 name: "Already done".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         // Manually mark the chore as done before starting execution.
@@ -4379,6 +4443,7 @@ mod tests {
                 name: "Stranded chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         // Manually flip to active, mimicking a kanban drag that
@@ -4423,6 +4488,7 @@ mod tests {
                 name: "Bounced chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4476,6 +4542,7 @@ mod tests {
                 name: "Live chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4528,6 +4595,7 @@ mod tests {
                 name: "Stale chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4584,6 +4652,7 @@ mod tests {
                 name: "Stale chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let stale = db
@@ -4638,6 +4707,7 @@ mod tests {
                 name: "Live chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let live = db
@@ -4692,6 +4762,7 @@ mod tests {
                 name: "Stays in backlog".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let done_chore = db
@@ -4700,6 +4771,7 @@ mod tests {
                 name: "Already done".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4738,6 +4810,7 @@ mod tests {
                 name: "Parked".to_owned(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         assert!(
@@ -4764,6 +4837,7 @@ mod tests {
                 name: "Live".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let result = db.reconcile_product_executions(&product.id).unwrap();
@@ -4808,6 +4882,7 @@ mod tests {
                 name: "Stuck chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4856,6 +4931,7 @@ mod tests {
                 name: "Pristine chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4895,6 +4971,7 @@ mod tests {
                 name: "Live chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4944,6 +5021,7 @@ mod tests {
                 name: "Parked".to_owned(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4994,6 +5072,7 @@ mod tests {
                     name: format!("Chore {index}"),
                     description: None,
                     autostart: true,
+                    priority: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -5049,6 +5128,7 @@ mod tests {
                 name: "Prereq".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let dependent = db
@@ -5057,6 +5137,7 @@ mod tests {
                 name: "Dependent".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         // Add the blocks edge BEFORE flipping dependent to active so
@@ -5111,6 +5192,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let execution = db
@@ -5171,6 +5253,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let execution = db
@@ -5260,6 +5343,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let execution = db
@@ -5360,6 +5444,7 @@ mod tests {
                 name: "ISO chore".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -5409,6 +5494,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5417,6 +5503,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
 
@@ -5527,6 +5614,7 @@ mod tests {
                 name: "Alpha task".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5535,6 +5623,7 @@ mod tests {
                 name: "Beta task".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let err = db
@@ -5571,6 +5660,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5579,6 +5669,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -5623,6 +5714,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5631,6 +5723,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         // Sanity: A starts as `todo` (default).
@@ -5683,6 +5776,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5691,6 +5785,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -5738,6 +5833,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         // Human moves A to `blocked` (no edges yet).
@@ -5763,6 +5859,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -5814,6 +5911,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5822,6 +5920,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -5864,6 +5963,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5872,6 +5972,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -5922,6 +6023,7 @@ mod tests {
                 name: "A".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let b = db
@@ -5930,6 +6032,7 @@ mod tests {
                 name: "B".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {

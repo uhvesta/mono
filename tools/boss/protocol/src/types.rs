@@ -55,10 +55,20 @@ pub struct Task {
     pub autostart: bool,
     #[serde(default = "default_human_actor")]
     pub last_status_actor: String,
+    /// One of `low` / `medium` / `high`. Mirrors `Project.priority`
+    /// exactly so kanban surfaces can render every work-item kind with
+    /// the same vocabulary. Existing rows from before this column was
+    /// introduced default to `medium`.
+    #[serde(default = "default_priority")]
+    pub priority: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+pub fn default_priority() -> String {
+    "medium".to_owned()
 }
 
 pub fn default_human_actor() -> String {
@@ -180,6 +190,11 @@ pub struct CreateTaskInput {
     /// `ready`. Defaults to `true`.
     #[serde(default = "default_true")]
     pub autostart: bool,
+    /// One of `low` / `medium` / `high`. Omitted → engine default
+    /// (`medium`), which is the right answer for the vast majority
+    /// of tasks; only callers who care should set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +210,10 @@ pub struct CreateChoreInput {
     /// (`autostart = true`).
     #[serde(default = "default_true")]
     pub autostart: bool,
+    /// One of `low` / `medium` / `high`. Omitted → engine default
+    /// (`medium`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
 }
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved

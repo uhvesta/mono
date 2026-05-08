@@ -945,6 +945,7 @@ private struct WorkBoardCardView: View {
 
             if hasFooterContent {
                 HStack {
+                    PriorityChip(priority: WorkPriority.parse(task.priority))
                     if let projectName, !projectName.isEmpty {
                         WorkStatusBadge(text: projectName)
                     }
@@ -973,11 +974,12 @@ private struct WorkBoardCardView: View {
         .draggable(task.id)
     }
 
+    /// The footer renders the priority chip on every card so a glance
+    /// at the board immediately separates `[HIGH]` work from the rest
+    /// without authors having to prefix names. The other footer
+    /// elements (project tag, blocked tag) appear conditionally.
     private var hasFooterContent: Bool {
-        if let projectName, !projectName.isEmpty {
-            return true
-        }
-        return task.status == "blocked"
+        true
     }
 
     private var cardBackground: Color {
@@ -1060,6 +1062,7 @@ private struct WorkCardPopoverView: View {
                     "Status",
                     value: task.status.replacingOccurrences(of: "_", with: " ").capitalized
                 )
+                priorityRow
                 if let ordinal = task.ordinal, !task.isChore {
                     metadataRow("Phase", value: "\(ordinal)")
                 }
@@ -1117,6 +1120,36 @@ private struct WorkCardPopoverView: View {
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.body)
+        }
+    }
+
+    /// Priority row with an inline picker. Editing here fires a
+    /// targeted update so authors can re-prioritise a card without
+    /// going through the full edit sheet.
+    @ViewBuilder
+    private var priorityRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Priority")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker(
+                "",
+                selection: Binding(
+                    get: { WorkPriority.parse(task.priority) },
+                    set: { newValue in
+                        if newValue.rawValue != task.priority {
+                            model.setPriority(for: task.id, to: newValue)
+                        }
+                    }
+                )
+            ) {
+                ForEach(WorkPriority.allCases) { priority in
+                    Text(priority.label).tag(priority)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .fixedSize()
         }
     }
 
@@ -1290,7 +1323,7 @@ private struct WorkEditSheet: View {
             _status = State(initialValue: task.status)
             _repoRemoteURL = State(initialValue: "")
             _goal = State(initialValue: "")
-            _priority = State(initialValue: "")
+            _priority = State(initialValue: task.priority)
             _prURL = State(initialValue: task.prURL ?? "")
         }
     }
@@ -1327,6 +1360,11 @@ private struct WorkEditSheet: View {
                 Picker("Status", selection: $status) {
                     ForEach(["todo", "active", "blocked", "in_review", "done"], id: \.self) { status in
                         Text(status.replacingOccurrences(of: "_", with: " ").capitalized).tag(status)
+                    }
+                }
+                Picker("Priority", selection: $priority) {
+                    ForEach(["low", "medium", "high"], id: \.self) { priority in
+                        Text(priority.capitalized).tag(priority)
                     }
                 }
                 TextField("PR URL", text: $prURL)
@@ -1389,6 +1427,54 @@ private struct WorkStatusBadge: View {
             return Color.white.opacity(0.96)
         }
         return Color(nsColor: .controlBackgroundColor)
+    }
+}
+
+/// Color-coded chip for the kanban card footer. Reads as `H`/`M`/`L`
+/// to keep the chip narrow at typical column widths; the full label
+/// surfaces in the tooltip and detail popover. We render every
+/// priority (medium included) rather than hiding the default so the
+/// field is always visible — invisible defaults are exactly what
+/// pushed authors to stuff `[MEDIUM]` into the name in the first
+/// place.
+private struct PriorityChip: View {
+    let priority: WorkPriority
+
+    var body: some View {
+        Text(letter)
+            .font(.caption.weight(.bold))
+            .foregroundStyle(foregroundColor)
+            .frame(minWidth: 18)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(backgroundColor)
+            .clipShape(Capsule())
+            .help("Priority: \(priority.label)")
+            .accessibilityLabel("Priority \(priority.label)")
+    }
+
+    private var letter: String {
+        switch priority {
+        case .high: return "H"
+        case .medium: return "M"
+        case .low: return "L"
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch priority {
+        case .high: return Color.red.opacity(0.18)
+        case .medium: return Color.gray.opacity(0.18)
+        case .low: return Color.blue.opacity(0.14)
+        }
+    }
+
+    private var foregroundColor: Color {
+        switch priority {
+        case .high: return .red
+        case .medium: return Color(nsColor: .secondaryLabelColor)
+        case .low: return .blue
+        }
     }
 }
 

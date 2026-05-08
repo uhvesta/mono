@@ -372,6 +372,10 @@ struct TaskCreateArgs {
 
     #[arg(long)]
     description: Option<String>,
+
+    /// Priority of the new task. Omitted → engine default (`medium`).
+    #[arg(long)]
+    priority: Option<TaskPriority>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -385,6 +389,11 @@ struct TaskListArgs {
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
     status: Vec<TaskStatus>,
+
+    /// Filter by priority. Repeat the flag or use a comma-separated list.
+    /// e.g. `--priority high` shows only high-priority work.
+    #[arg(long, value_delimiter = ',')]
+    priority: Vec<TaskPriority>,
 
     /// Case-insensitive substring match against name and description.
     #[arg(long = "match")]
@@ -412,6 +421,10 @@ struct ChoreCreateArgs {
 
     #[arg(long)]
     description: Option<String>,
+
+    /// Priority of the new chore. Omitted → engine default (`medium`).
+    #[arg(long)]
+    priority: Option<TaskPriority>,
 }
 
 /// Args for `boss task create-many`. The CLI reads a JSON array of
@@ -466,6 +479,10 @@ struct ChoreListArgs {
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
     status: Vec<TaskStatus>,
+
+    /// Filter by priority. Repeat the flag or use a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    priority: Vec<TaskPriority>,
 
     /// Case-insensitive substring match against name and description.
     #[arg(long = "match")]
@@ -543,6 +560,9 @@ struct TaskUpdateArgs {
 
     #[arg(long)]
     status: Option<TaskStatus>,
+
+    #[arg(long)]
+    priority: Option<TaskPriority>,
 
     #[arg(long)]
     ordinal: Option<i64>,
@@ -634,6 +654,15 @@ enum ProjectPriority {
     High,
 }
 
+/// Priority enum for tasks and chores. Mirrors `ProjectPriority`
+/// exactly so kanban surfaces and CLI flags speak one vocabulary.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum TaskPriority {
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum TaskStatus {
     Todo,
@@ -678,6 +707,16 @@ impl ProjectStatus {
 }
 
 impl ProjectPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl TaskPriority {
     fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
@@ -1222,6 +1261,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     name,
                     description,
                     autostart: !ctx.no_autostart,
+                    priority: args.priority.map(|priority| priority.as_str().to_owned()),
                 },
             )
             .await?;
@@ -1248,6 +1288,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             let tasks = apply_task_list_filters(
                 tasks,
                 &args.status,
+                &args.priority,
                 args.match_term.as_deref(),
                 &args.id,
                 args.limit,
@@ -1280,13 +1321,14 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 name: args.name,
                 description: args.description,
                 status: args.status.map(|status| status.as_str().to_owned()),
+                priority: args.priority.map(|priority| priority.as_str().to_owned()),
                 ordinal: args.ordinal,
                 pr_url: args.pr_url,
                 ..WorkItemPatch::default()
             };
             ensure_patch_present(
                 &patch,
-                "provide at least one field to update, such as --status or --pr-url",
+                "provide at least one field to update, such as --status, --priority, or --pr-url",
             )?;
             let task = expect_task(update_work_item(&mut client, &args.id, patch).await?)?;
             print_entity(ctx, &serde_json::json!({ "task": task }), || {
@@ -1356,6 +1398,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     name,
                     description,
                     autostart: !ctx.no_autostart,
+                    priority: args.priority.map(|priority| priority.as_str().to_owned()),
                 },
             )
             .await?;
@@ -1370,6 +1413,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             let chores = apply_task_list_filters(
                 chores,
                 &args.status,
+                &args.priority,
                 args.match_term.as_deref(),
                 &args.id,
                 args.limit,
@@ -1402,13 +1446,14 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 name: args.name,
                 description: args.description,
                 status: args.status.map(|status| status.as_str().to_owned()),
+                priority: args.priority.map(|priority| priority.as_str().to_owned()),
                 ordinal: args.ordinal,
                 pr_url: args.pr_url,
                 ..WorkItemPatch::default()
             };
             ensure_patch_present(
                 &patch,
-                "provide at least one field to update, such as --status or --pr-url",
+                "provide at least one field to update, such as --status, --priority, or --pr-url",
             )?;
             let chore = expect_chore(update_work_item(&mut client, &args.id, patch).await?)?;
             print_entity(ctx, &serde_json::json!({ "chore": chore }), || {
@@ -1802,6 +1847,11 @@ struct BulkCreateItem {
     autostart: Option<bool>,
     #[serde(default)]
     project_id: Option<String>,
+    /// Per-item priority override. Omitted → engine default
+    /// (`medium`). Accepts the same `low` / `medium` / `high`
+    /// vocabulary as the `--priority` flag.
+    #[serde(default)]
+    priority: Option<String>,
 }
 
 fn read_bulk_input(from_file: &str) -> Result<Vec<BulkCreateItem>, CliError> {
@@ -1885,6 +1935,7 @@ async fn run_task_create_many(
             name: item.name,
             description: normalize_non_empty(Some(item.description)),
             autostart: item.autostart.unwrap_or(default_autostart),
+            priority: item.priority,
         });
     }
 
@@ -1926,6 +1977,7 @@ async fn run_chore_create_many(
             name: item.name,
             description: normalize_non_empty(Some(item.description)),
             autostart: item.autostart.unwrap_or(default_autostart),
+            priority: item.priority,
         });
     }
 
@@ -2547,17 +2599,24 @@ fn unexpected_event(context: &str, event: &FrontendEvent) -> CliError {
 fn apply_task_list_filters(
     items: Vec<Task>,
     statuses: &[TaskStatus],
+    priorities: &[TaskPriority],
     match_term: Option<&str>,
     ids: &[String],
     limit: Option<usize>,
 ) -> Vec<Task> {
     let allowed_statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+    let allowed_priorities: Vec<&str> = priorities.iter().map(|p| p.as_str()).collect();
     let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     let lc_term = match_term.map(str::to_lowercase);
     items
         .into_iter()
         .filter(|task| {
             if !allowed_statuses.is_empty() && !allowed_statuses.contains(&task.status.as_str()) {
+                return false;
+            }
+            if !allowed_priorities.is_empty()
+                && !allowed_priorities.contains(&task.priority.as_str())
+            {
                 return false;
             }
             if !id_set.is_empty() && !id_set.contains(task.id.as_str()) {
@@ -2665,7 +2724,9 @@ fn print_tasks_table(tasks: &[Task]) {
     let mut table = Table::new();
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["ID", "NAME", "STATUS", "PROJECT", "ORDINAL", "PR URL"]);
+        .set_header(vec![
+            "ID", "NAME", "STATUS", "PRIORITY", "PROJECT", "ORDINAL", "PR URL",
+        ]);
     for task in tasks {
         let ordinal = task
             .ordinal
@@ -2675,6 +2736,7 @@ fn print_tasks_table(tasks: &[Task]) {
             task.id.as_str(),
             task.name.as_str(),
             task.status.as_str(),
+            task.priority.as_str(),
             task.project_id.as_deref().unwrap_or(""),
             ordinal.as_str(),
             task.pr_url.as_deref().unwrap_or(""),
@@ -2721,6 +2783,7 @@ fn print_task_details(title: &str, task: &Task) {
     println!("Name: {}", task.name);
     println!("Kind: {}", task.kind);
     println!("Status: {}", task.status);
+    println!("Priority: {}", task.priority);
     if let Some(ordinal) = task.ordinal {
         println!("Ordinal: {}", ordinal);
     }

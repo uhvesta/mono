@@ -1458,6 +1458,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1519,6 +1520,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1569,6 +1571,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1607,6 +1610,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1650,6 +1654,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1711,6 +1716,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1880,6 +1886,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1990,6 +1997,7 @@ mod tests {
                 name: "Old".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         let late = db
@@ -1998,6 +2006,7 @@ mod tests {
                 name: "New".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2072,6 +2081,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2133,6 +2143,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2202,6 +2213,7 @@ mod tests {
                 name: "Cleanup".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2283,6 +2295,7 @@ mod tests {
             name: "A1".to_owned(),
             description: None,
             autostart: true,
+            priority: None,
         })
         .unwrap();
         db.create_task(CreateTaskInput {
@@ -2291,6 +2304,7 @@ mod tests {
             name: "B1".to_owned(),
             description: None,
             autostart: true,
+            priority: None,
         })
         .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2368,6 +2382,7 @@ mod tests {
                     name: format!("Chore {index}"),
                     description: None,
                     autostart: true,
+                    priority: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -2473,6 +2488,7 @@ mod tests {
                 name: "Ghost A".to_owned(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -2493,6 +2509,7 @@ mod tests {
                 name: "Ghost B".to_owned(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -2520,6 +2537,7 @@ mod tests {
                 name: "Real worker".to_owned(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         let real_exec = db
@@ -2612,6 +2630,7 @@ mod tests {
                 name: format!("Chore {index}"),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         }
@@ -2680,6 +2699,7 @@ mod tests {
                 name: "Already running".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         // A second chore that will sit in `ready` because the
@@ -2690,6 +2710,7 @@ mod tests {
                 name: "Skip the queue".to_owned(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2802,6 +2823,7 @@ mod tests {
                 name: "Warm-up".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2816,6 +2838,7 @@ mod tests {
                 name: "Stuck".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -2895,6 +2918,7 @@ mod tests {
                 name: "Warm-up".to_owned(),
                 description: None,
                 autostart: true,
+                priority: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2905,6 +2929,7 @@ mod tests {
                 name: "Parked".to_owned(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(

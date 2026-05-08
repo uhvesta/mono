@@ -891,6 +891,10 @@ final class EngineClient: @unchecked Sendable {
         }
 
         let ordinal = (payload["ordinal"] as? NSNumber)?.intValue
+        // Pre-priority engines may not emit the field at all; default
+        // to `medium` to match the schema default rather than crashing
+        // the parse on a missing key.
+        let priority = (payload["priority"] as? String) ?? "medium"
 
         return WorkTask(
             id: id,
@@ -900,6 +904,7 @@ final class EngineClient: @unchecked Sendable {
             name: name,
             description: description,
             status: status,
+            priority: priority,
             ordinal: ordinal,
             prURL: payload["pr_url"] as? String,
             deletedAt: payload["deleted_at"] as? String,

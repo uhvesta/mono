@@ -324,6 +324,7 @@ mod tests {
                 name: name.into(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         db.update_work_item(
@@ -352,6 +353,7 @@ mod tests {
                 name: name.into(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         // Move chore directly to in_review with a pr_url, mirroring

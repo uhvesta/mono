@@ -108,6 +108,7 @@ Suggested fields:
 - `name`
 - `description`
 - `status` (`todo`, `active`, `blocked`, `in_review`, `done`)
+- `priority` (`low`, `medium`, `high` — defaults to `medium`)
 - `ordinal`
 - `pr_url`
 - `created_at`
@@ -138,12 +139,32 @@ Suggested fields:
 - `name`
 - `description`
 - `status` (`todo`, `active`, `blocked`, `in_review`, `done`)
+- `priority` (`low`, `medium`, `high` — defaults to `medium`)
 - `pr_url`
 - `created_at`
 - `updated_at`
 
 Conceptually, chores are first-class in the UI. In storage, they should reuse
 the same mechanics as tasks.
+
+#### Naming convention: do NOT prefix names with priority
+
+Tasks and chores carry priority as a **structured field** (the `priority`
+column above), not as a literal prefix in `name`. Do not write
+`[HIGH] Drop or gate the per-pane screen-scrape` or
+`[MEDIUM] Stop accumulating Boss assistant chunks` — pass
+`--priority high` / `--priority medium` instead, or leave it unset for the
+`medium` default.
+
+Names describe the work. Priority lives on the field. The kanban renders
+a colour-coded chip on every card so a quick scan still surfaces high-priority
+work, and `boss task list --priority high --json` (and the same on chores)
+filters by the field rather than relying on substring matches against name.
+
+The `[HIGH]` / `[MEDIUM]` / `[LOW]` prefix style was a workaround for a
+missing field. It's no longer needed; new tasks and chores should not
+adopt it. Existing rows with such prefixes are not auto-stripped; clean them
+up by hand or via a one-shot script when convenient.
 
 ## Storage Model
 
@@ -200,6 +221,7 @@ Use four tables in the first cut:
 - `name TEXT NOT NULL`
 - `description TEXT NOT NULL DEFAULT ''`
 - `status TEXT NOT NULL`
+- `priority TEXT NOT NULL DEFAULT 'medium'`
 - `ordinal INTEGER`
 - `pr_url TEXT`
 - `deleted_at TEXT`

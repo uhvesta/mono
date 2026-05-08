@@ -5405,6 +5405,7 @@ mod tests {
                 name: "c".into(),
                 description: None,
                 autostart: false,
+                priority: None,
             })
             .unwrap();
         let execution = server_state
