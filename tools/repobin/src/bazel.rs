@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::app::RepobinError;
+use crate::app::{OutputMode, RepobinError};
 
 const SLOW_BUILD_NOTICE: Duration = Duration::from_secs(3);
 const STREAM_BUILD_OUTPUT: Duration = Duration::from_secs(10);
@@ -17,12 +17,12 @@ pub trait BazelAdapter {
 
 #[derive(Debug, Clone, Copy)]
 pub struct RealBazel {
-    verbose: bool,
+    mode: OutputMode,
 }
 
 impl RealBazel {
-    pub fn new(verbose: bool) -> Self {
-        Self { verbose }
+    pub fn new(mode: OutputMode) -> Self {
+        Self { mode }
     }
 }
 
@@ -66,11 +66,15 @@ impl BazelAdapter for RealBazel {
         let stderr_handle = spawn_reader(stderr, tx);
         let started_at = Instant::now();
         let mut combined_output = Vec::new();
-        let mut printed_notice = self.verbose;
-        let mut streaming = self.verbose;
+        let quiet = self.mode.is_quiet();
+        let verbose = self.mode.is_verbose();
+        // In quiet (--json) mode, never emit routine notices or stream output;
+        // we still capture so we can dump it on failure.
+        let mut printed_notice = verbose || quiet;
+        let mut streaming = verbose;
         let mut stderr_writer = io::stderr().lock();
 
-        if self.verbose {
+        if verbose {
             writeln!(stderr_writer, "repobin: building {target}...").ok();
         }
 
@@ -102,7 +106,7 @@ impl BazelAdapter for RealBazel {
                 printed_notice = true;
             }
 
-            if !streaming && started_at.elapsed() >= STREAM_BUILD_OUTPUT {
+            if !streaming && !quiet && started_at.elapsed() >= STREAM_BUILD_OUTPUT {
                 writeln!(
                     stderr_writer,
                     "repobin: build still running; streaming Bazel output..."

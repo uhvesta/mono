@@ -15,6 +15,50 @@ use crate::dispatch::{DispatchPlan, prepare_dispatch, prepare_dispatch_from_repo
 use crate::install::{InstallReport, current_home_dir, install, resolve_bin_dir};
 
 const REPOBIN_BINARY_NAME: &str = "repobin";
+const REPOBIN_VERBOSE_ENV: &str = "REPOBIN_VERBOSE";
+const REPOBIN_VERBOSE_FLAG: &str = "--repobin-verbose";
+const JSON_FLAG: &str = "--json";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputMode {
+    pub verbose: bool,
+    pub json: bool,
+}
+
+impl OutputMode {
+    fn detect(forwarded_args: &[OsString]) -> Self {
+        Self::from_args_and_env(forwarded_args, env::var_os(REPOBIN_VERBOSE_ENV).is_some())
+    }
+
+    fn from_args_and_env(forwarded_args: &[OsString], verbose_env: bool) -> Self {
+        let mut verbose = verbose_env;
+        let mut json = false;
+        for arg in forwarded_args {
+            if arg == REPOBIN_VERBOSE_FLAG {
+                verbose = true;
+            } else if arg == JSON_FLAG {
+                json = true;
+            }
+        }
+        Self { verbose, json }
+    }
+
+    pub fn is_verbose(self) -> bool {
+        self.verbose && !self.json
+    }
+
+    pub fn is_quiet(self) -> bool {
+        self.json
+    }
+}
+
+fn strip_repobin_args(forwarded_args: &[OsString]) -> Vec<OsString> {
+    forwarded_args
+        .iter()
+        .filter(|arg| arg.as_os_str() != REPOBIN_VERBOSE_FLAG)
+        .cloned()
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum RepobinError {
@@ -340,8 +384,10 @@ fn dispatch_tool(
     tool_name: &str,
     forwarded_args: &[OsString],
 ) -> Result<(), RepobinError> {
-    let bazel = RealBazel::new(env::var_os("REPOBIN_VERBOSE").is_some());
-    let local_err = match prepare_dispatch(&bazel, cwd, tool_name, forwarded_args) {
+    let mode = OutputMode::detect(forwarded_args);
+    let cleaned_args = strip_repobin_args(forwarded_args);
+    let bazel = RealBazel::new(mode);
+    let local_err = match prepare_dispatch(&bazel, cwd, tool_name, &cleaned_args) {
         Ok(plan) => return exec_dispatch(plan),
         Err(error) => error,
     };
@@ -355,7 +401,8 @@ fn dispatch_tool(
         current_executable,
         cwd,
         tool_name,
-        forwarded_args,
+        &cleaned_args,
+        mode,
     )? {
         Some(plan) => plan,
         None => return Err(local_err),
@@ -369,6 +416,7 @@ fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
     cwd: &Path,
     tool_name: &str,
     forwarded_args: &[OsString],
+    mode: OutputMode,
 ) -> Result<Option<DispatchPlan>, RepobinError> {
     let Some(loaded) = load_defaults_for_exe(current_executable)? else {
         return Ok(None);
@@ -383,8 +431,8 @@ fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
     let cache_root = cache_root_from_env()?;
     let cache = RepoCache::for_url(&cache_root, &tool.repo);
     let lock = cache.lock()?;
-    let outcome = lock.ensure_up_to_date()?;
-    print_default_notice(tool_name, &tool.repo, &outcome);
+    let outcome = lock.ensure_up_to_date(mode)?;
+    print_default_notice(tool_name, &tool.repo, &outcome, mode);
 
     let cached_repo_config = load_repo_config(&lock.cache().checkout)?;
     let plan = prepare_dispatch_from_repo_config(
@@ -397,13 +445,32 @@ fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
     Ok(Some(plan))
 }
 
-fn print_default_notice(tool_name: &str, repo: &str, outcome: &EnsureOutcome) {
+fn print_default_notice(
+    tool_name: &str,
+    repo: &str,
+    outcome: &EnsureOutcome,
+    mode: OutputMode,
+) {
+    if let Some(line) = default_notice_line(tool_name, repo, outcome, mode) {
+        eprintln!("{line}");
+    }
+}
+
+fn default_notice_line(
+    tool_name: &str,
+    repo: &str,
+    outcome: &EnsureOutcome,
+    mode: OutputMode,
+) -> Option<String> {
+    if mode.is_quiet() || !mode.is_verbose() {
+        return None;
+    }
     let head = outcome.head();
     let short = if head.len() >= 7 { &head[..7] } else { head };
-    eprintln!(
+    Some(format!(
         "repobin: running `{tool_name}` from {repo} @ {short} ({}; default mode — not in a configured workspace)",
         outcome.note()
-    );
+    ))
 }
 
 fn exec_dispatch(plan: DispatchPlan) -> Result<(), RepobinError> {
@@ -439,7 +506,11 @@ mod tests {
     use crate::bazel::BazelAdapter;
     use crate::defaults::{DEFAULTS_FILE_NAME, DefaultsConfig, DefaultsTool, write_defaults};
 
-    use super::{RepobinError, invocation_name, prepare_default_plan};
+    use super::{
+        OutputMode, RepobinError, default_notice_line, invocation_name, prepare_default_plan,
+        strip_repobin_args,
+    };
+    use crate::cache::EnsureOutcome;
 
     struct UnreachableBazel;
 
@@ -480,6 +551,7 @@ mod tests {
             temp.path(),
             "boss",
             &[],
+            OutputMode::default(),
         )
         .expect("returns Ok");
         assert!(plan.is_none());
@@ -509,6 +581,7 @@ mod tests {
             temp.path(),
             "boss",
             &[],
+            OutputMode::default(),
         )
         .expect_err("expected ToolNotConfiguredAnywhere");
         match err {
@@ -518,5 +591,119 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    fn cached_outcome() -> EnsureOutcome {
+        EnsureOutcome::Cached {
+            head: "abcdef1234567890".to_string(),
+            refreshed: false,
+        }
+    }
+
+    #[test]
+    fn output_mode_routine_is_quiet() {
+        let mode = OutputMode::from_args_and_env(&[], false);
+        assert!(!mode.verbose);
+        assert!(!mode.json);
+        assert!(!mode.is_verbose());
+        assert!(!mode.is_quiet());
+    }
+
+    #[test]
+    fn output_mode_detects_verbose_env() {
+        let mode = OutputMode::from_args_and_env(&[], true);
+        assert!(mode.verbose);
+        assert!(mode.is_verbose());
+    }
+
+    #[test]
+    fn output_mode_detects_verbose_flag() {
+        let args = vec![OsString::from("--repobin-verbose")];
+        let mode = OutputMode::from_args_and_env(&args, false);
+        assert!(mode.verbose);
+        assert!(mode.is_verbose());
+    }
+
+    #[test]
+    fn output_mode_detects_json_flag() {
+        let args = vec![OsString::from("product"), OsString::from("--json")];
+        let mode = OutputMode::from_args_and_env(&args, false);
+        assert!(mode.json);
+        assert!(mode.is_quiet());
+    }
+
+    #[test]
+    fn output_mode_json_overrides_verbose() {
+        let args = vec![OsString::from("--repobin-verbose"), OsString::from("--json")];
+        let mode = OutputMode::from_args_and_env(&args, false);
+        assert!(mode.verbose);
+        assert!(mode.json);
+        // is_verbose is gated by !json so json wins for printing the line.
+        assert!(!mode.is_verbose());
+        assert!(mode.is_quiet());
+    }
+
+    #[test]
+    fn output_mode_ignores_partial_match() {
+        let args = vec![
+            OsString::from("--jsonfoo"),
+            OsString::from("--repobin-verbose-extra"),
+        ];
+        let mode = OutputMode::from_args_and_env(&args, false);
+        assert!(!mode.json);
+        assert!(!mode.verbose);
+    }
+
+    #[test]
+    fn default_notice_silent_in_routine_mode() {
+        assert!(
+            default_notice_line("boss", "repo", &cached_outcome(), OutputMode::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn default_notice_visible_when_verbose() {
+        let mode = OutputMode {
+            verbose: true,
+            json: false,
+        };
+        let line = default_notice_line("boss", "repo", &cached_outcome(), mode)
+            .expect("line should be emitted in verbose mode");
+        assert!(line.contains("repobin: running `boss`"));
+        assert!(line.contains("@ abcdef1"));
+    }
+
+    #[test]
+    fn default_notice_silent_under_json() {
+        let mode = OutputMode {
+            verbose: true,
+            json: true,
+        };
+        assert!(default_notice_line("boss", "repo", &cached_outcome(), mode).is_none());
+    }
+
+    #[test]
+    fn strip_repobin_args_removes_verbose_flag() {
+        let args = vec![
+            OsString::from("--repobin-verbose"),
+            OsString::from("product"),
+            OsString::from("list"),
+        ];
+        let cleaned = strip_repobin_args(&args);
+        assert_eq!(
+            cleaned,
+            vec![OsString::from("product"), OsString::from("list")],
+        );
+    }
+
+    #[test]
+    fn strip_repobin_args_keeps_other_flags() {
+        let args = vec![
+            OsString::from("product"),
+            OsString::from("--json"),
+            OsString::from("list"),
+        ];
+        let cleaned = strip_repobin_args(&args);
+        assert_eq!(cleaned, args);
     }
 }

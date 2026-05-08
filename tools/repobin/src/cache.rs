@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use fs4::fs_std::FileExt;
 use sha2::{Digest, Sha256};
 
-use crate::app::RepobinError;
+use crate::app::{OutputMode, RepobinError};
 
 const REFRESH_TTL_DEFAULT: Duration = Duration::from_secs(300);
 const TTL_ENV: &str = "REPOBIN_DEFAULTS_TTL_SECS";
@@ -108,9 +108,9 @@ impl RepoCacheLock {
         &self.cache
     }
 
-    pub fn ensure_up_to_date(&self) -> Result<EnsureOutcome, RepobinError> {
+    pub fn ensure_up_to_date(&self, mode: OutputMode) -> Result<EnsureOutcome, RepobinError> {
         if !self.cache.checkout.join(".git").is_dir() {
-            self.clone_initial()?;
+            self.clone_initial(mode)?;
             self.update_fetch_stamp()?;
             return Ok(EnsureOutcome::Cloned {
                 head: read_head(&self.cache.checkout)?,
@@ -133,13 +133,13 @@ impl RepoCacheLock {
                 refreshed: true,
             });
         }
-        fetch_and_reset(&self.cache.checkout)?;
+        fetch_and_reset(&self.cache.checkout, mode)?;
         let head = read_head(&self.cache.checkout)?;
         self.update_fetch_stamp()?;
         Ok(EnsureOutcome::Updated { head })
     }
 
-    fn clone_initial(&self) -> Result<(), RepobinError> {
+    fn clone_initial(&self, mode: OutputMode) -> Result<(), RepobinError> {
         if self.cache.checkout.exists() {
             fs::remove_dir_all(&self.cache.checkout).map_err(|source| {
                 RepobinError::WriteCacheMetadata {
@@ -148,25 +148,31 @@ impl RepoCacheLock {
                 }
             })?;
         }
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("clone")
             .arg("--depth=1")
             .arg("--single-branch")
             .arg(&self.cache.url)
             .arg(&self.cache.checkout)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|source| RepobinError::SpawnGit {
-                action: "clone".to_string(),
-                source,
-            })?;
-        forward_to_stderr(&output.stdout);
+            .stdout(Stdio::piped());
+        configure_stderr(&mut command, mode);
+        let output = command.output().map_err(|source| RepobinError::SpawnGit {
+            action: "clone".to_string(),
+            source,
+        })?;
         if !output.status.success() {
+            // On failure, surface whatever we captured so the user can debug,
+            // even if --json suppressed it during the run.
+            forward_to_stderr(&output.stderr);
+            forward_to_stderr(&output.stdout);
             return Err(RepobinError::GitFailed {
                 action: format!("clone {}", self.cache.url),
                 status: output.status.code(),
             });
+        }
+        if !mode.is_quiet() {
+            forward_to_stderr(&output.stdout);
         }
         let url_path = self.cache.dir.join("url");
         fs::write(&url_path, &self.cache.url).map_err(|source| {
@@ -256,47 +262,58 @@ fn ls_remote_head(checkout: &Path) -> Result<String, RepobinError> {
     Ok(sha)
 }
 
-fn fetch_and_reset(checkout: &Path) -> Result<(), RepobinError> {
-    let fetch = Command::new("git")
-        .arg("fetch")
-        .arg("--depth=1")
-        .arg("origin")
-        .arg("HEAD")
-        .current_dir(checkout)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|source| RepobinError::SpawnGit {
-            action: "fetch".to_string(),
-            source,
-        })?;
-    forward_to_stderr(&fetch.stdout);
-    if !fetch.status.success() {
+fn fetch_and_reset(checkout: &Path, mode: OutputMode) -> Result<(), RepobinError> {
+    run_quiet_git(
+        checkout,
+        &["fetch", "--depth=1", "origin", "HEAD"],
+        "fetch",
+        "fetch origin HEAD",
+        mode,
+    )?;
+    run_quiet_git(
+        checkout,
+        &["reset", "--hard", "FETCH_HEAD"],
+        "reset",
+        "reset --hard FETCH_HEAD",
+        mode,
+    )?;
+    Ok(())
+}
+
+fn run_quiet_git(
+    checkout: &Path,
+    args: &[&str],
+    spawn_action: &str,
+    fail_action: &str,
+    mode: OutputMode,
+) -> Result<(), RepobinError> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(checkout).stdout(Stdio::piped());
+    configure_stderr(&mut command, mode);
+    let output = command.output().map_err(|source| RepobinError::SpawnGit {
+        action: spawn_action.to_string(),
+        source,
+    })?;
+    if !output.status.success() {
+        forward_to_stderr(&output.stderr);
+        forward_to_stderr(&output.stdout);
         return Err(RepobinError::GitFailed {
-            action: "fetch origin HEAD".to_string(),
-            status: fetch.status.code(),
+            action: fail_action.to_string(),
+            status: output.status.code(),
         });
     }
-    let reset = Command::new("git")
-        .arg("reset")
-        .arg("--hard")
-        .arg("FETCH_HEAD")
-        .current_dir(checkout)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|source| RepobinError::SpawnGit {
-            action: "reset".to_string(),
-            source,
-        })?;
-    forward_to_stderr(&reset.stdout);
-    if !reset.status.success() {
-        return Err(RepobinError::GitFailed {
-            action: "reset --hard FETCH_HEAD".to_string(),
-            status: reset.status.code(),
-        });
+    if !mode.is_quiet() {
+        forward_to_stderr(&output.stdout);
     }
     Ok(())
+}
+
+fn configure_stderr(command: &mut Command, mode: OutputMode) {
+    if mode.is_quiet() {
+        command.stderr(Stdio::piped());
+    } else {
+        command.stderr(Stdio::inherit());
+    }
 }
 
 fn forward_to_stderr(buf: &[u8]) {
