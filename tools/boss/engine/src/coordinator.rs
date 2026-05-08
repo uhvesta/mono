@@ -2278,6 +2278,7 @@ mod tests {
                 name: "Design A".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         let second_project = db
@@ -2286,6 +2287,7 @@ mod tests {
                 name: "Design B".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         db.create_task(CreateTaskInput {
@@ -2338,14 +2340,29 @@ mod tests {
                 .iter()
                 .filter(|execution| execution.status == "running")
                 .count(),
-            1
+            1,
+            "pool cap = 1 must keep exactly one execution `running`",
         );
+        // Project design now lives on a per-project `kind = 'design'`
+        // task at `ordinal = 0`, with the user's project_tasks at
+        // `ordinal >= 1`. Only the design tasks are eligible for
+        // `ready` until they complete; the user-tasks stay
+        // `waiting_dependency` behind their project's design. So the
+        // shape is: 1 running design, 1 ready design (gated on the
+        // pool slot), 2 waiting_dependency project_tasks.
         assert_eq!(
             executions
                 .iter()
                 .filter(|execution| execution.status == "ready")
                 .count(),
-            3
+            1,
+        );
+        assert_eq!(
+            executions
+                .iter()
+                .filter(|execution| execution.status == "waiting_dependency")
+                .count(),
+            2,
         );
         assert_eq!(coordinator.worker_pool().idle_count().await, 0);
     }

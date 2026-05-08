@@ -220,9 +220,26 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Going through a file (rather than embedding the prompt in
         // the typed command) avoids shell quoting hell on multi-line,
         // backtick-bearing markdown.
+        // For project_design executions the work item is the
+        // project's synthetic design task. The task itself carries
+        // little context (name = "Design"), so look up the parent
+        // project to enrich the prompt with the project's name,
+        // description, and goal — that's the information the worker
+        // actually needs to produce a useful design pass.
+        let parent_project = match work_item {
+            WorkItem::Task(task) if task.kind == "design" => {
+                if let Some(project_id) = task.project_id.as_deref() {
+                    self.work_db.get_project(project_id).ok()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         let prompt_text = compose_execution_prompt(
             execution,
             work_item,
+            parent_project.as_ref(),
             workspace_path,
             cube_change_id,
         );
@@ -296,6 +313,7 @@ impl ExecutionRunner for PaneSpawnRunner {
 fn compose_execution_prompt(
     execution: &WorkExecution,
     work_item: &WorkItem,
+    parent_project: Option<&Project>,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
 ) -> String {
@@ -313,6 +331,20 @@ fn compose_execution_prompt(
     prompt.push_str(&format!("- work item: `{}`\n", work_item_name(work_item)));
     if let Some(cube_change_id) = cube_change_id {
         prompt.push_str(&format!("- local change: `{}`\n", cube_change_id));
+    }
+    // For project_design executions the work item is now the
+    // synthetic `kind = 'design'` task, which is intentionally
+    // sparse (`name = "Design"`, no description). The interesting
+    // context — what is the project actually for? — lives on the
+    // parent project. Surface it inline so the worker has the
+    // project's name/goal/description to anchor the design pass.
+    if let Some(project) = parent_project {
+        prompt.push_str(&format!("- parent project: `{}`\n", project.name));
+        if let Some(details) = project_details(project) {
+            prompt.push_str("- project details:\n");
+            prompt.push_str(details.trim_end());
+            prompt.push('\n');
+        }
     }
     if let Some(details) = work_item_details(work_item) {
         prompt.push_str("- details:\n");
@@ -333,7 +365,7 @@ fn compose_execution_prompt(
     });
     if matches!(
         execution.kind.as_str(),
-        "task_implementation" | "chore_implementation"
+        "task_implementation" | "chore_implementation" | "project_design"
     ) {
         // Acceptance criterion: the engine watches for a PR URL on the
         // run's branch when claude stops. If the worker stops without

@@ -315,6 +315,7 @@ mod tests {
                 name: format!("Project-{name}"),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         let task = db

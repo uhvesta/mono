@@ -94,6 +94,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             name: "Phase 1".to_owned(),
             description: Some("initial slice".to_owned()),
             goal: Some("ship work CLI".to_owned()),
+            autostart: true,
         },
     )
     .await?;
@@ -138,8 +139,11 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
     assert_eq!(listed_projects.len(), 1);
 
     let listed_tasks = list_tasks(&mut client, &product.id, Some(&project.id)).await?;
-    assert_eq!(listed_tasks.len(), 1);
-    assert_eq!(listed_tasks[0].id, task.id);
+    // Two rows: the auto-created `kind = 'design'` task plus the
+    // user-created project_task. The design task always sorts first.
+    assert_eq!(listed_tasks.len(), 2);
+    assert_eq!(listed_tasks[0].kind, "design");
+    assert_eq!(listed_tasks[1].id, task.id);
 
     let listed_chores = list_chores(&mut client, &product.id).await?;
     assert_eq!(listed_chores.len(), 1);
@@ -223,6 +227,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             name: "Slice".to_owned(),
             description: None,
             goal: None,
+            autostart: true,
         },
     )
     .await?;
@@ -305,6 +310,7 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
             name: "Subscribed".to_owned(),
             description: None,
             goal: None,
+            autostart: true,
         },
     )
     .await?;
@@ -351,6 +357,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             name: "Phase 2".to_owned(),
             description: None,
             goal: None,
+            autostart: true,
         },
     )
     .await?;
@@ -434,6 +441,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             name: "P".to_owned(),
             description: None,
             goal: None,
+            autostart: true,
         },
     )
     .await?;
@@ -1027,6 +1035,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             name: "Phase 3".to_owned(),
             description: None,
             goal: None,
+            autostart: true,
         },
     )
     .await?;
@@ -1252,6 +1261,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             name: "Phase 1".to_owned(),
             description: None,
             goal: None,
+            autostart: true,
         },
     )
     .await?;
@@ -1280,7 +1290,15 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     };
     assert_eq!(created_tasks.len(), 4);
     let listed_tasks = list_tasks(&mut client, &product.id, Some(&project.id)).await?;
-    assert_eq!(listed_tasks.len(), 4);
+    // 4 user-created project_tasks plus the auto-created design task.
+    assert_eq!(listed_tasks.len(), 5);
+    assert_eq!(
+        listed_tasks
+            .iter()
+            .filter(|t| t.kind == "design")
+            .count(),
+        1,
+    );
 
     let chore_inputs: Vec<CreateChoreInput> = (0..3)
         .map(|i| CreateChoreInput {
@@ -1341,7 +1359,10 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
         other => return Err(unexpected_event("expected WorkError", other)),
     }
     let listed_after = list_tasks(&mut client, &product.id, Some(&project.id)).await?;
-    assert_eq!(listed_after.len(), 4, "rollback must not leak rows");
+    // 4 user-created project_tasks (from the earlier successful batch)
+    // plus the auto-created design task — 5 total. The bad batch
+    // rolled back, so no extra rows leaked.
+    assert_eq!(listed_after.len(), 5, "rollback must not leak rows");
 
     Ok(())
 }

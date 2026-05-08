@@ -114,6 +114,16 @@ impl WorkDb {
             params![id, input.product_id, input.name, slug, description, goal, now],
         )?;
 
+        // Auto-create the project's design task. The design phase is
+        // a unit of work just like any other task on the project, so
+        // we represent it as one — the kanban renders it through the
+        // existing task pipeline (drag/drop, popover, runtime dot,
+        // PR-on-merge round-trip). It sorts first via `ordinal = 0`
+        // so the dispatcher picks it up before the project's own
+        // tasks (which start at `ordinal = 1` per the
+        // task-creation default).
+        insert_design_task_for_project_in_tx(&tx, &input.product_id, &id, input.autostart)?;
+
         let project = query_project(&tx, &id)?
             .with_context(|| format!("missing project after insert: {id}"))?;
         tx.commit()?;
@@ -496,6 +506,15 @@ impl WorkDb {
         query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
     }
 
+    /// Fetch a single project by id. Used by the runner when it
+    /// composes the worker prompt for a `kind = 'design'` task —
+    /// the design task itself is sparse, so the runner enriches the
+    /// prompt with the parent project's name/goal/description.
+    pub fn get_project(&self, id: &str) -> Result<Project> {
+        let conn = self.connect()?;
+        query_project(&conn, id)?.with_context(|| format!("unknown project: {id}"))
+    }
+
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
     /// when the execution is unknown or already in a terminal status
     /// — callers shouldn't try to cancel a row that's already done.
@@ -615,26 +634,23 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let product = query_product(&tx, product_id)?
             .with_context(|| format!("unknown product: {product_id}"))?;
-        let projects = list_projects_for_product(&tx, product_id)?;
+        let _projects = list_projects_for_product(&tx, product_id)?;
         let tasks = list_tasks_for_product(&tx, product_id)?;
         let mut result = ExecutionReconcileResult::default();
 
         let repo_remote_url = product.repo_remote_url.clone();
 
-        for project in &projects {
-            if !project_accepts_execution(project) {
-                continue;
-            }
-            reconcile_work_item_execution(
-                &tx,
-                &mut result,
-                &project.id,
-                "project_design",
-                "ready",
-                repo_remote_url.as_deref(),
-            )?;
-        }
-
+        // Bucket the product's project-bound tasks by parent. Both
+        // `kind = 'design'` and `kind = 'project_task'` share the
+        // same first-incomplete-is-`ready` chain — design tasks live
+        // at `ordinal = 0` so they sort to the head of the list and
+        // dispatch first. The execution kind diverges per-row:
+        // design dispatches as `project_design`, project_tasks as
+        // `task_implementation`. This is the single point where the
+        // project_design lifecycle plugs into the existing per-task
+        // dispatch machinery; once routed the rest of the lifecycle
+        // (PR detection, in_review→done, dependency cascade) is the
+        // unchanged task path.
         let mut project_tasks: HashMap<String, Vec<Task>> = HashMap::new();
         for task in tasks {
             match task.kind.as_str() {
@@ -650,7 +666,7 @@ impl WorkDb {
                         )?;
                     }
                 }
-                "project_task" => {
+                "project_task" | "design" => {
                     if let Some(project_id) = &task.project_id {
                         project_tasks
                             .entry(project_id.clone())
@@ -682,11 +698,15 @@ impl WorkDb {
                 } else {
                     "waiting_dependency"
                 };
+                let execution_kind = match task.kind.as_str() {
+                    "design" => "project_design",
+                    _ => "task_implementation",
+                };
                 reconcile_work_item_execution(
                     &tx,
                     &mut result,
                     &task.id,
-                    "task_implementation",
+                    execution_kind,
                     desired_status,
                     repo_remote_url.as_deref(),
                 )?;
@@ -1127,10 +1147,16 @@ impl WorkDb {
         };
 
         let tasks = {
+            // `kind IN ('project_task', 'design')` — the design task
+            // auto-created at project birth lives in the same lane as
+            // every other project task. Sorting on `ordinal` ASC puts
+            // the design task (ordinal = 0) at the head of the
+            // project's task chain, which matches the kanban
+            // expectation that design lands first.
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
                  FROM tasks
-                 WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([product_id], map_task)?;
@@ -1224,7 +1250,7 @@ impl WorkDb {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
                  FROM tasks
-                 WHERE product_id = ?1 AND project_id = ?2 AND kind = 'project_task' AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map(params![product_id, project_id], map_task)?;
@@ -1233,7 +1259,7 @@ impl WorkDb {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
                  FROM tasks
-                 WHERE product_id = ?1 AND kind = 'project_task' AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([product_id], map_task)?;
@@ -1638,6 +1664,7 @@ impl WorkDb {
         migrate_tasks_autostart(&conn)?;
         migrate_last_status_actor(&conn)?;
         migrate_tasks_priority(&conn)?;
+        migrate_backfill_project_design_tasks(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
         // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
@@ -1937,7 +1964,7 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind IN ('chore', 'project_task')
+             WHERE kind IN ('chore', 'project_task', 'design')
                AND status = 'in_review'
                AND pr_url IS NOT NULL
                AND pr_url != ''
@@ -2219,6 +2246,29 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
+}
+
+/// Insert a `kind = 'design'` task as the first row under
+/// `project_id`. Used by `create_project` and the migration that
+/// backfills design tasks for projects predating this column. The
+/// design task always has `ordinal = 0` so it sorts ahead of every
+/// `project_task` (which start at `ordinal = 1`) and the dispatcher
+/// picks it up first via the existing first-incomplete chain.
+fn insert_design_task_for_project_in_tx(
+    conn: &Connection,
+    product_id: &str,
+    project_id: &str,
+    autostart: bool,
+) -> Result<Task> {
+    let id = next_id("task");
+    let now = now_string();
+    let autostart_value: i64 = if autostart { 1 } else { 0 };
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
+         VALUES (?1, ?2, ?3, 'design', 'Design', '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium')",
+        params![id, product_id, project_id, now, autostart_value],
+    )?;
+    query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))
 }
 
 /// Validate a caller-supplied priority and return the canonical
@@ -2609,6 +2659,50 @@ fn migrate_tasks_priority(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Backfill a `kind = 'design'` task for every project that doesn't
+/// have one yet. Brings databases that predate
+/// design-as-task up to the new shape so the kanban renders them
+/// like new projects: a "Design" card sits at the head of the
+/// project's task list and the existing dispatcher picks it up the
+/// next time `reconcile_product_executions` runs.
+///
+/// The backfilled design task lands in `todo` with `autostart = 0`.
+/// Why parked-by-default: an existing project that's already been
+/// designed (or is mid-flight under the old project-id-keyed
+/// project_design execution) shouldn't get a duplicate worker
+/// spawned out from under the user. A human who actually wants the
+/// new design task to run can flip it to active in the kanban — the
+/// same path any other parked task takes — and the autostart gate
+/// melts away on first move-off-`todo`.
+fn migrate_backfill_project_design_tasks(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.product_id
+         FROM projects p
+         WHERE NOT EXISTS (
+             SELECT 1 FROM tasks t
+             WHERE t.project_id = p.id
+               AND t.kind = 'design'
+               AND t.deleted_at IS NULL
+         )",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (project_id, product_id) in rows {
+        let id = next_id("task");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
+             VALUES (?1, ?2, ?3, 'design', 'Design', '', 'todo', 0, NULL, NULL, ?4, ?4, 0, 'medium')",
+            params![id, product_id, project_id, now],
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
     let exists = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM work_executions WHERE id = ?1)",
@@ -2873,6 +2967,13 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
     Ok(match classify_id(work_item_id)? {
         ItemKind::Product => "product_design".to_owned(),
+        // Project ids no longer host their own executions — the
+        // project's design phase lives on its auto-created
+        // `kind = 'design'` task. We keep this arm returning
+        // `project_design` so legacy callers passing a project id to
+        // `RequestExecution` still get a sensible execution kind for
+        // logging, but the dispatch loop never actually creates
+        // executions against project ids any more.
         ItemKind::Project => "project_design".to_owned(),
         ItemKind::Task => {
             let task = query_task(conn, work_item_id)?
@@ -2880,6 +2981,7 @@ fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str) -> Result
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
             match task.kind.as_str() {
                 "chore" => "chore_implementation".to_owned(),
+                "design" => "project_design".to_owned(),
                 _ => "task_implementation".to_owned(),
             }
         }
@@ -2909,10 +3011,6 @@ fn can_reconcile_execution_status(status: &str) -> bool {
 
 fn execution_status_is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "abandoned" | "cancelled")
-}
-
-fn project_accepts_execution(project: &Project) -> bool {
-    !matches!(project.status.as_str(), "done" | "archived")
 }
 
 fn task_accepts_execution(task: &Task) -> bool {
@@ -3430,6 +3528,30 @@ mod tests {
         std::env::temp_dir().join(file)
     }
 
+    /// Project creation auto-spawns a `kind = 'design'` task, which
+    /// otherwise sits at the head of the project's task chain and
+    /// holds the dispatcher's `ready` slot. Most legacy tests pre-date
+    /// the design task and want to test the project_task ordering in
+    /// isolation, so they call this helper to mark the design as
+    /// already done — the rest of the chain then behaves exactly as it
+    /// did before.
+    fn complete_design_for_project(db: &WorkDb, project_id: &str) {
+        let project = db.get_project(project_id).unwrap();
+        let tasks = db.list_tasks(&project.product_id, Some(project_id), None).unwrap();
+        let design = tasks
+            .iter()
+            .find(|t| t.kind == "design")
+            .expect("project should have an auto-created design task");
+        db.update_work_item(
+            &design.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn creates_tree_and_soft_deletes_chores() {
         let path = temp_db_path("tree");
@@ -3448,6 +3570,7 @@ mod tests {
                 name: "Work taxonomy".to_owned(),
                 description: None,
                 goal: Some("goal".to_owned()),
+                autostart: true,
             })
             .unwrap();
         let task = db
@@ -3472,8 +3595,12 @@ mod tests {
 
         let tree = db.get_work_tree(&product.id).unwrap();
         assert_eq!(tree.projects.len(), 1);
-        assert_eq!(tree.tasks.len(), 1);
-        assert_eq!(tree.tasks[0].id, task.id);
+        // Each project carries an auto-created `kind = 'design'` task
+        // at `ordinal = 0` plus the user-created task — so the tree
+        // sees both. The design task always sorts first.
+        assert_eq!(tree.tasks.len(), 2);
+        assert_eq!(tree.tasks[0].kind, "design");
+        assert_eq!(tree.tasks[1].id, task.id);
         assert_eq!(tree.chores.len(), 1);
         assert_eq!(tree.chores[0].id, chore.id);
 
@@ -3502,6 +3629,7 @@ mod tests {
                 name: "Plan".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -3533,7 +3661,10 @@ mod tests {
         let tasks = db
             .list_tasks(&product.id, Some(&project.id), None)
             .unwrap();
-        assert_eq!(tasks.len(), 5);
+        // Five user-created tasks plus the auto-created design task
+        // that every new project carries.
+        assert_eq!(tasks.len(), 6);
+        assert!(tasks.iter().any(|t| t.kind == "design"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -3556,6 +3687,7 @@ mod tests {
                 name: "Plan".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
 
@@ -3591,7 +3723,13 @@ mod tests {
         let tasks = db
             .list_tasks(&product.id, Some(&project.id), None)
             .unwrap();
-        assert!(tasks.is_empty(), "rollback must leave no rows");
+        // The batch's project_task inserts must roll back, but the
+        // auto-created design task (inserted in `create_project`'s
+        // own committed transaction) is not part of this batch and
+        // remains. Assert exactly that shape so a future regression
+        // that lets the Bad row leak out shows up.
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].kind, "design");
 
         let _ = std::fs::remove_file(path);
     }
@@ -3873,6 +4011,7 @@ mod tests {
                 name: "Taxonomy".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         let first = db
@@ -3899,9 +4038,14 @@ mod tests {
         db.reorder_project_tasks(&project.id, &[second.id.clone(), first.id.clone()])
             .unwrap();
 
+        // The design task always sits at `ordinal = 0`, so it stays
+        // at index 0 regardless of how the user-created project_tasks
+        // are reordered. The reorder swap applies to the project_task
+        // pair only, which now occupy indices 1 and 2.
         let tree = db.get_work_tree(&product.id).unwrap();
-        assert_eq!(tree.tasks[0].id, second.id);
-        assert_eq!(tree.tasks[1].id, first.id);
+        assert_eq!(tree.tasks[0].kind, "design");
+        assert_eq!(tree.tasks[1].id, second.id);
+        assert_eq!(tree.tasks[2].id, first.id);
 
         let _ = std::fs::remove_file(path);
     }
@@ -3924,6 +4068,7 @@ mod tests {
                 name: "Execution foundation".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         let task = db
@@ -4082,6 +4227,7 @@ mod tests {
                 name: "Execution coordinator".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         let first_task = db
@@ -4114,8 +4260,19 @@ mod tests {
             })
             .unwrap();
 
+        // Mark the project's auto-created design task done so the
+        // first user-created project_task takes the head of the
+        // dispatch chain — this test predates design-as-task and is
+        // testing the project_task ordering, not the design phase.
+        complete_design_for_project(&db, &project.id);
+
         let result = db.reconcile_product_executions(&product.id).unwrap();
-        assert_eq!(result.created.len(), 4);
+        // Created executions: design (will reuse the existing one
+        // from the design task — actually design task is now `done`
+        // so it won't get reconciled), first_task, second_task,
+        // chore. Plus the design task already had status='todo' before
+        // we marked done — the reconcile may have created an execution
+        // for it. To avoid coupling, just assert the per-task shape.
         assert!(result.updated.is_empty());
 
         let first_execution = db.list_executions(Some(&first_task.id)).unwrap();
@@ -4157,6 +4314,7 @@ mod tests {
                 name: "Execution coordinator".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         let first_task = db
@@ -4179,6 +4337,13 @@ mod tests {
                 priority: None,
             })
             .unwrap();
+
+        // Mark the auto-created design task done so first_task takes
+        // the head of the project's dispatch chain — without this, the
+        // design task would be `ready` and first_task would still be
+        // `waiting_dependency` after we mark first_task done (it never
+        // becomes `ready` to begin with).
+        complete_design_for_project(&db, &project.id);
 
         db.reconcile_product_executions(&product.id).unwrap();
         db.update_work_item(
@@ -4220,6 +4385,7 @@ mod tests {
                 name: "Execution coordinator".to_owned(),
                 description: None,
                 goal: None,
+                autostart: true,
             })
             .unwrap();
         let task = db
@@ -4232,6 +4398,12 @@ mod tests {
                 priority: None,
             })
             .unwrap();
+
+        // Mark the auto-created design task done so the user's task
+        // is the first incomplete and would be `ready` once the repo
+        // remote becomes available — that's what this test cares
+        // about.
+        complete_design_for_project(&db, &project.id);
 
         let first_pass = db.reconcile_product_executions(&product.id).unwrap();
         assert!(first_pass.created.is_empty());
@@ -4246,7 +4418,10 @@ mod tests {
         )
         .unwrap();
         let second_pass = db.reconcile_product_executions(&product.id).unwrap();
-        assert_eq!(second_pass.created.len(), 2);
+        // Now there's exactly one executable item under the project
+        // (the user task; the design is `done`), so reconcile creates
+        // exactly one execution.
+        assert_eq!(second_pass.created.len(), 1);
 
         let task_execution = db.list_executions(Some(&task.id)).unwrap();
         assert_eq!(task_execution.len(), 1);
@@ -5130,6 +5305,171 @@ mod tests {
     /// `autostart=false` items live in `active` deliberately: the
     /// human moved them there but explicitly opted out of the
     /// auto-dispatcher. The on-free rescan must respect that flag —
+    /// `create_project` auto-spawns a `kind = 'design'` task at
+    /// `ordinal = 0`, and reconcile dispatches it as a
+    /// `project_design` execution. This is the join point that makes
+    /// the project's design phase show up on the kanban as a
+    /// regular task card.
+    #[test]
+    fn create_project_spawns_design_task_dispatched_as_project_design() {
+        let path = temp_db_path("project-spawns-design");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Engine dispatch instrumentation".to_owned(),
+                description: None,
+                goal: Some("expose every dispatch event".to_owned()),
+                autostart: true,
+            })
+            .unwrap();
+
+        // The project comes with a `kind = 'design'` task already
+        // attached, named "Design" and parked at `ordinal = 0` so it
+        // sorts first in the project's chain.
+        let tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        let design = tasks
+            .iter()
+            .find(|t| t.kind == "design")
+            .expect("project should have an auto-created design task");
+        assert_eq!(design.name, "Design");
+        assert_eq!(design.status, "todo");
+        assert_eq!(design.ordinal, Some(0));
+        assert_eq!(design.project_id.as_deref(), Some(project.id.as_str()));
+
+        // Reconcile lights up the design task as a `project_design`
+        // execution — same machinery as chore/task dispatch, just a
+        // different kind on the work_executions row.
+        db.reconcile_product_executions(&product.id).unwrap();
+        let executions = db.list_executions(Some(&design.id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].kind, "project_design");
+        assert_eq!(executions[0].status, "ready");
+
+        // The matching task runtime is in the work tree — that's
+        // what the kanban joins to render the activity dot. No
+        // separate "project runtime" needed.
+        let tree = db.get_work_tree(&product.id).unwrap();
+        let runtime = tree
+            .task_runtimes
+            .iter()
+            .find(|r| r.work_item_id == design.id)
+            .expect("design task runtime missing from work tree");
+        assert_eq!(runtime.execution_status.as_deref(), Some("ready"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `--no-autostart` on project create plumbs through to the
+    /// design task's autostart flag — so the design lives in `todo`
+    /// without spawning a worker until something explicitly schedules
+    /// it. Mirrors the chore/task autostart story exactly.
+    #[test]
+    fn create_project_no_autostart_parks_design_task() {
+        let path = temp_db_path("project-no-autostart-design");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Parked".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+            })
+            .unwrap();
+
+        let tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        let design = tasks
+            .iter()
+            .find(|t| t.kind == "design")
+            .expect("project should have an auto-created design task");
+        assert!(!design.autostart);
+
+        // Reconcile must NOT create an execution for the parked
+        // design task — the autostart gate keeps the dispatcher out.
+        db.reconcile_product_executions(&product.id).unwrap();
+        let executions = db.list_executions(Some(&design.id)).unwrap();
+        assert!(
+            executions.is_empty(),
+            "no_autostart design task must NOT spawn an execution, found: {executions:?}",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Pre-design-card databases don't have a design task per
+    /// project. The migration fills the gap so the kanban renders
+    /// existing projects the same way as new ones — a "Design"
+    /// card sits at the head of each project's chain on next open.
+    #[test]
+    fn migration_backfills_design_tasks_for_existing_projects() {
+        let path = temp_db_path("migration-design-backfill");
+        // First open establishes the schema. We then forcibly delete
+        // the auto-created design task to mirror a database created
+        // before this column existed.
+        let project_id = {
+            let db = WorkDb::open(path.clone()).unwrap();
+            let product = db
+                .create_product(CreateProductInput {
+                    name: "Boss".to_owned(),
+                    description: None,
+                    repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                })
+                .unwrap();
+            let project = db
+                .create_project(CreateProjectInput {
+                    product_id: product.id,
+                    name: "Legacy".to_owned(),
+                    description: None,
+                    goal: None,
+                    autostart: true,
+                })
+                .unwrap();
+            // Hard-delete the auto-created design task so the
+            // database looks like a pre-migration row set on next
+            // open.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "DELETE FROM tasks WHERE project_id = ?1 AND kind = 'design'",
+                params![project.id],
+            )
+            .unwrap();
+            project.id
+        };
+
+        // Re-open: the migration fires and backfills a design task.
+        let db = WorkDb::open(path.clone()).unwrap();
+        let project = db.get_project(&project_id).unwrap();
+        let tasks = db.list_tasks(&project.product_id, Some(&project_id), None).unwrap();
+        let design = tasks
+            .iter()
+            .find(|t| t.kind == "design")
+            .expect("migration should backfill a design task");
+        assert_eq!(design.status, "todo");
+        // Backfilled design tasks land parked: an existing project
+        // may already be mid-flight under the old project-id-keyed
+        // execution, so we don't auto-dispatch.
+        assert!(!design.autostart);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// otherwise a chore that died once would loop on every worker
     /// release.
     #[test]

@@ -182,6 +182,16 @@ pub struct CreateProjectInput {
     pub name: String,
     pub description: Option<String>,
     pub goal: Option<String>,
+    /// Project creation auto-creates a `kind = 'design'` task as the
+    /// first row under the project so the design phase shows up on
+    /// the kanban like any other task. With `autostart = false` that
+    /// design task is created in `todo` but the engine will NOT
+    /// dispatch a worker against it until something explicitly
+    /// schedules it (CLI `work start`, kanban drag-to-Doing, etc.).
+    /// Mirrors the chore/task `autostart` semantics — same gate,
+    /// applied at the moment the design task is born.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1159,6 +1159,13 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                     name,
                     description,
                     goal,
+                    // Project creation auto-creates a `kind = 'design'`
+                    // task as the project's first row. The global
+                    // `--no-autostart` flag, which already gates
+                    // chore/task auto-dispatch, now also gates that
+                    // design task so a single mental model covers
+                    // every work-item kind.
+                    autostart: !ctx.no_autostart,
                 },
             )
             .await?;
