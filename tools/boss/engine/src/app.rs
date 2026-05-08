@@ -1662,25 +1662,29 @@ fn is_descendant_of_any(pid: libc::pid_t, trust_roots: &[libc::pid_t]) -> bool {
 }
 
 fn current_parent_pid() -> Option<libc::pid_t> {
-    // Explicit override wins. Necessary when the engine is launched
-    // through `bazel run`, which daemonizes its server: the engine
-    // binary's actual parent ends up being `bazel`, reparented to
-    // launchd, so `getppid()` and any ancestor walk both miss the
-    // real app entirely. The macOS app sets `BOSS_APP_PID` to its own
-    // pid before spawning the engine.
-    if let Ok(raw) = std::env::var("BOSS_APP_PID") {
-        if let Ok(parsed) = raw.parse::<libc::pid_t>() {
-            if parsed > 1 {
-                return Some(parsed);
-            }
-        }
-    }
-    // SAFETY: getppid() has no preconditions; the returned pid is
-    // valid for the lifetime of the parent process (and thereafter
-    // returns 1 / launchd, which we treat as no-app-detected via the
-    // explicit check below).
-    let ppid = unsafe { libc::getppid() };
-    if ppid <= 1 { None } else { Some(ppid) }
+    // BOSS_APP_PID is the only signal we trust to identify the app
+    // tier. The macOS app sets it to its own pid before spawning the
+    // engine — necessary because `bazel run` daemonizes its server,
+    // reparenting the engine away from the app's process tree, so
+    // `getppid()` lands on `bazel` (or launchd) instead of the app.
+    //
+    // When BOSS_APP_PID is unset we leave app_pid as None rather than
+    // guessing from `getppid()`. Falling back to the parent yields a
+    // wrong-but-confident answer in every dev setup that launches the
+    // engine independently of the app (`bazel run` from a terminal,
+    // direct invocation of the binary, etc.) — the engine pins its
+    // trust root to bazel/launchd and then rejects every legitimate
+    // `RegisterAppSession` from the real app, which kills dispatch
+    // (every `SpawnWorkerPane` request fails because no app session
+    // is registered to receive it). With None, the trust gate becomes
+    // a no-op (matches the test path), the app registers, and the
+    // Boss session pid takes over as the real trust root once
+    // `RegisterBossSession` lands. Production is unaffected: the app
+    // always sets BOSS_APP_PID via `EngineProcessController`.
+    std::env::var("BOSS_APP_PID")
+        .ok()
+        .and_then(|raw| raw.parse::<libc::pid_t>().ok())
+        .filter(|&pid| pid > 1)
 }
 
 async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<ServerState>) {
@@ -5275,5 +5279,60 @@ mod tests {
             drain.is_err(),
             "duplicate Stop must not produce a second ProbeReplied for the same probe id",
         );
+    }
+
+    /// `current_parent_pid` must NOT fall back to `getppid()` when
+    /// `BOSS_APP_PID` is unset. The fallback used to land on the bazel
+    /// daemon (in `bazel run` dev setups) or launchd (1) — neither
+    /// matches the real macOS app, so every `RegisterAppSession` from
+    /// the actual app got rejected, no app session ever registered,
+    /// and every `SpawnWorkerPane` request fell on the floor. Drag-to
+    /// -Doing visibly accepted the request, the dispatcher created
+    /// the run row, then `start_worker` returned `AppDisconnected`
+    /// and the run flipped to `failed` with no surface explanation.
+    /// Production sets `BOSS_APP_PID`, so the env-set branch is
+    /// unaffected; this guards both branches.
+    ///
+    /// All four cases live in one test so the env mutations stay
+    /// serialised — sibling tests racing on the same key would flake
+    /// under cargo's parallel runner.
+    #[test]
+    fn current_parent_pid_only_trusts_env_var() {
+        let original = std::env::var_os("BOSS_APP_PID");
+
+        unsafe {
+            std::env::remove_var("BOSS_APP_PID");
+        }
+        assert_eq!(
+            super::current_parent_pid(),
+            None,
+            "unset BOSS_APP_PID must yield None — no getppid() fallback",
+        );
+
+        unsafe {
+            std::env::set_var("BOSS_APP_PID", "4242");
+        }
+        assert_eq!(super::current_parent_pid(), Some(4242));
+
+        unsafe {
+            std::env::set_var("BOSS_APP_PID", "1");
+        }
+        assert_eq!(
+            super::current_parent_pid(),
+            None,
+            "pids <= 1 are launchd / unset sentinels and must not be trusted",
+        );
+
+        unsafe {
+            std::env::set_var("BOSS_APP_PID", "not-a-number");
+        }
+        assert_eq!(super::current_parent_pid(), None);
+
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("BOSS_APP_PID", value),
+                None => std::env::remove_var("BOSS_APP_PID"),
+            }
+        }
     }
 }
