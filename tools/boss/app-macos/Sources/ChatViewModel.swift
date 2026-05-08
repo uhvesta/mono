@@ -1104,6 +1104,137 @@ final class ChatViewModel: ObservableObject {
         return names.joined(separator: ", ")
     }
 
+    /// All `blocks` prereqs for `task` joined against the work tree,
+    /// rendered in card-detail and tooltip order. Includes already-
+    /// satisfied edges so the popover can show the full picture (the
+    /// chain badge tooltip and the auto-block predicate filter further
+    /// for "incomplete" only).
+    func dependencyPrereqs(for taskID: String) -> [WorkDependencyRow] {
+        guard let productID = task(withID: taskID)?.productID
+            ?? project(withID: taskID)?.productID
+        else {
+            return []
+        }
+        let edges = dependenciesByProductID[productID] ?? []
+        return edges
+            .filter { $0.dependentID == taskID && $0.relation == "blocks" }
+            .map { workDependencyRow(forID: $0.prerequisiteID) }
+    }
+
+    /// All `blocks` dependents of `taskID`. Used by the card detail
+    /// Dependencies subsection to show "what does this gate?".
+    func dependencyDependents(for taskID: String) -> [WorkDependencyRow] {
+        guard let productID = task(withID: taskID)?.productID
+            ?? project(withID: taskID)?.productID
+        else {
+            return []
+        }
+        let edges = dependenciesByProductID[productID] ?? []
+        return edges
+            .filter { $0.prerequisiteID == taskID && $0.relation == "blocks" }
+            .map { workDependencyRow(forID: $0.dependentID) }
+    }
+
+    /// Subset of `dependencyPrereqs` that are still gating the row —
+    /// i.e. not yet in a satisfied status. Drives the chain badge's
+    /// hover tooltip ("gated by …") and the auto-block predicate.
+    func gatingPrereqs(for taskID: String) -> [WorkDependencyRow] {
+        dependencyPrereqs(for: taskID).filter { !isWorkItemSatisfied($0.id) }
+    }
+
+    /// True iff the engine parked the row in `blocked` (rather than the
+    /// user choosing it). The chain badge appears only for these rows
+    /// per design Q7 — manual blocks already get the lane and would
+    /// double up with the icon.
+    func isAutoBlocked(_ task: WorkTask) -> Bool {
+        task.status == "blocked"
+            && task.lastStatusActor == "engine"
+            && !gatingPrereqs(for: task.id).isEmpty
+    }
+
+    /// True iff the row currently has at least one unsatisfied gating
+    /// prereq. Drag refusal keys on this rather than `lastStatusActor`
+    /// because the engine refuses *any* manual move out of `blocked`
+    /// while gated, regardless of who set the status last (Q4).
+    func hasGatingPrereqs(_ task: WorkTask) -> Bool {
+        !gatingPrereqs(for: task.id).isEmpty
+    }
+
+    private func workDependencyRow(forID id: String) -> WorkDependencyRow {
+        if id.hasPrefix("proj_") {
+            if let project = project(withID: id) {
+                return WorkDependencyRow(
+                    id: project.id,
+                    title: project.name,
+                    status: project.status,
+                    kind: .project
+                )
+            }
+        } else if let task = task(withID: id) {
+            return WorkDependencyRow(
+                id: task.id,
+                title: task.name,
+                status: task.status,
+                kind: task.isChore ? .chore : .task
+            )
+        }
+        return WorkDependencyRow(id: id, title: id, status: "unknown", kind: .unknown)
+    }
+
+    /// Inline drag-refusal banner shown next to the source card when a
+    /// drag from Blocked → Doing is rejected because the row still has
+    /// unsatisfied gating prereqs (design item 11). Single-slot — the
+    /// previous notice is replaced when a new refusal fires.
+    @Published private(set) var dragRefusalNotice: DragRefusalNotice?
+
+    struct DragRefusalNotice: Equatable {
+        let taskID: String
+        let message: String
+    }
+
+    /// Variant of `moveTask` that returns whether the drop was
+    /// accepted. Used by the kanban's `dropDestination` so the source
+    /// lane can render an inline warning when the engine would refuse
+    /// the underlying status change.
+    func attemptMoveTask(_ taskID: String, to column: WorkBoardColumnKey) -> Bool {
+        guard let task = task(withID: taskID) else { return false }
+        let targetStatus = column.targetStatus
+        guard task.status != targetStatus else { return false }
+
+        if task.status == "blocked",
+           targetStatus != "blocked",
+           hasGatingPrereqs(task)
+        {
+            let count = gatingPrereqs(for: task.id).count
+            let plural = count == 1 ? "prerequisite" : "prerequisites"
+            dragRefusalNotice = DragRefusalNotice(
+                taskID: task.id,
+                message: "\(task.name) is gated by \(count) incomplete \(plural) — clear them or remove the edge first."
+            )
+            scheduleDragRefusalDismiss(for: task.id)
+            return false
+        }
+
+        moveTask(taskID, to: column)
+        return true
+    }
+
+    func clearDragRefusal() {
+        dragRefusalNotice = nil
+    }
+
+    private func scheduleDragRefusalDismiss(for taskID: String) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            await MainActor.run { [weak self] in
+                guard let self,
+                      self.dragRefusalNotice?.taskID == taskID
+                else { return }
+                self.dragRefusalNotice = nil
+            }
+        }
+    }
+
     private func workItemName(for id: String) -> String? {
         if id.hasPrefix("proj_") {
             return project(withID: id)?.name

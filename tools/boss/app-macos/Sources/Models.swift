@@ -29,6 +29,12 @@ struct WorkProject: Identifiable, Hashable {
     var priority: String
     var createdAt: String
     var updatedAt: String
+    /// `'human'` (default) when the most recent status change came
+    /// from a CLI / app caller; `'engine'` when the engine flipped
+    /// the status itself (e.g. dependency auto-block / unblock). The
+    /// kanban uses this to distinguish auto-blocks (chain badge,
+    /// drag refusal) from user-chosen blocks.
+    var lastStatusActor: String = "human"
 }
 
 struct WorkTask: Identifiable, Hashable {
@@ -45,6 +51,12 @@ struct WorkTask: Identifiable, Hashable {
     var deletedAt: String?
     var createdAt: String
     var updatedAt: String
+    /// `'human'` (default) when the most recent status change came
+    /// from a CLI / app caller; `'engine'` when the engine flipped
+    /// the status itself. The kanban renders the auto-block chain
+    /// badge only when this is `'engine'` so manual blocks stay
+    /// visually quiet (they already get the lane).
+    var lastStatusActor: String = "human"
 
     var isChore: Bool {
         kind == "chore"
@@ -232,6 +244,24 @@ struct WorkItemDependency: Hashable {
     let dependentID: String
     let prerequisiteID: String
     let relation: String
+}
+
+/// Resolved dependency row used by the card detail Dependencies
+/// subsection. Joins the raw edge against the product's tasks /
+/// chores / projects so the popover can render the prereq's title
+/// and current status without re-walking the work tree.
+struct WorkDependencyRow: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let status: String
+    let kind: WorkDependencyKind
+
+    enum WorkDependencyKind: String, Hashable {
+        case task
+        case chore
+        case project
+        case unknown
+    }
 }
 
 /// Live runtime state for one allocated worker slot, mirroring the
