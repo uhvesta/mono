@@ -17,6 +17,7 @@ rust_library(
         "src/merge_poller.rs",
         "src/pane_summary.rs",
         "src/protocol.rs",
+        "src/run_reconcile.rs",
         "src/runner.rs",
         "src/spawn_flow.rs",
         "src/transcript_tail.rs",

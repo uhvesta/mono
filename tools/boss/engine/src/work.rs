@@ -626,6 +626,30 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Return every `work_executions` row the engine considers "in
+    /// flight": status is non-terminal AND a cube workspace lease was
+    /// recorded against it (`cube_lease_id IS NOT NULL`). The startup
+    /// reconciler probes these against cube state to decide whether
+    /// the underlying worker is still alive — without that probe, the
+    /// existing `reconcile_active_dispatch` redispatches every
+    /// non-terminal row blindly because the live-worker registry is
+    /// empty at boot, which is the bug that produced the duplicate
+    /// dispatch on 2026-05-07.
+    pub fn list_in_flight_executions(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at
+             FROM work_executions
+             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled')
+               AND cube_lease_id IS NOT NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
     pub fn reconcile_product_executions(
         &self,
         product_id: &str,
@@ -4933,6 +4957,254 @@ mod tests {
         let latest = executions.last().unwrap();
         assert_ne!(latest.id, stale.id);
         assert_eq!(latest.status, "ready");
+    }
+
+    /// `list_in_flight_executions` is the input to the engine-startup
+    /// reconciler: it returns rows that the engine considers actively
+    /// occupying a worker (non-terminal status AND a recorded cube
+    /// lease). This test pins the filter so the probe doesn't get
+    /// dragged into rows it can't classify (terminal rows, ready rows
+    /// without a lease, etc.).
+    #[test]
+    fn list_in_flight_executions_filters_by_status_and_lease() {
+        let path = temp_db_path("list-in-flight");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        // (a) Running execution with a cube lease — the canonical
+        //     in-flight row. Created via `start_execution_run` so the
+        //     lease columns and status flip together exactly the way
+        //     the dispatcher does it in production.
+        let chore_a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Active worker".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let exec_a = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore_a.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.start_execution_run(
+            &exec_a.id,
+            "worker-1",
+            "mono",
+            "lease-A",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+        // (b) Non-terminal but never claimed — no lease was ever
+        //     recorded. Must NOT appear: the probe has nothing to
+        //     match against cube state, and the existing ghost-active
+        //     sweep handles never-dispatched ready rows.
+        let chore_b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stuck in queue".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore_b.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("ready".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // (c) Terminal status — must NOT appear regardless of lease.
+        let chore_c = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already done".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore_c.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("completed".to_owned()),
+            cube_lease_id: Some("lease-C".to_owned()),
+            cube_workspace_id: Some("mono-agent-002".to_owned()),
+            workspace_path: Some("/tmp/mono-agent-002".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let in_flight = db.list_in_flight_executions().unwrap();
+        let ids: Vec<&str> = in_flight.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec![exec_a.id.as_str()]);
+        let row = &in_flight[0];
+        assert_eq!(row.cube_lease_id.as_deref(), Some("lease-A"));
+        assert_eq!(row.cube_workspace_id.as_deref(), Some("mono-agent-001"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// End-to-end coverage for the engine-startup reconcile path with
+    /// a mix of live, dead, and unknown persisted runs — the explicit
+    /// acceptance test from the work-item brief. We exercise this at
+    /// the `reconcile_active_dispatch` level (not the cube probe
+    /// level, which has its own tests in `run_reconcile`) so we pin
+    /// the contract: live + unknown rows are left intact, only dead
+    /// rows are abandoned and redispatched.
+    #[test]
+    fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
+        use std::collections::HashSet;
+        let path = temp_db_path("reconcile-mixed");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+
+        // Three chores, each with a `running` execution and a recorded
+        // cube lease — exactly the shape `start_execution_run`
+        // produces.  The engine restarts; the probe will classify
+        // each row and feed `reconcile_active_dispatch`.
+        let live = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Worker still up".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let exec_live = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: live.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.start_execution_run(
+            &exec_live.id,
+            "worker-1",
+            "mono",
+            "lease-LIVE",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+        let dead = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Worker died with engine".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let exec_dead = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: dead.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.start_execution_run(
+            &exec_dead.id,
+            "worker-2",
+            "mono",
+            "lease-DEAD",
+            "mono-agent-002",
+            "/tmp/mono-agent-002",
+        )
+        .unwrap();
+
+        let unknown = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cube didn't know".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let exec_unknown = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: unknown.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.start_execution_run(
+            &exec_unknown.id,
+            "worker-3",
+            "mono",
+            "lease-UNK",
+            "mono-agent-003",
+            "/tmp/mono-agent-003",
+        )
+        .unwrap();
+
+        // Simulate the cube probe's output: live + unknown stay in
+        // the skip-dispatch set; dead falls out and gets redispatched.
+        let skip_dispatch: HashSet<String> =
+            [exec_live.id.clone(), exec_unknown.id.clone()].into_iter().collect();
+
+        let redispatched = db
+            .reconcile_active_dispatch(|execution_id| skip_dispatch.contains(execution_id))
+            .unwrap();
+        assert_eq!(
+            redispatched,
+            vec![dead.id.clone()],
+            "only the dead run's work item should be redispatched",
+        );
+
+        // Live row: unchanged. Still `running` with the original lease.
+        let live_after = db.list_executions(Some(&live.id)).unwrap();
+        assert_eq!(live_after.len(), 1, "live execution row must be preserved");
+        assert_eq!(live_after[0].status, "running");
+        assert_eq!(live_after[0].cube_lease_id.as_deref(), Some("lease-LIVE"));
+
+        // Unknown row: also unchanged. The probe didn't know either
+        // way, so we MUST NOT redispatch — that's the conservatism
+        // the work-item brief insists on ("ambiguous → leave alone").
+        let unknown_after = db.list_executions(Some(&unknown.id)).unwrap();
+        assert_eq!(unknown_after.len(), 1, "unknown execution row must be preserved");
+        assert_eq!(unknown_after[0].status, "running");
+        assert_eq!(unknown_after[0].cube_lease_id.as_deref(), Some("lease-UNK"));
+
+        // Dead row: original abandoned, fresh `ready` row inserted
+        // alongside it. The dispatcher will pick up the new row on
+        // its next tick.
+        let dead_after = db.list_executions(Some(&dead.id)).unwrap();
+        assert_eq!(dead_after.len(), 2, "dead row gets a redispatch alongside the abandonment");
+        let original = dead_after.iter().find(|e| e.id == exec_dead.id).unwrap();
+        assert_eq!(original.status, "abandoned");
+        assert!(original.finished_at.is_some());
+        let fresh = dead_after.iter().find(|e| e.id != exec_dead.id).unwrap();
+        assert_eq!(fresh.status, "ready");
+
+        let _ = std::fs::remove_file(path);
     }
 
     /// Direct API test for the per-call live-aware path the kanban

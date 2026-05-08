@@ -9,6 +9,7 @@ pub mod live_worker_state;
 pub mod merge_poller;
 pub mod pane_summary;
 pub mod protocol;
+pub mod run_reconcile;
 pub mod runner;
 pub mod spawn_flow;
 pub mod transcript_tail;

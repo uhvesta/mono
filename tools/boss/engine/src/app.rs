@@ -1500,15 +1500,63 @@ pub async fn serve(
     // is supposed to mirror "running or queued," and on startup we
     // re-issue RequestExecution for items that no longer satisfy
     // either half of that contract.
-    // On startup the live-worker registry is empty (no worker has
-    // spawned yet), so passing `is_run_live` here treats every
-    // existing non-terminal execution as stale — exactly what we want
-    // after a crash, where every recorded `waiting_human` row is by
-    // definition orphaned.
-    let live_states_for_reconcile = server_state.live_worker_states.clone();
+    //
+    // On startup the in-memory live-worker registry is empty, so we
+    // can't use it as the "is the worker still attached" oracle —
+    // taking it at face value would treat every persisted in-flight
+    // execution as orphaned and spawn a *second* worker on top of the
+    // one already running. That's the duplicate-dispatch bug observed
+    // on 2026-05-07 (slot 1+7 / slot 4+8 each on the same chore).
+    //
+    // Instead, probe `cube workspace list` once and mark every
+    // persisted in-flight execution Live / Dead / Unknown based on
+    // whether its lease is still bound to the same workspace. The
+    // events socket is intentionally NOT consulted (it can be the
+    // first thing to break on a crash). See `crate::run_reconcile`
+    // for the verdict rules.
+    let in_flight = match server_state.work_db.list_in_flight_executions() {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "failed to list in-flight executions for startup reconcile; continuing without per-run probe (existing reconcile path may double-dispatch)"
+            );
+            Vec::new()
+        }
+    };
+    let probe_report = if in_flight.is_empty() {
+        tracing::debug!("no persisted in-flight executions to probe at startup");
+        crate::run_reconcile::RunReconcileReport::default()
+    } else {
+        let now_epoch_s = crate::run_reconcile::current_epoch_s();
+        let report = crate::run_reconcile::probe_in_flight_runs(
+            server_state.cube_client.as_ref(),
+            &in_flight,
+            now_epoch_s,
+        )
+        .await;
+        tracing::info!(
+            in_flight_count = in_flight.len(),
+            live = report.live_count,
+            dead = report.dead_count,
+            unknown = report.unknown_count,
+            "engine startup: probed persisted in-flight runs against cube state",
+        );
+        if report.unknown_count > 0 {
+            tracing::warn!(
+                unknown = report.unknown_count,
+                "startup reconcile produced Unknown verdicts; those work items will NOT be auto-redispatched — operator should investigate"
+            );
+        }
+        report
+    };
+    let skip_dispatch_ids: HashSet<String> = probe_report
+        .skip_dispatch_ids()
+        .map(|s| s.to_owned())
+        .collect();
     match server_state
         .work_db
-        .reconcile_active_dispatch(|run_id| live_states_for_reconcile.is_run_live(run_id))
+        .reconcile_active_dispatch(|execution_id| skip_dispatch_ids.contains(execution_id))
     {
         Ok(redispatched) if !redispatched.is_empty() => {
             tracing::info!(
