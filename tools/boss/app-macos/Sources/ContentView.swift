@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import Textual
 
 private let workBoardColumnWidth: CGFloat = 280
 private let workBoardColumnSpacing: CGFloat = 12
