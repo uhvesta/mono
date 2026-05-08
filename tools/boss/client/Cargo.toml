@@ -11,3 +11,6 @@ serde_json = { workspace = true }
 shlex = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
