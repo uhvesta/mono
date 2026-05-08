@@ -36,6 +36,9 @@ final class ChatViewModel: ObservableObject {
     @Published var showBlockedOnly: Bool = false {
         didSet { invalidateWorkCache() }
     }
+    @Published var showArchivedProjects: Bool = false {
+        didSet { invalidateWorkCache() }
+    }
     @Published var selectedWorkCardID: String?
     @Published var workBoardGrouping: WorkBoardGrouping = .none {
         didSet { invalidateWorkCache() }
@@ -102,18 +105,33 @@ final class ChatViewModel: ObservableObject {
     }
 
     var projectFilterDescription: String {
-        switch selectedProjectFilterIDs.count {
+        let visibleSelected = visibleSelectedProjectFilterIDs
+        switch visibleSelected.count {
         case 0:
             return "All projects"
         case 1:
-            return selectedProject?.name ?? "1 project"
+            if let id = visibleSelected.first, let project = self.project(withID: id) {
+                return project.name
+            }
+            return "1 project"
         case let count:
             return "\(count) projects"
         }
     }
 
     var hasProjectFilters: Bool {
-        !selectedProjectFilterIDs.isEmpty
+        !visibleSelectedProjectFilterIDs.isEmpty
+    }
+
+    /// Subset of `selectedProjectFilterIDs` whose projects are currently
+    /// visible in the sidebar. When archived projects are hidden, their
+    /// IDs may still be in the filter set (so toggling Show Archived
+    /// back on restores the prior selection), but counts and badges
+    /// must only reflect what the user can see.
+    private var visibleSelectedProjectFilterIDs: Set<String> {
+        guard !selectedProjectFilterIDs.isEmpty else { return [] }
+        let visibleIDs = Set(projectsForSelectedProduct.map(\.id))
+        return selectedProjectFilterIDs.intersection(visibleIDs)
     }
 
     var selectedTask: WorkTask? {
@@ -122,6 +140,16 @@ final class ChatViewModel: ObservableObject {
     }
 
     var projectsForSelectedProduct: [WorkProject] {
+        let all = allProjectsForSelectedProduct
+        guard !showArchivedProjects else { return all }
+        return all.filter { $0.status != "archived" }
+    }
+
+    /// Unfiltered project list for the selected product, used by code
+    /// paths that need full visibility regardless of the sidebar's
+    /// Show Archived toggle (e.g. boss-agent context where the LLM
+    /// must know archived projects exist so it doesn't recreate them).
+    var allProjectsForSelectedProduct: [WorkProject] {
         guard let productID = currentSelectedProductID else { return [] }
         return (projectsByProductID[productID] ?? []).sorted(by: projectSort)
     }
@@ -139,7 +167,7 @@ final class ChatViewModel: ObservableObject {
         guard let productID = currentSelectedProductID else { return [] }
 
         let query = workSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let projectFilter = selectedProjectFilterIDs
+        let projectFilter = visibleSelectedProjectFilterIDs
 
         var items: [WorkTask] = []
         for project in projectsForSelectedProduct {
@@ -187,6 +215,7 @@ final class ChatViewModel: ObservableObject {
     private let selectedProjectFilterIDsDefaultsKey = "boss.work.projectFilterIDs"
     private let includeChoresDefaultsKey = "boss.work.includeChores"
     private let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
+    private let showArchivedProjectsDefaultsKey = "boss.work.showArchivedProjects"
     private let workBoardGroupingDefaultsKey = "boss.work.grouping"
     private let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
     private let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
@@ -212,6 +241,7 @@ final class ChatViewModel: ObservableObject {
             includeChores = defaults.bool(forKey: includeChoresDefaultsKey)
         }
         showBlockedOnly = defaults.bool(forKey: showBlockedOnlyDefaultsKey)
+        showArchivedProjects = defaults.bool(forKey: showArchivedProjectsDefaultsKey)
         if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),
            let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
             workBoardGrouping = grouping
@@ -329,6 +359,12 @@ final class ChatViewModel: ObservableObject {
         guard showBlockedOnly != value else { return }
         showBlockedOnly = value
         defaults.set(value, forKey: showBlockedOnlyDefaultsKey)
+    }
+
+    func setShowArchivedProjects(_ value: Bool) {
+        guard showArchivedProjects != value else { return }
+        showArchivedProjects = value
+        defaults.set(value, forKey: showArchivedProjectsDefaultsKey)
     }
 
     private func persistProjectFilterIDs() {
@@ -1054,7 +1090,7 @@ final class ChatViewModel: ObservableObject {
             lines.append("current_project_filter: all_projects")
         }
 
-        let projects = projectsForSelectedProduct
+        let projects = allProjectsForSelectedProduct
         if projects.isEmpty {
             lines.append("existing_projects: none")
         } else {

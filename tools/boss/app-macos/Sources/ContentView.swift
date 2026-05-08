@@ -248,14 +248,16 @@ struct ContentView: View {
 
                     ForEach(model.projectsForSelectedProduct) { project in
                         let isOn = model.selectedProjectFilterIDs.contains(project.id)
+                        let isArchived = project.status == "archived"
                         WorkSidebarFilterRow(
                             title: project.name,
                             subtitle: nil,
-                            systemImage: "folder",
+                            systemImage: isArchived ? "archivebox" : "folder",
                             isSelected: isOn,
                             trailing: project.status.capitalized,
                             showsCheckbox: true,
-                            isCheckboxOn: isOn
+                            isCheckboxOn: isOn,
+                            dimmed: isArchived
                         )
                         .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
                         .listRowBackground(Color.clear)
@@ -279,6 +281,13 @@ struct ContentView: View {
                     Toggle("Show blocked only", isOn: Binding(
                         get: { model.showBlockedOnly },
                         set: { model.setShowBlockedOnly($0) }
+                    ))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
+                    .listRowBackground(Color.clear)
+
+                    Toggle("Show archived projects", isOn: Binding(
+                        get: { model.showArchivedProjects },
+                        set: { model.setShowArchivedProjects($0) }
                     ))
                     .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
                     .listRowBackground(Color.clear)
@@ -745,6 +754,10 @@ private struct WorkSidebarFilterRow: View {
     let trailing: String?
     var showsCheckbox: Bool = false
     var isCheckboxOn: Bool = false
+    /// Render the row in a muted style — used for archived projects so
+    /// they're visibly distinct from active ones when the user opts in
+    /// to seeing them.
+    var dimmed: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -754,6 +767,7 @@ private struct WorkSidebarFilterRow: View {
                     .font(.system(size: 14, weight: .medium))
                     .frame(width: 15, alignment: .center)
                     .padding(.top, 2)
+                    .opacity(dimmed && !isCheckboxOn ? 0.6 : 1.0)
             } else {
                 Image(systemName: systemImage)
                     .foregroundStyle(isSelected ? .primary : .secondary)
@@ -763,9 +777,16 @@ private struct WorkSidebarFilterRow: View {
             }
             VStack(alignment: .leading, spacing: subtitle == nil ? 0 : 2) {
                 HStack(alignment: .top, spacing: 8) {
+                    if dimmed {
+                        Image(systemName: systemImage)
+                            .foregroundStyle(.secondary)
+                            .font(.system(size: 12, weight: .medium))
+                            .padding(.top, 3)
+                            .help("Archived")
+                    }
                     Text(title)
                         .font(.body.weight(isSelected ? .semibold : .regular))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(dimmed ? .secondary : .primary)
                         .lineLimit(2)
                         .truncationMode(.tail)
                         .fixedSize(horizontal: false, vertical: true)
@@ -778,6 +799,7 @@ private struct WorkSidebarFilterRow: View {
                         WorkStatusBadge(text: trailing, emphasized: isSelected)
                             .fixedSize(horizontal: true, vertical: false)
                             .layoutPriority(2)
+                            .opacity(dimmed ? 0.65 : 1.0)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
