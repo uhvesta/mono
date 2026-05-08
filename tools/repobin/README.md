@@ -89,12 +89,18 @@ skip writing the file.
 
 In default mode the configured repo is shallow-cloned into the cache and the
 build runs from that clone (using the target declared in
-`<checkout>/REPOBIN.toml`). A short notice goes to stderr so it is obvious
-that the tool was built from `HEAD`:
+`<checkout>/REPOBIN.toml`). The routine head/cached/default-mode dispatch is
+silent; genuine errors (failed clone, failed cache write, etc.) still surface
+on stderr. Set `REPOBIN_VERBOSE=1` to print a one-line notice on every
+default-mode dispatch:
 
 ```text
 repobin: running `boss` from git@github.com:spinyfin/mono.git @ 1a2b3c4 (cloned; default mode — not in a configured workspace)
 ```
+
+When the underlying tool is invoked with `--json`, the notice is suppressed on
+both stdout and stderr regardless of `REPOBIN_VERBOSE`, so
+`boss --json … 2>&1 | jq` parses cleanly.
 
 The cache lives at `$XDG_CACHE_HOME/repobin/repos/<slug>-<hash>/checkout` (or
 `~/.cache/repobin/repos/...`). Subsequent invocations reuse that checkout: a
