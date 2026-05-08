@@ -384,7 +384,7 @@ fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
     let cache = RepoCache::for_url(&cache_root, &tool.repo);
     let lock = cache.lock()?;
     let outcome = lock.ensure_up_to_date()?;
-    print_default_notice(tool_name, &tool.repo, &outcome);
+    print_default_notice(tool_name, &tool.repo, &outcome, forwarded_args);
 
     let cached_repo_config = load_repo_config(&lock.cache().checkout)?;
     let plan = prepare_dispatch_from_repo_config(
@@ -397,13 +397,45 @@ fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
     Ok(Some(plan))
 }
 
-fn print_default_notice(tool_name: &str, repo: &str, outcome: &EnsureOutcome) {
+fn print_default_notice(
+    tool_name: &str,
+    repo: &str,
+    outcome: &EnsureOutcome,
+    forwarded_args: &[OsString],
+) {
+    if !should_emit_default_notice(outcome, forwarded_args, repobin_verbose()) {
+        return;
+    }
     let head = outcome.head();
     let short = if head.len() >= 7 { &head[..7] } else { head };
     eprintln!(
         "repobin: running `{tool_name}` from {repo} @ {short} ({}; default mode — not in a configured workspace)",
         outcome.note()
     );
+}
+
+fn repobin_verbose() -> bool {
+    env::var_os("REPOBIN_VERBOSE").is_some()
+}
+
+fn args_request_json(args: &[OsString]) -> bool {
+    args.iter().any(|arg| arg == "--json")
+}
+
+fn should_emit_default_notice(
+    _outcome: &EnsureOutcome,
+    forwarded_args: &[OsString],
+    verbose: bool,
+) -> bool {
+    // --json is a strong signal the caller is parsing output; suppress on both
+    // streams regardless of verbosity so `boss --json … 2>&1 | jq` is safe.
+    if args_request_json(forwarded_args) {
+        return false;
+    }
+    // Default mode + head + cached/updated/cloned is the routine case. Stay
+    // silent unless the user asked for verbose output. Genuine errors (failed
+    // clone, failed cache write) still surface via RepobinError on stderr.
+    verbose
 }
 
 fn exec_dispatch(plan: DispatchPlan) -> Result<(), RepobinError> {
@@ -437,9 +469,13 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::bazel::BazelAdapter;
+    use crate::cache::EnsureOutcome;
     use crate::defaults::{DEFAULTS_FILE_NAME, DefaultsConfig, DefaultsTool, write_defaults};
 
-    use super::{RepobinError, invocation_name, prepare_default_plan};
+    use super::{
+        RepobinError, args_request_json, invocation_name, prepare_default_plan,
+        should_emit_default_notice,
+    };
 
     struct UnreachableBazel;
 
@@ -483,6 +519,64 @@ mod tests {
         )
         .expect("returns Ok");
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn args_request_json_detects_flag() {
+        assert!(args_request_json(&[OsString::from("--json")]));
+        assert!(args_request_json(&[
+            OsString::from("product"),
+            OsString::from("list"),
+            OsString::from("--json"),
+        ]));
+        assert!(!args_request_json(&[]));
+        assert!(!args_request_json(&[OsString::from("--jsonish")]));
+        assert!(!args_request_json(&[OsString::from("product"), OsString::from("list")]));
+    }
+
+    #[test]
+    fn default_notice_is_silent_in_routine_case() {
+        let outcomes = [
+            EnsureOutcome::Cloned {
+                head: "deadbeef".into(),
+            },
+            EnsureOutcome::Updated {
+                head: "deadbeef".into(),
+            },
+            EnsureOutcome::Cached {
+                head: "deadbeef".into(),
+                refreshed: true,
+            },
+            EnsureOutcome::Cached {
+                head: "deadbeef".into(),
+                refreshed: false,
+            },
+        ];
+        for outcome in &outcomes {
+            assert!(
+                !should_emit_default_notice(outcome, &[], false),
+                "routine head/default-mode dispatch must stay silent: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_notice_emits_when_verbose() {
+        let outcome = EnsureOutcome::Cached {
+            head: "deadbeef".into(),
+            refreshed: false,
+        };
+        assert!(should_emit_default_notice(&outcome, &[], true));
+    }
+
+    #[test]
+    fn json_args_silence_notice_even_when_verbose() {
+        let outcome = EnsureOutcome::Updated {
+            head: "deadbeef".into(),
+        };
+        let args = [OsString::from("product"), OsString::from("--json")];
+        assert!(!should_emit_default_notice(&outcome, &args, true));
+        assert!(!should_emit_default_notice(&outcome, &args, false));
     }
 
     #[test]
