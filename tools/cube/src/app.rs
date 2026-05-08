@@ -661,6 +661,67 @@ fn run_workspace(
                 }),
             )
         }
+        WorkspaceCommand::Remove {
+            workspace,
+            repo,
+            force,
+        } => {
+            let matches = store.list_workspaces_filtered(&WorkspaceListFilter {
+                repo: repo.as_deref(),
+                workspace_id: Some(&workspace),
+                ..Default::default()
+            })?;
+            let record = match matches.as_slice() {
+                [] => return Err(CubeError::WorkspaceNotFound(workspace)),
+                [single] => single.clone(),
+                many => {
+                    let repos = many
+                        .iter()
+                        .map(|r| r.repo.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(CubeError::InvalidArgument(format!(
+                        "workspace id `{workspace}` matches multiple repos ({repos}); disambiguate with --repo"
+                    )));
+                }
+            };
+
+            let _lock = RepoLock::acquire(&repo_lock_path(&record.repo, database_path)?)?;
+
+            if record.state == WorkspaceState::Leased && !force {
+                return Err(CubeError::InvalidArgument(format!(
+                    "workspace `{}/{}` is currently leased; force-release it first or pass --force",
+                    record.repo, record.workspace_id
+                )));
+            }
+
+            store.forget_workspace(&record.repo, &record.workspace_id)?;
+
+            audit!(
+                database_path,
+                "workspace.removed",
+                repo = record.repo,
+                workspace_id = record.workspace_id,
+                prior_state = record.state.as_str(),
+                lease_id = record.lease_id,
+                holder = record.holder,
+                forced = force,
+            );
+
+            let message = format!(
+                "Removed {}/{} from the registry (workspace directory left intact at {}).",
+                record.repo,
+                record.workspace_id,
+                record.workspace_path.display(),
+            );
+            RunResult::new(
+                message,
+                json!({
+                    "workspace": record,
+                    "forced": force,
+                }),
+            )
+        }
     }
 }
 
@@ -2409,6 +2470,353 @@ mod tests {
             "force-released"
         );
         release_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_remove_deletes_synced_free_row() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Sync the workspace into the registry by listing.
+        // (sync runs as a side effect of operations like lease; here we
+        // seed the row directly.)
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("remove");
+
+        assert!(result.message.contains("Removed mono/mono-agent-007"));
+        assert_eq!(result.payload["forced"], false);
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-007");
+
+        // Row must be gone, but the on-disk directory must remain.
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(remaining.is_empty(), "expected row to be deleted");
+        assert!(workspace_path.is_dir(), "directory must be left intact");
+    }
+
+    #[test]
+    fn workspace_remove_refuses_leased_row_without_force() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-001"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect_err("remove should refuse a leased row");
+
+        match error {
+            CubeError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("currently leased"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+
+        // Row must still be present.
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn workspace_remove_force_removes_leased_row() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-001", "--force"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("force remove");
+
+        assert_eq!(result.payload["forced"], true);
+        assert_eq!(result.payload["workspace"]["state"], "leased");
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(remaining.is_empty(), "row should be deleted under --force");
+    }
+
+    #[test]
+    fn workspace_remove_succeeds_when_directory_is_gone() {
+        // Canonical scenario: the operator wiped the workspace directory
+        // by hand and `cube workspace list` still surfaces the row. Remove
+        // must succeed without touching the missing path.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        // Wipe the directory like the user did manually.
+        std::fs::remove_dir_all(&workspace_path).unwrap();
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("remove dangling row");
+
+        assert!(result.message.contains("mono-agent-007"));
+
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let remaining = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some("mono"),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn workspace_remove_errors_when_workspace_id_unknown() {
+        let (_tempdir, database_path) = with_database_path();
+
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-999"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect_err("remove should fail for unknown workspace");
+
+        assert!(matches!(error, CubeError::WorkspaceNotFound(_)));
+    }
+
+    #[test]
+    fn workspace_remove_emits_audit_entry() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@github.com:spinyfin/mono.git",
+                "--workspace-root",
+                &workspace_root.display().to_string(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-007".to_string(),
+                        workspace_path: workspace_path.clone(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("remove");
+
+        let audit_dir = tempdir.path().join("audit");
+        let audit_files: Vec<_> = std::fs::read_dir(&audit_dir)
+            .expect("audit dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(audit_files.len(), 1, "expected one weekly audit file");
+
+        let contents = std::fs::read_to_string(&audit_files[0]).expect("audit content");
+        let line = contents.lines().last().expect("at least one event");
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(event["event"], "workspace.removed");
+        assert_eq!(event["repo"], "mono");
+        assert_eq!(event["workspace_id"], "mono-agent-007");
+        assert_eq!(event["prior_state"], "free");
+        assert_eq!(event["forced"], false);
     }
 
     #[test]

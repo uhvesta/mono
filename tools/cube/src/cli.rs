@@ -160,6 +160,9 @@ pub enum WorkspaceCommand {
         workspace: String,
     },
     /// List workspaces in the registry.
+    ///
+    /// See also `cube workspace lease`, `release`, `force-release`,
+    /// `heartbeat`, `status`, `setup`, `remove`.
     List {
         /// Filter by repo id.
         #[arg(long)]
@@ -171,6 +174,27 @@ pub enum WorkspaceCommand {
         /// e.g. `--holder boss/*`.
         #[arg(long)]
         holder: Option<String>,
+    },
+    /// Remove a workspace row from the registry.
+    ///
+    /// Deletes the `workspaces` row (and cascades `workspace_setup`)
+    /// for the given workspace id. The on-disk workspace directory is
+    /// left untouched — it may already be gone, or the operator may
+    /// want to inspect it. Use this to clean up dangling registry rows
+    /// after a workspace directory has been wiped manually.
+    ///
+    /// Refuses leased rows unless `--force`. The safer surgical default
+    /// is to `cube workspace force-release` first, then `remove`.
+    Remove {
+        /// Workspace id to remove (e.g. `mono-agent-004`).
+        workspace: String,
+        /// Optional repo filter; required only when the workspace id
+        /// matches multiple repos.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Remove even if the row is currently leased.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -570,6 +594,60 @@ mod tests {
             }
             _ => panic!("expected workspace list command"),
         }
+    }
+
+    #[test]
+    fn workspace_remove_parses_basic_form() {
+        let cli = Cli::parse_from(["cube", "workspace", "remove", "mono-agent-004"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Remove {
+                        workspace,
+                        repo,
+                        force,
+                    },
+            } => {
+                assert_eq!(workspace, "mono-agent-004");
+                assert!(repo.is_none());
+                assert!(!force);
+            }
+            _ => panic!("expected workspace remove command"),
+        }
+    }
+
+    #[test]
+    fn workspace_remove_accepts_repo_and_force() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "remove",
+            "mono-agent-004",
+            "--repo",
+            "mono",
+            "--force",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Remove {
+                        workspace,
+                        repo,
+                        force,
+                    },
+            } => {
+                assert_eq!(workspace, "mono-agent-004");
+                assert_eq!(repo.as_deref(), Some("mono"));
+                assert!(force);
+            }
+            _ => panic!("expected workspace remove command"),
+        }
+    }
+
+    #[test]
+    fn workspace_remove_requires_workspace_id() {
+        let result = Cli::try_parse_from(["cube", "workspace", "remove"]);
+        assert!(result.is_err());
     }
 
     #[test]
