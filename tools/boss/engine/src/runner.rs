@@ -232,20 +232,18 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Going through a file (rather than embedding the prompt in
         // the typed command) avoids shell quoting hell on multi-line,
         // backtick-bearing markdown.
-        // For project_design executions the work item is the
-        // project's synthetic design task. The task itself carries
-        // little context (name = "Design"), so look up the parent
-        // project to enrich the prompt with the project's name,
-        // description, and goal — that's the information the worker
-        // actually needs to produce a useful design pass.
+        // For any project-scoped task (the synthetic `kind = 'design'`
+        // task and ordinary `project_task` rows alike), the richer
+        // brief — what the project is for, what its goal is — lives
+        // on the parent project rather than on the task row. Look it
+        // up at spawn time so the worker prompt is always anchored on
+        // the current project state, not whatever was copied at
+        // create time.
         let parent_project = match work_item {
-            WorkItem::Task(task) if task.kind == "design" => {
-                if let Some(project_id) = task.project_id.as_deref() {
-                    self.work_db.get_project(project_id).ok()
-                } else {
-                    None
-                }
-            }
+            WorkItem::Task(task) | WorkItem::Chore(task) => task
+                .project_id
+                .as_deref()
+                .and_then(|project_id| self.work_db.get_project(project_id).ok()),
             _ => None,
         };
         let prompt_text = compose_execution_prompt(
@@ -345,12 +343,12 @@ fn compose_execution_prompt(
     if let Some(cube_change_id) = cube_change_id {
         prompt.push_str(&format!("- local change: `{}`\n", cube_change_id));
     }
-    // For project_design executions the work item is now the
-    // synthetic `kind = 'design'` task, which is intentionally
-    // sparse (`name = "Design"`, no description). The interesting
-    // context — what is the project actually for? — lives on the
-    // parent project. Surface it inline so the worker has the
-    // project's name/goal/description to anchor the design pass.
+    // For any project-scoped task — the synthetic `kind = 'design'`
+    // task plus ordinary `project_task` rows — the interesting
+    // context (what the project is for, its goal) lives on the
+    // parent project rather than on the task row. Surface it inline
+    // so the worker has the project's name/goal/description to
+    // anchor against, regardless of the execution kind.
     if let Some(project) = parent_project {
         prompt.push_str(&format!("- parent project: `{}`\n", project.name));
         if let Some(details) = project_details(project) {
@@ -473,7 +471,9 @@ mod pane_spawn_tests {
         SpawnWorkerPaneResult,
     };
     use crate::live_worker_state::LiveWorkerStateRegistry;
-    use crate::work::{Task, WorkExecution, WorkItem};
+    use crate::work::{
+        CreateProductInput, CreateProjectInput, CreateTaskInput, Task, WorkExecution, WorkItem,
+    };
     use crate::worker_registry::WorkerRegistry;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
@@ -798,6 +798,104 @@ mod pane_spawn_tests {
             state.execution_id.as_deref(),
             Some("exec-test-1"),
             "execution_id should match the WorkExecution row id"
+        );
+    }
+
+    /// Any task whose `project_id` is set must surface the parent
+    /// project's name/description/goal in its spawn prompt — the
+    /// task row itself is intentionally a thin handle (the design
+    /// task starts with `description = ''`; ordinary `project_task`
+    /// rows often only carry an implementation brief that omits the
+    /// project's *why*). Without the spawn-time walk the worker
+    /// boots with no project context and has to ask, which defeats
+    /// the point of having a project record at all.
+    #[tokio::test]
+    async fn spawn_prompt_for_project_scoped_task_includes_parent_project_context() {
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        // Stand up a real product → project → task chain so the
+        // runner's `get_project` lookup hits a row with the
+        // description/goal we want to assert on. `--no-autostart` on
+        // the project keeps the auto-spawned design task parked so
+        // it doesn't compete with our explicit run_execution call.
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+            })
+            .unwrap();
+        let project = work_db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Engine dispatch instrumentation".to_owned(),
+                description: Some(
+                    "Instrument the auto-dispatcher so every spawn decision is traceable."
+                        .to_owned(),
+                ),
+                goal: Some(
+                    "Operators can answer 'why did this task spawn now' from logs alone."
+                        .to_owned(),
+                ),
+                autostart: false,
+            })
+            .unwrap();
+        let task = work_db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Tag dispatch logs with execution kind".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+
+        let runner = PaneSpawnRunner::new(cfg, work_db);
+        runner.set_server_state(weak);
+
+        let mut execution = sample_execution(workspace.path());
+        execution.kind = "task_implementation".into();
+        execution.work_item_id = task.id.clone();
+
+        runner
+            .run_execution(
+                "worker-1",
+                &execution,
+                &WorkItem::Task(task),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await
+            .unwrap();
+
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+        assert!(
+            prompt.contains("parent project: `Engine dispatch instrumentation`"),
+            "prompt missing parent project name line:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Instrument the auto-dispatcher"),
+            "prompt missing parent project description:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("'why did this task spawn now'"),
+            "prompt missing parent project goal:\n{prompt}",
         );
     }
 
