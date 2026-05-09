@@ -28,6 +28,7 @@ The API exposes enum-like globals for comparisons:
 - `FieldKinds.*`
 - `FieldLabels.*`
 - `ParserBackends.*`
+- `OptionValueKinds.*`
 
 Examples:
 
@@ -135,7 +136,32 @@ return [finding(
 - `kind: FieldKind`
 - `type_name: str | None`
 - `is_repeated: bool`
-- `values: list[str]`
+- `values: list[OptionValue]`
+- `decoded: bool`
+
+`OptionValue`:
+
+- `kind: OptionValueKind`
+- `bool_value: bool | None`
+- `int_value: int | None`
+- `float_value: float | None`
+- `enum_name: str | None`
+- `string_value: str | None`
+- `bytes_hex: str | None`
+- `message_hex: str | None`
+- `message_fields: list[OptionField]`
+- `raw_repr: str`
+- `decoded: bool`
+
+`OptionField`:
+
+- `name: str`
+- `full_name: str`
+- `number: int`
+- `kind: FieldKind`
+- `type_name: str | None`
+- `is_repeated: bool`
+- `values: list[OptionValue]`
 - `decoded: bool`
 
 `ExtensionRegistryInfo`:
@@ -148,6 +174,29 @@ return [finding(
 The options surface is intentionally conservative: it is meant to give policies a stable way to notice option changes and uninterpreted/custom-option presence without pretending we fully understand every extension registry.
 
 Once `extension_registries` are configured, custom options that survive into descriptor unknown fields are resolved against those registries and exposed through `DescriptorOptions.extensions`.
+
+Example:
+
+```python
+def check(ctx: ProtoContext) -> list[Finding]:
+    findings = []
+    for file_pair in ctx.files:
+        if file_pair.after == None:
+            continue
+        for message in file_pair.after.messages:
+            for field in message.fields:
+                for ext in field.options.extensions:
+                    if ext.full_name == "acme.sensitive":
+                        if ext.values and ext.values[0].kind == OptionValueKinds.bool:
+                            if ext.values[0].bool_value:
+                                findings.append(info(
+                                    message = "field is marked sensitive: {}".format(field.full_name),
+                                    path = file_pair.path,
+                                ))
+    return findings
+```
+
+Message-valued custom options are decoded recursively when their message types are present in the configured extension registries. That means policies can inspect nested option fields without parsing raw protobuf bytes themselves.
 
 ## Delta Model
 
@@ -210,6 +259,8 @@ Current built-in delta kinds include:
 - `service_options_changed`
 - `method_options_changed`
 - `extension_options_changed`
+- `registered_option_removed`
+- `registered_option_value_changed`
 
 ## Helper Functions
 
@@ -226,6 +277,13 @@ Helpers exported into policy scope:
 - `removed_messages(ctx)`
 - `removed_enums(ctx)`
 - `option_changed_deltas(ctx)`
+- `registered_option_deltas(ctx)`
+- `option_extensions(options, full_name=None)`
+- `has_option(options, full_name)`
+- `bool_option(options, full_name)`
+- `option_field_values(options, full_name, field_path)`
+- `bool_option_field(options, full_name, field_path)`
+- `option_descendants(value)`
 
 Example:
 
@@ -246,6 +304,8 @@ def check(ctx: ProtoContext) -> list[Finding]:
 
 - `parser_backend = "auto"` prefers `protoc` and falls back to the pure Rust parser.
 - `extension_registries` are configured in check config and point at proto files that declare custom options/extensions.
+- Registry declarations are validated strictly. Duplicate extension full names or duplicate extendee/field-number pairs across configured registries are treated as configuration errors.
 - The check snapshots the full repository proto tree before parsing so imports still resolve when only part of the graph changes.
 - Unknown/custom options are surfaced through descriptor-option fingerprints, `has_unknown_fields`, best-effort uninterpreted-option entries, and registry-resolved `options.extensions`.
-- Registry decoding is intentionally conservative. Scalar wire-compatible values are decoded to strings; message-valued extensions currently surface as hex payloads rather than fully parsed submessages.
+- Registry decoding is recursive for registered message-valued custom options, and packable repeated scalars are unpacked into individual typed `OptionValue` entries.
+- The raw wire payload is still preserved in `message_hex` for message-valued option values, even when `message_fields` is populated.

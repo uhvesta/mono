@@ -13,7 +13,8 @@ use protobuf::descriptor::{
     FileDescriptorSet, MethodDescriptorProto, ServiceDescriptorProto,
 };
 use protobuf::descriptor::field_descriptor_proto::{Label, Type};
-use protobuf::{Message, UnknownValueRef};
+use protobuf::rt::WireType;
+use protobuf::{CodedInputStream, Message, UnknownValue, UnknownValueRef};
 use protobuf_parse::Parser;
 use serde::{Deserialize, Serialize};
 use starlark::environment::{Globals, GlobalsBuilder, LibraryExtension, Module};
@@ -477,6 +478,9 @@ fn build_extension_registry_set(
 ) -> Result<ExtensionRegistrySet> {
     let mut infos = Vec::new();
     let mut by_extendee = BTreeMap::<String, BTreeMap<u32, RegisteredExtension>>::new();
+    let mut by_full_name = BTreeMap::<String, RegisteredExtension>::new();
+    let mut message_types = BTreeMap::<String, RegisteredMessageType>::new();
+    let mut enum_types = BTreeMap::<String, RegisteredEnumType>::new();
 
     for registry in registries {
         let inputs = collect_snapshot_proto_inputs(snapshot_root, &registry.include_globs)?;
@@ -489,6 +493,8 @@ fn build_extension_registry_set(
         })?;
         let entries =
             extract_registered_extensions(&parsed.descriptor_set, &target_paths, &registry.name);
+        let (registry_message_types, registry_enum_types) =
+            extract_registered_types(&parsed.descriptor_set, &target_paths);
         let mut extendees = entries
             .iter()
             .map(|entry| entry.extendee.clone())
@@ -506,14 +512,46 @@ fn build_extension_registry_set(
             extendees,
         });
         for entry in entries {
+            if let Some(existing) = by_extendee
+                .get(&entry.extendee)
+                .and_then(|entries| entries.get(&entry.field_number))
+            {
+                bail!(
+                    "protobuf extension registry collision: `{}` and `{}` both declare extendee `{}` field number `{}`",
+                    existing.source_path,
+                    entry.source_path,
+                    entry.extendee,
+                    entry.field_number
+                );
+            }
+            if let Some(existing) = by_full_name.get(&entry.full_name) {
+                bail!(
+                    "protobuf extension registry collision: `{}` and `{}` both declare extension `{}`",
+                    existing.source_path,
+                    entry.source_path,
+                    entry.full_name
+                );
+            }
+            by_full_name.insert(entry.full_name.clone(), entry.clone());
             by_extendee
                 .entry(entry.extendee.clone())
                 .or_default()
                 .insert(entry.field_number, entry);
         }
+        for (name, message_type) in registry_message_types {
+            message_types.entry(name).or_insert(message_type);
+        }
+        for (name, enum_type) in registry_enum_types {
+            enum_types.entry(name).or_insert(enum_type);
+        }
     }
 
-    Ok(ExtensionRegistrySet { infos, by_extendee })
+    Ok(ExtensionRegistrySet {
+        infos,
+        by_extendee,
+        message_types,
+        enum_types,
+    })
 }
 
 fn collect_snapshot_proto_inputs(snapshot_root: &Path, include_globs: &GlobSet) -> Result<Vec<PathBuf>> {
@@ -985,13 +1023,71 @@ struct OptionExtensionValue {
     type_name: OptionalAttr<String>,
     is_repeated: bool,
     #[starlark(clone)]
-    values: Vec<String>,
+    values: Vec<OptionValueValue>,
     decoded: bool,
 }
 starlark_simple_value!(OptionExtensionValue);
 
 #[starlark_value(type = "OptionExtension")]
 impl<'v> StarlarkValue<'v> for OptionExtensionValue {
+    starlark_attrs!();
+}
+
+#[derive(
+    Debug, Clone, StarlarkAttrs, ProvidesStaticType, NoSerialize, Allocative,
+)]
+struct OptionFieldValue {
+    name: String,
+    full_name: String,
+    number: i32,
+    kind: FrozenAttr<FieldKindEnumValue>,
+    type_name: OptionalAttr<String>,
+    is_repeated: bool,
+    #[starlark(clone)]
+    values: Vec<OptionValueValue>,
+    decoded: bool,
+}
+starlark_simple_value!(OptionFieldValue);
+
+#[starlark_value(type = "OptionField")]
+impl<'v> StarlarkValue<'v> for OptionFieldValue {
+    starlark_attrs!();
+}
+
+#[derive(
+    Debug, Clone, StarlarkAttrs, ProvidesStaticType, NoSerialize, Allocative,
+)]
+struct OptionValueKindEnumValue {
+    value: &'static str,
+}
+starlark_simple_value!(OptionValueKindEnumValue);
+
+#[starlark_value(type = "OptionValueKind")]
+impl<'v> StarlarkValue<'v> for OptionValueKindEnumValue {
+    starlark_attrs!();
+}
+
+#[derive(
+    Debug, Clone, StarlarkAttrs, ProvidesStaticType, NoSerialize, Allocative,
+)]
+struct OptionValueValue {
+    kind: FrozenAttr<OptionValueKindEnumValue>,
+    bool_value: OptionalAttr<bool>,
+    int_value: OptionalAttr<i64>,
+    float_value: OptionalAttr<f64>,
+    enum_name: OptionalAttr<String>,
+    string_value: OptionalAttr<String>,
+    bytes_hex: OptionalAttr<String>,
+    message_hex: OptionalAttr<String>,
+    #[starlark(clone)]
+    message_fields: Vec<OptionFieldValue>,
+    raw_repr: String,
+    decoded: bool,
+}
+starlark_simple_value!(OptionValueValue);
+
+#[starlark_value(type = "OptionValue")]
+impl<'v> StarlarkValue<'v> for OptionValueValue {
     starlark_attrs!();
 }
 
@@ -1047,6 +1143,9 @@ struct SchemaDeltaValue {
     range_start: OptionalAttr<i32>,
     range_end: OptionalAttr<i32>,
     name: OptionalAttr<String>,
+    registry_name: OptionalAttr<String>,
+    before_raw_value: OptionalAttr<String>,
+    after_raw_value: OptionalAttr<String>,
 }
 starlark_simple_value!(SchemaDeltaValue);
 
@@ -1107,6 +1206,9 @@ impl_debug_display!(
     ReservedRangeValue,
     DescriptorOptionsValue,
     OptionExtensionValue,
+    OptionFieldValue,
+    OptionValueKindEnumValue,
+    OptionValueValue,
     UninterpretedOptionValue,
     SchemaDeltaValue,
     FindingValue,
@@ -1235,7 +1337,34 @@ struct OptionExtensionSchema {
     kind: String,
     type_name: Option<String>,
     is_repeated: bool,
-    values: Vec<String>,
+    values: Vec<OptionValueSchema>,
+    decoded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OptionFieldSchema {
+    name: String,
+    full_name: String,
+    number: i32,
+    kind: String,
+    type_name: Option<String>,
+    is_repeated: bool,
+    values: Vec<OptionValueSchema>,
+    decoded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OptionValueSchema {
+    kind: String,
+    bool_value: Option<bool>,
+    int_value: Option<i64>,
+    float_value: Option<f64>,
+    enum_name: Option<String>,
+    string_value: Option<String>,
+    bytes_hex: Option<String>,
+    message_hex: Option<String>,
+    message_fields: Vec<OptionFieldSchema>,
+    raw_repr: String,
     decoded: bool,
 }
 
@@ -1251,17 +1380,70 @@ struct ExtensionRegistryInfo {
 struct ExtensionRegistrySet {
     infos: Vec<ExtensionRegistryInfo>,
     by_extendee: BTreeMap<String, BTreeMap<u32, RegisteredExtension>>,
+    message_types: BTreeMap<String, RegisteredMessageType>,
+    enum_types: BTreeMap<String, RegisteredEnumType>,
 }
 
 #[derive(Debug, Clone)]
 struct RegisteredExtension {
     registry_name: String,
+    source_path: String,
     full_name: String,
     extendee: String,
     field_number: u32,
     kind: String,
     type_name: Option<String>,
     is_repeated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredMessageType {
+    fields_by_number: BTreeMap<u32, RegisteredMessageField>,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredMessageField {
+    name: String,
+    full_name: String,
+    number: u32,
+    kind: String,
+    type_name: Option<String>,
+    is_repeated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredEnumType {
+    values_by_number: BTreeMap<i32, String>,
+}
+
+#[derive(Debug, Clone)]
+enum OptionWireValue {
+    Fixed32(u32),
+    Fixed64(u64),
+    Varint(u64),
+    LengthDelimited(Vec<u8>),
+}
+
+impl From<UnknownValueRef<'_>> for OptionWireValue {
+    fn from(value: UnknownValueRef<'_>) -> Self {
+        match value {
+            UnknownValueRef::Fixed32(raw) => Self::Fixed32(raw),
+            UnknownValueRef::Fixed64(raw) => Self::Fixed64(raw),
+            UnknownValueRef::Varint(raw) => Self::Varint(raw),
+            UnknownValueRef::LengthDelimited(bytes) => Self::LengthDelimited(bytes.to_vec()),
+        }
+    }
+}
+
+impl From<UnknownValue> for OptionWireValue {
+    fn from(value: UnknownValue) -> Self {
+        match value {
+            UnknownValue::Fixed32(raw) => Self::Fixed32(raw),
+            UnknownValue::Fixed64(raw) => Self::Fixed64(raw),
+            UnknownValue::Varint(raw) => Self::Varint(raw),
+            UnknownValue::LengthDelimited(bytes) => Self::LengthDelimited(bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1609,12 +1791,14 @@ fn extract_registered_extensions(
         }
         output.extend(extract_registered_extensions_from_fields(
             registry_name,
+            &path,
             file.package(),
             "",
             &file.extension,
         ));
         output.extend(extract_registered_extensions_from_messages(
             registry_name,
+            &path,
             file.package(),
             "",
             &file.message_type,
@@ -1629,8 +1813,113 @@ fn extract_registered_extensions(
     output
 }
 
+fn extract_registered_types(
+    descriptor_set: &FileDescriptorSet,
+    target_paths: &BTreeSet<String>,
+) -> (
+    BTreeMap<String, RegisteredMessageType>,
+    BTreeMap<String, RegisteredEnumType>,
+) {
+    let mut message_types = BTreeMap::new();
+    let mut enum_types = BTreeMap::new();
+    for file in &descriptor_set.file {
+        let path = file.name().to_owned();
+        if !target_paths.contains(&path) {
+            continue;
+        }
+        collect_registered_enums(
+            file.package(),
+            "",
+            &file.enum_type,
+            &mut enum_types,
+        );
+        collect_registered_messages(
+            file.package(),
+            "",
+            &file.message_type,
+            &mut message_types,
+            &mut enum_types,
+        );
+    }
+    (message_types, enum_types)
+}
+
+fn collect_registered_messages(
+    package: &str,
+    parent: &str,
+    messages: &[DescriptorProto],
+    message_types: &mut BTreeMap<String, RegisteredMessageType>,
+    enum_types: &mut BTreeMap<String, RegisteredEnumType>,
+) {
+    for message in messages {
+        let full_name = normalize_proto_type_name(&join_proto_name(package, parent, message.name()));
+        let fields_by_number = message
+            .field
+            .iter()
+            .filter_map(|field| {
+                Some((
+                    u32::try_from(field.number()).ok()?,
+                    RegisteredMessageField {
+                        name: field.name().to_owned(),
+                        full_name: format!("{full_name}.{}", field.name()),
+                        number: u32::try_from(field.number()).ok()?,
+                        kind: describe_field_kind(field),
+                        type_name: non_empty(field.type_name.as_deref()),
+                        is_repeated: field
+                            .label
+                            .as_ref()
+                            .map(|label| label.enum_value_or_default())
+                            == Some(Label::LABEL_REPEATED),
+                    },
+                ))
+            })
+            .collect();
+        message_types.insert(
+            full_name.clone(),
+            RegisteredMessageType {
+                fields_by_number,
+            },
+        );
+        collect_registered_enums(
+            package,
+            &full_name,
+            &message.enum_type,
+            enum_types,
+        );
+        collect_registered_messages(
+            package,
+            &full_name,
+            &message.nested_type,
+            message_types,
+            enum_types,
+        );
+    }
+}
+
+fn collect_registered_enums(
+    package: &str,
+    parent: &str,
+    enums: &[EnumDescriptorProto],
+    enum_types: &mut BTreeMap<String, RegisteredEnumType>,
+) {
+    for enum_proto in enums {
+        let full_name = normalize_proto_type_name(&join_proto_name(package, parent, enum_proto.name()));
+        enum_types.insert(
+            full_name.clone(),
+            RegisteredEnumType {
+                values_by_number: enum_proto
+                    .value
+                    .iter()
+                    .map(|value| (value.number(), value.name().to_owned()))
+                    .collect(),
+            },
+        );
+    }
+}
+
 fn extract_registered_extensions_from_messages(
     registry_name: &str,
+    source_path: &str,
     package: &str,
     parent: &str,
     messages: &[DescriptorProto],
@@ -1640,12 +1929,14 @@ fn extract_registered_extensions_from_messages(
         let full_name = join_proto_name(package, parent, message.name());
         output.extend(extract_registered_extensions_from_fields(
             registry_name,
+            source_path,
             package,
             &full_name,
             &message.extension,
         ));
         output.extend(extract_registered_extensions_from_messages(
             registry_name,
+            source_path,
             package,
             &full_name,
             &message.nested_type,
@@ -1656,6 +1947,7 @@ fn extract_registered_extensions_from_messages(
 
 fn extract_registered_extensions_from_fields(
     registry_name: &str,
+    source_path: &str,
     package: &str,
     parent: &str,
     fields: &[FieldDescriptorProto],
@@ -1677,6 +1969,7 @@ fn extract_registered_extensions_from_fields(
             };
             Some(RegisteredExtension {
                 registry_name: registry_name.to_owned(),
+                source_path: source_path.to_owned(),
                 full_name,
                 extendee,
                 field_number: u32::try_from(field.number()).ok()?,
@@ -1841,6 +2134,10 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn normalize_proto_type_name(value: &str) -> String {
+    value.trim_start_matches('.').to_owned()
+}
+
 fn descriptor_options_schema<M: Message + fmt::Debug>(
     options: Option<&M>,
     extendee: &str,
@@ -1867,9 +2164,9 @@ fn resolve_option_extensions<M: Message + fmt::Debug>(
         return Vec::new();
     };
 
-    let mut grouped = BTreeMap::<u32, Vec<UnknownValueRef<'_>>>::new();
+    let mut grouped = BTreeMap::<u32, Vec<OptionWireValue>>::new();
     for (field_number, value) in options.special_fields().unknown_fields().iter() {
-        grouped.entry(field_number).or_default().push(value);
+        grouped.entry(field_number).or_default().push(value.into());
     }
 
     let mut resolved = Vec::new();
@@ -1877,10 +2174,13 @@ fn resolve_option_extensions<M: Message + fmt::Debug>(
         let Some(extension) = by_number.get(&field_number) else {
             continue;
         };
-        let decoded_values = values
-            .into_iter()
-            .map(|value| decode_extension_value(value, extension))
-            .collect::<Vec<_>>();
+        let decoded_values = decode_option_values(
+            values,
+            &extension.kind,
+            extension.type_name.as_deref(),
+            extension.is_repeated,
+            registry,
+        );
         resolved.push(OptionExtensionSchema {
             registry_name: extension.registry_name.clone(),
             full_name: extension.full_name.clone(),
@@ -1889,11 +2189,8 @@ fn resolve_option_extensions<M: Message + fmt::Debug>(
             kind: extension.kind.clone(),
             type_name: extension.type_name.clone(),
             is_repeated: extension.is_repeated,
-            decoded: decoded_values.iter().all(|(_, decoded)| *decoded),
-            values: decoded_values
-                .into_iter()
-                .map(|(value, _decoded)| value)
-                .collect(),
+            decoded: decoded_values.iter().all(|value| value.decoded),
+            values: decoded_values,
         });
     }
     resolved.sort_by(|left, right| {
@@ -1905,54 +2202,427 @@ fn resolve_option_extensions<M: Message + fmt::Debug>(
     resolved
 }
 
-fn decode_extension_value(
-    value: UnknownValueRef<'_>,
-    extension: &RegisteredExtension,
-) -> (String, bool) {
-    match extension.kind.as_str() {
+fn decode_option_values(
+    values: Vec<OptionWireValue>,
+    kind: &str,
+    type_name: Option<&str>,
+    is_repeated: bool,
+    registry: &ExtensionRegistrySet,
+) -> Vec<OptionValueSchema> {
+    let mut decoded = Vec::new();
+    for value in values {
+        if is_repeated && is_packed_kind(kind) {
+            if let OptionWireValue::LengthDelimited(bytes) = &value {
+                if let Ok(mut unpacked) = decode_packed_option_values(bytes, kind, type_name, registry)
+                {
+                    decoded.append(&mut unpacked);
+                    continue;
+                }
+            }
+        }
+        decoded.push(decode_option_value(value, kind, type_name, registry));
+    }
+    decoded
+}
+
+fn decode_option_value(
+    value: OptionWireValue,
+    kind: &str,
+    type_name: Option<&str>,
+    registry: &ExtensionRegistrySet,
+) -> OptionValueSchema {
+    match kind {
         "bool" => match value {
-            UnknownValueRef::Varint(raw) => ((raw != 0).to_string(), true),
-            other => (format!("{other:?}"), false),
+            OptionWireValue::Varint(raw) => OptionValueSchema {
+                kind: "bool".to_owned(),
+                bool_value: Some(raw != 0),
+                int_value: None,
+                float_value: None,
+                enum_name: None,
+                string_value: None,
+                bytes_hex: None,
+                message_hex: None,
+                message_fields: Vec::new(),
+                raw_repr: (raw != 0).to_string(),
+                decoded: true,
+            },
+            other => undecoded_option_value("unknown", wire_debug_repr(&other)),
         },
         "string" => match value {
-            UnknownValueRef::LengthDelimited(bytes) => match String::from_utf8(bytes.to_vec()) {
-                Ok(text) => (text, true),
-                Err(_) => (bytes_to_hex(bytes), false),
+            OptionWireValue::LengthDelimited(bytes) => match String::from_utf8(bytes.clone()) {
+                Ok(text) => OptionValueSchema {
+                    kind: "string".to_owned(),
+                    bool_value: None,
+                    int_value: None,
+                    float_value: None,
+                    enum_name: None,
+                    string_value: Some(text.clone()),
+                    bytes_hex: None,
+                    message_hex: None,
+                    message_fields: Vec::new(),
+                    raw_repr: text,
+                    decoded: true,
+                },
+                Err(_) => undecoded_option_value("bytes", format!("0x{}", bytes_to_hex(&bytes))),
             },
-            other => (format!("{other:?}"), false),
+            other => undecoded_option_value("unknown", wire_debug_repr(&other)),
         },
         "bytes" => match value {
-            UnknownValueRef::LengthDelimited(bytes) => (bytes_to_hex(bytes), true),
-            other => (format!("{other:?}"), false),
+            OptionWireValue::LengthDelimited(bytes) => {
+                let hex = bytes_to_hex(&bytes);
+                OptionValueSchema {
+                    kind: "bytes".to_owned(),
+                    bool_value: None,
+                    int_value: None,
+                    float_value: None,
+                    enum_name: None,
+                    string_value: None,
+                    bytes_hex: Some(hex.clone()),
+                    message_hex: None,
+                    message_fields: Vec::new(),
+                    raw_repr: format!("0x{hex}"),
+                    decoded: true,
+                }
+            }
+            other => undecoded_option_value("unknown", wire_debug_repr(&other)),
         },
         "double" => match value {
-            UnknownValueRef::Fixed64(raw) => (f64::from_bits(raw).to_string(), true),
-            other => (format!("{other:?}"), false),
+            OptionWireValue::Fixed64(raw) => {
+                let decoded = f64::from_bits(raw);
+                OptionValueSchema {
+                    kind: "float".to_owned(),
+                    bool_value: None,
+                    int_value: None,
+                    float_value: Some(decoded),
+                    enum_name: None,
+                    string_value: None,
+                    bytes_hex: None,
+                    message_hex: None,
+                    message_fields: Vec::new(),
+                    raw_repr: decoded.to_string(),
+                    decoded: true,
+                }
+            }
+            other => undecoded_option_value("unknown", wire_debug_repr(&other)),
         },
         "float" => match value {
-            UnknownValueRef::Fixed32(raw) => (f32::from_bits(raw).to_string(), true),
-            other => (format!("{other:?}"), false),
+            OptionWireValue::Fixed32(raw) => {
+                let decoded = f32::from_bits(raw) as f64;
+                OptionValueSchema {
+                    kind: "float".to_owned(),
+                    bool_value: None,
+                    int_value: None,
+                    float_value: Some(decoded),
+                    enum_name: None,
+                    string_value: None,
+                    bytes_hex: None,
+                    message_hex: None,
+                    message_fields: Vec::new(),
+                    raw_repr: decoded.to_string(),
+                    decoded: true,
+                }
+            }
+            other => undecoded_option_value("unknown", wire_debug_repr(&other)),
         },
-        "fixed32" | "sfixed32" => match value {
-            UnknownValueRef::Fixed32(raw) => (raw.to_string(), true),
-            other => (format!("{other:?}"), false),
-        },
-        "fixed64" | "sfixed64" => match value {
-            UnknownValueRef::Fixed64(raw) => (raw.to_string(), true),
-            other => (format!("{other:?}"), false),
+        "fixed32" => decode_int32_value(value, |raw| i64::from(raw)),
+        "sfixed32" => decode_int32_value(value, |raw| i64::from(raw as i32)),
+        "fixed64" => decode_int64_value(value, |raw| raw as i64),
+        "sfixed64" => decode_int64_value(value, |raw| raw as i64),
+        "sint32" => decode_varint_value(value, |raw| i64::from(decode_zig_zag_32(raw as u32))),
+        "sint64" => decode_varint_value(value, decode_zig_zag_64),
+        "int32" => decode_varint_value(value, |raw| i64::from(raw as u32 as i32)),
+        "uint32" => decode_varint_value(value, |raw| i64::from(raw as u32)),
+        "int64" => decode_varint_value(value, |raw| raw as i64),
+        "uint64" => decode_varint_value(value, |raw| raw as i64),
+        "enum" => match value {
+            OptionWireValue::Varint(raw) => {
+                let enum_number = raw as i32;
+                let enum_name = type_name
+                    .map(normalize_proto_type_name)
+                    .and_then(|name| registry.enum_types.get(&name).cloned())
+                    .and_then(|enum_type| enum_type.values_by_number.get(&enum_number).cloned());
+                OptionValueSchema {
+                    kind: "enum".to_owned(),
+                    bool_value: None,
+                    int_value: Some(i64::from(enum_number)),
+                    float_value: None,
+                    enum_name: enum_name.clone(),
+                    string_value: enum_name.clone(),
+                    bytes_hex: None,
+                    message_hex: None,
+                    message_fields: Vec::new(),
+                    raw_repr: enum_name.unwrap_or_else(|| enum_number.to_string()),
+                    decoded: true,
+                }
+            }
+            other => undecoded_option_value("unknown", wire_debug_repr(&other)),
         },
         "message" => match value {
-            UnknownValueRef::LengthDelimited(bytes) => {
-                (format!("0x{}", bytes_to_hex(bytes)), false)
+            OptionWireValue::LengthDelimited(bytes) => {
+                let hex = bytes_to_hex(&bytes);
+                let Some(type_name) = type_name.map(normalize_proto_type_name) else {
+                    return OptionValueSchema {
+                        kind: "message".to_owned(),
+                        bool_value: None,
+                        int_value: None,
+                        float_value: None,
+                        enum_name: None,
+                        string_value: None,
+                        bytes_hex: None,
+                        message_hex: Some(hex.clone()),
+                        message_fields: Vec::new(),
+                        raw_repr: format!("0x{hex}"),
+                        decoded: false,
+                    };
+                };
+                match decode_message_fields(&bytes, &type_name, registry) {
+                    Ok(message_fields) => OptionValueSchema {
+                        kind: "message".to_owned(),
+                        bool_value: None,
+                        int_value: None,
+                        float_value: None,
+                        enum_name: None,
+                        string_value: None,
+                        bytes_hex: None,
+                        message_hex: Some(hex.clone()),
+                        decoded: message_fields.iter().all(|field| field.decoded),
+                        message_fields,
+                        raw_repr: format!("0x{hex}"),
+                    },
+                    Err(_) => OptionValueSchema {
+                        kind: "message".to_owned(),
+                        bool_value: None,
+                        int_value: None,
+                        float_value: None,
+                        enum_name: None,
+                        string_value: None,
+                        bytes_hex: None,
+                        message_hex: Some(hex.clone()),
+                        message_fields: Vec::new(),
+                        raw_repr: format!("0x{hex}"),
+                        decoded: false,
+                    },
+                }
             }
-            other => (format!("{other:?}"), false),
+            other => undecoded_option_value("unknown", wire_debug_repr(&other)),
         },
         _ => match value {
-            UnknownValueRef::Varint(raw) => (raw.to_string(), true),
-            UnknownValueRef::Fixed32(raw) => (raw.to_string(), true),
-            UnknownValueRef::Fixed64(raw) => (raw.to_string(), true),
-            UnknownValueRef::LengthDelimited(bytes) => (format!("0x{}", bytes_to_hex(bytes)), false),
+            OptionWireValue::Varint(raw) => OptionValueSchema {
+                kind: "int".to_owned(),
+                bool_value: None,
+                int_value: Some(raw as i64),
+                float_value: None,
+                enum_name: None,
+                string_value: None,
+                bytes_hex: None,
+                message_hex: None,
+                message_fields: Vec::new(),
+                raw_repr: raw.to_string(),
+                decoded: true,
+            },
+            OptionWireValue::Fixed32(raw) => OptionValueSchema {
+                kind: "int".to_owned(),
+                bool_value: None,
+                int_value: Some(i64::from(raw)),
+                float_value: None,
+                enum_name: None,
+                string_value: None,
+                bytes_hex: None,
+                message_hex: None,
+                message_fields: Vec::new(),
+                raw_repr: raw.to_string(),
+                decoded: true,
+            },
+            OptionWireValue::Fixed64(raw) => OptionValueSchema {
+                kind: "int".to_owned(),
+                bool_value: None,
+                int_value: Some(raw as i64),
+                float_value: None,
+                enum_name: None,
+                string_value: None,
+                bytes_hex: None,
+                message_hex: None,
+                message_fields: Vec::new(),
+                raw_repr: raw.to_string(),
+                decoded: true,
+            },
+            OptionWireValue::LengthDelimited(bytes) => {
+                let hex = bytes_to_hex(&bytes);
+                undecoded_option_value("bytes", format!("0x{hex}"))
+            }
         },
+    }
+}
+
+fn undecoded_option_value(kind: &str, raw_repr: String) -> OptionValueSchema {
+    OptionValueSchema {
+        kind: kind.to_owned(),
+        bool_value: None,
+        int_value: None,
+        float_value: None,
+        enum_name: None,
+        string_value: None,
+        bytes_hex: None,
+        message_hex: None,
+        message_fields: Vec::new(),
+        raw_repr,
+        decoded: false,
+    }
+}
+
+fn decode_int32_value(
+    value: OptionWireValue,
+    convert: impl Fn(u32) -> i64,
+) -> OptionValueSchema {
+    match value {
+        OptionWireValue::Fixed32(raw) => OptionValueSchema {
+            kind: "int".to_owned(),
+            bool_value: None,
+            int_value: Some(convert(raw)),
+            float_value: None,
+            enum_name: None,
+            string_value: None,
+            bytes_hex: None,
+            message_hex: None,
+            message_fields: Vec::new(),
+            raw_repr: convert(raw).to_string(),
+            decoded: true,
+        },
+        other => undecoded_option_value("unknown", wire_debug_repr(&other)),
+    }
+}
+
+fn decode_int64_value(
+    value: OptionWireValue,
+    convert: impl Fn(u64) -> i64,
+) -> OptionValueSchema {
+    match value {
+        OptionWireValue::Fixed64(raw) => OptionValueSchema {
+            kind: "int".to_owned(),
+            bool_value: None,
+            int_value: Some(convert(raw)),
+            float_value: None,
+            enum_name: None,
+            string_value: None,
+            bytes_hex: None,
+            message_hex: None,
+            message_fields: Vec::new(),
+            raw_repr: convert(raw).to_string(),
+            decoded: true,
+        },
+        other => undecoded_option_value("unknown", wire_debug_repr(&other)),
+    }
+}
+
+fn decode_varint_value(
+    value: OptionWireValue,
+    convert: impl Fn(u64) -> i64,
+) -> OptionValueSchema {
+    match value {
+        OptionWireValue::Varint(raw) => OptionValueSchema {
+            kind: "int".to_owned(),
+            bool_value: None,
+            int_value: Some(convert(raw)),
+            float_value: None,
+            enum_name: None,
+            string_value: None,
+            bytes_hex: None,
+            message_hex: None,
+            message_fields: Vec::new(),
+            raw_repr: convert(raw).to_string(),
+            decoded: true,
+        },
+        other => undecoded_option_value("unknown", wire_debug_repr(&other)),
+    }
+}
+
+fn is_packed_kind(kind: &str) -> bool {
+    !matches!(kind, "string" | "bytes" | "message" | "group")
+}
+
+fn decode_packed_option_values(
+    bytes: &[u8],
+    kind: &str,
+    type_name: Option<&str>,
+    registry: &ExtensionRegistrySet,
+) -> Result<Vec<OptionValueSchema>> {
+    let mut input = CodedInputStream::from_bytes(bytes);
+    let mut values = Vec::new();
+    while !input.eof()? {
+        let value = match kind {
+            "bool" => OptionWireValue::Varint(u64::from(input.read_bool()?)),
+            "int32" | "uint32" | "enum" => OptionWireValue::Varint(u64::from(input.read_uint32()?)),
+            "int64" | "uint64" => OptionWireValue::Varint(input.read_uint64()?),
+            "sint32" => OptionWireValue::Varint(input.read_uint32()? as u64),
+            "sint64" => OptionWireValue::Varint(input.read_uint64()?),
+            "fixed32" | "sfixed32" | "float" => OptionWireValue::Fixed32(input.read_fixed32()?),
+            "fixed64" | "sfixed64" | "double" => OptionWireValue::Fixed64(input.read_fixed64()?),
+            _ => bail!("unsupported packed kind `{kind}`"),
+        };
+        values.push(decode_option_value(value, kind, type_name, registry));
+    }
+    Ok(values)
+}
+
+fn decode_message_fields(
+    bytes: &[u8],
+    type_name: &str,
+    registry: &ExtensionRegistrySet,
+) -> Result<Vec<OptionFieldSchema>> {
+    let Some(message_type) = registry.message_types.get(type_name) else {
+        bail!("unknown registered message type `{type_name}`");
+    };
+    let mut input = CodedInputStream::from_bytes(bytes);
+    let mut grouped = BTreeMap::<u32, Vec<OptionWireValue>>::new();
+    while let Some(tag) = input.read_raw_tag_or_eof()? {
+        let field_number = tag >> 3;
+        let wire_type = WireType::new(tag & 0x7)
+            .ok_or_else(|| anyhow!("invalid wire type in `{type_name}`"))?;
+        let value = input.read_unknown(wire_type)?;
+        grouped.entry(field_number).or_default().push(value.into());
+    }
+
+    let mut fields = Vec::new();
+    for (field_number, values) in grouped {
+        let Some(field) = message_type.fields_by_number.get(&field_number) else {
+            continue;
+        };
+        let decoded_values = decode_option_values(
+            values,
+            &field.kind,
+            field.type_name.as_deref(),
+            field.is_repeated,
+            registry,
+        );
+        fields.push(OptionFieldSchema {
+            name: field.name.clone(),
+            full_name: field.full_name.clone(),
+            number: i32::try_from(field.number).unwrap_or(i32::MAX),
+            kind: field.kind.clone(),
+            type_name: field.type_name.clone(),
+            is_repeated: field.is_repeated,
+            decoded: decoded_values.iter().all(|value| value.decoded),
+            values: decoded_values,
+        });
+    }
+    fields.sort_by(|left, right| left.number.cmp(&right.number));
+    Ok(fields)
+}
+
+fn decode_zig_zag_32(raw: u32) -> i32 {
+    ((raw >> 1) as i32) ^ -((raw & 1) as i32)
+}
+
+fn decode_zig_zag_64(raw: u64) -> i64 {
+    ((raw >> 1) as i64) ^ -((raw & 1) as i64)
+}
+
+fn wire_debug_repr(value: &OptionWireValue) -> String {
+    match value {
+        OptionWireValue::Fixed32(raw) => format!("Fixed32({raw})"),
+        OptionWireValue::Fixed64(raw) => format!("Fixed64({raw})"),
+        OptionWireValue::Varint(raw) => format!("Varint({raw})"),
+        OptionWireValue::LengthDelimited(bytes) => format!("LengthDelimited(0x{})", bytes_to_hex(bytes)),
     }
 }
 
@@ -2115,6 +2785,20 @@ fn field_kind_attr(name: &str) -> FrozenAttr<FieldKindEnumValue> {
 
 fn delta_kind_attr(name: &str) -> FrozenAttr<DeltaKindEnumValue> {
     FrozenAttr::new(delta_kind_value(name))
+}
+
+fn option_value_kind_attr(name: &str) -> FrozenAttr<OptionValueKindEnumValue> {
+    FrozenAttr::new(match name {
+        "bool" => option_value_kind_bool(),
+        "int" => option_value_kind_int(),
+        "enum" => option_value_kind_enum(),
+        "float" => option_value_kind_float(),
+        "string" => option_value_kind_string(),
+        "bytes" => option_value_kind_bytes(),
+        "message" => option_value_kind_message(),
+        "unknown" => option_value_kind_unknown(),
+        other => panic!("unsupported option value kind enum `{other}`"),
+    })
 }
 
 fn diff_file(
@@ -2625,6 +3309,91 @@ fn push_option_delta(
             ]),
         ));
     }
+    push_registered_option_deltas(deltas, path, symbol, before, after);
+}
+
+fn push_registered_option_deltas(
+    deltas: &mut Vec<SchemaDelta>,
+    path: &str,
+    symbol: &str,
+    before: &DescriptorOptionsSchema,
+    after: &DescriptorOptionsSchema,
+) {
+    let before_map = before
+        .extensions
+        .iter()
+        .map(|extension| (extension.full_name.clone(), extension))
+        .collect::<BTreeMap<_, _>>();
+    let after_map = after
+        .extensions
+        .iter()
+        .map(|extension| (extension.full_name.clone(), extension))
+        .collect::<BTreeMap<_, _>>();
+
+    for (full_name, before_extension) in &before_map {
+        let delta_symbol = format!("{symbol}::{full_name}");
+        match after_map.get(full_name) {
+            Some(after_extension) => {
+                let before_values = before_extension
+                    .values
+                    .iter()
+                    .map(|value| value.raw_repr.clone())
+                    .collect::<Vec<_>>();
+                let after_values = after_extension
+                    .values
+                    .iter()
+                    .map(|value| value.raw_repr.clone())
+                    .collect::<Vec<_>>();
+                if before_values != after_values || before_extension.decoded != after_extension.decoded {
+                    deltas.push(delta(
+                        path,
+                        "registered_option_value_changed",
+                        &delta_symbol,
+                        btreemap([
+                            ("name", serde_json::Value::String(full_name.clone())),
+                            (
+                                "registry_name",
+                                serde_json::Value::String(before_extension.registry_name.clone()),
+                            ),
+                            (
+                                "before_raw_value",
+                                serde_json::Value::String(before_values.join(", ")),
+                            ),
+                            (
+                                "after_raw_value",
+                                serde_json::Value::String(after_values.join(", ")),
+                            ),
+                        ]),
+                    ));
+                }
+            }
+            None => {
+                deltas.push(delta(
+                    path,
+                    "registered_option_removed",
+                    &delta_symbol,
+                    btreemap([
+                        ("name", serde_json::Value::String(full_name.clone())),
+                        (
+                            "registry_name",
+                            serde_json::Value::String(before_extension.registry_name.clone()),
+                        ),
+                        (
+                            "before_raw_value",
+                            serde_json::Value::String(
+                                before_extension
+                                    .values
+                                    .iter()
+                                    .map(|value| value.raw_repr.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            ),
+                        ),
+                    ]),
+                ));
+            }
+        }
+    }
 }
 
 fn maybe_json_string(value: Option<String>) -> serde_json::Value {
@@ -2985,6 +3754,9 @@ impl SchemaDelta {
             range_start: OptionalAttr::from(details_i32(&self.details, "range_start")),
             range_end: OptionalAttr::from(details_i32(&self.details, "range_end")),
             name: OptionalAttr::from(details_string(&self.details, "name")),
+            registry_name: OptionalAttr::from(details_string(&self.details, "registry_name")),
+            before_raw_value: OptionalAttr::from(details_string(&self.details, "before_raw_value")),
+            after_raw_value: OptionalAttr::from(details_string(&self.details, "after_raw_value")),
         }
     }
 }
@@ -3075,7 +3847,52 @@ impl OptionExtensionSchema {
             kind: field_kind_attr(&self.kind),
             type_name: OptionalAttr::from(self.type_name),
             is_repeated: self.is_repeated,
-            values: self.values,
+            values: self
+                .values
+                .into_iter()
+                .map(OptionValueSchema::into_value)
+                .collect(),
+            decoded: self.decoded,
+        }
+    }
+}
+
+impl OptionFieldSchema {
+    fn into_value(self) -> OptionFieldValue {
+        OptionFieldValue {
+            name: self.name,
+            full_name: self.full_name,
+            number: self.number,
+            kind: field_kind_attr(&self.kind),
+            type_name: OptionalAttr::from(self.type_name),
+            is_repeated: self.is_repeated,
+            values: self
+                .values
+                .into_iter()
+                .map(OptionValueSchema::into_value)
+                .collect(),
+            decoded: self.decoded,
+        }
+    }
+}
+
+impl OptionValueSchema {
+    fn into_value(self) -> OptionValueValue {
+        OptionValueValue {
+            kind: option_value_kind_attr(&self.kind),
+            bool_value: OptionalAttr::from(self.bool_value),
+            int_value: OptionalAttr::from(self.int_value),
+            float_value: OptionalAttr::from(self.float_value),
+            enum_name: OptionalAttr::from(self.enum_name),
+            string_value: OptionalAttr::from(self.string_value),
+            bytes_hex: OptionalAttr::from(self.bytes_hex),
+            message_hex: OptionalAttr::from(self.message_hex),
+            message_fields: self
+                .message_fields
+                .into_iter()
+                .map(OptionFieldSchema::into_value)
+                .collect(),
+            raw_repr: self.raw_repr,
             decoded: self.decoded,
         }
     }
@@ -3187,6 +4004,54 @@ field_kind_singleton!(field_kind_sfixed64, "sfixed64");
 field_kind_singleton!(field_kind_sint32, "sint32");
 field_kind_singleton!(field_kind_sint64, "sint64");
 
+fn option_value_kind_bool() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "bool" }))
+}
+
+fn option_value_kind_int() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "int" }))
+}
+
+fn option_value_kind_enum() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "enum" }))
+}
+
+fn option_value_kind_float() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "float" }))
+}
+
+fn option_value_kind_string() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "string" }))
+}
+
+fn option_value_kind_bytes() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "bytes" }))
+}
+
+fn option_value_kind_message() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "message" }))
+}
+
+fn option_value_kind_unknown() -> starlark::values::FrozenValue {
+    use starlark::environment::GlobalsStatic;
+    static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+    GLOBAL.function(|globals| globals.set("v", OptionValueKindEnumValue { value: "unknown" }))
+}
+
 fn delta_kind_names() -> &'static [&'static str] {
     &[
         "message_removed",
@@ -3222,6 +4087,8 @@ fn delta_kind_names() -> &'static [&'static str] {
         "service_options_changed",
         "method_options_changed",
         "extension_options_changed",
+        "registered_option_removed",
+        "registered_option_value_changed",
     ]
 }
 
@@ -3360,6 +4227,14 @@ fn delta_kind_value(name: &str) -> starlark::values::FrozenValue {
             static GLOBAL: GlobalsStatic = GlobalsStatic::new();
             GLOBAL.function(|g| g.set("v", DeltaKindEnumValue { value: "extension_options_changed" }))
         }
+        "registered_option_removed" => {
+            static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+            GLOBAL.function(|g| g.set("v", DeltaKindEnumValue { value: "registered_option_removed" }))
+        }
+        "registered_option_value_changed" => {
+            static GLOBAL: GlobalsStatic = GlobalsStatic::new();
+            GLOBAL.function(|g| g.set("v", DeltaKindEnumValue { value: "registered_option_value_changed" }))
+        }
         other => panic!("unsupported delta kind enum `{other}`"),
     }
 }
@@ -3434,6 +4309,8 @@ fn protobuf_type_globals(globals: &mut GlobalsBuilder) {
     const FieldLabel: StarlarkValueAsType<FieldLabelEnumValue> = StarlarkValueAsType::new();
     const FieldKind: StarlarkValueAsType<FieldKindEnumValue> = StarlarkValueAsType::new();
     const DeltaKind: StarlarkValueAsType<DeltaKindEnumValue> = StarlarkValueAsType::new();
+    const OptionValueKind: StarlarkValueAsType<OptionValueKindEnumValue> =
+        StarlarkValueAsType::new();
     const ProtoContext: StarlarkValueAsType<ProtoContextValue> = StarlarkValueAsType::new();
     const PolicyConfig: StarlarkValueAsType<PolicyConfigValue> = StarlarkValueAsType::new();
     const ParserInfo: StarlarkValueAsType<ParserInfoValue> = StarlarkValueAsType::new();
@@ -3456,6 +4333,8 @@ fn protobuf_type_globals(globals: &mut GlobalsBuilder) {
     const DescriptorOptions: StarlarkValueAsType<DescriptorOptionsValue> =
         StarlarkValueAsType::new();
     const OptionExtension: StarlarkValueAsType<OptionExtensionValue> = StarlarkValueAsType::new();
+    const OptionField: StarlarkValueAsType<OptionFieldValue> = StarlarkValueAsType::new();
+    const OptionValue: StarlarkValueAsType<OptionValueValue> = StarlarkValueAsType::new();
     const UninterpretedOption: StarlarkValueAsType<UninterpretedOptionValue> =
         StarlarkValueAsType::new();
     const SchemaDelta: StarlarkValueAsType<SchemaDeltaValue> = StarlarkValueAsType::new();
@@ -3483,6 +4362,16 @@ fn protobuf_enum_globals(globals: &mut GlobalsBuilder) {
         for (name, value) in field_kind_constants() {
             ns.set(name, value);
         }
+    });
+    globals.namespace("OptionValueKinds", |ns| {
+        ns.set("bool", option_value_kind_bool());
+        ns.set("int", option_value_kind_int());
+        ns.set("enum", option_value_kind_enum());
+        ns.set("float", option_value_kind_float());
+        ns.set("string", option_value_kind_string());
+        ns.set("bytes", option_value_kind_bytes());
+        ns.set("message", option_value_kind_message());
+        ns.set("unknown", option_value_kind_unknown());
     });
     globals.namespace("DeltaKinds", |ns| {
         for name in delta_kind_names() {
@@ -3620,6 +4509,91 @@ fn protobuf_helper_globals(globals: &mut GlobalsBuilder) {
             .collect())
     }
 
+    fn registered_option_deltas<'v>(
+        ctx: starlark::values::Value<'v>,
+    ) -> anyhow::Result<Vec<SchemaDeltaValue>> {
+        let ctx = ProtoContextValue::from_value(ctx)
+            .ok_or_else(|| anyhow!("expected `ProtoContext` for `ctx`"))?;
+        Ok(ctx
+            .deltas
+            .iter()
+            .filter(|delta| {
+                matches!(
+                    delta_kind_value_name(&delta.kind),
+                    "registered_option_removed" | "registered_option_value_changed"
+                )
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn option_extensions<'v>(
+        options: starlark::values::Value<'v>,
+        full_name: Option<String>,
+    ) -> anyhow::Result<Vec<OptionExtensionValue>> {
+        option_extensions_impl(options, full_name)
+    }
+
+    fn has_option<'v>(
+        options: starlark::values::Value<'v>,
+        full_name: String,
+    ) -> anyhow::Result<bool> {
+        Ok(!option_extensions_impl(options, Some(full_name))?.is_empty())
+    }
+
+    fn bool_option<'v>(
+        options: starlark::values::Value<'v>,
+        full_name: String,
+    ) -> anyhow::Result<OptionalAttr<bool>> {
+        let mut matches = option_extensions_impl(options, Some(full_name))?;
+        let Some(extension) = matches.pop() else {
+            return Ok(OptionalAttr::from(None));
+        };
+        Ok(OptionalAttr::from(
+            extension
+            .values
+            .iter()
+            .find_map(|value| value.bool_value.0),
+        ))
+    }
+
+    fn option_field_values<'v>(
+        options: starlark::values::Value<'v>,
+        full_name: String,
+        field_path: String,
+    ) -> anyhow::Result<Vec<OptionValueValue>> {
+        option_field_values_impl(options, full_name, field_path)
+    }
+
+    fn bool_option_field<'v>(
+        options: starlark::values::Value<'v>,
+        full_name: String,
+        field_path: String,
+    ) -> anyhow::Result<OptionalAttr<bool>> {
+        let values = option_field_values_impl(options, full_name, field_path)?;
+        Ok(OptionalAttr::from(
+            values.into_iter().find_map(|value| value.bool_value.0),
+        ))
+    }
+
+    fn option_descendants<'v>(
+        value: starlark::values::Value<'v>,
+    ) -> anyhow::Result<Vec<OptionFieldValue>> {
+        if let Some(extension) = OptionExtensionValue::from_value(value) {
+            return Ok(flatten_option_fields(
+                extension
+                    .values
+                    .iter()
+                    .flat_map(|option_value| option_value.message_fields.iter().cloned())
+                    .collect(),
+            ));
+        }
+        if let Some(option_value) = OptionValueValue::from_value(value) {
+            return Ok(flatten_option_fields(option_value.message_fields.clone()));
+        }
+        Err(anyhow!("expected `OptionExtension` or `OptionValue`"))
+    }
+
     fn finding_for_delta<'v>(
         ctx: starlark::values::Value<'v>,
         delta: starlark::values::Value<'v>,
@@ -3643,6 +4617,69 @@ fn protobuf_helper_globals(globals: &mut GlobalsBuilder) {
             Some(remediation.unwrap_or_else(|| ctx.config.default_remediation.clone())),
         ))
     }
+}
+
+fn option_extensions_impl<'v>(
+    options: starlark::values::Value<'v>,
+    full_name: Option<String>,
+) -> anyhow::Result<Vec<OptionExtensionValue>> {
+    let options = DescriptorOptionsValue::from_value(options)
+        .ok_or_else(|| anyhow!("expected `DescriptorOptions`"))?;
+    Ok(options
+        .extensions
+        .iter()
+        .filter(|extension| {
+            full_name
+                .as_ref()
+                .is_none_or(|expected| &extension.full_name == expected)
+        })
+        .cloned()
+        .collect())
+}
+
+fn option_field_values_impl<'v>(
+    options: starlark::values::Value<'v>,
+    full_name: String,
+    field_path: String,
+) -> anyhow::Result<Vec<OptionValueValue>> {
+    let extensions = option_extensions_impl(options, Some(full_name))?;
+    let segments = field_path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let mut values = extensions
+        .into_iter()
+        .flat_map(|extension| extension.values.into_iter())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Ok(values);
+    }
+    for segment in segments {
+        let mut next = Vec::new();
+        for value in values {
+            for field in &value.message_fields {
+                if field.name == segment {
+                    next.extend(field.values.iter().cloned());
+                }
+            }
+        }
+        values = next;
+    }
+    Ok(values)
+}
+
+fn flatten_option_fields(mut roots: Vec<OptionFieldValue>) -> Vec<OptionFieldValue> {
+    let mut flattened = Vec::new();
+    while let Some(field) = roots.pop() {
+        for value in field.values.iter().rev() {
+            for child in value.message_fields.iter().rev() {
+                roots.push(child.clone());
+            }
+        }
+        flattened.push(field);
+    }
+    flattened.reverse();
+    flattened
 }
 
 fn filter_delta_kind<'v>(
@@ -3833,8 +4870,13 @@ def check(ctx: ProtoContext) -> list[Finding]:
     removed = removed_fields(ctx)
     changed = changed_field_numbers(ctx)
     filtered = filter_deltas(ctx, kind = "field_removed", symbol_prefix = "example.")
+    option_deltas = registered_option_deltas(ctx)
+    flag = bool_option(ctx.files[0].before.options, "acme.flag")
+    owner = option_field_values(ctx.files[0].before.options, "acme.policy", "nested.owner")
+    descendants = option_descendants(option_extensions(ctx.files[0].before.options, "acme.policy")[0])
+    enabled = bool_option_field(ctx.files[0].before.options, "acme.policy", "enabled")
     findings = []
-    if len(removed) == 1 and len(changed) == 1 and len(filtered) == 1:
+    if len(removed) == 1 and len(changed) == 1 and len(filtered) == 1 and len(option_deltas) == 1 and flag and enabled and owner[0].string_value == "ops" and len(descendants) >= 3:
         findings.append(finding_for_delta(ctx, removed[0], "helper saw removed field"))
     return findings
 "#,
@@ -3895,6 +4937,7 @@ def check(ctx: ProtoContext) -> list[Finding]:
         assert!(delta_kinds.contains("package_changed"));
         assert!(delta_kinds.contains("syntax_changed"));
         assert!(delta_kinds.contains("message_options_changed"));
+        assert!(delta_kinds.contains("registered_option_value_changed"));
     }
 
     #[test]
@@ -3918,6 +4961,7 @@ def check(ctx: ProtoContext) -> list[Finding]:
                     51001,
                     super::RegisteredExtension {
                         registry_name: "acme".to_owned(),
+                        source_path: "proto/extensions/options.proto".to_owned(),
                         full_name: "acme.sensitive".to_owned(),
                         extendee: ".google.protobuf.FieldOptions".to_owned(),
                         field_number: 51001,
@@ -3927,6 +4971,8 @@ def check(ctx: ProtoContext) -> list[Finding]:
                     },
                 )]),
             )]),
+            message_types: BTreeMap::new(),
+            enum_types: BTreeMap::new(),
         };
 
         let decoded = super::descriptor_options_schema(
@@ -3938,8 +4984,148 @@ def check(ctx: ProtoContext) -> list[Finding]:
         assert_eq!(decoded.extensions.len(), 1);
         assert_eq!(decoded.extensions[0].registry_name, "acme");
         assert_eq!(decoded.extensions[0].full_name, "acme.sensitive");
-        assert_eq!(decoded.extensions[0].values, vec!["true".to_owned()]);
+        assert_eq!(decoded.extensions[0].values.len(), 1);
+        assert_eq!(decoded.extensions[0].values[0].kind, "bool");
+        assert_eq!(decoded.extensions[0].values[0].bool_value, Some(true));
+        assert_eq!(decoded.extensions[0].values[0].raw_repr, "true");
         assert!(decoded.extensions[0].decoded);
+    }
+
+    #[test]
+    fn decodes_message_valued_option_extensions() {
+        let mut options = protobuf::descriptor::FieldOptions::new();
+        options.special_fields.mut_unknown_fields().add_length_delimited(
+            51002,
+            vec![
+                0x08, 0x01, // enabled = true
+                0x12, 0x05, 0x0A, 0x03, b'o', b'p', b's', // nested.owner = "ops"
+                0x1A, 0x02, 0x07, 0x09, // ids = [7, 9] packed
+                0x20, 0x02, // mode = ACTIVE
+            ],
+        );
+
+        let registry = super::ExtensionRegistrySet {
+            infos: vec![super::ExtensionRegistryInfo {
+                name: "acme".to_owned(),
+                extension_count: 1,
+                files: vec!["proto/extensions/options.proto".to_owned()],
+                extendees: vec![".google.protobuf.FieldOptions".to_owned()],
+            }],
+            by_extendee: BTreeMap::from([(
+                ".google.protobuf.FieldOptions".to_owned(),
+                BTreeMap::from([(
+                    51002,
+                    super::RegisteredExtension {
+                        registry_name: "acme".to_owned(),
+                        source_path: "proto/extensions/options.proto".to_owned(),
+                        full_name: "acme.policy".to_owned(),
+                        extendee: ".google.protobuf.FieldOptions".to_owned(),
+                        field_number: 51002,
+                        kind: "message".to_owned(),
+                        type_name: Some(".acme.Policy".to_owned()),
+                        is_repeated: false,
+                    },
+                )]),
+            )]),
+            message_types: BTreeMap::from([
+                (
+                    "acme.Policy".to_owned(),
+                    super::RegisteredMessageType {
+                        fields_by_number: BTreeMap::from([
+                            (
+                                1,
+                                super::RegisteredMessageField {
+                                    name: "enabled".to_owned(),
+                                    full_name: "acme.Policy.enabled".to_owned(),
+                                    number: 1,
+                                    kind: "bool".to_owned(),
+                                    type_name: None,
+                                    is_repeated: false,
+                                },
+                            ),
+                            (
+                                2,
+                                super::RegisteredMessageField {
+                                    name: "nested".to_owned(),
+                                    full_name: "acme.Policy.nested".to_owned(),
+                                    number: 2,
+                                    kind: "message".to_owned(),
+                                    type_name: Some(".acme.Nested".to_owned()),
+                                    is_repeated: false,
+                                },
+                            ),
+                            (
+                                3,
+                                super::RegisteredMessageField {
+                                    name: "ids".to_owned(),
+                                    full_name: "acme.Policy.ids".to_owned(),
+                                    number: 3,
+                                    kind: "int32".to_owned(),
+                                    type_name: None,
+                                    is_repeated: true,
+                                },
+                            ),
+                            (
+                                4,
+                                super::RegisteredMessageField {
+                                    name: "mode".to_owned(),
+                                    full_name: "acme.Policy.mode".to_owned(),
+                                    number: 4,
+                                    kind: "enum".to_owned(),
+                                    type_name: Some(".acme.Mode".to_owned()),
+                                    is_repeated: false,
+                                },
+                            ),
+                        ]),
+                    },
+                ),
+                (
+                    "acme.Nested".to_owned(),
+                    super::RegisteredMessageType {
+                        fields_by_number: BTreeMap::from([(
+                            1,
+                            super::RegisteredMessageField {
+                                name: "owner".to_owned(),
+                                full_name: "acme.Nested.owner".to_owned(),
+                                number: 1,
+                                kind: "string".to_owned(),
+                                type_name: None,
+                                is_repeated: false,
+                            },
+                        )]),
+                    },
+                ),
+            ]),
+            enum_types: BTreeMap::from([(
+                "acme.Mode".to_owned(),
+                super::RegisteredEnumType {
+                    values_by_number: BTreeMap::from([(1, "UNKNOWN".to_owned()), (2, "ACTIVE".to_owned())]),
+                },
+            )]),
+        };
+
+        let decoded = super::descriptor_options_schema(
+            Some(&options),
+            ".google.protobuf.FieldOptions",
+            &registry,
+        );
+
+        let value = &decoded.extensions[0].values[0];
+        assert_eq!(value.kind, "message");
+        assert!(value.decoded);
+        assert_eq!(value.message_fields.len(), 4);
+        assert_eq!(value.message_fields[0].name, "enabled");
+        assert_eq!(value.message_fields[0].values[0].bool_value, Some(true));
+        assert_eq!(value.message_fields[1].name, "nested");
+        assert_eq!(
+            value.message_fields[1].values[0].message_fields[0].values[0].string_value,
+            Some("ops".to_owned())
+        );
+        assert_eq!(value.message_fields[2].values.len(), 2);
+        assert_eq!(value.message_fields[2].values[0].int_value, Some(7));
+        assert_eq!(value.message_fields[2].values[1].int_value, Some(9));
+        assert_eq!(value.message_fields[3].values[0].kind, "enum");
+        assert_eq!(value.message_fields[3].values[0].enum_name, Some("ACTIVE".to_owned()));
     }
 
     fn init_git_repo(root: &Path) {
@@ -3983,7 +5169,10 @@ def check(ctx: ProtoContext) -> list[Finding]:
                     fingerprint: "aa".to_owned(),
                     has_unknown_fields: false,
                     uninterpreted: Vec::new(),
-                    extensions: Vec::new(),
+                    extensions: vec![
+                        bool_option_extension("acme.flag", "true"),
+                        policy_option_extension("true"),
+                    ],
                 },
                 messages: vec![super::MessageSchema {
                     full_name: "example.v1.User".to_owned(),
@@ -4160,7 +5349,10 @@ def check(ctx: ProtoContext) -> list[Finding]:
                     fingerprint: "ab".to_owned(),
                     has_unknown_fields: true,
                     uninterpreted: Vec::new(),
-                    extensions: Vec::new(),
+                    extensions: vec![
+                        bool_option_extension("acme.flag", "false"),
+                        policy_option_extension("false"),
+                    ],
                 },
                 messages: vec![super::MessageSchema {
                     full_name: "example.v1.User".to_owned(),
@@ -4342,6 +5534,161 @@ def check(ctx: ProtoContext) -> list[Finding]:
                 uninterpreted: Vec::new(),
                 extensions: Vec::new(),
             },
+        }
+    }
+
+    fn bool_option_extension(full_name: &str, value: &str) -> super::OptionExtensionSchema {
+        super::OptionExtensionSchema {
+            registry_name: "acme".to_owned(),
+            full_name: full_name.to_owned(),
+            extendee: ".google.protobuf.FileOptions".to_owned(),
+            field_number: 51001,
+            kind: "bool".to_owned(),
+            type_name: None,
+            is_repeated: false,
+            values: vec![super::OptionValueSchema {
+                kind: "bool".to_owned(),
+                bool_value: Some(value == "true"),
+                int_value: None,
+                float_value: None,
+                enum_name: None,
+                string_value: None,
+                bytes_hex: None,
+                message_hex: None,
+                message_fields: Vec::new(),
+                raw_repr: value.to_owned(),
+                decoded: true,
+            }],
+            decoded: true,
+        }
+    }
+
+    fn policy_option_extension(enabled: &str) -> super::OptionExtensionSchema {
+        super::OptionExtensionSchema {
+            registry_name: "acme".to_owned(),
+            full_name: "acme.policy".to_owned(),
+            extendee: ".google.protobuf.FileOptions".to_owned(),
+            field_number: 51002,
+            kind: "message".to_owned(),
+            type_name: Some(".acme.Policy".to_owned()),
+            is_repeated: false,
+            values: vec![super::OptionValueSchema {
+                kind: "message".to_owned(),
+                bool_value: None,
+                int_value: None,
+                float_value: None,
+                enum_name: None,
+                string_value: None,
+                bytes_hex: None,
+                message_hex: Some("deadbeef".to_owned()),
+                message_fields: vec![
+                    super::OptionFieldSchema {
+                        name: "enabled".to_owned(),
+                        full_name: "acme.Policy.enabled".to_owned(),
+                        number: 1,
+                        kind: "bool".to_owned(),
+                        type_name: None,
+                        is_repeated: false,
+                        values: vec![super::OptionValueSchema {
+                            kind: "bool".to_owned(),
+                            bool_value: Some(enabled == "true"),
+                            int_value: None,
+                            float_value: None,
+                            enum_name: None,
+                            string_value: None,
+                            bytes_hex: None,
+                            message_hex: None,
+                            message_fields: Vec::new(),
+                            raw_repr: enabled.to_owned(),
+                            decoded: true,
+                        }],
+                        decoded: true,
+                    },
+                    super::OptionFieldSchema {
+                        name: "nested".to_owned(),
+                        full_name: "acme.Policy.nested".to_owned(),
+                        number: 2,
+                        kind: "message".to_owned(),
+                        type_name: Some(".acme.Nested".to_owned()),
+                        is_repeated: false,
+                        values: vec![super::OptionValueSchema {
+                            kind: "message".to_owned(),
+                            bool_value: None,
+                            int_value: None,
+                            float_value: None,
+                            enum_name: None,
+                            string_value: None,
+                            bytes_hex: None,
+                            message_hex: Some("bead".to_owned()),
+                            message_fields: vec![super::OptionFieldSchema {
+                                name: "owner".to_owned(),
+                                full_name: "acme.Nested.owner".to_owned(),
+                                number: 1,
+                                kind: "string".to_owned(),
+                                type_name: None,
+                                is_repeated: false,
+                                values: vec![super::OptionValueSchema {
+                                    kind: "string".to_owned(),
+                                    bool_value: None,
+                                    int_value: None,
+                                    float_value: None,
+                                    enum_name: None,
+                                    string_value: Some("ops".to_owned()),
+                                    bytes_hex: None,
+                                    message_hex: None,
+                                    message_fields: Vec::new(),
+                                    raw_repr: "ops".to_owned(),
+                                    decoded: true,
+                                }],
+                                decoded: true,
+                            }],
+                            raw_repr: "0xbead".to_owned(),
+                            decoded: true,
+                        }],
+                        decoded: true,
+                    },
+                    super::OptionFieldSchema {
+                        name: "ids".to_owned(),
+                        full_name: "acme.Policy.ids".to_owned(),
+                        number: 3,
+                        kind: "int32".to_owned(),
+                        type_name: None,
+                        is_repeated: true,
+                        values: vec![
+                            super::OptionValueSchema {
+                                kind: "int".to_owned(),
+                                bool_value: None,
+                                int_value: Some(7),
+                                float_value: None,
+                                enum_name: None,
+                                string_value: None,
+                                bytes_hex: None,
+                                message_hex: None,
+                                message_fields: Vec::new(),
+                                raw_repr: "7".to_owned(),
+                                decoded: true,
+                            },
+                            super::OptionValueSchema {
+                                kind: "int".to_owned(),
+                                bool_value: None,
+                                int_value: Some(9),
+                                float_value: None,
+                                enum_name: None,
+                                string_value: None,
+                                bytes_hex: None,
+                                message_hex: None,
+                                message_fields: Vec::new(),
+                                raw_repr: "9".to_owned(),
+                                decoded: true,
+                            },
+                        ],
+                        decoded: true,
+                    },
+                ],
+                raw_repr: "0xdeadbeef".to_owned(),
+                decoded: true,
+            }],
+            decoded: true,
         }
     }
 }

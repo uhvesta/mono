@@ -474,6 +474,8 @@ Per-registry keys:
 - `name` (required string)
 - `include_globs` (required array of glob strings)
 
+Configured extension registries are also used to decode registered custom options. Scalar values are typed, repeated packed scalars are unpacked, and message-valued custom options are decoded recursively into nested typed option fields for Starlark policies.
+
 Default built-in Starlark policy currently flags:
 
 - `message_removed`
@@ -519,6 +521,7 @@ def check(ctx: ProtoContext) -> list[Finding]:
 Notes:
 
 - `parser_backend = "auto"` prefers `protoc` and falls back to the pure Rust parser when `protoc` is unavailable or fails.
+- Configured extension registries are validated strictly; duplicate extension names or duplicate extendee/field-number declarations fail check startup.
 - The Starlark context exposes typed runtime values such as `ProtoContext`, `FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, `EnumDescriptor`, and `FieldDelta`.
 - The Starlark globals also export annotation-visible type names for those objects, plus a typed `Finding` return object and helper constructors `finding(...)`, `error(...)`, `warning(...)`, and `info(...)`.
 - Enum-like globals are exposed for policy comparisons, including `DeltaKinds.*`, `Severities.*`, `FieldKinds.*`, `FieldLabels.*`, and `ParserBackends.*`.

@@ -34,6 +34,8 @@ def check(ctx: ProtoContext) -> list[Finding]:
         "service_options_changed": "protobuf service options changed for `{}`",
         "method_options_changed": "protobuf method options changed for `{}`",
         "extension_options_changed": "protobuf extension options changed for `{}`",
+        "registered_option_removed": "registered protobuf option `{}` was removed",
+        "registered_option_value_changed": "registered protobuf option value changed for `{}`",
     }
 
     for delta in ctx.deltas:
