@@ -453,3 +453,79 @@ Config keys:
 Severity:
 
 - `error`.
+
+## `protobuf-evolution`
+
+Purpose:
+
+- Flags protobuf schema changes that are likely wire-incompatible across the base and current revisions.
+- Exposes normalized `before`, `after`, and computed `deltas` data to Starlark, and evaluates both the built-in default policy and any repo-local Starlark policy on top of that context.
+
+Config keys:
+
+- `include_globs` (optional array of glob strings, default `["**/*.proto"]`)
+- `severity` (optional default for built-in findings, default `error`)
+- `starlark_path` (optional repo-relative path to a Starlark policy file)
+- `parser_backend` (optional `auto|protoc|pure`, default `auto`)
+- `extension_registries` (optional array of extension-registry declarations)
+
+Per-registry keys:
+
+- `name` (required string)
+- `include_globs` (required array of glob strings)
+
+Configured extension registries are also used to decode registered custom options. Scalar values are typed, repeated packed scalars are unpacked, and message-valued custom options are decoded recursively into nested typed option fields for Starlark policies.
+
+Default built-in Starlark policy currently flags:
+
+- `message_removed`
+- `enum_removed`
+- `field_removed`
+- `field_number_changed`
+- `field_type_changed`
+- `field_label_changed`
+- `enum_value_removed`
+- `enum_value_number_changed`
+
+Example:
+
+```yaml
+checks:
+  - id: protobuf-evolution
+    check: protobuf-evolution
+    config:
+      include_globs:
+        - proto/**/*.proto
+      parser_backend: auto
+      extension_registries:
+        - name: acme-options
+          include_globs:
+            - proto/extensions/**/*.proto
+      starlark_path: tools/checkleft/proto_rules.star
+```
+
+Minimal Starlark policy example:
+
+```python
+def check(ctx: ProtoContext) -> list[Finding]:
+    findings = []
+    for delta in ctx.deltas:
+        if delta.kind == DeltaKinds.field_removed:
+            findings.append(warning(
+                message = "custom protobuf policy saw a removed field",
+                path = delta.path,
+            ))
+    return findings
+```
+
+Notes:
+
+- `parser_backend = "auto"` prefers `protoc` and falls back to the pure Rust parser when `protoc` is unavailable or fails.
+- Configured extension registries are validated strictly; duplicate extension names or duplicate extendee/field-number declarations fail check startup.
+- The Starlark context exposes typed runtime values such as `ProtoContext`, `FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, `EnumDescriptor`, and `FieldDelta`.
+- The Starlark globals also export annotation-visible type names for those objects, plus a typed `Finding` return object and helper constructors `finding(...)`, `error(...)`, `warning(...)`, and `info(...)`.
+- Enum-like globals are exposed for policy comparisons, including `DeltaKinds.*`, `Severities.*`, `FieldKinds.*`, `FieldLabels.*`, and `ParserBackends.*`.
+- Optional fields on runtime values are exposed as real optional values (`T | None`).
+- Descriptor parsing and delta computation remain in Rust; evolution policy decisions now run in Starlark, including the default built-in policy.
+- The built-in check snapshots the full repo proto tree so imports continue to resolve when only part of a schema graph changes.
+- See [Protobuf Starlark](protobuf-starlark.md) for the full typed API and helper surface.

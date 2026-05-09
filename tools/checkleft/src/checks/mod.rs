@@ -7,6 +7,7 @@ mod forbidden_imports_deps;
 mod forbidden_paths;
 mod frontend_no_legacy_api;
 mod ifchange_thenchange;
+mod protobuf_evolution;
 mod repo_visibility;
 mod rust_test_rule_coverage;
 mod todo_expiry;
@@ -31,6 +32,7 @@ pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(file_size::FileSizeCheck)?;
     registry.register(frontend_no_legacy_api::FrontendNoLegacyApiCheck)?;
     registry.register(ifchange_thenchange::IfChangeThenChangeCheck)?;
+    registry.register(protobuf_evolution::ProtobufEvolutionCheck)?;
     registry.register(repo_visibility::RepoVisibilityCheck)?;
     registry.register(rust_test_rule_coverage::RustTestRuleCoverageCheck)?;
     registry.register(todo_expiry::TodoExpiryCheck)?;
