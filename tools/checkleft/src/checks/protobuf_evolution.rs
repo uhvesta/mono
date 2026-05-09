@@ -4718,13 +4718,21 @@ fn details_bool(details: &BTreeMap<String, serde_json::Value>, key: &str) -> Opt
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
-    use std::path::Path;
+    use std::hint::black_box;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::{Duration, Instant};
 
+    use anyhow::anyhow;
+    use starlark::environment::Module;
+    use starlark::eval::Evaluator;
+    use starlark::syntax::{AstModule, Dialect, DialectTypes};
+    use starlark::values::OwnedFrozenValue;
     use tempfile::tempdir;
 
     use crate::check::Check;
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
+    use crate::output::{Finding, Location, Severity};
     use crate::source_tree::LocalSourceTree;
     use crate::vcs::BaseRevision;
 
@@ -5126,6 +5134,164 @@ def check(ctx: ProtoContext) -> list[Finding]:
         assert_eq!(value.message_fields[2].values[1].int_value, Some(9));
         assert_eq!(value.message_fields[3].values[0].kind, "enum");
         assert_eq!(value.message_fields[3].values[0].enum_name, Some("ACTIVE".to_owned()));
+    }
+
+    #[tokio::test]
+    #[ignore = "stress benchmark for manual protobuf evolution profiling"]
+    async fn protobuf_evolution_perf_stress_e2e() {
+        let file_count = env_usize("CHECKLEFT_PROTO_PERF_FILES", 24);
+        let messages_per_file = env_usize("CHECKLEFT_PROTO_PERF_MESSAGES", 10);
+        let fields_per_message = env_usize("CHECKLEFT_PROTO_PERF_FIELDS", 24);
+        let policy_samples = env_usize("CHECKLEFT_PROTO_PERF_POLICY_SAMPLES", 5);
+        let e2e_samples = env_usize("CHECKLEFT_PROTO_PERF_E2E_SAMPLES", 3);
+
+        let policy_context =
+            large_perf_context(file_count, messages_per_file, fields_per_message);
+        let starlark_findings = super::run_starlark_source(
+            super::PERF_POLICY_SOURCE,
+            "<perf>",
+            &policy_context,
+        )
+        .expect("run starlark perf policy");
+        let rust_findings = run_rust_perf_policy(&policy_context);
+        assert_eq!(starlark_findings.len(), rust_findings.len());
+
+        let starlark_policy = measure_sync(policy_samples, || {
+            super::run_starlark_source(super::PERF_POLICY_SOURCE, "<perf>", &policy_context)
+                .expect("run starlark perf policy")
+                .len()
+        });
+        let starlark_parse_only = measure_sync(policy_samples, || {
+            parse_perf_policy(super::PERF_POLICY_SOURCE);
+            1
+        });
+        let frozen_check = compile_perf_policy_check(super::PERF_POLICY_SOURCE);
+        let starlark_call_only = measure_sync(policy_samples, || {
+            call_frozen_perf_policy(&frozen_check, &policy_context)
+                .expect("run frozen starlark perf policy")
+                .len()
+        });
+        let rust_policy = measure_sync(policy_samples, || {
+            run_rust_perf_policy(&policy_context).len()
+        });
+
+        let temp = tempdir().expect("create temp dir");
+        init_git_repo(temp.path());
+        fs::write(temp.path().join("proto_rules.star"), super::PERF_POLICY_SOURCE)
+            .expect("write perf starlark");
+        for file_index in 0..file_count {
+            write_proto(
+                temp.path(),
+                &format!("proto/perf_{file_index:03}.proto"),
+                &stress_proto_file(
+                    file_index,
+                    messages_per_file,
+                    fields_per_message,
+                    true,
+                ),
+            );
+        }
+        git_commit_all(temp.path(), "base");
+        for file_index in 0..file_count {
+            write_proto(
+                temp.path(),
+                &format!("proto/perf_{file_index:03}.proto"),
+                &stress_proto_file(
+                    file_index,
+                    messages_per_file,
+                    fields_per_message,
+                    false,
+                ),
+            );
+        }
+
+        let tree = LocalSourceTree::with_base_revision(
+            temp.path(),
+            Some(BaseRevision::Git("HEAD".to_owned())),
+        )
+        .expect("create tree");
+        let check = ProtobufEvolutionCheck;
+        let configured = check
+            .configure(&toml::Value::Table(toml::toml! {
+                parser_backend = "pure"
+                starlark_path = "proto_rules.star"
+            }))
+            .expect("configure check");
+        let changeset = ChangeSet::new(
+            (0..file_count)
+                .map(|file_index| ChangedFile {
+                    path: Path::new(&format!("proto/perf_{file_index:03}.proto")).to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                })
+                .collect(),
+        );
+
+        let e2e_result = configured
+            .run(&changeset, &tree)
+            .await
+            .expect("run e2e perf check");
+        assert!(!e2e_result.findings.is_empty());
+
+        let mut e2e_durations = Vec::with_capacity(e2e_samples);
+        let mut e2e_sink = 0usize;
+        for _ in 0..e2e_samples {
+            let started_at = Instant::now();
+            let result = configured
+                .run(&changeset, &tree)
+                .await
+                .expect("run e2e perf check");
+            e2e_sink ^= black_box(result.findings.len());
+            e2e_durations.push(started_at.elapsed());
+        }
+        e2e_durations.sort_unstable();
+        black_box(e2e_sink);
+        let e2e_starlark = e2e_durations[e2e_durations.len() / 2];
+
+        println!(
+            "protobuf perf workload: files={file_count} messages_per_file={messages_per_file} fields_per_message={fields_per_message}"
+        );
+        println!(
+            "policy findings: starlark={} rust={} e2e={}",
+            starlark_findings.len(),
+            rust_findings.len(),
+            e2e_result.findings.len()
+        );
+        println!(
+            "{:<24} {:>12}",
+            "starlark-parse",
+            format_duration(starlark_parse_only)
+        );
+        println!(
+            "{:<24} {:>12}",
+            "starlark-policy",
+            format_duration(starlark_policy)
+        );
+        println!(
+            "{:<24} {:>12}",
+            "starlark-call-only",
+            format_duration(starlark_call_only)
+        );
+        println!(
+            "{:<24} {:>12}",
+            "rust-policy",
+            format_duration(rust_policy)
+        );
+        println!(
+            "{:<24} {:>12}",
+            "e2e-starlark",
+            format_duration(e2e_starlark)
+        );
+        println!(
+            "{:<24} {:>11.2}x",
+            "policy-overhead",
+            starlark_policy.as_secs_f64() / rust_policy.as_secs_f64()
+        );
+        println!(
+            "{:<24} {:>11.2}x",
+            "call-overhead",
+            starlark_call_only.as_secs_f64() / rust_policy.as_secs_f64()
+        );
     }
 
     fn init_git_repo(root: &Path) {
@@ -5691,4 +5857,486 @@ def check(ctx: ProtoContext) -> list[Finding]:
             decoded: true,
         }
     }
+
+    fn large_perf_context(
+        file_count: usize,
+        messages_per_file: usize,
+        fields_per_message: usize,
+    ) -> super::StarlarkProtoContext {
+        let mut changed_files = Vec::with_capacity(file_count);
+        let mut before = BTreeMap::new();
+        let mut after = BTreeMap::new();
+
+        for file_index in 0..file_count {
+            let path = format!("proto/perf_{file_index:03}.proto");
+            let package = format!("perf.f{file_index:03}");
+            let before_file =
+                build_perf_flat_file(&path, &package, messages_per_file, fields_per_message, true);
+            let after_file =
+                build_perf_flat_file(&path, &package, messages_per_file, fields_per_message, false);
+            changed_files.push(super::ChangedProtoFile {
+                current_path: Some(PathBuf::from(&path)),
+                base_path: Some(PathBuf::from(&path)),
+                kind: ChangeKind::Modified,
+            });
+            before.insert(path.clone(), before_file);
+            after.insert(path, after_file);
+        }
+
+        super::build_context(
+            &changed_files,
+            &before,
+            &after,
+            &[],
+            super::ParserBackend::Pure,
+            super::ParserBackend::Pure,
+            super::Severity::Warning,
+        )
+    }
+
+    fn build_perf_flat_file(
+        path: &str,
+        package: &str,
+        messages_per_file: usize,
+        fields_per_message: usize,
+        before_version: bool,
+    ) -> super::FlatFileSchema {
+        let mut messages = Vec::with_capacity(messages_per_file);
+        let mut flat_messages = BTreeMap::new();
+        for message_index in 0..messages_per_file {
+            let (message, flat) = build_perf_message(
+                package,
+                &format!("Message{message_index:03}"),
+                fields_per_message,
+                before_version,
+            );
+            flat_messages.insert(message.full_name.clone(), flat);
+            messages.push(message);
+        }
+
+        let options = super::DescriptorOptionsSchema {
+            fingerprint: if before_version { "perf-before" } else { "perf-after" }.to_owned(),
+            has_unknown_fields: false,
+            uninterpreted: Vec::new(),
+            extensions: vec![
+                bool_option_extension("acme.flag", if before_version { "true" } else { "false" }),
+                policy_option_extension(if before_version { "true" } else { "false" }),
+            ],
+        };
+
+        super::FlatFileSchema {
+            file: super::FileSchema {
+                path: path.to_owned(),
+                package: package.to_owned(),
+                syntax: "proto2".to_owned(),
+                options: options.clone(),
+                messages,
+                enums: Vec::new(),
+                services: Vec::new(),
+                extensions: Vec::new(),
+            },
+            messages: flat_messages,
+            enums: BTreeMap::new(),
+            services: BTreeMap::new(),
+            extensions_by_number: BTreeMap::new(),
+            extensions_by_name: BTreeMap::new(),
+        }
+    }
+
+    fn build_perf_message(
+        package: &str,
+        name: &str,
+        fields_per_message: usize,
+        before_version: bool,
+    ) -> (super::MessageSchema, super::FlatMessageSchema) {
+        let full_name = format!("{package}.{name}");
+        let mut fields = Vec::new();
+        for field_index in 1..=fields_per_message {
+            if !before_version && field_index % 9 == 0 {
+                continue;
+            }
+            let (number, kind) = if !before_version && field_index % 7 == 0 {
+                (field_index as i32 + 1000, "string")
+            } else if !before_version && field_index % 5 == 0 {
+                (field_index as i32, "int64")
+            } else {
+                (field_index as i32, "string")
+            };
+            fields.push(perf_field(
+                &format!("{full_name}.field_{field_index:03}"),
+                &format!("field_{field_index:03}"),
+                number,
+                kind,
+                before_version,
+            ));
+        }
+
+        let options = super::DescriptorOptionsSchema {
+            fingerprint: if before_version { "msg-before" } else { "msg-after" }.to_owned(),
+            has_unknown_fields: false,
+            uninterpreted: Vec::new(),
+            extensions: Vec::new(),
+        };
+
+        let fields_by_number = fields
+            .iter()
+            .cloned()
+            .map(|field| (field.number, field))
+            .collect();
+        let fields_by_name = fields
+            .iter()
+            .cloned()
+            .map(|field| (field.name.clone(), field))
+            .collect();
+
+        (
+            super::MessageSchema {
+                full_name: full_name.clone(),
+                name: name.to_owned(),
+                options: options.clone(),
+                is_map_entry: false,
+                fields: fields.clone(),
+                oneofs: Vec::new(),
+                extensions: Vec::new(),
+                reserved_ranges: Vec::new(),
+                reserved_names: Vec::new(),
+                nested_messages: Vec::new(),
+                nested_enums: Vec::new(),
+            },
+            super::FlatMessageSchema {
+                full_name,
+                fields_by_number,
+                fields_by_name,
+                oneofs_by_name: BTreeMap::new(),
+                extensions_by_number: BTreeMap::new(),
+                extensions_by_name: BTreeMap::new(),
+                reserved_ranges: BTreeSet::new(),
+                reserved_names: BTreeSet::new(),
+                options,
+                is_map_entry: false,
+            },
+        )
+    }
+
+    fn perf_field(
+        full_name: &str,
+        name: &str,
+        number: i32,
+        kind: &str,
+        before_version: bool,
+    ) -> super::FieldSchema {
+        super::FieldSchema {
+            full_name: full_name.to_owned(),
+            name: name.to_owned(),
+            number,
+            label: "optional".to_owned(),
+            kind: kind.to_owned(),
+            type_name: None,
+            json_name: None,
+            oneof_index: None,
+            oneof_name: None,
+            proto3_optional: false,
+            extendee: None,
+            options: super::DescriptorOptionsSchema {
+                fingerprint: if before_version { "field-before" } else { "field-after" }.to_owned(),
+                has_unknown_fields: false,
+                uninterpreted: Vec::new(),
+                extensions: Vec::new(),
+            },
+        }
+    }
+
+    fn stress_proto_file(
+        file_index: usize,
+        messages_per_file: usize,
+        fields_per_message: usize,
+        before_version: bool,
+    ) -> String {
+        let mut output = format!("syntax = \"proto2\";\npackage perf.f{file_index:03};\n\n");
+        for message_index in 0..messages_per_file {
+            output.push_str(&format!("message Message{message_index:03} {{\n"));
+            for field_index in 1..=fields_per_message {
+                if !before_version && field_index % 9 == 0 {
+                    continue;
+                }
+                let (number, kind) = if !before_version && field_index % 7 == 0 {
+                    (field_index + 1000, "string")
+                } else if !before_version && field_index % 5 == 0 {
+                    (field_index, "int64")
+                } else {
+                    (field_index, "string")
+                };
+                output.push_str(&format!(
+                    "  optional {kind} field_{field_index:03} = {number};\n"
+                ));
+            }
+            output.push_str("}\n\n");
+        }
+        output
+    }
+
+    fn run_rust_perf_policy(context: &super::StarlarkProtoContext) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        for delta in &context.deltas {
+            if matches!(
+                delta.kind.as_str(),
+                "field_removed"
+                    | "field_number_changed"
+                    | "field_type_changed"
+                    | "registered_option_value_changed"
+            ) {
+                findings.push(Finding {
+                    severity: Severity::Warning,
+                    message: format!("perf delta {}", delta.symbol),
+                    location: Some(Location {
+                        path: PathBuf::from(&delta.path),
+                        line: None,
+                        column: None,
+                    }),
+                    remediation: Some(super::DEFAULT_PROTOBUF_EVOLUTION_REMEDIATION.to_owned()),
+                    suggested_fix: None,
+                });
+            }
+        }
+
+        for file_pair in &context.files {
+            let target = file_pair.after.as_ref().or(file_pair.before.as_ref());
+            let Some(target) = target else {
+                continue;
+            };
+            if let Some(policy) = find_option_extension(&target.options, "acme.policy") {
+                if bool_option_field_schema(&target.options, "acme.policy", "enabled") == Some(true)
+                    && option_field_string_schema(&target.options, "acme.policy", "nested.owner")
+                        == Some("ops")
+                    && option_descendant_count_schema(policy) >= 3
+                {
+                    findings.push(Finding {
+                        severity: Severity::Info,
+                        message: format!("option policy {}", target.path),
+                        location: Some(Location {
+                            path: PathBuf::from(&file_pair.path),
+                            line: None,
+                            column: None,
+                        }),
+                        remediation: None,
+                        suggested_fix: None,
+                    });
+                }
+            }
+
+            for message in &target.messages {
+                for field in &message.fields {
+                    if field.kind == "string" && field.number % 11 == 0 {
+                        findings.push(Finding {
+                            severity: Severity::Info,
+                            message: format!("field sample {}", field.full_name),
+                            location: Some(Location {
+                                path: PathBuf::from(&file_pair.path),
+                                line: None,
+                                column: None,
+                            }),
+                            remediation: None,
+                            suggested_fix: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        findings
+    }
+
+    fn find_option_extension<'a>(
+        options: &'a super::DescriptorOptionsSchema,
+        full_name: &str,
+    ) -> Option<&'a super::OptionExtensionSchema> {
+        options
+            .extensions
+            .iter()
+            .find(|extension| extension.full_name == full_name)
+    }
+
+    fn bool_option_field_schema(
+        options: &super::DescriptorOptionsSchema,
+        full_name: &str,
+        field_path: &str,
+    ) -> Option<bool> {
+        option_field_values_schema(options, full_name, field_path)
+            .into_iter()
+            .find_map(|value| value.bool_value)
+    }
+
+    fn option_field_string_schema<'a>(
+        options: &'a super::DescriptorOptionsSchema,
+        full_name: &str,
+        field_path: &str,
+    ) -> Option<&'a str> {
+        option_field_values_schema(options, full_name, field_path)
+            .into_iter()
+            .find_map(|value| value.string_value.as_deref())
+    }
+
+    fn option_field_values_schema<'a>(
+        options: &'a super::DescriptorOptionsSchema,
+        full_name: &str,
+        field_path: &str,
+    ) -> Vec<&'a super::OptionValueSchema> {
+        let mut values = options
+            .extensions
+            .iter()
+            .filter(|extension| extension.full_name == full_name)
+            .flat_map(|extension| extension.values.iter())
+            .collect::<Vec<_>>();
+        for segment in field_path.split('.').filter(|segment| !segment.is_empty()) {
+            let mut next = Vec::new();
+            for value in values {
+                for field in &value.message_fields {
+                    if field.name == segment {
+                        next.extend(field.values.iter());
+                    }
+                }
+            }
+            values = next;
+        }
+        values
+    }
+
+    fn option_descendant_count_schema(extension: &super::OptionExtensionSchema) -> usize {
+        extension
+            .values
+            .iter()
+            .map(option_value_descendant_count_schema)
+            .sum()
+    }
+
+    fn option_value_descendant_count_schema(value: &super::OptionValueSchema) -> usize {
+        value.message_fields.len()
+            + value
+                .message_fields
+                .iter()
+                .map(option_field_descendant_count_schema)
+                .sum::<usize>()
+    }
+
+    fn option_field_descendant_count_schema(field: &super::OptionFieldSchema) -> usize {
+        field.values
+            .iter()
+            .map(option_value_descendant_count_schema)
+            .sum()
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn measure_sync<F>(samples: usize, mut run: F) -> Duration
+    where
+        F: FnMut() -> usize,
+    {
+        let mut durations = Vec::with_capacity(samples);
+        let mut sink = 0usize;
+        for _ in 0..samples {
+            let started_at = Instant::now();
+            sink ^= black_box(run());
+            durations.push(started_at.elapsed());
+        }
+        durations.sort_unstable();
+        black_box(sink);
+        durations[durations.len() / 2]
+    }
+
+    fn format_duration(duration: Duration) -> String {
+        if duration.as_secs() >= 1 {
+            format!("{:.2}s", duration.as_secs_f64())
+        } else if duration.as_millis() >= 1 {
+            format!("{:.1}ms", duration.as_secs_f64() * 1_000.0)
+        } else {
+            format!("{:.1}us", duration.as_secs_f64() * 1_000_000.0)
+        }
+    }
+
+    fn parse_perf_policy(source: &str) {
+        let dialect = Dialect {
+            enable_types: DialectTypes::Enable,
+            ..Dialect::Standard
+        };
+        AstModule::parse("<perf>", source.to_owned(), &dialect).expect("parse perf policy");
+    }
+
+    fn compile_perf_policy_check(source: &str) -> OwnedFrozenValue {
+        let dialect = Dialect {
+            enable_types: DialectTypes::Enable,
+            ..Dialect::Standard
+        };
+        let ast = AstModule::parse("<perf>", source.to_owned(), &dialect)
+            .expect("parse perf policy");
+        let globals = super::protobuf_starlark_globals();
+        let module = Module::new();
+        let mut evaluator = Evaluator::new(&module);
+        evaluator
+            .eval_module(ast, &globals)
+            .expect("eval perf policy module");
+        drop(evaluator);
+        let frozen = module.freeze().expect("freeze perf policy module");
+        frozen.get("check").expect("get perf check function")
+    }
+
+    fn call_frozen_perf_policy(
+        check: &OwnedFrozenValue,
+        context: &super::StarlarkProtoContext,
+    ) -> anyhow::Result<Vec<Finding>> {
+        let module = Module::new();
+        let mut evaluator = Evaluator::new(&module);
+        let check = check.owned_value(module.frozen_heap());
+        let ctx = module.heap().alloc(context.clone().into_proto_context_value());
+        let value = evaluator
+            .eval_function(check, &[ctx], &[])
+            .map_err(|error| anyhow!(error.to_string()))?;
+        super::unpack_starlark_findings(value)
+    }
 }
+
+#[cfg(test)]
+const PERF_POLICY_SOURCE: &str = r#"
+def check(ctx: ProtoContext) -> list[Finding]:
+    findings = []
+    for delta in ctx.deltas:
+        if (
+            delta.kind == DeltaKinds.field_removed
+            or delta.kind == DeltaKinds.field_number_changed
+            or delta.kind == DeltaKinds.field_type_changed
+            or delta.kind == DeltaKinds.registered_option_value_changed
+        ):
+            findings.append(finding_for_delta(
+                ctx,
+                delta,
+                "perf delta {}".format(delta.symbol),
+                severity = Severities.warning,
+            ))
+
+    for file_pair in ctx.files:
+        target = file_pair.after if file_pair.after != None else file_pair.before
+        if target == None:
+            continue
+        if has_option(target.options, "acme.policy"):
+            descendants = option_descendants(option_extensions(target.options, "acme.policy")[0])
+            owners = option_field_values(target.options, "acme.policy", "nested.owner")
+            enabled = bool_option_field(target.options, "acme.policy", "enabled")
+            if enabled and owners and owners[0].string_value == "ops" and len(descendants) >= 3:
+                findings.append(info(
+                    message = "option policy {}".format(target.path),
+                    path = file_pair.path,
+                ))
+        for message in target.messages:
+            for field in message.fields:
+                if field.kind == FieldKinds.string and field.number % 11 == 0:
+                    findings.append(info(
+                        message = "field sample {}".format(field.full_name),
+                        path = file_pair.path,
+                    ))
+    return findings
+"#;
