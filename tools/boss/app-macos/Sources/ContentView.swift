@@ -604,9 +604,16 @@ struct ContentView: View {
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 if model.workBoardGrouping == .project {
-                    Text(section.title)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(section.title)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        if let projectID = section.projectID,
+                           let project = model.project(withID: projectID) {
+                            ProjectDesignDocAffordance(model: model, project: project)
+                        }
+                    }
                 }
                 workSectionItems(section.items, column: column)
             }
@@ -1110,6 +1117,116 @@ struct WorkBoardCardView: View {
             return .orange
         }
         return Color(nsColor: .separatorColor)
+    }
+}
+
+/// Per-project "open the design doc" affordance for the kanban
+/// project-section header. Icon variant is keyed off
+/// [[ProjectDesignDocState]] (hidden / plain doc icon / warning glyph),
+/// click handler is the engine-resolved open dispatch on
+/// [[ChatViewModel.openProjectDesignDoc(_:)]]. The view stays empty
+/// when no state has been resolved yet so cards don't flash a stale
+/// affordance while the first `ResolveProjectDesignDoc` is in flight.
+struct ProjectDesignDocAffordance: View {
+    @ObservedObject var model: ChatViewModel
+    let project: WorkProject
+
+    var body: some View {
+        if let presentation = ProjectDesignDocAffordancePresentation.from(
+            state: model.designDocStateByProjectID[project.id] ?? .notSet
+        ) {
+            Button {
+                model.openProjectDesignDoc(project)
+            } label: {
+                Image(systemName: presentation.systemImage)
+                    .font(.caption)
+                    .foregroundStyle(presentation.tint)
+                    .accessibilityLabel(presentation.accessibilityLabel)
+            }
+            .buttonStyle(.plain)
+            .help(presentation.tooltip)
+        }
+    }
+}
+
+/// Pure-data presentation chosen for a `ProjectDesignDocState`. Lives
+/// outside the view so tests can assert "this state renders this
+/// icon" without spinning up a SwiftUI host — the kanban view is a
+/// thin reflection of these fields.
+struct ProjectDesignDocAffordancePresentation: Equatable {
+    let systemImage: String
+    let tooltip: String
+    let accessibilityLabel: String
+    let kind: Kind
+
+    enum Kind: Equatable {
+        case resolved
+        case broken
+    }
+
+    var tint: Color {
+        switch kind {
+        case .resolved:
+            return .secondary
+        case .broken:
+            return .orange
+        }
+    }
+
+    /// Map a `ProjectDesignDocState` to its kanban presentation. Returns
+    /// `nil` for `.notSet` so the kanban hides the affordance entirely
+    /// — the design doc spec (Q3) wants no icon when the pointer is
+    /// unset, distinct from the warning glyph used for broken pointers.
+    static func from(state: ProjectDesignDocState) -> ProjectDesignDocAffordancePresentation? {
+        switch state {
+        case .notSet:
+            return nil
+        case .resolved(let resolved, _, _):
+            let repoBase = repoBasename(from: resolved.repoRemoteURL)
+            let tooltip = "\(repoBase):\(resolved.path)"
+            return ProjectDesignDocAffordancePresentation(
+                systemImage: "doc.text",
+                tooltip: tooltip,
+                accessibilityLabel: "Open design doc",
+                kind: .resolved
+            )
+        case .broken(let reason):
+            return ProjectDesignDocAffordancePresentation(
+                systemImage: "exclamationmark.triangle",
+                tooltip: "Design doc pointer is broken: \(reason)",
+                accessibilityLabel: "Design doc pointer is broken",
+                kind: .broken
+            )
+        }
+    }
+
+    /// Pull the `owner/repo` slug out of a GitHub URL for the hover
+    /// tooltip. Falls back to the raw URL when the path isn't
+    /// recognisable so we never render an empty `:path`. Handles
+    /// both `https://github.com/foo/bar.git` and SCP-style
+    /// `git@github.com:foo/bar.git` — `URL(string:)` accepts the
+    /// SCP form on macOS but treats `git@github.com` as the scheme
+    /// and leaves `path` empty, so the scheme check below routes
+    /// scheme-less inputs through the colon-split branch.
+    private static func repoBasename(from repoURL: String) -> String {
+        if let url = URL(string: repoURL), url.host != nil {
+            let parts = url.path
+                .split(separator: "/", omittingEmptySubsequences: true)
+                .map(String.init)
+            if parts.count >= 2 {
+                let owner = parts[0]
+                let repo = parts[1].hasSuffix(".git")
+                    ? String(parts[1].dropLast(4))
+                    : parts[1]
+                return "\(owner)/\(repo)"
+            }
+        }
+        if let scpRange = repoURL.range(of: ":") {
+            let path = String(repoURL[scpRange.upperBound...])
+            let trimmed = path.hasSuffix(".git") ? String(path.dropLast(4)) : path
+            return trimmed
+        }
+        return repoURL
     }
 }
 

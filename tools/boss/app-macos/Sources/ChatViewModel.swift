@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(AppKit)
+import AppKit
+#endif
 
 @MainActor
 final class ChatViewModel: ObservableObject {
@@ -84,6 +87,15 @@ final class ChatViewModel: ObservableObject {
     /// in sync via `live_status_enabled_set` echoes. Persisted on
     /// the engine side so this is purely a UI mirror.
     @Published var liveStatusDisabledSlotIDs: Set<Int> = []
+
+    /// Resolved design-doc pointer state per project. Populated lazily
+    /// when a project surface (kanban project header, future detail
+    /// view) calls `resolveProjectDesignDoc(_:)`; refreshed whenever
+    /// the engine pushes a fresh `WorkTree` so a re-pointing or unset
+    /// from another session lands in the icon without a manual reload.
+    /// A missing entry means "we haven't asked yet" — the affordance
+    /// stays hidden until the engine replies.
+    @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
 
     /// Toggle the live-status summarizer for `slotId`. Sends the
     /// RPC and optimistically updates local state; the engine echo
@@ -640,6 +652,50 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// Ask the engine to resolve the design-doc pointer for every
+    /// project whose row carries a non-nil `designDocPath`. Projects
+    /// with no pointer set are skipped so the engine doesn't burn an
+    /// RPC just to be told `not_set` — the affordance is hidden in
+    /// that case anyway. Re-issued on every `WorkTree` so a re-point
+    /// landed in another session flows through to the icon.
+    func refreshDesignDocStates(for projects: [WorkProject]) {
+        guard isConnected else { return }
+        for project in projects where project.designDocPath != nil {
+            engine.sendResolveProjectDesignDoc(projectID: project.id)
+        }
+    }
+
+    /// Open the design-doc pointer for `project`. Dispatch follows
+    /// `ProjectDesignDocState`:
+    ///
+    /// - `.notSet` — affordance shouldn't have been clickable. No-op.
+    /// - `.broken` — surface the engine's reason as a work error so
+    ///   the user can re-point. The renderer / re-point sheet are
+    ///   tracked separately (design Q5 / Q9).
+    /// - `.resolved` — open the GitHub web URL. The in-app renderer
+    ///   for project pointers is a follow-up (Q9 — `case .projectPointer`
+    ///   on `DesignRendererView` lands once `design-producing-tasks`
+    ///   ships its renderer); until then the web URL is the universal
+    ///   fast path, and the kind discriminator stays load-bearing for
+    ///   when the renderer arrives.
+    func openProjectDesignDoc(_ project: WorkProject) {
+        let state = designDocStateByProjectID[project.id] ?? .notSet
+        switch state {
+        case .notSet:
+            return
+        case .broken(let reason):
+            workErrorMessage = "Design doc pointer is broken: \(reason)"
+        case .resolved(_, _, let webURL):
+            guard let url = URL(string: webURL) else {
+                workErrorMessage = "Design doc URL could not be parsed: \(webURL)"
+                return
+            }
+            #if canImport(AppKit)
+            NSWorkspace.shared.open(url)
+            #endif
+        }
+    }
+
     // MARK: - Event Handling
 
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
@@ -780,6 +836,7 @@ final class ChatViewModel: ObservableObject {
             dependenciesByProductID[product.id] = dependencies
             reconcileWorkSelection()
             refreshWorkSubscriptions()
+            refreshDesignDocStates(for: projects)
             workErrorMessage = nil
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
@@ -812,6 +869,8 @@ final class ChatViewModel: ObservableObject {
             } else {
                 liveStatusDisabledSlotIDs.insert(slotId)
             }
+        case .projectDesignDocResolved(let output):
+            designDocStateByProjectID[output.projectID] = output.state
         }
     }
 
@@ -879,7 +938,11 @@ final class ChatViewModel: ObservableObject {
         products.first { $0.id == id }
     }
 
-    private func project(withID id: String) -> WorkProject? {
+    /// Lookup a project row by id across every product the model has
+    /// loaded. Non-private so view code (the kanban project-card
+    /// affordance) can resolve a section's `projectID` to a full
+    /// `WorkProject` without re-walking the projects map itself.
+    func project(withID id: String) -> WorkProject? {
         for projects in projectsByProductID.values {
             if let project = projects.first(where: { $0.id == id }) {
                 return project
@@ -969,7 +1032,13 @@ final class ChatViewModel: ObservableObject {
 
         return grouped.keys.sorted().compactMap { key in
             guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
-            return WorkBoardSection(id: "\(column.rawValue)-\(key)", title: key, items: sectionItems)
+            let projectID = sectionItems.first(where: { !$0.isChore })?.projectID
+            return WorkBoardSection(
+                id: "\(column.rawValue)-\(key)",
+                title: key,
+                items: sectionItems,
+                projectID: projectID
+            )
         }
     }
 

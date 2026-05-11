@@ -112,6 +112,10 @@ enum EngineEvent {
     /// uses this to confirm the engine accepted the change before
     /// flipping local state.
     case liveStatusEnabledSet(slotId: Int, enabled: Bool)
+    /// Engine reply to a `ResolveProjectDesignDoc` RPC. Carries the
+    /// per-project `ProjectDesignDocState` the kanban consumes to
+    /// pick the right icon affordance and open dispatch.
+    case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -307,6 +311,19 @@ final class EngineClient: @unchecked Sendable {
     func sendRegisterAppSession() {
         sendLine([
             "type": "register_app_session",
+        ])
+    }
+
+    /// Resolve a project's design-doc pointer. Engine replies with
+    /// `project_design_doc_resolved` carrying a
+    /// `ResolveProjectDesignDocOutput` whose `state` discriminator
+    /// drives the kanban affordance and the open dispatcher. No DB
+    /// writes; no topic events — callers can re-issue lazily as cards
+    /// scroll into view without polluting the work tree.
+    func sendResolveProjectDesignDoc(projectID: String) {
+        sendLine([
+            "type": "resolve_project_design_doc",
+            "project_id": projectID,
         ])
     }
 
@@ -672,6 +689,18 @@ final class EngineClient: @unchecked Sendable {
                 let slotId = (payload["slot_id"] as? NSNumber)?.intValue ?? 0
                 let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
                 emit(.liveStatusEnabledSet(slotId: slotId, enabled: enabled))
+            case "project_design_doc_resolved":
+                guard let outputPayload = payload["output"] as? [String: Any],
+                      let outputData = try? JSONSerialization.data(withJSONObject: outputPayload),
+                      let output = try? JSONDecoder().decode(
+                        ResolveProjectDesignDocOutput.self,
+                        from: outputData
+                      )
+                else {
+                    emit(.error(message: "received invalid project_design_doc_resolved payload"))
+                    break
+                }
+                emit(.projectDesignDocResolved(output: output))
             default:
                 break
             }
