@@ -6,9 +6,9 @@ use crate::types::{
     AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRunInput, CreateTaskInput, DependencyFilter, ListDependenciesInput, Product, Project,
-    RemoveDependencyInput, RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch, WorkRun,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -344,6 +344,26 @@ pub enum FrontendRequest {
     /// summarizer disabled. The UI uses this to render the toggle
     /// state on the Agents-tab worker row.
     ListLiveStatusDisabledSlots,
+    /// Set (or clear) a project's design-doc pointer. Persists the
+    /// three `projects.design_doc_*` columns per
+    /// [`SetProjectDesignDocInput`]'s semantics and replies with the
+    /// updated `Project` row wrapped in a `WorkItemUpdated` event —
+    /// same shape `UpdateWorkItem` returns for any other property
+    /// edit, so existing kanban subscribers refresh without special
+    /// casing. Publishes a `work_invalidated` topic event on the
+    /// project's product so other connected clients see the change.
+    SetProjectDesignDoc {
+        #[serde(flatten)]
+        input: SetProjectDesignDocInput,
+    },
+    /// Read-only: resolve a project's design-doc pointer into the
+    /// structured [`ResolveProjectDesignDocOutput`] the UI consumes.
+    /// Engine-side this is `WorkDb::resolve_project_design_doc`
+    /// composed with a cheap check against the engine's in-flight
+    /// execution list to populate
+    /// [`ProjectDesignDocState::Resolved::local_workspace_available`].
+    /// No DB writes; no topic events.
+    ResolveProjectDesignDoc { project_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -604,6 +624,14 @@ pub enum FrontendEvent {
     /// state on the Agents-tab worker row.
     LiveStatusDisabledSlotsList {
         slot_ids: Vec<u8>,
+    },
+    /// Response to [`FrontendRequest::ResolveProjectDesignDoc`]: the
+    /// resolved pointer state for a single project. Carried inline
+    /// (not flattened) so the kanban can deserialise straight into a
+    /// `ResolveProjectDesignDocOutput` without going through the
+    /// envelope.
+    ProjectDesignDocResolved {
+        output: ResolveProjectDesignDocOutput,
     },
 }
 

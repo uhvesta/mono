@@ -13,9 +13,11 @@ use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
     AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
-    FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project, RemoveDependencyInput,
-    Task, TopicEventPayload, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch, work_product_topic,
+    FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
+    ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TopicEventPayload, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    work_product_topic,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -1363,6 +1365,257 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     // plus the auto-created design task — 5 total. The bad batch
     // rolled back, so no extra rows leaked.
     assert_eq!(listed_after.len(), 5, "rollback must not leak rows");
+
+    Ok(())
+}
+
+async fn set_project_design_doc(
+    client: &mut BossClient,
+    input: SetProjectDesignDocInput,
+) -> Result<Project> {
+    match client
+        .send_request(&FrontendRequest::SetProjectDesignDoc { input })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_project(item),
+        other => Err(unexpected_event("set project design doc", other)),
+    }
+}
+
+async fn resolve_project_design_doc(
+    client: &mut BossClient,
+    project_id: &str,
+) -> Result<ResolveProjectDesignDocOutput> {
+    match client
+        .send_request(&FrontendRequest::ResolveProjectDesignDoc {
+            project_id: project_id.to_owned(),
+        })
+        .await?
+    {
+        FrontendEvent::ProjectDesignDocResolved { output } => Ok(output),
+        other => Err(unexpected_event("resolve project design doc", other)),
+    }
+}
+
+/// Acceptance criterion for chore #5 of the project-design-doc-pointer
+/// design: a CLI-style client sets a project's design-doc pointer, a
+/// second resolve call returns the same triple wrapped in
+/// `ResolveProjectDesignDocOutput`, and the resolution semantics
+/// (same-product vs external classification, branch defaults, broken
+/// pointer when the product has no `repo_remote_url`) all round-trip
+/// through the wire layer correctly.
+#[tokio::test]
+async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // ----- in-repo (same-product) case --------------------------------------
+    let mono = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Mono".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: mono.id.clone(),
+            name: "Pointer".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+        },
+    )
+    .await?;
+
+    // Fresh project: no pointer set → resolver answers `NotSet`.
+    let initial = resolve_project_design_doc(&mut client, &project.id).await?;
+    assert_eq!(initial.project_id, project.id);
+    assert!(matches!(initial.state, ProjectDesignDocState::NotSet));
+
+    // CLI sets the pointer with just a path; repo/branch inherit from
+    // the product. The returned `WorkItemUpdated` carries the persisted
+    // `Project` so the kanban can refresh without an extra round-trip.
+    let updated = set_project_design_doc(
+        &mut client,
+        SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_path: Some("tools/boss/docs/designs/pointer.md".to_owned()),
+            ..SetProjectDesignDocInput::default()
+        },
+    )
+    .await?;
+    assert_eq!(updated.id, project.id);
+    assert_eq!(
+        updated.design_doc_path.as_deref(),
+        Some("tools/boss/docs/designs/pointer.md"),
+    );
+    assert!(updated.design_doc_repo_remote_url.is_none());
+    assert!(updated.design_doc_branch.is_none());
+
+    // Resolve: same-product (the path inherits the product's repo),
+    // branch defaults to `main`, web URL is rendered for the kanban
+    // tooltip.
+    let resolved = resolve_project_design_doc(&mut client, &project.id).await?;
+    assert_eq!(resolved.project_id, project.id);
+    match resolved.state {
+        ProjectDesignDocState::Resolved {
+            resolved,
+            local_workspace_available,
+            web_url,
+        } => {
+            assert_eq!(resolved.repo_remote_url, "git@github.com:spinyfin/mono.git");
+            assert_eq!(resolved.branch, "main");
+            assert_eq!(resolved.path, "tools/boss/docs/designs/pointer.md");
+            assert_eq!(
+                resolved.kind,
+                ResolvedDesignDocKind::SameProduct {
+                    product_id: mono.id.clone()
+                },
+            );
+            // No worker has leased a workspace in this test process,
+            // so `local_workspace_available` is `false` — matches the
+            // engine-side closure that queries in-flight executions.
+            assert!(!local_workspace_available);
+            assert!(
+                web_url.contains("spinyfin/mono"),
+                "web_url should reference the resolved repo: {web_url}",
+            );
+            assert!(
+                web_url.contains("tools/boss/docs/designs/pointer.md"),
+                "web_url should embed the resolved path: {web_url}",
+            );
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+
+    // ----- separate-repo (external) case ------------------------------------
+    // Override the pointer to point at a doc-repo that isn't a tracked
+    // product. Branch override survives the round-trip; the resolver
+    // classifies the repo as `External` because no other `products` row
+    // matches.
+    let external_url = "https://github.com/myorg/wiki.git".to_owned();
+    let external_update = set_project_design_doc(
+        &mut client,
+        SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some(external_url.clone()),
+            design_doc_branch: Some("trunk".to_owned()),
+            design_doc_path: Some("designs/pointer.md".to_owned()),
+            ..SetProjectDesignDocInput::default()
+        },
+    )
+    .await?;
+    assert_eq!(
+        external_update.design_doc_repo_remote_url.as_deref(),
+        Some(external_url.as_str()),
+    );
+    assert_eq!(external_update.design_doc_branch.as_deref(), Some("trunk"));
+
+    let resolved_external = resolve_project_design_doc(&mut client, &project.id).await?;
+    match resolved_external.state {
+        ProjectDesignDocState::Resolved { resolved, .. } => {
+            assert_eq!(resolved.repo_remote_url, external_url);
+            assert_eq!(resolved.branch, "trunk");
+            assert_eq!(resolved.path, "designs/pointer.md");
+            assert_eq!(resolved.kind, ResolvedDesignDocKind::External);
+        }
+        other => panic!("expected Resolved (external), got {other:?}"),
+    }
+
+    // ----- unset path -------------------------------------------------------
+    let cleared = set_project_design_doc(
+        &mut client,
+        SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            unset: true,
+            ..SetProjectDesignDocInput::default()
+        },
+    )
+    .await?;
+    assert!(cleared.design_doc_path.is_none());
+    assert!(cleared.design_doc_repo_remote_url.is_none());
+    assert!(cleared.design_doc_branch.is_none());
+    let resolved_cleared = resolve_project_design_doc(&mut client, &project.id).await?;
+    assert!(matches!(
+        resolved_cleared.state,
+        ProjectDesignDocState::NotSet,
+    ));
+
+    // ----- broken pointer (path set, no repo available) --------------------
+    // A product without a `repo_remote_url` and a project whose pointer
+    // sets only the path can't be resolved — surface as `Broken` per
+    // design Q5.
+    let no_repo = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "NoRepo".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    let orphan = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: no_repo.id.clone(),
+            name: "Orphan".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+        },
+    )
+    .await?;
+    set_project_design_doc(
+        &mut client,
+        SetProjectDesignDocInput {
+            project_id: orphan.id.clone(),
+            design_doc_path: Some("docs/orphan.md".to_owned()),
+            ..SetProjectDesignDocInput::default()
+        },
+    )
+    .await?;
+    let resolved_broken = resolve_project_design_doc(&mut client, &orphan.id).await?;
+    match resolved_broken.state {
+        ProjectDesignDocState::Broken { reason } => {
+            assert!(
+                reason.contains("repo"),
+                "broken reason should name the missing repo column: {reason}",
+            );
+        }
+        other => panic!("expected Broken, got {other:?}"),
+    }
+
+    // ----- validation error surfaces as WorkError --------------------------
+    // Q8: paths must be repo-relative markdown — feed the engine a
+    // path traversal and confirm the validator's error rides back on
+    // the wire as a `WorkError` (rather than crashing the connection
+    // or returning a half-applied write).
+    match client
+        .send_request(&FrontendRequest::SetProjectDesignDoc {
+            input: SetProjectDesignDocInput {
+                project_id: project.id.clone(),
+                design_doc_path: Some("../escape.md".to_owned()),
+                ..SetProjectDesignDocInput::default()
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains(".."),
+                "validation error should mention the bad segment: {message}",
+            );
+        }
+        other => return Err(unexpected_event("expected WorkError", other)),
+    }
+
+    // The rejected write must not have touched the row.
+    let after_reject = resolve_project_design_doc(&mut client, &project.id).await?;
+    assert!(matches!(after_reject.state, ProjectDesignDocState::NotSet));
 
     Ok(())
 }
