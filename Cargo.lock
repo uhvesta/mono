@@ -203,6 +203,7 @@ dependencies = [
  "clap",
  "fastrand 2.3.0",
  "libc",
+ "regex",
  "reqwest",
  "rusqlite",
  "rustls",
