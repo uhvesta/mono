@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal, Read, Write};
-use std::process::ExitCode;
+use std::path::PathBuf;
+use std::process::{Command, ExitCode};
 
 use anyhow::Result;
 use boss_client::{
@@ -10,8 +11,9 @@ use boss_protocol::{
     AddDependencyInput, CREATED_VIA_CLI, CreateChoreInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
     DependencyDirection, DependencyEdge, DependencyFilter, FrontendEvent, FrontendRequest,
-    ListDependenciesInput, Product, Project, RemoveDependencyInput, Task, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    ListDependenciesInput, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProjectDesignDocInput, Task,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -106,6 +108,19 @@ enum ProjectCommand {
     /// Move a project into a different lifecycle status
     /// (planned/active/blocked/done/archived).
     Move(ProjectMoveArgs),
+    /// Set or clear a project's design-doc pointer. `--path` sets the
+    /// repo-relative doc path; `--repo` and `--branch` are optional
+    /// overrides that fall back to the product's defaults. `--unset`
+    /// clears all three pointer columns.
+    #[command(name = "set-design-doc")]
+    SetDesignDoc(ProjectSetDesignDocArgs),
+    /// Resolve a project's design-doc pointer and open it. Default
+    /// behaviour: if the doc lives in the project's own product and a
+    /// workspace is leased, open the file in `$EDITOR`; otherwise open
+    /// the GitHub web URL. `--web` forces the web URL; `--print` just
+    /// emits the resolved target without opening it.
+    #[command(name = "open-design")]
+    OpenDesign(ProjectOpenDesignArgs),
     /// Manage dependency edges (`A depends on B` ⇒ B gates A).
     Depend {
         #[command(subcommand)]
@@ -381,6 +396,62 @@ struct ProjectUpdateArgs {
 
     #[arg(long)]
     priority: Option<ProjectPriority>,
+}
+
+/// Args for `boss project set-design-doc`. Either `--path` (with
+/// optional `--repo` / `--branch`) or `--unset` must be supplied;
+/// clap enforces mutual exclusion for the conflict cases and the
+/// handler rejects the empty case at runtime.
+#[derive(Debug, Clone, Args)]
+struct ProjectSetDesignDocArgs {
+    #[arg(long)]
+    product: Option<String>,
+
+    selector: String,
+
+    /// Repo-relative path to the design doc (e.g.
+    /// `tools/boss/docs/designs/foo.md`). Must end in `.md` /
+    /// `.markdown`; absolute paths and `..` segments are rejected
+    /// engine-side.
+    #[arg(long, conflicts_with = "unset")]
+    path: Option<String>,
+
+    /// Override the repo URL the doc lives in. Omit to inherit from
+    /// the project's product (the same-repo case).
+    #[arg(long, requires = "path", conflicts_with = "unset")]
+    repo: Option<String>,
+
+    /// Override the branch the doc lives on. Omit to inherit from
+    /// the product's docs branch (or `main`).
+    #[arg(long, requires = "path", conflicts_with = "unset")]
+    branch: Option<String>,
+
+    /// Clear all three pointer columns. Mutually exclusive with
+    /// `--path` / `--repo` / `--branch`.
+    #[arg(long)]
+    unset: bool,
+}
+
+/// Args for `boss project open-design`. `--web` forces the GitHub
+/// web URL; `--print` emits the resolved target without launching
+/// anything. Both flags can combine — `--web --print` prints the
+/// web URL.
+#[derive(Debug, Clone, Args)]
+struct ProjectOpenDesignArgs {
+    #[arg(long)]
+    product: Option<String>,
+
+    selector: String,
+
+    /// Skip the same-product / workspace fast path and always emit
+    /// the GitHub web URL.
+    #[arg(long)]
+    web: bool,
+
+    /// Don't launch anything; print the resolved target to stdout
+    /// instead. Combine with `--web` to print the web URL.
+    #[arg(long)]
+    print: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1203,11 +1274,19 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 },
             )
             .await?;
+            let design_doc = resolve_project_design_doc(&mut client, &project.id).await?;
             print_entity(
                 ctx,
-                &serde_json::json!({ "project": project, "dependencies": detail }),
+                &serde_json::json!({
+                    "project": project,
+                    "dependencies": detail,
+                    "design_doc": design_doc,
+                }),
                 || {
                     print_project_details("Project", &project);
+                    if let Some(line) = format_project_design_doc_line(&design_doc.state) {
+                        println!("Design doc: {line}");
+                    }
                     print_dependency_section(&detail);
                 },
             )
@@ -1273,6 +1352,67 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             print_entity(ctx, &serde_json::json!({ "project": moved }), || {
                 print_project_details("Moved project", &moved);
             })
+        }
+        ProjectCommand::SetDesignDoc(args) => {
+            if !args.unset && args.path.is_none() {
+                return Err(CliError::usage(
+                    "provide --path <p> (with optional --repo/--branch) or --unset",
+                ));
+            }
+            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let project =
+                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let input = if args.unset {
+                SetProjectDesignDocInput {
+                    project_id: project.id.clone(),
+                    unset: true,
+                    ..SetProjectDesignDocInput::default()
+                }
+            } else {
+                SetProjectDesignDocInput {
+                    project_id: project.id.clone(),
+                    design_doc_repo_remote_url: args.repo,
+                    design_doc_branch: args.branch,
+                    design_doc_path: args.path,
+                    unset: false,
+                }
+            };
+            let updated = set_project_design_doc(&mut client, input).await?;
+            let resolved = resolve_project_design_doc(&mut client, &updated.id).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "project": updated, "design_doc": resolved }),
+                || {
+                    print_project_details("Updated project", &updated);
+                    if let Some(line) = format_project_design_doc_line(&resolved.state) {
+                        println!("Design doc: {line}");
+                    }
+                },
+            )
+        }
+        ProjectCommand::OpenDesign(args) => {
+            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let project =
+                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let resolved = resolve_project_design_doc(&mut client, &project.id).await?;
+            let action = decide_open_design_action(&resolved.state, args.web)?;
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "project_id": project.id,
+                    "design_doc": resolved,
+                    "action": action.as_json(),
+                }),
+                || {
+                    if !ctx.quiet {
+                        println!("{}", action.human_summary());
+                    }
+                },
+            )?;
+            if !args.print {
+                action.launch()?;
+            }
+            Ok(())
         }
         ProjectCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
     }
@@ -1689,6 +1829,42 @@ async fn create_project(
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("project create", &other)),
+    }
+}
+
+async fn set_project_design_doc(
+    client: &mut BossClient,
+    input: SetProjectDesignDocInput,
+) -> Result<Project, CliError> {
+    match client
+        .send_request(&FrontendRequest::SetProjectDesignDoc { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_project(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("set project design doc", &other)),
+    }
+}
+
+async fn resolve_project_design_doc(
+    client: &mut BossClient,
+    project_id: &str,
+) -> Result<ResolveProjectDesignDocOutput, CliError> {
+    match client
+        .send_request(&FrontendRequest::ResolveProjectDesignDoc {
+            project_id: project_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::ProjectDesignDocResolved { output } => Ok(output),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("resolve project design doc", &other)),
     }
 }
 
@@ -2796,6 +2972,154 @@ fn print_project_details(title: &str, project: &Project) {
     }
 }
 
+/// Format the "Design doc:" line appended by `boss project show` /
+/// `boss project set-design-doc`. `None` means "no line should be
+/// emitted" — used by `Show` so the unset case stays silent rather
+/// than printing "Design doc: (not set)" on every project that
+/// hasn't been pointed yet. The set / broken cases produce a
+/// concrete line so the user can see at a glance which path the doc
+/// resolves to and whether the pointer is healthy.
+fn format_project_design_doc_line(state: &ProjectDesignDocState) -> Option<String> {
+    match state {
+        ProjectDesignDocState::NotSet => None,
+        ProjectDesignDocState::Resolved { resolved, web_url, .. } => {
+            Some(format!("{} ({})", resolved.path, web_url))
+        }
+        ProjectDesignDocState::Broken { reason } => {
+            Some(format!("(broken) {reason}"))
+        }
+    }
+}
+
+/// What `boss project open-design` should do once the engine has
+/// resolved the pointer. Built by [`decide_open_design_action`] from
+/// the engine's `ProjectDesignDocState` + the `--web` flag; consumed
+/// by the handler to either print or launch the right target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenDesignAction {
+    /// Open a local file inside a leased workspace (the
+    /// same-product fast path). The path is workspace-relative and
+    /// gets joined to whatever cube currently has leased — but the
+    /// CLI doesn't talk to cube, so we surface the doc's repo-relative
+    /// path and let the editor / opener resolve it from the user's
+    /// cwd (i.e. the worker's leased workspace).
+    LocalFile { path: PathBuf, web_url: String },
+    /// Open the GitHub web URL. Used for `External` pointers, for
+    /// `SameProduct`/`OtherProduct` when no workspace is leased, and
+    /// whenever `--web` is explicit.
+    Web { url: String },
+}
+
+impl OpenDesignAction {
+    fn human_summary(&self) -> String {
+        match self {
+            Self::LocalFile { path, .. } => format!("Opening {} in $EDITOR", path.display()),
+            Self::Web { url } => format!("Opening {url} in browser"),
+        }
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        match self {
+            Self::LocalFile { path, web_url } => serde_json::json!({
+                "kind": "local_file",
+                "path": path.to_string_lossy(),
+                "web_url": web_url,
+            }),
+            Self::Web { url } => serde_json::json!({
+                "kind": "web",
+                "url": url,
+            }),
+        }
+    }
+
+    fn launch(&self) -> Result<(), CliError> {
+        match self {
+            Self::LocalFile { path, web_url } => match std::env::var_os("EDITOR") {
+                Some(editor) => spawn_opener(editor, [path.as_os_str()]),
+                None => {
+                    eprintln!(
+                        "warning: $EDITOR not set; falling back to web URL ({web_url})",
+                    );
+                    spawn_opener_for_url(web_url)
+                }
+            },
+            Self::Web { url } => spawn_opener_for_url(url),
+        }
+    }
+}
+
+fn spawn_opener<I, A>(program: I, args: A) -> Result<(), CliError>
+where
+    I: AsRef<std::ffi::OsStr>,
+    A: IntoIterator,
+    A::Item: AsRef<std::ffi::OsStr>,
+{
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|err| CliError::internal(anyhow::anyhow!("failed to launch opener: {err}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::internal(anyhow::anyhow!(
+            "opener exited with status {status}",
+        )))
+    }
+}
+
+fn spawn_opener_for_url(url: &str) -> Result<(), CliError> {
+    #[cfg(target_os = "macos")]
+    let program: &str = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program: &str = "xdg-open";
+    spawn_opener(program, [url])
+}
+
+/// Decide which open action [`OpenDesignAction`] to take for a
+/// resolved pointer. Pure function; unit-tested. Errors when the
+/// pointer is `NotSet` (caller error — should not invoke
+/// `open-design` on a project without a pointer) or `Broken` (the
+/// pointer can't resolve to a target).
+fn decide_open_design_action(
+    state: &ProjectDesignDocState,
+    force_web: bool,
+) -> Result<OpenDesignAction, CliError> {
+    match state {
+        ProjectDesignDocState::NotSet => Err(CliError::not_found(
+            "project has no design-doc pointer (set one with `boss project set-design-doc`)",
+        )),
+        ProjectDesignDocState::Broken { reason } => Err(CliError::conflict(format!(
+            "design-doc pointer is broken: {reason}",
+        ))),
+        ProjectDesignDocState::Resolved {
+            resolved,
+            local_workspace_available,
+            web_url,
+        } => {
+            if force_web {
+                return Ok(OpenDesignAction::Web {
+                    url: web_url.clone(),
+                });
+            }
+            let can_use_filesystem = matches!(
+                resolved.kind,
+                ResolvedDesignDocKind::SameProduct { .. }
+                    | ResolvedDesignDocKind::OtherProduct { .. },
+            ) && *local_workspace_available;
+            if can_use_filesystem {
+                Ok(OpenDesignAction::LocalFile {
+                    path: PathBuf::from(&resolved.path),
+                    web_url: web_url.clone(),
+                })
+            } else {
+                Ok(OpenDesignAction::Web {
+                    url: web_url.clone(),
+                })
+            }
+        }
+    }
+}
+
 fn print_task_details(title: &str, task: &Task) {
     println!("{title}");
     println!("ID: {}", task.id);
@@ -2824,11 +3148,15 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, ProductCommand,
-        ProductStatus, ProjectCommand, ProjectStatus, TaskCommand, classify_bind_pr,
-        expect_leaf_work_item, pick_by_index, validate_github_pr_url,
+        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, OpenDesignAction,
+        ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, TaskCommand,
+        classify_bind_pr, decide_open_design_action, expect_leaf_work_item,
+        format_project_design_doc_line, pick_by_index, validate_github_pr_url,
     };
-    use boss_protocol::{Product, Project, Task, WorkItem};
+    use boss_protocol::{
+        Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
+        WorkItem,
+    };
 
     #[test]
     fn move_target_maps_review_to_in_review() {
@@ -3233,5 +3561,256 @@ mod tests {
         let raw = r#"{ "name": "x", "description": "y", "autosatrt": true }"#;
         let err = serde_json::from_str::<BulkCreateItem>(raw).expect_err("typo must fail");
         assert!(err.to_string().contains("autosatrt"), "{err}");
+    }
+
+    #[test]
+    fn parses_project_set_design_doc_with_path() {
+        let cli = Cli::parse_from([
+            "boss",
+            "project",
+            "set-design-doc",
+            "pointer",
+            "--product",
+            "boss",
+            "--path",
+            "tools/boss/docs/designs/foo.md",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::SetDesignDoc(args),
+            } => {
+                assert_eq!(args.selector, "pointer");
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert_eq!(
+                    args.path.as_deref(),
+                    Some("tools/boss/docs/designs/foo.md"),
+                );
+                assert!(!args.unset);
+                assert!(args.repo.is_none());
+                assert!(args.branch.is_none());
+            }
+            _ => panic!("expected project set-design-doc command"),
+        }
+    }
+
+    #[test]
+    fn parses_project_set_design_doc_with_repo_and_branch() {
+        let cli = Cli::parse_from([
+            "boss",
+            "project",
+            "set-design-doc",
+            "pointer",
+            "--product",
+            "boss",
+            "--path",
+            "designs/foo.md",
+            "--repo",
+            "https://github.com/myorg/wiki.git",
+            "--branch",
+            "trunk",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::SetDesignDoc(args),
+            } => {
+                assert_eq!(
+                    args.repo.as_deref(),
+                    Some("https://github.com/myorg/wiki.git"),
+                );
+                assert_eq!(args.branch.as_deref(), Some("trunk"));
+            }
+            _ => panic!("expected project set-design-doc command"),
+        }
+    }
+
+    #[test]
+    fn parses_project_set_design_doc_with_unset() {
+        let cli = Cli::parse_from([
+            "boss",
+            "project",
+            "set-design-doc",
+            "pointer",
+            "--product",
+            "boss",
+            "--unset",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::SetDesignDoc(args),
+            } => {
+                assert!(args.unset);
+                assert!(args.path.is_none());
+            }
+            _ => panic!("expected project set-design-doc command"),
+        }
+    }
+
+    /// Clap enforces the mutual exclusion between `--unset` and the
+    /// pointer-set flags so the engine never sees an ambiguous
+    /// request.
+    #[test]
+    fn rejects_unset_combined_with_path() {
+        let err = Cli::try_parse_from([
+            "boss",
+            "project",
+            "set-design-doc",
+            "pointer",
+            "--unset",
+            "--path",
+            "designs/foo.md",
+        ])
+        .expect_err("unset + path must conflict");
+        let rendered = err.to_string();
+        assert!(rendered.contains("--unset") || rendered.contains("--path"), "{rendered}");
+    }
+
+    /// `--repo` without `--path` is meaningless — clap rejects it at
+    /// parse time so the user fixes the call rather than seeing a
+    /// confusing engine error.
+    #[test]
+    fn rejects_repo_without_path() {
+        let err = Cli::try_parse_from([
+            "boss",
+            "project",
+            "set-design-doc",
+            "pointer",
+            "--repo",
+            "https://github.com/x/y.git",
+        ])
+        .expect_err("repo without path must error");
+        assert!(err.to_string().contains("--path"), "{err}");
+    }
+
+    #[test]
+    fn parses_project_open_design_print_and_web() {
+        let cli = Cli::parse_from([
+            "boss",
+            "project",
+            "open-design",
+            "pointer",
+            "--product",
+            "boss",
+            "--web",
+            "--print",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::OpenDesign(args),
+            } => {
+                assert_eq!(args.selector, "pointer");
+                assert!(args.web);
+                assert!(args.print);
+            }
+            _ => panic!("expected project open-design command"),
+        }
+    }
+
+    fn resolved_state(
+        kind: ResolvedDesignDocKind,
+        local: bool,
+    ) -> ProjectDesignDocState {
+        ProjectDesignDocState::Resolved {
+            resolved: ResolvedDesignDoc {
+                repo_remote_url: "git@github.com:spinyfin/mono.git".to_owned(),
+                branch: "main".to_owned(),
+                path: "tools/boss/docs/designs/foo.md".to_owned(),
+                kind,
+            },
+            local_workspace_available: local,
+            web_url: "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/foo.md"
+                .to_owned(),
+        }
+    }
+
+    /// Same-product pointer with a leased workspace picks the
+    /// filesystem fast path (renderer / `$EDITOR`), not the web URL.
+    #[test]
+    fn open_design_same_product_with_workspace_uses_local_file() {
+        let state = resolved_state(
+            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            true,
+        );
+        let action = decide_open_design_action(&state, false).unwrap();
+        match action {
+            OpenDesignAction::LocalFile { path, web_url } => {
+                assert_eq!(path.to_string_lossy(), "tools/boss/docs/designs/foo.md");
+                assert!(web_url.starts_with("https://github.com/"));
+            }
+            other => panic!("expected LocalFile, got {other:?}"),
+        }
+    }
+
+    /// Without a leased workspace the fast path is unavailable —
+    /// fall through to the web URL even for same-product pointers.
+    #[test]
+    fn open_design_same_product_without_workspace_falls_back_to_web() {
+        let state = resolved_state(
+            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            false,
+        );
+        let action = decide_open_design_action(&state, false).unwrap();
+        assert!(matches!(action, OpenDesignAction::Web { .. }));
+    }
+
+    /// `--web` forces the web URL regardless of workspace state.
+    #[test]
+    fn open_design_force_web_overrides_local_path() {
+        let state = resolved_state(
+            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            true,
+        );
+        let action = decide_open_design_action(&state, true).unwrap();
+        assert!(matches!(action, OpenDesignAction::Web { .. }));
+    }
+
+    /// External pointers always open in the browser — there's no
+    /// workspace shortcut for repos Boss doesn't track.
+    #[test]
+    fn open_design_external_always_uses_web() {
+        let state = resolved_state(ResolvedDesignDocKind::External, true);
+        let action = decide_open_design_action(&state, false).unwrap();
+        assert!(matches!(action, OpenDesignAction::Web { .. }));
+    }
+
+    #[test]
+    fn open_design_not_set_errors() {
+        let err = decide_open_design_action(&ProjectDesignDocState::NotSet, false)
+            .expect_err("not-set must error");
+        assert!(err.to_string().contains("no design-doc pointer"), "{err}");
+    }
+
+    #[test]
+    fn open_design_broken_errors() {
+        let state = ProjectDesignDocState::Broken {
+            reason: "missing repo".to_owned(),
+        };
+        let err = decide_open_design_action(&state, false).expect_err("broken must error");
+        assert!(err.to_string().contains("broken"), "{err}");
+    }
+
+    #[test]
+    fn design_doc_line_omits_unset_state() {
+        assert!(format_project_design_doc_line(&ProjectDesignDocState::NotSet).is_none());
+    }
+
+    #[test]
+    fn design_doc_line_renders_resolved_state() {
+        let state = resolved_state(
+            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            false,
+        );
+        let line = format_project_design_doc_line(&state).expect("resolved → line");
+        assert!(line.contains("tools/boss/docs/designs/foo.md"));
+        assert!(line.contains("https://github.com/"));
+    }
+
+    #[test]
+    fn design_doc_line_flags_broken_state() {
+        let state = ProjectDesignDocState::Broken {
+            reason: "no repo".to_owned(),
+        };
+        let line = format_project_design_doc_line(&state).expect("broken → line");
+        assert!(line.contains("(broken)"));
+        assert!(line.contains("no repo"));
     }
 }
