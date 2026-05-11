@@ -3798,6 +3798,59 @@ async fn handle_frontend_connection(
                     FrontendEvent::LiveStatusDisabledSlotsList { slot_ids },
                 );
             }
+            FrontendRequest::SetProjectDesignDoc { input } => {
+                match work_db.set_project_design_doc(input) {
+                    Ok(project) => {
+                        let item = WorkItem::Project(project);
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "project_design_doc_set",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemUpdated { item },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::ResolveProjectDesignDoc { project_id } => {
+                let leased_repos: HashSet<String> = work_db
+                    .list_in_flight_executions()
+                    .map(|execs| execs.into_iter().map(|e| e.repo_remote_url).collect())
+                    .unwrap_or_default();
+                match work_db
+                    .resolve_project_design_doc(&project_id, |repo| leased_repos.contains(repo))
+                {
+                    Ok(output) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::ProjectDesignDocResolved { output },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
         }
     }
 
