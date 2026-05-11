@@ -518,6 +518,14 @@ impl ServerState {
         pane_releaser.set_server_state(Arc::downgrade(&server_state));
         probe_queuer.set_server_state(Arc::downgrade(&server_state));
 
+        // Seed the live-status manager's disabled-slot set from the
+        // engine metadata KV — survives restarts of the engine
+        // process. Empty on first boot.
+        let persisted = load_live_status_disabled_slots(&server_state.work_db);
+        server_state
+            .live_status_manager
+            .set_initial_disabled_slots(persisted);
+
         Ok(server_state)
     }
 
@@ -3761,6 +3769,35 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            FrontendRequest::SetLiveStatusEnabled { slot_id, enabled } => {
+                server_state
+                    .live_status_manager
+                    .set_enabled(slot_id, enabled);
+                if let Err(err) = persist_live_status_disabled_slots(
+                    &work_db,
+                    &server_state.live_status_manager.disabled_snapshot(),
+                ) {
+                    tracing::warn!(
+                        slot_id,
+                        enabled,
+                        ?err,
+                        "live_status: failed to persist disabled-slot toggle",
+                    );
+                }
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::LiveStatusEnabledSet { slot_id, enabled },
+                );
+            }
+            FrontendRequest::ListLiveStatusDisabledSlots => {
+                let slot_ids = server_state.live_status_manager.disabled_snapshot();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::LiveStatusDisabledSlotsList { slot_ids },
+                );
+            }
         }
     }
 
@@ -3769,6 +3806,38 @@ async fn handle_frontend_connection(
     sink.close();
     let _ = writer_task.await;
     Ok(())
+}
+
+/// Metadata key used to persist the live-status disabled-slot list.
+/// Stored as a comma-separated list of u8 slot ids — the set is at
+/// most 8 entries, so we don't bother with JSON.
+const META_LIVE_STATUS_DISABLED_SLOTS: &str = "live_status_disabled_slots";
+
+/// Persist the disabled-slot snapshot to the metadata KV. Called
+/// from the toggle handler. Errors bubble up so the caller can log
+/// them — persistence failure is non-fatal (the in-memory set still
+/// honours the toggle until restart).
+fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u8]) -> Result<()> {
+    let joined = slot_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    work_db.set_metadata(META_LIVE_STATUS_DISABLED_SLOTS, &joined)?;
+    Ok(())
+}
+
+/// Read the persisted disabled-slot list from the metadata KV.
+/// Returns an empty vec on first boot or if the row is missing /
+/// malformed (a stray comma is treated as "no entries" rather than
+/// failing the engine startup).
+fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
+    let Ok(Some(raw)) = work_db.get_metadata(META_LIVE_STATUS_DISABLED_SLOTS) else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|s| s.trim().parse::<u8>().ok())
+        .collect()
 }
 
 fn send_response(sink: &SessionSink, request_id: &str, payload: FrontendEvent) {

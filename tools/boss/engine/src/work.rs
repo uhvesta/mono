@@ -1716,6 +1716,36 @@ impl WorkDb {
     /// Returns `(summary, basis_hash)` so callers can compare the
     /// stored basis against a freshly computed one to decide whether
     /// the cache is still valid.
+    /// Read a value from the engine's metadata KV. Returns `None` if
+    /// the key has never been written. Used by the engine for small
+    /// persisted settings (live-status disabled slot list, schema
+    /// version, etc.) that don't deserve their own table.
+    pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Insert-or-replace a metadata value. The metadata table is the
+    /// engine-side KV store — schema version, persisted live-status
+    /// disabled slots, anything that needs to outlive the process
+    /// without justifying a dedicated table.
+    pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn get_pane_summary(&self, work_item_id: &str) -> Result<Option<(String, String)>> {
         let conn = self.connect()?;
         let row = conn
@@ -4123,6 +4153,36 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn metadata_get_returns_none_for_missing_key() {
+        let path = temp_db_path("meta-missing");
+        let db = WorkDb::open(path).unwrap();
+        let value = db.get_metadata("never_written").unwrap();
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn metadata_set_then_get_round_trips() {
+        let path = temp_db_path("meta-roundtrip");
+        let db = WorkDb::open(path).unwrap();
+        db.set_metadata("live_status_disabled_slots", "1,3,7")
+            .unwrap();
+        let value = db.get_metadata("live_status_disabled_slots").unwrap();
+        assert_eq!(value.as_deref(), Some("1,3,7"));
+    }
+
+    #[test]
+    fn metadata_set_replaces_prior_value_for_same_key() {
+        let path = temp_db_path("meta-replace");
+        let db = WorkDb::open(path).unwrap();
+        db.set_metadata("live_status_disabled_slots", "1,3")
+            .unwrap();
+        db.set_metadata("live_status_disabled_slots", "5,7")
+            .unwrap();
+        let value = db.get_metadata("live_status_disabled_slots").unwrap();
+        assert_eq!(value.as_deref(), Some("5,7"));
     }
 
     #[test]

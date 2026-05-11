@@ -330,6 +330,20 @@ pub enum FrontendRequest {
         #[serde(flatten)]
         input: ListDependenciesInput,
     },
+    /// Per-slot toggle for the live-status summarizer. When
+    /// `enabled = false`, the engine stops calling the summarizer for
+    /// `slot_id` and clears any existing `live_status`; the UI falls
+    /// back to the static pane_summary. Persisted in the engine
+    /// metadata table so the choice survives engine restarts.
+    /// Idempotent — toggling to the current state is a benign no-op.
+    SetLiveStatusEnabled {
+        slot_id: u8,
+        enabled: bool,
+    },
+    /// Snapshot of which slots currently have the live-status
+    /// summarizer disabled. The UI uses this to render the toggle
+    /// state on the Agents-tab worker row.
+    ListLiveStatusDisabledSlots,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,6 +590,20 @@ pub enum FrontendEvent {
     /// status and name already joined in.
     DependencyDetail {
         detail: WorkItemDependencyDetail,
+    },
+    /// Response to [`FrontendRequest::SetLiveStatusEnabled`]. Carries
+    /// the resulting enabled flag for the slot so the caller can
+    /// distinguish "applied" from "already in that state" if it
+    /// wants.
+    LiveStatusEnabledSet {
+        slot_id: u8,
+        enabled: bool,
+    },
+    /// Snapshot of which slots currently have the live-status
+    /// summarizer disabled. The UI uses this to render the toggle
+    /// state on the Agents-tab worker row.
+    LiveStatusDisabledSlotsList {
+        slot_ids: Vec<u8>,
     },
 }
 
