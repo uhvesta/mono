@@ -2044,7 +2044,8 @@ impl WorkDb {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 autostart INTEGER NOT NULL DEFAULT 1,
-                priority TEXT NOT NULL DEFAULT 'medium'
+                priority TEXT NOT NULL DEFAULT 'medium',
+                repo_remote_url TEXT
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -2133,19 +2134,28 @@ impl WorkDb {
         migrate_tasks_priority(&conn)?;
         migrate_project_design_doc_columns(&conn)?;
         migrate_backfill_project_design_tasks(&conn)?;
+        migrate_tasks_repo_remote_url(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
         // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
         // columns rather than silently skipping. Keep this out of the
         // schema-init batch so a pre-v3 database can still be opened.
+        // The same rule applies to `tasks_repo_idx` against pre-v5
+        // databases that haven't yet been migrated.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS work_executions_ready_idx
                 ON work_executions(status, priority, created_at)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS tasks_repo_idx
+                ON tasks(repo_remote_url, deleted_at)
+                WHERE repo_remote_url IS NOT NULL",
+            [],
+        )?;
         migrate_timestamps_to_epoch(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '4')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '5')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -3148,6 +3158,18 @@ fn migrate_tasks_priority(conn: &Connection) -> Result<()> {
             "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// Add the per-work-item `repo_remote_url` override to `tasks`. `NULL`
+/// (the default for existing rows) means "inherit from the parent
+/// product's `repo_remote_url`"; a non-`NULL` value wins the
+/// resolution at dispatch time. Purely additive — see
+/// `tools/boss/docs/designs/multi-repo-work-modeling.md` (Q1).
+fn migrate_tasks_repo_remote_url(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "repo_remote_url")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN repo_remote_url TEXT", [])?;
     }
     Ok(())
 }
@@ -7932,7 +7954,7 @@ mod tests {
 
     /// Pre-v3 / pre-v4 databases should pick up the new dependency
     /// table and `last_status_actor` columns transparently on open;
-    /// the engine writes `schema_version = 4`.
+    /// the engine writes the latest `schema_version`.
     #[test]
     fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
         let path = temp_db_path("deps-migrate");
@@ -7983,7 +8005,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         let _ = std::fs::remove_file(path);
     }
 
@@ -8054,6 +8076,126 @@ mod tests {
         assert!(table_has_column(&conn, "projects", "design_doc_repo_remote_url").unwrap());
         assert!(table_has_column(&conn, "projects", "design_doc_branch").unwrap());
         assert!(table_has_column(&conn, "projects", "design_doc_path").unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Fresh init lands the new `tasks.repo_remote_url` column, the
+    /// partial `tasks_repo_idx` index, and bumps the recorded
+    /// `schema_version` to 5.
+    #[test]
+    fn fresh_init_includes_tasks_repo_remote_url() {
+        let path = temp_db_path("tasks-repo-fresh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+
+        assert!(table_has_column(&conn, "tasks", "repo_remote_url").unwrap());
+
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'tasks_repo_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "5");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A pre-v5 database (no `repo_remote_url` column on `tasks`,
+    /// `schema_version = 4`) should pick up the new column with
+    /// existing rows defaulting to `NULL`, get the partial index
+    /// created, and have `schema_version` bumped to 5.
+    #[test]
+    fn migration_from_v4_adds_tasks_repo_remote_url() {
+        let path = temp_db_path("tasks-repo-migrate");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Stand up a minimal v4 schema: just enough to round-trip a
+        // single task row that pre-dates the new column.
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 design_doc_repo_remote_url TEXT,
+                 design_doc_branch TEXT,
+                 design_doc_path TEXT);
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 priority TEXT NOT NULL DEFAULT 'medium');
+             INSERT INTO products(id, name, slug, status, created_at, updated_at)
+             VALUES ('prod_legacy', 'Legacy', 'legacy', 'active',
+                     '1700000000', '1700000000');
+             INSERT INTO tasks(id, product_id, kind, name, status,
+                               created_at, updated_at)
+             VALUES ('task_legacy', 'prod_legacy', 'chore', 'Legacy',
+                     'todo', '1700000000', '1700000000');
+             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // New column lands and the legacy row reads back as NULL.
+        assert!(table_has_column(&conn, "tasks", "repo_remote_url").unwrap());
+        let legacy_repo: Option<String> = conn
+            .query_row(
+                "SELECT repo_remote_url FROM tasks WHERE id = 'task_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_repo, None);
+
+        // Partial index materializes on the migration path too — the
+        // index DDL only runs once the column exists, so a pre-v5
+        // database that fails to migrate would also fail this check.
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'tasks_repo_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+
+        // schema_version moves from 4 → 5.
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "5");
+
         let _ = std::fs::remove_file(path);
     }
 
