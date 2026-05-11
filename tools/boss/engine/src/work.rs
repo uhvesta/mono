@@ -19,10 +19,11 @@ pub use boss_protocol::{
     AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    ExecutionReconcileResult, ListDependenciesInput, Product, Project, RemoveDependencyInput,
-    RequestExecutionInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
-    WorkTree,
+    ExecutionReconcileResult, ListDependenciesInput, Product, Project, ProjectDesignDocState,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch, WorkRun, WorkTree,
 };
 
 use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
@@ -538,6 +539,326 @@ impl WorkDb {
     pub fn get_project(&self, id: &str) -> Result<Project> {
         let conn = self.connect()?;
         query_project(&conn, id)?.with_context(|| format!("unknown project: {id}"))
+    }
+
+    /// Write the project's design-doc pointer columns.
+    ///
+    /// Three input shapes (matching `SetProjectDesignDocInput`):
+    /// - `unset = true` → all three columns are cleared to `NULL`
+    ///   atomically. Any explicit field values supplied alongside are
+    ///   ignored.
+    /// - `design_doc_path = Some(p)` with non-empty `p` → set the
+    ///   pointer. `p` is validated per the design's Q8 rules (no
+    ///   leading `/`, no `..` segments, must end in `.md` /
+    ///   `.markdown`). `design_doc_repo_remote_url` and
+    ///   `design_doc_branch` are best-effort overrides; `None` /
+    ///   blank clears that column so resolution falls back to the
+    ///   product. The repo URL is canonicalised the same way
+    ///   `products.repo_remote_url` is (trim-normalise).
+    /// - `design_doc_path = None` (and `unset = false`) → update only
+    ///   the non-path columns. The existing path stays put. Useful
+    ///   when the user is correcting a typo in just the repo or
+    ///   branch fields.
+    ///
+    /// Last-writer-wins: a fresh call overwrites whatever was there.
+    /// `updated_at` is stamped on every write. `last_status_actor` is
+    /// intentionally untouched — pointer edits are property edits,
+    /// not status transitions (Q10).
+    pub fn set_project_design_doc(&self, input: SetProjectDesignDocInput) -> Result<Project> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        ensure_project_exists(&tx, &input.project_id)?;
+        let now = now_string();
+
+        if input.unset {
+            tx.execute(
+                "UPDATE projects
+                 SET design_doc_repo_remote_url = NULL,
+                     design_doc_branch = NULL,
+                     design_doc_path = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![input.project_id, now],
+            )?;
+            let updated = query_project(&tx, &input.project_id)?
+                .with_context(|| format!("unknown project: {}", input.project_id))?;
+            tx.commit()?;
+            return Ok(updated);
+        }
+
+        let repo = canonicalize_design_doc_repo_remote_url(input.design_doc_repo_remote_url);
+        let branch = normalize_optional_text(input.design_doc_branch);
+
+        match input.design_doc_path {
+            Some(raw_path) => {
+                let path = validate_design_doc_path(&raw_path)?;
+                tx.execute(
+                    "UPDATE projects
+                     SET design_doc_repo_remote_url = ?2,
+                         design_doc_branch = ?3,
+                         design_doc_path = ?4,
+                         updated_at = ?5
+                     WHERE id = ?1",
+                    params![input.project_id, repo, branch, path, now],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE projects
+                     SET design_doc_repo_remote_url = ?2,
+                         design_doc_branch = ?3,
+                         updated_at = ?4
+                     WHERE id = ?1",
+                    params![input.project_id, repo, branch, now],
+                )?;
+            }
+        }
+
+        let updated = query_project(&tx, &input.project_id)?
+            .with_context(|| format!("unknown project: {}", input.project_id))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Resolve a project's design-doc pointer into the structured
+    /// `ProjectDesignDocState` the UI consumes.
+    ///
+    /// Resolution rules (per design Q2):
+    /// - `design_doc_path` is `NULL` → `NotSet` (UI hides the
+    ///   affordance entirely).
+    /// - Otherwise fall back to the product for any missing
+    ///   `repo_remote_url` / `branch` override. Branch defaults to
+    ///   `"main"` when neither the project nor (a future)
+    ///   `products.docs_branch` supplies one.
+    /// - If no repo can be resolved (project override `NULL` and
+    ///   product's `repo_remote_url` `NULL`) → `Broken` with a
+    ///   human-readable reason.
+    /// - Classify the resolved repo against the project's product:
+    ///   `SameProduct` when it matches, `OtherProduct` when another
+    ///   Boss-tracked product owns the repo, `External` otherwise.
+    ///
+    /// `is_repo_workspace_leased` is consulted only on the resolved
+    /// path — pass a closure that asks cube whether at least one
+    /// workspace is currently leased for the resolved
+    /// `repo_remote_url`. In test/CLI contexts where cube isn't
+    /// reachable, `|_| false` is the safe default (the open
+    /// affordance just falls back to the GitHub web URL).
+    pub fn resolve_project_design_doc<F>(
+        &self,
+        project_id: &str,
+        is_repo_workspace_leased: F,
+    ) -> Result<ResolveProjectDesignDocOutput>
+    where
+        F: FnOnce(&str) -> bool,
+    {
+        let conn = self.connect()?;
+        let project = query_project(&conn, project_id)?
+            .with_context(|| format!("unknown project: {project_id}"))?;
+        let product = query_product(&conn, &project.product_id)?
+            .with_context(|| format!("unknown product: {}", project.product_id))?;
+
+        let Some(path) = project.design_doc_path.clone() else {
+            return Ok(ResolveProjectDesignDocOutput {
+                project_id: project.id,
+                state: ProjectDesignDocState::NotSet,
+            });
+        };
+
+        let resolved_repo = project
+            .design_doc_repo_remote_url
+            .clone()
+            .or_else(|| product.repo_remote_url.clone());
+        let Some(repo) = resolved_repo else {
+            return Ok(ResolveProjectDesignDocOutput {
+                project_id: project.id,
+                state: ProjectDesignDocState::Broken {
+                    reason: "design_doc_path is set but neither the project's design_doc_repo_remote_url nor the product's repo_remote_url is populated".to_owned(),
+                },
+            });
+        };
+
+        let branch = project
+            .design_doc_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_owned());
+
+        let kind = if let Some(product_repo) = product.repo_remote_url.as_deref()
+            && product_repo == repo.as_str()
+        {
+            ResolvedDesignDocKind::SameProduct {
+                product_id: project.product_id.clone(),
+            }
+        } else if let Some(other_product) = find_product_by_repo_remote_url(&conn, &repo)? {
+            ResolvedDesignDocKind::OtherProduct {
+                product_id: other_product,
+            }
+        } else {
+            ResolvedDesignDocKind::External
+        };
+
+        let web_url = render_design_doc_web_url(&repo, &branch, &path);
+        let local_workspace_available = is_repo_workspace_leased(&repo);
+
+        Ok(ResolveProjectDesignDocOutput {
+            project_id: project.id,
+            state: ProjectDesignDocState::Resolved {
+                resolved: ResolvedDesignDoc {
+                    repo_remote_url: repo,
+                    branch,
+                    path,
+                    kind,
+                },
+                local_workspace_available,
+                web_url,
+            },
+        })
+    }
+
+    /// Sync a `(repo, branch, path)` triple discovered by
+    /// `DesignDetector` into the parent project's pointer columns,
+    /// **iff** the project's `design_doc_path` is currently `NULL`.
+    ///
+    /// This is the one-way auto-populate rule from design Q6: a
+    /// project that already has a hand-set pointer wins; a project
+    /// that has no pointer benefits from the detector's discovery.
+    /// Repo URL is canonicalised on the way in; path is validated
+    /// against the same Q8 rules `set_project_design_doc` enforces,
+    /// so a detector that hands us a garbage path fails fast rather
+    /// than corrupting the column.
+    ///
+    /// Returns `true` if the columns were written, `false` if the
+    /// project already had a pointer set (no-op).
+    ///
+    /// TODO(design-producing-tasks): wire this method into
+    /// `DesignDetector`'s `DOC_REF` stop handler once that detector
+    /// exists. Until then, this is exercised only by integration
+    /// tests with a hand-rolled caller.
+    pub fn sync_project_design_doc_from_detector(
+        &self,
+        project_id: &str,
+        repo_remote_url: Option<&str>,
+        branch: Option<&str>,
+        path: &str,
+    ) -> Result<bool> {
+        let validated_path = validate_design_doc_path(path)?;
+        let repo = canonicalize_design_doc_repo_remote_url(repo_remote_url.map(str::to_owned));
+        let branch = normalize_optional_text(branch.map(str::to_owned));
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let project = query_project(&tx, project_id)?
+            .with_context(|| format!("unknown project: {project_id}"))?;
+        if project.design_doc_path.is_some() {
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE projects
+             SET design_doc_repo_remote_url = ?2,
+                 design_doc_branch = ?3,
+                 design_doc_path = ?4,
+                 updated_at = ?5
+             WHERE id = ?1",
+            params![project_id, repo, branch, validated_path, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Surface a `WorkAttentionItem` when an `ApproveDesign` event
+    /// names a design doc whose location disagrees with the parent
+    /// project's already-set pointer.
+    ///
+    /// Behaviour (per design Q6 sync rule 3):
+    /// - Project pointer is `NULL` → no conflict, no item, returns
+    ///   `Ok(None)`. The auto-populate path
+    ///   (`sync_project_design_doc_from_detector`) handles that
+    ///   case before approval.
+    /// - Project pointer matches the approved triple (after
+    ///   resolving `None` overrides against the product / default
+    ///   branch) → no item, returns `Ok(None)`.
+    /// - Project pointer differs → an attention item with kind
+    ///   `design_doc_pointer_conflict` is inserted against
+    ///   `execution_id` and returned.
+    ///
+    /// The helper does NOT overwrite the project's pointer — the
+    /// user's manual value always wins; the attention item asks
+    /// them to choose explicitly.
+    ///
+    /// TODO(design-producing-tasks): wire this method into
+    /// `ApproveDesign`'s state-transition handler once that path
+    /// exists. Until then, this is exercised only by integration
+    /// tests with a hand-rolled caller.
+    pub fn surface_design_doc_conflict_on_approve(
+        &self,
+        project_id: &str,
+        execution_id: &str,
+        approved_repo_remote_url: Option<&str>,
+        approved_branch: Option<&str>,
+        approved_path: &str,
+    ) -> Result<Option<WorkAttentionItem>> {
+        let approved_path = validate_design_doc_path(approved_path)?;
+        let approved_repo =
+            canonicalize_design_doc_repo_remote_url(approved_repo_remote_url.map(str::to_owned));
+        let approved_branch = normalize_optional_text(approved_branch.map(str::to_owned));
+
+        let conn = self.connect()?;
+        let project = query_project(&conn, project_id)?
+            .with_context(|| format!("unknown project: {project_id}"))?;
+        let Some(project_path) = project.design_doc_path.clone() else {
+            return Ok(None);
+        };
+        let product = query_product(&conn, &project.product_id)?
+            .with_context(|| format!("unknown product: {}", project.product_id))?;
+        drop(conn);
+
+        let project_repo_effective = project
+            .design_doc_repo_remote_url
+            .clone()
+            .or_else(|| product.repo_remote_url.clone());
+        let approved_repo_effective = approved_repo
+            .clone()
+            .or_else(|| product.repo_remote_url.clone());
+
+        let project_branch_effective = project
+            .design_doc_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_owned());
+        let approved_branch_effective = approved_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_owned());
+
+        if project_repo_effective == approved_repo_effective
+            && project_branch_effective == approved_branch_effective
+            && project_path == approved_path
+        {
+            return Ok(None);
+        }
+
+        let title = "Design doc pointer disagrees with approved design".to_owned();
+        let body_markdown = format!(
+            "The project's design-doc pointer (`{project_repo}` `{project_branch}` `{project_path}`) differs from the location of the approved design doc (`{approved_repo}` `{approved_branch}` `{approved_path}`). Update the project pointer with `boss project set-design-doc` or revoke the approval.",
+            project_repo = project_repo_effective
+                .as_deref()
+                .unwrap_or("<no repo resolved>"),
+            project_branch = project_branch_effective,
+            project_path = project_path,
+            approved_repo = approved_repo_effective
+                .as_deref()
+                .unwrap_or("<no repo resolved>"),
+            approved_branch = approved_branch_effective,
+            approved_path = approved_path,
+        );
+
+        let item = self.create_attention_item(CreateAttentionItemInput {
+            execution_id: execution_id.to_owned(),
+            kind: "design_doc_pointer_conflict".to_owned(),
+            status: None,
+            title,
+            body_markdown,
+            resolved_at: None,
+        })?;
+        Ok(Some(item))
     }
 
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
@@ -3343,6 +3664,75 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
             Some(trimmed.to_owned())
         }
     })
+}
+
+/// Validate a caller-supplied `design_doc_path` per design Q8.
+///
+/// Rules: relative path (no leading `/`), no `..` segments, not
+/// blank, must reference a markdown file (`.md` or `.markdown`).
+/// Path is trimmed before storage so the column always reflects the
+/// canonical form. Callers that want to *clear* the pointer should
+/// use `unset = true` on `SetProjectDesignDocInput` instead of
+/// passing an empty string here.
+fn validate_design_doc_path(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("design_doc_path may not be empty (use `unset = true` to clear the pointer)");
+    }
+    if trimmed.starts_with('/') {
+        bail!("design_doc_path must be repo-relative (no leading `/`): {trimmed}");
+    }
+    if trimmed.split('/').any(|seg| seg == "..") {
+        bail!("design_doc_path may not contain `..` segments: {trimmed}");
+    }
+    if !(trimmed.ends_with(".md") || trimmed.ends_with(".markdown")) {
+        bail!("design_doc_path must reference a markdown file (.md or .markdown): {trimmed}");
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Canonicalise a caller-supplied design-doc repo remote URL into
+/// the same shape `products.repo_remote_url` uses. Today both fields
+/// route through `normalize_optional_text` (trim + blank→None) so a
+/// project pointer that inherits "the product's repo" doesn't drift
+/// out of equality on round-trip. Lift this to a richer
+/// `(scheme, owner, repo, .git)` canonicaliser if the product side
+/// ever grows one.
+fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> Option<String> {
+    normalize_optional_text(value)
+}
+
+/// Build the GitHub web URL for a design doc per the design's Q5
+/// recipe (`https://github.com/<owner>/<repo>/blob/<branch>/<path>`).
+/// Falls back to a best-effort blob URL when the repo doesn't parse
+/// as a `github.com` URL (e.g. an enterprise mirror) so the caller
+/// always gets *something* to render — the resolver itself doesn't
+/// fail the whole request just because the URL formatter can't pull
+/// `owner/repo` out of the remote.
+fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, path: &str) -> String {
+    match crate::completion::parse_repo_slug(repo_remote_url) {
+        Ok(slug) => format!("https://github.com/{slug}/blob/{branch}/{path}"),
+        Err(_) => format!("{repo_remote_url}/blob/{branch}/{path}"),
+    }
+}
+
+/// Look up a product by `repo_remote_url`. Used by
+/// `resolve_project_design_doc` to classify a resolved repo as
+/// `OtherProduct` (Boss tracks it) vs `External` (we don't). Returns
+/// `None` when no product matches. `NULL` `repo_remote_url` rows are
+/// excluded so a freshly-created product without a URL doesn't
+/// silently match the project's pointer.
+fn find_product_by_repo_remote_url(conn: &Connection, repo_remote_url: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM products
+         WHERE repo_remote_url IS NOT NULL AND repo_remote_url = ?1
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1",
+        [repo_remote_url],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn apply_text_patch(target: &mut String, patch: Option<String>) {
@@ -7604,6 +7994,678 @@ mod tests {
         assert!(table_has_column(&conn, "projects", "design_doc_repo_remote_url").unwrap());
         assert!(table_has_column(&conn, "projects", "design_doc_branch").unwrap());
         assert!(table_has_column(&conn, "projects", "design_doc_path").unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Stand up a fresh product + project against `path` so the
+    /// design-doc pointer tests don't all open-code the same
+    /// boilerplate. Returns the project id; the product's repo URL
+    /// is the standard `mono` git@ form the rest of the suite uses.
+    fn seed_project_for_design_doc(db: &WorkDb) -> (Product, Project) {
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Project design doc pointer".to_owned(),
+                description: None,
+                goal: None,
+                autostart: true,
+            })
+            .unwrap();
+        (product, project)
+    }
+
+    /// Convenience: rebuild a `set_project_design_doc` input with
+    /// just the project id and path filled in. Most pointer tests
+    /// only care about the path; defaulting the rest keeps signal
+    /// high.
+    fn set_design_doc_input(project_id: &str, path: &str) -> SetProjectDesignDocInput {
+        SetProjectDesignDocInput {
+            project_id: project_id.to_owned(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: Some(path.to_owned()),
+            unset: false,
+        }
+    }
+
+    #[test]
+    fn set_project_design_doc_rejects_empty_path() {
+        let path = temp_db_path("design-doc-empty-path");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let err = db
+            .set_project_design_doc(set_design_doc_input(&project.id, "   "))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may not be empty"), "got: {err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_rejects_absolute_path() {
+        let path = temp_db_path("design-doc-abs-path");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let err = db
+            .set_project_design_doc(set_design_doc_input(&project.id, "/etc/passwd.md"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repo-relative"), "got: {err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_rejects_dotdot_segments() {
+        let path = temp_db_path("design-doc-dotdot");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let err = db
+            .set_project_design_doc(set_design_doc_input(
+                &project.id,
+                "tools/../../../etc/passwd.md",
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`..`"), "got: {err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_rejects_bad_extension() {
+        let path = temp_db_path("design-doc-bad-ext");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let err = db
+            .set_project_design_doc(set_design_doc_input(
+                &project.id,
+                "tools/boss/docs/designs/foo.html",
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("markdown"), "got: {err}");
+
+        // And `.md` / `.markdown` both pass.
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/foo.md",
+        ))
+        .unwrap();
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/foo.markdown",
+        ))
+        .unwrap();
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_unset_clears_all_three_columns() {
+        let path = temp_db_path("design-doc-unset");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some(
+                "https://github.com/myorg/wiki.git".to_owned(),
+            ),
+            design_doc_branch: Some("docs".to_owned()),
+            design_doc_path: Some("designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+        let after_set = db.get_project(&project.id).unwrap();
+        assert_eq!(
+            after_set.design_doc_repo_remote_url.as_deref(),
+            Some("https://github.com/myorg/wiki.git"),
+        );
+        assert_eq!(after_set.design_doc_branch.as_deref(), Some("docs"));
+        assert_eq!(after_set.design_doc_path.as_deref(), Some("designs/foo.md"));
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: None,
+            unset: true,
+        })
+        .unwrap();
+
+        let cleared = db.get_project(&project.id).unwrap();
+        assert!(cleared.design_doc_repo_remote_url.is_none());
+        assert!(cleared.design_doc_branch.is_none());
+        assert!(cleared.design_doc_path.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_canonicalises_repo_url() {
+        let path = temp_db_path("design-doc-canonical-repo");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        // Surrounding whitespace and a blank branch should normalise
+        // away the same way `products.repo_remote_url` does.
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some(
+                "  https://github.com/myorg/wiki.git  ".to_owned(),
+            ),
+            design_doc_branch: Some("   ".to_owned()),
+            design_doc_path: Some("designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+
+        let stored = db.get_project(&project.id).unwrap();
+        assert_eq!(
+            stored.design_doc_repo_remote_url.as_deref(),
+            Some("https://github.com/myorg/wiki.git"),
+        );
+        assert!(stored.design_doc_branch.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_is_last_writer_wins() {
+        let path = temp_db_path("design-doc-last-writer");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/first.md",
+        ))
+        .unwrap();
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/second.md",
+        ))
+        .unwrap();
+        let after_set = db.get_project(&project.id).unwrap();
+        assert_eq!(
+            after_set.design_doc_path.as_deref(),
+            Some("tools/boss/docs/designs/second.md"),
+        );
+
+        // Then unset.
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: None,
+            unset: true,
+        })
+        .unwrap();
+        assert!(
+            db.get_project(&project.id)
+                .unwrap()
+                .design_doc_path
+                .is_none()
+        );
+
+        // Then set again — clears the cleared state, no residue.
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/third.md",
+        ))
+        .unwrap();
+        assert_eq!(
+            db.get_project(&project.id)
+                .unwrap()
+                .design_doc_path
+                .as_deref(),
+            Some("tools/boss/docs/designs/third.md"),
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_with_no_path_only_updates_overrides() {
+        let path = temp_db_path("design-doc-overrides-only");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: Some("tools/boss/docs/designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+
+        // Now patch only the branch; the path must stay put.
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: Some("docs".to_owned()),
+            design_doc_path: None,
+            unset: false,
+        })
+        .unwrap();
+        let stored = db.get_project(&project.id).unwrap();
+        assert_eq!(stored.design_doc_branch.as_deref(), Some("docs"));
+        assert_eq!(
+            stored.design_doc_path.as_deref(),
+            Some("tools/boss/docs/designs/foo.md"),
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_project_design_doc_returns_not_set_when_path_null() {
+        let path = temp_db_path("resolve-not-set");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let resolved = db
+            .resolve_project_design_doc(&project.id, |_| false)
+            .unwrap();
+        assert_eq!(resolved.project_id, project.id);
+        assert!(matches!(resolved.state, ProjectDesignDocState::NotSet));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_project_design_doc_same_product_inherits_repo_and_default_branch() {
+        let path = temp_db_path("resolve-same-product");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/foo.md",
+        ))
+        .unwrap();
+
+        let resolved = db
+            .resolve_project_design_doc(&project.id, |_| true)
+            .unwrap();
+        let ProjectDesignDocState::Resolved {
+            resolved,
+            local_workspace_available,
+            web_url,
+        } = resolved.state
+        else {
+            panic!("expected Resolved state, got {:?}", resolved.state);
+        };
+        assert_eq!(resolved.repo_remote_url, "git@github.com:spinyfin/mono.git");
+        assert_eq!(resolved.branch, "main");
+        assert_eq!(resolved.path, "tools/boss/docs/designs/foo.md");
+        assert_eq!(
+            resolved.kind,
+            ResolvedDesignDocKind::SameProduct {
+                product_id: product.id.clone(),
+            }
+        );
+        assert!(local_workspace_available);
+        // Repo URL is `git@github.com:spinyfin/mono.git` → web URL
+        // renders against the parsed `spinyfin/mono` slug.
+        assert_eq!(
+            web_url,
+            "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/foo.md",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_project_design_doc_classifies_other_product() {
+        let path = temp_db_path("resolve-other-product");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        // A second Boss product whose repo owns the design doc.
+        let wiki_product = db
+            .create_product(CreateProductInput {
+                name: "Wiki".to_owned(),
+                description: None,
+                repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
+            })
+            .unwrap();
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some(
+                "https://github.com/myorg/wiki.git".to_owned(),
+            ),
+            design_doc_branch: Some("docs".to_owned()),
+            design_doc_path: Some("designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+
+        let resolved = db
+            .resolve_project_design_doc(&project.id, |_| false)
+            .unwrap();
+        let ProjectDesignDocState::Resolved {
+            resolved,
+            local_workspace_available,
+            web_url,
+        } = resolved.state
+        else {
+            panic!("expected Resolved state");
+        };
+        assert_eq!(resolved.branch, "docs");
+        assert_eq!(
+            resolved.kind,
+            ResolvedDesignDocKind::OtherProduct {
+                product_id: wiki_product.id,
+            }
+        );
+        assert!(!local_workspace_available);
+        assert_eq!(
+            web_url,
+            "https://github.com/myorg/wiki/blob/docs/designs/foo.md",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_project_design_doc_classifies_external() {
+        let path = temp_db_path("resolve-external");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some(
+                "https://github.com/external/other.git".to_owned(),
+            ),
+            design_doc_branch: None,
+            design_doc_path: Some("designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+
+        let resolved = db
+            .resolve_project_design_doc(&project.id, |_| false)
+            .unwrap();
+        let ProjectDesignDocState::Resolved { resolved, .. } = resolved.state else {
+            panic!("expected Resolved state");
+        };
+        assert_eq!(resolved.kind, ResolvedDesignDocKind::External);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_project_design_doc_surfaces_broken_when_no_repo() {
+        let path = temp_db_path("resolve-broken");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        // Product without a repo_remote_url, so a project that
+        // doesn't supply one either has nothing to resolve against.
+        let product = db
+            .create_product(CreateProductInput {
+                name: "NoRepo".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Broken".to_owned(),
+                description: None,
+                goal: None,
+                autostart: true,
+            })
+            .unwrap();
+
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "designs/foo.md",
+        ))
+        .unwrap();
+
+        let resolved = db
+            .resolve_project_design_doc(&project.id, |_| false)
+            .unwrap();
+        match resolved.state {
+            ProjectDesignDocState::Broken { reason } => {
+                assert!(
+                    reason.contains("repo"),
+                    "broken reason should mention the missing repo: {reason}"
+                );
+            }
+            other => panic!("expected Broken state, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sync_project_design_doc_from_detector_populates_when_null() {
+        let path = temp_db_path("detector-sync-empty");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let wrote = db
+            .sync_project_design_doc_from_detector(
+                &project.id,
+                Some("git@github.com:spinyfin/mono.git"),
+                Some("main"),
+                "tools/boss/docs/designs/foo.md",
+            )
+            .unwrap();
+        assert!(wrote, "expected the detector hook to write");
+
+        let updated = db.get_project(&project.id).unwrap();
+        assert_eq!(
+            updated.design_doc_path.as_deref(),
+            Some("tools/boss/docs/designs/foo.md"),
+        );
+        assert_eq!(
+            updated.design_doc_repo_remote_url.as_deref(),
+            Some("git@github.com:spinyfin/mono.git"),
+        );
+        assert_eq!(updated.design_doc_branch.as_deref(), Some("main"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sync_project_design_doc_from_detector_skips_when_pointer_set() {
+        let path = temp_db_path("detector-sync-skip");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/manual.md",
+        ))
+        .unwrap();
+
+        let wrote = db
+            .sync_project_design_doc_from_detector(
+                &project.id,
+                Some("git@github.com:spinyfin/mono.git"),
+                Some("main"),
+                "tools/boss/docs/designs/from-detector.md",
+            )
+            .unwrap();
+        assert!(!wrote, "expected the detector hook to no-op");
+
+        let unchanged = db.get_project(&project.id).unwrap();
+        assert_eq!(
+            unchanged.design_doc_path.as_deref(),
+            Some("tools/boss/docs/designs/manual.md"),
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sync_project_design_doc_from_detector_validates_path() {
+        let path = temp_db_path("detector-sync-bad-path");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let err = db
+            .sync_project_design_doc_from_detector(
+                &project.id,
+                None,
+                None,
+                "/absolute/path.md",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repo-relative"), "got: {err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Helper: stand up an execution attached to the given project so
+    /// the conflict-surfacing test has a foreign key it can attach
+    /// the attention item to.
+    fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkExecution {
+        let task = db
+            .create_task(CreateTaskInput {
+                product_id: product_id.to_owned(),
+                project_id: project_id.to_owned(),
+                name: "Schema".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.create_execution(CreateExecutionInput {
+            work_item_id: task.id,
+            kind: "task_implementation".to_owned(),
+            status: Some("ready".to_owned()),
+            repo_remote_url: None,
+            cube_repo_id: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            workspace_path: None,
+            priority: None,
+            preferred_workspace_id: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn surface_design_doc_conflict_on_approve_no_pointer_is_no_op() {
+        let path = temp_db_path("approve-conflict-no-pointer");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (product, project) = seed_project_for_design_doc(&db);
+        let execution = seed_execution_for(&db, &product.id, &project.id);
+
+        let item = db
+            .surface_design_doc_conflict_on_approve(
+                &project.id,
+                &execution.id,
+                None,
+                None,
+                "tools/boss/docs/designs/foo.md",
+            )
+            .unwrap();
+        assert!(item.is_none());
+        assert!(db.list_attention_items(&execution.id).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn surface_design_doc_conflict_on_approve_silent_when_pointer_matches() {
+        let path = temp_db_path("approve-conflict-match");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (product, project) = seed_project_for_design_doc(&db);
+        let execution = seed_execution_for(&db, &product.id, &project.id);
+
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/foo.md",
+        ))
+        .unwrap();
+
+        // Approved doc matches: same path, inherits same repo, default
+        // branch matches the resolved default.
+        let item = db
+            .surface_design_doc_conflict_on_approve(
+                &project.id,
+                &execution.id,
+                None,
+                None,
+                "tools/boss/docs/designs/foo.md",
+            )
+            .unwrap();
+        assert!(item.is_none(), "expected silent no-op when pointers agree");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn surface_design_doc_conflict_on_approve_emits_attention_item_when_pointer_differs() {
+        let path = temp_db_path("approve-conflict-emits");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (product, project) = seed_project_for_design_doc(&db);
+        let execution = seed_execution_for(&db, &product.id, &project.id);
+
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/manual.md",
+        ))
+        .unwrap();
+
+        let item = db
+            .surface_design_doc_conflict_on_approve(
+                &project.id,
+                &execution.id,
+                None,
+                None,
+                "tools/boss/docs/designs/from-task.md",
+            )
+            .unwrap()
+            .expect("conflict should surface an attention item");
+        assert_eq!(item.kind, "design_doc_pointer_conflict");
+        assert!(
+            item.body_markdown.contains("manual.md"),
+            "body should name the project's path: {}",
+            item.body_markdown,
+        );
+        assert!(
+            item.body_markdown.contains("from-task.md"),
+            "body should name the approved path: {}",
+            item.body_markdown,
+        );
+
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "design_doc_pointer_conflict");
+
+        // Project pointer must not be overwritten by the helper.
+        let unchanged = db.get_project(&project.id).unwrap();
+        assert_eq!(
+            unchanged.design_doc_path.as_deref(),
+            Some("tools/boss/docs/designs/manual.md"),
+        );
+
         let _ = std::fs::remove_file(path);
     }
 
