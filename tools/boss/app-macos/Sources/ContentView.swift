@@ -1112,8 +1112,7 @@ private struct WorkCardPopoverView: View {
             }
 
             if !task.description.isEmpty {
-                Text(task.description)
-                    .fixedSize(horizontal: false, vertical: true)
+                descriptionSummary
             }
 
             VStack(alignment: .leading, spacing: 10) {
@@ -1174,6 +1173,64 @@ private struct WorkCardPopoverView: View {
         }
         .padding(20)
         .frame(width: 360, alignment: .leading)
+    }
+
+    /// Truncated rendering of the task description so a long body
+    /// can't push the trailing metadata (Project, Status, …) off
+    /// screen. Caps the visible text to roughly the first six lines
+    /// and offers a "Read full description" affordance when the body
+    /// has more content or markdown structure worth seeing rendered.
+    @ViewBuilder
+    private var descriptionSummary: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(descriptionSummaryText)
+                .font(.body)
+                .lineLimit(6)
+                .truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if shouldOfferFullDescription {
+                Button {
+                    MarkdownViewerWindowController.shared.present(
+                        title: task.name,
+                        markdown: task.description
+                    )
+                } label: {
+                    Label("Read full description", systemImage: "doc.text.magnifyingglass")
+                        .font(.callout)
+                }
+                .buttonStyle(.link)
+                .accessibilityIdentifier("work-card-read-full-description")
+            }
+        }
+    }
+
+    /// Plain-text preview used in the popover body. We surface the
+    /// first paragraph because longer descriptions are usually a
+    /// markdown document (`# heading` lines, fenced code, bullet
+    /// lists) — that content reads poorly as raw text and is better
+    /// served by the full markdown viewer the affordance opens.
+    private var descriptionSummaryText: String {
+        let trimmed = task.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let paragraphs = trimmed.components(separatedBy: "\n\n")
+        let firstParagraph = paragraphs.first ?? trimmed
+        return firstParagraph.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// True when the description has content the truncated preview
+    /// can't show (additional paragraphs, more than ~6 lines, or
+    /// markdown features like headings or fenced code that only
+    /// render meaningfully in the viewer).
+    private var shouldOfferFullDescription: Bool {
+        let trimmed = task.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return false }
+        if trimmed != descriptionSummaryText { return true }
+        if trimmed.components(separatedBy: "\n").count > 6 { return true }
+        if trimmed.count > 280 { return true }
+        if trimmed.contains("```") { return true }
+        if trimmed.contains("\n#") || trimmed.hasPrefix("#") { return true }
+        return false
     }
 
     @ViewBuilder

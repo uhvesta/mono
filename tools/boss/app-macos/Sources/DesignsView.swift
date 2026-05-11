@@ -371,7 +371,7 @@ private struct MarkdownDocumentView: View {
     let fileURL: URL
 
     @State private var loadError: String?
-    @State private var blocks: [MarkdownBlock] = []
+    @State private var source: String = ""
 
     var body: some View {
         ScrollView {
@@ -394,9 +394,7 @@ private struct MarkdownDocumentView: View {
                         .foregroundStyle(.red)
                         .font(.callout)
                 } else {
-                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                        MarkdownBlockView(block: block)
-                    }
+                    MarkdownBodyView(source: source)
                 }
             }
             .padding(.horizontal, 24)
@@ -422,11 +420,102 @@ private struct MarkdownDocumentView: View {
         switch result {
         case .success(let text):
             self.loadError = nil
-            self.blocks = MarkdownParser.parse(text)
+            self.source = text
         case .failure(let error):
             self.loadError = "Failed to read file: \(error.localizedDescription)"
-            self.blocks = []
+            self.source = ""
         }
+    }
+}
+
+/// Renders a string of markdown source as a non-scrolling block stack
+/// using the same parser and per-block views the Designs file viewer
+/// uses. The caller is responsible for scroll/padding/frame chrome,
+/// so this view composes naturally inside popovers, sheets, or other
+/// content containers.
+struct MarkdownBodyView: View {
+    let source: String
+
+    private var blocks: [MarkdownBlock] {
+        MarkdownParser.parse(source)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                MarkdownBlockView(block: block)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Stand-alone scrolling viewer that wraps `MarkdownBodyView` with a
+/// title row, used by `MarkdownViewerWindowController` to render long
+/// task / chore descriptions in their own window. The chrome matches
+/// `MarkdownDocumentView` so the popover's "Read full description"
+/// affordance lands the reader in a layout that visually mirrors the
+/// Designs file viewer.
+struct MarkdownViewerView: View {
+    let title: String
+    let source: String
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(title)
+                    .font(.title3.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                Divider()
+                MarkdownBodyView(source: source)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// Owns the NSWindows hosting `MarkdownViewerView`. macOS deallocates
+/// non-document windows immediately on close by default — we set
+/// `isReleasedWhenClosed = false` and hold strong references here so
+/// the SwiftUI view tree survives until the user dismisses the
+/// window, then drop the reference in `windowWillClose` so it doesn't
+/// leak.
+@MainActor
+final class MarkdownViewerWindowController: NSObject, NSWindowDelegate {
+    static let shared = MarkdownViewerWindowController()
+
+    private var openWindows: [NSWindow] = []
+
+    private override init() {
+        super.init()
+    }
+
+    func present(title: String, markdown: String) {
+        let content = MarkdownViewerView(title: title, source: markdown)
+        let hosting = NSHostingView(rootView: content)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 640),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = title
+        window.contentView = hosting
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        openWindows.append(window)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        openWindows.removeAll { $0 === window }
     }
 }
 
