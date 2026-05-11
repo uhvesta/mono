@@ -226,6 +226,10 @@ struct WorkTask: Identifiable, Hashable {
     /// badge only when this is `'engine'` so manual blocks stay
     /// visually quiet (they already get the lane).
     var lastStatusActor: String = "human"
+    /// The surface that filed this row — `cli`, `bossctl`, `mac_app`,
+    /// `engine_auto`, or `unknown`. Pre-column rows arrive as
+    /// `unknown` from the engine's migration default.
+    var createdVia: String = "unknown"
 
     var isChore: Bool {
         kind == "chore"

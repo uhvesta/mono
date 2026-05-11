@@ -1027,6 +1027,8 @@ mod tests {
             work_item_id: None,
             work_item_name: None,
             execution_id: None,
+            live_status: None,
+            live_status_at: None,
         }
     }
 

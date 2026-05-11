@@ -899,6 +899,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db

@@ -407,6 +407,7 @@ mod tests {
             autostart: true,
             last_status_actor: "human".to_owned(),
             priority: "medium".to_owned(),
+            created_via: "unknown".to_owned(),
         })
     }
 

@@ -1485,6 +1485,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1547,6 +1548,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1597,6 +1599,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1636,6 +1639,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1680,6 +1684,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1742,6 +1747,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1912,6 +1918,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2048,6 +2055,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let late = db
@@ -2057,6 +2065,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2132,6 +2141,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2194,6 +2204,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2264,6 +2275,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2348,6 +2360,7 @@ mod tests {
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         })
         .unwrap();
         db.create_task(CreateTaskInput {
@@ -2357,6 +2370,7 @@ mod tests {
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         })
         .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2450,6 +2464,7 @@ mod tests {
                     description: None,
                     autostart: true,
                     priority: None,
+                    created_via: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -2556,6 +2571,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -2577,6 +2593,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -2605,6 +2622,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let real_exec = db
@@ -2698,6 +2716,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         }
@@ -2767,6 +2786,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         // A second chore that will sit in `ready` because the
@@ -2778,6 +2798,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2891,6 +2912,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2906,6 +2928,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -2986,6 +3009,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2997,6 +3021,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(

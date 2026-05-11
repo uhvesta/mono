@@ -121,6 +121,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             },
         })
         .await?

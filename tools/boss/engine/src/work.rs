@@ -16,14 +16,15 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use boss_protocol::{
-    AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    ExecutionReconcileResult, ListDependenciesInput, Product, Project, ProjectDesignDocState,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch, WorkRun, WorkTree,
+    AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, CreateAttentionItemInput,
+    CreateChoreInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection,
+    DependencyEdge, DependencyFilter, ExecutionReconcileResult, ListDependenciesInput, Product,
+    Project, ProjectDesignDocState, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
+    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    WorkTree, is_known_created_via,
 };
 
 use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
@@ -1588,7 +1589,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1599,7 +1600,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -1682,7 +1683,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1691,7 +1692,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1790,7 +1791,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -2045,7 +2046,8 @@ impl WorkDb {
                 updated_at TEXT NOT NULL,
                 autostart INTEGER NOT NULL DEFAULT 1,
                 priority TEXT NOT NULL DEFAULT 'medium',
-                repo_remote_url TEXT
+                repo_remote_url TEXT,
+                created_via TEXT NOT NULL DEFAULT 'unknown'
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -2133,6 +2135,7 @@ impl WorkDb {
         migrate_last_status_actor(&conn)?;
         migrate_tasks_priority(&conn)?;
         migrate_project_design_doc_columns(&conn)?;
+        migrate_tasks_created_via(&conn)?;
         migrate_backfill_project_design_tasks(&conn)?;
         migrate_tasks_repo_remote_url(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
@@ -2660,6 +2663,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         autostart: row.get::<_, i64>(12)? != 0,
         last_status_actor: row.get(13)?,
         priority: row.get(14)?,
+        created_via: row.get(15)?,
     })
 }
 
@@ -2721,11 +2725,12 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
+    let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "task");
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
@@ -2739,11 +2744,12 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
+    let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "chore");
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
-         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7)",
-        params![id, input.product_id, input.name, description, now, autostart_value, priority],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8)",
+        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
@@ -2755,6 +2761,12 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
 /// design task always has `ordinal = 0` so it sorts ahead of every
 /// `project_task` (which start at `ordinal = 1`) and the dispatcher
 /// picks it up first via the existing first-incomplete chain.
+///
+/// `created_via` is always `engine_auto`: the user did not file the
+/// design task directly, the engine added it as a side-effect of
+/// project creation (or backfill). That distinction is the entire
+/// point of the column — manual chores and engine-spawned ones must
+/// be tellable apart in one query.
 fn insert_design_task_for_project_in_tx(
     conn: &Connection,
     product_id: &str,
@@ -2765,11 +2777,39 @@ fn insert_design_task_for_project_in_tx(
     let now = now_string();
     let autostart_value: i64 = if autostart { 1 } else { 0 };
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
-         VALUES (?1, ?2, ?3, 'design', 'Design', '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium')",
-        params![id, product_id, project_id, now, autostart_value],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+         VALUES (?1, ?2, ?3, 'design', 'Design', '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6)",
+        params![id, product_id, project_id, now, autostart_value, CREATED_VIA_ENGINE_AUTO],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))
+}
+
+/// Resolve the caller-supplied `created_via` to a stored string. A
+/// `None` input lands as `unknown` (the engine app should normally
+/// have already substituted a transport-layer hint by the time the
+/// row reaches this insert; falling through to `unknown` here is the
+/// last-resort safety net). Values outside the documented set are
+/// stored verbatim but logged so we can spot undocumented sources
+/// sneaking in. `id_for_log` and `kind_for_log` exist only to make
+/// the warning useful — they don't affect the stored value.
+fn canonicalize_created_via(
+    raw: Option<&str>,
+    id_for_log: &str,
+    kind_for_log: &str,
+) -> String {
+    let value = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(CREATED_VIA_UNKNOWN);
+    if !is_known_created_via(value) {
+        tracing::warn!(
+            id = %id_for_log,
+            kind = %kind_for_log,
+            created_via = %value,
+            "created_via not in documented set; storing as-is",
+        );
+    }
+    value.to_owned()
 }
 
 /// Validate a caller-supplied priority and return the canonical
@@ -2862,7 +2902,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -2925,7 +2965,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -3174,6 +3214,22 @@ fn migrate_tasks_repo_remote_url(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add `created_via` to `tasks` so the engine records the surface
+/// that filed each chore/task — `cli`, `bossctl`, `mac_app`, or
+/// `engine_auto`. Existing rows default to `unknown` (the same
+/// fallback the engine uses when a caller omits the field). The
+/// column is purely additive; no existing query depends on it.
+fn migrate_tasks_created_via(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "created_via")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN created_via TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+
 /// Add per-project design-doc pointer columns. The three columns
 /// jointly identify "where this project's design doc lives" and
 /// are all nullable: `design_doc_path` is the load-bearing field
@@ -3231,9 +3287,9 @@ fn migrate_backfill_project_design_tasks(conn: &Connection) -> Result<()> {
         let id = next_id("task");
         let now = now_string();
         conn.execute(
-            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority)
-             VALUES (?1, ?2, ?3, 'design', 'Design', '', 'todo', 0, NULL, NULL, ?4, ?4, 0, 'medium')",
-            params![id, product_id, project_id, now],
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+             VALUES (?1, ?2, ?3, 'design', 'Design', '', 'todo', 0, NULL, NULL, ?4, ?4, 0, 'medium', ?5)",
+            params![id, product_id, project_id, now, CREATED_VIA_ENGINE_AUTO],
         )?;
     }
     Ok(())
@@ -4236,6 +4292,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let chore = db
@@ -4245,6 +4302,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -4296,6 +4354,7 @@ mod tests {
                 description: Some(format!("d{i}")),
                 autostart: i % 2 == 0,
                 priority: None,
+                created_via: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -4356,6 +4415,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             },
             CreateTaskInput {
                 product_id: product.id.clone(),
@@ -4364,6 +4424,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             },
         ];
         let err = db
@@ -4409,6 +4470,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -4447,6 +4509,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let chore_running = db
@@ -4456,6 +4519,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4521,6 +4585,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let dependent = db
@@ -4530,6 +4595,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -4555,6 +4621,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let other_dependent = db
@@ -4564,6 +4631,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -4677,6 +4745,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let second = db
@@ -4687,6 +4756,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -4734,6 +4804,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -4893,6 +4964,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let second_task = db
@@ -4903,6 +4975,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let chore = db
@@ -4912,6 +4985,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -4980,6 +5054,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let second_task = db
@@ -4990,6 +5065,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -5051,6 +5127,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -5104,6 +5181,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -5190,6 +5268,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -5256,6 +5335,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -5330,6 +5410,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         // Manually mark the chore as done before starting execution.
@@ -5402,6 +5483,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         // Manually flip to active, mimicking a kanban drag that
@@ -5447,6 +5529,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -5501,6 +5584,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -5554,6 +5638,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -5619,6 +5704,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let exec_a = db
@@ -5650,6 +5736,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -5668,6 +5755,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -5722,6 +5810,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let exec_live = db
@@ -5749,6 +5838,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let exec_dead = db
@@ -5776,6 +5866,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let exec_unknown = db
@@ -5859,6 +5950,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let stale = db
@@ -5918,6 +6010,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -5984,6 +6077,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -6032,6 +6126,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         // Drive the chore into `active` so reconcile considers it.
@@ -6114,6 +6209,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6185,6 +6281,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let live = db
@@ -6240,6 +6337,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let done_chore = db
@@ -6249,6 +6347,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6288,6 +6387,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         assert!(
@@ -6315,6 +6415,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let result = db.reconcile_product_executions(&product.id).unwrap();
@@ -6360,6 +6461,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6409,6 +6511,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6449,6 +6552,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6664,6 +6768,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6715,6 +6820,7 @@ mod tests {
                     description: None,
                     autostart: true,
                     priority: None,
+                    created_via: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -6771,6 +6877,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let dependent = db
@@ -6780,6 +6887,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         // Add the blocks edge BEFORE flipping dependent to active so
@@ -6835,6 +6943,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -6896,6 +7005,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -6986,6 +7096,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = db
@@ -7087,6 +7198,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -7137,6 +7249,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7146,6 +7259,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -7257,6 +7371,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7266,6 +7381,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let err = db
@@ -7303,6 +7419,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7312,6 +7429,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7357,6 +7475,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7366,6 +7485,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         // Sanity: A starts as `todo` (default).
@@ -7419,6 +7539,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7428,6 +7549,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7481,6 +7603,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let prereq_b = db
@@ -7490,6 +7613,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let prereq_c = db
@@ -7499,6 +7623,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7582,6 +7707,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let prereq = db
@@ -7591,6 +7717,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7671,6 +7798,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7680,6 +7808,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 
@@ -7732,6 +7861,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         // Human moves A to `blocked` (no edges yet).
@@ -7758,6 +7888,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.update_work_item(
@@ -7810,6 +7941,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7819,6 +7951,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7862,6 +7995,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7871,6 +8005,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7922,6 +8057,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let b = db
@@ -7931,6 +8067,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -8062,6 +8199,124 @@ mod tests {
         assert_eq!(project.design_doc_repo_remote_url, None);
         assert_eq!(project.design_doc_branch, None);
         assert_eq!(project.design_doc_path, None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Round-trip: stamping `created_via` on the input is preserved
+    /// across insert + read; omitting it lands `unknown` (the engine-
+    /// app handler is responsible for substituting a transport hint
+    /// before reaching this layer); the auto-created project design
+    /// task is always `engine_auto`.
+    #[test]
+    fn create_via_round_trip_per_source() {
+        let path = temp_db_path("created-via");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+
+        let cli_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "from cli".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: Some(boss_protocol::CREATED_VIA_CLI.to_owned()),
+            })
+            .unwrap();
+        assert_eq!(cli_chore.created_via, boss_protocol::CREATED_VIA_CLI);
+
+        let unknown_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "no source".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+            })
+            .unwrap();
+        assert_eq!(unknown_chore.created_via, CREATED_VIA_UNKNOWN);
+
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Proj".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+            })
+            .unwrap();
+        let project_tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        let design_task = project_tasks
+            .iter()
+            .find(|t| t.kind == "design")
+            .expect("project create should auto-spawn a design task");
+        assert_eq!(design_task.created_via, CREATED_VIA_ENGINE_AUTO);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Pre-existing databases that predate `created_via` should pick
+    /// up the new column with `unknown` for every row, and fresh
+    /// writes that follow continue to set their own value.
+    #[test]
+    fn migration_adds_created_via_with_unknown_default() {
+        let path = temp_db_path("created-via-migrate");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human');
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 priority TEXT NOT NULL DEFAULT 'medium');
+             INSERT INTO products(id, name, slug, status, created_at, updated_at)
+             VALUES ('prod_legacy', 'L', 'l', 'active', '1700000000', '1700000000');
+             INSERT INTO tasks(id, product_id, project_id, kind, name, description,
+                 status, ordinal, pr_url, deleted_at, created_at, updated_at,
+                 autostart, last_status_actor, priority)
+             VALUES ('task_legacy', 'prod_legacy', NULL, 'chore', 'old', '',
+                 'todo', NULL, NULL, NULL, '1700000000', '1700000000',
+                 1, 'human', 'medium');
+             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "created_via").unwrap());
+        let legacy = query_task(&conn, "task_legacy").unwrap().unwrap();
+        assert_eq!(legacy.created_via, CREATED_VIA_UNKNOWN);
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "5");
         let _ = std::fs::remove_file(path);
     }
 
@@ -8752,6 +9007,7 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -8903,6 +9159,7 @@ mod tests {
                     description: None,
                     autostart: false,
                     priority: None,
+                    created_via: None,
                 })
                 .unwrap()
                 .id
