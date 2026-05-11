@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# concat-videos — losslessly concatenate two or more video files using ffmpeg's
+# concat demuxer (stream copy, no re-encode). Inputs must share codec/resolution/
+# frame rate — typical when the files come from the same camera as adjacent
+# clips in a sequence.
+#
+# Output filename is derived from the inputs. For DJI clips like
+#   DJI_20260510150025_0045_D.MP4
+#   DJI_20260510150408_0046_D.MP4
+# it writes DJI_20260510150025_0045-0046_D.MP4 (earliest timestamp, hyphenated
+# sequence range, preserved suffix). For other naming patterns it falls back
+# to joining the basenames with '+'.
+
+set -euo pipefail
+
+# Where to log when run from a Finder Quick Action (Automator gives the script
+# a minimal env and no terminal, so progress vanishes without an explicit log).
+LOG_DIR="${HOME}/Library/Logs/concat-videos"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/concat-videos.log"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "${LOG_FILE}" >&2
+}
+
+die() {
+  log "ERROR: $*"
+  if command -v osascript >/dev/null 2>&1; then
+    /usr/bin/osascript -e "display notification \"$*\" with title \"concat-videos failed\""
+  fi
+  exit 1
+}
+
+if [[ "$#" -lt 2 ]]; then
+  echo "usage: $(basename "$0") FILE1 FILE2 [FILE3 ...]" >&2
+  exit 64
+fi
+
+# Resolve and sort inputs by name for predictable order regardless of selection
+# order in Finder.
+inputs=()
+for f in "$@"; do
+  [[ -f "$f" ]] || die "not a file: $f"
+  abs="$(cd "$(dirname -- "$f")" && pwd)/$(basename -- "$f")"
+  inputs+=("$abs")
+done
+IFS=$'\n' inputs=($(printf '%s\n' "${inputs[@]}" | sort)); unset IFS
+
+first="${inputs[0]}"
+out_dir="$(dirname -- "$first")"
+
+# Derive output filename. Try the DJI pattern first: DJI_<timestamp>_<seq>_<X>.MP4.
+# Across adjacent clips the timestamp differs, so only the suffix must match;
+# we keep the earliest file's timestamp (inputs were sorted by name above) and
+# join the sequence numbers with hyphens.
+dji_re='^DJI_([0-9]{14})_([0-9]{4})(_[A-Z]\.MP4)$'
+all_dji=true
+timestamp=""
+suffix=""
+seqs=()
+for f in "${inputs[@]}"; do
+  base="$(basename -- "$f")"
+  if [[ "$base" =~ $dji_re ]]; then
+    t="${BASH_REMATCH[1]}"
+    s="${BASH_REMATCH[2]}"
+    sx="${BASH_REMATCH[3]}"
+    if [[ -z "$timestamp" ]]; then
+      timestamp="$t"
+      suffix="$sx"
+    elif [[ "$sx" != "$suffix" ]]; then
+      all_dji=false
+      break
+    fi
+    seqs+=("$s")
+  else
+    all_dji=false
+    break
+  fi
+done
+
+if $all_dji; then
+  IFS=- ; seq_join="${seqs[*]}"; unset IFS
+  out_name="DJI_${timestamp}_${seq_join}${suffix}"
+else
+  parts=()
+  for f in "${inputs[@]}"; do
+    base="$(basename -- "$f")"
+    parts+=("${base%.*}")
+  done
+  IFS=+ ; joined="${parts[*]}"; unset IFS
+  ext="${first##*.}"
+  out_name="${joined}.${ext}"
+fi
+
+out_path="${out_dir}/${out_name}"
+
+# Don't clobber an existing file. Append _2, _3, ... before the extension.
+if [[ -e "$out_path" ]]; then
+  stem="${out_name%.*}"
+  ext="${out_name##*.}"
+  i=2
+  while [[ -e "${out_dir}/${stem}_${i}.${ext}" ]]; do
+    i=$((i + 1))
+  done
+  out_path="${out_dir}/${stem}_${i}.${ext}"
+fi
+
+# Build the concat list. The concat demuxer requires single-quoted paths with
+# literal single quotes escaped as '\''.
+list="$(mktemp -t concat-videos).txt"
+trap 'rm -f "$list"' EXIT
+
+for f in "${inputs[@]}"; do
+  esc="${f//\'/\'\\\'\'}"
+  printf "file '%s'\n" "$esc" >> "$list"
+done
+
+# Find ffmpeg. Automator/launchd give shells a minimal PATH that misses
+# Homebrew, so probe common locations explicitly.
+FFMPEG=""
+for candidate in \
+  "${FFMPEG_BIN:-}" \
+  "$(command -v ffmpeg 2>/dev/null || true)" \
+  /opt/homebrew/bin/ffmpeg \
+  /usr/local/bin/ffmpeg \
+  /opt/local/bin/ffmpeg
+do
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    FFMPEG="$candidate"
+    break
+  fi
+done
+[[ -n "$FFMPEG" ]] || die "ffmpeg not found. Install via: brew install ffmpeg"
+
+log "concat ${#inputs[@]} files -> ${out_path}"
+for f in "${inputs[@]}"; do log "  in: $f"; done
+
+# Run ffmpeg. Stream copy = no re-encode = lossless and fast.
+"$FFMPEG" -hide_banner -nostdin -loglevel warning \
+  -f concat -safe 0 -i "$list" \
+  -map 0:v:0 -map 0:a:0 -c copy \
+  "$out_path" 2>&1 | tee -a "${LOG_FILE}" >&2
+
+log "ok: ${out_path}"
+
+if command -v osascript >/dev/null 2>&1; then
+  /usr/bin/osascript -e "display notification \"$(basename "$out_path")\" with title \"concat-videos done\""
+fi
+
+printf '%s\n' "$out_path"
