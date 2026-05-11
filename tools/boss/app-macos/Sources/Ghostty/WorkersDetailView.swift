@@ -4,11 +4,21 @@ import SwiftUI
 struct WorkersDetailView: View {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
+    /// View model that owns the per-slot live-status enabled flags
+    /// and exposes the RPC to toggle them. Plumbed in from the
+    /// `ContentView` parent so this view can stay a thin shell over
+    /// `ChatViewModel`'s state.
+    @ObservedObject var liveStatusModel: ChatViewModel
 
     var body: some View {
-        WorkerGrid(runtime: workspace.runtime, slots: workspace.slots, liveStates: liveStates)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .separatorColor))
+        WorkerGrid(
+            runtime: workspace.runtime,
+            slots: workspace.slots,
+            liveStates: liveStates,
+            liveStatusModel: liveStatusModel
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .separatorColor))
     }
 }
 
@@ -16,6 +26,7 @@ private struct WorkerGrid: View {
     let runtime: GhosttyRuntime
     let slots: [WorkerSlot]
     @ObservedObject var liveStates: LiveWorkerStateStore
+    @ObservedObject var liveStatusModel: ChatViewModel
 
     var body: some View {
         let columns = 4
@@ -30,7 +41,14 @@ private struct WorkerGrid: View {
                         WorkerSlotView(
                             runtime: runtime,
                             slot: slot,
-                            liveState: liveStates.bySlot[slot.slotId]
+                            liveState: liveStates.bySlot[slot.slotId],
+                            liveStatusEnabled: liveStatusModel.isLiveStatusEnabled(slotId: slot.slotId),
+                            onToggleLiveStatus: { enabled in
+                                liveStatusModel.setLiveStatusEnabled(
+                                    slotId: slot.slotId,
+                                    enabled: enabled
+                                )
+                            }
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
@@ -44,6 +62,14 @@ private struct WorkerSlotView: View {
     let runtime: GhosttyRuntime
     let slot: WorkerSlot
     let liveState: WorkerLiveState?
+    /// Whether the live-status summarizer is currently enabled for
+    /// this slot. Drives the small toggle in the slot header (Q9
+    /// per-worker off-switch).
+    let liveStatusEnabled: Bool
+    /// Closure the toggle calls when the human flips the switch. The
+    /// parent threads this through to `ChatViewModel`, which sends
+    /// the RPC and updates the local mirror.
+    let onToggleLiveStatus: (Bool) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -144,10 +170,37 @@ private struct WorkerSlotView: View {
             } else if let state = slot.session?.claudeState {
                 statusPill(state.label, color: claudeStateColor(state))
             }
+
+            liveStatusToggle
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .help(slotTooltip)
+    }
+
+    /// Tiny eye-icon toggle in the slot header that disables the
+    /// live-status summarizer for this slot. Off = engine stops
+    /// summarising and the UI falls back to pane_summary. Persisted
+    /// across engine restarts; the engine echoes the new state back
+    /// so reads via subscribe stay in sync. Tooltip explains the
+    /// trade-off so a curious user understands what the icon does.
+    @ViewBuilder
+    private var liveStatusToggle: some View {
+        let enabled = liveStatusEnabled
+        Button {
+            onToggleLiveStatus(!enabled)
+        } label: {
+            Image(systemName: enabled ? "eye" : "eye.slash")
+                .font(.caption2)
+                .foregroundStyle(enabled ? Color.secondary : Color(nsColor: .tertiaryLabelColor))
+        }
+        .buttonStyle(.plain)
+        .help(
+            enabled
+                ? "Live status on — engine summarises this worker's transcript."
+                : "Live status off — falls back to the static pane summary."
+        )
+        .accessibilityLabel(enabled ? "Disable live status" : "Enable live status")
     }
 
     private func liveActivityColor(_ activity: WorkerActivity) -> Color {

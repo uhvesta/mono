@@ -104,6 +104,14 @@ enum EngineEvent {
     /// `list_worker_live_states` and as a topic push on
     /// `worker.live_states` whenever any slot changes.
     case workerLiveStatesList(states: [WorkerLiveState])
+    /// Snapshot of slot ids whose live-status summarizer has been
+    /// manually disabled by the human. Sourced from a one-shot reply
+    /// to `list_live_status_disabled_slots`.
+    case liveStatusDisabledSlotsList(slotIds: [Int])
+    /// Echoed result of a `set_live_status_enabled` toggle. The UI
+    /// uses this to confirm the engine accepted the change before
+    /// flipping local state.
+    case liveStatusEnabledSet(slotId: Int, enabled: Bool)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -179,6 +187,24 @@ final class EngineClient: @unchecked Sendable {
     /// `worker.live_states` topic to keep up to date in real time.
     func sendListWorkerLiveStates() {
         sendLine(["type": "list_worker_live_states"])
+    }
+
+    /// Ask the engine for the current set of slot ids that have the
+    /// live-status summarizer disabled. Used at session start so the
+    /// Agents-tab toggle reflects the persisted state.
+    func sendListLiveStatusDisabledSlots() {
+        sendLine(["type": "list_live_status_disabled_slots"])
+    }
+
+    /// Toggle the live-status summarizer for one slot. The engine
+    /// persists the choice in its metadata KV so it survives an
+    /// engine restart.
+    func sendSetLiveStatusEnabled(slotId: Int, enabled: Bool) {
+        sendLine([
+            "type": "set_live_status_enabled",
+            "slot_id": slotId,
+            "enabled": enabled,
+        ])
     }
 
     func sendSubscribe(topics: [String]) {
@@ -636,6 +662,14 @@ final class EngineClient: @unchecked Sendable {
                 let raw = payload["states"] as? [[String: Any]] ?? []
                 let states = raw.compactMap(parseWorkerLiveState)
                 emit(.workerLiveStatesList(states: states))
+            case "live_status_disabled_slots_list":
+                let raw = payload["slot_ids"] as? [Any] ?? []
+                let slotIds = raw.compactMap { ($0 as? NSNumber)?.intValue }
+                emit(.liveStatusDisabledSlotsList(slotIds: slotIds))
+            case "live_status_enabled_set":
+                let slotId = (payload["slot_id"] as? NSNumber)?.intValue ?? 0
+                let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
+                emit(.liveStatusEnabledSet(slotId: slotId, enabled: enabled))
             default:
                 break
             }

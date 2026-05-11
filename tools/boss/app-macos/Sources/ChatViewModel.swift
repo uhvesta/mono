@@ -63,6 +63,32 @@ final class ChatViewModel: ObservableObject {
     /// live state subscribe to the store.
     let liveWorkerStates = LiveWorkerStateStore()
 
+    /// Slot ids whose live-status summarizer has been manually
+    /// disabled by the human via the Agents-tab toggle. Sourced from
+    /// `list_live_status_disabled_slots` at session start and kept
+    /// in sync via `live_status_enabled_set` echoes. Persisted on
+    /// the engine side so this is purely a UI mirror.
+    @Published var liveStatusDisabledSlotIDs: Set<Int> = []
+
+    /// Toggle the live-status summarizer for `slotId`. Sends the
+    /// RPC and optimistically updates local state; the engine echo
+    /// brings the two back in sync.
+    func setLiveStatusEnabled(slotId: Int, enabled: Bool) {
+        if enabled {
+            liveStatusDisabledSlotIDs.remove(slotId)
+        } else {
+            liveStatusDisabledSlotIDs.insert(slotId)
+        }
+        engine.sendSetLiveStatusEnabled(slotId: slotId, enabled: enabled)
+    }
+
+    /// `true` if the live-status summarizer is currently enabled for
+    /// `slotId`. Defaults to enabled — the disabled set is the
+    /// minority case.
+    func isLiveStatusEnabled(slotId: Int) -> Bool {
+        !liveStatusDisabledSlotIDs.contains(slotId)
+    }
+
     var selectedProduct: WorkProduct? {
         guard let productID = currentSelectedProductID else { return nil }
         return product(withID: productID)
@@ -616,6 +642,7 @@ final class ChatViewModel: ObservableObject {
             refreshWorkSubscriptions()
             engine.sendListProducts()
             engine.sendListWorkerLiveStates()
+            engine.sendListLiveStatusDisabledSlots()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
@@ -757,6 +784,14 @@ final class ChatViewModel: ObservableObject {
             workErrorMessage = message
         case .workerLiveStatesList(let states):
             liveWorkerStates.update(states: states)
+        case .liveStatusDisabledSlotsList(let slotIds):
+            liveStatusDisabledSlotIDs = Set(slotIds)
+        case .liveStatusEnabledSet(let slotId, let enabled):
+            if enabled {
+                liveStatusDisabledSlotIDs.remove(slotId)
+            } else {
+                liveStatusDisabledSlotIDs.insert(slotId)
+            }
         }
     }
 

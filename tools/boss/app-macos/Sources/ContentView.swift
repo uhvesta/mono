@@ -173,7 +173,11 @@ struct ContentView: View {
 
     private var agentsView: some View {
         #if canImport(GhosttyKit)
-        WorkersDetailView(workspace: workersWorkspace, liveStates: model.liveWorkerStates)
+        WorkersDetailView(
+            workspace: workersWorkspace,
+            liveStates: model.liveWorkerStates,
+            liveStatusModel: model
+        )
             .background(Color(nsColor: .windowBackgroundColor))
         #else
         VStack(alignment: .leading, spacing: 12) {
