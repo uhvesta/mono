@@ -152,20 +152,27 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
 }
 
 fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
-    // Inline-prefix all three env vars the shim needs. `BOSS_RUN_ID`
-    // is the load-bearing one for live-worker-state correlation: if
-    // it's missing from the shim's env, the splice that adds
-    // `_boss_run_id` to the payload silently fails and the engine
-    // drops the hook event, pinning the worker's activity at
-    // `Spawning`. Setting it here (rather than relying on env
-    // inheritance from the worker pane through claude into the hook
-    // subprocess) guarantees the shim sees it regardless of how
-    // claude handles env propagation.
+    // Inline-prefix all env vars the shim needs. `BOSS_RUN_ID` is the
+    // load-bearing one for live-worker-state correlation: if it's
+    // missing from the shim's env, the splice that adds `_boss_run_id`
+    // to the payload silently fails and the engine drops the hook
+    // event, pinning the worker's activity at `Spawning`. Setting it
+    // here (rather than relying on env inheritance from the worker
+    // pane through claude into the hook subprocess) guarantees the
+    // shim sees it regardless of how claude handles env propagation.
+    //
+    // `BOSS_WORKSPACE` tells the shim where to write its on-disk event
+    // buffer when the engine is unreachable (see the shim's
+    // resilience docs). Without it the shim falls back to cwd, which
+    // is normally the workspace anyway — but inline-prefixing is the
+    // belt that survives any future change to how claude propagates
+    // cwd to hook subprocesses.
     let command = format!(
-        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} {shim}",
+        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
         socket = shell_escape(&input.events_socket_path.display().to_string()),
         lease = shell_escape(&input.lease_id),
         run_id = shell_escape(&input.run_id),
+        workspace = shell_escape(&input.workspace_path.display().to_string()),
         shim = shell_escape(&input.boss_event_path.display().to_string()),
     );
 
@@ -328,6 +335,35 @@ mod tests {
         assert!(command.contains("lease-uuid-abc"));
         assert!(command.contains("boss-event"));
         assert!(command.starts_with("BOSS_EVENTS_SOCKET="));
+    }
+
+    #[test]
+    fn settings_json_inlines_workspace_into_every_hook_command() {
+        // The shim writes its on-disk event buffer relative to
+        // `BOSS_WORKSPACE` when the engine socket is unreachable. The
+        // hook command must inline-prefix this env var so the buffer
+        // lives in the lease's workspace regardless of cwd.
+        let input = sample_input();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let workspace_str = input.workspace_path.display().to_string();
+        for hook_name in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "Notification",
+            "SessionEnd",
+        ] {
+            let command = parsed["hooks"][hook_name][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing command for {hook_name}"));
+            assert!(
+                command.contains(&format!("BOSS_WORKSPACE='{workspace_str}'")),
+                "{hook_name} command missing BOSS_WORKSPACE=<workspace>: {command}",
+            );
+        }
     }
 
     #[test]

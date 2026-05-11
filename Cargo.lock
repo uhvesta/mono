@@ -223,6 +223,7 @@ name = "boss-event"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs4",
  "serde_json",
  "tempfile",
 ]
