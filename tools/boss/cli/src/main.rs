@@ -2956,6 +2956,9 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             last_status_actor: "human".to_owned(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: None,
         };
         assert!(expect_leaf_work_item(WorkItem::Project(project)).is_err());
     }

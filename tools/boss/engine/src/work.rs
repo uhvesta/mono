@@ -2192,6 +2192,12 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
         last_status_actor: row.get(10)?,
+        // The design-doc pointer columns land in a follow-up chore
+        // (schema migration); until then `map_project` does not read
+        // them and every row resolves to `None` on the wire.
+        design_doc_repo_remote_url: None,
+        design_doc_branch: None,
+        design_doc_path: None,
     })
 }
 

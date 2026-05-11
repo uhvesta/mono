@@ -711,7 +711,10 @@ final class EngineClient: @unchecked Sendable {
             priority: priority,
             createdAt: createdAt,
             updatedAt: updatedAt,
-            lastStatusActor: (payload["last_status_actor"] as? String) ?? "human"
+            lastStatusActor: (payload["last_status_actor"] as? String) ?? "human",
+            designDocRepoRemoteURL: payload["design_doc_repo_remote_url"] as? String,
+            designDocBranch: payload["design_doc_branch"] as? String,
+            designDocPath: payload["design_doc_path"] as? String
         )
     }
 

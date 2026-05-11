@@ -31,6 +31,22 @@ pub struct Project {
     /// back to `todo` when this is `'engine'` — manual blocks stick.
     #[serde(default = "default_human_actor")]
     pub last_status_actor: String,
+    /// Repo URL the project's design doc lives in. `None` → inherit
+    /// from the project's product (`products.repo_remote_url`). Set
+    /// explicitly when the doc lives in a different repo (the
+    /// separate-doc-repo case at work).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_doc_repo_remote_url: Option<String>,
+    /// Branch the design doc lives on. `None` → inherit from the
+    /// product's docs branch (or `"main"` if no per-product default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_doc_branch: Option<String>,
+    /// Repo-relative path to the design doc (e.g.
+    /// `"tools/boss/docs/designs/foo.md"`). `None` → no pointer set;
+    /// UI affordance is hidden. This is the load-bearing field — when
+    /// `None` the other two are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_doc_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,4 +454,300 @@ pub enum DependencyFilter {
     Unblocked,
     /// Only items currently gated by at least one incomplete prereq.
     BlockedByDeps,
+}
+
+/// Input to the `SetProjectDesignDoc` RPC: point a project at its
+/// design doc. Three optional fields (mirroring the three columns on
+/// `projects`), plus an `unset` switch that clears the pointer.
+///
+/// Resolution semantics (also enforced engine-side):
+/// - `design_doc_path = Some(p)` with non-empty `p` → set the
+///   pointer; `repo_remote_url` / `branch` are best-effort overrides
+///   (any `None` falls back to the product's defaults).
+/// - `design_doc_path = None` with `unset = false` → only the
+///   non-path fields are updated; the existing path stays put.
+/// - `unset = true` → clear all three columns. Any explicit field
+///   values supplied alongside are ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetProjectDesignDocInput {
+    pub project_id: String,
+    /// `None` means "inherit from `product.repo_remote_url`" (the
+    /// in-repo case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_doc_repo_remote_url: Option<String>,
+    /// `None` means "inherit from `product.docs_branch`, falling back
+    /// to `"main"`".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_doc_branch: Option<String>,
+    /// Repo-relative path. Setting `Some("")` is rejected by the
+    /// engine (use `unset = true` to clear). `None` leaves the
+    /// existing path unchanged unless `unset` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_doc_path: Option<String>,
+    /// When `true`, clear the pointer entirely (all three columns set
+    /// to NULL). Takes precedence over any explicit field values.
+    #[serde(default)]
+    pub unset: bool,
+}
+
+/// Result of resolving a project's design-doc pointer. Carries the
+/// concrete `(repo, branch, path)` triple plus a discriminator that
+/// tells the open affordance which fast path it can take.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedDesignDoc {
+    pub repo_remote_url: String,
+    pub branch: String,
+    pub path: String,
+    pub kind: ResolvedDesignDocKind,
+}
+
+/// Where the resolved design doc actually lives relative to the
+/// project's product. Drives the open affordance: `SameProduct` and
+/// `OtherProduct` can open in the leased workspace's filesystem when
+/// cube has a workspace for the repo; `External` always falls back
+/// to the GitHub web URL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResolvedDesignDocKind {
+    /// Doc lives in the project's own product's repo. Fast path: read
+    /// the file straight from a leased workspace.
+    SameProduct { product_id: String },
+    /// Doc lives in a Boss-tracked product different from the
+    /// project's. If cube has a workspace for that repo, the same
+    /// fast path applies; otherwise fall through to web.
+    OtherProduct { product_id: String },
+    /// Doc lives in a repo Boss does not track as a Product. Open
+    /// always goes through the GitHub web URL.
+    External,
+}
+
+/// Wire-level state returned by `ResolveProjectDesignDoc`. The UI
+/// uses this directly to pick the right affordance (hidden, plain
+/// icon, warning glyph) without re-implementing the resolution
+/// logic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProjectDesignDocState {
+    /// The project has no design-doc pointer set. UI hides the
+    /// affordance entirely.
+    NotSet,
+    /// The pointer resolved cleanly. Carries the structured triple,
+    /// a hint about whether cube currently has a workspace leased for
+    /// the resolved repo (so the open dispatcher can pick the
+    /// filesystem fast path), and a pre-rendered GitHub web URL for
+    /// the kanban tooltip / right-click "copy link."
+    Resolved {
+        resolved: ResolvedDesignDoc,
+        /// True when at least one cube workspace is leased for
+        /// `resolved.repo_remote_url`.
+        local_workspace_available: bool,
+        /// `https://github.com/<owner>/<repo>/blob/<branch>/<path>`,
+        /// pre-built so consumers don't have to re-parse the repo
+        /// URL.
+        web_url: String,
+    },
+    /// The pointer is set but cannot be resolved (e.g. path with no
+    /// repo to resolve against). The UI surfaces a warning glyph
+    /// linking to the set-design-doc form.
+    Broken { reason: String },
+}
+
+/// Output of the `ResolveProjectDesignDoc` RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolveProjectDesignDocOutput {
+    pub project_id: String,
+    pub state: ProjectDesignDocState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn sample_project_json(extra: Value) -> Value {
+        let mut base = json!({
+            "id": "proj_1",
+            "product_id": "prod_1",
+            "name": "Demo",
+            "slug": "demo",
+            "description": "",
+            "goal": "",
+            "status": "todo",
+            "priority": "medium",
+            "created_at": "2026-05-11T00:00:00Z",
+            "updated_at": "2026-05-11T00:00:00Z",
+        });
+        if let (Value::Object(target), Value::Object(extra)) = (&mut base, extra) {
+            for (k, v) in extra {
+                target.insert(k, v);
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn project_decodes_without_design_doc_fields() {
+        let raw = sample_project_json(json!({}));
+        let project: Project = serde_json::from_value(raw).unwrap();
+        assert!(project.design_doc_repo_remote_url.is_none());
+        assert!(project.design_doc_branch.is_none());
+        assert!(project.design_doc_path.is_none());
+        assert_eq!(project.last_status_actor, "human");
+    }
+
+    #[test]
+    fn project_skips_none_design_doc_fields_on_encode() {
+        let project: Project = serde_json::from_value(sample_project_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&project).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("design_doc_repo_remote_url"));
+        assert!(!obj.contains_key("design_doc_branch"));
+        assert!(!obj.contains_key("design_doc_path"));
+    }
+
+    #[test]
+    fn project_roundtrips_with_design_doc_fields() {
+        let raw = sample_project_json(json!({
+            "design_doc_repo_remote_url": "https://github.com/foo/bar.git",
+            "design_doc_branch": "main",
+            "design_doc_path": "tools/boss/docs/designs/demo.md",
+        }));
+        let project: Project = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(
+            project.design_doc_repo_remote_url.as_deref(),
+            Some("https://github.com/foo/bar.git"),
+        );
+        assert_eq!(project.design_doc_branch.as_deref(), Some("main"));
+        assert_eq!(
+            project.design_doc_path.as_deref(),
+            Some("tools/boss/docs/designs/demo.md"),
+        );
+
+        let reencoded = serde_json::to_value(&project).unwrap();
+        let project2: Project = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(
+            project.design_doc_repo_remote_url,
+            project2.design_doc_repo_remote_url,
+        );
+        assert_eq!(project.design_doc_branch, project2.design_doc_branch);
+        assert_eq!(project.design_doc_path, project2.design_doc_path);
+    }
+
+    #[test]
+    fn set_project_design_doc_input_roundtrips() {
+        let input = SetProjectDesignDocInput {
+            project_id: "proj_1".into(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: Some("tools/boss/docs/designs/demo.md".into()),
+            unset: false,
+        };
+        let raw = serde_json::to_value(&input).unwrap();
+        let obj = raw.as_object().unwrap();
+        assert!(!obj.contains_key("design_doc_repo_remote_url"));
+        assert!(!obj.contains_key("design_doc_branch"));
+        assert_eq!(obj.get("unset"), Some(&Value::Bool(false)));
+        let back: SetProjectDesignDocInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(back.project_id, input.project_id);
+        assert_eq!(back.design_doc_path, input.design_doc_path);
+        assert_eq!(back.unset, input.unset);
+    }
+
+    #[test]
+    fn set_project_design_doc_input_unset_decodes_without_optional_fields() {
+        let raw = json!({
+            "project_id": "proj_1",
+            "unset": true,
+        });
+        let parsed: SetProjectDesignDocInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.project_id, "proj_1");
+        assert!(parsed.unset);
+        assert!(parsed.design_doc_path.is_none());
+    }
+
+    #[test]
+    fn resolved_design_doc_kind_serializes_as_internally_tagged() {
+        let same = ResolvedDesignDocKind::SameProduct {
+            product_id: "prod_1".into(),
+        };
+        let raw = serde_json::to_value(&same).unwrap();
+        assert_eq!(
+            raw,
+            json!({"type": "same_product", "product_id": "prod_1"})
+        );
+
+        let external = ResolvedDesignDocKind::External;
+        let raw = serde_json::to_value(&external).unwrap();
+        assert_eq!(raw, json!({"type": "external"}));
+
+        let back: ResolvedDesignDocKind =
+            serde_json::from_value(json!({"type": "other_product", "product_id": "prod_2"}))
+                .unwrap();
+        assert_eq!(
+            back,
+            ResolvedDesignDocKind::OtherProduct {
+                product_id: "prod_2".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn project_design_doc_state_roundtrips_all_variants() {
+        let not_set = ProjectDesignDocState::NotSet;
+        let raw = serde_json::to_value(&not_set).unwrap();
+        assert_eq!(raw, json!({"type": "not_set"}));
+        assert_eq!(
+            serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(),
+            not_set,
+        );
+
+        let resolved = ProjectDesignDocState::Resolved {
+            resolved: ResolvedDesignDoc {
+                repo_remote_url: "https://github.com/foo/bar.git".into(),
+                branch: "main".into(),
+                path: "docs/x.md".into(),
+                kind: ResolvedDesignDocKind::SameProduct {
+                    product_id: "prod_1".into(),
+                },
+            },
+            local_workspace_available: true,
+            web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
+        };
+        let raw = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(raw["type"], "resolved");
+        assert_eq!(
+            serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(),
+            resolved,
+        );
+
+        let broken = ProjectDesignDocState::Broken {
+            reason: "no repo".into(),
+        };
+        let raw = serde_json::to_value(&broken).unwrap();
+        assert_eq!(raw, json!({"type": "broken", "reason": "no repo"}));
+        assert_eq!(
+            serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(),
+            broken,
+        );
+    }
+
+    #[test]
+    fn resolve_project_design_doc_output_roundtrips() {
+        let output = ResolveProjectDesignDocOutput {
+            project_id: "proj_1".into(),
+            state: ProjectDesignDocState::Resolved {
+                resolved: ResolvedDesignDoc {
+                    repo_remote_url: "https://github.com/foo/bar.git".into(),
+                    branch: "main".into(),
+                    path: "docs/x.md".into(),
+                    kind: ResolvedDesignDocKind::External,
+                },
+                local_workspace_available: false,
+                web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
+            },
+        };
+        let raw = serde_json::to_value(&output).unwrap();
+        let back: ResolveProjectDesignDocOutput = serde_json::from_value(raw).unwrap();
+        assert_eq!(output, back);
+    }
 }

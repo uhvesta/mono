@@ -36,6 +36,174 @@ struct WorkProject: Identifiable, Hashable {
     /// kanban uses this to distinguish auto-blocks (chain badge,
     /// drag refusal) from user-chosen blocks.
     var lastStatusActor: String = "human"
+    /// Repo URL the project's design doc lives in. `nil` → inherit
+    /// from the project's product. Mirrors
+    /// `Project.design_doc_repo_remote_url`.
+    var designDocRepoRemoteURL: String? = nil
+    /// Branch the design doc lives on. `nil` → inherit from the
+    /// product's docs branch (or `"main"`). Mirrors
+    /// `Project.design_doc_branch`.
+    var designDocBranch: String? = nil
+    /// Repo-relative path to the design doc. `nil` → no pointer set,
+    /// UI affordance hidden. Mirrors `Project.design_doc_path`.
+    var designDocPath: String? = nil
+}
+
+/// Swift mirror of `boss_protocol::SetProjectDesignDocInput`.
+/// Three optional override fields plus an `unset` switch the engine
+/// uses to clear the pointer. `nil` paths are skipped on encode so
+/// the wire form matches serde's `skip_serializing_if`.
+struct SetProjectDesignDocInput: Codable, Hashable {
+    var projectID: String
+    var designDocRepoRemoteURL: String?
+    var designDocBranch: String?
+    var designDocPath: String?
+    var unset: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case designDocRepoRemoteURL = "design_doc_repo_remote_url"
+        case designDocBranch = "design_doc_branch"
+        case designDocPath = "design_doc_path"
+        case unset
+    }
+}
+
+/// Resolution kind for a project's design-doc pointer. Discriminator
+/// drives the open affordance: same/other product can fast-path into
+/// a leased workspace; `.external` always opens the GitHub web URL.
+enum ResolvedDesignDocKind: Hashable {
+    case sameProduct(productID: String)
+    case otherProduct(productID: String)
+    case external
+}
+
+extension ResolvedDesignDocKind: Codable {
+    enum CodingKeys: String, CodingKey {
+        case type
+        case productID = "product_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(String.self, forKey: .type)
+        switch type {
+        case "same_product":
+            self = .sameProduct(productID: try container.decode(String.self, forKey: .productID))
+        case "other_product":
+            self = .otherProduct(productID: try container.decode(String.self, forKey: .productID))
+        case "external":
+            self = .external
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .type,
+                in: container,
+                debugDescription: "Unknown ResolvedDesignDocKind type: \(type)"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .sameProduct(let productID):
+            try container.encode("same_product", forKey: .type)
+            try container.encode(productID, forKey: .productID)
+        case .otherProduct(let productID):
+            try container.encode("other_product", forKey: .type)
+            try container.encode(productID, forKey: .productID)
+        case .external:
+            try container.encode("external", forKey: .type)
+        }
+    }
+}
+
+/// Swift mirror of `boss_protocol::ResolvedDesignDoc` — the
+/// concrete `(repo, branch, path)` triple plus the kind discriminator
+/// that decides which open path the affordance should take.
+struct ResolvedDesignDoc: Codable, Hashable {
+    var repoRemoteURL: String
+    var branch: String
+    var path: String
+    var kind: ResolvedDesignDocKind
+
+    enum CodingKeys: String, CodingKey {
+        case repoRemoteURL = "repo_remote_url"
+        case branch
+        case path
+        case kind
+    }
+}
+
+/// Swift mirror of `boss_protocol::ProjectDesignDocState`. Drives
+/// the UI affordance: `.notSet` hides the icon, `.resolved` shows a
+/// clickable doc icon (with a tooltip rendered from `webURL`), and
+/// `.broken` shows a warning glyph that opens the re-point form.
+enum ProjectDesignDocState: Hashable {
+    case notSet
+    case resolved(resolved: ResolvedDesignDoc, localWorkspaceAvailable: Bool, webURL: String)
+    case broken(reason: String)
+}
+
+extension ProjectDesignDocState: Codable {
+    enum CodingKeys: String, CodingKey {
+        case type
+        case resolved
+        case localWorkspaceAvailable = "local_workspace_available"
+        case webURL = "web_url"
+        case reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(String.self, forKey: .type)
+        switch type {
+        case "not_set":
+            self = .notSet
+        case "resolved":
+            self = .resolved(
+                resolved: try container.decode(ResolvedDesignDoc.self, forKey: .resolved),
+                localWorkspaceAvailable: try container.decode(Bool.self, forKey: .localWorkspaceAvailable),
+                webURL: try container.decode(String.self, forKey: .webURL)
+            )
+        case "broken":
+            self = .broken(reason: try container.decode(String.self, forKey: .reason))
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .type,
+                in: container,
+                debugDescription: "Unknown ProjectDesignDocState type: \(type)"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .notSet:
+            try container.encode("not_set", forKey: .type)
+        case .resolved(let resolved, let localWorkspaceAvailable, let webURL):
+            try container.encode("resolved", forKey: .type)
+            try container.encode(resolved, forKey: .resolved)
+            try container.encode(localWorkspaceAvailable, forKey: .localWorkspaceAvailable)
+            try container.encode(webURL, forKey: .webURL)
+        case .broken(let reason):
+            try container.encode("broken", forKey: .type)
+            try container.encode(reason, forKey: .reason)
+        }
+    }
+}
+
+/// Swift mirror of `boss_protocol::ResolveProjectDesignDocOutput` —
+/// the wire envelope returned by the `ResolveProjectDesignDoc` RPC.
+struct ResolveProjectDesignDocOutput: Codable, Hashable {
+    var projectID: String
+    var state: ProjectDesignDocState
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case state
+    }
 }
 
 struct WorkTask: Identifiable, Hashable {
