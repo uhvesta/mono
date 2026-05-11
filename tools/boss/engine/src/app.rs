@@ -1567,6 +1567,48 @@ pub async fn serve(
         .skip_dispatch_ids()
         .map(|s| s.to_owned())
         .collect();
+
+    // Reap orphans before reconcile dispatch fires. For every Dead
+    // verdict the cube probe returned, mark the execution row
+    // `orphaned` (terminal) so the subsequent `reconcile_active_dispatch`
+    // sees it as a finished predecessor and inherits its
+    // `cube_workspace_id` into the new ready row's
+    // `preferred_workspace_id`. The orphan reap intentionally does NOT
+    // release the cube workspace lease — the workspace may still hold
+    // in-flight commits the next worker should resume against.
+    //
+    // See docs/post-crash-recovery.md for the full flow.
+    let orphan_reason = "engine startup: cube probe verdict Dead — worker lease no longer matches recorded state across restart";
+    for (execution_id, verdict) in &probe_report.verdicts {
+        if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
+            continue;
+        }
+        match server_state
+            .work_db
+            .mark_execution_orphaned(execution_id, orphan_reason)
+        {
+            Ok(execution) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    cube_workspace_id = ?execution.cube_workspace_id,
+                    "startup reaper: marked execution orphaned (workspace preserved for re-lease)",
+                );
+            }
+            Err(err) => {
+                // Already-terminal rows are benign here — a parallel
+                // sweep (e.g. heal_ghost_active_chores) may have
+                // closed the row first. Anything else is real and
+                // worth surfacing.
+                tracing::warn!(
+                    execution_id,
+                    error = %format!("{err:#}"),
+                    "startup reaper: skipped orphan reap (likely already terminal)",
+                );
+            }
+        }
+    }
+
     match server_state
         .work_db
         .reconcile_active_dispatch(|execution_id| skip_dispatch_ids.contains(execution_id))
@@ -3268,6 +3310,58 @@ async fn handle_frontend_connection(
                             &sink,
                             &request_id,
                             FrontendEvent::ExecutionCancelled { execution },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::ReapRun { run_id } => {
+                // `bossctl agents reap` is the manual escape hatch for
+                // orphans the engine startup probe missed (e.g. the
+                // cube lease was still within its TTL on relaunch, so
+                // the probe said "Live" even though the libghostty
+                // pane is gone). Gate it `BossOnly`: this is a state
+                // mutation that should not be reachable from a worker
+                // pane subtree.
+                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        run_id = %run_id,
+                        "reap_run rejected: caller not in Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            message: "reap_run requires Boss authority".to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                let reason = "manual reap via bossctl agents reap";
+                match server_state
+                    .work_db
+                    .mark_execution_orphaned(&run_id, reason)
+                {
+                    Ok(execution) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            cube_workspace_id = ?execution.cube_workspace_id,
+                            "reap_run: marked execution orphaned (workspace preserved)",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::RunReaped { run_id, execution },
                         );
                     }
                     Err(err) => {
