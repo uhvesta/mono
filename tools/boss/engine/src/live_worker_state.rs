@@ -192,6 +192,61 @@ impl LiveWorkerStateRegistry {
         before != *state
     }
 
+    /// Replace the live-status string for `slot_id` and stamp
+    /// `live_status_at` with the current ISO-8601 timestamp. Returns
+    /// `true` iff the entry actually changed — callers gate the
+    /// `broadcast_live_worker_states` push on this exactly like
+    /// [`Self::apply_event`] does.
+    ///
+    /// Pass `Some(text)` to set the field and `None` to clear it
+    /// (used when a worker has been idle long enough that the prior
+    /// summary would be misleading). Clearing also wipes
+    /// `live_status_at` so the staleness UI never has a dangling
+    /// timestamp.
+    ///
+    /// Returns `false` if no entry exists for the slot (event
+    /// arrived before spawn registered, or after release) — the
+    /// caller treats that as a benign drop, mirroring `apply_event`.
+    ///
+    /// The registry never decides on its own whether the update is
+    /// appropriate for the current activity. The trigger fan-in
+    /// owns that policy (e.g., don't refresh while `Spawning`,
+    /// suppress stale writes after `Idle`); the registry just stores
+    /// the value the caller passed.
+    pub fn set_live_status(&self, slot_id: u8, status: Option<String>) -> bool {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Some(state) = guard.by_slot.get_mut(&slot_id) else {
+            return false;
+        };
+        match (&status, &state.live_status) {
+            (None, None) => {
+                // Already cleared; nothing to broadcast.
+                false
+            }
+            (None, Some(_)) => {
+                // Clearing wipes both halves of the pair so the
+                // staleness UI never has a dangling timestamp.
+                state.live_status = None;
+                state.live_status_at = None;
+                true
+            }
+            (Some(_), _) => {
+                // Always advance the timestamp on a successful set —
+                // the staleness UI keys off it and the broadcast cost
+                // (8 slots × < 1 KiB at < 1 Hz aggregate) is the
+                // budget the design's Q6 already accepted. The
+                // text-equality short-circuit was tempting but would
+                // freeze `last_status_at` until the model picked a
+                // different phrasing, which is exactly the
+                // "no summarizer activity for >5min" stale signal
+                // we'd then misfire on.
+                state.live_status = status;
+                state.live_status_at = Some(current_iso8601());
+                true
+            }
+        }
+    }
+
     /// Mark a slot as errored. Used when the events socket fails to
     /// decode a payload or repeatedly drops connections. Returns
     /// `true` if the entry actually changed.
@@ -457,6 +512,91 @@ mod tests {
         assert_eq!(states[0].slot_id, 1);
         assert_eq!(states[1].slot_id, 2);
         assert_eq!(states[2].slot_id, 3);
+    }
+
+    #[test]
+    fn set_live_status_writes_text_and_stamps_timestamp() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        let changed =
+            reg.set_live_status(1, Some("running tests after the layout fix".into()));
+        assert!(changed);
+        let state = reg.get(1).unwrap();
+        assert_eq!(
+            state.live_status.as_deref(),
+            Some("running tests after the layout fix"),
+        );
+        assert!(state.live_status_at.is_some());
+    }
+
+    #[test]
+    fn set_live_status_clears_both_fields() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_live_status(1, Some("doing a thing".into()));
+        let changed = reg.set_live_status(1, None);
+        assert!(changed);
+        let state = reg.get(1).unwrap();
+        assert!(state.live_status.is_none());
+        assert!(state.live_status_at.is_none());
+    }
+
+    #[test]
+    fn set_live_status_returns_false_when_clearing_already_empty_slot() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        let changed = reg.set_live_status(1, None);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn set_live_status_returns_true_on_repeated_set_to_advance_timestamp() {
+        // Two consecutive sets with the same text must still return
+        // true so the broadcast fires — the staleness UI keys off
+        // `live_status_at`, and freezing it on text equality would
+        // misfire the "no summarizer activity" warning.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        let first = reg.set_live_status(1, Some("running tests".into()));
+        let second = reg.set_live_status(1, Some("running tests".into()));
+        assert!(first);
+        assert!(second);
+    }
+
+    #[test]
+    fn set_live_status_returns_false_when_slot_unknown() {
+        let reg = LiveWorkerStateRegistry::new();
+        let changed = reg.set_live_status(7, Some("orphan".into()));
+        assert!(!changed);
+    }
+
+    #[test]
+    fn set_live_status_round_trips_through_snapshot() {
+        // The snapshot is what the topic publisher serialises, so
+        // confirm that a successful `set_live_status` shows up in
+        // both the named getter and the snapshot list.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(2, "run-2", "claude-opus-4-7", 0, None);
+        reg.set_live_status(2, Some("editing the redactor".into()));
+        let states = reg.snapshot();
+        let s = states.iter().find(|s| s.slot_id == 2).unwrap();
+        assert_eq!(s.live_status.as_deref(), Some("editing the redactor"));
+        assert!(s.live_status_at.is_some());
+    }
+
+    #[test]
+    fn release_slot_clears_live_status_pair() {
+        // Releasing a slot drops the entry whole, so a subsequent
+        // re-spawn into the same slot starts with `None`/`None`.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_live_status(1, Some("doing a thing".into()));
+        reg.release_slot(1);
+        assert!(reg.get(1).is_none());
+        reg.register_spawn(1, "run-2", "claude-opus-4-7", 1, None);
+        let state = reg.get(1).unwrap();
+        assert!(state.live_status.is_none());
+        assert!(state.live_status_at.is_none());
     }
 
     #[test]
