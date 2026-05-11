@@ -122,6 +122,21 @@ enum AgentsAction {
         #[arg(long, default_value_t = 100)]
         lines: usize,
     },
+    /// Mark an execution as `orphaned` (terminal) without releasing
+    /// its cube workspace lease. Used to recover from a Boss app
+    /// crash where the worker pane died but the engine still treats
+    /// the run as live — the engine's startup probe misses these
+    /// when the cube lease is still within its TTL.
+    ///
+    /// The run id MUST be passed explicitly (no slot-id / crew-name
+    /// fallback): the live-worker registry is the source for the
+    /// fallbacks and an orphaned worker is by definition not in it.
+    Reap {
+        /// Execution / run id of the orphaned worker (e.g.
+        /// `exec_18ad6336fedcb190_12`). Look this up with `bossctl
+        /// workspace summary` or `boss chore show`.
+        run_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -188,6 +203,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Agents {
             action: AgentsAction::Transcript { agent, lines },
         } => agents_transcript(&cli.socket_path, cli.json, agent, lines).await,
+        Command::Agents {
+            action: AgentsAction::Reap { run_id },
+        } => agents_reap(&cli.socket_path, cli.json, run_id).await,
         Command::Agents {
             action:
                 AgentsAction::Launch {
@@ -765,6 +783,52 @@ async fn agents_transcript(
     }
 }
 
+async fn agents_reap(
+    socket_path: &Option<String>,
+    json: bool,
+    run_id: String,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::ReapRun {
+            run_id: run_id.clone(),
+        })
+        .await
+        .context("sending ReapRun")?;
+    match response {
+        FrontendEvent::RunReaped {
+            run_id: returned,
+            execution,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "reaped",
+                        "run_id": returned,
+                        "execution": execution,
+                    })
+                );
+            } else {
+                println!("reaped run {returned}");
+                println!("  execution:        {}", execution.id);
+                println!("  status:           {}", execution.status);
+                if let Some(ws) = &execution.cube_workspace_id {
+                    println!("  workspace_id:     {ws}  (preserved for re-lease)");
+                }
+                if let Some(path) = &execution.workspace_path {
+                    println!("  workspace_path:   {path}");
+                }
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected reap: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
 async fn workspace_summary(socket_path: &Option<String>, json: bool) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
@@ -931,6 +995,7 @@ fn describe_verb(command: &Command) -> String {
             AgentsAction::Launch { .. } => "agents launch".into(),
             AgentsAction::Stop { .. } => "agents stop".into(),
             AgentsAction::Transcript { .. } => "agents transcript".into(),
+            AgentsAction::Reap { .. } => "agents reap".into(),
         },
         Command::Probe { .. } => "probe".into(),
         Command::Work { action } => match action {

@@ -276,6 +276,17 @@ pub enum FrontendRequest {
     CancelExecution {
         execution_id: String,
     },
+    /// Boss-only RPC: mark the execution backing `run_id` as the
+    /// terminal `orphaned` status and preserve its cube workspace
+    /// lease so a fresh execution can resume against the same branch.
+    /// Used by `bossctl agents reap` for orphans that the engine
+    /// startup heuristics missed — e.g. when the cube lease is still
+    /// within its TTL because the previous app crash was recent.
+    /// Returns `WorkError` if the run id is unknown or already
+    /// terminal.
+    ReapRun {
+        run_id: String,
+    },
     /// Tail the most recent transcript chunk for `run_id`. The engine
     /// reads `WorkRun.transcript_path` and returns the trailing
     /// `lines` lines (raw JSONL — the caller decides how to render).
@@ -514,6 +525,14 @@ pub enum FrontendEvent {
     /// row's status is now `cancelled`; resource teardown (pane
     /// release, cube workspace release) is asynchronous.
     ExecutionCancelled {
+        execution: WorkExecution,
+    },
+    /// Engine confirms a manual orphan reap. The execution row is now
+    /// in the terminal `orphaned` status; its cube workspace lease has
+    /// intentionally been left intact so a fresh execution can resume
+    /// against the same branch.
+    RunReaped {
+        run_id: String,
         execution: WorkExecution,
     },
     /// Trailing transcript chunk for a run. `lines` are the raw JSONL

@@ -588,6 +588,91 @@ async fn agents_interrupt_does_not_reject_local_caller_as_boss_only() -> Result<
 }
 
 #[tokio::test]
+async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
+    // Drive a seeded chore from `ready` → `running` (so it has the
+    // workspace columns the orphan path needs to preserve), then send
+    // a `ReapRun` and verify:
+    //   - the engine returns `RunReaped` with status='orphaned',
+    //   - cube workspace columns are preserved on the row,
+    //   - a second reap on the now-terminal row errors cleanly.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
+    // Start an actual run on the execution so the workspace columns
+    // are populated. `start_execution_run` requires the row to be
+    // `ready` first, which `seed_execution` guarantees.
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    work_db.start_execution_run(
+        &execution_id,
+        "test-agent",
+        "mono",
+        "lease-REAP",
+        "mono-agent-007",
+        "/tmp/mono-agent-007",
+    )?;
+
+    let response = client
+        .send_request(&FrontendRequest::ReapRun {
+            run_id: execution_id.clone(),
+        })
+        .await?;
+    let reaped = match response {
+        FrontendEvent::RunReaped { run_id, execution } => {
+            assert_eq!(run_id, execution_id);
+            execution
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    };
+    assert_eq!(reaped.id, execution_id);
+    assert_eq!(reaped.status, "orphaned");
+    assert!(reaped.finished_at.is_some(), "reap must stamp finished_at");
+    // Workspace columns preserved — that's the whole contract.
+    assert_eq!(reaped.cube_lease_id.as_deref(), Some("lease-REAP"));
+    assert_eq!(reaped.cube_workspace_id.as_deref(), Some("mono-agent-007"));
+    assert_eq!(reaped.workspace_path.as_deref(), Some("/tmp/mono-agent-007"));
+
+    // Second reap on the now-terminal row must error rather than
+    // silently no-op — same contract as `cancel_execution`.
+    let response = client
+        .send_request(&FrontendRequest::ReapRun {
+            run_id: execution_id,
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("terminal"),
+                "expected terminal-status error, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_reap_unknown_run_returns_clear_error() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::ReapRun {
+            run_id: "exec_does_not_exist".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("unknown execution"),
+                "expected unknown-execution message, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()> {
     // Live-coordinator-session repro: `bossctl workspace summary` was
     // failing AppOrBoss when invoked from a shell that descended from

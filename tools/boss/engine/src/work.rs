@@ -285,7 +285,7 @@ impl WorkDb {
                  SET status = 'abandoned',
                      finished_at = COALESCE(finished_at, ?2)
                  WHERE work_item_id = ?1
-                   AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled')",
+                   AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
                 params![work_item_id, now],
             )?;
             // Demote the kanban status. Use a guarded update so we
@@ -347,7 +347,8 @@ impl WorkDb {
             //   - latest execution terminal → yes,
             //   - latest execution non-terminal but `is_live`
             //     reports the slot is gone → yes (stale row).
-            let needs_dispatch = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
+            let existing = query_latest_execution_for_work_item(&tx, &work_item_id)?;
+            let needs_dispatch = match &existing {
                 Some(existing) => {
                     execution_status_is_terminal(&existing.status) || !is_live(&existing.id)
                 }
@@ -356,12 +357,26 @@ impl WorkDb {
             if !needs_dispatch {
                 continue;
             }
+            // When the predecessor was orphaned by the startup reaper
+            // (worker pane died across the engine restart), default
+            // the new ready row's `preferred_workspace_id` to the
+            // orphan's `cube_workspace_id`. The orphan's workspace
+            // typically still holds in-flight commits the human wants
+            // resumed — without this hint the dispatcher would lease
+            // any free workspace and the fresh worker would start
+            // against `main` on an unrelated branch. Only fires for
+            // orphaned predecessors; abandoned / failed / cancelled
+            // ones are intentional throwaways and don't carry forward.
+            let preferred_workspace_id = existing
+                .as_ref()
+                .filter(|prev| prev.status == "orphaned")
+                .and_then(|prev| prev.cube_workspace_id.clone());
             request_execution_in_tx_with_live_check(
                 &tx,
                 RequestExecutionInput {
                     work_item_id: work_item_id.clone(),
                     priority: None,
-                    preferred_workspace_id: None,
+                    preferred_workspace_id,
                     force: false,
                 },
                 |run_id| is_live(run_id),
@@ -579,6 +594,69 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Transition a non-terminal execution to the `orphaned` terminal
+    /// status. Used by the startup reaper and the manual `bossctl
+    /// agents reap` path when a worker process has died (or is
+    /// presumed dead) but the engine has no other clean signal that
+    /// it should stop treating the row as live.
+    ///
+    /// The workspace lease columns (`cube_lease_id`,
+    /// `cube_workspace_id`, `workspace_path`) are intentionally left
+    /// intact. The brief is explicit: do NOT release the cube
+    /// workspace lease here — the workspace may still have in-flight
+    /// commits from the dead worker that a fresh execution should
+    /// resume against. Lease cleanup is a separate concern (cube TTL
+    /// expiry or explicit `bossctl agents stop`).
+    ///
+    /// Any non-terminal `work_runs` rows attached to the execution are
+    /// stamped `orphaned` with the same reason recorded as
+    /// `result_summary`, so the run history reflects how the row went
+    /// terminal rather than leaving it `active` forever.
+    ///
+    /// Errors when the execution is unknown or already terminal —
+    /// callers shouldn't try to reap a row that's already done.
+    pub fn mark_execution_orphaned(
+        &self,
+        execution_id: &str,
+        reason: &str,
+    ) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let existing = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        if execution_status_is_terminal(&existing.status) {
+            bail!(
+                "execution {execution_id} is already in terminal status `{}` and cannot be reaped as orphaned",
+                existing.status
+            );
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'orphaned',
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE id = ?1",
+            params![execution_id, now.as_str()],
+        )?;
+        // Stamp any still-active work_runs as orphaned so the run
+        // history matches the execution status. result_summary holds
+        // the reaper's reason so an operator inspecting the row can
+        // see why the engine terminated it.
+        tx.execute(
+            "UPDATE work_runs
+             SET status = 'orphaned',
+                 result_summary = COALESCE(result_summary, ?3),
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE execution_id = ?1
+               AND finished_at IS NULL",
+            params![execution_id, now.as_str(), reason],
+        )?;
+        let updated = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution after orphan reap: {execution_id}"))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Return the run ids that belong to `execution_id` and have not
     /// yet finished. The cancel-execution flow uses this to find any
     /// libghostty pane the execution still backs so the engine can
@@ -652,7 +730,7 @@ impl WorkDb {
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at
              FROM work_executions
-             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled')
+             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -3095,7 +3173,10 @@ fn can_reconcile_execution_status(status: &str) -> bool {
 }
 
 fn execution_status_is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "abandoned" | "cancelled")
+    matches!(
+        status,
+        "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
+    )
 }
 
 fn task_accepts_execution(task: &Task) -> bool {
@@ -5340,6 +5421,277 @@ mod tests {
             .unwrap();
         assert_eq!(stale_after.status, "abandoned");
         assert!(stale_after.finished_at.is_some());
+    }
+
+    /// Reaping a running execution stamps it `orphaned` (terminal),
+    /// preserves the cube workspace columns, and stamps any active
+    /// work_runs with status='orphaned' + the supplied reason as the
+    /// run's `result_summary`. The orphan path is what
+    /// `bossctl agents reap` and the engine-startup reaper both call.
+    #[test]
+    fn mark_execution_orphaned_preserves_workspace_and_stamps_run() {
+        let path = temp_db_path("reap-orphan");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Orphan candidate".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        let (_running, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-orphan",
+                "mono",
+                "lease-ORPH",
+                "mono-agent-004",
+                "/tmp/mono-agent-004",
+            )
+            .unwrap();
+
+        let reason = "test reap: simulated pane death";
+        let orphaned = db.mark_execution_orphaned(&execution.id, reason).unwrap();
+        assert_eq!(orphaned.status, "orphaned");
+        assert!(
+            orphaned.finished_at.is_some(),
+            "orphan reap must stamp finished_at",
+        );
+        // Workspace columns MUST be preserved — that's the whole
+        // contract that lets the next worker resume the same branch.
+        assert_eq!(orphaned.cube_lease_id.as_deref(), Some("lease-ORPH"));
+        assert_eq!(orphaned.cube_workspace_id.as_deref(), Some("mono-agent-004"));
+        assert_eq!(orphaned.workspace_path.as_deref(), Some("/tmp/mono-agent-004"));
+
+        // And the run record gets the reason as its result_summary so
+        // an operator can later see why the row went terminal.
+        let run_after = db.get_run(&run.id).unwrap();
+        assert_eq!(run_after.status, "orphaned");
+        assert!(run_after.finished_at.is_some());
+        assert_eq!(run_after.result_summary.as_deref(), Some(reason));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Reaping a row that's already terminal must error rather than
+    /// silently no-op — same contract as `cancel_execution`. This is
+    /// what stops the engine-startup reaper from racing the existing
+    /// `heal_ghost_active_chores` sweep into a double-stamp.
+    #[test]
+    fn mark_execution_orphaned_errors_on_already_terminal() {
+        let path = temp_db_path("reap-already-terminal");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already done".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("completed".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let err = db
+            .mark_execution_orphaned(&execution.id, "test")
+            .expect_err("terminal rows must refuse reap");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("terminal"),
+            "expected terminal-status error, got: {msg}",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// After the startup reaper marks an execution `orphaned`, the
+    /// next `reconcile_active_dispatch` pass creates a fresh `ready`
+    /// row whose `preferred_workspace_id` inherits the orphan's
+    /// `cube_workspace_id`. Without this, cube would lease any free
+    /// workspace and the new worker would start against `main` on an
+    /// unrelated branch — losing the in-progress work the orphan was
+    /// driving.
+    #[test]
+    fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
+        let path = temp_db_path("reconcile-orphan-workspace");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Resumable orphan".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        // Drive the chore into `active` so reconcile considers it.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.start_execution_run(
+            &execution.id,
+            "worker-orphan",
+            "mono",
+            "lease-ORPH",
+            "mono-agent-005",
+            "/tmp/mono-agent-005",
+        )
+        .unwrap();
+
+        // Reaper pass: simulate the startup probe's Dead verdict.
+        db.mark_execution_orphaned(&execution.id, "test orphan").unwrap();
+
+        // Reconcile pass: predecessor is terminal-orphaned, so a fresh
+        // ready row is inserted. The new row must inherit the orphan's
+        // workspace_id as its preferred_workspace_id.
+        let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 2);
+        let orphan_after = executions.iter().find(|e| e.id == execution.id).unwrap();
+        assert_eq!(orphan_after.status, "orphaned");
+        // Workspace preserved on the orphan row.
+        assert_eq!(orphan_after.cube_workspace_id.as_deref(), Some("mono-agent-005"));
+
+        let fresh = executions.iter().find(|e| e.id != execution.id).unwrap();
+        assert_eq!(fresh.status, "ready");
+        assert_eq!(
+            fresh.preferred_workspace_id.as_deref(),
+            Some("mono-agent-005"),
+            "fresh ready row must inherit the orphan's workspace_id so cube re-leases the same branch",
+        );
+        // The new row doesn't carry the cube lease directly — that's
+        // set by `start_execution_run` when the dispatcher claims it.
+        assert!(fresh.cube_lease_id.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `reconcile_active_dispatch` does NOT inherit workspace_id from
+    /// predecessors that landed in a different terminal status
+    /// (`abandoned`, `cancelled`, `failed`). Those are intentional
+    /// throwaways — a redispatch shouldn't drag forward a workspace
+    /// the human or engine deliberately cut loose.
+    #[test]
+    fn reconcile_does_not_inherit_workspace_from_non_orphaned_terminal() {
+        let path = temp_db_path("reconcile-no-inherit");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cancelled predecessor".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.start_execution_run(
+            &execution.id,
+            "worker-cancel",
+            "mono",
+            "lease-CAN",
+            "mono-agent-006",
+            "/tmp/mono-agent-006",
+        )
+        .unwrap();
+        db.cancel_execution(&execution.id).unwrap();
+        // Cancel reset kanban → todo. Drive it back to active so
+        // reconcile re-considers the work item.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
+        assert_eq!(redispatched, vec![chore.id.clone()]);
+
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        let fresh = executions.iter().find(|e| e.id != execution.id).unwrap();
+        assert!(
+            fresh.preferred_workspace_id.is_none(),
+            "cancelled predecessor must NOT propagate workspace_id forward; got {fresh:?}",
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     /// And the inverse: live-worker → idempotent.
