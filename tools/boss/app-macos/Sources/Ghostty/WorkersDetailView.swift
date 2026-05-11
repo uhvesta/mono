@@ -169,17 +169,28 @@ private struct WorkerSlotView: View {
         return "\(base) · idle"
     }
 
-    /// Second line in the titlebar. The engine ships a lowercase
-    /// gerund phrase (e.g. `"fixing bossctl and agent stops"`) which
-    /// we render as a natural-language sentence under the worker's
-    /// display name (`"Riker is fixing bossctl and agent stops"`).
-    /// Falls back to the run id when no summary is available so we
-    /// never lose traceability. Either way we attach the run id as a
-    /// hover tooltip — the sentence is purely visual and the full id
-    /// is what every log/api/taxonomy elsewhere uses.
+    /// Second line in the titlebar. When the engine has a live-status
+    /// sentence for this slot — refreshed by the summarizer in
+    /// `engine/src/live_status.rs` — that's the most informative
+    /// thing to surface, so it wins. Otherwise we fall back to the
+    /// static pane_summary gerund phrase ("Riker is fixing the
+    /// fencer scraper"), then to the run id, then to "idle". The
+    /// two summary shapes have different grammatical contracts on
+    /// purpose: live status is a full sentence rendered raw,
+    /// pane_summary is a verb phrase rendered with the `"<Name> is
+    /// "` prefix.
     @ViewBuilder
     private var slotSubtitle: some View {
-        if let summary = slot.summary, !summary.isEmpty {
+        if let live = liveState?.liveStatus,
+           !live.isEmpty
+        {
+            Text(live)
+                .font(.caption2)
+                .foregroundStyle(liveStatusColor)
+                .lineLimit(1)
+                .help(slot.runId ?? "")
+                .accessibilityLabel("Live status: \(live)")
+        } else if let summary = slot.summary, !summary.isEmpty {
             Text("\(WorkerNames.name(forSlot: slot.slotId)) is \(summary)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -196,6 +207,22 @@ private struct WorkerSlotView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
+        }
+    }
+
+    /// Match the Doing-card colour mapping (Q4): red for errored
+    /// runs, accent for "waiting for input", tertiary for idle,
+    /// `.secondary` while working.
+    private var liveStatusColor: Color {
+        switch liveState?.activity {
+        case .errored:
+            return .red
+        case .waitingForInput:
+            return .accentColor
+        case .idle:
+            return Color(nsColor: .tertiaryLabelColor)
+        default:
+            return .secondary
         }
     }
 
