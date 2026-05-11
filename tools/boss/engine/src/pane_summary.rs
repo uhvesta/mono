@@ -409,6 +409,8 @@ mod tests {
             priority: "medium".to_owned(),
             created_via: "unknown".to_owned(),
             repo_remote_url: None,
+            blocked_reason: None,
+            blocked_attempt_id: None,
         })
     }
 

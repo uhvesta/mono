@@ -91,6 +91,23 @@ pub struct Task {
     /// derived on the client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
+    /// When `status = 'blocked'`, an open-ended discriminator
+    /// explaining *why*. Documented values: `'dependency'` (gated by a
+    /// `work_item_dependencies` prereq), `'merge_conflict'` (an
+    /// `in_review` PR's branch conflicts with `main`), `'review_feedback'`
+    /// (a reviewer requested changes), `'ci_failure'` / `'ci_failure_exhausted'`
+    /// (CI on the PR went red). `None` for non-`blocked` rows and for
+    /// legacy `blocked` rows whose reason wasn't tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// Soft FK to the attempt row currently trying to clear the block —
+    /// `conflict_resolutions.id` when `blocked_reason = 'merge_conflict'`,
+    /// the review-iteration table's id when `blocked_reason = 'review_feedback'`,
+    /// etc. `None` for `'dependency'` (the prereqs are queried via
+    /// `work_item_dependencies` instead) and for any block without an
+    /// engine-managed attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_attempt_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -182,6 +199,66 @@ pub struct WorkAttentionItem {
     pub body_markdown: String,
     pub created_at: String,
     pub resolved_at: Option<String>,
+}
+
+/// One engine attempt to clear a merge conflict on an `in_review`
+/// PR — the wire shape of a `conflict_resolutions` row. Stored as a
+/// sibling to `WorkExecution` rather than as a `Task` because the
+/// attempt is not itself a kanban work item; it's an engine-managed
+/// remediation tied to its parent via `work_item_id`. See
+/// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`
+/// (Q3) for the side-table-not-tasks-row rationale.
+///
+/// `status` values: `pending` (row created, worker not yet
+/// dispatched), `running` (worker holds a lease and is editing),
+/// `succeeded` (push landed, PR back to mergeable), `superseded`
+/// (a newer attempt — or a human push — replaced this one),
+/// `failed` (worker gave up / errored), `abandoned` (engine
+/// declined to spawn, e.g. churn-threshold or product opt-out).
+///
+/// `pr_url` / `pr_number` / `head_branch` / `base_branch` are
+/// snapshots of the parent's PR state at trigger time so the row
+/// stays interpretable after the parent's branch is recycled.
+/// `base_sha_at_trigger` is the conflict-event discriminator that
+/// the UNIQUE key (`(work_item_id, base_sha_at_trigger)`) uses to
+/// keep two probes on the same conflict from creating two rows.
+/// `head_sha_before` / `head_sha_after` bracket the worker's push.
+/// `conflict_diagnosis` is structured JSON produced by the
+/// pre-spawn diagnosis collector — null until the engine fills it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictResolution {
+    pub id: String,
+    pub product_id: String,
+    pub work_item_id: String,
+    pub pr_url: String,
+    pub pr_number: i64,
+    pub head_branch: String,
+    pub base_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha_at_trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha_after: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// Structured JSON output of the pre-spawn diagnosis collector.
+    /// Wire-encoded as a string so the engine can roll the schema
+    /// forward without bumping this type; consumers parse on demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_diagnosis: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -926,5 +1003,136 @@ mod tests {
         let raw = serde_json::to_value(&output).unwrap();
         let back: ResolveProjectDesignDocOutput = serde_json::from_value(raw).unwrap();
         assert_eq!(output, back);
+    }
+
+    fn sample_task_json(extra: Value) -> Value {
+        let mut base = json!({
+            "id": "task_1",
+            "product_id": "prod_1",
+            "project_id": null,
+            "kind": "chore",
+            "name": "Demo",
+            "description": "",
+            "status": "todo",
+            "ordinal": null,
+            "pr_url": null,
+            "deleted_at": null,
+            "created_at": "1747000000",
+            "updated_at": "1747000000",
+        });
+        if let (Value::Object(target), Value::Object(extra)) = (&mut base, extra) {
+            for (k, v) in extra {
+                target.insert(k, v);
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn task_decodes_without_blocked_fields() {
+        let raw = sample_task_json(json!({}));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert!(task.blocked_reason.is_none());
+        assert!(task.blocked_attempt_id.is_none());
+    }
+
+    #[test]
+    fn task_skips_none_blocked_fields_on_encode() {
+        let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&task).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("blocked_reason"));
+        assert!(!obj.contains_key("blocked_attempt_id"));
+    }
+
+    #[test]
+    fn task_roundtrips_with_blocked_fields() {
+        let raw = sample_task_json(json!({
+            "status": "blocked",
+            "blocked_reason": "merge_conflict",
+            "blocked_attempt_id": "conflict_18ab_1",
+        }));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert_eq!(task.blocked_reason.as_deref(), Some("merge_conflict"));
+        assert_eq!(task.blocked_attempt_id.as_deref(), Some("conflict_18ab_1"));
+
+        let reencoded = serde_json::to_value(&task).unwrap();
+        let task2: Task = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(task.blocked_reason, task2.blocked_reason);
+        assert_eq!(task.blocked_attempt_id, task2.blocked_attempt_id);
+    }
+
+    #[test]
+    fn conflict_resolution_roundtrips_with_all_fields() {
+        let attempt = ConflictResolution {
+            id: "conflict_18ab_1".into(),
+            product_id: "prod_1".into(),
+            work_item_id: "task_77".into(),
+            pr_url: "https://github.com/foo/bar/pull/243".into(),
+            pr_number: 243,
+            head_branch: "feat/banana".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("abc123".into()),
+            head_sha_before: Some("def456".into()),
+            head_sha_after: Some("ghi789".into()),
+            status: "succeeded".into(),
+            failure_reason: None,
+            cube_lease_id: Some("lease_1".into()),
+            cube_workspace_id: Some("ws_1".into()),
+            worker_id: Some("worker_1".into()),
+            conflict_diagnosis: Some("{\"hunks\":1}".into()),
+            created_at: "1747000000".into(),
+            started_at: Some("1747000010".into()),
+            finished_at: Some("1747000100".into()),
+        };
+        let raw = serde_json::to_value(&attempt).unwrap();
+        let back: ConflictResolution = serde_json::from_value(raw).unwrap();
+        assert_eq!(attempt, back);
+    }
+
+    #[test]
+    fn conflict_resolution_pending_skips_optional_fields_on_encode() {
+        let attempt = ConflictResolution {
+            id: "conflict_18ab_2".into(),
+            product_id: "prod_1".into(),
+            work_item_id: "task_77".into(),
+            pr_url: "https://github.com/foo/bar/pull/243".into(),
+            pr_number: 243,
+            head_branch: "feat/banana".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: None,
+            head_sha_before: None,
+            head_sha_after: None,
+            status: "pending".into(),
+            failure_reason: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            worker_id: None,
+            conflict_diagnosis: None,
+            created_at: "1747000000".into(),
+            started_at: None,
+            finished_at: None,
+        };
+        let encoded = serde_json::to_value(&attempt).unwrap();
+        let obj = encoded.as_object().unwrap();
+        for absent in [
+            "base_sha_at_trigger",
+            "head_sha_before",
+            "head_sha_after",
+            "failure_reason",
+            "cube_lease_id",
+            "cube_workspace_id",
+            "worker_id",
+            "conflict_diagnosis",
+            "started_at",
+            "finished_at",
+        ] {
+            assert!(
+                !obj.contains_key(absent),
+                "expected {absent} omitted on encode",
+            );
+        }
+        let back: ConflictResolution = serde_json::from_value(encoded).unwrap();
+        assert_eq!(attempt, back);
     }
 }

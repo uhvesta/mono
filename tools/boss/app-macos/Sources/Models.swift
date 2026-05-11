@@ -235,6 +235,19 @@ struct WorkTask: Identifiable, Hashable {
     /// because serde skips the field when it's `None` on the wire
     /// (see `Task.repo_remote_url` in `boss_protocol::types`).
     var repoRemoteURL: String? = nil
+    /// When `status == "blocked"`, the engine's discriminator for
+    /// *why* — `"dependency"`, `"merge_conflict"`, `"review_feedback"`,
+    /// `"ci_failure"`, `"ci_failure_exhausted"`. `nil` for non-blocked
+    /// rows and for legacy blocked rows without a tracked reason.
+    /// Phase 1 of the merge-conflict design only populates this; the
+    /// kanban renders it as no-op decoration until a later phase wires
+    /// the badge labels through.
+    var blockedReason: String? = nil
+    /// Soft FK to the engine attempt currently trying to clear the
+    /// block (a `conflict_resolutions.id` for `merge_conflict`).
+    /// Discriminated by `blockedReason`; `nil` for blocks without an
+    /// engine-managed attempt.
+    var blockedAttemptID: String? = nil
 
     var isChore: Bool {
         kind == "chore"

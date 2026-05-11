@@ -1589,7 +1589,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1600,7 +1600,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -1683,7 +1683,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1692,7 +1692,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1791,7 +1791,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -2157,8 +2157,12 @@ impl WorkDb {
             [],
         )?;
         migrate_timestamps_to_epoch(&conn)?;
+        migrate_tasks_blocked_reason(&conn)?;
+        migrate_products_auto_pr_maintenance_enabled(&conn)?;
+        migrate_conflict_resolutions_table(&conn)?;
+        migrate_backfill_blocked_reason_dependency(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '5')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '6')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -2665,6 +2669,8 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         priority: row.get(14)?,
         created_via: row.get(15)?,
         repo_remote_url: None,
+        blocked_reason: row.get(16)?,
+        blocked_attempt_id: row.get(17)?,
     })
 }
 
@@ -2903,7 +2909,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -2966,7 +2972,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -3293,6 +3299,131 @@ fn migrate_backfill_project_design_tasks(conn: &Connection) -> Result<()> {
             params![id, product_id, project_id, now, CREATED_VIA_ENGINE_AUTO],
         )?;
     }
+    Ok(())
+}
+
+/// Add `blocked_reason` and `blocked_attempt_id` columns on `tasks`.
+/// `blocked_reason` discriminates *why* a row is in `status = 'blocked'`
+/// (`'dependency'` for the existing dep-graph machinery,
+/// `'merge_conflict'` for the conflict-resolution flow, `'review_feedback'`
+/// for the review-iteration flow, etc.). `blocked_attempt_id` is a soft
+/// FK whose target table is discriminated by `blocked_reason` — `NULL`
+/// for `'dependency'`, points at a `conflict_resolutions.id` for
+/// `'merge_conflict'`. Both columns are nullable: legacy `blocked` rows
+/// without a recoverable reason stay `NULL`.
+fn migrate_tasks_blocked_reason(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "blocked_reason")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN blocked_reason TEXT", [])?;
+    }
+    if !table_has_column(conn, "tasks", "blocked_attempt_id")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN blocked_attempt_id TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add `products.auto_pr_maintenance_enabled` — the unified opt-out
+/// flag governing every auto-PR-maintenance flow (auto-rebase,
+/// conflict resolution, CI remediation). Defaults to `1` (enabled).
+///
+/// Backwards-compat path: if a previous build of this codebase already
+/// shipped `products.auto_rebase_enabled` (the original auto-rebase
+/// design's flag), rename it in place to the new name so the existing
+/// value carries over. If neither column exists, create the new one
+/// directly. Both branches are idempotent.
+fn migrate_products_auto_pr_maintenance_enabled(conn: &Connection) -> Result<()> {
+    let has_old = table_has_column(conn, "products", "auto_rebase_enabled")?;
+    let has_new = table_has_column(conn, "products", "auto_pr_maintenance_enabled")?;
+    if has_new {
+        return Ok(());
+    }
+    if has_old {
+        conn.execute(
+            "ALTER TABLE products RENAME COLUMN auto_rebase_enabled TO auto_pr_maintenance_enabled",
+            [],
+        )?;
+    } else {
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Create the `conflict_resolutions` side table. Stores one row per
+/// engine attempt to clear a merge conflict on an in-review PR; rows
+/// are sparse (most PRs never conflict) and retained after success as
+/// history. See `tools/boss/docs/designs/merge-conflict-handling-in-review.md`
+/// (Q3) for the rationale on why this is a side table rather than a
+/// `tasks` row.
+fn migrate_conflict_resolutions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conflict_resolutions (
+             id                  TEXT PRIMARY KEY,
+             product_id          TEXT NOT NULL,
+             work_item_id        TEXT NOT NULL,
+             pr_url              TEXT NOT NULL,
+             pr_number           INTEGER NOT NULL,
+             head_branch         TEXT NOT NULL,
+             base_branch         TEXT NOT NULL,
+             base_sha_at_trigger TEXT,
+             head_sha_before     TEXT,
+             head_sha_after      TEXT,
+             status              TEXT NOT NULL,
+             failure_reason      TEXT,
+             cube_lease_id       TEXT,
+             cube_workspace_id   TEXT,
+             worker_id           TEXT,
+             conflict_diagnosis  TEXT,
+             created_at          TEXT NOT NULL,
+             started_at          TEXT,
+             finished_at         TEXT,
+             UNIQUE (work_item_id, base_sha_at_trigger)
+         );
+         CREATE INDEX IF NOT EXISTS conflict_resolutions_status_idx
+             ON conflict_resolutions(status);
+         CREATE INDEX IF NOT EXISTS conflict_resolutions_work_item_idx
+             ON conflict_resolutions(work_item_id);
+         CREATE INDEX IF NOT EXISTS conflict_resolutions_product_idx
+             ON conflict_resolutions(product_id);",
+    )?;
+    Ok(())
+}
+
+/// Backfill `blocked_reason = 'dependency'` for `blocked` rows that
+/// have at least one currently-gating prerequisite edge. The dep-graph
+/// machinery owns the `'dependency'` reason going forward; this pass
+/// catches rows the dep-graph machinery flipped before the column
+/// existed. Rows that remain `blocked` with no gating prereq stay
+/// `NULL` (legacy "blocked by a human for some untracked reason").
+/// Idempotent — the `blocked_reason IS NULL` guard means re-running
+/// the migration is a no-op once values are written.
+fn migrate_backfill_blocked_reason_dependency(conn: &Connection) -> Result<()> {
+    // The dep-graph machinery defines "gating" as a `relation = 'blocks'`
+    // edge whose prereq has not reached a satisfied terminal status. For
+    // task/chore prereqs (`task_…`) only `'done'` satisfies; for project
+    // prereqs (`proj_…`) `'done'` or `'archived'` satisfies. SQL mirrors
+    // `work_dependencies::status_satisfies` exactly.
+    conn.execute(
+        "UPDATE tasks
+            SET blocked_reason = 'dependency'
+          WHERE status = 'blocked'
+            AND blocked_reason IS NULL
+            AND deleted_at IS NULL
+            AND EXISTS (
+              SELECT 1
+                FROM work_item_dependencies d
+                LEFT JOIN tasks    pt ON pt.id = d.prerequisite_id AND pt.deleted_at IS NULL
+                LEFT JOIN projects pp ON pp.id = d.prerequisite_id
+               WHERE d.dependent_id = tasks.id
+                 AND d.relation = 'blocks'
+                 AND (
+                   (pt.id IS NOT NULL AND pt.status <> 'done')
+                   OR (pp.id IS NOT NULL AND pp.status <> 'done' AND pp.status <> 'archived')
+                 )
+            )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -8224,7 +8355,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
         let _ = std::fs::remove_file(path);
     }
 
@@ -8400,7 +8531,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
         let _ = std::fs::remove_file(path);
     }
 
@@ -8420,7 +8551,7 @@ mod tests {
 
     /// Fresh init lands the new `tasks.repo_remote_url` column, the
     /// partial `tasks_repo_idx` index, and bumps the recorded
-    /// `schema_version` to 5.
+    /// `schema_version` to 6.
     #[test]
     fn fresh_init_includes_tasks_repo_remote_url() {
         let path = temp_db_path("tasks-repo-fresh");
@@ -8446,7 +8577,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
 
         let _ = std::fs::remove_file(path);
     }
@@ -8454,7 +8585,7 @@ mod tests {
     /// A pre-v5 database (no `repo_remote_url` column on `tasks`,
     /// `schema_version = 4`) should pick up the new column with
     /// existing rows defaulting to `NULL`, get the partial index
-    /// created, and have `schema_version` bumped to 5.
+    /// created, and have `schema_version` bumped to 6.
     #[test]
     fn migration_from_v4_adds_tasks_repo_remote_url() {
         let path = temp_db_path("tasks-repo-migrate");
@@ -8525,7 +8656,7 @@ mod tests {
             .unwrap();
         assert_eq!(index_exists, 1);
 
-        // schema_version moves from 4 → 5.
+        // schema_version moves from 4 → 6.
         let version: String = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'schema_version'",
@@ -8533,8 +8664,212 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Fresh init lands the merge-conflict-handling columns and the
+    /// `conflict_resolutions` side table. Phase 1 of the
+    /// merge-conflict-handling design.
+    #[test]
+    fn fresh_init_includes_merge_conflict_schema() {
+        let path = temp_db_path("mc-fresh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "blocked_reason").unwrap());
+        assert!(table_has_column(&conn, "tasks", "blocked_attempt_id").unwrap());
+        assert!(
+            table_has_column(&conn, "products", "auto_pr_maintenance_enabled").unwrap(),
+            "products should carry the unified opt-out flag after a fresh init",
+        );
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'conflict_resolutions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1, "conflict_resolutions table should exist");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A pre-v6 database with the original `products.auto_rebase_enabled`
+    /// column should have it renamed in place to
+    /// `auto_pr_maintenance_enabled`, preserving any existing value.
+    /// Idempotent across re-opens.
+    #[test]
+    fn migration_renames_auto_rebase_enabled_when_present() {
+        let path = temp_db_path("mc-rename-auto-rebase");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 auto_rebase_enabled INTEGER NOT NULL DEFAULT 1);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human');
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 priority TEXT NOT NULL DEFAULT 'medium',
+                 created_via TEXT NOT NULL DEFAULT 'unknown');
+             INSERT INTO products(id, name, slug, status, created_at, updated_at,
+                                   auto_rebase_enabled)
+             VALUES ('prod_legacy', 'L', 'l', 'active', '1700000000', '1700000000', 0);
+             INSERT INTO metadata(key, value) VALUES ('schema_version','5');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(
+            !table_has_column(&conn, "products", "auto_rebase_enabled").unwrap(),
+            "old column should have been renamed",
+        );
+        assert!(
+            table_has_column(&conn, "products", "auto_pr_maintenance_enabled").unwrap(),
+            "new column should be present after rename",
+        );
+        let preserved: i64 = conn
+            .query_row(
+                "SELECT auto_pr_maintenance_enabled FROM products WHERE id = 'prod_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 0, "existing value must carry across the rename");
+
+        // Idempotency: re-opening must be a no-op (no double-rename
+        // panic on an already-renamed column).
+        drop(conn);
+        let db2 = WorkDb::open(path.clone()).unwrap();
+        let conn2 = db2.connect().unwrap();
+        assert!(table_has_column(&conn2, "products", "auto_pr_maintenance_enabled").unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Backfill flips `blocked_reason = 'dependency'` for an existing
+    /// `blocked` row that is gated by a still-incomplete prereq edge,
+    /// and leaves `NULL` on a `blocked` row whose prereq is already
+    /// `done` (legacy human-set block).
+    #[test]
+    fn migration_backfills_blocked_reason_for_active_prereqs() {
+        let path = temp_db_path("mc-blocked-backfill");
+        // Stand up the pre-Phase-1 schema by hand: needs `tasks`,
+        // `projects`, `products`, `work_item_dependencies`, plus
+        // `last_status_actor`. We pre-seed two blocked dependents,
+        // one whose prereq is still `todo` (should backfill to
+        // `'dependency'`) and one whose prereq is already `done`
+        // (should stay `NULL`).
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human');
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 priority TEXT NOT NULL DEFAULT 'medium',
+                 created_via TEXT NOT NULL DEFAULT 'unknown');
+             CREATE TABLE work_item_dependencies (
+                 dependent_id TEXT NOT NULL, prerequisite_id TEXT NOT NULL,
+                 relation TEXT NOT NULL DEFAULT 'blocks',
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (dependent_id, prerequisite_id, relation));
+             INSERT INTO products(id, name, slug, status, created_at, updated_at)
+             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
+             -- Two dependents already in `blocked` from the engine's
+             -- pre-Phase-1 auto-block path; both still have edges.
+             INSERT INTO tasks(id, product_id, project_id, kind, name,
+                                description, status, created_at, updated_at,
+                                autostart, last_status_actor, priority, created_via)
+             VALUES
+              ('task_dep_active',   'prod_1', NULL, 'chore', 'gated by todo',
+               '', 'blocked', '1700000000', '1700000000', 1, 'engine', 'medium', 'cli'),
+              ('task_dep_done',     'prod_1', NULL, 'chore', 'gated by done',
+               '', 'blocked', '1700000000', '1700000000', 1, 'engine', 'medium', 'cli'),
+              ('task_prereq_todo',  'prod_1', NULL, 'chore', 'still todo',
+               '', 'todo',    '1700000000', '1700000000', 1, 'human',  'medium', 'cli'),
+              ('task_prereq_done',  'prod_1', NULL, 'chore', 'already done',
+               '', 'done',    '1700000000', '1700000000', 1, 'human',  'medium', 'cli'),
+              ('task_legacy_block', 'prod_1', NULL, 'chore', 'manual block',
+               '', 'blocked', '1700000000', '1700000000', 1, 'human',  'medium', 'cli');
+             INSERT INTO work_item_dependencies(dependent_id, prerequisite_id, relation, created_at)
+             VALUES
+              ('task_dep_active', 'task_prereq_todo', 'blocks', '1700000000'),
+              ('task_dep_done',   'task_prereq_done', 'blocks', '1700000000');
+             INSERT INTO metadata(key, value) VALUES ('schema_version','5');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        let reason_for = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT blocked_reason FROM tasks WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            reason_for("task_dep_active").as_deref(),
+            Some("dependency"),
+            "blocked row with non-done prereq should be backfilled",
+        );
+        assert_eq!(
+            reason_for("task_dep_done"),
+            None,
+            "blocked row whose prereq already finished is a legacy manual block",
+        );
+        assert_eq!(
+            reason_for("task_legacy_block"),
+            None,
+            "blocked row with no edges stays legacy NULL",
+        );
+
+        // Idempotency: re-opening leaves the same values in place.
+        drop(conn);
+        let db2 = WorkDb::open(path.clone()).unwrap();
+        let conn2 = db2.connect().unwrap();
+        let count_dependency: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE blocked_reason = 'dependency'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_dependency, 1);
         let _ = std::fs::remove_file(path);
     }
 

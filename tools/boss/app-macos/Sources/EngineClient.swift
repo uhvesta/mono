@@ -818,7 +818,9 @@ final class EngineClient: @unchecked Sendable {
             updatedAt: updatedAt,
             lastStatusActor: (payload["last_status_actor"] as? String) ?? "human",
             createdVia: (payload["created_via"] as? String) ?? "unknown",
-            repoRemoteURL: payload["repo_remote_url"] as? String
+            repoRemoteURL: payload["repo_remote_url"] as? String,
+            blockedReason: payload["blocked_reason"] as? String,
+            blockedAttemptID: payload["blocked_attempt_id"] as? String
         )
     }
 
