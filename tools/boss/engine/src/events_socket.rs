@@ -43,10 +43,19 @@ const LOCAL_PEERPID: libc::c_int = 0x002;
 /// a worker. The shim runs as a descendant of the worker process, so
 /// we walk up the process tree (see [`WorkerRegistry::lookup_with_ancestor_walk`])
 /// to find the run this hook belongs to.
+///
+/// `transcript_path` is the verbatim `transcript_path` field claude
+/// stamps on every hook payload — `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
+/// We surface it here so the engine can persist it on `WorkRun` the
+/// first time we see it; the live-status summarizer loop reads that
+/// row to know which file to tail. Without this, `transcript_path`
+/// stays NULL forever and the summarizer never gets past its
+/// "no transcript path yet" early-out.
 #[derive(Debug, Clone)]
 pub struct IncomingHookEvent {
     pub peer_pid: Option<libc::pid_t>,
     pub run_id: Option<String>,
+    pub transcript_path: Option<String>,
     pub event: WorkerEvent,
 }
 
@@ -180,10 +189,12 @@ pub async fn handle_connection(
     let run_id = payload_run_id.or_else(|| {
         peer_pid_value.and_then(|pid| registry.lookup_with_ancestor_walk(pid))
     });
+    let transcript_path = extract_transcript_path_from_payload(&raw);
     let event = normalize_hook_event(&raw)?;
     Ok(IncomingHookEvent {
         peer_pid: peer_pid_value,
         run_id,
+        transcript_path,
         event,
     })
 }
@@ -193,6 +204,17 @@ pub async fn handle_connection(
 /// `BOSS_RUN_ID=` doesn't poison correlation with an empty id.
 fn extract_run_id_from_payload(raw: &serde_json::Value) -> Option<String> {
     let s = raw.get("_boss_run_id")?.as_str()?;
+    if s.is_empty() { None } else { Some(s.to_owned()) }
+}
+
+/// Pull `transcript_path` out of the raw hook payload. Claude stamps
+/// the absolute path to the session's JSONL transcript on every hook
+/// payload it emits; the boss-event shim forwards the payload
+/// unchanged, so we read the field straight off the wire. Empty
+/// strings are treated as missing so we never persist a path that
+/// `tokio::fs::File::open` would reject anyway.
+fn extract_transcript_path_from_payload(raw: &serde_json::Value) -> Option<String> {
+    let s = raw.get("transcript_path")?.as_str()?;
     if s.is_empty() { None } else { Some(s.to_owned()) }
 }
 
@@ -322,6 +344,90 @@ mod tests {
         }
         // Empty registry: no run_id correlation.
         assert_eq!(incoming.run_id, None);
+    }
+
+    #[tokio::test]
+    async fn transcript_path_extracted_from_payload() {
+        // Claude stamps `transcript_path` on every hook payload. We
+        // surface it here so the engine can persist it on the
+        // `work_runs` row — without this round-trip, the live-status
+        // summarizer's tail watcher has no file to open and the per-slot
+        // loop early-outs every tick on "no transcript path yet".
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(
+                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":"/home/u/.claude/projects/foo/sess-1.jsonl"}"#,
+            ).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        client.await.unwrap();
+
+        assert_eq!(
+            incoming.transcript_path.as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_transcript_path_is_none() {
+        // Pre-live-status hook payloads (and the test fixtures still
+        // around) won't carry the field. The extractor must surface
+        // `None` rather than erroring or stalling the dispatcher.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream
+                .write_all(br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}"#)
+                .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        client.await.unwrap();
+
+        assert!(incoming.transcript_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_transcript_path_is_none() {
+        // An empty string would round-trip through SQLite into a
+        // path the tail watcher would try (and fail) to open every
+        // tick. Treat empty as missing, matching the `_boss_run_id`
+        // policy.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(
+                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":""}"#,
+            ).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        client.await.unwrap();
+
+        assert!(incoming.transcript_path.is_none());
     }
 
     #[tokio::test]

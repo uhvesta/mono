@@ -1998,6 +1998,32 @@ async fn dispatch_live_worker_state(
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         return;
     };
+    // Persist the transcript path the moment we see it on a hook
+    // payload. `start_execution_run` inserts the work_runs row with
+    // `transcript_path = NULL` (the engine has no way to know the
+    // path until the worker tells us via its first hook), so without
+    // this write the live-status summarizer's `TranscriptPathResolver`
+    // returns None forever and the per-slot loop early-outs every
+    // tick on "no transcript path yet". The setter is idempotent
+    // (first-writer-wins) so we don't clobber the path the tail
+    // watcher has already opened across later sessions/resumes.
+    if let Some(path) = incoming.transcript_path.as_deref() {
+        match server_state.work_db.set_run_transcript_path_if_unset(run_id, path) {
+            Ok(true) => tracing::info!(
+                run_id,
+                slot_id,
+                transcript_path = %path,
+                "recorded transcript_path on work_run from hook payload",
+            ),
+            Ok(false) => {}
+            Err(err) => tracing::warn!(
+                run_id,
+                slot_id,
+                ?err,
+                "failed to persist transcript_path from hook payload",
+            ),
+        }
+    }
     let prior_activity = server_state
         .live_worker_states
         .get(slot_id)
@@ -5482,6 +5508,7 @@ mod tests {
         let first_stop = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
             run_id: Some(run.id.clone()),
+            transcript_path: None,
             event: WorkerEvent::Stop {
                 session_id: "claude-sess-1".into(),
                 stop_hook_active: false,
@@ -5513,6 +5540,7 @@ mod tests {
         let second_stop = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
             run_id: Some(run.id.clone()),
+            transcript_path: None,
             event: WorkerEvent::Stop {
                 session_id: "claude-sess-1".into(),
                 stop_hook_active: false,

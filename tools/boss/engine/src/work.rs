@@ -1452,6 +1452,30 @@ impl WorkDb {
         query_run(&conn, id)?.with_context(|| format!("unknown run: {id}"))
     }
 
+    /// Persist the verbatim `transcript_path` we learned from a hook
+    /// event payload. Idempotent for the first writer (the
+    /// `WHERE transcript_path IS NULL` clause keeps every subsequent
+    /// hook event from rewriting the same value, and also keeps a
+    /// later SessionStart/resume from clobbering the path the
+    /// summarizer's tail watcher has already opened against the
+    /// original session). Returns `Ok(true)` if a row was actually
+    /// updated. A missing run id is treated as a benign no-op — hook
+    /// events can race ahead of the run being written.
+    pub fn set_run_transcript_path_if_unset(
+        &self,
+        run_id: &str,
+        transcript_path: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET transcript_path = ?2
+             WHERE id = ?1 AND transcript_path IS NULL",
+            params![run_id, transcript_path],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Stamp the actual pane-slot identity onto an existing run record.
     /// The coordinator inserts the run with the worker-pool placeholder
     /// (`worker-N` from capacity tracking), then calls this once the
@@ -5268,6 +5292,48 @@ mod tests {
 
         let unknown = db.set_run_agent_id("run-does-not-exist", "worker-1");
         assert!(unknown.is_err());
+
+        // The fresh run row starts with `transcript_path = NULL` (the
+        // engine has no way to learn the path until the first hook
+        // event arrives). The first time we see a transcript_path on
+        // a hook payload, the dispatcher persists it here; subsequent
+        // events must NOT overwrite it (a `/resume` session would
+        // otherwise yank the path out from under the summarizer's
+        // open file handle).
+        assert!(reread.transcript_path.is_none());
+        let first = db
+            .set_run_transcript_path_if_unset(
+                &run.id,
+                "/home/u/.claude/projects/foo/sess-1.jsonl",
+            )
+            .unwrap();
+        assert!(first, "first write must report updated=true");
+        let after_first = db.get_run(&run.id).unwrap();
+        assert_eq!(
+            after_first.transcript_path.as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+        );
+        let second = db
+            .set_run_transcript_path_if_unset(
+                &run.id,
+                "/home/u/.claude/projects/foo/sess-2.jsonl",
+            )
+            .unwrap();
+        assert!(!second, "second write must be a no-op");
+        let after_second = db.get_run(&run.id).unwrap();
+        assert_eq!(
+            after_second.transcript_path.as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+            "first writer must win — never clobber the path the summarizer tail watcher already opened",
+        );
+
+        // Unknown run id is a benign no-op: hook payloads can race
+        // ahead of the run row in pathological timing, and the
+        // dispatcher already silently drops events for unknown runs.
+        let missing = db
+            .set_run_transcript_path_if_unset("run-does-not-exist", "/x.jsonl")
+            .unwrap();
+        assert!(!missing);
 
         let _ = std::fs::remove_file(path);
     }
