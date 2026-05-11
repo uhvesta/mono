@@ -140,6 +140,13 @@ pub trait WorkerSpawner: Send + Sync {
     /// caller can broadcast the snapshot on the worker live-state
     /// topic. Default no-op for tests.
     async fn publish_live_worker_states(&self) {}
+
+    /// Hook called after a slot has been registered so the engine can
+    /// spawn the per-slot live-status summarizer task. Default no-op
+    /// for tests; production `ServerState` starts the task via its
+    /// `LiveStatusManager`. The task tears itself down when
+    /// `release_worker_pane` runs.
+    fn start_live_status_slot(&self, _slot_id: u8, _run_id: &str) {}
 }
 
 /// Render the worker-config files, ask the app to spawn a pane,
@@ -289,12 +296,16 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     if let Some(live_states) = spawner.live_worker_state_registry() {
         live_states.register_spawn(
             slot_id,
-            input.run_id,
+            input.run_id.clone(),
             DEFAULT_LAUNCH_MODEL,
             shell_pid,
             input.work_item_binding,
         );
         spawner.publish_live_worker_states().await;
+        // 5. Spin up the live-status summarizer for this slot. The
+        //    manager owns the task lifecycle and will be torn down
+        //    on `release_worker_pane`.
+        spawner.start_live_status_slot(slot_id, &input.run_id);
     }
 
     Ok(StartedWorker {

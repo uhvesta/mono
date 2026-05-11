@@ -17,6 +17,9 @@ use crate::coordinator::{
     CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
+use crate::live_status_loop::{
+    LiveStatusBroadcaster, LiveStatusManager, TranscriptPathResolver, Trigger,
+};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::protocol::{
@@ -32,6 +35,29 @@ use tokio::time::{Duration, timeout};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
+
+#[async_trait]
+impl LiveStatusBroadcaster for ServerState {
+    async fn broadcast_live_worker_states(&self) {
+        // Disambiguate against the trait method of the same name —
+        // call the inherent publisher directly via UFCS so this
+        // doesn't recurse.
+        ServerState::broadcast_live_worker_states(self).await;
+    }
+}
+
+#[async_trait]
+impl TranscriptPathResolver for ServerState {
+    async fn transcript_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
+        match self.work_db.get_run(run_id) {
+            Ok(run) => run.transcript_path.map(std::path::PathBuf::from),
+            Err(err) => {
+                tracing::debug!(run_id, ?err, "live_status: transcript path lookup failed");
+                None
+            }
+        }
+    }
+}
 
 #[async_trait]
 impl crate::spawn_flow::WorkerSpawner for ServerState {
@@ -66,6 +92,31 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
 
     async fn publish_live_worker_states(&self) {
         self.broadcast_live_worker_states().await;
+    }
+
+    fn start_live_status_slot(&self, slot_id: u8, run_id: &str) {
+        let Some(arc_self) = self._self_weak.upgrade() else {
+            tracing::debug!(
+                slot_id,
+                "start_live_status_slot: ServerState already dropped",
+            );
+            return;
+        };
+        // Snapshot the API key once at slot start — picking it up
+        // lazily inside the task would require sharing the config or
+        // a closure, and the key doesn't change for the worker's
+        // lifetime anyway.
+        let api_key = arc_self.anthropic_api_key.clone();
+        let broadcaster: Arc<dyn LiveStatusBroadcaster> = arc_self.clone();
+        let resolver: Arc<dyn TranscriptPathResolver> = arc_self.clone();
+        self.live_status_manager.start_slot(
+            slot_id,
+            run_id.to_owned(),
+            api_key,
+            self.live_worker_states.clone(),
+            broadcaster,
+            resolver,
+        );
     }
 }
 
@@ -201,6 +252,15 @@ struct ServerState {
     /// `ListWorkerLiveStates` and pushed on the
     /// `worker.live_states` topic whenever any slot changes.
     live_worker_states: Arc<LiveWorkerStateRegistry>,
+    /// Per-slot trigger fan-in for the live-status summarizer. Started
+    /// when `spawn_flow` calls `start_live_status_slot`; torn down
+    /// in `release_worker_pane`.
+    live_status_manager: Arc<LiveStatusManager>,
+    /// Snapshot of the Anthropic API key captured at engine startup.
+    /// Used by the live-status summarizer for the per-slot task; the
+    /// pane-titlebar summarizer continues to resolve the key
+    /// per-spawn via `cfg.agent()`.
+    anthropic_api_key: Option<String>,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
     /// Pid of the process the engine trusts as the macOS app — must
@@ -375,6 +435,10 @@ impl ServerState {
         app_pid: Option<libc::pid_t>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
+        let anthropic_api_key = cfg
+            .agent()
+            .ok()
+            .and_then(|agent| agent.anthropic_api_key.clone());
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
@@ -430,6 +494,8 @@ impl ServerState {
                 topic_broker,
                 worker_registry: WorkerRegistry::new(),
                 live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
+                live_status_manager: Arc::new(LiveStatusManager::new()),
+                anthropic_api_key,
                 next_session_id: AtomicU64::new(1),
                 work_revision,
                 app_pid,
@@ -562,6 +628,10 @@ impl ServerState {
         // ownership of the slot in the worker registry, so a stale
         // entry here would lie to the UI about the slot being live.
         self.live_worker_states.release_slot(slot_id);
+        // Tear down the per-slot live-status task. The manager
+        // doesn't await the task's exit so a wedged Anthropic call
+        // can't block the release path.
+        self.live_status_manager.stop_slot(slot_id);
         self.broadcast_live_worker_states().await;
     }
 
@@ -1898,11 +1968,51 @@ async fn dispatch_live_worker_state(
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         return;
     };
+    let prior_activity = server_state
+        .live_worker_states
+        .get(slot_id)
+        .map(|s| s.activity);
     let changed = server_state
         .live_worker_states
         .apply_event(slot_id, &incoming.event);
     if changed {
         server_state.broadcast_live_worker_states().await;
+    }
+    // Fan out the matching trigger to the per-slot live-status loop.
+    // The manager drops the trigger if no slot task is running, so a
+    // hook arriving before `register_spawn` or after `release_slot`
+    // is a benign no-op.
+    let new_activity = server_state
+        .live_worker_states
+        .get(slot_id)
+        .map(|s| s.activity);
+    match &incoming.event {
+        crate::protocol::WorkerEvent::Stop { .. } => {
+            server_state
+                .live_status_manager
+                .notify(slot_id, Trigger::Stop);
+        }
+        crate::protocol::WorkerEvent::PostToolUse { .. } => {
+            server_state
+                .live_status_manager
+                .notify(slot_id, Trigger::PostToolUse);
+        }
+        _ => {}
+    }
+    if let (Some(prior), Some(new)) = (prior_activity, new_activity) {
+        if prior != new {
+            server_state
+                .live_status_manager
+                .notify(slot_id, Trigger::ActivityChanged(new));
+        }
+    } else if let Some(new) = new_activity {
+        // First event lands on a freshly spawned slot — the trigger
+        // gives the loop the activity it should base its initial
+        // policy on (in particular, Working → starts the timer
+        // floor).
+        server_state
+            .live_status_manager
+            .notify(slot_id, Trigger::ActivityChanged(new));
     }
 }
 

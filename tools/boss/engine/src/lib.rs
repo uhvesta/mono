@@ -6,6 +6,7 @@ pub mod config;
 pub mod coordinator;
 pub mod events_socket;
 pub mod live_status;
+pub mod live_status_loop;
 pub mod live_status_redact;
 pub mod live_worker_state;
 pub mod merge_poller;
