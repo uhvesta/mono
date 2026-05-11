@@ -93,7 +93,8 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
+            "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
+                    design_doc_repo_remote_url, design_doc_branch, design_doc_path
              FROM projects
              WHERE product_id = ?1
              ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -1170,7 +1171,8 @@ impl WorkDb {
 
         let projects = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
+                "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
+                        design_doc_repo_remote_url, design_doc_branch, design_doc_path
                  FROM projects
                  WHERE product_id = ?1
                  ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -1590,7 +1592,10 @@ impl WorkDb {
                 status TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                design_doc_repo_remote_url TEXT,
+                design_doc_branch TEXT,
+                design_doc_path TEXT
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS projects_product_slug_idx
@@ -1697,6 +1702,7 @@ impl WorkDb {
         migrate_tasks_autostart(&conn)?;
         migrate_last_status_actor(&conn)?;
         migrate_tasks_priority(&conn)?;
+        migrate_project_design_doc_columns(&conn)?;
         migrate_backfill_project_design_tasks(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
@@ -2192,12 +2198,9 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
         last_status_actor: row.get(10)?,
-        // The design-doc pointer columns land in a follow-up chore
-        // (schema migration); until then `map_project` does not read
-        // them and every row resolves to `None` on the wire.
-        design_doc_repo_remote_url: None,
-        design_doc_branch: None,
-        design_doc_path: None,
+        design_doc_repo_remote_url: row.get(11)?,
+        design_doc_branch: row.get(12)?,
+        design_doc_path: row.get(13)?,
     })
 }
 
@@ -2407,7 +2410,8 @@ fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
 
 fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
     conn.query_row(
-        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
+        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
+                design_doc_repo_remote_url, design_doc_branch, design_doc_path
          FROM projects
          WHERE id = ?1",
         [id],
@@ -2470,7 +2474,8 @@ fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttent
 
 fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor
+        "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
+                design_doc_repo_remote_url, design_doc_branch, design_doc_path
          FROM projects
          WHERE product_id = ?1
          ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -2714,6 +2719,27 @@ fn migrate_tasks_priority(conn: &Connection) -> Result<()> {
             "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// Add per-project design-doc pointer columns. The three columns
+/// jointly identify "where this project's design doc lives" and
+/// are all nullable: `design_doc_path` is the load-bearing field
+/// and a `NULL` path means no pointer is set. The other two are
+/// optional overrides that fall back to the product's repo /
+/// docs-branch defaults when `NULL`. Existing rows keep `NULL` on
+/// all three across the upgrade.
+fn migrate_project_design_doc_columns(conn: &Connection) -> Result<()> {
+    for column in [
+        "design_doc_repo_remote_url",
+        "design_doc_branch",
+        "design_doc_path",
+    ] {
+        if !table_has_column(conn, "projects", column)? {
+            let ddl = format!("ALTER TABLE projects ADD COLUMN {column} TEXT");
+            conn.execute(&ddl, [])?;
+        }
     }
     Ok(())
 }
@@ -7156,6 +7182,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, "4");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Pre-existing databases (whose `projects` table predates the
+    /// design-doc pointer chore) should pick up the three new
+    /// nullable columns transparently on open, and `query_project`
+    /// should keep working — every existing row reads back with
+    /// `None` on each pointer field.
+    #[test]
+    fn migration_adds_project_design_doc_columns() {
+        let path = temp_db_path("design-doc-migrate");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human');
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 priority TEXT NOT NULL DEFAULT 'medium');
+             INSERT INTO products(id, name, slug, status, created_at, updated_at)
+             VALUES ('prod_legacy', 'Legacy', 'legacy', 'active', '1700000000', '1700000000');
+             INSERT INTO projects(id, product_id, name, slug, status, priority, created_at, updated_at)
+             VALUES ('proj_legacy', 'prod_legacy', 'Legacy', 'legacy', 'planned', 'medium', '1700000000', '1700000000');
+             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "projects", "design_doc_repo_remote_url").unwrap());
+        assert!(table_has_column(&conn, "projects", "design_doc_branch").unwrap());
+        assert!(table_has_column(&conn, "projects", "design_doc_path").unwrap());
+        drop(conn);
+
+        let project = query_project(&db.connect().unwrap(), "proj_legacy")
+            .unwrap()
+            .expect("legacy project should survive migration");
+        assert_eq!(project.design_doc_repo_remote_url, None);
+        assert_eq!(project.design_doc_branch, None);
+        assert_eq!(project.design_doc_path, None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Fresh init (no pre-existing tables) lands the three pointer
+    /// columns via `CREATE TABLE`, not via the migration path. Verify
+    /// both routes converge on the same schema shape.
+    #[test]
+    fn fresh_init_includes_project_design_doc_columns() {
+        let path = temp_db_path("design-doc-fresh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "projects", "design_doc_repo_remote_url").unwrap());
+        assert!(table_has_column(&conn, "projects", "design_doc_branch").unwrap());
+        assert!(table_has_column(&conn, "projects", "design_doc_path").unwrap());
         let _ = std::fs::remove_file(path);
     }
 
