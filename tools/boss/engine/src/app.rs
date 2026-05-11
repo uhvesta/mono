@@ -5392,6 +5392,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = server_state

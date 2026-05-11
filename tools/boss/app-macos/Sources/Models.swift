@@ -230,6 +230,11 @@ struct WorkTask: Identifiable, Hashable {
     /// `engine_auto`, or `unknown`. Pre-column rows arrive as
     /// `unknown` from the engine's migration default.
     var createdVia: String = "unknown"
+    /// Per-work-item repo override. `nil` → inherit from the parent
+    /// product's `repoRemoteURL`. Pre-column rows decode as `nil`
+    /// because serde skips the field when it's `None` on the wire
+    /// (see `Task.repo_remote_url` in `boss_protocol::types`).
+    var repoRemoteURL: String? = nil
 
     var isChore: Bool {
         kind == "chore"

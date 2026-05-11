@@ -84,6 +84,13 @@ pub struct Task {
     /// of the other values.
     #[serde(default = "default_unknown_created_via")]
     pub created_via: String,
+    /// Per-work-item repo override. `None` → inherit from the parent
+    /// `Product.repo_remote_url`. Stored as a canonical remote URL
+    /// (e.g. `git@github.com:myorg/repo.git` or
+    /// `https://github.com/myorg/repo.git`); short-name display is
+    /// derived on the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -273,6 +280,11 @@ pub struct CreateTaskInput {
     /// so the row is never silently labeled `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_via: Option<String>,
+    /// Per-work-item repo override. `None` → the task inherits from
+    /// its product. Canonical remote URL form (engine canonicalises
+    /// caller-supplied URLs at write time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +307,11 @@ pub struct CreateChoreInput {
     /// See `CreateTaskInput::created_via`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_via: Option<String>,
+    /// Per-work-item repo override. `None` → the chore inherits from
+    /// its product. Canonical remote URL form (engine canonicalises
+    /// caller-supplied URLs at write time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote_url: Option<String>,
 }
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved
@@ -778,6 +795,117 @@ mod tests {
             serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(),
             broken,
         );
+    }
+
+    fn sample_task_json(extra: Value) -> Value {
+        let mut base = json!({
+            "id": "task_1",
+            "product_id": "prod_1",
+            "project_id": Value::Null,
+            "kind": "chore",
+            "name": "Demo",
+            "description": "",
+            "status": "todo",
+            "ordinal": Value::Null,
+            "pr_url": Value::Null,
+            "deleted_at": Value::Null,
+            "created_at": "2026-05-11T00:00:00Z",
+            "updated_at": "2026-05-11T00:00:00Z",
+        });
+        if let (Value::Object(target), Value::Object(extra)) = (&mut base, extra) {
+            for (k, v) in extra {
+                target.insert(k, v);
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn task_decodes_without_repo_remote_url() {
+        let raw = sample_task_json(json!({}));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert!(task.repo_remote_url.is_none());
+        assert_eq!(task.created_via, CREATED_VIA_UNKNOWN);
+    }
+
+    #[test]
+    fn task_skips_none_repo_remote_url_on_encode() {
+        let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&task).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("repo_remote_url"));
+    }
+
+    #[test]
+    fn task_roundtrips_with_repo_remote_url() {
+        let raw = sample_task_json(json!({
+            "repo_remote_url": "https://github.com/foo/bar.git",
+        }));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            task.repo_remote_url.as_deref(),
+            Some("https://github.com/foo/bar.git"),
+        );
+        let reencoded = serde_json::to_value(&task).unwrap();
+        let task2: Task = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(task.repo_remote_url, task2.repo_remote_url);
+    }
+
+    #[test]
+    fn create_task_input_repo_remote_url_roundtrips() {
+        let raw = json!({
+            "product_id": "prod_1",
+            "project_id": "proj_1",
+            "name": "Demo",
+            "description": null,
+            "repo_remote_url": "git@github.com:foo/bar.git",
+        });
+        let parsed: CreateTaskInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            parsed.repo_remote_url.as_deref(),
+            Some("git@github.com:foo/bar.git"),
+        );
+        let encoded = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            encoded["repo_remote_url"],
+            Value::String("git@github.com:foo/bar.git".into()),
+        );
+
+        let without_field = json!({
+            "product_id": "prod_1",
+            "project_id": "proj_1",
+            "name": "Demo",
+            "description": null,
+        });
+        let parsed_none: CreateTaskInput = serde_json::from_value(without_field).unwrap();
+        assert!(parsed_none.repo_remote_url.is_none());
+        let encoded_none = serde_json::to_value(&parsed_none).unwrap();
+        assert!(!encoded_none.as_object().unwrap().contains_key("repo_remote_url"));
+    }
+
+    #[test]
+    fn create_chore_input_repo_remote_url_roundtrips() {
+        let raw = json!({
+            "product_id": "prod_1",
+            "name": "Demo",
+            "description": null,
+            "repo_remote_url": "",
+        });
+        let parsed: CreateChoreInput = serde_json::from_value(raw).unwrap();
+        // Empty string is preserved here; the engine interprets it as
+        // "clear" on update verbs but for create it just resolves as
+        // not-set / inherit.
+        assert_eq!(parsed.repo_remote_url.as_deref(), Some(""));
+
+        let without_field = json!({
+            "product_id": "prod_1",
+            "name": "Demo",
+            "description": null,
+        });
+        let parsed_none: CreateChoreInput = serde_json::from_value(without_field).unwrap();
+        assert!(parsed_none.repo_remote_url.is_none());
+        let encoded_none = serde_json::to_value(&parsed_none).unwrap();
+        assert!(!encoded_none.as_object().unwrap().contains_key("repo_remote_url"));
     }
 
     #[test]

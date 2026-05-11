@@ -1296,6 +1296,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
+                    repo_remote_url: None,
                 },
             )
             .await?;
@@ -1378,6 +1379,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
+                    repo_remote_url: None,
                 },
             )
             .await?;
@@ -1938,6 +1940,7 @@ async fn run_task_create_many(
             autostart: item.autostart.unwrap_or(default_autostart),
             priority: item.priority,
             created_via: Some(CREATED_VIA_CLI.to_owned()),
+            repo_remote_url: None,
         });
     }
 
@@ -1981,6 +1984,7 @@ async fn run_chore_create_many(
             autostart: item.autostart.unwrap_or(default_autostart),
             priority: item.priority,
             created_via: Some(CREATED_VIA_CLI.to_owned()),
+            repo_remote_url: None,
         });
     }
 
@@ -2920,6 +2924,7 @@ mod tests {
             last_status_actor: "human".to_owned(),
             priority: "medium".to_owned(),
             created_via: "unknown".to_owned(),
+            repo_remote_url: None,
         }
     }
 

@@ -576,6 +576,7 @@ mod pane_spawn_tests {
             last_status_actor: "human".into(),
             priority: "medium".into(),
             created_via: "unknown".to_owned(),
+            repo_remote_url: None,
         })
     }
 
@@ -862,6 +863,7 @@ mod pane_spawn_tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 

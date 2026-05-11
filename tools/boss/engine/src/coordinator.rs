@@ -1785,6 +1785,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1848,6 +1849,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1899,6 +1901,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1939,6 +1942,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -1984,6 +1988,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2047,6 +2052,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2229,6 +2235,8 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2354,6 +2362,8 @@ mod tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2420,6 +2430,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2557,6 +2568,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let late = db
@@ -2567,6 +2579,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2643,6 +2656,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2706,6 +2720,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2777,6 +2792,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2862,6 +2878,7 @@ mod tests {
             autostart: true,
             priority: None,
             created_via: None,
+            repo_remote_url: None,
         })
         .unwrap();
         db.create_task(CreateTaskInput {
@@ -2872,6 +2889,7 @@ mod tests {
             autostart: true,
             priority: None,
             created_via: None,
+            repo_remote_url: None,
         })
         .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2966,6 +2984,7 @@ mod tests {
                     autostart: true,
                     priority: None,
                     created_via: None,
+                    repo_remote_url: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -3073,6 +3092,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -3095,6 +3115,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -3124,6 +3145,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let real_exec = db
@@ -3218,6 +3240,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         }
@@ -3288,6 +3311,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // A second chore that will sit in `ready` because the
@@ -3300,6 +3324,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3414,6 +3439,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3430,6 +3456,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -3511,6 +3538,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3523,6 +3551,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(

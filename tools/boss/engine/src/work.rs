@@ -2664,6 +2664,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         last_status_actor: row.get(13)?,
         priority: row.get(14)?,
         created_via: row.get(15)?,
+        repo_remote_url: None,
     })
 }
 
@@ -4293,6 +4294,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let chore = db
@@ -4303,6 +4305,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -4355,6 +4358,7 @@ mod tests {
                 autostart: i % 2 == 0,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -4416,6 +4420,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             },
             CreateTaskInput {
                 product_id: product.id.clone(),
@@ -4425,6 +4430,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             },
         ];
         let err = db
@@ -4471,6 +4477,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -4510,6 +4517,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let chore_running = db
@@ -4520,6 +4528,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4586,6 +4595,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let dependent = db
@@ -4596,6 +4606,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -4622,6 +4633,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let other_dependent = db
@@ -4632,6 +4644,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -4746,6 +4759,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let second = db
@@ -4757,6 +4771,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -4805,6 +4820,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -4965,6 +4981,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let second_task = db
@@ -4976,6 +4993,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let chore = db
@@ -4986,6 +5004,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -5055,6 +5074,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let second_task = db
@@ -5066,6 +5086,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -5128,6 +5149,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -5182,6 +5204,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -5269,6 +5292,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -5336,6 +5360,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -5411,6 +5436,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // Manually mark the chore as done before starting execution.
@@ -5484,6 +5510,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // Manually flip to active, mimicking a kanban drag that
@@ -5530,6 +5557,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -5585,6 +5613,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -5639,6 +5668,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -5705,6 +5735,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let exec_a = db
@@ -5737,6 +5768,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -5756,6 +5788,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -5811,6 +5844,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let exec_live = db
@@ -5839,6 +5873,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let exec_dead = db
@@ -5867,6 +5902,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let exec_unknown = db
@@ -5951,6 +5987,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let stale = db
@@ -6011,6 +6048,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -6078,6 +6116,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -6127,6 +6166,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // Drive the chore into `active` so reconcile considers it.
@@ -6210,6 +6250,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6282,6 +6323,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let live = db
@@ -6338,6 +6380,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let done_chore = db
@@ -6348,6 +6391,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6388,6 +6432,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         assert!(
@@ -6416,6 +6461,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let result = db.reconcile_product_executions(&product.id).unwrap();
@@ -6462,6 +6508,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6512,6 +6559,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6553,6 +6601,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6769,6 +6818,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -6821,6 +6871,7 @@ mod tests {
                     autostart: true,
                     priority: None,
                     created_via: None,
+                    repo_remote_url: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -6878,6 +6929,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let dependent = db
@@ -6888,6 +6940,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // Add the blocks edge BEFORE flipping dependent to active so
@@ -6944,6 +6997,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -7006,6 +7060,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -7097,6 +7152,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let execution = db
@@ -7199,6 +7255,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -7250,6 +7307,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -7260,6 +7318,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -7372,6 +7431,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -7382,6 +7442,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let err = db
@@ -7420,6 +7481,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -7430,6 +7492,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7476,6 +7539,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -7486,6 +7550,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // Sanity: A starts as `todo` (default).
@@ -7540,6 +7605,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -7550,6 +7616,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7604,6 +7671,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let prereq_b = db
@@ -7614,6 +7682,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let prereq_c = db
@@ -7624,6 +7693,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7708,6 +7778,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let prereq = db
@@ -7718,6 +7789,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7799,6 +7871,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -7809,6 +7882,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
 
@@ -7862,6 +7936,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // Human moves A to `blocked` (no edges yet).
@@ -7889,6 +7964,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -7942,6 +8018,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -7952,6 +8029,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7996,6 +8074,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -8006,6 +8085,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -8058,6 +8138,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         let b = db
@@ -8068,6 +8149,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -8227,6 +8309,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: Some(boss_protocol::CREATED_VIA_CLI.to_owned()),
+                repo_remote_url: None,
             })
             .unwrap();
         assert_eq!(cli_chore.created_via, boss_protocol::CREATED_VIA_CLI);
@@ -8239,6 +8322,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         assert_eq!(unknown_chore.created_via, CREATED_VIA_UNKNOWN);
@@ -9008,6 +9092,7 @@ mod tests {
                 autostart: true,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -9160,6 +9245,7 @@ mod tests {
                     autostart: false,
                     priority: None,
                     created_via: None,
+                    repo_remote_url: None,
                 })
                 .unwrap()
                 .id

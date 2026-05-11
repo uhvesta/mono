@@ -327,6 +327,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         db.update_work_item(
@@ -357,6 +358,7 @@ mod tests {
                 autostart: false,
                 priority: None,
                 created_via: None,
+                repo_remote_url: None,
             })
             .unwrap();
         // Move chore directly to in_review with a pr_url, mirroring
