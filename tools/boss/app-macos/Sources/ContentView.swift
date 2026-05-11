@@ -1176,6 +1176,7 @@ private struct WorkCardPopoverView: View {
                     metadataRow("Phase", value: "\(ordinal)")
                 }
                 metadataPRRow(prURL: task.prURL)
+                sourceChipRow
             }
 
             WorkDependenciesSection(model: model, taskID: task.id)
@@ -1319,6 +1320,27 @@ private struct WorkCardPopoverView: View {
             .labelsHidden()
             .pickerStyle(.menu)
             .fixedSize()
+        }
+    }
+
+    /// Surface that filed this row, rendered as a small chip below the
+    /// PR row. Visible on every card; the chip text is the raw
+    /// `created_via` value (`cli`, `mac_app`, `engine_auto`, …) so a
+    /// future undocumented source shows up verbatim rather than
+    /// silently looking like one of the known values.
+    @ViewBuilder
+    private var sourceChipRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Source")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(task.createdVia)
+                .font(.caption)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule().fill(Color.secondary.opacity(0.15))
+                )
         }
     }
 

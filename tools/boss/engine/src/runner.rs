@@ -575,6 +575,7 @@ mod pane_spawn_tests {
             autostart: true,
             last_status_actor: "human".into(),
             priority: "medium".into(),
+            created_via: "unknown".to_owned(),
         })
     }
 
@@ -860,6 +861,7 @@ mod pane_spawn_tests {
                 description: None,
                 autostart: true,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
 

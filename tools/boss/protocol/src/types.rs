@@ -77,6 +77,13 @@ pub struct Task {
     /// introduced default to `medium`.
     #[serde(default = "default_priority")]
     pub priority: String,
+    /// The surface that filed this row — `cli`, `bossctl`, `mac_app`,
+    /// `engine_auto`, or `unknown`. Stamped at insert time and never
+    /// rewritten. `unknown` only appears on rows that predate this
+    /// column (the migration default); fresh writes always carry one
+    /// of the other values.
+    #[serde(default = "default_unknown_created_via")]
+    pub created_via: String,
 }
 
 fn default_true() -> bool {
@@ -89,6 +96,39 @@ pub fn default_priority() -> String {
 
 pub fn default_human_actor() -> String {
     "human".to_owned()
+}
+
+/// Canonical "I don't know where this came from" stamp. Applied by
+/// the migration to existing rows and by the engine's last-resort
+/// fallback when a caller omits the field. Fresh writes from any
+/// documented surface (`cli`, `bossctl`, `mac_app`, `engine_auto`)
+/// must carry their own value.
+pub fn default_unknown_created_via() -> String {
+    CREATED_VIA_UNKNOWN.to_owned()
+}
+
+pub const CREATED_VIA_CLI: &str = "cli";
+pub const CREATED_VIA_BOSSCTL: &str = "bossctl";
+pub const CREATED_VIA_MAC_APP: &str = "mac_app";
+pub const CREATED_VIA_ENGINE_AUTO: &str = "engine_auto";
+pub const CREATED_VIA_UNKNOWN: &str = "unknown";
+
+/// Documented `created_via` values. The engine canonicalises caller-
+/// supplied strings against this set; values outside it are stored
+/// as-is but logged so we can spot undocumented sources sneaking in.
+pub const KNOWN_CREATED_VIA: &[&str] = &[
+    CREATED_VIA_CLI,
+    CREATED_VIA_BOSSCTL,
+    CREATED_VIA_MAC_APP,
+    CREATED_VIA_ENGINE_AUTO,
+    CREATED_VIA_UNKNOWN,
+];
+
+/// `true` when `value` is one of the documented `created_via` strings.
+/// Engine writes for unknown values still go through, but a warning is
+/// logged at the insert site.
+pub fn is_known_created_via(value: &str) -> bool {
+    KNOWN_CREATED_VIA.contains(&value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +267,12 @@ pub struct CreateTaskInput {
     /// of tasks; only callers who care should set this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Surface that filed this task — `cli`, `bossctl`, `mac_app`,
+    /// `engine_auto`. Documented callers always set it explicitly;
+    /// when omitted, the engine falls back to a transport-layer hint
+    /// so the row is never silently labeled `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +292,9 @@ pub struct CreateChoreInput {
     /// (`medium`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// See `CreateTaskInput::created_via`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
 }
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved

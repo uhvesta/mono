@@ -2581,7 +2581,12 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::CreateTask { input } => match work_db.create_task(input) {
+            FrontendRequest::CreateTask { mut input } => {
+                if input.created_via.is_none() {
+                    input.created_via =
+                        Some(transport_default_created_via(&server_state, &session_id).await);
+                }
+                match work_db.create_task(input) {
                 Ok(task) => {
                     let item = WorkItem::Task(task);
                     let product_id = work_item_product_id(&item);
@@ -2611,8 +2616,14 @@ async fn handle_frontend_connection(
                         },
                     );
                 }
-            },
-            FrontendRequest::CreateChore { input } => match work_db.create_chore(input) {
+            }
+            }
+            FrontendRequest::CreateChore { mut input } => {
+                if input.created_via.is_none() {
+                    input.created_via =
+                        Some(transport_default_created_via(&server_state, &session_id).await);
+                }
+                match work_db.create_chore(input) {
                 Ok(task) => {
                     let item = WorkItem::Chore(task);
                     let product_id = work_item_product_id(&item);
@@ -2642,8 +2653,15 @@ async fn handle_frontend_connection(
                         },
                     );
                 }
-            },
-            FrontendRequest::CreateManyTasks { input } => {
+            }
+            }
+            FrontendRequest::CreateManyTasks { mut input } => {
+                let fallback = transport_default_created_via(&server_state, &session_id).await;
+                for item in &mut input.items {
+                    if item.created_via.is_none() {
+                        item.created_via = Some(fallback.clone());
+                    }
+                }
                 handle_create_many(
                     work_db.create_many_tasks(input),
                     "tasks_created",
@@ -2655,7 +2673,13 @@ async fn handle_frontend_connection(
                 )
                 .await;
             }
-            FrontendRequest::CreateManyChores { input } => {
+            FrontendRequest::CreateManyChores { mut input } => {
+                let fallback = transport_default_created_via(&server_state, &session_id).await;
+                for item in &mut input.items {
+                    if item.created_via.is_none() {
+                        item.created_via = Some(fallback.clone());
+                    }
+                }
                 handle_create_many(
                     work_db.create_many_chores(input),
                     "chores_created",
@@ -4111,6 +4135,31 @@ async fn handle_create_many(
     }
 }
 
+/// Transport-layer fallback for `created_via` when a caller didn't
+/// stamp it themselves. The macOS app self-identifies via
+/// `RegisterAppSession`, so any request from the registered app
+/// session defaults to `mac_app`; everything else (CLI, bossctl,
+/// ad-hoc test client) falls through to `unknown`. CLI / bossctl
+/// always set the field explicitly, so `unknown` here only fires for
+/// off-the-beaten-path callers — exactly the case we want to flag in
+/// the database rather than mislabel.
+async fn transport_default_created_via(
+    server_state: &Arc<ServerState>,
+    session_id: &str,
+) -> String {
+    let app_session_id = server_state
+        .app_session
+        .lock()
+        .await
+        .as_ref()
+        .map(|h| h.session_id.clone());
+    if app_session_id.as_deref() == Some(session_id) {
+        boss_protocol::CREATED_VIA_MAC_APP.to_owned()
+    } else {
+        boss_protocol::CREATED_VIA_UNKNOWN.to_owned()
+    }
+}
+
 fn work_item_id(item: &WorkItem) -> String {
     match item {
         WorkItem::Product(product) => product.id.clone(),
@@ -5320,6 +5369,7 @@ mod tests {
                 description: None,
                 autostart: false,
                 priority: None,
+                created_via: None,
             })
             .unwrap();
         let execution = server_state

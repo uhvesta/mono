@@ -254,6 +254,7 @@ final class EngineClient: @unchecked Sendable {
             "project_id": projectId,
             "name": name,
             "description": description,
+            "created_via": "mac_app",
         ])
     }
 
@@ -263,6 +264,7 @@ final class EngineClient: @unchecked Sendable {
             "product_id": productId,
             "name": name,
             "description": description,
+            "created_via": "mac_app",
         ])
     }
 
@@ -785,7 +787,8 @@ final class EngineClient: @unchecked Sendable {
             deletedAt: payload["deleted_at"] as? String,
             createdAt: createdAt,
             updatedAt: updatedAt,
-            lastStatusActor: (payload["last_status_actor"] as? String) ?? "human"
+            lastStatusActor: (payload["last_status_actor"] as? String) ?? "human",
+            createdVia: (payload["created_via"] as? String) ?? "unknown"
         )
     }
 

@@ -7,11 +7,11 @@ use boss_client::{
     stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
-    DependencyFilter, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
-    RemoveDependencyInput, Task, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch,
+    AddDependencyInput, CREATED_VIA_CLI, CreateChoreInput, CreateManyChoresInput,
+    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
+    DependencyDirection, DependencyEdge, DependencyFilter, FrontendEvent, FrontendRequest,
+    ListDependenciesInput, Product, Project, RemoveDependencyInput, Task, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -1295,6 +1295,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     description,
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
+                    created_via: Some(CREATED_VIA_CLI.to_owned()),
                 },
             )
             .await?;
@@ -1376,6 +1377,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     description,
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
+                    created_via: Some(CREATED_VIA_CLI.to_owned()),
                 },
             )
             .await?;
@@ -1935,6 +1937,7 @@ async fn run_task_create_many(
             description: normalize_non_empty(Some(item.description)),
             autostart: item.autostart.unwrap_or(default_autostart),
             priority: item.priority,
+            created_via: Some(CREATED_VIA_CLI.to_owned()),
         });
     }
 
@@ -1977,6 +1980,7 @@ async fn run_chore_create_many(
             description: normalize_non_empty(Some(item.description)),
             autostart: item.autostart.unwrap_or(default_autostart),
             priority: item.priority,
+            created_via: Some(CREATED_VIA_CLI.to_owned()),
         });
     }
 
@@ -2799,6 +2803,7 @@ fn print_task_details(title: &str, task: &Task) {
     println!("Kind: {}", task.kind);
     println!("Status: {}", task.status);
     println!("Priority: {}", task.priority);
+    println!("Source: {}", task.created_via);
     if let Some(ordinal) = task.ordinal {
         println!("Ordinal: {}", ordinal);
     }
@@ -2914,6 +2919,7 @@ mod tests {
             autostart: true,
             last_status_actor: "human".to_owned(),
             priority: "medium".to_owned(),
+            created_via: "unknown".to_owned(),
         }
     }
 

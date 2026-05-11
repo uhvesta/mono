@@ -112,6 +112,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             description: Some("extract reusable BossClient".to_owned()),
             autostart: true,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -127,6 +128,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -243,6 +245,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             description: None,
             autostart: true,
             priority: Some("high".to_owned()),
+            created_via: None,
         },
     )
     .await?;
@@ -256,6 +259,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -372,6 +376,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -455,6 +460,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -500,6 +506,7 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
             description: None,
             autostart: false,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -916,6 +923,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -927,6 +935,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             description: None,
             autostart: true,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -1050,6 +1059,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             description: None,
             autostart: false,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -1062,6 +1072,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             description: None,
             autostart: false,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -1074,6 +1085,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             description: None,
             autostart: false,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -1085,6 +1097,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             description: None,
             autostart: false,
             priority: None,
+            created_via: None,
         },
     )
     .await?;
@@ -1276,6 +1289,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             description: Some(format!("desc {i}")),
             autostart: false,
             priority: None,
+            created_via: None,
         })
         .collect();
     let created_tasks = match client
@@ -1309,6 +1323,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             description: None,
             autostart: i == 0,
             priority: None,
+            created_via: None,
         })
         .collect();
     let created_chores = match client
@@ -1339,6 +1354,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             description: None,
             autostart: false,
             priority: None,
+            created_via: None,
         },
         CreateTaskInput {
             product_id: product.id.clone(),
@@ -1347,6 +1363,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             description: None,
             autostart: false,
             priority: None,
+            created_via: None,
         },
     ];
     match client
