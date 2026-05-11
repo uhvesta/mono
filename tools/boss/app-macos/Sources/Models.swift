@@ -379,6 +379,12 @@ struct WorkBoardSection: Identifiable {
     let items: [WorkTask]
     var isCollapsible: Bool = false
     var defaultExpanded: Bool = true
+    /// Project id this section represents when the board is grouped
+    /// by project. `nil` for chores / un-projected sections / column
+    /// groupings. The kanban project-card affordance (design-doc
+    /// icon) reads this to look up the resolved
+    /// `ProjectDesignDocState` for the section's header row.
+    var projectID: String? = nil
 }
 
 extension WorkTask {
