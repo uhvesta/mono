@@ -4,6 +4,7 @@ pub mod cli;
 pub mod completion;
 pub mod config;
 pub mod coordinator;
+pub mod dispatch_events;
 pub mod events_socket;
 pub mod live_status;
 pub mod live_status_loop;

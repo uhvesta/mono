@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -476,14 +477,35 @@ impl ServerState {
         let cube_client_for_state = cube_client.clone();
         let publisher_for_state = publisher.clone();
 
+        // Resolve the Boss state root from the db path's parent so the
+        // dispatch-event JSONL stream lands next to state.db /
+        // events.sock under the same root. Falls back to the user's
+        // `~/Library/Application Support/Boss/` if the db path has no
+        // parent (only possible in degenerate test configs).
+        let dispatch_event_root: PathBuf = cfg
+            .work
+            .db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join("Library/Application Support/Boss"))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> = Arc::new(
+            crate::dispatch_events::JsonlFileSink::new(dispatch_event_root),
+        );
+
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
-            let execution_coordinator = Arc::new(ExecutionCoordinator::with_publisher(
+            let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
                 worker_pool,
                 cube_client,
                 runner_for_coordinator,
                 publisher,
-            ));
+            );
+            execution_coordinator_inner.set_dispatch_events(dispatch_events);
+            let execution_coordinator = Arc::new(execution_coordinator_inner);
 
             ServerState {
                 work_db,

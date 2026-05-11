@@ -11,6 +11,7 @@ rust_library(
         "src/completion.rs",
         "src/config.rs",
         "src/coordinator.rs",
+        "src/dispatch_events.rs",
         "src/events_socket.rs",
         "src/lib.rs",
         "src/live_status.rs",

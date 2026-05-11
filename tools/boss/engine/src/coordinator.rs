@@ -10,6 +10,9 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
+use crate::dispatch_events::{
+    DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
+};
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution, WorkItem, WorkRun};
 
@@ -567,6 +570,13 @@ pub struct ExecutionCoordinator {
     cube_client: Arc<dyn CubeClient>,
     execution_runner: Arc<dyn ExecutionRunner>,
     publisher: Arc<dyn ExecutionPublisher>,
+    /// Structured stream of dispatch-pipeline events. Defaults to a
+    /// no-op so legacy tests and short-lived callers don't need to
+    /// stand one up; production wiring should install a
+    /// [`crate::dispatch_events::JsonlFileSink`] via
+    /// [`ExecutionCoordinator::set_dispatch_events`] before
+    /// scheduling starts.
+    dispatch_events: Arc<dyn DispatchEventSink>,
     scheduling_active: AtomicBool,
 }
 
@@ -599,8 +609,24 @@ impl ExecutionCoordinator {
             cube_client,
             execution_runner,
             publisher,
+            dispatch_events: Arc::new(NoopDispatchEventSink::default()),
             scheduling_active: AtomicBool::new(false),
         }
+    }
+
+    /// Install a dispatch-event sink. The production engine threads
+    /// in a `JsonlFileSink` writing under the Boss state root; tests
+    /// pass a `RecordingDispatchEventSink` to assert on the stage
+    /// timeline.
+    pub fn set_dispatch_events(&mut self, sink: Arc<dyn DispatchEventSink>) {
+        self.dispatch_events = sink;
+    }
+
+    /// Builder-style equivalent for callers that construct the
+    /// coordinator inside an `Arc::new(...)` chain.
+    pub fn with_dispatch_events(mut self, sink: Arc<dyn DispatchEventSink>) -> Self {
+        self.dispatch_events = sink;
+        self
     }
 
     pub fn worker_pool(&self) -> WorkerPool {
@@ -669,6 +695,21 @@ impl ExecutionCoordinator {
                 break;
             };
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
+
+            // Stage 1: request_recorded — the execution row is ready
+            // and the scheduler has picked it up. This event closes
+            // the gap between "the row exists" and "the scheduler
+            // saw it" that the motivating incident lived in.
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::RequestRecorded, DispatchOutcome::Ok, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_details(serde_json::json!({
+                            "preferred_workspace_id": preferred_workspace_id,
+                        })),
+                )
+                .await;
+
             let Some(worker_id) = self
                 .worker_pool
                 .claim_worker(&execution.id, preferred_workspace_id.as_deref())
@@ -691,19 +732,44 @@ impl ExecutionCoordinator {
                 // have no running execution, surface the gap so the
                 // ghost-active state isn't silent — the human can
                 // compare against `bossctl agents list`.
-                if let Ok(orphans) = self.work_db.list_active_chores_without_live_run() {
-                    if !orphans.is_empty() {
-                        tracing::warn!(
-                            ghost_active = ?orphans,
-                            pool_capacity,
-                            "active chores without a running execution after pool exhaustion \
-                             — `boss chore list --status active` and `bossctl agents list` will \
-                             diverge until a slot frees up"
-                        );
-                    }
+                let orphans = self
+                    .work_db
+                    .list_active_chores_without_live_run()
+                    .unwrap_or_default();
+                if !orphans.is_empty() {
+                    tracing::warn!(
+                        ghost_active = ?orphans,
+                        pool_capacity,
+                        "active chores without a running execution after pool exhaustion \
+                         — `boss chore list --status active` and `bossctl agents list` will \
+                         diverge until a slot frees up"
+                    );
                 }
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::WorkerClaimed,
+                            DispatchOutcome::Skipped,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_details(serde_json::json!({
+                            "reason": "pool_exhausted",
+                            "pool_capacity": pool_capacity,
+                            "ghost_active": orphans,
+                        })),
+                    )
+                    .await;
                 break;
             };
+
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Ok, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(&worker_id),
+                )
+                .await;
 
             if let Err(err) = self.schedule_execution(&execution, &worker_id).await {
                 tracing::error!(
@@ -747,10 +813,37 @@ impl ExecutionCoordinator {
         {
             Ok(repo) => repo,
             Err(err) => {
-                self.record_start_failure(execution, worker_id, None, &err)?;
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::CubeRepoEnsured,
+                            DispatchOutcome::Error,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_error(&err),
+                    )
+                    .await;
+                self.record_start_failure(
+                    execution,
+                    worker_id,
+                    None,
+                    "cube_repo_ensure_failed",
+                    "Cube `repo ensure` failed",
+                    &err,
+                )?;
                 return Err(err);
             }
         };
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id),
+            )
+            .await;
 
         let lease = match self
             .cube_client
@@ -782,10 +875,44 @@ impl ExecutionCoordinator {
                     error = format!("{err:#}"),
                     "cube workspace lease failed; marking execution start as failed"
                 );
-                self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)?;
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::CubeWorkspaceLeased,
+                            DispatchOutcome::Error,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_error(&err),
+                    )
+                    .await;
+                self.record_start_failure(
+                    execution,
+                    worker_id,
+                    Some(repo.repo_id.as_str()),
+                    "cube_workspace_lease_failed",
+                    "Cube `workspace lease` failed",
+                    &err,
+                )?;
                 return Err(err);
             }
         };
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(
+                    Stage::CubeWorkspaceLeased,
+                    DispatchOutcome::Ok,
+                    &execution.id,
+                )
+                .with_work_item(&execution.work_item_id)
+                .with_worker(worker_id)
+                .with_cube_repo(&repo.repo_id)
+                .with_cube_lease(&lease.lease_id)
+                .with_cube_workspace(&lease.workspace_id),
+            )
+            .await;
         let change_title = execution_change_title(execution, &work_item);
         let change = match self
             .cube_client
@@ -802,10 +929,46 @@ impl ExecutionCoordinator {
                         "failed to release workspace after change creation failure"
                     );
                 }
-                self.record_start_failure(execution, worker_id, Some(repo.repo_id.as_str()), &err)?;
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::CubeChangeCreated,
+                            DispatchOutcome::Error,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_cube_lease(&lease.lease_id)
+                        .with_cube_workspace(&lease.workspace_id)
+                        .with_error(&err),
+                    )
+                    .await;
+                self.record_start_failure(
+                    execution,
+                    worker_id,
+                    Some(repo.repo_id.as_str()),
+                    "cube_change_create_failed",
+                    "Cube `change create` failed",
+                    &err,
+                )?;
                 return Err(err);
             }
         };
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_lease(&lease.lease_id)
+                    .with_cube_workspace(&lease.workspace_id)
+                    .with_details(serde_json::json!({
+                        "change_id": change.change_id,
+                        "change_title": change_title,
+                    })),
+            )
+            .await;
 
         match self.work_db.start_execution_run(
             &execution.id,
@@ -828,6 +991,19 @@ impl ExecutionCoordinator {
                     workspace_path = %lease.workspace_path.display(),
                     "started execution run"
                 );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::RunStarted, DispatchOutcome::Ok, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                            })),
+                    )
+                    .await;
                 self.publisher
                     .publish(
                         &execution.id,
@@ -866,6 +1042,29 @@ impl ExecutionCoordinator {
                         "failed to release workspace after run start failure"
                     );
                 }
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::RunStarted,
+                            DispatchOutcome::Error,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_cube_lease(&lease.lease_id)
+                        .with_cube_workspace(&lease.workspace_id)
+                        .with_error(&err),
+                    )
+                    .await;
+                self.record_start_failure(
+                    execution,
+                    worker_id,
+                    Some(repo.repo_id.as_str()),
+                    "execution_run_start_failed",
+                    "`start_execution_run` failed",
+                    &err,
+                )?;
                 Err(err)
             }
         }
@@ -876,6 +1075,8 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         worker_id: &str,
         cube_repo_id: Option<&str>,
+        attention_kind: &str,
+        attention_title: &str,
         error: &anyhow::Error,
     ) -> Result<()> {
         let (execution, run) = self.work_db.fail_execution_start(
@@ -891,6 +1092,39 @@ impl ExecutionCoordinator {
             error = %error,
             "recorded execution start failure"
         );
+
+        // The historical silent-release path: the execution row
+        // flipped to `failed` and the operator had nothing in
+        // `bossctl agents list` to chase. Surface every dispatch
+        // start failure as a `WorkAttentionItem` so the next failure
+        // is diagnosable in one bossctl call instead of needing a
+        // tracing-log tail.
+        let attention_body = format!(
+            "Execution `{execution_id}` could not start on worker `{worker_id}`.\n\n\
+             **Error:** {err}\n\n\
+             Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` for the full stage timeline.",
+            execution_id = execution.id,
+            err = format!("{error:#}"),
+        );
+        if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: execution.id.clone(),
+            kind: attention_kind.to_owned(),
+            status: None,
+            title: attention_title.to_owned(),
+            body_markdown: attention_body,
+            resolved_at: None,
+        }) {
+            // Attention-item insertion shouldn't fail the dispatch
+            // record path; if it does, just log it. The execution
+            // row is still marked `failed`, so the gap is at worst
+            // back to where we started.
+            tracing::error!(
+                ?attention_err,
+                execution_id = %execution.id,
+                "failed to record attention item for execution start failure",
+            );
+        }
+
         let publisher = self.publisher.clone();
         let execution_id = execution.id.clone();
         let work_item_id = execution.work_item_id.clone();
@@ -978,6 +1212,22 @@ impl ExecutionCoordinator {
                         "failed to record execution completion"
                     );
                 }
+                // Successful spawn → emit a structured `pane_spawned`
+                // event so consumers can pair it with the
+                // `cube_workspace_leased` event that preceded it and
+                // see the full timeline.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Ok, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                            })),
+                    )
+                    .await;
             }
             Err(err) => {
                 let released = match self.cube_client.release_workspace(&lease.lease_id).await {
@@ -995,6 +1245,37 @@ impl ExecutionCoordinator {
                 };
                 let error_text = err.to_string();
 
+                // Historical silent-release path: a pane-spawn
+                // failure (libghostty IPC drop, slot busy, prompt
+                // composition error) inside `run_execution` marked
+                // the run `failed` and released the lease without
+                // raising anything the operator could see. Attach a
+                // `WorkAttentionItem` to this run so the failure
+                // turns up in the kanban "Attention" lane and via
+                // `ListAttentionItems`. The structured event below
+                // gives tooling a parallel signal.
+                let attention = Some(CreateAttentionItemInput {
+                    execution_id: execution.id.clone(),
+                    kind: "pane_spawn_failed".to_owned(),
+                    status: None,
+                    title: "Worker pane failed to spawn".to_owned(),
+                    body_markdown: format!(
+                        "Execution `{exec_id}` leased workspace `{ws}` but the worker pane never came up.\n\n\
+                         **Error:** {err}\n\n\
+                         The lease was {release_state}. Inspect \
+                         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline.",
+                        exec_id = execution.id,
+                        ws = lease.workspace_id,
+                        err = format!("{err:#}"),
+                        release_state = if released {
+                            "released back to cube"
+                        } else {
+                            "still held by the engine (release failed — see the engine log)"
+                        },
+                    ),
+                    resolved_at: None,
+                });
+
                 match self.work_db.finish_execution_run(
                     &execution.id,
                     &run.id,
@@ -1003,7 +1284,7 @@ impl ExecutionCoordinator {
                     None,
                     Some(error_text.as_str()),
                     released,
-                    None,
+                    attention,
                 ) {
                     Ok((execution, _run, _)) => {
                         tracing::warn!(
@@ -1014,6 +1295,24 @@ impl ExecutionCoordinator {
                             released_workspace = released,
                             "execution run failed"
                         );
+                        self.dispatch_events
+                            .emit(
+                                DispatchEvent::new(
+                                    Stage::PaneSpawned,
+                                    DispatchOutcome::Error,
+                                    &execution.id,
+                                )
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(&worker_id)
+                                .with_cube_lease(&lease.lease_id)
+                                .with_cube_workspace(&lease.workspace_id)
+                                .with_error(&err)
+                                .with_details(serde_json::json!({
+                                    "run_id": run.id,
+                                    "released_workspace": released,
+                                })),
+                            )
+                            .await;
                         self.publisher
                             .publish(
                                 &execution.id,
@@ -1898,6 +2197,208 @@ mod tests {
                 })
                 .clone()
         }
+    }
+
+    /// Regression for the silent-release dispatch failure: when the
+    /// pane-spawn step inside `run_execution` fails — libghostty IPC
+    /// drop, prompt composition error, runner panic, all surface
+    /// here as `Err(_)` from `ExecutionRunner::run_execution` — the
+    /// coordinator MUST raise a `WorkAttentionItem` AND emit a
+    /// structured `pane_spawned` error event. Before this fix
+    /// landed, the run flipped to `failed` and the lease was
+    /// released, but nothing surfaced to `bossctl agents list` or
+    /// the kanban view; operators had nothing to chase. The
+    /// `RecordingDispatchEventSink` below asserts the stage timeline
+    /// reaches `pane_spawned: error`; the `list_attention_items`
+    /// assertion proves the WorkAttentionItem made it to disk.
+    #[tokio::test]
+    async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            fail: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+
+        // The execution went all the way through the lease + change
+        // creation. `rescan_active_dispatch_after_release` will
+        // re-queue the chore (pre-existing retry behavior, since
+        // `start_execution_run` flipped tasks.status to `active`
+        // before the spawn failed), so cube fakes may be invoked
+        // multiple times — pin only "at least once each".
+        assert!(!cube.lease_calls.lock().await.is_empty());
+        assert!(!cube.create_calls.lock().await.is_empty());
+        // The lease is released after the pane-spawn failure — before
+        // the fix, this release was the *only* observable signal that
+        // anything went wrong.
+        assert!(
+            cube.release_calls
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == "lease-1")
+        );
+
+        // Loud signal #1: the WorkAttentionItem is what surfaces in
+        // the kanban "Attention" lane and through `ListAttentionItems`.
+        // The exact count varies — once the run finishes_execution_run
+        // with `failed`, `rescan_active_dispatch_after_release` will
+        // see the chore is still in `active` status (auto-advanced
+        // when `start_execution_run` committed) and re-queue another
+        // ready execution, which fails again. That retry behavior is
+        // pre-existing; this test only pins the loud-failure contract:
+        // every failed pane spawn raises exactly one attention item.
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            !attention_items.is_empty(),
+            "pane-spawn failure must raise at least one attention item; got nothing",
+        );
+        let first = &attention_items[0];
+        assert_eq!(first.kind, "pane_spawn_failed");
+        assert!(
+            first.body_markdown.contains("worker pane never came up"),
+            "attention body should describe the failure mode; got {:?}",
+            first.body_markdown,
+        );
+        assert!(
+            first.body_markdown.contains("worker prompt failed"),
+            "attention body should include the original error; got {:?}",
+            first.body_markdown,
+        );
+
+        // Loud signal #2: a structured `pane_spawned: error` event in
+        // the dispatch stream, so external tooling can flag it
+        // without scanning tracing logs.
+        let events = recording.events_for(&execution_id).await;
+        let pane_event = events
+            .iter()
+            .find(|event| event.stage == "pane_spawned" && event.outcome == "error")
+            .unwrap_or_else(|| {
+                panic!("expected a pane_spawned:error event for {execution_id}; got {events:#?}")
+            });
+        assert!(
+            pane_event
+                .error_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("worker prompt failed")),
+            "pane_spawned event must include the underlying error; got {:?}",
+            pane_event.error_message,
+        );
+        // The stage timeline before the failure should also be
+        // visible — request_recorded, worker_claimed, cube stages,
+        // run_started — so an operator can confirm dispatch did get
+        // through every earlier handoff.
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        for expected in [
+            "request_recorded",
+            "worker_claimed",
+            "cube_repo_ensured",
+            "cube_workspace_leased",
+            "cube_change_created",
+            "run_started",
+            "pane_spawned",
+        ] {
+            assert!(
+                stages.contains(&expected),
+                "stage `{expected}` missing from dispatch timeline; got {stages:?}",
+            );
+        }
+    }
+
+    /// Cube lease failures also need the loud-failure contract: a
+    /// `WorkAttentionItem` AND a structured event. This pins both —
+    /// the older `lease_failure_logs_cube_stderr_at_error_before_recording_failure`
+    /// test only asserts the tracing log shape.
+    #[tokio::test]
+    async fn cube_lease_failure_raises_attention_item_and_dispatch_event() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease: true,
+            ..FakeCubeClient::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            attention_items.len(),
+            1,
+            "cube lease failure must raise exactly one attention item",
+        );
+        assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
+        assert!(attention_items[0]
+            .body_markdown
+            .contains("cube workspace lease failed"));
+
+        let events = recording.events_for(&execution_id).await;
+        let lease_event = events
+            .iter()
+            .find(|event| event.stage == "cube_workspace_leased")
+            .expect("cube_workspace_leased event missing");
+        assert_eq!(lease_event.outcome, "error");
+        // The timeline must NOT include later stages — dispatch
+        // bailed at the lease step.
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert!(!stages.contains(&"cube_change_created"));
+        assert!(!stages.contains(&"run_started"));
+        assert!(!stages.contains(&"pane_spawned"));
     }
 
     #[tokio::test]
