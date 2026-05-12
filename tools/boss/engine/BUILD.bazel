@@ -24,6 +24,7 @@ rust_library(
         "src/live_worker_state.rs",
         "src/merge_poller.rs",
         "src/pane_summary.rs",
+        "src/pr_auto_bind_poller.rs",
         "src/protocol.rs",
         "src/run_reconcile.rs",
         "src/runner.rs",
