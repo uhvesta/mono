@@ -67,8 +67,11 @@ struct ContentView: View {
         .task {
             model.startIfNeeded()
         }
+        // Agents has no sidebar, so the NavigationSplitView-injected toggle
+        // would be an orphan — suppress it when Agents is active.
+        .toolbar(removing: model.navigationMode == .agents ? .sidebarToggle : nil)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .navigation) {
                 Picker("Mode", selection: Binding(
                     get: { model.navigationMode },
                     set: { model.setNavigationMode($0) }
