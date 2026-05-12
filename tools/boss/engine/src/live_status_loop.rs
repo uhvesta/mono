@@ -44,9 +44,98 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::live_status;
+use crate::live_status::{self, SummarizerOutcome};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::transcript_tail::TranscriptTail;
+
+/// Per-slot diagnostic state captured by the trigger fan-in. The
+/// `bossctl live-status debug` verb reads this to give a one-shot view
+/// of the pipeline without log-diving — see the chore description for
+/// the field-by-field contract. Nothing in this struct is wired into
+/// the cooldown/retry logic; it's strictly for observability.
+#[derive(Debug, Clone, Default)]
+pub struct SlotDebugSnapshot {
+    /// Last trigger the per-slot loop received (any variant).
+    pub last_trigger_kind: Option<String>,
+    pub last_trigger_at_epoch_s: Option<i64>,
+    /// Outcome tag of the most recent summarizer call (the four
+    /// distinguishable cases from [`SummarizerOutcome::tag`]).
+    pub last_outcome_tag: Option<String>,
+    /// Human-readable detail for the most recent summarizer call.
+    pub last_outcome_detail: Option<String>,
+    pub last_outcome_at_epoch_s: Option<i64>,
+    /// Timestamp of the most recent `Success` outcome.
+    pub last_success_at_epoch_s: Option<i64>,
+    /// First 80 chars of the most recent successful summary text.
+    pub last_success_text: Option<String>,
+    /// Resolved transcript path the loop is tailing, or `None` if the
+    /// resolver has not returned a path yet.
+    pub transcript_path: Option<String>,
+    /// Bytes of redacted prompt text fed to the most recent
+    /// summarizer call. Helpful for telling "transcript is empty" from
+    /// "transcript is huge".
+    pub last_redacted_bytes: Option<usize>,
+    /// True if the disabled-slot toggle was active at the time of the
+    /// last loop iteration that observed it.
+    pub disabled: bool,
+}
+
+/// Manager-level diagnostic store. Mutated by per-slot tasks; read by
+/// the `live-status debug` RPC handler. Lives behind a single mutex
+/// shared by reference; per-slot writes are short and not on the hot
+/// path of any user-facing latency budget, so the contention cost is
+/// negligible.
+#[derive(Default)]
+pub struct LiveStatusDebugStore {
+    inner: StdMutex<HashMap<u8, SlotDebugSnapshot>>,
+}
+
+impl LiveStatusDebugStore {
+    pub fn snapshot_for(&self, slot_id: u8) -> SlotDebugSnapshot {
+        self.inner
+            .lock()
+            .expect("debug store mutex poisoned")
+            .get(&slot_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn snapshot_all(&self) -> HashMap<u8, SlotDebugSnapshot> {
+        self.inner
+            .lock()
+            .expect("debug store mutex poisoned")
+            .clone()
+    }
+
+    fn update<F: FnOnce(&mut SlotDebugSnapshot)>(&self, slot_id: u8, f: F) {
+        let mut guard = self.inner.lock().expect("debug store mutex poisoned");
+        let entry = guard.entry(slot_id).or_default();
+        f(entry);
+    }
+
+    fn forget(&self, slot_id: u8) {
+        self.inner
+            .lock()
+            .expect("debug store mutex poisoned")
+            .remove(&slot_id);
+    }
+}
+
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn trigger_kind(t: &Trigger) -> &'static str {
+    match t {
+        Trigger::Stop => "stop",
+        Trigger::PostToolUse => "post_tool_use",
+        Trigger::ActivityChanged(_) => "activity_changed",
+        Trigger::Shutdown => "shutdown",
+    }
+}
 
 /// Default PostToolUse counter modulus before a refresh is requested.
 const POST_TOOL_USE_K: u32 = 5;
@@ -117,6 +206,7 @@ struct SlotConfig {
     broadcaster: Arc<dyn LiveStatusBroadcaster>,
     resolver: Arc<dyn TranscriptPathResolver>,
     disabled: Arc<DisabledSlots>,
+    debug_store: Arc<LiveStatusDebugStore>,
 }
 
 /// Shared, lock-protected list of slots whose summarizer has been
@@ -168,6 +258,7 @@ impl DisabledSlots {
 pub struct LiveStatusManager {
     slots: StdMutex<HashMap<u8, SlotHandle>>,
     disabled: Arc<DisabledSlots>,
+    debug_store: Arc<LiveStatusDebugStore>,
 }
 
 impl Default for LiveStatusManager {
@@ -175,6 +266,7 @@ impl Default for LiveStatusManager {
         Self {
             slots: StdMutex::new(HashMap::new()),
             disabled: Arc::new(DisabledSlots::default()),
+            debug_store: Arc::new(LiveStatusDebugStore::default()),
         }
     }
 }
@@ -222,6 +314,29 @@ impl LiveStatusManager {
         self.disabled.snapshot()
     }
 
+    /// Shared handle to the diagnostic store. The `live-status debug`
+    /// RPC handler reads this; per-slot tasks already hold their own
+    /// clone via `SlotConfig`.
+    pub fn debug_store(&self) -> Arc<LiveStatusDebugStore> {
+        self.debug_store.clone()
+    }
+
+    /// Slot ids currently running a per-slot task. Distinct from
+    /// `disabled_snapshot()` — a slot can have a running task that is
+    /// also disabled, and both pieces of information are surfaced
+    /// separately in the debug verb.
+    pub fn active_slot_ids(&self) -> Vec<u8> {
+        let mut v: Vec<u8> = self
+            .slots
+            .lock()
+            .expect("manager mutex poisoned")
+            .keys()
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Spawn (or replace) the per-slot task. Idempotent in the
     /// re-spawn case: a slot whose prior task is still alive gets
     /// torn down first so we never have two summarizer loops racing
@@ -236,7 +351,23 @@ impl LiveStatusManager {
         resolver: Arc<dyn TranscriptPathResolver>,
     ) {
         self.stop_slot(slot_id);
+        tracing::info!(
+            slot_id,
+            run_id = %run_id,
+            has_api_key = api_key.is_some(),
+            "live_status: start_slot — spawning per-slot summarizer task",
+        );
         let (sender, receiver) = mpsc::unbounded_channel();
+        // Reset the diagnostic snapshot for this slot — the prior
+        // entry, if any, belongs to a previous run that just
+        // released. The disabled flag is sticky across re-spawns so
+        // it gets read from the live set on first iteration.
+        self.debug_store.update(slot_id, |snap| {
+            *snap = SlotDebugSnapshot {
+                disabled: self.disabled.is_disabled(slot_id),
+                ..SlotDebugSnapshot::default()
+            };
+        });
         let cfg = SlotConfig {
             slot_id,
             run_id,
@@ -245,6 +376,7 @@ impl LiveStatusManager {
             broadcaster,
             resolver,
             disabled: self.disabled.clone(),
+            debug_store: self.debug_store.clone(),
         };
         let join = tokio::spawn(run_slot_loop(cfg, receiver));
         let mut guard = self.slots.lock().expect("manager mutex poisoned");
@@ -265,6 +397,7 @@ impl LiveStatusManager {
             .expect("manager mutex poisoned")
             .remove(&slot_id);
         if let Some(mut h) = handle {
+            tracing::info!(slot_id, "live_status: stop_slot — tearing down per-slot task");
             // Best-effort: send Shutdown, then drop the sender so the
             // receiver returns None even if the task was holding the
             // sleep at the time.
@@ -275,19 +408,39 @@ impl LiveStatusManager {
             // it: a wedged Anthropic call must not block the release
             // path.
             let _ = h.join.take();
+            self.debug_store.forget(slot_id);
         }
     }
 
     /// Forward `trigger` to the task running `slot_id`. Returns
     /// `true` if the trigger was delivered, `false` if no task is
-    /// running for that slot (benign — events that arrive before
-    /// start_slot or after stop_slot are dropped).
+    /// running for that slot.
+    ///
+    /// A drop here used to be silent — one of the suspected silent-
+    /// failure modes the chore exists to surface. Now we log every
+    /// drop at `warn` with the slot/trigger so a hook event that
+    /// races ahead of `start_slot` (or arrives after `stop_slot`) is
+    /// visible in engine stderr.
     pub fn notify(&self, slot_id: u8, trigger: Trigger) -> bool {
+        let kind = trigger_kind(&trigger);
         let guard = self.slots.lock().expect("manager mutex poisoned");
         let Some(handle) = guard.get(&slot_id) else {
+            tracing::warn!(
+                slot_id,
+                trigger = kind,
+                "live_status: notify dropped — no per-slot task running for this slot",
+            );
             return false;
         };
-        handle.sender.send(trigger).is_ok()
+        let sent = handle.sender.send(trigger).is_ok();
+        if !sent {
+            tracing::warn!(
+                slot_id,
+                trigger = kind,
+                "live_status: notify dropped — receiver closed (slot task already exiting)",
+            );
+        }
+        sent
     }
 
     /// True iff the manager currently has a task for `slot_id`. Used
@@ -324,6 +477,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         broadcaster,
         resolver,
         disabled,
+        debug_store,
     } = cfg;
     let mut tail: Option<TranscriptTail> = None;
     let mut transcript_buffer: Vec<Value> = Vec::new();
@@ -337,13 +491,26 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // in `Working` and have a `last_success_at` to count against.
         // Outside of that, idle out the loop on the channel only.
         let timer_remaining = compute_timer_delay(last_activity, last_success_at, idle_since);
-        let trigger = tokio::select! {
+        let (trigger, synthetic) = tokio::select! {
             t = rx.recv() => match t {
-                Some(t) => t,
+                Some(t) => (t, false),
                 None => return,
             },
-            _ = tokio::time::sleep(timer_remaining) => Trigger::PostToolUse, // synthesise a tick
+            _ = tokio::time::sleep(timer_remaining) => (Trigger::PostToolUse, true),
         };
+
+        let kind = trigger_kind(&trigger);
+        tracing::debug!(
+            slot_id,
+            trigger = kind,
+            synthetic,
+            activity = last_activity.as_str(),
+            "live_status: slot loop received trigger",
+        );
+        debug_store.update(slot_id, |snap| {
+            snap.last_trigger_kind = Some(kind.to_owned());
+            snap.last_trigger_at_epoch_s = Some(epoch_now());
+        });
 
         match trigger {
             Trigger::Shutdown => return,
@@ -403,6 +570,11 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             last_activity,
             WorkerActivity::Spawning | WorkerActivity::Terminated
         ) {
+            tracing::debug!(
+                slot_id,
+                activity = last_activity.as_str(),
+                "live_status: skip — quiet activity state",
+            );
             continue;
         }
 
@@ -411,7 +583,15 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // pane_summary) and skip the model call until the toggle
         // flips back on. The toggle flip itself sends a wake-up
         // trigger so this branch fires within a tick of the change.
-        if disabled.is_disabled(slot_id) {
+        let disabled_now = disabled.is_disabled(slot_id);
+        debug_store.update(slot_id, |snap| {
+            snap.disabled = disabled_now;
+        });
+        if disabled_now {
+            tracing::info!(
+                slot_id,
+                "live_status: skip — slot disabled by per-slot toggle",
+            );
             if registry.set_live_status(slot_id, None) {
                 broadcaster.broadcast_live_worker_states().await;
             }
@@ -423,6 +603,11 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         if last_activity == WorkerActivity::Idle {
             if let Some(idle_at) = idle_since {
                 if idle_at.elapsed() >= IDLE_CLEAR_AFTER {
+                    tracing::info!(
+                        slot_id,
+                        idle_for_s = idle_at.elapsed().as_secs(),
+                        "live_status: clearing live_status — idle grace expired",
+                    );
                     if registry.set_live_status(slot_id, None) {
                         broadcaster.broadcast_live_worker_states().await;
                     }
@@ -439,7 +624,14 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // accumulates triggers during the `await`, and the loop
         // services them after each call.
         if let Some(at) = last_success_at {
-            if at.elapsed() < SUCCESS_COOLDOWN {
+            let elapsed = at.elapsed();
+            if elapsed < SUCCESS_COOLDOWN {
+                tracing::debug!(
+                    slot_id,
+                    cooldown_remaining_ms =
+                        SUCCESS_COOLDOWN.saturating_sub(elapsed).as_millis() as u64,
+                    "live_status: skip — within success cooldown",
+                );
                 continue;
             }
         }
@@ -448,17 +640,35 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // path is recorded on the WorkRun row some time after spawn).
         if tail.is_none() {
             if let Some(path) = resolver.transcript_path(&run_id).await {
+                let path_str = path.display().to_string();
+                tracing::info!(
+                    slot_id,
+                    run_id = %run_id,
+                    transcript_path = %path_str,
+                    "live_status: resolved transcript path; tail started",
+                );
+                debug_store.update(slot_id, |snap| {
+                    snap.transcript_path = Some(path_str);
+                });
                 tail = Some(TranscriptTail::new(path));
             } else {
-                tracing::debug!(slot_id, run_id, "live_status: no transcript path yet");
+                tracing::info!(
+                    slot_id,
+                    run_id = %run_id,
+                    "live_status: skip — no transcript path yet (work_runs row has NULL)",
+                );
                 continue;
             }
         }
 
         // Pull any new transcript content into the buffer.
+        let mut new_lines_count = 0usize;
         if let Some(t) = tail.as_mut() {
             match t.poll().await {
-                Ok(new_lines) => transcript_buffer.extend(new_lines),
+                Ok(new_lines) => {
+                    new_lines_count = new_lines.len();
+                    transcript_buffer.extend(new_lines);
+                }
                 Err(err) => {
                     tracing::warn!(slot_id, ?err, "live_status: transcript tail error");
                 }
@@ -469,22 +679,86 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             transcript_buffer.drain(0..drop_n);
         }
         if transcript_buffer.is_empty() {
-            // Nothing to summarize yet — don't burn a call.
+            tracing::debug!(
+                slot_id,
+                "live_status: skip — transcript buffer empty after poll",
+            );
             continue;
         }
 
-        let summary =
+        // Pre-compute the redacted payload bytes for the debug store
+        // — we'd rather pay this cost twice on the rare diagnostic
+        // path than thread the byte count out of the summarizer's
+        // private helper.
+        let redacted_bytes =
+            live_status::redact_and_assemble(&transcript_buffer).len();
+        debug_store.update(slot_id, |snap| {
+            snap.last_redacted_bytes = Some(redacted_bytes);
+        });
+        tracing::debug!(
+            slot_id,
+            buffer_lines = transcript_buffer.len(),
+            new_lines = new_lines_count,
+            redacted_bytes,
+            "live_status: calling summarizer",
+        );
+
+        let outcome =
             live_status::summarize_transcript(api_key.as_deref(), &transcript_buffer).await;
 
-        if let Some(text) = summary {
-            if registry.set_live_status(slot_id, Some(text)) {
-                broadcaster.broadcast_live_worker_states().await;
+        // Always update the debug store with the outcome so the
+        // verb can show "last attempt" even when the loop keeps
+        // retrying the same failure.
+        let outcome_tag = outcome.tag().to_owned();
+        let outcome_detail = outcome.detail();
+        let now_epoch = epoch_now();
+        debug_store.update(slot_id, |snap| {
+            snap.last_outcome_tag = Some(outcome_tag.clone());
+            snap.last_outcome_detail = Some(outcome_detail.clone());
+            snap.last_outcome_at_epoch_s = Some(now_epoch);
+        });
+        tracing::info!(
+            slot_id,
+            outcome = %outcome_tag,
+            detail = %outcome_detail,
+            "live_status: summarizer outcome",
+        );
+
+        match outcome {
+            SummarizerOutcome::Success(text) => {
+                let prior = registry.get(slot_id).and_then(|s| s.live_status);
+                let transition = match (&prior, &Some(text.clone())) {
+                    (None, Some(_)) => "none->some",
+                    (Some(p), Some(t)) if p == t => "some->some_same",
+                    (Some(_), Some(_)) => "some->some_diff",
+                    _ => "noop",
+                };
+                tracing::info!(
+                    slot_id,
+                    transition,
+                    summary_prefix = %text.chars().take(80).collect::<String>(),
+                    "live_status: set_live_status broadcasting",
+                );
+                let preview: String = text.chars().take(80).collect();
+                debug_store.update(slot_id, |snap| {
+                    snap.last_success_at_epoch_s = Some(now_epoch);
+                    snap.last_success_text = Some(preview);
+                });
+                if registry.set_live_status(slot_id, Some(text)) {
+                    broadcaster.broadcast_live_worker_states().await;
+                }
+                last_success_at = Some(Instant::now());
             }
-            last_success_at = Some(Instant::now());
+            // On any failure, deliberately do NOT advance
+            // last_success_at so the next tick can retry immediately
+            // and the staleness UI sees the stamp freeze. The outcome
+            // is already in the debug store + tracing above.
+            SummarizerOutcome::NoApiKey
+            | SummarizerOutcome::EmptyAfterRedaction
+            | SummarizerOutcome::ApiError { .. }
+            | SummarizerOutcome::Transport(_)
+            | SummarizerOutcome::PostFilterDropped => {}
         }
-        // On failure, deliberately do NOT advance last_success_at so
-        // the next tick can retry immediately and the staleness UI
-        // sees the stamp freeze.
     }
 }
 
@@ -728,6 +1002,67 @@ mod tests {
         mgr.set_initial_disabled_slots([1, 2, 3]);
         mgr.set_initial_disabled_slots([5]);
         assert_eq!(mgr.disabled_snapshot(), vec![5]);
+    }
+
+    #[test]
+    fn notify_returns_false_for_unknown_slot() {
+        // Hook events that arrive before `start_slot` (or after
+        // `stop_slot`) used to be silently dropped — one of the
+        // suspected silent-failure modes the chore exists to surface.
+        // The current implementation logs a `warn` on the drop; we
+        // still assert the return value so a future refactor can't
+        // accidentally swallow the false without us noticing.
+        let mgr = LiveStatusManager::new();
+        let delivered = mgr.notify(99, Trigger::Stop);
+        assert!(!delivered, "notify on a slot with no task must return false");
+    }
+
+    #[tokio::test]
+    async fn debug_store_records_last_trigger_kind() {
+        // The `bossctl live-status debug` verb reads
+        // `LiveStatusManager::debug_store()`. Confirm that a notify
+        // round-trips into the per-slot snapshot — without this, the
+        // verb would always report "no trigger received yet" even on
+        // an actively-running worker.
+        let mgr = LiveStatusManager::new();
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(7, "run-7", "claude-opus-4-7", 0, None);
+        let bc: Arc<dyn LiveStatusBroadcaster> =
+            Arc::new(CountingBroadcaster::default());
+        let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
+        mgr.start_slot(7, "run-7".into(), None, registry, bc, res);
+        mgr.notify(7, Trigger::Stop);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let snap = mgr.debug_store().snapshot_for(7);
+        assert_eq!(snap.last_trigger_kind.as_deref(), Some("stop"));
+        assert!(snap.last_trigger_at_epoch_s.is_some());
+        mgr.stop_slot(7);
+    }
+
+    #[test]
+    fn stop_slot_forgets_debug_snapshot() {
+        // The snapshot for a released slot must not leak into a
+        // subsequent re-spawn.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mgr = LiveStatusManager::new();
+            let registry = Arc::new(LiveWorkerStateRegistry::new());
+            registry.register_spawn(8, "run-8", "claude-opus-4-7", 0, None);
+            let bc: Arc<dyn LiveStatusBroadcaster> =
+                Arc::new(CountingBroadcaster::default());
+            let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
+            mgr.start_slot(8, "run-8".into(), None, registry, bc, res);
+            mgr.notify(8, Trigger::Stop);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(mgr.debug_store().snapshot_for(8).last_trigger_kind.is_some());
+            mgr.stop_slot(8);
+            // After stop_slot the snapshot is wiped.
+            let snap = mgr.debug_store().snapshot_for(8);
+            assert!(snap.last_trigger_kind.is_none());
+        });
     }
 
     #[tokio::test]

@@ -42,7 +42,6 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -89,28 +88,151 @@ pub const AWAITING_INPUT_LITERAL: &str = "awaiting input";
 /// Literal string written when `activity` flips to `Errored`.
 pub const ERRORED_LITERAL: &str = "errored — check logs";
 
+/// Distinguishable outcomes for one summarizer call. Returned by
+/// [`summarize_transcript`] so the trigger fan-in can both log the
+/// reason and surface it through the live-status debug verb. Previously
+/// every failure path returned `None`, which made it impossible to
+/// tell "missing API key" apart from "transcript empty after
+/// redaction" or "Anthropic returned 429" — all three look identical
+/// from the outside, all logged at `warn` at best, and all three are
+/// silent failure modes the chore wants observable.
+#[derive(Debug, Clone)]
+pub enum SummarizerOutcome {
+    /// Model returned a one-sentence summary that passed the post-filter.
+    /// Caller writes this to `live_status`.
+    Success(String),
+    /// `api_key` was `None`. The engine started without an
+    /// `ANTHROPIC_API_KEY`, so no summarizer call can ever succeed.
+    /// The trigger fan-in surfaces this through the debug verb and
+    /// (one-time, at startup) logs at `error` so the user notices.
+    NoApiKey,
+    /// Transcript tail had content but every entry was deny-listed or
+    /// fully redacted. Benign — happens early in a worker's life or
+    /// when the transcript is dominated by tool reads of secret files.
+    EmptyAfterRedaction,
+    /// Anthropic returned a non-2xx response. `status` is the numeric
+    /// code (e.g. 401, 429, 529). `snippet` is the first ~120 chars of
+    /// the response body, with secret-pattern redaction applied so a
+    /// rogue error message can't leak credentials into the log.
+    ApiError { status: u16, snippet: String },
+    /// The HTTP client failed before getting a response (timeout, TLS
+    /// handshake failure, DNS, connection reset).
+    Transport(String),
+    /// The model replied but the post-filter dropped the result —
+    /// either fully-redacted or empty after trim. Caller keeps prior.
+    PostFilterDropped,
+}
+
+impl SummarizerOutcome {
+    /// The short tag rendered in logs and in the debug verb output —
+    /// matches the names the chore enumerates.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SummarizerOutcome::Success(_) => "success",
+            SummarizerOutcome::NoApiKey => "no_api_key",
+            SummarizerOutcome::EmptyAfterRedaction => "empty_after_redaction",
+            SummarizerOutcome::ApiError { .. } => "api_error",
+            SummarizerOutcome::Transport(_) => "transport_error",
+            SummarizerOutcome::PostFilterDropped => "post_filter_dropped",
+        }
+    }
+
+    /// Human-readable detail for the debug verb. Returned alongside
+    /// `tag` so a JSON consumer can pick the structured tag and still
+    /// render the verbose form.
+    pub fn detail(&self) -> String {
+        match self {
+            SummarizerOutcome::Success(text) => {
+                // First 80 chars so the verb output stays single-line.
+                let clip: String = text.chars().take(80).collect();
+                if clip.len() < text.len() {
+                    format!("{clip}…")
+                } else {
+                    clip
+                }
+            }
+            SummarizerOutcome::NoApiKey => {
+                "ANTHROPIC_API_KEY not configured on the engine".to_owned()
+            }
+            SummarizerOutcome::EmptyAfterRedaction => {
+                "transcript empty after deny-list + secret-pattern redaction".to_owned()
+            }
+            SummarizerOutcome::ApiError { status, snippet } => {
+                format!("anthropic returned {status}: {snippet}")
+            }
+            SummarizerOutcome::Transport(err) => err.clone(),
+            SummarizerOutcome::PostFilterDropped => {
+                "model reply rejected by post-filter (empty / mostly redacted)".to_owned()
+            }
+        }
+    }
+}
+
 /// Top-level entry: redact `transcript_lines`, build a prompt, call
-/// the model, post-filter the response. Returns `None` on any
-/// failure path (no api key, transcript empty after redaction, API
-/// error, mostly-redacted output). The caller (PR 5's trigger
-/// fan-in) keeps the prior `live_status` in that case.
+/// the model, post-filter the response. Returns a typed outcome so
+/// the trigger fan-in can distinguish "no api key" from "model 429"
+/// from "transcript empty after redaction" — see [`SummarizerOutcome`].
+///
+/// The caller keeps the prior `live_status` value on every non-success
+/// outcome.
 pub async fn summarize_transcript(
     api_key: Option<&str>,
     transcript_lines: &[Value],
-) -> Option<String> {
-    let api_key = api_key?;
+) -> SummarizerOutcome {
+    let Some(api_key) = api_key else {
+        tracing::error!(
+            "live_status: summarizer skipped — ANTHROPIC_API_KEY not configured",
+        );
+        return SummarizerOutcome::NoApiKey;
+    };
     let redacted = redact_and_assemble(transcript_lines);
     if redacted.trim().is_empty() {
         tracing::debug!("live_status: transcript empty after redaction");
-        return None;
+        return SummarizerOutcome::EmptyAfterRedaction;
     }
     match claude_one_sentence(api_key, &redacted).await {
-        Ok(summary) => Some(summary),
-        Err(err) => {
-            tracing::warn!(?err, "live_status: summarizer call failed");
-            None
+        Ok(ClaudeReply::Success(summary)) => SummarizerOutcome::Success(summary),
+        Ok(ClaudeReply::PostFilterDropped) => {
+            tracing::warn!(
+                "live_status: post-filter dropped the model reply",
+            );
+            SummarizerOutcome::PostFilterDropped
+        }
+        Err(SummarizerCallError::Api { status, body }) => {
+            // Redact the body before logging so an error response
+            // containing the key (some Anthropic 401 bodies echo
+            // headers) can't leak into engine stderr.
+            let snippet = live_status_redact::redact_text(&clip_str(&body, 120));
+            tracing::error!(
+                status,
+                snippet = %snippet,
+                "live_status: anthropic returned non-2xx",
+            );
+            SummarizerOutcome::ApiError { status, snippet }
+        }
+        Err(SummarizerCallError::Transport(err)) => {
+            let msg = err.to_string();
+            tracing::error!(err = %msg, "live_status: transport error");
+            SummarizerOutcome::Transport(msg)
+        }
+        Err(SummarizerCallError::Decode(err)) => {
+            let msg = err.to_string();
+            tracing::error!(err = %msg, "live_status: failed to decode anthropic response");
+            SummarizerOutcome::Transport(msg)
         }
     }
+}
+
+fn clip_str(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.len() + c.len_utf8() > max {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Apply [`live_status_redact`] to a transcript tail and assemble the
@@ -321,9 +443,39 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-/// Hit Anthropic with a one-sentence ask. Errors are bucketed into
-/// `anyhow` — the caller turns any error into "keep prior".
-pub async fn claude_one_sentence(api_key: &str, transcript: &str) -> Result<String> {
+/// Internal reply shape from [`claude_one_sentence`]. Success carries
+/// the cleaned summary; `PostFilterDropped` distinguishes "Anthropic
+/// returned a response but the post-filter rejected it" from any
+/// transport-level error.
+pub enum ClaudeReply {
+    Success(String),
+    PostFilterDropped,
+}
+
+/// Structured error variants for [`claude_one_sentence`]. The caller
+/// (`summarize_transcript`) maps each into the matching
+/// [`SummarizerOutcome`] for logging + the debug verb. We avoid
+/// `anyhow::Error` here because the surface needs to distinguish
+/// "model 429" from "TLS handshake failed" — the chore explicitly
+/// asks for these to be distinct outcomes.
+#[derive(Debug, thiserror::Error)]
+pub enum SummarizerCallError {
+    #[error("anthropic returned {status}: {body}")]
+    Api { status: u16, body: String },
+    #[error(transparent)]
+    Transport(#[from] reqwest::Error),
+    #[error("failed to decode anthropic response: {0}")]
+    Decode(String),
+}
+
+/// Hit Anthropic with a one-sentence ask. Returns a structured outcome
+/// so the caller can bucket success vs. API error vs. transport error
+/// vs. post-filter-dropped; the previous `anyhow::Result<String>` shape
+/// erased the distinction the live-status debug verb needs.
+pub async fn claude_one_sentence(
+    api_key: &str,
+    transcript: &str,
+) -> std::result::Result<ClaudeReply, SummarizerCallError> {
     let client = http_client();
     let (system, user) = build_messages(transcript);
     let body = ClaudeRequest {
@@ -344,11 +496,14 @@ pub async fn claude_one_sentence(api_key: &str, transcript: &str) -> Result<Stri
         .send()
         .await?;
     if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("anthropic returned {status}: {text}");
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SummarizerCallError::Api { status, body });
     }
-    let parsed: ClaudeResponse = resp.json().await?;
+    let parsed: ClaudeResponse = resp
+        .json()
+        .await
+        .map_err(|err| SummarizerCallError::Decode(err.to_string()))?;
     let raw = parsed
         .content
         .into_iter()
@@ -357,9 +512,9 @@ pub async fn claude_one_sentence(api_key: &str, transcript: &str) -> Result<Stri
         .unwrap_or_default();
     let cleaned = clean_summary(&raw);
     if cleaned.is_empty() {
-        anyhow::bail!("anthropic returned an empty summary");
+        return Ok(ClaudeReply::PostFilterDropped);
     }
-    Ok(cleaned)
+    Ok(ClaudeReply::Success(cleaned))
 }
 
 /// Post-process the model reply: trim whitespace and quotes, drop a
@@ -518,22 +673,61 @@ mod tests {
     }
 
     #[test]
-    fn summarize_transcript_returns_none_without_api_key() {
+    fn summarize_transcript_reports_no_api_key() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(summarize_transcript(None, &[]));
-        assert!(result.is_none());
+        assert!(matches!(result, SummarizerOutcome::NoApiKey));
+        assert_eq!(result.tag(), "no_api_key");
     }
 
     #[tokio::test]
-    async fn summarize_transcript_returns_none_when_transcript_empty_after_redaction() {
-        let lines = vec![assistant_tool_use(
-            "Read",
-            json!({"file_path": "/Users/x/.ssh/id_rsa"}),
-        )];
-        // Even with an api key, redaction strips the only entry, so
-        // we should bail out before calling the model.
+    async fn summarize_transcript_reports_empty_after_redaction() {
+        // Use the *exact* shape the redactor's `should_drop_entry`
+        // matches — a top-level `content` array. The
+        // `assistant_tool_use` helper wraps content under `message`,
+        // which `should_drop_entry` does not currently walk into.
+        // That coverage gap is its own bug; the chore explicitly
+        // asks us not to fix it here, only to surface it via
+        // observability (the per-slot debug verb will show
+        // `last_outcome=success` even when the redactor missed). For
+        // this test we use a deliberately-redactor-recognised fixture
+        // so the EmptyAfterRedaction branch is exercised end-to-end
+        // without depending on an outbound HTTP call.
+        let lines = vec![serde_json::json!({
+            "type": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"file_path": "/Users/x/.ssh/id_rsa"},
+            }],
+        })];
         let result = summarize_transcript(Some("key"), &lines).await;
-        assert!(result.is_none());
+        assert!(
+            matches!(result, SummarizerOutcome::EmptyAfterRedaction),
+            "outcome was {:?}",
+            result
+        );
+        assert_eq!(result.tag(), "empty_after_redaction");
+    }
+
+    #[test]
+    fn summarizer_outcome_tag_strings_match_chore_spec() {
+        // The chore's debug-verb contract names these four outcomes
+        // explicitly: success / no_api_key / api_error / empty_after_redaction.
+        // The strings are part of the public-facing JSON, so pin them.
+        assert_eq!(
+            SummarizerOutcome::Success("running tests".into()).tag(),
+            "success"
+        );
+        assert_eq!(SummarizerOutcome::NoApiKey.tag(), "no_api_key");
+        assert_eq!(
+            SummarizerOutcome::ApiError { status: 429, snippet: "rate limited".into() }.tag(),
+            "api_error"
+        );
+        assert_eq!(
+            SummarizerOutcome::EmptyAfterRedaction.tag(),
+            "empty_after_redaction"
+        );
     }
 
     #[tokio::test]

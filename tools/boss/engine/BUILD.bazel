@@ -7,6 +7,7 @@ rust_library(
     srcs = [
         "src/app.rs",
         "src/audit.rs",
+        "src/build_info.rs",
         "src/cli.rs",
         "src/completion.rs",
         "src/config.rs",

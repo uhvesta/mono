@@ -1,5 +1,6 @@
 pub mod app;
 pub mod audit;
+pub mod build_info;
 pub mod cli;
 pub mod completion;
 pub mod config;
