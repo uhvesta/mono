@@ -4303,12 +4303,29 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::ResolveProjectDesignDoc { project_id } => {
-                let leased_repos: HashSet<String> = work_db
+                // Build a (repo_remote_url -> workspace_path) lookup so the
+                // resolver can hand the open dispatcher an absolute
+                // workspace path for `$EDITOR` / renderer fast-path.
+                // First-match wins when multiple workspaces lease the
+                // same repo — any of them resolves the file equally well.
+                let leased_repo_paths: HashMap<String, String> = work_db
                     .list_in_flight_executions()
-                    .map(|execs| execs.into_iter().map(|e| e.repo_remote_url).collect())
+                    .map(|execs| {
+                        let mut map = HashMap::new();
+                        for exec in execs {
+                            if let Some(path) = exec.workspace_path
+                                && !map.contains_key(&exec.repo_remote_url)
+                            {
+                                map.insert(exec.repo_remote_url, path);
+                            }
+                        }
+                        map
+                    })
                     .unwrap_or_default();
                 match work_db
-                    .resolve_project_design_doc(&project_id, |repo| leased_repos.contains(repo))
+                    .resolve_project_design_doc(&project_id, |repo| {
+                        leased_repo_paths.get(repo).cloned()
+                    })
                 {
                     Ok(output) => send_response(
                         &sink,

@@ -1639,7 +1639,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
     match resolved.state {
         ProjectDesignDocState::Resolved {
             resolved,
-            local_workspace_available,
+            workspace_path,
             web_url,
         } => {
             assert_eq!(resolved.repo_remote_url, "git@github.com:spinyfin/mono.git");
@@ -1652,9 +1652,9 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
                 },
             );
             // No worker has leased a workspace in this test process,
-            // so `local_workspace_available` is `false` — matches the
-            // engine-side closure that queries in-flight executions.
-            assert!(!local_workspace_available);
+            // so `workspace_path` is `None` — matches the engine-side
+            // closure that queries in-flight executions.
+            assert!(workspace_path.is_none());
             assert!(
                 web_url.contains("spinyfin/mono"),
                 "web_url should reference the resolved repo: {web_url}",

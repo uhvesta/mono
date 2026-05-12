@@ -3983,7 +3983,7 @@ fn decide_open_design_action(
         ))),
         ProjectDesignDocState::Resolved {
             resolved,
-            local_workspace_available,
+            workspace_path,
             web_url,
         } => {
             if force_web {
@@ -3995,7 +3995,7 @@ fn decide_open_design_action(
                 resolved.kind,
                 ResolvedDesignDocKind::SameProduct { .. }
                     | ResolvedDesignDocKind::OtherProduct { .. },
-            ) && *local_workspace_available;
+            ) && workspace_path.is_some();
             if can_use_filesystem {
                 Ok(OpenDesignAction::LocalFile {
                     path: PathBuf::from(&resolved.path),
@@ -4694,7 +4694,8 @@ mod tests {
                 path: "tools/boss/docs/designs/foo.md".to_owned(),
                 kind,
             },
-            local_workspace_available: local,
+            workspace_path: local
+                .then(|| "/tmp/mono-agent-007".to_owned()),
             web_url: "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/foo.md"
                 .to_owned(),
         }

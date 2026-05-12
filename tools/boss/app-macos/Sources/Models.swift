@@ -144,9 +144,16 @@ struct ResolvedDesignDoc: Codable, Hashable {
 /// the UI affordance: `.notSet` hides the icon, `.resolved` shows a
 /// clickable doc icon (with a tooltip rendered from `webURL`), and
 /// `.broken` shows a warning glyph that opens the re-point form.
+///
+/// On `.resolved`, `workspacePath` is the absolute path of a cube
+/// workspace currently leased for the resolved repo (or `nil` when
+/// none is leased). The open dispatcher uses it to fast-path
+/// `$EDITOR` / the in-app renderer onto the workspace file system
+/// when the kind is same- or other-product; absence falls back to
+/// the GitHub web URL.
 enum ProjectDesignDocState: Hashable {
     case notSet
-    case resolved(resolved: ResolvedDesignDoc, localWorkspaceAvailable: Bool, webURL: String)
+    case resolved(resolved: ResolvedDesignDoc, workspacePath: String?, webURL: String)
     case broken(reason: String)
 }
 
@@ -154,7 +161,7 @@ extension ProjectDesignDocState: Codable {
     enum CodingKeys: String, CodingKey {
         case type
         case resolved
-        case localWorkspaceAvailable = "local_workspace_available"
+        case workspacePath = "workspace_path"
         case webURL = "web_url"
         case reason
     }
@@ -168,7 +175,7 @@ extension ProjectDesignDocState: Codable {
         case "resolved":
             self = .resolved(
                 resolved: try container.decode(ResolvedDesignDoc.self, forKey: .resolved),
-                localWorkspaceAvailable: try container.decode(Bool.self, forKey: .localWorkspaceAvailable),
+                workspacePath: try container.decodeIfPresent(String.self, forKey: .workspacePath),
                 webURL: try container.decode(String.self, forKey: .webURL)
             )
         case "broken":
@@ -187,10 +194,10 @@ extension ProjectDesignDocState: Codable {
         switch self {
         case .notSet:
             try container.encode("not_set", forKey: .type)
-        case .resolved(let resolved, let localWorkspaceAvailable, let webURL):
+        case .resolved(let resolved, let workspacePath, let webURL):
             try container.encode("resolved", forKey: .type)
             try container.encode(resolved, forKey: .resolved)
-            try container.encode(localWorkspaceAvailable, forKey: .localWorkspaceAvailable)
+            try container.encodeIfPresent(workspacePath, forKey: .workspacePath)
             try container.encode(webURL, forKey: .webURL)
         case .broken(let reason):
             try container.encode("broken", forKey: .type)

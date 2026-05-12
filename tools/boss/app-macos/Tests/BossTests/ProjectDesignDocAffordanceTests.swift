@@ -31,7 +31,7 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 path: "tools/boss/docs/designs/x.md",
                 kind: .sameProduct(productID: "prod_1")
             ),
-            localWorkspaceAvailable: true,
+            workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
             webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
         )
         let presentation = ProjectDesignDocAffordancePresentation.from(state: state)
@@ -54,7 +54,7 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 path: "docs/x.md",
                 kind: .external
             ),
-            localWorkspaceAvailable: false,
+            workspacePath: nil,
             webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
         )
         XCTAssertEqual(
@@ -95,15 +95,74 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         XCTAssertNil(model.workErrorMessage)
     }
 
-    /// `.resolved` routes the engine-built web URL through
-    /// `ChatViewModel.urlOpener`. The production default hands it to
-    /// `NSWorkspace.shared.open`, which would pop the user's browser
-    /// during `swift test`; the stub here captures the URL instead so
-    /// the test can both (a) assert the dispatcher fired the opener
-    /// with the right URL, and (b) guarantee no real opener call leaks
-    /// into the dev loop. The (resolved-but-unparseable) fallback case
-    /// is covered in [[testOpenOnResolvedWithUnparseableURLSurfacesError]].
-    func testOpenOnResolvedDoesNotSetErrorMessage() {
+    /// `.resolved` with a same-product kind and a leased cube workspace
+    /// hands the open dispatcher a `file://` URL that points at the
+    /// resolved doc inside that workspace, **not** the GitHub web URL.
+    /// This is the "open in `$EDITOR` / OS-registered .md handler"
+    /// fast path from design Q3 (the table row `SameProduct + workspace
+    /// available`). The stub captures the URL so the test asserts (a)
+    /// the dispatcher chose the local file branch and (b) the path
+    /// composition is `workspacePath/resolved.path`.
+    func testOpenOnResolvedSameProductWithWorkspaceOpensLocalFile() {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+        let workspacePath = "/Users/me/Documents/dev/workspaces/mono-agent-007"
+        var openedURLs: [URL] = []
+        model.urlOpener = { openedURLs.append($0) }
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "tools/boss/docs/designs/x.md",
+                kind: .sameProduct(productID: project.productID)
+            ),
+            workspacePath: workspacePath,
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+        )
+        model.openProjectDesignDoc(project)
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertEqual(openedURLs.count, 1)
+        let opened = openedURLs.first!
+        XCTAssertTrue(opened.isFileURL, "expected a file:// URL, got \(opened)")
+        XCTAssertEqual(
+            opened.path,
+            "\(workspacePath)/tools/boss/docs/designs/x.md"
+        )
+    }
+
+    /// Other-product pointers with a leased workspace get the same
+    /// fast path as same-product pointers — cube has the repo, the
+    /// renderer / `$EDITOR` can read it directly. Design Q3's table
+    /// row `OtherProduct + workspace available` mirrors `SameProduct`.
+    func testOpenOnResolvedOtherProductWithWorkspaceOpensLocalFile() {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+        let workspacePath = "/Users/me/Documents/dev/workspaces/wiki-agent-001"
+        var openedURLs: [URL] = []
+        model.urlOpener = { openedURLs.append($0) }
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/myorg/wiki.git",
+                branch: "main",
+                path: "designs/x.md",
+                kind: .otherProduct(productID: "prod_wiki")
+            ),
+            workspacePath: workspacePath,
+            webURL: "https://github.com/myorg/wiki/blob/main/designs/x.md"
+        )
+        model.openProjectDesignDoc(project)
+        XCTAssertEqual(openedURLs.count, 1)
+        let opened = openedURLs.first!
+        XCTAssertTrue(opened.isFileURL)
+        XCTAssertEqual(opened.path, "\(workspacePath)/designs/x.md")
+    }
+
+    /// Same-product pointer but no workspace leased → fall back to
+    /// the web URL. Design Q3's table row `SameProduct + workspace
+    /// unavailable` is identical to `External` in terms of open
+    /// target. The stub asserts the dispatcher routed the engine's
+    /// pre-rendered `web_url`, not a fabricated local path.
+    func testOpenOnResolvedSameProductWithoutWorkspaceFallsBackToWebURL() {
         let model = makeModelWithProject()
         let project = model.projectsByProductID.values.first!.first!
         let webURL = "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
@@ -116,11 +175,38 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 path: "tools/boss/docs/designs/x.md",
                 kind: .sameProduct(productID: project.productID)
             ),
-            localWorkspaceAvailable: true,
+            workspacePath: nil,
             webURL: webURL
         )
         model.openProjectDesignDoc(project)
         XCTAssertNil(model.workErrorMessage)
+        XCTAssertEqual(openedURLs.map(\.absoluteString), [webURL])
+    }
+
+    /// External pointers always open the web URL, even if a workspace
+    /// for the same repo happens to be leased — Boss doesn't track
+    /// the repo as a Product so the kanban can't promise the editor
+    /// will land in the right place. (In practice the engine returns
+    /// `workspace_path = nil` for `.external` anyway because the repo
+    /// isn't on any product, but the dispatcher must hold the line if
+    /// that invariant ever drifts.)
+    func testOpenOnResolvedExternalAlwaysFallsBackToWebURL() {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+        let webURL = "https://github.com/foo/bar/blob/main/x.md"
+        var openedURLs: [URL] = []
+        model.urlOpener = { openedURLs.append($0) }
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "x.md",
+                kind: .external
+            ),
+            workspacePath: "/tmp/should-be-ignored",
+            webURL: webURL
+        )
+        model.openProjectDesignDoc(project)
         XCTAssertEqual(openedURLs.map(\.absoluteString), [webURL])
     }
 
@@ -137,7 +223,7 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 path: "x.md",
                 kind: .external
             ),
-            localWorkspaceAvailable: false,
+            workspacePath: nil,
             webURL: ""
         )
         model.openProjectDesignDoc(project)
@@ -176,7 +262,7 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                     path: "docs/x.md",
                     kind: .sameProduct(productID: project.productID)
                 ),
-                localWorkspaceAvailable: true,
+                workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
                 webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
             )
         )
