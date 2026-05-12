@@ -40,6 +40,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         self.window = window
         NSApp.activate(ignoringOtherApps: true)
+
+        DispatchEventsWindowController.shared.restoreIfNeeded()
+    }
+
+    @objc func toggleDispatchEventsViewer(_ sender: Any?) {
+        DispatchEventsWindowController.shared.toggle()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -87,6 +93,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
+
+        let debugMenuItem = NSMenuItem()
+        let debugMenu = NSMenu(title: "Debug")
+        let dispatchItem = debugMenu.addItem(
+            withTitle: "Dispatch Events",
+            action: #selector(AppDelegate.toggleDispatchEventsViewer(_:)),
+            keyEquivalent: "d"
+        )
+        dispatchItem.keyEquivalentModifierMask = [.command, .shift]
+        dispatchItem.target = self
+        debugMenuItem.submenu = debugMenu
+        mainMenu.addItem(debugMenuItem)
 
         NSApp.mainMenu = mainMenu
     }
