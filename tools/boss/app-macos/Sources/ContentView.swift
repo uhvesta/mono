@@ -169,6 +169,12 @@ struct ContentView: View {
     private var sidebar: some View {
         workSidebar
             .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 360)
+            .overlay(alignment: .trailing) {
+                // Cursor feedback only; native NSSplitView splitter handles drag.
+                Color.clear
+                    .frame(width: 6)
+                    .pointerStyle(.frameResize(position: .trailing))
+            }
     }
 
     private var detail: some View {
