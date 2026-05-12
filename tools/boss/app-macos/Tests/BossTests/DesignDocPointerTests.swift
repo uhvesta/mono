@@ -99,11 +99,37 @@ final class DesignDocPointerCodableTests: XCTestCase {
                 path: "docs/x.md",
                 kind: .sameProduct(productID: "prod_1")
             ),
-            localWorkspaceAvailable: true,
+            workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
             webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
         )
         let back = try roundtrip(state)
         XCTAssertEqual(back, state)
+    }
+
+    /// The engine omits `workspace_path` from the wire JSON when no
+    /// workspace is leased for the resolved repo (serde's
+    /// `skip_serializing_if = "Option::is_none"`). The Swift decoder
+    /// must accept that shape too — otherwise every project without a
+    /// leased workspace would 422 on the kanban side.
+    func testProjectDesignDocStateResolvedDecodesWithoutWorkspacePath() throws {
+        let wire = """
+        {
+          "type": "resolved",
+          "resolved": {
+            "repo_remote_url": "https://github.com/foo/bar.git",
+            "branch": "main",
+            "path": "docs/x.md",
+            "kind": {"type": "external"}
+          },
+          "web_url": "https://github.com/foo/bar/blob/main/docs/x.md"
+        }
+        """
+        let state = try decoder.decode(ProjectDesignDocState.self, from: Data(wire.utf8))
+        if case let .resolved(_, workspacePath, _) = state {
+            XCTAssertNil(workspacePath)
+        } else {
+            XCTFail("expected .resolved, got \(state)")
+        }
     }
 
     func testProjectDesignDocStateBrokenRoundtrip() throws {
@@ -122,7 +148,7 @@ final class DesignDocPointerCodableTests: XCTestCase {
                     path: "docs/x.md",
                     kind: .external
                 ),
-                localWorkspaceAvailable: false,
+                workspacePath: nil,
                 webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
             )
         )

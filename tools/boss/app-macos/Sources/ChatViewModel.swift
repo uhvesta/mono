@@ -802,12 +802,14 @@ final class ChatViewModel: ObservableObject {
     /// - `.broken` — surface the engine's reason as a work error so
     ///   the user can re-point. The renderer / re-point sheet are
     ///   tracked separately (design Q5 / Q9).
-    /// - `.resolved` — open the GitHub web URL. The in-app renderer
-    ///   for project pointers is a follow-up (Q9 — `case .projectPointer`
-    ///   on `DesignRendererView` lands once `design-producing-tasks`
-    ///   ships its renderer); until then the web URL is the universal
-    ///   fast path, and the kind discriminator stays load-bearing for
-    ///   when the renderer arrives.
+    /// - `.resolved` — same/other-product pointers with a leased cube
+    ///   workspace open the file directly on disk (the design's
+    ///   `$EDITOR` fast path, routed through `NSWorkspace` so the
+    ///   user's registered `.md` handler wins — `Q9` reuse of the
+    ///   in-app renderer is a follow-up once `design-producing-tasks`
+    ///   ships its renderer). Everything else — external pointers, or
+    ///   same/other-product pointers without a leased workspace —
+    ///   falls through to the GitHub web URL.
     func openProjectDesignDoc(_ project: WorkProject) {
         let state = designDocStateByProjectID[project.id] ?? .notSet
         switch state {
@@ -815,12 +817,32 @@ final class ChatViewModel: ObservableObject {
             return
         case .broken(let reason):
             workErrorMessage = "Design doc pointer is broken: \(reason)"
-        case .resolved(_, _, let webURL):
+        case .resolved(let resolved, let workspacePath, let webURL):
+            if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind) {
+                let absolute = (workspacePath as NSString)
+                    .appendingPathComponent(resolved.path)
+                urlOpener(URL(fileURLWithPath: absolute))
+                return
+            }
             guard let url = URL(string: webURL) else {
                 workErrorMessage = "Design doc URL could not be parsed: \(webURL)"
                 return
             }
             urlOpener(url)
+        }
+    }
+
+    /// Kanban open-affordance fast-path predicate: a `ResolvedDesignDocKind`
+    /// is editor-eligible exactly when the doc lives in a repo Boss
+    /// tracks as a Product (same- or other-product). External pointers
+    /// always fall through to the web URL because cube can't lease
+    /// untracked repos.
+    private func isWorkspaceFastPathEligible(kind: ResolvedDesignDocKind) -> Bool {
+        switch kind {
+        case .sameProduct, .otherProduct:
+            return true
+        case .external:
+            return false
         }
     }
 

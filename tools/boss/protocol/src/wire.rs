@@ -384,7 +384,7 @@ pub enum FrontendRequest {
     /// Engine-side this is `WorkDb::resolve_project_design_doc`
     /// composed with a cheap check against the engine's in-flight
     /// execution list to populate
-    /// [`ProjectDesignDocState::Resolved::local_workspace_available`].
+    /// [`ProjectDesignDocState::Resolved::workspace_path`].
     /// No DB writes; no topic events.
     ResolveProjectDesignDoc { project_id: String },
     /// Worker-facing escape hatch for the merge-conflict resolution

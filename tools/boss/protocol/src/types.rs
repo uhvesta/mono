@@ -806,15 +806,20 @@ pub enum ProjectDesignDocState {
     /// affordance entirely.
     NotSet,
     /// The pointer resolved cleanly. Carries the structured triple,
-    /// a hint about whether cube currently has a workspace leased for
-    /// the resolved repo (so the open dispatcher can pick the
-    /// filesystem fast path), and a pre-rendered GitHub web URL for
-    /// the kanban tooltip / right-click "copy link."
+    /// the absolute path of a leased cube workspace for the resolved
+    /// repo (so the open dispatcher can pick the filesystem fast
+    /// path), and a pre-rendered GitHub web URL for the kanban
+    /// tooltip / right-click "copy link."
     Resolved {
         resolved: ResolvedDesignDoc,
-        /// True when at least one cube workspace is leased for
-        /// `resolved.repo_remote_url`.
-        local_workspace_available: bool,
+        /// Absolute path to a cube workspace leased for
+        /// `resolved.repo_remote_url`, if any. `Some(path)` means the
+        /// open dispatcher can hand `<workspace_path>/<resolved.path>`
+        /// to `$EDITOR` / the in-app renderer; `None` means no
+        /// workspace is currently leased so the affordance falls back
+        /// to the GitHub web URL. Boolean form is `workspace_path.is_some()`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_path: Option<String>,
         /// `https://github.com/<owner>/<repo>/blob/<branch>/<path>`,
         /// pre-built so consumers don't have to re-parse the repo
         /// URL.
@@ -984,7 +989,7 @@ mod tests {
                     product_id: "prod_1".into(),
                 },
             },
-            local_workspace_available: true,
+            workspace_path: Some("/Users/me/Documents/dev/workspaces/mono-agent-001".into()),
             web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
         };
         let raw = serde_json::to_value(&resolved).unwrap();
@@ -1127,7 +1132,7 @@ mod tests {
                     path: "docs/x.md".into(),
                     kind: ResolvedDesignDocKind::External,
                 },
-                local_workspace_available: false,
+                workspace_path: None,
                 web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
             },
         };

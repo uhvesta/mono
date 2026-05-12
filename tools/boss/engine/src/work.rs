@@ -706,19 +706,21 @@ impl WorkDb {
     ///   `SameProduct` when it matches, `OtherProduct` when another
     ///   Boss-tracked product owns the repo, `External` otherwise.
     ///
-    /// `is_repo_workspace_leased` is consulted only on the resolved
-    /// path — pass a closure that asks cube whether at least one
-    /// workspace is currently leased for the resolved
-    /// `repo_remote_url`. In test/CLI contexts where cube isn't
-    /// reachable, `|_| false` is the safe default (the open
-    /// affordance just falls back to the GitHub web URL).
+    /// `lookup_repo_workspace_path` is consulted only on the resolved
+    /// path — pass a closure that asks cube for the absolute path of
+    /// a workspace currently leased for the resolved `repo_remote_url`
+    /// (or `None` when no workspace is leased). The macOS open
+    /// dispatcher uses the returned path to fast-path into `$EDITOR` /
+    /// the in-app renderer; when `None`, the affordance falls back to
+    /// the GitHub web URL. In test/CLI contexts where cube isn't
+    /// reachable, `|_| None` is the safe default.
     pub fn resolve_project_design_doc<F>(
         &self,
         project_id: &str,
-        is_repo_workspace_leased: F,
+        lookup_repo_workspace_path: F,
     ) -> Result<ResolveProjectDesignDocOutput>
     where
-        F: FnOnce(&str) -> bool,
+        F: FnOnce(&str) -> Option<String>,
     {
         let conn = self.connect()?;
         let project = query_project(&conn, project_id)?
@@ -766,7 +768,7 @@ impl WorkDb {
         };
 
         let web_url = render_design_doc_web_url(&repo, &branch, &path);
-        let local_workspace_available = is_repo_workspace_leased(&repo);
+        let workspace_path = lookup_repo_workspace_path(&repo);
 
         Ok(ResolveProjectDesignDocOutput {
             project_id: project.id,
@@ -777,7 +779,7 @@ impl WorkDb {
                     path,
                     kind,
                 },
-                local_workspace_available,
+                workspace_path,
                 web_url,
             },
         })
@@ -11388,7 +11390,7 @@ mod tests {
         let (_product, project) = seed_project_for_design_doc(&db);
 
         let resolved = db
-            .resolve_project_design_doc(&project.id, |_| false)
+            .resolve_project_design_doc(&project.id, |_| None)
             .unwrap();
         assert_eq!(resolved.project_id, project.id);
         assert!(matches!(resolved.state, ProjectDesignDocState::NotSet));
@@ -11409,11 +11411,13 @@ mod tests {
         .unwrap();
 
         let resolved = db
-            .resolve_project_design_doc(&project.id, |_| true)
+            .resolve_project_design_doc(&project.id, |_| {
+                Some("/tmp/mono-agent-007".to_owned())
+            })
             .unwrap();
         let ProjectDesignDocState::Resolved {
             resolved,
-            local_workspace_available,
+            workspace_path,
             web_url,
         } = resolved.state
         else {
@@ -11428,7 +11432,7 @@ mod tests {
                 product_id: product.id.clone(),
             }
         );
-        assert!(local_workspace_available);
+        assert_eq!(workspace_path.as_deref(), Some("/tmp/mono-agent-007"));
         // Repo URL is `git@github.com:spinyfin/mono.git` → web URL
         // renders against the parsed `spinyfin/mono` slug.
         assert_eq!(
@@ -11466,11 +11470,11 @@ mod tests {
         .unwrap();
 
         let resolved = db
-            .resolve_project_design_doc(&project.id, |_| false)
+            .resolve_project_design_doc(&project.id, |_| None)
             .unwrap();
         let ProjectDesignDocState::Resolved {
             resolved,
-            local_workspace_available,
+            workspace_path,
             web_url,
         } = resolved.state
         else {
@@ -11483,7 +11487,7 @@ mod tests {
                 product_id: wiki_product.id,
             }
         );
-        assert!(!local_workspace_available);
+        assert!(workspace_path.is_none());
         assert_eq!(
             web_url,
             "https://github.com/myorg/wiki/blob/docs/designs/foo.md",
@@ -11510,7 +11514,7 @@ mod tests {
         .unwrap();
 
         let resolved = db
-            .resolve_project_design_doc(&project.id, |_| false)
+            .resolve_project_design_doc(&project.id, |_| None)
             .unwrap();
         let ProjectDesignDocState::Resolved { resolved, .. } = resolved.state else {
             panic!("expected Resolved state");
@@ -11551,7 +11555,7 @@ mod tests {
         .unwrap();
 
         let resolved = db
-            .resolve_project_design_doc(&project.id, |_| false)
+            .resolve_project_design_doc(&project.id, |_| None)
             .unwrap();
         match resolved.state {
             ProjectDesignDocState::Broken { reason } => {
