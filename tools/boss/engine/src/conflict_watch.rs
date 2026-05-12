@@ -742,6 +742,11 @@ mod tests {
         ) -> anyhow::Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
             Ok(Vec::new())
         }
+        async fn list_repos(
+            &self,
+        ) -> anyhow::Result<Vec<crate::coordinator::CubeRepoSummary>> {
+            Ok(Vec::new())
+        }
     }
 
     /// Insert a `conflict_resolutions` row in `running` for the given

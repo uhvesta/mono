@@ -933,6 +933,11 @@ mod tests {
         ) -> Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
             Ok(Vec::new())
         }
+        async fn list_repos(
+            &self,
+        ) -> Result<Vec<crate::coordinator::CubeRepoSummary>> {
+            Ok(Vec::new())
+        }
     }
 
     #[tokio::test]

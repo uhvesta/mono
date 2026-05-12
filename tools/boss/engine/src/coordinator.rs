@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -170,6 +171,20 @@ pub struct CubeWorkspaceStatus {
     pub lease_expires_at_epoch_s: Option<i64>,
 }
 
+/// Pool-config view of a repo as returned by `cube repo list --json`.
+/// Used by the cold-pool probe in [`ExecutionCoordinator::schedule_execution`]
+/// to decide whether the auto-provisioned defaults are worth flagging
+/// to the operator. See `multi-repo-work-modeling.md` Q6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CubeRepoSummary {
+    pub repo_id: String,
+    pub origin: String,
+    pub main_branch: String,
+    pub workspace_root: PathBuf,
+    pub workspace_prefix: String,
+    pub source: Option<PathBuf>,
+}
+
 #[async_trait]
 pub trait CubeClient: Send + Sync {
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle>;
@@ -192,6 +207,10 @@ pub trait CubeClient: Send + Sync {
     /// per workspace, the same shape `workspace_status` returns for a
     /// single workspace.
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>>;
+    /// Snapshot every repo cube has registered. One round-trip;
+    /// callers use it to inspect pool config for advisory checks like
+    /// the cold-repo probe.
+    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>>;
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +444,40 @@ impl CubeClient for CommandCubeClient {
                 task: w.task,
                 leased_at_epoch_s: w.leased_at_epoch_s,
                 lease_expires_at_epoch_s: w.lease_expires_at_epoch_s,
+            })
+            .collect())
+    }
+
+    async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+        #[derive(Deserialize)]
+        struct ListPayload {
+            repos: Vec<ListRepo>,
+        }
+
+        #[derive(Deserialize)]
+        struct ListRepo {
+            repo: String,
+            origin: String,
+            main_branch: String,
+            workspace_root: PathBuf,
+            workspace_prefix: String,
+            #[serde(default)]
+            source: Option<PathBuf>,
+        }
+
+        let payload: ListPayload =
+            serde_json::from_value(self.run_json(&["--json", "repo", "list"]).await?)
+                .context("failed to decode `cube repo list` payload")?;
+        Ok(payload
+            .repos
+            .into_iter()
+            .map(|r| CubeRepoSummary {
+                repo_id: r.repo,
+                origin: r.origin,
+                main_branch: r.main_branch,
+                workspace_root: r.workspace_root,
+                workspace_prefix: r.workspace_prefix,
+                source: r.source,
             })
             .collect())
     }
@@ -722,6 +775,14 @@ pub struct ExecutionCoordinator {
     /// TOCTOU between "queue saw empty" and "active=false" that left
     /// fresh `ready` executions stranded with no scheduler running.
     scheduling_pending: AtomicBool,
+    /// Repo origin URLs the cold-pool probe has already inspected in
+    /// this engine's lifetime. The probe runs once per URL on the
+    /// first successful `ensure_repo` for that URL; subsequent
+    /// dispatches against the same URL skip both the `cube repo list`
+    /// round-trip and the attention-item write. Engine restart resets
+    /// this; per `multi-repo-work-modeling.md` R4 the deduplication
+    /// scope is engine-lifetime, not durable.
+    repo_cold_probe_seen: Mutex<HashSet<String>>,
 }
 
 impl ExecutionCoordinator {
@@ -756,6 +817,7 @@ impl ExecutionCoordinator {
             dispatch_events: Arc::new(NoopDispatchEventSink::default()),
             scheduling_active: AtomicBool::new(false),
             scheduling_pending: AtomicBool::new(false),
+            repo_cold_probe_seen: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1104,6 +1166,7 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
+        self.maybe_probe_cold_repo(execution).await;
         self.dispatch_events
             .emit(
                 DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Ok, &execution.id)
@@ -1302,6 +1365,90 @@ impl ExecutionCoordinator {
                     &err,
                 )?;
                 Err(err)
+            }
+        }
+    }
+
+    /// Cold-repo probe (design doc Q6, Follow-up chore #8). The first
+    /// time a given repo URL flows through `ensure_repo` in this
+    /// engine's lifetime, ask cube `repo list --json` once and check
+    /// whether the entry for this URL is sitting on cube's
+    /// auto-provisioned defaults — i.e. nothing was customised with
+    /// `cube repo add` / `cube repo configure`. If so, raise an
+    /// advisory `repo_cold_pool` `WorkAttentionItem` against the
+    /// execution naming the exact override command.
+    ///
+    /// Best-effort by design: never blocks dispatch, never returns an
+    /// error to the caller. A failed `list_repos` round-trip is logged
+    /// at WARN and the URL is still marked seen so we don't retry the
+    /// probe every dispatch — engine restart re-probes per R4.
+    async fn maybe_probe_cold_repo(self: &Arc<Self>, execution: &WorkExecution) {
+        let origin = execution.repo_remote_url.clone();
+        {
+            let mut seen = self.repo_cold_probe_seen.lock().await;
+            if !seen.insert(origin.clone()) {
+                return;
+            }
+        }
+
+        let repos = match self.cube_client.list_repos().await {
+            Ok(repos) => repos,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    execution_id = %execution.id,
+                    repo_remote_url = %origin,
+                    "cold-repo probe: `cube repo list` failed — skipping advisory check"
+                );
+                return;
+            }
+        };
+
+        let Some(repo) = repos.iter().find(|r| r.origin == origin) else {
+            tracing::debug!(
+                execution_id = %execution.id,
+                repo_remote_url = %origin,
+                "cold-repo probe: ensured repo not present in `cube repo list` snapshot"
+            );
+            return;
+        };
+
+        if !repo_has_default_pool_config(repo) {
+            return;
+        }
+
+        let title = format!(
+            "Cold cube pool for `{repo_id}` — using auto-provisioned defaults",
+            repo_id = repo.repo_id,
+        );
+        let body = cold_repo_attention_body(repo);
+        let input = CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: "repo_cold_pool".to_owned(),
+            status: None,
+            title,
+            body_markdown: body,
+            resolved_at: None,
+        };
+        match self.work_db.create_attention_item(input) {
+            Ok(item) => {
+                tracing::info!(
+                    attention_id = %item.id,
+                    execution_id = %execution.id,
+                    repo_id = %repo.repo_id,
+                    repo_remote_url = %origin,
+                    "cold-repo probe: raised advisory attention item"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    execution_id = %execution.id,
+                    repo_id = %repo.repo_id,
+                    repo_remote_url = %origin,
+                    "cold-repo probe: failed to persist attention item — dispatch continues"
+                );
             }
         }
     }
@@ -2004,6 +2151,76 @@ fn execution_change_title(execution: &WorkExecution, work_item: &WorkItem) -> St
     }
 }
 
+/// Does `repo`'s cube pool config look like the auto-provisioned
+/// defaults that `cube repo ensure` writes when a brand-new origin
+/// turns up — i.e. nothing the operator has customised?
+///
+/// The check is conservative: every field has to look default. If any
+/// of `main_branch`, `workspace_root`, `workspace_prefix`, or `source`
+/// has been touched, we trust the operator and stay silent. The
+/// advisory exists to nudge users who never noticed cube auto-cloned
+/// into `~/.local/share/cube/workspaces`; once they run
+/// `cube repo add` the next probe sees customised fields and the item
+/// no longer surfaces.
+fn repo_has_default_pool_config(repo: &CubeRepoSummary) -> bool {
+    if repo.main_branch != "main" {
+        return false;
+    }
+    if repo.source.is_some() {
+        return false;
+    }
+    let expected_prefix = format!("{}-agent-", repo.repo_id);
+    if repo.workspace_prefix != expected_prefix {
+        return false;
+    }
+    workspace_root_is_cube_default(&repo.workspace_root)
+}
+
+/// Heuristic for "cube auto-provisioned this `workspace_root`". The
+/// engine can't directly ask cube what its data dir is, so we compare
+/// against cube's documented defaults: `$CUBE_DATA_DIR/workspaces`,
+/// `$XDG_DATA_HOME/cube/workspaces`, or `~/.local/share/cube/workspaces`.
+/// Anything else — including the `~/Documents/dev/workspaces` layout
+/// the workspace rules recommend — is treated as customised.
+fn workspace_root_is_cube_default(workspace_root: &Path) -> bool {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("CUBE_DATA_DIR") {
+        candidates.push(PathBuf::from(path).join("workspaces"));
+    }
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+        candidates.push(PathBuf::from(path).join("cube/workspaces"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/share/cube/workspaces"));
+    }
+    candidates.iter().any(|candidate| candidate == workspace_root)
+}
+
+/// Body for the `repo_cold_pool` advisory. Mirrors the design doc Q6
+/// recommendation block so the user gets the exact `cube repo add`
+/// override invocation, pre-filled with this repo's id and origin.
+fn cold_repo_attention_body(repo: &CubeRepoSummary) -> String {
+    format!(
+        "First dispatch against `{repo_id}` ({origin}).\n\
+         Cube auto-provisioned a pool at `{workspace_root}` with prefix `{prefix}`.\n\n\
+         To customize, run:\n\n\
+         ```\n\
+         cube repo add {repo_id} \\\n    \
+             --origin {origin} \\\n    \
+             --workspace-root ~/Documents/dev/workspaces \\\n    \
+             --workspace-prefix {repo_id}-agent\n\
+         ```\n\n\
+         Each pool has a configurable workspace count (concurrent workers per repo). \
+         For multi-repo products this matters — see \
+         `tools/boss/docs/designs/multi-repo-work-modeling.md` Q6. This item is \
+         advisory; dispatch is proceeding with cube defaults.",
+        repo_id = repo.repo_id,
+        origin = repo.origin,
+        workspace_root = repo.workspace_root.display(),
+        prefix = repo.workspace_prefix,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::pending;
@@ -2019,9 +2236,9 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
-        ExecutionCoordinator, ExecutionPublisher, FrontendEvent, MAX_WORKER_POOL_SIZE, WorkerPool,
-        slot_id_from_worker_id,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
+        CubeWorkspaceStatus, ExecutionCoordinator, ExecutionPublisher, FrontendEvent,
+        MAX_WORKER_POOL_SIZE, WorkerPool, slot_id_from_worker_id,
     };
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
@@ -2038,6 +2255,16 @@ mod tests {
         status_calls: Mutex<Vec<PathBuf>>,
         heartbeat_calls: Mutex<Vec<(String, Option<u64>)>>,
         force_release_calls: Mutex<Vec<(String, Option<String>)>>,
+        /// Counts how many times `list_repos` has been invoked. Tests
+        /// for the cold-pool probe assert this equals 1 across two
+        /// dispatches against the same URL (probe is engine-lifetime
+        /// deduped).
+        list_repos_calls: Mutex<u32>,
+        /// Snapshot returned by `list_repos`. Default is the empty
+        /// slice — most tests don't exercise the cold-pool probe and
+        /// the empty list short-circuits before any attention item is
+        /// written.
+        repos: Mutex<Vec<CubeRepoSummary>>,
         fail_ensure: bool,
         fail_lease: bool,
         /// Simulate cube refusing a `--prefer` request because the
@@ -2053,6 +2280,11 @@ mod tests {
     impl FakeCubeClient {
         fn with_next_workspace_id(self, id: impl Into<String>) -> Self {
             *self.next_workspace_id.try_lock().expect("uncontended") = Some(id.into());
+            self
+        }
+
+        fn with_repos(self, repos: Vec<CubeRepoSummary>) -> Self {
+            *self.repos.try_lock().expect("uncontended") = repos;
             self
         }
     }
@@ -2166,6 +2398,11 @@ mod tests {
 
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
             Ok(Vec::new())
+        }
+
+        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+            *self.list_repos_calls.lock().await += 1;
+            Ok(self.repos.lock().await.clone())
         }
     }
 
@@ -2357,6 +2594,246 @@ mod tests {
         assert_eq!(cube.create_calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
+    }
+
+    /// `cube_default_workspace_root_for_test` mirrors the production
+    /// helper so tests can construct a `workspace_root` value that
+    /// `workspace_root_is_cube_default` would accept, without
+    /// mutating process-wide env vars (which would race other tests
+    /// in the same crate).
+    fn cube_default_workspace_root_for_test() -> PathBuf {
+        if let Some(d) = std::env::var_os("CUBE_DATA_DIR") {
+            return PathBuf::from(d).join("workspaces");
+        }
+        if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(d).join("cube/workspaces");
+        }
+        let home = std::env::var_os("HOME").expect(
+            "test requires HOME, CUBE_DATA_DIR, or XDG_DATA_HOME to be set so we can \
+             construct a cube-default workspace_root that the helper recognises",
+        );
+        PathBuf::from(home).join(".local/share/cube/workspaces")
+    }
+
+    /// Q6 / Follow-up chore #8: the cold-repo probe raises an
+    /// advisory `repo_cold_pool` attention item on the first dispatch
+    /// against a previously-unseen URL whose cube pool config matches
+    /// auto-provision defaults. Across two dispatches against the
+    /// same URL only one item is written, and `cube repo list` is
+    /// only called once — both dispatches still drive the execution
+    /// to `running`.
+    #[tokio::test]
+    async fn cold_repo_probe_raises_advisory_once_across_repeated_dispatches() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let origin = "git@github.com:spinyfin/mono.git";
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some(origin.to_owned()),
+            })
+            .unwrap();
+        // Two chores → two executions against the same product/URL.
+        let chore_a = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup A".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let chore_b = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup B".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Cube reports a single repo whose pool config exactly
+        // matches the auto-provisioned defaults — `cube repo add`
+        // / `cube repo configure` were never run.
+        let default_repo = CubeRepoSummary {
+            repo_id: "mono".to_owned(),
+            origin: origin.to_owned(),
+            main_branch: "main".to_owned(),
+            workspace_root: cube_default_workspace_root_for_test(),
+            workspace_prefix: "mono-agent-".to_owned(),
+            source: None,
+        };
+        let cube = Arc::new(
+            FakeCubeClient::default().with_repos(vec![default_repo]),
+        );
+        // Pool size 2 so both executions can dispatch concurrently.
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(2),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        coordinator.kick();
+
+        let exec_a = db.list_executions(Some(&chore_a.id)).unwrap().pop().unwrap();
+        let exec_b = db.list_executions(Some(&chore_b.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &exec_a.id, "running").await;
+        wait_for_execution_status(db.as_ref(), &exec_b.id, "running").await;
+
+        // Two ensure_repo calls (one per execution), but list_repos
+        // was deduplicated to exactly one round-trip.
+        assert_eq!(cube.ensure_calls.lock().await.len(), 2);
+        assert_eq!(*cube.list_repos_calls.lock().await, 1);
+
+        // Exactly one advisory item across both executions. It
+        // attaches to the execution that hit the probe first.
+        let attn_a = db.list_attention_items(&exec_a.id).unwrap();
+        let attn_b = db.list_attention_items(&exec_b.id).unwrap();
+        let cold_items: Vec<_> = attn_a
+            .iter()
+            .chain(attn_b.iter())
+            .filter(|item| item.kind == "repo_cold_pool")
+            .collect();
+        assert_eq!(
+            cold_items.len(),
+            1,
+            "expected exactly one repo_cold_pool item across both executions, \
+             got {} (exec_a: {} items, exec_b: {} items)",
+            cold_items.len(),
+            attn_a.len(),
+            attn_b.len(),
+        );
+        let item = cold_items[0];
+        assert_eq!(item.status, "open");
+        assert!(
+            item.body_markdown.contains("cube repo add mono"),
+            "body should name the override command verbatim; got: {}",
+            item.body_markdown,
+        );
+        assert!(
+            item.body_markdown.contains(origin),
+            "body should echo the repo origin; got: {}",
+            item.body_markdown,
+        );
+    }
+
+    /// A repo whose cube pool config has been customised (custom
+    /// `workspace_root` or `workspace_prefix`) is the steady-state we
+    /// don't want to nag about. Even though it's the first dispatch
+    /// in this engine's lifetime, no `repo_cold_pool` item should
+    /// land.
+    #[tokio::test]
+    async fn cold_repo_probe_stays_silent_when_pool_is_customised() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let origin = "git@github.com:spinyfin/mono.git";
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some(origin.to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let custom_repo = CubeRepoSummary {
+            repo_id: "mono".to_owned(),
+            origin: origin.to_owned(),
+            main_branch: "main".to_owned(),
+            workspace_root: PathBuf::from("/Users/operator/Documents/dev/workspaces"),
+            workspace_prefix: "mono-agent-".to_owned(),
+            source: None,
+        };
+        let cube = Arc::new(
+            FakeCubeClient::default().with_repos(vec![custom_repo]),
+        );
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        ));
+        coordinator.kick();
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "running").await;
+
+        assert_eq!(*cube.list_repos_calls.lock().await, 1);
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert!(
+            items.iter().all(|i| i.kind != "repo_cold_pool"),
+            "no repo_cold_pool item should be raised for a customised pool; got: {:?}",
+            items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn repo_has_default_pool_config_recognises_defaults_only() {
+        use super::{repo_has_default_pool_config, CubeRepoSummary};
+        // A repo whose every field matches the auto-provisioned
+        // defaults — the case the probe should flag.
+        let default_root = cube_default_workspace_root_for_test();
+        let base = CubeRepoSummary {
+            repo_id: "nimbus".to_owned(),
+            origin: "git@github.com:myorg/nimbus.git".to_owned(),
+            main_branch: "main".to_owned(),
+            workspace_root: default_root.clone(),
+            workspace_prefix: "nimbus-agent-".to_owned(),
+            source: None,
+        };
+        assert!(repo_has_default_pool_config(&base));
+
+        // A custom main_branch means the operator has touched the
+        // config — stay silent.
+        let mut customised = base.clone();
+        customised.main_branch = "trunk".to_owned();
+        assert!(!repo_has_default_pool_config(&customised));
+
+        // `source` overlay means the user is sharing a local clone;
+        // pool is explicitly configured.
+        let mut with_source = base.clone();
+        with_source.source = Some(PathBuf::from("/Users/dev/Documents/dev/nimbus"));
+        assert!(!repo_has_default_pool_config(&with_source));
+
+        // Custom workspace_prefix that doesn't match the auto-derived
+        // `{repo_id}-agent-` shape.
+        let mut custom_prefix = base.clone();
+        custom_prefix.workspace_prefix = "nimbus-pool-".to_owned();
+        assert!(!repo_has_default_pool_config(&custom_prefix));
+
+        // Custom workspace_root anywhere outside cube's data dir.
+        let mut custom_root = base;
+        custom_root.workspace_root = PathBuf::from("/Users/dev/Documents/dev/workspaces");
+        assert!(!repo_has_default_pool_config(&custom_root));
     }
 
     #[tokio::test]

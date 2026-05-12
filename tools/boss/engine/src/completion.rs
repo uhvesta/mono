@@ -897,7 +897,8 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
+        CubeWorkspaceStatus,
     };
     use crate::work::{
         CreateChoreInput, CreateExecutionInput, CreateProductInput, WorkDb, WorkItem,
@@ -1008,6 +1009,9 @@ mod tests {
             Ok(())
         }
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+            Ok(Vec::new())
+        }
+        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
             Ok(Vec::new())
         }
     }

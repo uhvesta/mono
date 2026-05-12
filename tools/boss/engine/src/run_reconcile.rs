@@ -242,7 +242,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
+        CubeWorkspaceStatus,
     };
 
     struct StubCube {
@@ -312,6 +313,10 @@ mod tests {
             // Clone, and tests fire one probe per StubCube.
             let mut guard = self.list_response.lock().unwrap();
             std::mem::replace(&mut *guard, Err(anyhow!("StubCube already drained")))
+        }
+
+        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+            unimplemented!("not used by probe")
         }
     }
 
