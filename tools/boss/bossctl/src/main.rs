@@ -825,11 +825,14 @@ async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -
 }
 
 /// Inject `text` into the worker pane referenced by `agent`, as if
-/// the user had typed it. A trailing newline is appended so the
-/// claude session treats the input as submitted (matching the
-/// "and pressing return" semantics in the verb's contract). Callers
-/// that need raw injection without an implicit submit should drive
-/// the engine RPC directly.
+/// the user had typed it and pressed Return. The submit step is the
+/// app-side writer's responsibility: after pasting the body via
+/// libghostty's text path it synthesises a Return keystroke, which
+/// is what makes the prompt land. Earlier revisions of this CLI
+/// appended a trailing `\n` here in the hope that the paste path
+/// would treat it as Enter; it does not (the `\n` lands as a literal
+/// newline character in the input field), so the writer owns
+/// submission now and the CLI ships the text verbatim.
 async fn agents_send(
     socket_path: &Option<String>,
     json: bool,
@@ -839,14 +842,10 @@ async fn agents_send(
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
     let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
-    let mut payload = text;
-    if !payload.ends_with('\n') {
-        payload.push('\n');
-    }
     let response = client
         .send_request(&FrontendRequest::SendInputToWorker {
             run_id: run_id.clone(),
-            text: payload,
+            text,
         })
         .await
         .context("sending SendInputToWorker")?;

@@ -84,9 +84,15 @@ final class WorkersWorkspaceModel: ObservableObject {
         return .success
     }
 
-    /// Write text into the slot's libghostty surface as if user-typed.
-    /// Used for probe injection (Stop-boundary text from the engine)
-    /// and `bossctl agents send`.
+    /// Type text into the slot's libghostty surface and submit it as
+    /// if the user had pasted the body and pressed Return. Used for
+    /// probe injection (Stop-boundary text from the engine), `bossctl
+    /// agents send`, and the macOS app's intervene affordance.
+    ///
+    /// The submit step happens inside `submitText` — see its docstring
+    /// for why a trailing `\n` inside the payload is not enough to
+    /// land the prompt: libghostty's paste path delivers control
+    /// characters as input-field content, not as a keystroke.
     func sendToPane(slotId: Int, text: String) -> EngineSendResult {
         guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
@@ -97,7 +103,7 @@ final class WorkersWorkspaceModel: ObservableObject {
         guard let host = session.hostView else {
             return .failure(.internalFailure("pane has no live surface"))
         }
-        host.writeText(text)
+        host.submitText(text)
         return .success
     }
 
