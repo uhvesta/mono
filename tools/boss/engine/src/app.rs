@@ -695,6 +695,19 @@ impl ServerState {
                 tracing::warn!(?err, run_id, slot_id, "release_worker_pane: failed");
             }
         }
+        // The engine's WorkerPool slot was held for the lifetime of
+        // the libghostty pane (the coordinator deferred its release
+        // when `run_execution` returned with `slot_id = Some(N)`).
+        // Now that the pane has been torn down — successfully or
+        // not — the engine and the app are back in agreement that
+        // slot N is free, so release the pool slot too and kick the
+        // scheduler. `WorkerPool::release_worker` is a find-or-skip
+        // no-op for already-idle slots, so this is safe even if the
+        // pane was a non-pool spawn (e.g. legacy or test path).
+        let worker_id = WorkerPool::worker_id_for_slot(slot_id);
+        self.execution_coordinator
+            .release_worker_and_kick(&worker_id, None)
+            .await;
         // Always drop the live-state entry — we've already given up
         // ownership of the slot in the worker registry, so a stale
         // entry here would lie to the UI about the slot being live.
@@ -5219,6 +5232,79 @@ mod tests {
         // chore-done firing for the same run) is a no-op.
         server_state.release_worker_pane("run-x").await;
         assert!(server_state.live_worker_states.get(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn release_worker_pane_releases_matching_worker_pool_slot() {
+        // Engine-side lifecycle pairing: the WorkerPool slot is held
+        // for the lifetime of the libghostty pane (not just for the
+        // duration of `run_execution`). Tearing the pane down via
+        // `release_worker_pane` must hand the pool slot back so a
+        // subsequent `claim_worker` can reuse it — otherwise the
+        // engine and the app drift apart and the next
+        // SpawnWorkerPane gets rejected as SlotBusy.
+        let server_state = test_server_state();
+        let pool = server_state.execution_coordinator.worker_pool();
+
+        // Pre-claim slot 1 the way the coordinator would, then wire
+        // the worker_registry so `release_worker_pane` can resolve
+        // the run id back to that slot.
+        let claimed = pool
+            .claim_worker("exec-1", None)
+            .await
+            .expect("worker pool starts with one free slot");
+        assert_eq!(claimed, "worker-1");
+        assert_eq!(pool.idle_count().await, 0);
+        server_state.worker_registry.register_run_slot("run-1", 1);
+
+        // No app session is registered, so the SendToApp call inside
+        // release_worker_pane bails on NotRegistered — the pool
+        // release must still happen.
+        server_state.release_worker_pane("run-1").await;
+
+        assert_eq!(
+            pool.idle_count().await,
+            1,
+            "WorkerPool slot must be freed once the libghostty pane is released",
+        );
+        // And the next claim lands on the same slot.
+        let re_claimed = pool
+            .claim_worker("exec-2", None)
+            .await
+            .expect("slot 1 is free");
+        assert_eq!(re_claimed, "worker-1");
+    }
+
+    #[tokio::test]
+    async fn release_worker_pane_pool_release_is_idempotent() {
+        // A pane can be released from more than one path (completion
+        // handler, force-release, engine shutdown). `take_slot_for_run`
+        // is the natural choke point — the second call sees no slot
+        // mapping and short-circuits before touching the pool — so a
+        // racy double-release must not zero out an unrelated execution
+        // that has already re-claimed the slot.
+        let server_state = test_server_state();
+        let pool = server_state.execution_coordinator.worker_pool();
+
+        let _claimed = pool.claim_worker("exec-1", None).await.unwrap();
+        server_state.worker_registry.register_run_slot("run-1", 1);
+
+        server_state.release_worker_pane("run-1").await;
+        assert_eq!(pool.idle_count().await, 1);
+
+        // Re-claim the slot for a new execution.
+        let claimed_again = pool.claim_worker("exec-2", None).await.unwrap();
+        assert_eq!(claimed_again, "worker-1");
+        assert_eq!(pool.idle_count().await, 0);
+
+        // A duplicate release for the original run must not steal the
+        // slot back from exec-2.
+        server_state.release_worker_pane("run-1").await;
+        assert_eq!(
+            pool.idle_count().await,
+            0,
+            "duplicate release_worker_pane must not free a slot now held by a different execution",
+        );
     }
 
     #[tokio::test]

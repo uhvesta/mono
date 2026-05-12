@@ -481,7 +481,7 @@ impl WorkerPool {
     }
 
     #[cfg(test)]
-    async fn idle_count(&self) -> usize {
+    pub(crate) async fn idle_count(&self) -> usize {
         let inner = self.inner.lock().await;
         inner
             .workers
@@ -1278,6 +1278,20 @@ impl ExecutionCoordinator {
             )
             .await;
 
+        // Pane-spawn runs hand the slot to a live libghostty pane; the
+        // WorkerPool slot must remain claimed until that pane is torn
+        // down by `ServerState::release_worker_pane` (completion, force
+        // release, or engine shutdown). Releasing it here would let a
+        // concurrent dispatch re-claim the same slot while the pane
+        // still owns it, and the app would reject `SpawnWorkerPane`
+        // with `SlotBusy`. Non-pane runs (test fakes, future
+        // ACP-style runners) leave `slot_id = None` and still need
+        // the inline release.
+        let defer_pool_slot_release = matches!(
+            run_outcome.as_ref(),
+            Ok(outcome) if outcome.slot_id.is_some()
+        );
+
         match run_outcome {
             Ok(outcome) => {
                 // If the runner allocated a real pane slot for this
@@ -1450,8 +1464,26 @@ impl ExecutionCoordinator {
             }
         }
 
+        if !defer_pool_slot_release {
+            self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
+                .await;
+        }
+    }
+
+    /// Release `worker_id` back to the pool, then rescan + kick to
+    /// pick up newly-eligible work. Used at the tail of non-pane
+    /// `run_execution` calls and from [`ServerState::release_worker_pane`]
+    /// for the deferred pane-spawn case — the engine and the app must
+    /// agree on which slots are busy, so the WorkerPool free signal is
+    /// paired with the libghostty pane teardown rather than firing as
+    /// soon as the spawn RPC returns.
+    pub async fn release_worker_and_kick(
+        self: &Arc<Self>,
+        worker_id: &str,
+        last_workspace_id: Option<&str>,
+    ) {
         self.worker_pool
-            .release_worker(&worker_id, Some(lease.workspace_id.as_str()))
+            .release_worker(worker_id, last_workspace_id)
             .await;
         self.rescan_active_dispatch_after_release();
         self.kick();
@@ -1990,6 +2022,105 @@ mod tests {
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
         assert_eq!(run.status, "completed");
         assert_eq!(run.agent_id, "worker-5");
+    }
+
+    #[tokio::test]
+    async fn pane_spawn_run_does_not_release_worker_pool_slot() {
+        // The libghostty pane outlives the `run_execution` call —
+        // PaneSpawnRunner returns Ok(WaitingHuman) the instant the
+        // SpawnWorkerPane RPC completes, but the user-visible worker
+        // is just getting started. If the coordinator freed the
+        // WorkerPool slot at that moment, the next dispatch could
+        // re-claim the slot and the app would reject the spawn with
+        // SlotBusy. Outcomes that carry slot_id = Some(N) must keep
+        // the slot claimed until `release_worker_pane` fires.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            slot_id: Some(1),
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            runner,
+        ));
+        coordinator.kick();
+
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        wait_for_execution_status(db.as_ref(), &execution.id, "waiting_human").await;
+
+        // Slot 1 still belongs to the (notionally) live pane. Only
+        // `release_worker_pane` (driven by completion / force release
+        // / shutdown) is allowed to free it.
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            0,
+            "WorkerPool slot must stay claimed while the libghostty pane is alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_worker_and_kick_frees_pool_slot() {
+        // The deferred-release helper called from
+        // `ServerState::release_worker_pane` after the pane RPC
+        // returns. After it runs, the matching pool slot is idle
+        // again and the next claim succeeds.
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db,
+            WorkerPool::new(2),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+
+        let claimed = coordinator
+            .worker_pool()
+            .claim_worker("exec-pre", None)
+            .await
+            .expect("pool has free slots");
+        assert_eq!(coordinator.worker_pool().idle_count().await, 1);
+
+        coordinator
+            .release_worker_and_kick(&claimed, Some("ws-1"))
+            .await;
+
+        assert_eq!(
+            coordinator.worker_pool().idle_count().await,
+            2,
+            "release_worker_and_kick must return the slot to the idle pool",
+        );
+        // Idempotent: a second release on the same already-idle slot
+        // is a no-op (the pane-spawn lifecycle can racily re-enter
+        // this path from completion + chore-done).
+        coordinator
+            .release_worker_and_kick(&claimed, Some("ws-1"))
+            .await;
+        assert_eq!(coordinator.worker_pool().idle_count().await, 2);
     }
 
     #[tokio::test]
