@@ -2086,14 +2086,6 @@ async fn dispatch_live_worker_state(
         );
         return;
     };
-    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
-        tracing::warn!(
-            run_id,
-            kind = event_kind,
-            "live_status: dropping hook — run_id is not registered against a slot (event ahead of register_run_slot or after take_slot_for_run)",
-        );
-        return;
-    };
     // Persist the transcript path the moment we see it on a hook
     // payload. `start_execution_run` inserts the work_runs row with
     // `transcript_path = NULL` (the engine has no way to know the
@@ -2103,23 +2095,39 @@ async fn dispatch_live_worker_state(
     // tick on "no transcript path yet". The setter is idempotent
     // (first-writer-wins) so we don't clobber the path the tail
     // watcher has already opened across later sessions/resumes.
+    //
+    // This runs BEFORE the slot lookup so it survives the cases where
+    // `slot_for_run` would otherwise drop the event: a first hook
+    // racing ahead of `register_run_slot`, an engine restart that
+    // wipes the in-memory `WorkerRegistry` while pre-existing workers
+    // keep firing hooks, or a late hook arriving after the slot has
+    // been released. The persist is keyed solely on `run_id` and does
+    // not need the slot mapping — gating it under that lookup was the
+    // gap that pinned `work_runs.transcript_path` at NULL across
+    // engine restarts.
     if let Some(path) = incoming.transcript_path.as_deref() {
         match server_state.work_db.set_run_transcript_path_if_unset(run_id, path) {
             Ok(true) => tracing::info!(
                 run_id,
-                slot_id,
                 transcript_path = %path,
                 "recorded transcript_path on work_run from hook payload",
             ),
             Ok(false) => {}
             Err(err) => tracing::warn!(
                 run_id,
-                slot_id,
                 ?err,
                 "failed to persist transcript_path from hook payload",
             ),
         }
     }
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        tracing::warn!(
+            run_id,
+            kind = event_kind,
+            "live_status: dropping hook fan-out — run_id is not registered against a slot (event ahead of register_run_slot or after take_slot_for_run); transcript_path already persisted",
+        );
+        return;
+    };
     let prior_activity = server_state
         .live_worker_states
         .get(slot_id)
@@ -6076,6 +6084,99 @@ mod tests {
         assert!(
             drain.is_err(),
             "duplicate Stop must not produce a second ProbeReplied for the same probe id",
+        );
+    }
+
+    /// `dispatch_live_worker_state` must persist `transcript_path` on
+    /// the matching `work_runs` row even when the in-memory
+    /// `WorkerRegistry` has no slot mapping for the run. Without this
+    /// guarantee, an engine restart wipes the slot map and every
+    /// subsequent hook from pre-existing workers leaves
+    /// `work_runs.transcript_path` NULL — pinning the live-status
+    /// summarizer at `skip_no_transcript_path` until the worker is
+    /// re-spawned. The fan-out to the per-slot trigger pipeline is
+    /// still gated on the slot lookup (the manager has no slot to
+    /// notify), but the durable column write is not.
+    #[tokio::test]
+    async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let run = server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: None,
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        assert!(
+            run.transcript_path.is_none(),
+            "precondition: freshly-created run starts with transcript_path=NULL",
+        );
+        // Deliberately do NOT call register_run_slot — this simulates
+        // the engine-restart window where the registry is empty but
+        // the worker is still firing hooks.
+        assert_eq!(
+            server_state.worker_registry.slot_for_run(&run.id),
+            None,
+            "precondition: slot mapping must be absent for this regression",
+        );
+
+        let event = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run.id.clone()),
+            transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+            event: WorkerEvent::PostToolUse {
+                session_id: "claude-sess-1".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+                tool_response: serde_json::Value::Null,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &event).await;
+
+        let reread = server_state.work_db.get_run(&run.id).unwrap();
+        assert_eq!(
+            reread.transcript_path.as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+            "dispatcher must persist transcript_path on work_runs even when the slot mapping is missing",
         );
     }
 
