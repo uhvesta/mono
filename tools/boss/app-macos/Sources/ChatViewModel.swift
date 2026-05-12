@@ -97,6 +97,19 @@ final class ChatViewModel: ObservableObject {
     /// stays hidden until the engine replies.
     @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
 
+    /// Indirection for the OS URL opener used by [[openProjectDesignDoc(_:)]].
+    /// Production defaults to `NSWorkspace.shared.open`; tests inject a
+    /// recording stub so a `.resolved` click never hands a real GitHub
+    /// blob URL to the OS during `swift test`. A test that fires the
+    /// resolved branch without overriding this *will* pop the user's
+    /// browser — see `ProjectDesignDocAffordanceTests` for the stub
+    /// pattern.
+    var urlOpener: (URL) -> Void = { url in
+        #if canImport(AppKit)
+        NSWorkspace.shared.open(url)
+        #endif
+    }
+
     /// Toggle the live-status summarizer for `slotId`. Sends the
     /// RPC and optimistically updates local state; the engine echo
     /// brings the two back in sync.
@@ -690,9 +703,7 @@ final class ChatViewModel: ObservableObject {
                 workErrorMessage = "Design doc URL could not be parsed: \(webURL)"
                 return
             }
-            #if canImport(AppKit)
-            NSWorkspace.shared.open(url)
-            #endif
+            urlOpener(url)
         }
     }
 

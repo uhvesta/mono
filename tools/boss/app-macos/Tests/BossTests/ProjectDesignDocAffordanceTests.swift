@@ -95,15 +95,20 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         XCTAssertNil(model.workErrorMessage)
     }
 
-    /// `.resolved` triggers an `NSWorkspace.open` on the engine-built
-    /// web URL. The test can't observe `NSWorkspace` directly, so it
-    /// asserts the dispatcher's *user-visible* side effects: no
-    /// workErrorMessage gets set, and the (resolved-but-unparseable)
-    /// fallback branch *does* set one. Together these pin the kind
-    /// switch's two halves.
+    /// `.resolved` routes the engine-built web URL through
+    /// `ChatViewModel.urlOpener`. The production default hands it to
+    /// `NSWorkspace.shared.open`, which would pop the user's browser
+    /// during `swift test`; the stub here captures the URL instead so
+    /// the test can both (a) assert the dispatcher fired the opener
+    /// with the right URL, and (b) guarantee no real opener call leaks
+    /// into the dev loop. The (resolved-but-unparseable) fallback case
+    /// is covered in [[testOpenOnResolvedWithUnparseableURLSurfacesError]].
     func testOpenOnResolvedDoesNotSetErrorMessage() {
         let model = makeModelWithProject()
         let project = model.projectsByProductID.values.first!.first!
+        let webURL = "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+        var openedURLs: [URL] = []
+        model.urlOpener = { openedURLs.append($0) }
         model.designDocStateByProjectID[project.id] = .resolved(
             resolved: ResolvedDesignDoc(
                 repoRemoteURL: "https://github.com/foo/bar.git",
@@ -112,10 +117,11 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .sameProduct(productID: project.productID)
             ),
             localWorkspaceAvailable: true,
-            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+            webURL: webURL
         )
         model.openProjectDesignDoc(project)
         XCTAssertNil(model.workErrorMessage)
+        XCTAssertEqual(openedURLs.map(\.absoluteString), [webURL])
     }
 
     /// An unparseable web URL on a resolved state still must not
@@ -230,6 +236,15 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
 
     private func makeModelWithProject() -> ChatViewModel {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        // Trap the production default so a test that reaches the
+        // `.resolved` branch without installing a recording stub can't
+        // silently fire `NSWorkspace.shared.open` during `swift test`
+        // (which pops the user's browser on every iteration). Tests
+        // that want to exercise the opener must override this with a
+        // recording stub.
+        model.urlOpener = { url in
+            XCTFail("urlOpener was invoked with \(url) — install a recording stub before exercising `.resolved`.")
+        }
         let productID = "prod_test"
         model.products = [
             WorkProduct(
