@@ -208,15 +208,41 @@ struct ApiPr {
 }
 
 fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
-    if pr.merged_at.is_some() {
-        return PrStatus::Merged { url: pr.url };
-    }
-    if pr.state.eq_ignore_ascii_case("closed") {
-        return PrStatus::Closed { url: pr.url };
-    }
+    // Structural safety belt against the "worker's `@-` is a recent
+    // squash-merge commit on `main`" misbind. `jj_candidate_commit_shas`
+    // returns both `@` and `@-`; when the worker did `jj new main` and
+    // committed on `@` without pushing, `@-` is the tip of `main` —
+    // which is the merge commit of whatever PR landed most recently.
+    // The GitHub `commits/{sha}/pulls` endpoint then happily returns
+    // that unrelated, already-merged PR. Without this gate the
+    // completion handler stamps the chore's `pr_url` with it and
+    // transitions to `done`, so the kanban Review column is skipped
+    // and the audit trail points at an unrelated PR.
+    //
+    // The legitimate worker-attribution path is: the worker pushed
+    // their branch (or it was pushed previously) and at least one
+    // local commit sha matches the PR's `head.sha`. For unmerged PRs
+    // we already required `head_match` to classify as `Fresh`; require
+    // it for `Merged` and `Closed` too so a commit that the worker
+    // didn't actually create the PR for can't get bound. Failing the
+    // gate returns `None`, which the on-Stop handler treats as
+    // "awaiting input" — the worker is probed to push and open a PR.
     let head_match = local_shas
         .iter()
         .any(|c| c.eq_ignore_ascii_case(&pr.head_sha));
+
+    if pr.merged_at.is_some() {
+        if head_match {
+            return PrStatus::Merged { url: pr.url };
+        }
+        return PrStatus::None;
+    }
+    if pr.state.eq_ignore_ascii_case("closed") {
+        if head_match {
+            return PrStatus::Closed { url: pr.url };
+        }
+        return PrStatus::None;
+    }
     if head_match {
         PrStatus::Fresh { url: pr.url }
     } else {
@@ -1845,6 +1871,354 @@ mod tests {
             after.status, "running",
             "non-conflict-kind executions must not trip the conflict-resolution finalizer",
         );
+    }
+
+    /// Regression for the "worker's `@-` is a recent squash-merge
+    /// commit on `main`" misbind (the engine PR-auto-bind regression
+    /// where chores were getting stamped with PRs referenced as prior
+    /// art in their description text). When the worker did
+    /// `jj new main` and committed locally without pushing, `@-`
+    /// resolves to the tip of `main` — which is the merge commit of
+    /// whatever PR landed most recently. The GitHub
+    /// `commits/{sha}/pulls` endpoint then returns that unrelated,
+    /// already-merged PR. Without the head-sha gate, the on-Stop
+    /// handler would stamp the chore's `pr_url` with that PR and
+    /// transition it to `done`.
+    ///
+    /// The gate: `classify_pr` only returns `Merged`/`Closed` if at
+    /// least one local sha matches the PR's `head.sha`. The squash
+    /// case keeps `head.sha` = the original PR branch head, which is
+    /// a different sha from `@-` on main, so a mismatched merged PR
+    /// is correctly rejected as `None`.
+    #[test]
+    fn classify_pr_rejects_merged_pr_when_head_sha_not_in_local_shas() {
+        // Worker's @ is unpushed; @- is the squash-merge commit on
+        // main. The merged PR returned by GitHub has `head.sha` =
+        // the original branch head, which is neither @ nor @-.
+        let pr = ApiPr {
+            url: "https://github.com/foo/bar/pull/99".into(),
+            state: "closed".into(),
+            merged_at: Some("2026-05-12T03:51:00Z".into()),
+            head_sha: "branch_head_sha_aaaaaaaaaaaaaaaaaa".into(),
+        };
+        let local_shas = vec![
+            "worker_at_sha_111111111111111111111".into(),
+            "main_tip_sha_222222222222222222222".into(),
+        ];
+        assert_eq!(classify_pr(pr, &local_shas), PrStatus::None);
+    }
+
+    /// Sibling regression: a closed-but-not-merged PR whose `head.sha`
+    /// doesn't appear in the worker's local shas is also rejected.
+    /// The on-Stop handler treats `None` and `Closed` identically
+    /// (publish_awaiting_pr + queue PROBE_NO_PR), so the user-visible
+    /// behavior is unchanged for the legitimate "worker pushed, PR got
+    /// closed" case — but a phantom closed PR found via `@-` on main
+    /// can no longer leak a url onto the chore via downstream code
+    /// that reads `PrStatus::url()`.
+    #[test]
+    fn classify_pr_rejects_closed_pr_when_head_sha_not_in_local_shas() {
+        let pr = ApiPr {
+            url: "https://github.com/foo/bar/pull/100".into(),
+            state: "closed".into(),
+            merged_at: None,
+            head_sha: "branch_head_sha_bbbbbbbbbbbbbbbbbb".into(),
+        };
+        let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
+        assert_eq!(classify_pr(pr, &local_shas), PrStatus::None);
+    }
+
+    /// Positive case: a merged PR whose `head.sha` matches a local sha
+    /// (the worker pushed and then their PR got merged before Stop
+    /// fired) still classifies as `Merged`. This keeps the
+    /// `merged_pr_skips_in_review_and_moves_chore_to_done` flow alive
+    /// for the legitimate fast-merge case.
+    #[test]
+    fn classify_pr_accepts_merged_pr_when_head_sha_matches_local() {
+        let pr = ApiPr {
+            url: "https://github.com/foo/bar/pull/42".into(),
+            state: "closed".into(),
+            merged_at: Some("2026-05-12T04:00:00Z".into()),
+            head_sha: "worker_at_sha_111111111111111111111".into(),
+        };
+        let local_shas = vec![
+            "worker_at_sha_111111111111111111111".into(),
+            "worker_parent_sha_222222222222222222222".into(),
+        ];
+        assert_eq!(
+            classify_pr(pr, &local_shas),
+            PrStatus::Merged {
+                url: "https://github.com/foo/bar/pull/42".into(),
+            },
+        );
+    }
+
+    /// End-to-end regression mirror of the user-reported symptom:
+    /// the chore description references multiple historical merged
+    /// PRs in narrative text, and the worker exits without pushing.
+    /// The detector returns `None` (because the structural head-sha
+    /// gate in `classify_pr` rejects the parent-on-main false
+    /// positive), and the on-Stop handler must therefore leave the
+    /// chore in `active` with `pr_url` unset — NOT transition it to
+    /// `done` against one of the PRs mentioned in the description.
+    ///
+    /// We can't drive `classify_pr` from end-to-end here without a
+    /// real `gh`/`jj` install in the test harness, so we stub the
+    /// detector with `PrStatus::None` (the exact value the fixed
+    /// `classify_pr` now returns for the bug scenario) and assert on
+    /// the chore-and-execution state the handler is supposed to land
+    /// in. The description-text storm is preserved to make the
+    /// intent clear if this test ever has to be revisited.
+    #[tokio::test]
+    async fn chore_with_pr_references_in_description_stays_active_when_worker_exits_without_pr() {
+        let workspace = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+        let description_with_pr_refs = "\
+This is a follow-up to PR #379 (the auto-bind safety net work). \
+See #379 for context. We also referenced #379 in the design doc. \
+PR #379 was reverted in #381; the structural fix from PR #379 should \
+not be reintroduced as-is. Out-of-scope section of prior PR #379 \
+applies. Discussion in PR #379 still relevant. PR #379. PR #379. \
+PR #379. PR #379.";
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Engine PR-auto-bind regression returned".into(),
+                description: Some(description_with_pr_refs.into()),
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // Worker exited without pushing — the (now-fixed) detector
+        // returns `None` rather than misbinding to one of the PRs
+        // mentioned in the description text.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.on_stop(&execution.id).await;
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+
+        let item = db.get_work_item(&chore.id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(
+                    t.status, "active",
+                    "chore with PR refs in description must stay active when the worker exits without a PR",
+                );
+                assert!(
+                    t.pr_url.is_none(),
+                    "pr_url must NOT be stamped from description text — got {:?}",
+                    t.pr_url,
+                );
+                assert_ne!(
+                    t.last_status_actor, "engine",
+                    "engine must NOT be the last status actor when no PR was bound",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        let exec_after = db.get_execution(&execution.id).unwrap();
+        assert_eq!(
+            exec_after.status, "waiting_human",
+            "execution must stay in waiting_human so a follow-up Stop can re-check",
+        );
+        assert_eq!(
+            exec_after.cube_lease_id.as_deref(),
+            Some("lease-1"),
+            "cube lease must NOT be released when no PR was bound",
+        );
+
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "expected one probe, got {queued:?}");
+        assert_eq!(queued[0].1, PROBE_NO_PR);
+    }
+
+    /// Second half of the required coverage: a chore whose
+    /// description references multiple historical PRs, but the
+    /// worker actually pushes and creates a real PR. The detector
+    /// reports `Fresh { url }` for the worker's PR. The chore must
+    /// bind to *that* PR (the one the worker actually created), not
+    /// to any of the PRs mentioned in the description text.
+    #[tokio::test]
+    async fn chore_with_pr_references_in_description_binds_to_worker_created_pr_not_description_pr()
+    {
+        let workspace = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+        // Description points at PR #379 repeatedly as prior art. The
+        // worker is going to actually create PR #500.
+        let description_with_pr_refs = "\
+Follow-up to PR #379. See PR #379. Reverted in #381. PR #379. PR #379. \
+PR #379. PR #379. PR #379. PR #379. PR #379.";
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Engine PR-auto-bind regression returned".into(),
+                description: Some(description_with_pr_refs.into()),
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // The worker DID create a real PR — number 500, freshly
+        // opened. The (fixed) detector reports that fresh PR's url,
+        // NOT any of the description-mentioned PRs.
+        let workers_actual_pr = "https://github.com/spinyfin/mono/pull/500";
+        let description_mentioned_pr = "https://github.com/spinyfin/mono/pull/379";
+        let detector = StubPrDetector::ok(Some(workers_actual_pr));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube,
+            publisher,
+            pane,
+            probes,
+        );
+        let outcome = handler.on_stop(&execution.id).await;
+        match outcome {
+            StopOutcome::PrDetected { pr_url } => {
+                assert_eq!(
+                    pr_url, workers_actual_pr,
+                    "must bind to the worker-created PR, not the description-mentioned one",
+                );
+            }
+            other => panic!("expected PrDetected, got {other:?}"),
+        }
+
+        let item = db.get_work_item(&chore.id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some(workers_actual_pr),
+                    "pr_url must be the worker's actual PR",
+                );
+                assert_ne!(
+                    t.pr_url.as_deref(),
+                    Some(description_mentioned_pr),
+                    "pr_url MUST NOT be one of the historical PRs the description mentions",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 
     #[test]
