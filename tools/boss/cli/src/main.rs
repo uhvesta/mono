@@ -363,6 +363,16 @@ struct ProjectListArgs {
     #[arg(long)]
     id: Vec<String>,
 
+    /// Filter by resolved repo. Accepts a full URL or a short
+    /// name (basename of the URL minus `.git`). Short-name match is
+    /// case-insensitive prefix; selectors shorter than 2 chars are
+    /// rejected to keep false-positive density low.
+    ///
+    /// Projects don't carry a repo column today; the filter matches
+    /// against the parent product's `repo_remote_url`.
+    #[arg(long = "repo")]
+    repo: Option<String>,
+
     #[command(flatten)]
     dep: DependencyFilterArgs,
 }
@@ -471,6 +481,13 @@ struct TaskCreateArgs {
     /// Priority of the new task. Omitted → engine default (`medium`).
     #[arg(long)]
     priority: Option<TaskPriority>,
+
+    /// Repo URL override for this task. Omit to inherit from the
+    /// product default; pass `""` later via `task update --repo ""`
+    /// to clear an override.
+    #[arg(long = "repo")]
+    #[arg(alias = "repo-remote-url")]
+    repo_remote_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -502,6 +519,15 @@ struct TaskListArgs {
     #[arg(long)]
     id: Vec<String>,
 
+    /// Filter by resolved repo. Accepts a full URL or a short
+    /// name (basename of the URL minus `.git`). Resolution falls
+    /// back to the parent product's `repo_remote_url` when the
+    /// task carries no override, so `--repo nimbus` finds inherited
+    /// matches too. Short-name match is case-insensitive prefix;
+    /// selectors shorter than 2 chars are rejected.
+    #[arg(long = "repo")]
+    repo: Option<String>,
+
     #[command(flatten)]
     dep: DependencyFilterArgs,
 }
@@ -520,6 +546,13 @@ struct ChoreCreateArgs {
     /// Priority of the new chore. Omitted → engine default (`medium`).
     #[arg(long)]
     priority: Option<TaskPriority>,
+
+    /// Repo URL override for this chore. Omit to inherit from the
+    /// product default; pass `""` later via `chore update --repo ""`
+    /// to clear an override.
+    #[arg(long = "repo")]
+    #[arg(alias = "repo-remote-url")]
+    repo_remote_url: Option<String>,
 }
 
 /// Args for `boss task create-many`. The CLI reads a JSON array of
@@ -590,6 +623,10 @@ struct ChoreListArgs {
     /// Filter to specific id(s); repeatable.
     #[arg(long)]
     id: Vec<String>,
+
+    /// Filter by resolved repo. See `boss task list --help`.
+    #[arg(long = "repo")]
+    repo: Option<String>,
 
     #[command(flatten)]
     dep: DependencyFilterArgs,
@@ -670,6 +707,13 @@ struct TaskUpdateArgs {
     /// `boss chore update --help`.
     #[arg(long = "pr-url", hide_short_help = true)]
     pr_url: Option<String>,
+
+    /// Set or clear this item's repo override. `--repo <url>` sets
+    /// the override; `--repo ""` clears it so the item inherits
+    /// from the product default. Same shape as `--pr-url ""`.
+    #[arg(long = "repo")]
+    #[arg(alias = "repo-remote-url")]
+    repo_remote_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1248,6 +1292,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
         ProjectCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let dep_filter = args.dep.into_filter();
+            let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
             let projects = list_projects(&mut client, &product.id, dep_filter).await?;
             let projects = apply_project_list_filters(
                 projects,
@@ -1255,6 +1300,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 args.match_term.as_deref(),
                 &args.id,
                 args.limit,
+                repo_selector.as_ref(),
+                product.repo_remote_url.as_deref(),
             );
             print_entity(
                 ctx,
@@ -1436,7 +1483,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: None,
+                    repo_remote_url: normalize_non_empty(args.repo_remote_url),
                 },
             )
             .await?;
@@ -1453,6 +1500,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 None => None,
             };
             let dep_filter = args.dep.into_filter();
+            let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
             let tasks = list_tasks(
                 &mut client,
                 &product.id,
@@ -1467,6 +1515,8 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 args.match_term.as_deref(),
                 &args.id,
                 args.limit,
+                repo_selector.as_ref(),
+                product.repo_remote_url.as_deref(),
             );
             print_entity(ctx, &serde_json::json!({ "tasks": tasks }), || {
                 print_tasks_table(&tasks)
@@ -1519,7 +1569,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: None,
+                    repo_remote_url: normalize_non_empty(args.repo_remote_url),
                 },
             )
             .await?;
@@ -1530,6 +1580,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
         ChoreCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let dep_filter = args.dep.into_filter();
+            let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
             let chores = list_chores(&mut client, &product.id, dep_filter).await?;
             let chores = apply_task_list_filters(
                 chores,
@@ -1538,6 +1589,8 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 args.match_term.as_deref(),
                 &args.id,
                 args.limit,
+                repo_selector.as_ref(),
+                product.repo_remote_url.as_deref(),
             );
             print_entity(ctx, &serde_json::json!({ "chores": chores }), || {
                 print_tasks_table(&chores)
@@ -1593,11 +1646,15 @@ async fn run_update_leaf(
         priority: args.priority.map(|priority| priority.as_str().to_owned()),
         ordinal: args.ordinal,
         pr_url: args.pr_url,
+        // Preserve the empty-string "clear" wire form: `--repo ""`
+        // means the engine should clear the override (inherit from
+        // the product). Don't `normalize_non_empty` here.
+        repo_remote_url: args.repo_remote_url,
         ..WorkItemPatch::default()
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, or --pr-url",
+        "provide at least one field to update, such as --status, --priority, --pr-url, or --repo",
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
@@ -2795,6 +2852,67 @@ fn unexpected_event(context: &str, event: &FrontendEvent) -> CliError {
     ))
 }
 
+/// Parsed `--repo <selector>` filter. Per design Q3 +
+/// `tools/boss/docs/designs/multi-repo-work-modeling.md` R10:
+///   - reject selectors shorter than 2 chars,
+///   - match against the *resolved* repo on every row (task override
+///     ?? parent product default), not just the override column,
+///   - selectors that look like a full URL match the canonicalised
+///     URL exactly (case-insensitive),
+///   - otherwise treat the selector as a short name and match as
+///     case-insensitive prefix of `short_name_for(url)`.
+struct RepoSelector {
+    /// Lowercased selector — used for both comparison branches.
+    lc: String,
+    /// `true` when the selector looks like a full URL (contains a
+    /// scheme separator or a `git@…:` prefix). URL form ⇒ exact
+    /// case-insensitive match; otherwise short-name prefix match.
+    is_url_form: bool,
+}
+
+impl RepoSelector {
+    fn parse(raw: &str) -> Result<Self, CliError> {
+        let trimmed = raw.trim();
+        if trimmed.len() < 2 {
+            return Err(CliError::usage(
+                "--repo selector must be at least 2 characters (avoids spurious short-name matches)",
+            ));
+        }
+        let is_url_form = trimmed.contains("://") || trimmed.starts_with("git@");
+        Ok(Self {
+            lc: trimmed.to_ascii_lowercase(),
+            is_url_form,
+        })
+    }
+
+    /// Match against an effective repo URL. `None` (work item has no
+    /// resolution) never matches — `--repo` is a positive filter.
+    fn matches(&self, resolved_url: Option<&str>) -> bool {
+        let Some(url) = resolved_url else { return false };
+        let lc_url = url.to_ascii_lowercase();
+        if self.is_url_form {
+            return lc_url == self.lc;
+        }
+        let short = short_name_for(&lc_url);
+        short.starts_with(&self.lc)
+    }
+}
+
+/// Match `short_name_for` from the design — basename of the path
+/// minus `.git`. Pure string parse, no registry lookup.
+fn short_name_for(url: &str) -> &str {
+    let after_slash = url.rsplit('/').next().unwrap_or(url);
+    let after_colon = after_slash.rsplit(':').next().unwrap_or(after_slash);
+    after_colon.trim_end_matches(".git")
+}
+
+/// Resolve a task / chore's effective repo: its own override wins;
+/// fall back to the product's default. Used by the `--repo` filter
+/// so `--repo nimbus` finds inherited matches too (design R10 / Q3).
+fn resolved_repo_for_task<'a>(task: &'a Task, product_repo: Option<&'a str>) -> Option<&'a str> {
+    task.repo_remote_url.as_deref().or(product_repo)
+}
+
 fn apply_task_list_filters(
     items: Vec<Task>,
     statuses: &[TaskStatus],
@@ -2802,6 +2920,8 @@ fn apply_task_list_filters(
     match_term: Option<&str>,
     ids: &[String],
     limit: Option<usize>,
+    repo: Option<&RepoSelector>,
+    product_repo: Option<&str>,
 ) -> Vec<Task> {
     let allowed_statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
     let allowed_priorities: Vec<&str> = priorities.iter().map(|p| p.as_str()).collect();
@@ -2828,6 +2948,11 @@ fn apply_task_list_filters(
                     return false;
                 }
             }
+            if let Some(selector) = repo {
+                if !selector.matches(resolved_repo_for_task(task, product_repo)) {
+                    return false;
+                }
+            }
             true
         })
         .take(limit.unwrap_or(usize::MAX))
@@ -2840,6 +2965,8 @@ fn apply_project_list_filters(
     match_term: Option<&str>,
     ids: &[String],
     limit: Option<usize>,
+    repo: Option<&RepoSelector>,
+    product_repo: Option<&str>,
 ) -> Vec<Project> {
     let allowed_statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
     let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -2858,6 +2985,14 @@ fn apply_project_list_filters(
                 let name = project.name.to_lowercase();
                 let desc = project.description.to_lowercase();
                 if !name.contains(term.as_str()) && !desc.contains(term.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(selector) = repo {
+                // Projects have no repo column today; they resolve
+                // through their parent product, so every project under
+                // a given product shares the same effective repo.
+                if !selector.matches(product_repo) {
                     return false;
                 }
             }
@@ -3149,9 +3284,9 @@ mod tests {
 
     use super::{
         BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, OpenDesignAction,
-        ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, TaskCommand,
+        ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, TaskCommand,
         classify_bind_pr, decide_open_design_action, expect_leaf_work_item,
-        format_project_design_doc_line, pick_by_index, validate_github_pr_url,
+        format_project_design_doc_line, pick_by_index, short_name_for, validate_github_pr_url,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -3814,5 +3949,176 @@ mod tests {
         let line = format_project_design_doc_line(&state).expect("broken → line");
         assert!(line.contains("(broken)"));
         assert!(line.contains("no repo"));
+    }
+
+    #[test]
+    fn parses_chore_create_with_repo_override() {
+        let cli = Cli::parse_from([
+            "boss",
+            "chore",
+            "create",
+            "--product",
+            "work",
+            "--name",
+            "fix it",
+            "--repo",
+            "git@github.com:myorg/nimbus.git",
+        ]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::Create(args),
+            } => {
+                assert_eq!(args.product.as_deref(), Some("work"));
+                assert_eq!(
+                    args.repo_remote_url.as_deref(),
+                    Some("git@github.com:myorg/nimbus.git")
+                );
+            }
+            _ => panic!("expected chore create command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_create_with_repo_override() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "create",
+            "--product",
+            "boss",
+            "--project",
+            "plan",
+            "--name",
+            "n",
+            "--repo",
+            "https://github.com/myorg/wiki.git",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Create(args),
+            } => {
+                assert_eq!(
+                    args.repo_remote_url.as_deref(),
+                    Some("https://github.com/myorg/wiki.git")
+                );
+            }
+            _ => panic!("expected task create command"),
+        }
+    }
+
+    /// `--repo ""` on update is the canonical "clear the override"
+    /// form (mirrors `--pr-url ""`). Clap surfaces it as
+    /// `Some("")`; the engine canonicaliser turns the empty string
+    /// into `None` so the task inherits from the product again.
+    #[test]
+    fn parses_task_update_with_repo_clear() {
+        let cli = Cli::parse_from([
+            "boss", "task", "update", "task_1", "--repo", "",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Update(args),
+            } => {
+                assert_eq!(args.id, "task_1");
+                assert_eq!(args.repo_remote_url.as_deref(), Some(""));
+            }
+            _ => panic!("expected task update command"),
+        }
+    }
+
+    #[test]
+    fn parses_chore_update_with_repo_set() {
+        let cli = Cli::parse_from([
+            "boss",
+            "chore",
+            "update",
+            "task_xyz",
+            "--repo",
+            "git@github.com:myorg/nimbus.git",
+        ]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::Update(args),
+            } => {
+                assert_eq!(
+                    args.repo_remote_url.as_deref(),
+                    Some("git@github.com:myorg/nimbus.git")
+                );
+            }
+            _ => panic!("expected chore update command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_list_with_repo_filter() {
+        let cli = Cli::parse_from([
+            "boss", "task", "list", "--product", "work", "--repo", "nimbus",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::List(args),
+            } => {
+                assert_eq!(args.repo.as_deref(), Some("nimbus"));
+            }
+            _ => panic!("expected task list command"),
+        }
+    }
+
+    #[test]
+    fn short_name_for_handles_ssh_and_https() {
+        assert_eq!(
+            short_name_for("git@github.com:spinyfin/mono.git"),
+            "mono"
+        );
+        assert_eq!(
+            short_name_for("https://github.com/spinyfin/mono.git"),
+            "mono"
+        );
+        assert_eq!(short_name_for("https://github.com/foo/bar"), "bar");
+    }
+
+    #[test]
+    fn repo_selector_rejects_short_input() {
+        assert!(RepoSelector::parse("").is_err());
+        assert!(RepoSelector::parse("m").is_err());
+        assert!(RepoSelector::parse("  m ").is_err(), "whitespace doesn't count");
+        assert!(RepoSelector::parse("mo").is_ok());
+    }
+
+    #[test]
+    fn repo_selector_short_name_prefix_match() {
+        let sel = RepoSelector::parse("nim").unwrap();
+        assert!(sel.matches(Some("git@github.com:myorg/nimbus.git")));
+        assert!(sel.matches(Some("https://github.com/other/nimbus-platform.git")));
+        // Wrong product but same repo short-name → match (Q3).
+        assert!(sel.matches(Some("https://github.com/foo/nimbus")));
+        // Different repo, prefix doesn't match.
+        assert!(!sel.matches(Some("git@github.com:myorg/mono.git")));
+        // Unresolved row never matches.
+        assert!(!sel.matches(None));
+    }
+
+    /// Inherited match: a task with no override but whose parent
+    /// product points at `nimbus` should match `--repo nimbus`. The
+    /// CLI resolves against the *effective* repo, not the raw column.
+    #[test]
+    fn repo_selector_matches_inherited_product_default() {
+        let sel = RepoSelector::parse("nimbus").unwrap();
+        let task = dummy_task("task_1", "task");
+        assert!(task.repo_remote_url.is_none());
+        let resolved =
+            super::resolved_repo_for_task(&task, Some("git@github.com:myorg/nimbus.git"));
+        assert!(sel.matches(resolved));
+    }
+
+    #[test]
+    fn repo_selector_full_url_form_is_exact_match() {
+        let sel = RepoSelector::parse("git@github.com:myorg/nimbus.git").unwrap();
+        // case-insensitive exact match
+        assert!(sel.matches(Some("git@github.com:myorg/nimbus.git")));
+        assert!(sel.matches(Some("GIT@GITHUB.COM:MYORG/NIMBUS.GIT")));
+        // a different repo with the same short name does NOT match
+        // when the selector is the URL form.
+        assert!(!sel.matches(Some("git@github.com:other/nimbus.git")));
     }
 }

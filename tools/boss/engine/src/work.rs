@@ -72,7 +72,7 @@ impl WorkDb {
         let now = now_string();
         let slug = unique_product_slug(&tx, &slugify(&input.name))?;
         let description = input.description.unwrap_or_default();
-        let repo_remote_url = normalize_optional_text(input.repo_remote_url);
+        let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
 
         tx.execute(
             "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at)
@@ -1655,7 +1655,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1666,7 +1666,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -1749,7 +1749,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1758,7 +1758,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1857,7 +1857,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -2284,7 +2284,7 @@ impl WorkDb {
 
         apply_text_patch(&mut product.name, patch.name);
         apply_text_patch(&mut product.description, patch.description);
-        apply_optional_patch(&mut product.repo_remote_url, patch.repo_remote_url);
+        apply_repo_remote_url_patch(&mut product.repo_remote_url, patch.repo_remote_url);
         apply_text_patch(&mut product.status, patch.status);
         product.slug = unique_product_slug_for_update(&tx, id, &slugify(&product.name))?;
         product.updated_at = now_string();
@@ -2377,6 +2377,7 @@ impl WorkDb {
         apply_text_patch(&mut task.description, patch.description);
         apply_text_patch(&mut task.status, patch.status);
         apply_optional_patch(&mut task.pr_url, patch.pr_url);
+        apply_repo_remote_url_patch(&mut task.repo_remote_url, patch.repo_remote_url);
         if let Some(priority_patch) = patch.priority {
             task.priority = normalize_priority(Some(&priority_patch))?;
         }
@@ -2393,7 +2394,7 @@ impl WorkDb {
         tx.execute(
             "UPDATE tasks
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
-                 priority = ?9,
+                 priority = ?9, repo_remote_url = ?10,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
              WHERE id = ?1",
             params![
@@ -2406,6 +2407,7 @@ impl WorkDb {
                 task.updated_at,
                 actor,
                 task.priority,
+                task.repo_remote_url,
             ],
         )?;
 
@@ -2889,9 +2891,9 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         last_status_actor: row.get(13)?,
         priority: row.get(14)?,
         created_via: row.get(15)?,
-        repo_remote_url: None,
         blocked_reason: row.get(16)?,
         blocked_attempt_id: row.get(17)?,
+        repo_remote_url: row.get(18)?,
     })
 }
 
@@ -2954,11 +2956,12 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "task");
+    let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
@@ -2973,11 +2976,12 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "chore");
+    let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
-         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8)",
-        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url)
+         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9)",
+        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
@@ -3130,7 +3134,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -3193,7 +3197,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -4309,15 +4313,33 @@ fn validate_design_doc_path(path: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-/// Canonicalise a caller-supplied design-doc repo remote URL into
-/// the same shape `products.repo_remote_url` uses. Today both fields
-/// route through `normalize_optional_text` (trim + blank→None) so a
-/// project pointer that inherits "the product's repo" doesn't drift
-/// out of equality on round-trip. Lift this to a richer
-/// `(scheme, owner, repo, .git)` canonicaliser if the product side
-/// ever grows one.
-fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> Option<String> {
+/// Canonicalise a caller-supplied repo remote URL into the same shape
+/// stored on `products.repo_remote_url`. Shared between every column
+/// that holds a repo URL: product default, task / chore override,
+/// project design-doc pointer. Today the canonical form is just
+/// `trim + blank→None`; lift to a richer `(scheme, owner, repo, .git)`
+/// canonicaliser here when the column grows one — every write site
+/// already routes through this function.
+pub fn canonicalize_repo_remote_url(value: Option<String>) -> Option<String> {
     normalize_optional_text(value)
+}
+
+/// Per design Q3 (`tools/boss/docs/designs/multi-repo-work-modeling.md`):
+/// strip protocol + host, take the path basename minus `.git`.
+///   `git@github.com:foo/bar.git` → `bar`
+///   `https://github.com/foo/bar.git` → `bar`
+/// Pure-string parse — no registry. Used by the CLI to match
+/// `--repo <selector>` against a resolved repo URL.
+pub fn short_name_for(url: &str) -> &str {
+    let after_slash = url.rsplit('/').next().unwrap_or(url);
+    let after_colon = after_slash.rsplit(':').next().unwrap_or(after_slash);
+    after_colon.trim_end_matches(".git")
+}
+
+/// Thin wrapper kept for the design-doc call sites until they migrate
+/// to [`canonicalize_repo_remote_url`] directly.
+fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> Option<String> {
+    canonicalize_repo_remote_url(value)
 }
 
 /// Build the GitHub web URL for a design doc per the design's Q5
@@ -4356,6 +4378,18 @@ fn find_product_by_repo_remote_url(conn: &Connection, repo_remote_url: &str) -> 
 fn apply_text_patch(target: &mut String, patch: Option<String>) {
     if let Some(value) = patch {
         *target = value;
+    }
+}
+
+/// Apply a `WorkItemPatch.repo_remote_url` update with the canonical
+/// "empty-string clears" wire convention. `None` patch means "leave
+/// the column alone." `Some("")` (or any whitespace-only string)
+/// means "clear the override / inherit." Otherwise canonicalise and
+/// store the value. Shared between product / task / chore update
+/// paths so a single rule governs every repo URL column.
+fn apply_repo_remote_url_patch(target: &mut Option<String>, patch: Option<String>) {
+    if let Some(value) = patch {
+        *target = canonicalize_repo_remote_url(Some(value));
     }
 }
 

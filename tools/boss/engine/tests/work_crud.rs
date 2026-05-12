@@ -293,6 +293,111 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
     Ok(())
 }
 
+/// End-to-end round-trip for the multi-repo CLI feature: an explicit
+/// `repo_remote_url` on `CreateChoreInput` persists, is readable via
+/// `ListChores`, can be cleared via `WorkItemPatch.repo_remote_url =
+/// Some("")` (the `boss <kind> update --repo ""` wire form), and the
+/// cleared row reads back with `repo_remote_url = None` so the
+/// downstream resolver inherits the product default. Acceptance test
+/// for the "CLI: --repo flag on chore/task/project create, update,
+/// list verbs" work item.
+#[tokio::test]
+async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Work".to_owned(),
+            description: None,
+            // Product has no default repo — every chore here picks one.
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+
+    // Create-with-override: the wire field lands on the row.
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Fix nimbus deploy".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
+        },
+    )
+    .await?;
+    assert_eq!(
+        chore.repo_remote_url.as_deref(),
+        Some("git@github.com:myorg/nimbus.git"),
+    );
+
+    // List-with-filter (the CLI's job): the override survives the
+    // SELECT and is visible on the listed row, so the CLI's
+    // `RepoSelector` can match against the resolved repo.
+    let listed = list_chores(&mut client, &product.id).await?;
+    let row = listed
+        .iter()
+        .find(|c| c.id == chore.id)
+        .expect("chore missing from list");
+    assert_eq!(
+        row.repo_remote_url.as_deref(),
+        Some("git@github.com:myorg/nimbus.git"),
+    );
+
+    // Update-to-clear: the engine canonicalises empty-string to
+    // `None` (matching the existing `--pr-url ""` convention).
+    let cleared = expect_chore(
+        update_work_item(
+            &mut client,
+            &chore.id,
+            WorkItemPatch {
+                repo_remote_url: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert!(
+        cleared.repo_remote_url.is_none(),
+        "empty-string patch must clear the override, got {:?}",
+        cleared.repo_remote_url,
+    );
+
+    // List-without-filter shape: the row reads back with the column
+    // unset, ready to inherit from the product default at dispatch.
+    let listed_after = list_chores(&mut client, &product.id).await?;
+    let row_after = listed_after
+        .iter()
+        .find(|c| c.id == chore.id)
+        .expect("chore missing from list after clear");
+    assert!(row_after.repo_remote_url.is_none());
+
+    // Set it back to a different URL to confirm overwrite works too
+    // (the CLI's set / clear / re-set cycle).
+    let reset = expect_chore(
+        update_work_item(
+            &mut client,
+            &chore.id,
+            WorkItemPatch {
+                repo_remote_url: Some("https://github.com/other/wiki.git".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(
+        reset.repo_remote_url.as_deref(),
+        Some("https://github.com/other/wiki.git"),
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn second_client_receives_invalidation_from_first() -> Result<()> {
     let engine = TestEngine::spawn().await?;
