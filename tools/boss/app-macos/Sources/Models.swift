@@ -4,6 +4,11 @@ enum NavigationMode: String, CaseIterable, Identifiable {
     case agents = "Agents"
     case work = "Work"
     case designs = "Designs"
+    /// Engine-tab: lists `conflict_resolutions` (and, when the auto-
+    /// rebase-stacked-prs flow lands, `rebase_attempts`) — the engine's
+    /// attempt-shaped remediation feed. Phase 5 #14 of the merge-
+    /// conflict design.
+    case engine = "Engine"
 
     var id: String { rawValue }
 }
@@ -736,6 +741,102 @@ enum AgentActivityState {
             return reason
         case .none:
             return "No agent attached"
+        }
+    }
+}
+
+/// Swift mirror of `boss_protocol::ConflictResolution`. One engine
+/// attempt to clear a merge conflict on an `in_review` PR. Powers the
+/// Engine tab's attempt-row list (design Phase 5 #14) and the
+/// "🔧 conflict cleared" PR-card badge (#15).
+struct WorkConflictResolution: Identifiable, Hashable {
+    let id: String
+    var productID: String
+    var workItemID: String
+    var prURL: String
+    var prNumber: Int
+    var headBranch: String
+    var baseBranch: String
+    var baseSHAAtTrigger: String?
+    var headSHABefore: String?
+    var headSHAAfter: String?
+    /// `pending` / `running` / `succeeded` / `failed` / `abandoned` /
+    /// `superseded`. See the wire-type docs in `boss_protocol::types`
+    /// for the lifecycle.
+    var status: String
+    var failureReason: String?
+    var cubeLeaseID: String?
+    var cubeWorkspaceID: String?
+    var workerID: String?
+    /// Raw JSON blob the worker prompt was built from. Carried verbatim
+    /// here so the detail panel can surface it without a separate fetch.
+    var conflictDiagnosis: String?
+    var createdAt: String
+    var startedAt: String?
+    var finishedAt: String?
+}
+
+/// Discriminator for the unified Engine-tab attempt feed. Phase 5 #14
+/// lists `conflict_resolutions` and (when the auto-rebase-stacked-prs
+/// flow lands) `rebase_attempts` together. The Swift side keeps the
+/// row kinds in a single sortable list so future row kinds (CI
+/// remediations per the design Phase 9 #37) just grow this enum.
+enum EngineAttemptRow: Identifiable, Hashable {
+    case conflictResolution(WorkConflictResolution)
+
+    var id: String {
+        switch self {
+        case .conflictResolution(let r):
+            return "crz:\(r.id)"
+        }
+    }
+
+    var kindLabel: String {
+        switch self {
+        case .conflictResolution:
+            return "Conflict"
+        }
+    }
+
+    var status: String {
+        switch self {
+        case .conflictResolution(let r):
+            return r.status
+        }
+    }
+
+    var prURL: String {
+        switch self {
+        case .conflictResolution(let r):
+            return r.prURL
+        }
+    }
+
+    var workItemID: String {
+        switch self {
+        case .conflictResolution(let r):
+            return r.workItemID
+        }
+    }
+
+    var createdAt: String {
+        switch self {
+        case .conflictResolution(let r):
+            return r.createdAt
+        }
+    }
+
+    var finishedAt: String? {
+        switch self {
+        case .conflictResolution(let r):
+            return r.finishedAt
+        }
+    }
+
+    var failureReason: String? {
+        switch self {
+        case .conflictResolution(let r):
+            return r.failureReason
         }
     }
 }

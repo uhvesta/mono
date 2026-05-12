@@ -4173,6 +4173,165 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            FrontendRequest::ListConflictResolutions {
+                product_id,
+                status,
+                work_item_id,
+                limit,
+            } => {
+                // Read-only listing surface for `boss engine conflicts
+                // list`. No auth gate — the rows are diagnostic and the
+                // caller can already read the SQLite file.
+                match work_db.list_conflict_resolutions(
+                    product_id.as_deref(),
+                    &status,
+                    work_item_id.as_deref(),
+                    limit,
+                ) {
+                    Ok(attempts) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::ConflictResolutionsList { attempts },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::GetConflictResolution { attempt_id } => {
+                match work_db.get_conflict_resolution(&attempt_id) {
+                    Ok(Some(attempt)) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::ConflictResolution { attempt },
+                    ),
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "conflict resolution attempt {attempt_id:?} is unknown",
+                            ),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::RetryConflictResolution { attempt_id } => {
+                match work_db.retry_conflict_resolution(&attempt_id) {
+                    Ok(Some(attempt)) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            work_item_id = %attempt.work_item_id,
+                            pr_url = %attempt.pr_url,
+                            "retry_conflict_resolution: attempt reset to pending",
+                        );
+                        // Mirror the freshly-pending start so the macOS
+                        // app's activity feed shows the retry as a new
+                        // attempt. The wire shape is identical to the
+                        // detection-path's started event — the consumer
+                        // doesn't need to distinguish.
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &attempt.product_id,
+                                FrontendEvent::ConflictResolutionStarted {
+                                    product_id: attempt.product_id.clone(),
+                                    work_item_id: attempt.work_item_id.clone(),
+                                    attempt_id: attempt.id.clone(),
+                                    pr_url: attempt.pr_url.clone(),
+                                },
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ConflictResolutionRetried { attempt },
+                        );
+                    }
+                    Ok(None) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "conflict resolution attempt {attempt_id:?} is unknown or not in a terminal-failure state (only failed/abandoned rows can be retried)",
+                                ),
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::AbandonConflictResolution { attempt_id, reason } => {
+                match work_db.mark_conflict_resolution_abandoned(&attempt_id, &reason) {
+                    Ok(Some(attempt)) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            work_item_id = %attempt.work_item_id,
+                            pr_url = %attempt.pr_url,
+                            %reason,
+                            "abandon_conflict_resolution: attempt flipped to abandoned",
+                        );
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &attempt.product_id,
+                                FrontendEvent::ConflictResolutionAbandoned {
+                                    product_id: attempt.product_id.clone(),
+                                    work_item_id: attempt.work_item_id.clone(),
+                                    attempt_id: attempt.id.clone(),
+                                    pr_url: attempt.pr_url.clone(),
+                                    failure_reason: reason.clone(),
+                                },
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ConflictResolutionMarkedAbandoned { attempt },
+                        );
+                    }
+                    Ok(None) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "conflict resolution attempt {attempt_id:?} is unknown or already terminal",
+                                ),
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::MarkConflictResolutionFailed { attempt_id, reason } => {
                 // Worker-facing stop-condition surface. `User` tier:
                 // the worker pane invokes `boss engine conflicts

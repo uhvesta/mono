@@ -116,6 +116,23 @@ enum EngineEvent {
     /// per-project `ProjectDesignDocState` the kanban consumes to
     /// pick the right icon affordance and open dispatch.
     case projectDesignDocResolved(output: ResolveProjectDesignDocOutput)
+    /// Response to `list_conflict_resolutions` — the filtered set of
+    /// rows for the Engine tab. Phase 5 #13/#14 of the merge-conflict
+    /// design.
+    case conflictResolutionsList(attempts: [WorkConflictResolution])
+    /// Activity-feed push: a fresh conflict-resolution attempt was
+    /// created (or a `retry` reset an existing one) and a worker is
+    /// about to take over. The Engine tab refreshes; the badge state
+    /// is unaffected (only `succeeded` counts as a "cleared" event).
+    case conflictResolutionStarted(productID: String, workItemID: String, attemptID: String, prURL: String)
+    /// Activity-feed push: an attempt finished successfully. Drives the
+    /// "🔧 conflict cleared" PR-card badge (Phase 5 #15) and refreshes
+    /// the Engine tab.
+    case conflictResolutionSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String)
+    /// Activity-feed push: an attempt failed terminally.
+    case conflictResolutionFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    /// Activity-feed push: an attempt was abandoned on purpose.
+    case conflictResolutionAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -325,6 +342,31 @@ final class EngineClient: @unchecked Sendable {
             "type": "resolve_project_design_doc",
             "project_id": projectID,
         ])
+    }
+
+    /// Engine-tab listing fetch (Phase 5 #14). `productID = nil`
+    /// returns every product's attempts; `statuses` is AND-ed on the
+    /// server, `limit` caps the response.
+    func sendListConflictResolutions(
+        productID: String? = nil,
+        statuses: [String] = [],
+        workItemID: String? = nil,
+        limit: Int? = nil
+    ) {
+        var payload: [String: Any] = ["type": "list_conflict_resolutions"]
+        if let productID {
+            payload["product_id"] = productID
+        }
+        if !statuses.isEmpty {
+            payload["status"] = statuses
+        }
+        if let workItemID {
+            payload["work_item_id"] = workItemID
+        }
+        if let limit {
+            payload["limit"] = limit
+        }
+        sendLine(payload)
     }
 
     func sendSpawnWorkerPaneResponse(requestId: String, result: EngineSpawnResult) {
@@ -701,6 +743,40 @@ final class EngineClient: @unchecked Sendable {
                     break
                 }
                 emit(.projectDesignDocResolved(output: output))
+            case "conflict_resolutions_list":
+                let raw = payload["attempts"] as? [[String: Any]] ?? []
+                let attempts = raw.compactMap(parseConflictResolution)
+                emit(.conflictResolutionsList(attempts: attempts))
+            case "conflict_resolution_started":
+                emit(.conflictResolutionStarted(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? ""
+                ))
+            case "conflict_resolution_succeeded":
+                emit(.conflictResolutionSucceeded(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? ""
+                ))
+            case "conflict_resolution_failed":
+                emit(.conflictResolutionFailed(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? "",
+                    failureReason: payload["failure_reason"] as? String ?? ""
+                ))
+            case "conflict_resolution_abandoned":
+                emit(.conflictResolutionAbandoned(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? "",
+                    failureReason: payload["failure_reason"] as? String ?? ""
+                ))
             default:
                 break
             }
@@ -821,6 +897,42 @@ final class EngineClient: @unchecked Sendable {
             repoRemoteURL: payload["repo_remote_url"] as? String,
             blockedReason: payload["blocked_reason"] as? String,
             blockedAttemptID: payload["blocked_attempt_id"] as? String
+        )
+    }
+
+    private func parseConflictResolution(_ payload: [String: Any]) -> WorkConflictResolution? {
+        guard let id = payload["id"] as? String,
+              let productID = payload["product_id"] as? String,
+              let workItemID = payload["work_item_id"] as? String,
+              let prURL = payload["pr_url"] as? String,
+              let headBranch = payload["head_branch"] as? String,
+              let baseBranch = payload["base_branch"] as? String,
+              let status = payload["status"] as? String,
+              let createdAt = payload["created_at"] as? String
+        else {
+            return nil
+        }
+        let prNumber = (payload["pr_number"] as? NSNumber)?.intValue ?? 0
+        return WorkConflictResolution(
+            id: id,
+            productID: productID,
+            workItemID: workItemID,
+            prURL: prURL,
+            prNumber: prNumber,
+            headBranch: headBranch,
+            baseBranch: baseBranch,
+            baseSHAAtTrigger: payload["base_sha_at_trigger"] as? String,
+            headSHABefore: payload["head_sha_before"] as? String,
+            headSHAAfter: payload["head_sha_after"] as? String,
+            status: status,
+            failureReason: payload["failure_reason"] as? String,
+            cubeLeaseID: payload["cube_lease_id"] as? String,
+            cubeWorkspaceID: payload["cube_workspace_id"] as? String,
+            workerID: payload["worker_id"] as? String,
+            conflictDiagnosis: payload["conflict_diagnosis"] as? String,
+            createdAt: createdAt,
+            startedAt: payload["started_at"] as? String,
+            finishedAt: payload["finished_at"] as? String
         )
     }
 

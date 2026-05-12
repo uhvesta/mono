@@ -8,12 +8,13 @@ use boss_client::{
     stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, CREATED_VIA_CLI, CreateChoreInput, CreateManyChoresInput,
-    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
-    DependencyDirection, DependencyEdge, DependencyFilter, FrontendEvent, FrontendRequest,
-    ListDependenciesInput, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProjectDesignDocInput, Task,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    AddDependencyInput, CREATED_VIA_CLI, ConflictResolution, CreateChoreInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, FrontendEvent,
+    FrontendRequest, ListDependenciesInput, Product, Project, ProjectDesignDocState,
+    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind,
+    SetProjectDesignDocInput, Task, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -286,12 +287,77 @@ enum EngineCommand {
 
 #[derive(Debug, Subcommand)]
 enum EngineConflictsCommand {
+    /// List `conflict_resolutions` rows, freshest first. Filters are
+    /// AND-ed; omit them all to see every attempt. Human output is a
+    /// table; `--json` emits the full row vector.
+    List(EngineConflictsListArgs),
+    /// Show a single `conflict_resolutions` row by id. Carries every
+    /// column the engine has for the attempt, including the structured
+    /// `conflict_diagnosis` blob (verbatim) — useful when debugging
+    /// what the worker was handed.
+    Show(EngineConflictsShowArgs),
+    /// Reset a `failed` or `abandoned` attempt back to `pending` so the
+    /// engine re-dispatches a worker. Rejected for non-terminal rows
+    /// (`pending` / `running`). The parent work item is re-flipped to
+    /// `blocked: merge_conflict` as part of the reset.
+    Retry(EngineConflictsRetryArgs),
+    /// Mark a non-terminal attempt `abandoned`. Distinct from
+    /// `mark-failed`: the caller is explicitly stepping away (PR closed,
+    /// parent merged externally, manual override) rather than declaring
+    /// the worker gave up.
+    Abandon(EngineConflictsAbandonArgs),
     /// Flip a `conflict_resolutions` attempt to `failed` with a
     /// reason. Worker-facing escape hatch: the resolution worker calls
     /// this when it hits a stop condition (semantic obsolescence,
     /// product decision required, architectural mismatch) and chooses
     /// not to push.
     MarkFailed(EngineConflictsMarkFailedArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineConflictsListArgs {
+    /// Filter to a single product (id or slug). Omit for all products.
+    #[arg(long)]
+    product: Option<String>,
+
+    /// Filter by status. Repeatable / comma-separated. Documented
+    /// values: pending, running, succeeded, failed, abandoned,
+    /// superseded.
+    #[arg(long, value_delimiter = ',')]
+    status: Vec<String>,
+
+    /// Filter to a single parent work item id.
+    #[arg(long = "work-item")]
+    work_item: Option<String>,
+
+    /// Cap the number of returned rows. Engine returns every match
+    /// when omitted; the CLI default is 50 to keep human output
+    /// readable.
+    #[arg(long)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineConflictsShowArgs {
+    /// Attempt id from the `conflict_resolutions` table (e.g. `crz_…`).
+    attempt_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineConflictsRetryArgs {
+    /// Attempt id from the `conflict_resolutions` table.
+    attempt_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineConflictsAbandonArgs {
+    /// Attempt id from the `conflict_resolutions` table.
+    attempt_id: String,
+
+    /// Free-form reason stored verbatim in `failure_reason`.
+    /// Default: `manual_abandon`.
+    #[arg(long, default_value = "manual_abandon")]
+    reason: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1808,6 +1874,121 @@ async fn run_engine_conflicts_command(
     ctx: &RunContext,
 ) -> Result<(), CliError> {
     match command {
+        EngineConflictsCommand::List(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let product_id = match args.product.clone() {
+                Some(selector) => Some(
+                    resolve_product(&mut client, Some(selector), ctx)
+                        .await?
+                        .id,
+                ),
+                None => None,
+            };
+            // CLI-side default cap so human output stays readable; an
+            // explicit `--limit 0` is treated as "no cap" so JSON
+            // callers can stream everything.
+            let limit = match args.limit {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => Some(50),
+            };
+            let response = client
+                .send_request(&FrontendRequest::ListConflictResolutions {
+                    product_id,
+                    status: args.status.clone(),
+                    work_item_id: args.work_item.clone(),
+                    limit,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ConflictResolutionsList { attempts } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempts": attempts }),
+                    || print_conflict_resolutions_table(&attempts),
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("conflicts list", &other)),
+            }
+        }
+        EngineConflictsCommand::Show(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::GetConflictResolution {
+                    attempt_id: args.attempt_id.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ConflictResolution { attempt } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempt": attempt }),
+                    || print_conflict_resolution_detail(&attempt),
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("conflicts show", &other)),
+            }
+        }
+        EngineConflictsCommand::Retry(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::RetryConflictResolution {
+                    attempt_id: args.attempt_id.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ConflictResolutionRetried { attempt } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempt": attempt }),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "Conflict resolution {} reset to pending; engine will re-dispatch a worker.",
+                                attempt.id,
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("conflicts retry", &other)),
+            }
+        }
+        EngineConflictsCommand::Abandon(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::AbandonConflictResolution {
+                    attempt_id: args.attempt_id.clone(),
+                    reason: args.reason.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ConflictResolutionMarkedAbandoned { attempt } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempt": attempt }),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "Conflict resolution {} marked abandoned (reason: {}).",
+                                attempt.id,
+                                attempt.failure_reason.as_deref().unwrap_or("<unset>"),
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("conflicts abandon", &other)),
+            }
+        }
         EngineConflictsCommand::MarkFailed(args) => {
             let mut client = connect_for_work(ctx).await?;
             let response = client
@@ -1837,6 +2018,89 @@ async fn run_engine_conflicts_command(
                 other => Err(unexpected_event("conflicts mark-failed", &other)),
             }
         }
+    }
+}
+
+fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED",
+        ]);
+    for attempt in attempts {
+        table.add_row(vec![
+            attempt.id.as_str(),
+            attempt.status.as_str(),
+            attempt.pr_url.as_str(),
+            attempt.work_item_id.as_str(),
+            attempt.failure_reason.as_deref().unwrap_or(""),
+            attempt.created_at.as_str(),
+        ]);
+    }
+    println!("{table}");
+}
+
+fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
+    let mut table = Table::new();
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec!["FIELD", "VALUE"]);
+    let unset = "<unset>".to_owned();
+    let rows: Vec<(&str, String)> = vec![
+        ("id", attempt.id.clone()),
+        ("status", attempt.status.clone()),
+        ("product_id", attempt.product_id.clone()),
+        ("work_item_id", attempt.work_item_id.clone()),
+        ("pr_url", attempt.pr_url.clone()),
+        ("pr_number", attempt.pr_number.to_string()),
+        ("head_branch", attempt.head_branch.clone()),
+        ("base_branch", attempt.base_branch.clone()),
+        (
+            "base_sha_at_trigger",
+            attempt.base_sha_at_trigger.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "head_sha_before",
+            attempt.head_sha_before.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "head_sha_after",
+            attempt.head_sha_after.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "failure_reason",
+            attempt.failure_reason.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "cube_lease_id",
+            attempt.cube_lease_id.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "cube_workspace_id",
+            attempt.cube_workspace_id.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "worker_id",
+            attempt.worker_id.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        ("created_at", attempt.created_at.clone()),
+        (
+            "started_at",
+            attempt.started_at.clone().unwrap_or_else(|| unset.clone()),
+        ),
+        (
+            "finished_at",
+            attempt.finished_at.clone().unwrap_or_else(|| unset.clone()),
+        ),
+    ];
+    for (field, value) in &rows {
+        table.add_row(vec![*field, value.as_str()]);
+    }
+    println!("{table}");
+    if let Some(diag) = &attempt.conflict_diagnosis {
+        println!();
+        println!("conflict_diagnosis (raw):");
+        println!("{diag}");
     }
 }
 
