@@ -24,4 +24,5 @@ pub mod transcript_tail;
 pub mod work;
 pub mod work_dependencies;
 pub mod worker_registry;
+pub mod worker_sandbox_audit;
 pub mod worker_setup;

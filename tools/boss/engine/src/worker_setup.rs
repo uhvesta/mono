@@ -134,6 +134,14 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
            and concurrent edits will corrupt their state.\n\
          - Do not modify cube's database, lease state, or workspace\n\
            registry. The engine reconciles state on its own.\n\
+         - The Boss runtime state under `~/Library/Application Support/Boss/`\n\
+           (state.db, dispatch-events, engine-audit.log, the events\n\
+           socket, executions/, …) is the coordinator's territory.\n\
+           Workers must never read, write, or otherwise touch it —\n\
+           the engine enforces this via permission deny rules and\n\
+           audits every attempt. If you need work-taxonomy context,\n\
+           ask the coordinator to inject it; do not query the DB\n\
+           yourself. `bossctl` is similarly coordinator-only.\n\
          \n\
          ## Coordinator\n\
          \n\
@@ -198,7 +206,24 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
         // settings override user-global per key, so this wins even
         // when the human's `~/.claude/settings.json` defaults to
         // interactive.
-        "permissions": { "defaultMode": "auto" },
+        //
+        // The `deny` rules fence the worker off from Boss's runtime
+        // state. Workers operate on source code in their leased
+        // workspace; the engine's `state.db`, dispatch events,
+        // engine-audit log and the events socket all live under the
+        // Boss support dir and are coordinator-only. A worker that
+        // reads `state.db` directly can see ground truth the
+        // coordinator hasn't shown it (breaks reproducibility);
+        // writing to those files is catastrophic. Same logic for
+        // `bossctl`: that's the coordinator's CLI, not the worker's.
+        // The deny rules are belt; the engine-side audit in
+        // `audit_worker_sandbox_attempt` is suspenders that logs
+        // every attempt even if a future harness change lets a tool
+        // call through.
+        "permissions": {
+            "defaultMode": "auto",
+            "deny": deny_rules(input),
+        },
         "hooks": {
             "SessionStart":     [hook.clone()],
             "UserPromptSubmit": [hook.clone()],
@@ -209,6 +234,52 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
             "SessionEnd":       [hook],
         },
     })
+}
+
+/// Build the permission deny list. Returns a JSON array of strings in
+/// claude-code permission syntax: `<Tool>(<pattern>)`.
+///
+/// The Boss state directory is derived from `events_socket_path`'s
+/// parent — both live under `~/Library/Application Support/Boss/` in
+/// production, but tests / future relocations get the same treatment
+/// without a hardcoded path.
+fn deny_rules(input: &WorkerSetupInput) -> Vec<String> {
+    let mut rules = Vec::new();
+
+    if let Some(state_dir) = input.events_socket_path.parent() {
+        let dir = state_dir.display().to_string();
+        // Both the bare directory and the `**` subtree are listed
+        // explicitly: glob `**` doesn't match the directory itself in
+        // every harness, and we want a `Read("…/Boss")` ls attempt to
+        // be denied just like a `Read("…/Boss/state.db")`.
+        for prefix in ["Read", "Edit", "Write"] {
+            rules.push(format!("{prefix}({dir})"));
+            rules.push(format!("{prefix}({dir}/**)"));
+        }
+    }
+
+    // `bossctl` is the coordinator's CLI surface (probes, agents
+    // list, work mutations). Workers don't drive the coordinator,
+    // they answer to it. Block every shape:
+    //   - bare `bossctl` (no args)
+    //   - `bossctl <verb> …` via the `:*` shell-prefix glob
+    //   - any absolute path that ends in `/bossctl` (the engine's
+    //     spawn flow injects an absolute symlink dir, so plain
+    //     `bossctl` is the normal shape — but lock the absolute
+    //     form too in case a worker tries to bypass via `$HOME/bin`).
+    rules.push("Bash(bossctl)".to_owned());
+    rules.push("Bash(bossctl:*)".to_owned());
+
+    // `boss` lifecycle verbs that bounce the engine out from under
+    // the worker. The rest of the `boss` surface (list/show/etc.)
+    // talks to the engine over its IPC socket which is fine, but
+    // start/stop reach into engine process state.
+    rules.push("Bash(boss engine start)".to_owned());
+    rules.push("Bash(boss engine start:*)".to_owned());
+    rules.push("Bash(boss engine stop)".to_owned());
+    rules.push("Bash(boss engine stop:*)".to_owned());
+
+    rules
 }
 
 /// Single-quote a shell argument, escaping internal quotes. Matches the
@@ -394,6 +465,106 @@ mod tests {
                 "{hook_name} command missing BOSS_RUN_ID=<run_id>: {command}",
             );
         }
+    }
+
+    #[test]
+    fn settings_json_denies_boss_state_dir_reads_writes_and_edits() {
+        // The acceptance criterion for the worker-sandboxing change:
+        // a worker spawned by the engine cannot, via Read / Edit /
+        // Write, touch any file under the Boss state dir. The deny
+        // list must name the dir and the `**` subtree for each tool
+        // so a `Read("…/Boss")` ls and a `Read("…/Boss/state.db")`
+        // both deny.
+        let input = sample_input();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let deny = parsed["permissions"]["deny"]
+            .as_array()
+            .expect("deny array present");
+        let deny_set: Vec<&str> = deny.iter().filter_map(|v| v.as_str()).collect();
+        let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
+        for tool in ["Read", "Edit", "Write"] {
+            let bare = format!("{tool}({boss_dir})");
+            let glob = format!("{tool}({boss_dir}/**)");
+            assert!(
+                deny_set.iter().any(|r| *r == bare),
+                "expected deny rule {bare} in {deny_set:?}",
+            );
+            assert!(
+                deny_set.iter().any(|r| *r == glob),
+                "expected deny rule {glob} in {deny_set:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn settings_json_denies_bossctl_and_engine_lifecycle_verbs() {
+        // bossctl is coordinator-only; `boss engine start|stop` reach
+        // into engine process state. The rest of the `boss` surface
+        // talks to the engine over its IPC socket and is fine.
+        let input = sample_input();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let deny: Vec<&str> = parsed["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for rule in [
+            "Bash(bossctl)",
+            "Bash(bossctl:*)",
+            "Bash(boss engine start)",
+            "Bash(boss engine start:*)",
+            "Bash(boss engine stop)",
+            "Bash(boss engine stop:*)",
+        ] {
+            assert!(
+                deny.iter().any(|r| *r == rule),
+                "expected deny rule {rule} in {deny:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn settings_json_does_not_deny_workspace_paths() {
+        // Defensive: a buggy deny rule that accidentally fences off
+        // `~/Documents/dev/workspaces/…` would break every worker
+        // (their lease lives there). Verify no deny rule names the
+        // workspace root.
+        let input = sample_input();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let deny: Vec<&str> = parsed["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for rule in &deny {
+            assert!(
+                !rule.contains("workspaces"),
+                "deny rule must not target the workspaces dir: {rule}",
+            );
+        }
+    }
+
+    #[test]
+    fn claude_md_warns_against_touching_boss_state_dir() {
+        // A worker that misses the harness-level deny rule (e.g. a
+        // future claude-code release changes the rule format) needs
+        // a soft soft-rule in the CLAUDE.md system prompt to know
+        // it's off-limits. Belt-and-suspenders.
+        let input = sample_input();
+        let rendered = render_claude_md(&input);
+        assert!(
+            rendered.contains("Library/Application Support/Boss"),
+            "CLAUDE.md must call out the Boss state dir explicitly",
+        );
+        assert!(
+            rendered.contains("bossctl"),
+            "CLAUDE.md must explicitly identify bossctl as coordinator-only",
+        );
     }
 
     #[test]

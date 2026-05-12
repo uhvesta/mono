@@ -2061,6 +2061,18 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 event = ?incoming.event,
                                 "events socket: hook event received",
                             );
+                            // Audit *before* the live-state fan-out
+                            // so an engine-side mismatch in the
+                            // dispatch path can't drop the audit line
+                            // — the deny is enforced harness-side by
+                            // claude already, this is the independent
+                            // forensic record. See
+                            // [`worker_sandbox_audit`] for why.
+                            crate::worker_sandbox_audit::record_if_sandbox_attempt(
+                                &server_state.dispatch_event_root,
+                                incoming.run_id.as_deref(),
+                                &incoming.event,
+                            );
                             dispatch_live_worker_state(&server_state, &incoming).await;
                             // ProbeReplied runs *before* dispatch so a
                             // single Stop never both fires the reply
