@@ -38,6 +38,109 @@ const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// applies if cube wedges, so we time-bound it too.
 const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
+/// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` is 30 minutes, so a
+/// 5-minute cadence gives ~6 chances to renew within one TTL window
+/// — generous enough that a single failed beat (e.g., a transient
+/// cube subprocess failure) doesn't immediately put the lease at
+/// risk.
+const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Owns the per-run cube lease heartbeat task. Dropping the guard
+/// aborts the heartbeat — used at the end of `run_execution` so the
+/// heartbeat cannot outlive its lease.
+///
+/// Background: cube treats any lease whose `lease_expires_at_epoch_s`
+/// has passed as eligible for reclamation. Without periodic
+/// heartbeats from the engine, every worker that runs longer than
+/// the TTL is silently susceptible to having its workspace's `@`
+/// reset by the next lease call. The investigation chore for
+/// `mono-agent-001` (2026-05-12) traced Worf's "`@` got re-pointed
+/// mid-flight" symptom to exactly this — the engine never called
+/// `heartbeat_lease`, despite both cube and the trait defining it.
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl HeartbeatGuard {
+    fn spawn(
+        cube_client: Arc<dyn CubeClient>,
+        lease_id: String,
+        execution_id: String,
+        run_id: String,
+        worker_id: String,
+    ) -> Self {
+        Self::spawn_with_interval(
+            cube_client,
+            lease_id,
+            execution_id,
+            run_id,
+            worker_id,
+            LEASE_HEARTBEAT_INTERVAL,
+        )
+    }
+
+    /// Test seam: lets unit tests drive the heartbeat with a tiny
+    /// interval (e.g., 50 ms) so they can exercise multiple beats
+    /// without depending on tokio's paused-time API. Production
+    /// callers go through [`Self::spawn`].
+    fn spawn_with_interval(
+        cube_client: Arc<dyn CubeClient>,
+        lease_id: String,
+        execution_id: String,
+        run_id: String,
+        worker_id: String,
+        interval: Duration,
+    ) -> Self {
+        let handle = tokio::spawn(async move {
+            // First tick fires immediately at start; the elapsed
+            // interval is the *gap* between subsequent ticks. Skip
+            // the first immediate tick so we don't issue a redundant
+            // heartbeat the moment the lease was acquired.
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match cube_client.heartbeat_lease(&lease_id, None).await {
+                    Ok(()) => {
+                        tracing::debug!(
+                            %execution_id,
+                            %run_id,
+                            %worker_id,
+                            %lease_id,
+                            "extended cube lease via heartbeat"
+                        );
+                    }
+                    Err(err) => {
+                        // A single failed heartbeat is not fatal — the
+                        // lease still has up to a TTL of remaining
+                        // life before cube will reclaim it. Log
+                        // structured at WARN so an operator
+                        // investigating a future "`@` moved" report
+                        // can grep for failed beats and see the gap.
+                        tracing::warn!(
+                            %execution_id,
+                            %run_id,
+                            %worker_id,
+                            %lease_id,
+                            ?err,
+                            "cube lease heartbeat failed; will retry next interval"
+                        );
+                    }
+                }
+            }
+        });
+        Self { handle }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CubeRepoHandle {
     pub repo_id: String,
@@ -1482,6 +1585,26 @@ impl ExecutionCoordinator {
         lease: CubeWorkspaceLease,
         change: CubeChangeHandle,
     ) {
+        // Keep the cube lease alive for the lifetime of the run. Without
+        // this, the lease ages past `DEFAULT_LEASE_TTL_SECS` (30 min) in
+        // the middle of any long-running worker, and the next
+        // `cube workspace lease` call from another execution silently
+        // reclaims the slot, runs `jj new <main>` against the workspace,
+        // and moves the still-active worker's `@`. That's the
+        // 2026-05-12 incident Worf reported on `mono-agent-001`.
+        //
+        // The heartbeat task is scoped to this function: it's aborted
+        // on the JoinHandle drop at the end, so it can't outlive the
+        // run and accidentally extend a lease the engine has already
+        // released downstream.
+        let heartbeat = HeartbeatGuard::spawn(
+            self.cube_client.clone(),
+            lease.lease_id.clone(),
+            execution.id.clone(),
+            run.id.clone(),
+            worker_id.clone(),
+        );
+
         let run_outcome = self
             .execution_runner
             .run_execution(
@@ -1492,6 +1615,7 @@ impl ExecutionCoordinator {
                 Some(change.change_id.as_str()),
             )
             .await;
+        drop(heartbeat);
 
         // Pane-spawn runs hand the slot to a live libghostty pane; the
         // WorkerPool slot must remain claimed until that pane is torn
@@ -4481,5 +4605,62 @@ mod tests {
         coordinator.kick();
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+    }
+
+    /// Regression for the 2026-05-12 "`@` got re-pointed mid-flight"
+    /// incident (`mono-agent-001`, Worf's report). Pre-fix, the engine
+    /// never called `cube_client.heartbeat_lease` from anywhere — the
+    /// trait method had only stub implementations in test mocks. Any
+    /// worker that ran longer than `DEFAULT_LEASE_TTL_SECS = 1800` had
+    /// its lease silently age out, after which the next
+    /// `cube workspace lease` call from another execution reclaimed
+    /// the workspace and ran `jj new <main>` on the still-active
+    /// worker's working copy.
+    ///
+    /// This test pins down the fix: while the guard is alive, the
+    /// heartbeat fires at the configured interval; dropping the guard
+    /// stops the heartbeat. The default 5-minute production interval
+    /// is shortened to 50 ms here so the test stays fast.
+    #[tokio::test]
+    async fn heartbeat_guard_renews_lease_until_dropped() {
+        use super::HeartbeatGuard;
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let cube_dyn: Arc<dyn CubeClient> = cube.clone();
+        let guard = HeartbeatGuard::spawn_with_interval(
+            cube_dyn,
+            "lease-1".to_owned(),
+            "exec-1".to_owned(),
+            "run-1".to_owned(),
+            "worker-1".to_owned(),
+            Duration::from_millis(50),
+        );
+
+        // Three intervals: expect at least two heartbeats (the first
+        // tick is consumed at startup so the timer measures gaps).
+        sleep(Duration::from_millis(180)).await;
+        let beats_during = cube.heartbeat_calls.lock().await.len();
+        assert!(
+            beats_during >= 2,
+            "expected >= 2 heartbeats in ~180ms with a 50ms interval, got {beats_during}",
+        );
+        for (lease, ttl) in cube.heartbeat_calls.lock().await.iter() {
+            assert_eq!(lease, "lease-1");
+            assert!(ttl.is_none(), "engine heartbeats use cube's default TTL");
+        }
+
+        // Drop stops the task. Sleep through more intervals and
+        // assert the count is frozen — proving the heartbeat is
+        // scoped to the guard's lifetime and cannot extend a lease
+        // the run has already finished with.
+        drop(guard);
+        sleep(Duration::from_millis(50)).await;
+        let beats_after_drop_snapshot = cube.heartbeat_calls.lock().await.len();
+        sleep(Duration::from_millis(200)).await;
+        let beats_final = cube.heartbeat_calls.lock().await.len();
+        assert_eq!(
+            beats_final, beats_after_drop_snapshot,
+            "heartbeat must stop firing after the guard is dropped",
+        );
     }
 }
