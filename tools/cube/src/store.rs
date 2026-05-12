@@ -21,6 +21,21 @@ pub struct WorkspaceListFilter<'a> {
     pub holder_pattern: Option<&'a str>,
 }
 
+/// One row swept by [`Store::expire_stale_leases`]. The lease handler
+/// needs the original holder/task/lease_id so it can write an audit
+/// trail for the timeline ("`lease.expired_reclaimed`") and tell the
+/// reset path that the workspace it just claimed used to belong to
+/// someone — so destructive `jj new <main>` should be guarded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExpiredLease {
+    pub workspace_id: String,
+    pub lease_id: String,
+    pub holder: Option<String>,
+    pub task: Option<String>,
+    pub leased_at_epoch_s: Option<i64>,
+    pub lease_expires_at_epoch_s: Option<i64>,
+}
+
 impl Store {
     pub fn open_default() -> Result<Self, CubeError> {
         let path = database_path()?;
@@ -647,14 +662,55 @@ impl Store {
 
     /// Sweep leases whose expiry is at or before `now_epoch_s`; flip them
     /// back to `free` and record `expired` as the release reason. Returns
-    /// the number of leases reclaimed.
+    /// one [`ExpiredLease`] entry per swept row so callers can audit them
+    /// and apply per-workspace policy (e.g., refuse to destructively
+    /// reset a workspace whose `@` still has the prior lease holder's
+    /// work) — the original signature only returned a count, which made
+    /// it impossible for the lease handler to tell apart "claimed a
+    /// genuinely free workspace" from "claimed a workspace that was
+    /// just reclaimed out from under a still-active worker."
     pub fn expire_stale_leases(
         &self,
         repo: &str,
         now_epoch_s: i64,
-    ) -> Result<usize, CubeError> {
-        let updated = self
-            .connection
+    ) -> Result<Vec<ExpiredLease>, CubeError> {
+        let transaction = self.connection.unchecked_transaction().map_err(CubeError::Storage)?;
+        let swept = {
+            let mut statement = transaction
+                .prepare(
+                    r#"
+                    SELECT workspace_id, lease_id, holder, task, leased_at_epoch_s, lease_expires_at_epoch_s
+                    FROM workspaces
+                    WHERE repo = ?1
+                      AND state = ?2
+                      AND lease_expires_at_epoch_s IS NOT NULL
+                      AND lease_expires_at_epoch_s <= ?3
+                    "#,
+                )
+                .map_err(CubeError::Storage)?;
+            let rows = statement
+                .query_map(
+                    params![repo, WorkspaceState::Leased.as_str(), now_epoch_s],
+                    |row| {
+                        Ok(ExpiredLease {
+                            workspace_id: row.get(0)?,
+                            lease_id: row.get(1)?,
+                            holder: row.get(2)?,
+                            task: row.get(3)?,
+                            leased_at_epoch_s: row.get(4)?,
+                            lease_expires_at_epoch_s: row.get(5)?,
+                        })
+                    },
+                )
+                .map_err(CubeError::Storage)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(CubeError::Storage)?
+        };
+        if swept.is_empty() {
+            transaction.rollback().map_err(CubeError::Storage)?;
+            return Ok(swept);
+        }
+        transaction
             .execute(
                 r#"
                 UPDATE workspaces
@@ -680,7 +736,8 @@ impl Store {
                 ],
             )
             .map_err(CubeError::Storage)?;
-        Ok(updated)
+        transaction.commit().map_err(CubeError::Storage)?;
+        Ok(swept)
     }
 
     pub fn insert_change(&self, record: &ChangeRecord) -> Result<ChangeRecord, CubeError> {
@@ -1152,7 +1209,13 @@ mod tests {
 
         // Sweep at t=200 — only lease-b is past its TTL
         let reclaimed = store.expire_stale_leases("mono", 200).expect("sweep");
-        assert_eq!(reclaimed, 1);
+        assert_eq!(reclaimed.len(), 1);
+        let swept = &reclaimed[0];
+        assert_eq!(swept.workspace_id, "mono-agent-002");
+        assert_eq!(swept.lease_id, "lease-b");
+        assert_eq!(swept.holder.as_deref(), Some("bob"));
+        assert_eq!(swept.task.as_deref(), Some("review"));
+        assert_eq!(swept.lease_expires_at_epoch_s, Some(100));
 
         let after = store
             .list_workspaces_filtered(&WorkspaceListFilter {

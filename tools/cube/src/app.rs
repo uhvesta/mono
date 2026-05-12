@@ -102,6 +102,25 @@ pub enum CubeError {
         workspace_path: PathBuf,
         cause: String,
     },
+    /// The lease handler tried to reclaim a workspace whose previous
+    /// lease had expired (so cube flipped it back to `free`), but the
+    /// workspace's `@` still has the prior holder's uncommitted /
+    /// non-main work. A destructive `jj new <main>` would have silently
+    /// destroyed it — most likely from underneath a worker whose lease
+    /// expired but who is still active. Surface this loudly instead.
+    /// Operators recover with `cube workspace force-release` after
+    /// confirming the prior worker is genuinely gone.
+    #[error(
+        "workspace `{workspace_path}` was reclaimed from an expired lease (prior holder: {prior_holder}, \
+         lease: {prior_lease_id}) but its working copy still has uncommitted work; refusing to \
+         destructively reset it. Use `cube workspace force-release --lease {prior_lease_id}` to \
+         acknowledge data loss and re-attempt the lease."
+    )]
+    LeaseExpiredWorkspaceDirty {
+        workspace_path: PathBuf,
+        prior_lease_id: String,
+        prior_holder: String,
+    },
 }
 
 /// Stable substring jj prints when a working copy is stale relative to
@@ -124,6 +143,11 @@ impl CubeError {
             | Self::CommandFailed { .. }
             | Self::Json(_)
             | Self::StaleRecoveryFailed { .. } => ExitCode::FAILURE,
+            // Surfaced as its own exit code so the engine's heartbeat
+            // failure path can detect "I lost a lease and the workspace
+            // still has work" specifically and surface it as a
+            // `WorkAttentionItem` rather than a generic lease failure.
+            Self::LeaseExpiredWorkspaceDirty { .. } => ExitCode::from(7),
         }
     }
 }
@@ -390,8 +414,29 @@ fn run_workspace(
 
             let leased_at_epoch_s = current_epoch_s()?;
             // Sweep any leases that have already exceeded their TTL so they
-            // become claimable again.
-            store.expire_stale_leases(&repo, leased_at_epoch_s)?;
+            // become claimable again. Audit each reclaimed lease before
+            // doing anything else so the timeline shows the prior
+            // holder/task — when a worker's `@` is observed to move
+            // mid-flight, this is the first thing to grep.
+            let expired = store.expire_stale_leases(&repo, leased_at_epoch_s)?;
+            for swept in &expired {
+                audit!(
+                    database_path,
+                    "lease.expired_reclaimed",
+                    repo = repo,
+                    workspace_id = swept.workspace_id,
+                    prior_lease_id = swept.lease_id,
+                    prior_holder = swept.holder.as_deref(),
+                    prior_task = swept.task.as_deref(),
+                    prior_leased_at_epoch_s = swept.leased_at_epoch_s,
+                    prior_lease_expires_at_epoch_s = swept.lease_expires_at_epoch_s,
+                );
+            }
+            let expired_by_workspace_id: std::collections::HashMap<&str, &crate::store::ExpiredLease> =
+                expired
+                    .iter()
+                    .map(|e| (e.workspace_id.as_str(), e))
+                    .collect();
             // Self-heal any rows whose on-disk directory has been deleted
             // out from under cube. The repo lock is already held by this
             // lease call, so use the `_in_repo` variant that skips its own
@@ -408,7 +453,7 @@ fn run_workspace(
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
             let lease_expires_at = Some(leased_at_epoch_s + DEFAULT_LEASE_TTL_SECS);
-            let mut workspace = match store.claim_workspace(
+            let (mut workspace, was_auto_created) = match store.claim_workspace(
                 &repo,
                 &holder,
                 &task,
@@ -417,12 +462,12 @@ fn run_workspace(
                 lease_expires_at,
                 prefer.as_deref(),
             )? {
-                Some(ws) => ws,
+                Some(ws) => (ws, false),
                 None => {
                     let new_candidate = auto_create_workspace(runner, &repo_record, &candidates)?;
                     candidates.push(new_candidate);
                     store.sync_workspaces(&repo, &candidates)?;
-                    store
+                    let ws = store
                         .claim_workspace(
                             &repo,
                             &holder,
@@ -432,7 +477,8 @@ fn run_workspace(
                             lease_expires_at,
                             prefer.as_deref(),
                         )?
-                        .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?
+                        .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
+                    (ws, true)
                 }
             };
 
@@ -461,11 +507,28 @@ fn run_workspace(
                 return Err(CubeError::NoAvailableWorkspace(repo));
             }
 
-            if let Err(error) = reset_workspace(
+            // If the workspace we just claimed was reclaimed-from-expired
+            // in this lease call, guard the reset: a destructive
+            // `jj new <main>` against a workspace whose prior lease
+            // holder is still active would silently destroy their
+            // working copy. This is exactly the race Worf reported on
+            // 2026-05-12 ("`@` got re-pointed at unrelated commits").
+            //
+            // Auto-created workspaces just came out of `jj git clone`,
+            // so there is no prior worker's `@` to protect — skip the
+            // guard in that case to avoid spurious refusals after the
+            // reconcile-and-replace path discards a dangling row.
+            let prior_expired = if was_auto_created {
+                None
+            } else {
+                expired_by_workspace_id.get(workspace.workspace_id.as_str()).copied()
+            };
+            if let Err(error) = reset_workspace_guarded(
                 runner,
                 database_path,
                 &workspace.workspace_path,
                 &repo_record.main_branch,
+                prior_expired,
             ) {
                 let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                 return Err(error);
@@ -1082,17 +1145,152 @@ fn reset_workspace(
     workspace_path: &Path,
     main_branch: &str,
 ) -> Result<()> {
+    reset_workspace_guarded(runner, database_path, workspace_path, main_branch, None)
+}
+
+/// Variant of [`reset_workspace`] that refuses to run the destructive
+/// `jj new <main>` step if the workspace's `@` still has the prior
+/// lease holder's uncommitted work AND `prior_expired` says the lease
+/// we just claimed was reclaimed-out-from-under that holder. Surfaces
+/// [`CubeError::LeaseExpiredWorkspaceDirty`] so the lease handler can
+/// abort cleanly instead of stomping on the still-active worker.
+///
+/// When `prior_expired` is `None` (normal release path, or a workspace
+/// that was already `free`), the guard is a no-op and behavior matches
+/// the original `reset_workspace`.
+///
+/// Every `jj` invocation here also writes an audit entry
+/// (`workspace.jj_op`) so the next time someone reports "my `@`
+/// moved", we can replay the log and prove or disprove a cube-side
+/// reset.
+fn reset_workspace_guarded(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    main_branch: &str,
+    prior_expired: Option<&crate::store::ExpiredLease>,
+) -> Result<()> {
+    audit_jj_op(database_path, workspace_path, "git", &["fetch"], prior_expired);
     run_jj(
         runner,
         database_path,
         &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
     )?;
+
+    if let Some(prior) = prior_expired {
+        let head_status = read_head_status(runner, database_path, workspace_path, main_branch)?;
+        if !head_status.is_clean_on_main {
+            audit!(
+                database_path,
+                "workspace.reset_refused_dirty",
+                workspace_path = workspace_path.display().to_string(),
+                main_branch = main_branch,
+                head_change_id = head_status.head_change_id,
+                head_is_empty = head_status.head_is_empty,
+                head_parent_bookmarks = head_status.head_parent_bookmarks,
+                prior_lease_id = prior.lease_id,
+                prior_holder = prior.holder.as_deref(),
+                prior_task = prior.task.as_deref(),
+            );
+            return Err(CubeError::LeaseExpiredWorkspaceDirty {
+                workspace_path: workspace_path.to_path_buf(),
+                prior_lease_id: prior.lease_id.clone(),
+                prior_holder: prior
+                    .holder
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+            });
+        }
+    }
+
+    audit_jj_op(database_path, workspace_path, "new", &[main_branch], prior_expired);
     run_jj(
         runner,
         database_path,
         &RealCommandRunner::invocation(workspace_path, "jj", &["new", main_branch]),
     )?;
     Ok(())
+}
+
+/// Audit one of cube's own `jj` invocations against a leased
+/// workspace. Pair-reads of this with the cube audit log let an
+/// investigator answer "did cube move my `@`?" without guesswork —
+/// every fetch/new/log/etc. cube runs lands here with the workspace
+/// path, the verb, and (when relevant) the lease that just expired.
+fn audit_jj_op(
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    verb: &str,
+    args: &[&str],
+    prior_expired: Option<&crate::store::ExpiredLease>,
+) {
+    audit!(
+        database_path,
+        "workspace.jj_op",
+        workspace_path = workspace_path.display().to_string(),
+        verb = verb,
+        args = args,
+        prior_expired_lease_id = prior_expired.map(|e| e.lease_id.as_str()),
+        prior_expired_holder = prior_expired.and_then(|e| e.holder.as_deref()),
+    );
+}
+
+/// Snapshot the parts of `jj`'s view we need to tell apart "fresh
+/// clean checkout on main" from "the prior worker left work here."
+/// Empty + parent is main → safe to reset. Anything else → guard.
+#[derive(Debug)]
+struct HeadStatus {
+    head_change_id: String,
+    head_is_empty: bool,
+    head_parent_bookmarks: String,
+    is_clean_on_main: bool,
+}
+
+fn read_head_status(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    main_branch: &str,
+) -> Result<HeadStatus> {
+    // Tab-separated so a bookmark name containing arbitrary chars
+    // (jj allows slashes etc.) can't confuse the parser.
+    let template = "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")";
+    let output = run_jj(
+        runner,
+        database_path,
+        &CommandInvocation {
+            cwd: workspace_path.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec![
+                "log".to_string(),
+                "--no-graph".to_string(),
+                "-r".to_string(),
+                "@".to_string(),
+                "-T".to_string(),
+                template.to_string(),
+            ],
+        },
+    )?;
+    let trimmed = output.trim();
+    let mut parts = trimmed.split('\t');
+    let head_change_id = parts.next().unwrap_or("").to_string();
+    let head_is_empty = parts.next().unwrap_or("false").eq_ignore_ascii_case("true");
+    let head_parent_bookmarks = parts.next().unwrap_or("").to_string();
+    // Treat "@ is empty and its parent is on `main`" as a clean reset
+    // candidate. The bookmark list is `;`-separated by parent (jj's @
+    // can have multiple parents post-merge), and each entry is a
+    // comma-separated list of bookmarks on that parent.
+    let parent_is_main = head_parent_bookmarks
+        .split(';')
+        .flat_map(|p| p.split(','))
+        .any(|b| b.trim() == main_branch);
+    let is_clean_on_main = head_is_empty && parent_is_main;
+    Ok(HeadStatus {
+        head_change_id,
+        head_is_empty,
+        head_parent_bookmarks,
+        is_clean_on_main,
+    })
 }
 
 /// Run a `jj` command against a workspace, transparently recovering
@@ -2513,10 +2711,20 @@ mod tests {
         assert_eq!(audit_files.len(), 1, "expected one weekly audit file");
 
         let contents = std::fs::read_to_string(&audit_files[0]).expect("audit content");
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "expected lease + release events");
+        let events: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .collect();
+        let by_event: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| {
+                let name = e["event"].as_str().unwrap_or_default();
+                name == "lease.acquired" || name == "lease.released"
+            })
+            .collect();
+        assert_eq!(by_event.len(), 2, "expected one lease.acquired + one lease.released event");
 
-        let acquired: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let acquired = by_event[0];
         assert_eq!(acquired["event"], "lease.acquired");
         assert_eq!(acquired["repo"], "mono");
         assert_eq!(acquired["workspace_id"], "mono-agent-004");
@@ -2526,11 +2734,25 @@ mod tests {
         assert!(acquired["holder"].is_string());
         assert!(acquired["ts"].as_str().unwrap().ends_with('Z'));
 
-        let released: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let released = by_event[1];
         assert_eq!(released["event"], "lease.released");
         assert_eq!(released["lease_id"], lease_id);
         assert_eq!(released["reason"], "done");
         assert_eq!(released["keep_dirty"], false);
+
+        // The instrumentation chore also requires that every `jj`
+        // operation cube runs against a leased workspace is auditable.
+        // Each reset emits a fetch + new pair, and we have a lease and
+        // a release: so four `workspace.jj_op` entries on the timeline.
+        let jj_ops: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.jj_op")
+            .collect();
+        assert_eq!(jj_ops.len(), 4, "expected 4 workspace.jj_op events (fetch+new each for lease+release)");
+        let workspace_path_str = workspace_path.display().to_string();
+        for op in &jj_ops {
+            assert_eq!(op["workspace_path"], workspace_path_str);
+        }
     }
 
     #[test]
@@ -5071,6 +5293,203 @@ steps:
             })
             .collect();
         assert_eq!(reconciled.len(), 1);
+    }
+
+    /// Regression for the 2026-05-12 "`@` got re-pointed mid-flight"
+    /// incident. Setup mimics the race exactly:
+    ///   1. A worker leases a workspace and starts editing — `@` ends
+    ///      up off main on an unbookmarked change (the worker's WIP).
+    ///   2. The worker's lease ages past its TTL (engine forgot to
+    ///      heartbeat — the orthogonal bug the engine-side fix
+    ///      addresses).
+    ///   3. A new lease request arrives. The expected old behavior was
+    ///      to silently `expire_stale_leases`, claim the slot, and run
+    ///      `jj new <main>` — moving the still-active worker's `@`.
+    ///
+    /// The fix this test pins down: cube's reset path now checks `@`'s
+    /// emptiness and parent-bookmark before running `jj new`, sees the
+    /// workspace is still on a non-main change with content, refuses
+    /// to reset, releases the just-acquired lease, and surfaces
+    /// `LeaseExpiredWorkspaceDirty` so the caller can fail loudly
+    /// instead of clobbering the prior worker's work.
+    #[test]
+    fn second_lease_refuses_to_reset_workspace_with_uncommitted_prior_work() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // First lease — normal happy path.
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let first = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "wip"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        let prior_lease_id = first.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        // Worker has been editing — `@` is off main, has uncommitted
+        // content. Force expiry so `expire_stale_leases` reclaims it
+        // on the next lease call.
+        force_lease_expiry(&database_path, &prior_lease_id, 1);
+
+        // The second lease's reset path should run `jj git fetch` then
+        // the head-status probe and stop. Stub the probe to return a
+        // non-empty `@` whose parent isn't `main` — exactly the
+        // shape a still-active worker's WIP looks like.
+        let probe_output = "abcd1234\tfalse\tfeature-bookmark";
+        let second_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")",
+                ],
+                probe_output,
+            ),
+        ]);
+
+        let err = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "incoming"]),
+            Some(&database_path),
+            &second_runner,
+        )
+        .expect_err("second lease must refuse to clobber the WIP");
+
+        match &err {
+            CubeError::LeaseExpiredWorkspaceDirty {
+                workspace_path: refused_path,
+                prior_lease_id: refused_lease,
+                ..
+            } => {
+                assert_eq!(refused_path, &workspace_path);
+                assert_eq!(refused_lease, &prior_lease_id);
+            }
+            other => panic!("expected LeaseExpiredWorkspaceDirty, got {other:?}"),
+        }
+        second_runner.assert_exhausted();
+
+        // The crucial regression-pin: `jj new main` was NEVER invoked
+        // on the leased workspace, so the active worker's `@` is
+        // untouched. The probe is the only post-fetch jj call that
+        // ran; the runner's exhausted assertion above proves no other
+        // command was issued.
+        let events = audit_events(&tempdir);
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "workspace.reset_refused_dirty")
+            .collect();
+        assert_eq!(refused.len(), 1, "expected one workspace.reset_refused_dirty event");
+        assert_eq!(refused[0]["prior_lease_id"], prior_lease_id);
+        assert_eq!(refused[0]["workspace_path"], workspace_path.display().to_string());
+
+        // `lease.expired_reclaimed` must also have been audited so the
+        // timeline reads end-to-end ("we swept this lease, then we
+        // refused to destructively reset its workspace").
+        let reclaimed: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "lease.expired_reclaimed")
+            .collect();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0]["prior_lease_id"], prior_lease_id);
+
+        // The new lease was rolled back: workspace is back to `free`
+        // with `lease_setup_failed` recorded. The old (expired) row's
+        // lease_id is gone — `expire_stale_leases` cleared it before
+        // the refused claim.
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let rows = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Free);
+        assert_eq!(rows[0].last_release_reason.as_deref(), Some("lease_setup_failed"));
+    }
+
+    /// The dirty guard must NOT fire on the steady-state happy path:
+    /// when `@` is empty and its parent is on `main`, the workspace is
+    /// safe to reset and lease acquisition proceeds normally.
+    #[test]
+    fn second_lease_resets_normally_when_at_is_clean_on_main() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let first = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "wip"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        let prior_lease_id = first.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        force_lease_expiry(&database_path, &prior_lease_id, 1);
+
+        // Clean @: empty, parent on main → safe to reset.
+        let probe_output = "abcd1234\ttrue\tmain";
+        let second_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")",
+                ],
+                probe_output,
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "def5678",
+            ),
+        ]);
+
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "fresh"]),
+            Some(&database_path),
+            &second_runner,
+        )
+        .expect("second lease must succeed when the workspace is clean on main");
+        second_runner.assert_exhausted();
     }
 
     #[test]
