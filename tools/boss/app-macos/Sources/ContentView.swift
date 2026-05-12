@@ -43,6 +43,10 @@ struct ContentView: View {
             DesignsView(chat: model)
                 .opacity(model.navigationMode == .designs ? 1 : 0)
                 .allowsHitTesting(model.navigationMode == .designs)
+
+            EngineView(chat: model)
+                .opacity(model.navigationMode == .engine ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .engine)
         }
         #if canImport(GhosttyKit)
         .task {
@@ -915,7 +919,8 @@ private struct WorkBoardCardItem: View {
                     blockedBy: blockedBy,
                     isAutoBlocked: isAutoBlocked,
                     gatingPrereqs: gatingPrereqs,
-                    repoChip: repoChip
+                    repoChip: repoChip,
+                    showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL)
                 )
             }
             .buttonStyle(.plain)
@@ -1024,6 +1029,12 @@ struct WorkBoardCardView: View {
     /// mode, where the chip lives on the product header instead — see
     /// `WorkBoardRepoMode` for the mode rule.
     var repoChip: RepoChipPresentation? = nil
+    /// True when this card's PR was the target of a successful
+    /// conflict-resolution attempt inside the freshness window
+    /// (Phase 5 #15 of the merge-conflict design). Renders the
+    /// `"🔧 conflict cleared"` chip in the footer; ages out after 24h
+    /// via [[ChatViewModel.showsConflictClearedBadge(forPR:)]].
+    var showsConflictClearedBadge: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1097,6 +1108,9 @@ struct WorkBoardCardView: View {
                             .help(autoBlockTooltip)
                             .accessibilityLabel("Auto-blocked by dependencies")
                             .accessibilityValue(autoBlockTooltip)
+                    }
+                    if showsConflictClearedBadge {
+                        ConflictClearedBadge()
                     }
                     Spacer()
                 }
@@ -1944,6 +1958,31 @@ struct RepoChipView: View {
         case .taskOverride:
             return Color.accentColor.opacity(0.4)
         }
+    }
+}
+
+/// "🔧 conflict cleared" PR-card chip. Phase 5 #15 of the merge-
+/// conflict design. Rendered on parent cards whose PR was the target
+/// of a successful conflict-resolution attempt in the last 24h
+/// (the freshness window lives on
+/// [[ChatViewModel.badgeFreshnessWindow]]). The tooltip names the
+/// action so a glance tells a reader *what* the engine cleared, not
+/// just that something happened.
+private struct ConflictClearedBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Text("🔧")
+                .font(.caption2)
+            Text("conflict cleared")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.green)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.green.opacity(0.12))
+        .clipShape(Capsule())
+        .help("The engine cleared a merge conflict on this PR within the last 24 hours.")
+        .accessibilityLabel("Conflict cleared by the engine")
     }
 }
 

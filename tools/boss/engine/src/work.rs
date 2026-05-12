@@ -3112,6 +3112,138 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Read-only list of `conflict_resolutions` rows for the Phase 5
+    /// `boss engine conflicts list` CLI. Filters are AND-ed; an empty
+    /// `status` slice means "any status." Rows come back freshest first
+    /// (`created_at DESC, id DESC`) so the CLI's first row is the row a
+    /// human typically wants. `limit = None` returns every match — the
+    /// CLI caps with `--limit`, so the engine doesn't apply a default.
+    pub fn list_conflict_resolutions(
+        &self,
+        product_id: Option<&str>,
+        statuses: &[String],
+        work_item_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ConflictResolution>> {
+        let conn = self.connect()?;
+        let mut sql = String::from(
+            "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+                    base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
+                    cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
+                    created_at, started_at, finished_at
+             FROM conflict_resolutions WHERE 1=1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(pid) = product_id {
+            sql.push_str(" AND product_id = ?");
+            params_vec.push(Box::new(pid.to_owned()));
+        }
+        if let Some(wid) = work_item_id {
+            sql.push_str(" AND work_item_id = ?");
+            params_vec.push(Box::new(wid.to_owned()));
+        }
+        if !statuses.is_empty() {
+            sql.push_str(" AND status IN (");
+            for (idx, status) in statuses.iter().enumerate() {
+                if idx > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                params_vec.push(Box::new(status.clone()));
+            }
+            sql.push(')');
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC");
+        if let Some(cap) = limit {
+            sql.push_str(" LIMIT ?");
+            params_vec.push(Box::new(cap as i64));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(refs.as_slice(), map_conflict_resolution)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Reset a terminal-failure attempt back to `pending` so the
+    /// dispatcher re-spawns a worker. Only valid when the row's current
+    /// status is `failed` or `abandoned`; the caller (CLI) is
+    /// responsible for surfacing the rejection on a non-terminal row.
+    ///
+    /// The reset clears `failure_reason`, `head_sha_after`, the lease
+    /// triple (`cube_lease_id`, `cube_workspace_id`, `worker_id`), and
+    /// `finished_at`/`started_at` — i.e. it puts the row back into the
+    /// shape the dispatcher expects for a fresh pending attempt. The
+    /// parent work item is also re-flipped to `blocked: merge_conflict`
+    /// (if currently `in_review`) and its `blocked_attempt_id` is
+    /// repointed at the reset row. Returns the reset row on success;
+    /// `Ok(None)` when the id is unknown or the row is non-terminal.
+    pub fn retry_conflict_resolution(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET status            = 'pending',
+                    failure_reason    = NULL,
+                    head_sha_after    = NULL,
+                    cube_lease_id     = NULL,
+                    cube_workspace_id = NULL,
+                    worker_id         = NULL,
+                    started_at        = NULL,
+                    finished_at       = NULL
+              WHERE id = ?1
+                AND status IN ('failed', 'abandoned')",
+            params![attempt_id],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let reset = query_conflict_resolution(&tx, attempt_id)?
+            .with_context(|| format!("unknown conflict_resolution after retry: {attempt_id}"))?;
+        // Re-stamp the parent's blocked state so the kanban shows the
+        // card in `blocked: merge_conflict` again, and so the dispatcher
+        // re-picks the row up. The flip is best-effort — if the parent
+        // is already `blocked: merge_conflict` (or has been moved
+        // somewhere unexpected by a human), we leave it alone.
+        tx.execute(
+            "UPDATE tasks
+                SET status             = 'blocked',
+                    blocked_reason     = 'merge_conflict',
+                    blocked_attempt_id = ?2,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'in_review'
+                AND pr_url = ?4
+                AND deleted_at IS NULL",
+            params![reset.work_item_id, reset.id, now, reset.pr_url],
+        )?;
+        // If the parent is already blocked: merge_conflict (e.g. the
+        // retire path hasn't run because the conflict is still live),
+        // just re-point the attempt id.
+        tx.execute(
+            "UPDATE tasks
+                SET blocked_attempt_id = ?2,
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND deleted_at IS NULL",
+            params![reset.work_item_id, reset.id, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(reset))
+    }
+
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
     /// `workspace_path` on `execution_id`. Returns the prior lease id
     /// — `Some` means the caller is responsible for issuing the cube

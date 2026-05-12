@@ -382,6 +382,40 @@ pub enum FrontendRequest {
         attempt_id: String,
         reason: String,
     },
+    /// Read-only: list `conflict_resolutions` rows. The CLI surface is
+    /// `boss engine conflicts list` (design Phase 5 / #13). Filters are
+    /// AND-ed; an empty `status` list matches every status. Ordering is
+    /// `created_at DESC, id DESC` so the freshest attempt is first.
+    ListConflictResolutions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        product_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        status: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Read-only: fetch a single attempt row by id. Returns
+    /// [`FrontendEvent::ConflictResolution`] on success and
+    /// [`FrontendEvent::WorkError`] when the id is unknown.
+    GetConflictResolution { attempt_id: String },
+    /// Reset a terminal-failure attempt back to `pending` so the
+    /// dispatcher re-spawns a worker. Only valid for rows whose status
+    /// is `failed` or `abandoned`; calling on a non-terminal row
+    /// (`pending` / `running`) is rejected. The parent work item is
+    /// re-flipped to `blocked: merge_conflict` and the new
+    /// `blocked_attempt_id` points at the reset row. See Phase 5 #13.
+    RetryConflictResolution { attempt_id: String },
+    /// Engine-side abandon: flip a non-terminal attempt to `abandoned`
+    /// with the supplied reason. Distinct from `mark-failed` in that the
+    /// caller is explicitly stepping away (PR closed, parent merged
+    /// externally, manual override) rather than declaring the worker
+    /// gave up. Idempotent; rows already terminal yield a WorkError.
+    AbandonConflictResolution {
+        attempt_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +697,28 @@ pub enum FrontendEvent {
     /// so the CLI can pretty-print "attempt foo flipped to failed,
     /// reason bar" without a follow-up `get`.
     ConflictResolutionMarkedFailed {
+        attempt: ConflictResolution,
+    },
+    /// Response to [`FrontendRequest::ListConflictResolutions`]: the
+    /// filtered set of rows, ordered freshest-first.
+    ConflictResolutionsList {
+        attempts: Vec<ConflictResolution>,
+    },
+    /// Response to [`FrontendRequest::GetConflictResolution`]: a single
+    /// row by id.
+    ConflictResolution {
+        attempt: ConflictResolution,
+    },
+    /// Response to [`FrontendRequest::RetryConflictResolution`]: the
+    /// row after the reset to `pending`. The engine has already
+    /// re-flipped the parent work item back to `blocked:
+    /// merge_conflict` so the dispatcher can pick up the new attempt.
+    ConflictResolutionRetried {
+        attempt: ConflictResolution,
+    },
+    /// Response to [`FrontendRequest::AbandonConflictResolution`]: the
+    /// row after the flip to `abandoned`.
+    ConflictResolutionMarkedAbandoned {
         attempt: ConflictResolution,
     },
     /// Activity-feed push: a fresh conflict-resolution attempt has been

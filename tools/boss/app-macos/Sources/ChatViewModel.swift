@@ -97,6 +97,37 @@ final class ChatViewModel: ObservableObject {
     /// stays hidden until the engine replies.
     @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
 
+    /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
+    /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
+    /// button taps. Phase 5 #14 of the merge-conflict design.
+    @Published var conflictResolutions: [WorkConflictResolution] = []
+
+    /// PR URLs whose most recent conflict-resolution attempt succeeded,
+    /// with the wall-clock timestamp the engine reported (or the local
+    /// observation time as a fallback). Drives the
+    /// `"🔧 conflict cleared"` PR-card badge: cards whose PR sits in
+    /// this map with an age under [[badgeFreshnessWindow]] render the
+    /// chip. Phase 5 #15.
+    @Published var recentlyClearedConflictPRs: [String: Date] = [:]
+
+    /// 24-hour rolling window for the PR-card "🔧 conflict cleared"
+    /// chip. Matches the auto-rebase-stacked-prs.md Q7 cadence so the
+    /// two surfaces feel symmetric.
+    static let conflictBadgeFreshnessWindow: TimeInterval = 24 * 60 * 60
+
+    var badgeFreshnessWindow: TimeInterval { Self.conflictBadgeFreshnessWindow }
+
+    /// `true` when this PR's most recent successful conflict-resolution
+    /// landed inside the badge window. Cards bind to this on the
+    /// `Identifiable` task id; non-PR cards always return `false`.
+    func showsConflictClearedBadge(forPR prURL: String?) -> Bool {
+        guard let prURL,
+              let clearedAt = recentlyClearedConflictPRs[prURL] else {
+            return false
+        }
+        return Date().timeIntervalSince(clearedAt) < badgeFreshnessWindow
+    }
+
     /// Indirection for the OS URL opener used by [[openProjectDesignDoc(_:)]].
     /// Production defaults to `NSWorkspace.shared.open`; tests inject a
     /// recording stub so a `.resolved` click never hands a real GitHub
@@ -319,6 +350,8 @@ final class ChatViewModel: ObservableObject {
         defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
         if mode == .work {
             refreshWork()
+        } else if mode == .engine, isConnected {
+            refreshConflictResolutions()
         }
     }
 
@@ -882,7 +915,30 @@ final class ChatViewModel: ObservableObject {
             }
         case .projectDesignDocResolved(let output):
             designDocStateByProjectID[output.projectID] = output.state
+        case .conflictResolutionsList(let attempts):
+            conflictResolutions = attempts
+        case .conflictResolutionStarted, .conflictResolutionFailed,
+             .conflictResolutionAbandoned:
+            // Any transition refreshes the engine-tab list so the
+            // status column re-renders. The badge state only updates
+            // on the `succeeded` arm.
+            engine.sendListConflictResolutions(limit: 200)
+        case .conflictResolutionSucceeded(_, _, _, let prURL):
+            // Stamp the PR url so the kanban card shows the
+            // "🔧 conflict cleared" chip for the next 24h (#15). The
+            // engine doesn't carry a finished_at on the push, so we
+            // record the wall-clock observation time — close enough
+            // for an ageing window measured in hours.
+            recentlyClearedConflictPRs[prURL] = Date()
+            engine.sendListConflictResolutions(limit: 200)
         }
+    }
+
+    /// Engine-tab entry point: ask the engine for the current attempt
+    /// list. Idempotent — the view-model just overwrites the array
+    /// when the reply lands.
+    func refreshConflictResolutions() {
+        engine.sendListConflictResolutions(limit: 200)
     }
 
     // MARK: - Private Helpers

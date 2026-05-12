@@ -1122,6 +1122,293 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     Ok(())
 }
 
+/// Phase 5 #13 happy paths for the read-only `list` and `show` verbs:
+/// seed two attempts under one product, query the freshest-first list,
+/// then fetch one by id.
+#[tokio::test]
+async fn engine_conflicts_list_and_show_round_trip() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let (product, _chore, a, b) = seed_two_conflict_resolutions(&engine).await?;
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // List with no filters: both attempts come back, freshest first.
+    let response = client
+        .send_request(&FrontendRequest::ListConflictResolutions {
+            product_id: None,
+            status: vec![],
+            work_item_id: None,
+            limit: None,
+        })
+        .await?;
+    let attempts = match response {
+        FrontendEvent::ConflictResolutionsList { attempts } => attempts,
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    };
+    assert_eq!(attempts.len(), 2, "expected both seeded attempts");
+    assert_eq!(attempts[0].id, b.id, "freshest attempt should sort first");
+    assert_eq!(attempts[1].id, a.id);
+
+    // Product-scoped query returns the same rows.
+    let response = client
+        .send_request(&FrontendRequest::ListConflictResolutions {
+            product_id: Some(product.id.clone()),
+            status: vec![],
+            work_item_id: None,
+            limit: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::ConflictResolutionsList { attempts } => {
+            assert_eq!(attempts.len(), 2);
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+
+    // Status filter limits the result set.
+    let response = client
+        .send_request(&FrontendRequest::ListConflictResolutions {
+            product_id: None,
+            status: vec!["pending".to_owned()],
+            work_item_id: None,
+            limit: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::ConflictResolutionsList { attempts } => {
+            assert_eq!(attempts.len(), 2);
+            assert!(attempts.iter().all(|a| a.status == "pending"));
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    let response = client
+        .send_request(&FrontendRequest::ListConflictResolutions {
+            product_id: None,
+            status: vec!["succeeded".to_owned()],
+            work_item_id: None,
+            limit: None,
+        })
+        .await?;
+    match response {
+        FrontendEvent::ConflictResolutionsList { attempts } => {
+            assert!(attempts.is_empty());
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+
+    // Limit caps the response.
+    let response = client
+        .send_request(&FrontendRequest::ListConflictResolutions {
+            product_id: None,
+            status: vec![],
+            work_item_id: None,
+            limit: Some(1),
+        })
+        .await?;
+    match response {
+        FrontendEvent::ConflictResolutionsList { attempts } => {
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].id, b.id);
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+
+    // `show` round-trips by id.
+    let response = client
+        .send_request(&FrontendRequest::GetConflictResolution {
+            attempt_id: a.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::ConflictResolution { attempt } => {
+            assert_eq!(attempt.id, a.id);
+            assert_eq!(attempt.pr_url, a.pr_url);
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+
+    // `show` on unknown id surfaces a structured error.
+    let response = client
+        .send_request(&FrontendRequest::GetConflictResolution {
+            attempt_id: "crz_does_not_exist".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("crz_does_not_exist"),
+                "expected message to name the missing id, got: {message}",
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
+/// Phase 5 #13 `retry`: only `failed` and `abandoned` rows can be
+/// reset; non-terminal rows are rejected.
+#[tokio::test]
+async fn engine_conflicts_retry_resets_terminal_rows() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let (_product, _chore, _a, b) = seed_two_conflict_resolutions(&engine).await?;
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // A `pending` row cannot be retried.
+    let response = client
+        .send_request(&FrontendRequest::RetryConflictResolution {
+            attempt_id: b.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("terminal-failure"),
+                "expected non-terminal rejection, got: {message}",
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+
+    // Flip `b` to `failed` so retry can reset it.
+    client
+        .send_request(&FrontendRequest::MarkConflictResolutionFailed {
+            attempt_id: b.id.clone(),
+            reason: "architectural_mismatch".to_owned(),
+        })
+        .await?;
+
+    let response = client
+        .send_request(&FrontendRequest::RetryConflictResolution {
+            attempt_id: b.id.clone(),
+        })
+        .await?;
+    let reset = match response {
+        FrontendEvent::ConflictResolutionRetried { attempt } => attempt,
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    };
+    assert_eq!(reset.id, b.id);
+    assert_eq!(reset.status, "pending");
+    assert!(reset.failure_reason.is_none(), "failure_reason cleared");
+    assert!(reset.started_at.is_none(), "started_at cleared");
+    assert!(reset.finished_at.is_none(), "finished_at cleared");
+
+    // A second retry of a now-pending row is rejected.
+    let response = client
+        .send_request(&FrontendRequest::RetryConflictResolution {
+            attempt_id: b.id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { .. } => {}
+        other => return Err(anyhow!("expected WorkError on re-retry, got: {other:?}")),
+    }
+    Ok(())
+}
+
+/// Phase 5 #13 `abandon`: flip non-terminal rows to `abandoned`; the
+/// already-terminal arm rejects.
+#[tokio::test]
+async fn engine_conflicts_abandon_flips_attempt_status() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let (_product, _chore, a, _b) = seed_two_conflict_resolutions(&engine).await?;
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::AbandonConflictResolution {
+            attempt_id: a.id.clone(),
+            reason: "pr_closed".to_owned(),
+        })
+        .await?;
+    let flipped = match response {
+        FrontendEvent::ConflictResolutionMarkedAbandoned { attempt } => attempt,
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    };
+    assert_eq!(flipped.id, a.id);
+    assert_eq!(flipped.status, "abandoned");
+    assert_eq!(flipped.failure_reason.as_deref(), Some("pr_closed"));
+    assert!(flipped.finished_at.is_some());
+
+    // Idempotency: terminal rows are rejected.
+    let response = client
+        .send_request(&FrontendRequest::AbandonConflictResolution {
+            attempt_id: a.id.clone(),
+            reason: "ignored".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("already terminal") || message.contains("unknown"),
+                "expected terminal/unknown message, got: {message}",
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
+/// Helper: seed a product + chore + two `pending` `conflict_resolutions`
+/// rows. Returns the second one as the freshest (different
+/// `base_sha_at_trigger` so the UNIQUE key allows both inserts).
+async fn seed_two_conflict_resolutions(
+    engine: &TestEngine,
+) -> Result<(boss_protocol::Product, boss_protocol::Task, boss_protocol::ConflictResolution, boss_protocol::ConflictResolution)> {
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(CreateProductInput {
+        name: "P".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
+    })?;
+    let chore = work_db.create_chore(CreateChoreInput {
+        product_id: product.id.clone(),
+        name: "C".to_owned(),
+        description: None,
+        autostart: false,
+        priority: None,
+        created_via: None,
+        repo_remote_url: None,
+    })?;
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some("https://github.com/foo/bar/pull/77".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    work_db.mark_chore_blocked_merge_conflict(&chore.id, "https://github.com/foo/bar/pull/77")?;
+    let a = work_db
+        .insert_conflict_resolution(boss_engine::work::ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/77".to_owned(),
+            pr_number: 77,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("aaa".to_owned()),
+            head_sha_before: Some("ddd".to_owned()),
+        })?
+        .expect("first insert seeds the row");
+    // Tick `created_at` forward by sleeping briefly so the second row
+    // sorts after the first. `now_string()` has second resolution.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let b = work_db
+        .insert_conflict_resolution(boss_engine::work::ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/77".to_owned(),
+            pr_number: 77,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("bbb".to_owned()),
+            head_sha_before: Some("eee".to_owned()),
+        })?
+        .expect("second insert seeds the row (different base_sha)");
+    drop(work_db);
+    Ok((product, chore, a, b))
+}
+
 #[tokio::test]
 async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()> {
     // Live-coordinator-session repro: `bossctl workspace summary` was
