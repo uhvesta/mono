@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import Textual
 
 // MARK: - Repo path resolution
 
@@ -394,7 +395,12 @@ private struct MarkdownDocumentView: View {
                         .foregroundStyle(.red)
                         .font(.callout)
                 } else {
-                    MarkdownBodyView(source: source)
+                    StructuredText(
+                        markdown: source,
+                        baseURL: fileURL.deletingLastPathComponent()
+                    )
+                    .bossMarkdown()
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .padding(.horizontal, 24)
