@@ -102,10 +102,19 @@ pub struct DispatcherStatsReport {
     /// a `work_runs` row (returned Ok(true)). Each run contributes
     /// at most one to this counter — the first writer wins.
     pub transcript_path_persist_updated: u64,
-    /// Persist calls that returned Ok(false) — the row was already
-    /// populated for that run. Expected to climb in steady state
-    /// (every subsequent hook is a no-op).
+    /// Persist calls where the target row already had a non-NULL
+    /// `transcript_path`. Expected to climb in steady state (every
+    /// subsequent hook for the same run is a no-op).
     pub transcript_path_persist_noop: u64,
+    /// Persist calls where no matching `work_runs` row exists yet
+    /// for the execution carried on `_boss_run_id`. Split out from
+    /// `_noop` because that conflation is how the 2026-05-12
+    /// wrong-namespace bug stayed invisible: a hook payload whose
+    /// `_boss_run_id` did not match any `work_runs.id` looked
+    /// identical on the wire to a legitimate "already set" no-op.
+    /// A persistently non-zero value here means the dispatcher is
+    /// being handed an identifier the runs table cannot resolve.
+    pub transcript_path_persist_row_missing: u64,
     /// Persist calls that returned Err. Should normally be zero; a
     /// non-zero value means the DB write is failing silently and the
     /// engine logs are the next stop.
@@ -227,6 +236,7 @@ mod tests {
                 hook_events_without_transcript_path_in_payload: 2,
                 transcript_path_persist_updated: 1,
                 transcript_path_persist_noop: 3,
+                transcript_path_persist_row_missing: 0,
                 transcript_path_persist_err: 0,
                 transcript_path_persist_from_cache: 2,
                 last_hook_run_id: Some("run-z".into()),

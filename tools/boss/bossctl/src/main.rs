@@ -1397,6 +1397,10 @@ fn print_dispatcher_stats(stats: &boss_protocol::DispatcherStatsReport) {
         stats.transcript_path_persist_noop,
     );
     println!(
+        "  transcript_path_persist_row_missing:         {}",
+        stats.transcript_path_persist_row_missing,
+    );
+    println!(
         "  transcript_path_persist_err:                 {}",
         stats.transcript_path_persist_err,
     );

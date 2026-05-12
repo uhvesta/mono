@@ -164,6 +164,7 @@ pub struct DispatcherStats {
     pub hook_events_without_transcript_path_in_payload: AtomicU64,
     pub transcript_path_persist_updated: AtomicU64,
     pub transcript_path_persist_noop: AtomicU64,
+    pub transcript_path_persist_row_missing: AtomicU64,
     pub transcript_path_persist_err: AtomicU64,
     pub transcript_path_persist_from_cache: AtomicU64,
     /// Last hook event the dispatcher processed. Held behind a mutex
@@ -204,6 +205,10 @@ impl DispatcherStats {
     }
     pub fn inc_persist_noop(&self) {
         self.transcript_path_persist_noop
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_persist_row_missing(&self) {
+        self.transcript_path_persist_row_missing
             .fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_persist_err(&self) {
@@ -252,6 +257,9 @@ impl DispatcherStats {
             transcript_path_persist_noop: self
                 .transcript_path_persist_noop
                 .load(Ordering::Relaxed),
+            transcript_path_persist_row_missing: self
+                .transcript_path_persist_row_missing
+                .load(Ordering::Relaxed),
             transcript_path_persist_err: self
                 .transcript_path_persist_err
                 .load(Ordering::Relaxed),
@@ -271,6 +279,7 @@ pub struct DispatcherStatsSnapshot {
     pub hook_events_without_transcript_path_in_payload: u64,
     pub transcript_path_persist_updated: u64,
     pub transcript_path_persist_noop: u64,
+    pub transcript_path_persist_row_missing: u64,
     pub transcript_path_persist_err: u64,
     pub transcript_path_persist_from_cache: u64,
     pub last_hook: Option<LastHookSnapshot>,

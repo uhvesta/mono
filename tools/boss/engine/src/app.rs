@@ -29,7 +29,7 @@ use crate::protocol::{
     ReleaseWorkerPaneInput, RequestExecutionInput, SendToPaneInput, TOPIC_WORK_PRODUCTS,
     TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic, work_product_topic,
 };
-use crate::work::{Task, WorkDb, WorkItem};
+use crate::work::{SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
@@ -2203,29 +2203,46 @@ async fn dispatch_live_worker_state(
         }
     };
     if let Some(path) = resolved_path.as_deref() {
+        // `run_id` here is the `_boss_run_id` from the hook payload,
+        // which carries the **execution_id** (`exec_*`) — not a
+        // `work_runs.id` (`run_*`). The setter joins on
+        // `work_runs.execution_id` so the caller doesn't have to
+        // care; the local `execution_id` binding is just to make
+        // the namespace explicit at the call site, since the
+        // historical "run_id" naming all the way through the
+        // dispatcher is what hid the wrong-namespace bug.
+        let execution_id = run_id;
         match server_state
             .work_db
-            .set_run_transcript_path_if_unset(run_id, path)
+            .set_run_transcript_path_if_unset(execution_id, path)
         {
-            Ok(true) => {
+            Ok(SetRunTranscriptPathOutcome::Updated) => {
                 server_state.dispatcher_stats.inc_persist_updated();
                 if from_cache {
                     server_state.dispatcher_stats.inc_persist_from_cache();
                 }
                 tracing::info!(
-                    run_id,
+                    execution_id,
                     transcript_path = %path,
                     from_cache,
                     "recorded transcript_path on work_run from hook payload",
                 );
             }
-            Ok(false) => {
+            Ok(SetRunTranscriptPathOutcome::AlreadySet) => {
                 server_state.dispatcher_stats.inc_persist_noop();
+            }
+            Ok(SetRunTranscriptPathOutcome::RowMissing) => {
+                server_state.dispatcher_stats.inc_persist_row_missing();
+                tracing::warn!(
+                    execution_id,
+                    transcript_path = %path,
+                    "no work_runs row for execution yet; transcript_path persist deferred to a later hook",
+                );
             }
             Err(err) => {
                 server_state.dispatcher_stats.inc_persist_err();
                 tracing::warn!(
-                    run_id,
+                    execution_id,
                     ?err,
                     "failed to persist transcript_path from hook payload",
                 );
@@ -4600,6 +4617,7 @@ fn build_live_status_debug_report(
             .hook_events_without_transcript_path_in_payload,
         transcript_path_persist_updated: stats.transcript_path_persist_updated,
         transcript_path_persist_noop: stats.transcript_path_persist_noop,
+        transcript_path_persist_row_missing: stats.transcript_path_persist_row_missing,
         transcript_path_persist_err: stats.transcript_path_persist_err,
         transcript_path_persist_from_cache: stats.transcript_path_persist_from_cache,
         last_hook_run_id: stats.last_hook.as_ref().map(|h| h.run_id.clone()),
@@ -6468,15 +6486,21 @@ mod tests {
         // Deliberately do NOT call register_run_slot — this simulates
         // the engine-restart window where the registry is empty but
         // the worker is still firing hooks.
+        //
+        // Slot keys (and `_boss_run_id` payload values) are the
+        // execution id, not the work_runs.id — that's what
+        // `runner.rs::run_execution` plumbs through to the worker's
+        // env. The test mirrors that namespace so the dispatcher's
+        // SQL join finds the row.
         assert_eq!(
-            server_state.worker_registry.slot_for_run(&run.id),
+            server_state.worker_registry.slot_for_run(&execution.id),
             None,
             "precondition: slot mapping must be absent for this regression",
         );
 
         let event = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(execution.id.clone()),
             transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
             event: WorkerEvent::PostToolUse {
                 session_id: "claude-sess-1".into(),
@@ -6492,6 +6516,213 @@ mod tests {
             reread.transcript_path.as_deref(),
             Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
             "dispatcher must persist transcript_path on work_runs even when the slot mapping is missing",
+        );
+    }
+
+    /// Regression test for the 2026-05-12 wrong-namespace bug. The
+    /// dispatcher's `_boss_run_id` carries an **execution id**
+    /// (`exec_*`) — that's what `runner.rs::run_execution` plumbs into
+    /// the worker shim's `BOSS_RUN_ID` env var. The pre-fix
+    /// `set_run_transcript_path_if_unset` joined the UPDATE on
+    /// `work_runs.id`, which is in a different namespace (`run_*`).
+    /// The SQL never matched, every call returned `Ok(false)`, the
+    /// dispatcher counted it as `_persist_noop`, and 427/427
+    /// historical rows kept their `transcript_path` NULL forever
+    /// even though hook delivery was healthy and the payload always
+    /// carried `transcript_path`.
+    ///
+    /// Pre-fix this test would observe: `_persist_updated == 0`,
+    /// `_persist_noop == 1`, `_persist_row_missing` did not exist,
+    /// and `work_runs.transcript_path` stayed NULL.
+    ///
+    /// Post-fix: `_persist_updated == 1`, `_persist_row_missing == 0`,
+    /// and the row carries the persisted path. The
+    /// `_persist_row_missing` counter is the new structural defense:
+    /// if the dispatcher is ever handed an id the runs table cannot
+    /// resolve, it now shows up as its own counter instead of being
+    /// silently absorbed as a steady-state no-op.
+    #[tokio::test]
+    async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        // Drive the real `start_execution_run` path so the run is
+        // minted with a `run_*` id — production-shaped. Asserting
+        // the namespace prefixes here pins the invariant: if the
+        // ids ever converge, the regression's premise changes and
+        // future readers should rewrite this test, not paper over
+        // it.
+        let (execution, run) = server_state
+            .work_db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+        assert!(
+            execution.id.starts_with("exec_"),
+            "precondition: execution id must use the `exec_` namespace; got {}",
+            execution.id,
+        );
+        assert!(
+            run.id.starts_with("run_"),
+            "precondition: run id must use the `run_` namespace; got {}",
+            run.id,
+        );
+        assert!(
+            run.transcript_path.is_none(),
+            "precondition: freshly-started run has transcript_path=NULL",
+        );
+
+        // Production sets `BOSS_RUN_ID=execution.id` (see
+        // `runner.rs::run_execution`), so the dispatcher's payload
+        // `_boss_run_id` carries an `exec_*` value. Mirror that
+        // exactly — the entire point of the regression is that the
+        // dispatcher must successfully persist when handed this
+        // shape.
+        let event = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(execution.id.clone()),
+            transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+            event: WorkerEvent::PostToolUse {
+                session_id: "claude-sess-1".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+                tool_response: serde_json::Value::Null,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &event).await;
+
+        let reread = server_state.work_db.get_run(&run.id).unwrap();
+        assert_eq!(
+            reread.transcript_path.as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+            "dispatcher must persist transcript_path on work_runs even though the hook payload's _boss_run_id is an execution id",
+        );
+
+        let stats = server_state.dispatcher_stats.snapshot();
+        assert_eq!(
+            stats.transcript_path_persist_updated, 1,
+            "exactly one Updated outcome expected; got stats={stats:?}",
+        );
+        assert_eq!(
+            stats.transcript_path_persist_noop, 0,
+            "this is the first writer — Updated must not be misclassified as AlreadySet; got stats={stats:?}",
+        );
+        assert_eq!(
+            stats.transcript_path_persist_row_missing, 0,
+            "the work_runs row exists for this execution; RowMissing must not fire; got stats={stats:?}",
+        );
+        assert_eq!(
+            stats.transcript_path_persist_err, 0,
+            "no DB error expected; got stats={stats:?}",
+        );
+    }
+
+    /// Companion regression: when the dispatcher is handed an
+    /// execution id that has no `work_runs` row yet (e.g., a
+    /// SessionStart hook arrived before `start_execution_run`
+    /// committed), the outcome must be visible as
+    /// `_persist_row_missing`, NOT silently merged into
+    /// `_persist_noop`. The `_persist_noop=263 _persist_updated=0`
+    /// pattern that hid the wrong-namespace bug for two PRs is
+    /// what this counter exists to prevent in the future.
+    #[tokio::test]
+    async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        // Intentionally skip `start_execution_run` — the execution
+        // exists but has no `work_runs` row yet, mirroring the
+        // race where a hook arrives before the run is inserted.
+
+        let event = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(execution.id.clone()),
+            transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+            event: WorkerEvent::SessionStart {
+                session_id: "claude-sess-1".into(),
+                source: crate::protocol::SessionStartSource::Startup,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &event).await;
+
+        let stats = server_state.dispatcher_stats.snapshot();
+        assert_eq!(
+            stats.transcript_path_persist_row_missing, 1,
+            "row_missing must fire when no work_runs row exists for the execution; got stats={stats:?}",
+        );
+        assert_eq!(
+            stats.transcript_path_persist_updated, 0,
+            "nothing was written; Updated must stay 0; got stats={stats:?}",
+        );
+        assert_eq!(
+            stats.transcript_path_persist_noop, 0,
+            "AlreadySet/Noop is a different outcome and must NOT be incremented; conflation here is the whole reason this counter exists; got stats={stats:?}",
         );
     }
 
@@ -6573,15 +6804,17 @@ mod tests {
             .unwrap();
         // Register a slot so this run is past the slot-lookup guard —
         // the chore's running-engine condition is "slot present,
-        // transcript_path null".
+        // transcript_path null". The slot is keyed on the execution
+        // id (that's what `BOSS_RUN_ID` carries in production), not
+        // on the work_runs.id.
         server_state
             .worker_registry
-            .register_run_slot(run.id.clone(), 5);
+            .register_run_slot(execution.id.clone(), 5);
 
         // Step 1: SessionStart populates the cache AND the row.
         let session_start = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(execution.id.clone()),
             transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
             event: WorkerEvent::SessionStart {
                 session_id: "claude-sess-1".into(),
@@ -6624,7 +6857,7 @@ mod tests {
         // cached path is persisted.
         let post_tool_use = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(execution.id.clone()),
             transcript_path: None,
             event: WorkerEvent::PostToolUse {
                 session_id: "claude-sess-1".into(),
@@ -6746,14 +6979,15 @@ mod tests {
             })
             .unwrap();
         let slot_id = 5u8;
+        // Slots are keyed on the execution id, mirroring what the
+        // worker shim's `BOSS_RUN_ID` carries in production.
+        let _ = &run; // pin: row must exist for the persist join below.
         server_state
             .worker_registry
-            .register_run_slot(run.id.clone(), slot_id);
-        // Register the slot's LiveWorkerState entry so apply_event
-        // has something to mutate.
+            .register_run_slot(execution.id.clone(), slot_id);
         server_state.live_worker_states.register_spawn(
             slot_id,
-            run.id.clone(),
+            execution.id.clone(),
             "claude-opus-4-7",
             0,
             None,
@@ -6769,7 +7003,7 @@ mod tests {
             std::sync::Arc::new(NopResolver);
         server_state.live_status_manager.start_slot(
             slot_id,
-            run.id.clone(),
+            execution.id.clone(),
             None,
             server_state.live_worker_states.clone(),
             broadcaster,
@@ -6778,7 +7012,7 @@ mod tests {
 
         let event = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(execution.id.clone()),
             transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
             event: WorkerEvent::PostToolUse {
                 session_id: "claude-sess-1".into(),

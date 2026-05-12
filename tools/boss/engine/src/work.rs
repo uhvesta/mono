@@ -1536,27 +1536,77 @@ impl WorkDb {
     }
 
     /// Persist the verbatim `transcript_path` we learned from a hook
-    /// event payload. Idempotent for the first writer (the
+    /// event payload.
+    ///
+    /// **Namespace warning.** The dispatcher's `_boss_run_id` carries
+    /// the `work_executions.id` (`exec_*`), not a `work_runs.id`
+    /// (`run_*`) — `runner.rs::run_execution` plumbs `execution.id`
+    /// through to `BOSS_RUN_ID` for the worker shim, and the engine's
+    /// `WorkerRegistry` keys its slot map on the same identifier. The
+    /// pre-2026-05-12 version of this function joined `WHERE id = ?1`
+    /// on `work_runs.id`, which never matched — every hook quietly
+    /// returned "0 rows updated" and the `transcript_path` column
+    /// stayed NULL forever. PR #366 and PR #372 both shipped trying
+    /// to fix the symptom without spotting the cross-namespace join.
+    /// This implementation resolves the most-recent `work_runs` row
+    /// for the execution and writes against its `id`, so the caller
+    /// can keep handing us an execution id without worrying about the
+    /// run/execution split.
+    ///
+    /// The lookup picks the latest run per `(created_at DESC, id
+    /// DESC)`: an execution can have multiple `work_runs` rows from
+    /// re-spawns, but only one is "live" at any moment (the others
+    /// are terminal). The live one is always the most recent insert,
+    /// so writing to it lines up with the running worker's actual
+    /// transcript file.
+    ///
+    /// Idempotent for the first writer per run (the
     /// `WHERE transcript_path IS NULL` clause keeps every subsequent
     /// hook event from rewriting the same value, and also keeps a
     /// later SessionStart/resume from clobbering the path the
-    /// summarizer's tail watcher has already opened against the
-    /// original session). Returns `Ok(true)` if a row was actually
-    /// updated. A missing run id is treated as a benign no-op — hook
-    /// events can race ahead of the run being written.
+    /// summarizer's tail watcher has already opened).
+    ///
+    /// Returns:
+    /// - `Updated` — the row's `transcript_path` was just written.
+    /// - `AlreadySet` — the latest run for this execution already
+    ///   has a non-NULL `transcript_path`; legitimate steady-state
+    ///   no-op.
+    /// - `RowMissing` — no `work_runs` row exists yet for this
+    ///   execution. Split out from `AlreadySet` because that
+    ///   conflation is precisely what hid the wrong-namespace bug:
+    ///   on the wire, "0 rows updated" looked identical between
+    ///   "run already populated" and "the join never matched in the
+    ///   first place".
     pub fn set_run_transcript_path_if_unset(
         &self,
-        run_id: &str,
+        execution_id: &str,
         transcript_path: &str,
-    ) -> Result<bool> {
+    ) -> Result<SetRunTranscriptPathOutcome> {
         let conn = self.connect()?;
+        let latest_run_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(run_id) = latest_run_id else {
+            return Ok(SetRunTranscriptPathOutcome::RowMissing);
+        };
         let updated = conn.execute(
             "UPDATE work_runs
              SET transcript_path = ?2
              WHERE id = ?1 AND transcript_path IS NULL",
             params![run_id, transcript_path],
         )?;
-        Ok(updated > 0)
+        if updated > 0 {
+            Ok(SetRunTranscriptPathOutcome::Updated)
+        } else {
+            Ok(SetRunTranscriptPathOutcome::AlreadySet)
+        }
     }
 
     /// Test-only helper: force `transcript_path` back to NULL on an
@@ -3375,6 +3425,20 @@ impl WorkDb {
 pub enum WorkerPrCompletionTarget {
     InReview,
     Done,
+}
+
+/// Outcome of [`WorkDb::set_run_transcript_path_if_unset`]. The third
+/// variant exists to keep "the latest run for this execution already
+/// has a transcript_path" (legitimate no-op) distinguishable from
+/// "no `work_runs` row exists for this execution yet" (real problem,
+/// either a startup race or a wrong-namespace identifier). Returning
+/// a flat `bool` from this call is what hid the 2026-05-12 bug:
+/// every hook delivery silently looked like an already-set no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetRunTranscriptPathOutcome {
+    Updated,
+    AlreadySet,
+    RowMissing,
 }
 
 /// Result of a successful [`WorkDb::record_worker_pr_completion`] call.
@@ -6853,14 +6917,24 @@ mod tests {
         // events must NOT overwrite it (a `/resume` session would
         // otherwise yank the path out from under the summarizer's
         // open file handle).
+        //
+        // Note the call passes `execution.id` (an `exec_*`), not
+        // `run.id` (a `run_*`) — that mirrors what the dispatcher
+        // actually feeds the function in production via the
+        // `_boss_run_id` hook-payload field. The function resolves
+        // to the latest run for the execution under the hood.
         assert!(reread.transcript_path.is_none());
         let first = db
             .set_run_transcript_path_if_unset(
-                &run.id,
+                &execution.id,
                 "/home/u/.claude/projects/foo/sess-1.jsonl",
             )
             .unwrap();
-        assert!(first, "first write must report updated=true");
+        assert_eq!(
+            first,
+            SetRunTranscriptPathOutcome::Updated,
+            "first write must report Updated",
+        );
         let after_first = db.get_run(&run.id).unwrap();
         assert_eq!(
             after_first.transcript_path.as_deref(),
@@ -6868,11 +6942,15 @@ mod tests {
         );
         let second = db
             .set_run_transcript_path_if_unset(
-                &run.id,
+                &execution.id,
                 "/home/u/.claude/projects/foo/sess-2.jsonl",
             )
             .unwrap();
-        assert!(!second, "second write must be a no-op");
+        assert_eq!(
+            second,
+            SetRunTranscriptPathOutcome::AlreadySet,
+            "second write must be a no-op",
+        );
         let after_second = db.get_run(&run.id).unwrap();
         assert_eq!(
             after_second.transcript_path.as_deref(),
@@ -6880,13 +6958,28 @@ mod tests {
             "first writer must win — never clobber the path the summarizer tail watcher already opened",
         );
 
-        // Unknown run id is a benign no-op: hook payloads can race
-        // ahead of the run row in pathological timing, and the
-        // dispatcher already silently drops events for unknown runs.
+        // Unknown execution id must surface as RowMissing, not as a
+        // silent no-op — that distinction is the whole point of the
+        // 2026-05-12 chore, because conflating the two is what hid
+        // the wrong-namespace bug behind a steady `_persist_noop=N`.
         let missing = db
-            .set_run_transcript_path_if_unset("run-does-not-exist", "/x.jsonl")
+            .set_run_transcript_path_if_unset("exec-does-not-exist", "/x.jsonl")
             .unwrap();
-        assert!(!missing);
+        assert_eq!(missing, SetRunTranscriptPathOutcome::RowMissing);
+
+        // The same call passing a `work_runs.id` (the old, buggy
+        // shape) must also surface as RowMissing — `run.id` is in a
+        // different namespace from `execution_id` and must not match.
+        // This pins the regression: pre-fix, passing `run.id` was
+        // the production code path and would silently return false.
+        let wrong_namespace = db
+            .set_run_transcript_path_if_unset(&run.id, "/y.jsonl")
+            .unwrap();
+        assert_eq!(
+            wrong_namespace,
+            SetRunTranscriptPathOutcome::RowMissing,
+            "passing a work_runs.id where an execution_id is expected must surface as RowMissing — not be silently absorbed as an AlreadySet no-op",
+        );
 
         let _ = std::fs::remove_file(path);
     }
