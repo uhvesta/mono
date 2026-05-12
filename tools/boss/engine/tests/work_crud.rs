@@ -114,6 +114,8 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -131,6 +133,8 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -249,6 +253,8 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             priority: Some("high".to_owned()),
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -264,6 +270,8 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -328,6 +336,8 @@ async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -487,6 +497,8 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -572,6 +584,8 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -619,6 +633,8 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -1037,6 +1053,8 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -1050,6 +1068,8 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -1175,6 +1195,8 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -1189,6 +1211,8 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -1203,6 +1227,8 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -1216,6 +1242,8 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;
@@ -1409,6 +1437,8 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         })
         .collect();
     let created_tasks = match client
@@ -1444,6 +1474,8 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         })
         .collect();
     let created_chores = match client
@@ -1476,6 +1508,8 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
         CreateTaskInput {
             product_id: product.id.clone(),
@@ -1486,6 +1520,8 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     ];
     match client

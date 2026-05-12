@@ -416,6 +416,17 @@ pub enum FrontendRequest {
         attempt_id: String,
         reason: String,
     },
+    /// Set (or clear) a product's `default_model` per the
+    /// effort-and-model-estimation design (PR #370). `model` is a
+    /// claude model slug stored verbatim; `None` clears the column.
+    /// The engine does NOT validate the slug — claude is the source
+    /// of truth on what `--model` accepts (design §Q3). Returns the
+    /// updated product wrapped in `WorkItemUpdated`.
+    SetProductDefaultModel {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

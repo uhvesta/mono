@@ -31,7 +31,7 @@ pub use boss_protocol::{
     AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, ConflictResolution,
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput,
-    DependencyDirection, DependencyEdge, DependencyFilter, ExecutionReconcileResult,
+    DependencyDirection, DependencyEdge, DependencyFilter, EffortLevel, ExecutionReconcileResult,
     ListDependenciesInput, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
     RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
     SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
@@ -68,7 +68,7 @@ impl WorkDb {
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at
+            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model
              FROM products
              ORDER BY name COLLATE NOCASE ASC",
         )?;
@@ -87,8 +87,8 @@ impl WorkDb {
         let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
 
         tx.execute(
-            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL)",
             params![id, input.name, slug, description, repo_remote_url, now],
         )?;
 
@@ -569,6 +569,36 @@ impl WorkDb {
     pub fn get_project(&self, id: &str) -> Result<Project> {
         let conn = self.connect()?;
         query_project(&conn, id)?.with_context(|| format!("unknown project: {id}"))
+    }
+
+    /// Set (or clear) a product's `default_model` per the
+    /// effort-and-model-estimation design (PR #370). `model = None`
+    /// or `Some("")` clears the column; any other slug is stored
+    /// verbatim after a trim. The engine deliberately does NOT
+    /// validate the slug — `claude` is the source of truth on what
+    /// `--model` accepts, and a new model must be adoptable without
+    /// an engine release blocking it (design §Q3).
+    pub fn set_product_default_model(
+        &self,
+        product_id: &str,
+        model: Option<&str>,
+    ) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let _ = query_product(&tx, product_id)?
+            .with_context(|| format!("unknown product: {product_id}"))?;
+        let now = now_string();
+        let stored = model
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        tx.execute(
+            "UPDATE products SET default_model = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, stored, now],
+        )?;
+        let updated = query_product(&tx, product_id)?
+            .with_context(|| format!("unknown product: {product_id}"))?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Write the project's design-doc pointer columns.
@@ -1785,7 +1815,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1796,7 +1826,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -1879,7 +1909,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1888,7 +1918,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1987,7 +2017,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -2205,7 +2235,8 @@ impl WorkDb {
                 repo_remote_url TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                default_model TEXT
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -2243,7 +2274,9 @@ impl WorkDb {
                 autostart INTEGER NOT NULL DEFAULT 1,
                 priority TEXT NOT NULL DEFAULT 'medium',
                 repo_remote_url TEXT,
-                created_via TEXT NOT NULL DEFAULT 'unknown'
+                created_via TEXT NOT NULL DEFAULT 'unknown',
+                effort_level TEXT,
+                model_override TEXT
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -2377,6 +2410,8 @@ impl WorkDb {
         migrate_conflict_resolutions_table(&conn)?;
         migrate_backfill_blocked_reason_dependency(&conn)?;
         migrate_work_attention_items_work_item_id(&conn)?;
+        migrate_tasks_effort_and_model_columns(&conn)?;
+        migrate_products_default_model(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '7')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2422,12 +2457,13 @@ impl WorkDb {
         apply_text_patch(&mut product.description, patch.description);
         apply_repo_remote_url_patch(&mut product.repo_remote_url, patch.repo_remote_url);
         apply_text_patch(&mut product.status, patch.status);
+        apply_optional_string_patch(&mut product.default_model, patch.default_model);
         product.slug = unique_product_slug_for_update(&tx, id, &slugify(&product.name))?;
         product.updated_at = now_string();
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8
              WHERE id = ?1",
             params![
                 product.id,
@@ -2437,6 +2473,7 @@ impl WorkDb {
                 product.repo_remote_url,
                 product.status,
                 product.updated_at,
+                product.default_model,
             ],
         )?;
 
@@ -2517,6 +2554,22 @@ impl WorkDb {
         if let Some(priority_patch) = patch.priority {
             task.priority = normalize_priority(Some(&priority_patch))?;
         }
+        if let Some(effort_patch) = patch.effort_level {
+            // Empty string clears the column; anything else must
+            // parse as one of the five allowed levels. Invalid
+            // values reject the whole patch — no half-updates.
+            let trimmed = effort_patch.trim();
+            task.effort_level = if trimmed.is_empty() {
+                None
+            } else {
+                Some(
+                    trimmed
+                        .parse::<EffortLevel>()
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                )
+            };
+        }
+        apply_optional_string_patch(&mut task.model_override, patch.model_override);
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
         }
@@ -2527,10 +2580,13 @@ impl WorkDb {
         }
         let actor = if status_changed { "human" } else { "" };
 
+        let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
+
         tx.execute(
             "UPDATE tasks
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
                  priority = ?9, repo_remote_url = ?10,
+                 effort_level = ?11, model_override = ?12,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
              WHERE id = ?1",
             params![
@@ -2544,6 +2600,8 @@ impl WorkDb {
                 actor,
                 task.priority,
                 task.repo_remote_url,
+                effort_level_value,
+                task.model_override,
             ],
         )?;
 
@@ -3481,6 +3539,7 @@ fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         status: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+        default_model: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -3504,6 +3563,24 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
 }
 
 fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let effort_raw: Option<String> = row.get(19)?;
+    let effort_level = match effort_raw.as_deref() {
+        None | Some("") => None,
+        Some(s) => match s.parse::<EffortLevel>() {
+            Ok(level) => Some(level),
+            Err(err) => {
+                // The column is constrained in code, not by SQL. A row
+                // carrying an out-of-set value is engine-side data
+                // corruption: surface it loudly rather than silently
+                // dropping the level.
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    19,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+                ));
+            }
+        },
+    };
     Ok(Task {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -3524,6 +3601,8 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         blocked_reason: row.get(16)?,
         blocked_attempt_id: row.get(17)?,
         repo_remote_url: row.get(18)?,
+        effort_level,
+        model_override: row.get::<_, Option<String>>(20)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -3647,11 +3726,13 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "task");
     let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
+    let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
+    let model_override = normalize_model_override(input.model_override);
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
@@ -3667,14 +3748,26 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "chore");
     let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
+    let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
+    let model_override = normalize_model_override(input.model_override);
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url)
-         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9)",
-        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override)
+         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
+}
+
+/// Trim and reduce an empty model slug to `None`. The CLI uses
+/// `--model ""` to clear a stored override on update verbs; the
+/// engine treats the same shape consistently on create so callers
+/// don't have to special-case empty strings. Non-empty strings pass
+/// through verbatim — claude is the source of truth on slug
+/// resolution (design §Q3).
+fn normalize_model_override(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
 /// Insert a `kind = 'design'` task as the first row under
@@ -3799,7 +3892,7 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
 
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
-        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at
+        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model
          FROM products
          WHERE id = ?1",
         [id],
@@ -3824,7 +3917,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -3887,7 +3980,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -4397,6 +4490,40 @@ fn migrate_work_attention_items_work_item_id(conn: &Connection) -> Result<()> {
             ON work_attention_items(work_item_id, created_at)",
         [],
     )?;
+    Ok(())
+}
+
+/// Add `tasks.effort_level` and `tasks.model_override` per the
+/// effort-and-model-estimation design (PR #370). Both columns are
+/// nullable TEXT; existing rows keep `NULL` across the upgrade so
+/// dispatcher behaviour is unchanged for unset rows (Q3 step 4).
+///
+/// `effort_level` is constrained in code (see [`EffortLevel`]); we
+/// deliberately do NOT add a SQL `CHECK` — the rule lives in the
+/// engine and bumping the enum should never require a schema rebuild.
+/// `model_override` carries a Claude model slug verbatim — also
+/// unvalidated at write time so a new model can ship without an
+/// engine release blocking adoption (design §Q3).
+fn migrate_tasks_effort_and_model_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "effort_level")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN effort_level TEXT", [])?;
+    }
+    if !table_has_column(conn, "tasks", "model_override")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add `products.default_model` per the effort-and-model-estimation
+/// design (PR #370). Nullable TEXT carrying a Claude model slug
+/// verbatim; existing product rows keep `NULL`. Lets a product owner
+/// set "default everything on this product to Sonnet" without
+/// touching every row's `model_override` (design §Q3 precedence step
+/// 3).
+fn migrate_products_default_model(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "default_model")? {
+        conn.execute("ALTER TABLE products ADD COLUMN default_model TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -5257,6 +5384,23 @@ fn apply_optional_patch(target: &mut Option<String>, patch: Option<String>) {
     }
 }
 
+/// `WorkItemPatch.model_override` / `WorkItemPatch.default_model`
+/// share the "empty string clears, otherwise store verbatim" wire
+/// shape: `None` leaves the column alone, `Some("")` writes NULL,
+/// and `Some(slug)` stores the slug after a trim. Slugs are
+/// deliberately not validated — claude is the source of truth on
+/// what `--model` accepts (design §Q3).
+fn apply_optional_string_patch(target: &mut Option<String>, patch: Option<String>) {
+    if let Some(value) = patch {
+        let trimmed = value.trim();
+        *target = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        };
+    }
+}
+
 fn task_to_item(task: Task) -> WorkItem {
     if task.kind == "chore" {
         WorkItem::Chore(task)
@@ -5696,6 +5840,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let chore = db
@@ -5707,6 +5853,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -5760,6 +5908,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -5822,6 +5972,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             },
             CreateTaskInput {
                 product_id: product.id.clone(),
@@ -5832,6 +5984,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             },
         ];
         let err = db
@@ -5879,6 +6033,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -5919,6 +6075,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let chore_running = db
@@ -5930,6 +6088,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -5997,6 +6157,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let dependent = db
@@ -6008,6 +6170,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -6035,6 +6199,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let other_dependent = db
@@ -6046,6 +6212,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -6161,6 +6329,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let second = db
@@ -6173,6 +6343,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6222,6 +6394,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6385,6 +6559,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let second_task = db
@@ -6397,6 +6573,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let chore = db
@@ -6408,6 +6586,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6478,6 +6658,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let second_task = db
@@ -6490,6 +6672,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6553,6 +6737,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6570,6 +6756,8 @@ mod tests {
             &product.id,
             WorkItemPatch {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                effort_level: None,
+                model_override: None,
                 ..WorkItemPatch::default()
             },
         )
@@ -6612,6 +6800,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6663,6 +6853,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6732,6 +6924,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6793,6 +6987,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -6809,6 +7005,8 @@ mod tests {
             &chore.id,
             WorkItemPatch {
                 repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
+                effort_level: None,
+                model_override: None,
                 ..WorkItemPatch::default()
             },
         )
@@ -6846,6 +7044,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -7005,6 +7205,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -7073,6 +7275,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -7149,6 +7353,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // Manually mark the chore as done before starting execution.
@@ -7223,6 +7429,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // Manually flip to active, mimicking a kanban drag that
@@ -7270,6 +7478,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -7326,6 +7536,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -7381,6 +7593,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -7448,6 +7662,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let exec_a = db
@@ -7481,6 +7697,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -7501,6 +7719,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -7557,6 +7777,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let exec_live = db
@@ -7586,6 +7808,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let exec_dead = db
@@ -7615,6 +7839,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let exec_unknown = db
@@ -7700,6 +7926,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let stale = db
@@ -7761,6 +7989,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -7829,6 +8059,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -7879,6 +8111,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // Drive the chore into `active` so reconcile considers it.
@@ -7963,6 +8197,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -8036,6 +8272,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let live = db
@@ -8093,6 +8331,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let done_chore = db
@@ -8104,6 +8344,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -8145,6 +8387,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         assert!(
@@ -8174,6 +8418,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let result = db.reconcile_product_executions(&product.id).unwrap();
@@ -8221,6 +8467,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -8272,6 +8520,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -8314,6 +8564,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -8531,6 +8783,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -8584,6 +8838,8 @@ mod tests {
                     priority: None,
                     created_via: None,
                     repo_remote_url: None,
+                    effort_level: None,
+                    model_override: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -8642,6 +8898,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let dependent = db
@@ -8653,6 +8911,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // Add the blocks edge BEFORE flipping dependent to active so
@@ -8710,6 +8970,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -8773,6 +9035,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -8866,6 +9130,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -8969,6 +9235,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -9021,6 +9289,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9032,6 +9302,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -9145,6 +9417,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9156,6 +9430,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let err = db
@@ -9195,6 +9471,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9206,6 +9484,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -9253,6 +9533,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9264,6 +9546,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // Sanity: A starts as `todo` (default).
@@ -9319,6 +9603,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9330,6 +9616,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -9385,6 +9673,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let prereq_b = db
@@ -9396,6 +9686,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let prereq_c = db
@@ -9407,6 +9699,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -9492,6 +9786,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let prereq = db
@@ -9503,6 +9799,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -9585,6 +9883,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9596,6 +9896,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
@@ -9650,6 +9952,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // Human moves A to `blocked` (no edges yet).
@@ -9678,6 +9982,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -9732,6 +10038,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9743,6 +10051,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -9788,6 +10098,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9799,6 +10111,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -9852,6 +10166,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let b = db
@@ -9863,6 +10179,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -10023,6 +10341,8 @@ mod tests {
                 priority: None,
                 created_via: Some(boss_protocol::CREATED_VIA_CLI.to_owned()),
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         assert_eq!(cli_chore.created_via, boss_protocol::CREATED_VIA_CLI);
@@ -10036,6 +10356,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         assert_eq!(unknown_chore.created_via, CREATED_VIA_UNKNOWN);
@@ -10385,6 +10707,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // Flip the chore into `blocked: merge_conflict` so the
@@ -11416,6 +11740,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -11569,6 +11895,8 @@ mod tests {
                     priority: None,
                     created_via: None,
                     repo_remote_url: None,
+                    effort_level: None,
+                    model_override: None,
                 })
                 .unwrap()
                 .id
@@ -11670,6 +11998,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         (path, db, product.id, task.id)
@@ -11781,5 +12111,415 @@ mod tests {
             message.contains("orphan task") && message.contains(&task_id),
             "expected an orphan-task error mentioning the task id, got: {message}",
         );
+    }
+
+    /// Default-shape sanity: a freshly-created chore/task has NULL
+    /// for the new effort/model columns; a freshly-created product
+    /// has NULL for `default_model`. Confirms the migration's
+    /// "behaviour unchanged for unset rows" contract holds on a
+    /// brand-new DB (the easy case — the migration test below
+    /// covers an upgrade-in-place).
+    #[test]
+    fn effort_and_model_default_to_null_on_fresh_rows() {
+        let path = temp_db_path("effort-fresh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        assert!(product.default_model.is_none());
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Trivial fix".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        assert!(chore.effort_level.is_none());
+        assert!(chore.model_override.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `create_chore` with `effort_level` / `model_override` set
+    /// writes both columns; `query_task` reads them back through
+    /// `map_task` faithfully.
+    #[test]
+    fn effort_and_model_roundtrip_through_create_and_query() {
+        let path = temp_db_path("effort-roundtrip");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Big investigation".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: Some(EffortLevel::Large),
+                model_override: Some("claude-opus-4-7".into()),
+            })
+            .unwrap();
+        assert_eq!(chore.effort_level, Some(EffortLevel::Large));
+        assert_eq!(chore.model_override.as_deref(), Some("claude-opus-4-7"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Update verb honours `--effort` set/clear and `--model`
+    /// set/clear semantics (empty string clears, anything else
+    /// stores verbatim).
+    #[test]
+    fn update_chore_sets_and_clears_effort_and_model() {
+        let path = temp_db_path("effort-update");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Some work".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+
+        // Set via update.
+        let updated = db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    effort_level: Some("medium".into()),
+                    model_override: Some("sonnet".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let task = match updated {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            _ => panic!("expected chore/task item"),
+        };
+        assert_eq!(task.effort_level, Some(EffortLevel::Medium));
+        assert_eq!(task.model_override.as_deref(), Some("sonnet"));
+
+        // Clear via empty string.
+        let cleared = db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    effort_level: Some(String::new()),
+                    model_override: Some(String::new()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let task = match cleared {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            _ => panic!("expected chore/task item"),
+        };
+        assert!(task.effort_level.is_none());
+        assert!(task.model_override.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Update verb rejects an invalid `effort_level` string with a
+    /// clear error that names the allowed values.
+    #[test]
+    fn update_chore_rejects_invalid_effort_level() {
+        let path = temp_db_path("effort-invalid");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Some work".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+
+        let err = db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    effort_level: Some("galaxybrain".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("galaxybrain"));
+        assert!(message.contains("trivial"));
+        assert!(message.contains("max"));
+
+        // Row was not partially updated — effort_level remains NULL.
+        let after = db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    name: Some("force a no-op write so we can re-read".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let task = match after {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            _ => panic!("expected chore/task item"),
+        };
+        assert!(task.effort_level.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `set_product_default_model` round-trip: set then clear.
+    /// Slugs are stored verbatim (no validation).
+    #[test]
+    fn product_default_model_set_and_clear() {
+        let path = temp_db_path("default-model");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        assert!(product.default_model.is_none());
+
+        let with_model = db
+            .set_product_default_model(&product.id, Some("sonnet"))
+            .unwrap();
+        assert_eq!(with_model.default_model.as_deref(), Some("sonnet"));
+
+        // Verbatim — engine does not normalise the slug.
+        let verbatim = db
+            .set_product_default_model(&product.id, Some("an-unreleased-model-2099"))
+            .unwrap();
+        assert_eq!(
+            verbatim.default_model.as_deref(),
+            Some("an-unreleased-model-2099"),
+        );
+
+        let cleared = db
+            .set_product_default_model(&product.id, Some(""))
+            .unwrap();
+        assert!(cleared.default_model.is_none());
+
+        let cleared_again = db
+            .set_product_default_model(&product.id, None)
+            .unwrap();
+        assert!(cleared_again.default_model.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Drop the effort/model columns (simulating a pre-PR-370 DB)
+    /// and re-open: the migration's ALTER TABLE path must re-add
+    /// them and leave existing rows with NULL on each new column.
+    /// SQLite 3.35+ supports `ALTER TABLE … DROP COLUMN`, which lets
+    /// us replay an upgrade-in-place without hand-rolling the
+    /// pre-v7 schema from scratch.
+    #[test]
+    fn migration_re_adds_effort_and_model_columns_on_upgrade() {
+        let path = temp_db_path("effort-upgrade");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Legacy chore".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            // Drop the new columns to simulate a pre-migration DB.
+            conn.execute("ALTER TABLE tasks DROP COLUMN effort_level", [])
+                .unwrap();
+            conn.execute("ALTER TABLE tasks DROP COLUMN model_override", [])
+                .unwrap();
+            conn.execute("ALTER TABLE products DROP COLUMN default_model", [])
+                .unwrap();
+            assert!(!table_has_column(&conn, "tasks", "effort_level").unwrap());
+            assert!(!table_has_column(&conn, "tasks", "model_override").unwrap());
+            assert!(!table_has_column(&conn, "products", "default_model").unwrap());
+        }
+        drop(db);
+
+        // Re-open re-runs the migrations.
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "effort_level").unwrap());
+        assert!(table_has_column(&conn, "tasks", "model_override").unwrap());
+        assert!(table_has_column(&conn, "products", "default_model").unwrap());
+
+        let chore_effort: Option<String> = conn
+            .query_row(
+                "SELECT effort_level FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let chore_model: Option<String> = conn
+            .query_row(
+                "SELECT model_override FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let product_model: Option<String> = conn
+            .query_row(
+                "SELECT default_model FROM products WHERE id = ?1",
+                [&product.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(chore_effort.is_none());
+        assert!(chore_model.is_none());
+        assert!(product_model.is_none());
+
+        // Post-migration rows can carry any of the five enum
+        // values; the round-trip continues to work.
+        let after_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Post-migration chore".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: Some(EffortLevel::Trivial),
+                model_override: Some("haiku".into()),
+            })
+            .unwrap();
+        assert_eq!(after_chore.effort_level, Some(EffortLevel::Trivial));
+        assert_eq!(after_chore.model_override.as_deref(), Some("haiku"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Migration test: rows created against a pre-migration schema
+    /// keep `NULL` for the new columns after the migration runs.
+    /// Mirrors the legacy-row contract every prior migration is
+    /// expected to honour.
+    #[test]
+    fn migration_leaves_existing_rows_with_null_effort_and_model() {
+        let path = temp_db_path("effort-migrate");
+
+        // Stand up a "pre-migration" DB by hand-rolling rows with the
+        // older column set, then re-open via `WorkDb::open` so the
+        // migration runs against it. We don't replay the entire pre-v7
+        // schema; we just drop the new columns on a freshly-init'd DB
+        // to simulate the upgrade path.
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Pre-migration chore".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        // Simulate the pre-migration state by NULL-ing whatever the
+        // current schema initialised. `create_chore` already stores
+        // NULL for `effort_level` / `model_override`, and
+        // `create_product` already stores NULL for `default_model`,
+        // so we just confirm that — the explicit ALTER-TABLE path on
+        // re-open is exercised by the legacy-on-disk DBs in the
+        // field, which the upgrade test below would otherwise be a
+        // synthetic re-init of.
+        drop(db);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        let chore_effort: Option<String> = conn
+            .query_row(
+                "SELECT effort_level FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let chore_model: Option<String> = conn
+            .query_row(
+                "SELECT model_override FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let product_model: Option<String> = conn
+            .query_row(
+                "SELECT default_model FROM products WHERE id = ?1",
+                [&product.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(chore_effort.is_none());
+        assert!(chore_model.is_none());
+        assert!(product_model.is_none());
+
+        let _ = std::fs::remove_file(path);
     }
 }

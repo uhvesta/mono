@@ -10,11 +10,11 @@ use boss_client::{
 use boss_protocol::{
     AddDependencyInput, CREATED_VIA_CLI, ConflictResolution, CreateChoreInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, FrontendEvent,
-    FrontendRequest, ListDependenciesInput, Product, Project, ProjectDesignDocState,
-    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind,
-    SetProjectDesignDocInput, Task, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch,
+    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortLevel,
+    FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
+    ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -102,6 +102,13 @@ enum ProductCommand {
     Delete(ProductSelectorArg),
     /// Move a product into a different lifecycle status (active/paused/archived).
     Move(ProductMoveArgs),
+    /// Set (or clear) the product's default claude model slug. Used by
+    /// the dispatcher (per the effort-and-model design's Q3
+    /// precedence) when a task/chore on this product has no
+    /// `model_override` set. Slug is stored verbatim — claude is the
+    /// source of truth on which slugs resolve.
+    #[command(name = "set-default-model")]
+    SetDefaultModel(ProductSetDefaultModelArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -388,6 +395,24 @@ struct ProductSelectorArg {
 }
 
 #[derive(Debug, Clone, Args)]
+struct ProductSetDefaultModelArgs {
+    selector: String,
+
+    /// Claude model slug to store as the product default (e.g.
+    /// `opus`, `sonnet`, `haiku`, `claude-opus-4-7`). Stored verbatim
+    /// — no validation against the engine. Mutually exclusive with
+    /// `--unset`; one of the two is required.
+    #[arg(long, value_name = "SLUG", conflicts_with = "unset")]
+    model: Option<String>,
+
+    /// Clear the product's `default_model` so the dispatcher falls
+    /// through to the effort-level default (per design §Q3).
+    /// Mutually exclusive with `--model`.
+    #[arg(long)]
+    unset: bool,
+}
+
+#[derive(Debug, Clone, Args)]
 struct ProjectSelectorArgs {
     #[arg(long)]
     product: Option<String>,
@@ -593,6 +618,18 @@ struct TaskCreateArgs {
     #[arg(long = "repo")]
     #[arg(alias = "repo-remote-url")]
     repo_remote_url: Option<String>,
+
+    /// Effort estimate (`trivial`/`small`/`medium`/`large`/`max`).
+    /// Omitted → no level set; the dispatcher falls through to
+    /// product / engine default per the design's Q3 precedence.
+    #[arg(long, value_enum)]
+    effort: Option<EffortLevelArg>,
+
+    /// Claude model slug override (e.g. `opus`, `sonnet`, `haiku`,
+    /// or a fully-qualified id). Stored verbatim — claude is the
+    /// source of truth on slugs.
+    #[arg(long, value_name = "SLUG")]
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -658,6 +695,17 @@ struct ChoreCreateArgs {
     #[arg(long = "repo")]
     #[arg(alias = "repo-remote-url")]
     repo_remote_url: Option<String>,
+
+    /// Effort estimate (`trivial`/`small`/`medium`/`large`/`max`).
+    /// Omitted → no level set; the dispatcher falls through per
+    /// design §Q3 precedence.
+    #[arg(long, value_enum)]
+    effort: Option<EffortLevelArg>,
+
+    /// Claude model slug override. Stored verbatim — claude is the
+    /// source of truth on slugs.
+    #[arg(long, value_name = "SLUG")]
+    model: Option<String>,
 }
 
 /// Args for `boss task create-many`. The CLI reads a JSON array of
@@ -819,6 +867,26 @@ struct TaskUpdateArgs {
     #[arg(long = "repo")]
     #[arg(alias = "repo-remote-url")]
     repo_remote_url: Option<String>,
+
+    /// Set the effort level (`trivial`/`small`/`medium`/`large`/`max`).
+    /// Mutually exclusive with `--unset-effort`.
+    #[arg(long, value_enum, conflicts_with = "unset_effort")]
+    effort: Option<EffortLevelArg>,
+
+    /// Clear the effort level so the row falls through to the
+    /// dispatcher's product / engine default again (design §Q3).
+    #[arg(long = "unset-effort")]
+    unset_effort: bool,
+
+    /// Claude model slug override. Stored verbatim. Mutually
+    /// exclusive with `--unset-model`.
+    #[arg(long, value_name = "SLUG", conflicts_with = "unset_model")]
+    model: Option<String>,
+
+    /// Clear the per-row model override so the dispatcher falls
+    /// through per design §Q3 precedence.
+    #[arg(long = "unset-model")]
+    unset_model: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -905,6 +973,44 @@ enum TaskPriority {
     Low,
     Medium,
     High,
+}
+
+/// CLI surface for `tasks.effort_level` (design §Q1):
+/// `trivial | small | medium | large | max`. `max` is the human-only
+/// escape hatch — the coordinator's heuristic never emits it, but
+/// users can set it via `--effort max` to request Claude's maximum
+/// reasoning depth.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum EffortLevelArg {
+    Trivial,
+    Small,
+    Medium,
+    Large,
+    Max,
+}
+
+impl EffortLevelArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Trivial => "trivial",
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl From<EffortLevelArg> for boss_protocol::EffortLevel {
+    fn from(value: EffortLevelArg) -> Self {
+        match value {
+            EffortLevelArg::Trivial => boss_protocol::EffortLevel::Trivial,
+            EffortLevelArg::Small => boss_protocol::EffortLevel::Small,
+            EffortLevelArg::Medium => boss_protocol::EffortLevel::Medium,
+            EffortLevelArg::Large => boss_protocol::EffortLevel::Large,
+            EffortLevelArg::Max => boss_protocol::EffortLevel::Max,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1361,6 +1467,19 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 print_product_details("Moved product", &moved);
             })
         }
+        ProductCommand::SetDefaultModel(args) => {
+            if !args.unset && args.model.is_none() {
+                return Err(CliError::usage(
+                    "provide either --model <slug> or --unset",
+                ));
+            }
+            let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+            let model = if args.unset { None } else { args.model };
+            let updated = set_product_default_model(&mut client, &product.id, model).await?;
+            print_entity(ctx, &serde_json::json!({ "product": updated }), || {
+                print_product_details("Updated product", &updated);
+            })
+        }
     }
 }
 
@@ -1632,6 +1751,8 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
                     repo_remote_url: normalize_non_empty(args.repo_remote_url),
+                    effort_level: args.effort.map(EffortLevel::from),
+                    model_override: normalize_non_empty(args.model),
                 },
             )
             .await?;
@@ -1730,6 +1851,8 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
                     repo_remote_url: normalize_non_empty(args.repo_remote_url),
+                    effort_level: args.effort.map(EffortLevel::from),
+                    model_override: normalize_non_empty(args.model),
                 },
             )
             .await?;
@@ -1800,6 +1923,16 @@ async fn run_update_leaf(
     ctx: &RunContext,
     args: TaskUpdateArgs,
 ) -> Result<(), CliError> {
+    let effort_level = if args.unset_effort {
+        Some(String::new())
+    } else {
+        args.effort.map(|e| e.as_str().to_owned())
+    };
+    let model_override = if args.unset_model {
+        Some(String::new())
+    } else {
+        args.model
+    };
     let patch = WorkItemPatch {
         name: args.name,
         description: args.description,
@@ -1811,11 +1944,13 @@ async fn run_update_leaf(
         // means the engine should clear the override (inherit from
         // the product). Don't `normalize_non_empty` here.
         repo_remote_url: args.repo_remote_url,
+        effort_level,
+        model_override,
         ..WorkItemPatch::default()
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, or --repo",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, or --model",
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
@@ -2269,6 +2404,27 @@ async fn create_product(
     }
 }
 
+async fn set_product_default_model(
+    client: &mut BossClient,
+    product_id: &str,
+    model: Option<String>,
+) -> Result<Product, CliError> {
+    match client
+        .send_request(&FrontendRequest::SetProductDefaultModel {
+            product_id: product_id.to_owned(),
+            model,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_product(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("set-default-model", &other)),
+    }
+}
+
 async fn create_project(
     client: &mut BossClient,
     input: CreateProjectInput,
@@ -2572,6 +2728,8 @@ async fn run_task_create_many(
             priority: item.priority,
             created_via: Some(CREATED_VIA_CLI.to_owned()),
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         });
     }
 
@@ -2616,6 +2774,8 @@ async fn run_chore_create_many(
             priority: item.priority,
             created_via: Some(CREATED_VIA_CLI.to_owned()),
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         });
     }
 
@@ -3285,7 +3445,10 @@ fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Result<(), CliE
         || patch.priority.is_some()
         || patch.repo_remote_url.is_some()
         || patch.pr_url.is_some()
-        || patch.ordinal.is_some();
+        || patch.ordinal.is_some()
+        || patch.effort_level.is_some()
+        || patch.model_override.is_some()
+        || patch.default_model.is_some();
 
     if has_fields {
         Ok(())
@@ -3515,18 +3678,27 @@ where
 }
 
 fn print_products_table(products: &[Product]) {
+    let show_default_model = products.iter().any(|p| p.default_model.is_some());
     let mut table = Table::new();
+    let mut header = vec!["ID", "SLUG", "NAME", "STATUS", "REPO"];
+    if show_default_model {
+        header.push("DEFAULT MODEL");
+    }
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["ID", "SLUG", "NAME", "STATUS", "REPO"]);
+        .set_header(header);
     for product in products {
-        table.add_row(vec![
+        let mut row = vec![
             product.id.as_str(),
             product.slug.as_str(),
             product.name.as_str(),
             product.status.as_str(),
             product.repo_remote_url.as_deref().unwrap_or(""),
-        ]);
+        ];
+        if show_default_model {
+            row.push(product.default_model.as_deref().unwrap_or(""));
+        }
+        table.add_row(row);
     }
     println!("{table}");
 }
@@ -3550,26 +3722,40 @@ fn print_projects_table(projects: &[Project]) {
 }
 
 fn print_tasks_table(tasks: &[Task]) {
+    // Only render the EFFORT column when at least one row in the
+    // view carries a level — keeps the common case (legacy rows)
+    // narrow but surfaces the new field as soon as it lands on
+    // anything. JSON output always carries the field; this is a
+    // human-readability nicety only.
+    let show_effort = tasks.iter().any(|t| t.effort_level.is_some());
     let mut table = Table::new();
+    let mut header = vec!["ID", "NAME", "STATUS", "PRIORITY"];
+    if show_effort {
+        header.push("EFFORT");
+    }
+    header.extend_from_slice(&["PROJECT", "ORDINAL", "PR URL"]);
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "ID", "NAME", "STATUS", "PRIORITY", "PROJECT", "ORDINAL", "PR URL",
-        ]);
+        .set_header(header);
     for task in tasks {
         let ordinal = task
             .ordinal
             .map(|value| value.to_string())
             .unwrap_or_default();
-        table.add_row(vec![
+        let mut row: Vec<&str> = vec![
             task.id.as_str(),
             task.name.as_str(),
             task.status.as_str(),
             task.priority.as_str(),
-            task.project_id.as_deref().unwrap_or(""),
-            ordinal.as_str(),
-            task.pr_url.as_deref().unwrap_or(""),
-        ]);
+        ];
+        let effort_cell = task.effort_level.map(|l| l.as_str()).unwrap_or("");
+        if show_effort {
+            row.push(effort_cell);
+        }
+        row.push(task.project_id.as_deref().unwrap_or(""));
+        row.push(ordinal.as_str());
+        row.push(task.pr_url.as_deref().unwrap_or(""));
+        table.add_row(row);
     }
     println!("{table}");
 }
@@ -3581,6 +3767,9 @@ fn print_product_details(title: &str, product: &Product) {
     println!("Slug: {}", product.slug);
     println!("Status: {}", product.status);
     println!("Repo: {}", product.repo_remote_url.as_deref().unwrap_or(""));
+    if let Some(model) = product.default_model.as_deref() {
+        println!("Default model: {model}");
+    }
     if !product.description.is_empty() {
         println!("Description: {}", product.description);
     }
@@ -3797,6 +3986,12 @@ fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>
         );
     }
     println!("Priority: {}", task.priority);
+    if let Some(level) = task.effort_level {
+        println!("Effort: {level}");
+    }
+    if let Some(model) = task.model_override.as_deref() {
+        println!("Model override: {model}");
+    }
     println!("Source: {}", task.created_via);
     if let Some(ordinal) = task.ordinal {
         println!("Ordinal: {}", ordinal);
@@ -3814,11 +4009,12 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, OpenDesignAction,
-        ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, TaskCommand,
-        classify_bind_pr, decide_open_design_action, ensure_explicit_product_matches,
-        expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
-        is_typed_work_item_id, pick_by_index, short_name_for, validate_github_pr_url,
+        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, EffortLevelArg, MoveTarget,
+        OpenDesignAction, ProductCommand, ProductStatus, ProjectCommand, ProjectStatus,
+        RepoSelector, TaskCommand, classify_bind_pr, decide_open_design_action,
+        ensure_explicit_product_matches, expect_leaf_work_item, format_project_design_doc_line,
+        format_repo_line, is_typed_work_item_id, pick_by_index, short_name_for,
+        validate_github_pr_url,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -3922,6 +4118,8 @@ mod tests {
             repo_remote_url: None,
             blocked_reason: None,
             blocked_attempt_id: None,
+            effort_level: None,
+            model_override: None,
         }
     }
 
@@ -3949,6 +4147,7 @@ mod tests {
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
+            default_model: None,
         };
         assert!(expect_leaf_work_item(WorkItem::Product(product)).is_err());
 
@@ -3984,6 +4183,7 @@ mod tests {
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
+            default_model: None,
         }
     }
 
@@ -4627,6 +4827,159 @@ mod tests {
     }
 
     #[test]
+    fn parses_chore_create_with_effort_and_model() {
+        let cli = Cli::parse_from([
+            "boss",
+            "chore",
+            "create",
+            "--product",
+            "boss",
+            "--name",
+            "fix it",
+            "--effort",
+            "large",
+            "--model",
+            "claude-opus-4-7",
+        ]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::Create(args),
+            } => {
+                assert!(matches!(args.effort, Some(EffortLevelArg::Large)));
+                assert_eq!(args.model.as_deref(), Some("claude-opus-4-7"));
+            }
+            _ => panic!("expected chore create command"),
+        }
+    }
+
+    /// `--effort` only accepts the five documented values; anything
+    /// else fails at parse time with a clear clap error listing the
+    /// valid set.
+    #[test]
+    fn rejects_invalid_effort_level_at_parse_time() {
+        let result = Cli::try_parse_from([
+            "boss",
+            "chore",
+            "create",
+            "--product",
+            "boss",
+            "--name",
+            "x",
+            "--effort",
+            "galaxybrain",
+        ]);
+        let err = result.expect_err("expected clap to reject the value");
+        let rendered = err.to_string();
+        // clap renders the allowed set; the exact framing changes
+        // between clap versions but the level names are stable.
+        assert!(rendered.contains("trivial"), "{rendered}");
+        assert!(rendered.contains("max"), "{rendered}");
+    }
+
+    #[test]
+    fn parses_task_update_with_effort_clear_and_model_clear() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "update",
+            "task_1",
+            "--unset-effort",
+            "--unset-model",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Update(args),
+            } => {
+                assert!(args.unset_effort);
+                assert!(args.unset_model);
+                assert!(args.effort.is_none());
+                assert!(args.model.is_none());
+            }
+            _ => panic!("expected task update command"),
+        }
+    }
+
+    /// `--effort` and `--unset-effort` are mutually exclusive — the
+    /// `conflicts_with` attribute on the args struct makes clap
+    /// reject the combination.
+    #[test]
+    fn task_update_rejects_effort_and_unset_effort_together() {
+        let result = Cli::try_parse_from([
+            "boss",
+            "task",
+            "update",
+            "task_1",
+            "--effort",
+            "small",
+            "--unset-effort",
+        ]);
+        assert!(result.is_err(), "expected clap to reject mutually exclusive flags");
+    }
+
+    #[test]
+    fn parses_product_set_default_model_with_model() {
+        let cli = Cli::parse_from([
+            "boss",
+            "product",
+            "set-default-model",
+            "boss",
+            "--model",
+            "sonnet",
+        ]);
+        match cli.command {
+            Commands::Product {
+                command: ProductCommand::SetDefaultModel(args),
+            } => {
+                assert_eq!(args.selector, "boss");
+                assert_eq!(args.model.as_deref(), Some("sonnet"));
+                assert!(!args.unset);
+            }
+            _ => panic!("expected product set-default-model command"),
+        }
+    }
+
+    #[test]
+    fn parses_product_set_default_model_with_unset() {
+        let cli = Cli::parse_from([
+            "boss",
+            "product",
+            "set-default-model",
+            "boss",
+            "--unset",
+        ]);
+        match cli.command {
+            Commands::Product {
+                command: ProductCommand::SetDefaultModel(args),
+            } => {
+                assert!(args.unset);
+                assert!(args.model.is_none());
+            }
+            _ => panic!("expected product set-default-model command"),
+        }
+    }
+
+    /// `set-default-model` rejects `--model` and `--unset` together
+    /// at the parser; the "neither was supplied" case is caught in
+    /// the runtime handler (the selector positional sits outside the
+    /// mutual-exclusion group so the parser can still resolve it).
+    #[test]
+    fn product_set_default_model_rejects_model_with_unset() {
+        let result = Cli::try_parse_from([
+            "boss",
+            "product",
+            "set-default-model",
+            "boss",
+            "--model",
+            "sonnet",
+            "--unset",
+        ]);
+        assert!(
+            result.is_err(),
+            "expected clap to reject --model and --unset together",
+        );
+    }
+
+    #[test]
     fn parses_chore_update_with_repo_set() {
         let cli = Cli::parse_from([
             "boss",
@@ -4791,6 +5144,7 @@ mod tests {
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
+            default_model: None,
         }
     }
 

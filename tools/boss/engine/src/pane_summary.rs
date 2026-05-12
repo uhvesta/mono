@@ -411,6 +411,8 @@ mod tests {
             repo_remote_url: None,
             blocked_reason: None,
             blocked_attempt_id: None,
+            effort_level: None,
+            model_override: None,
         })
     }
 

@@ -130,6 +130,8 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             },
         })
         .await?
@@ -732,6 +734,8 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             },
         })
         .await?
@@ -834,6 +838,8 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             },
         })
         .await?
@@ -922,6 +928,8 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             },
         })
         .await?
@@ -1037,6 +1045,8 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         priority: None,
         created_via: None,
         repo_remote_url: None,
+        effort_level: None,
+        model_override: None,
     })?;
     work_db.update_work_item(
         &chore.id,
@@ -1368,6 +1378,8 @@ async fn seed_two_conflict_resolutions(
         priority: None,
         created_via: None,
         repo_remote_url: None,
+        effort_level: None,
+        model_override: None,
     })?;
     work_db.update_work_item(
         &chore.id,

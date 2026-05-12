@@ -222,6 +222,8 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         },
     )
     .await?;

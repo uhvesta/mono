@@ -51,3 +51,27 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+# End-to-end coverage for the effort-level / model-override CLI
+# surface (PR #370 schema task). Same shape as `infer_product_test`
+# — drives the `boss` binary against an in-process engine to confirm
+# `--effort` / `--model` round-trip through create/edit/show and
+# `set-default-model` lifecycles.
+rust_test(
+    name = "effort_and_model_test",
+    srcs = ["tests/effort_and_model.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)

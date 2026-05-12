@@ -2288,6 +2288,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2352,6 +2354,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2409,6 +2413,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2503,6 +2509,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2544,6 +2552,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2590,6 +2600,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2654,6 +2666,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2836,6 +2850,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2967,6 +2983,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3075,6 +3093,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3213,6 +3233,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3289,6 +3311,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3427,6 +3451,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let late = db
@@ -3438,6 +3464,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3515,6 +3543,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3579,6 +3609,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3651,6 +3683,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3737,6 +3771,8 @@ mod tests {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         })
         .unwrap();
         db.create_task(CreateTaskInput {
@@ -3748,6 +3784,8 @@ mod tests {
             priority: None,
             created_via: None,
             repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
         })
         .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3843,6 +3881,8 @@ mod tests {
                     priority: None,
                     created_via: None,
                     repo_remote_url: None,
+                    effort_level: None,
+                    model_override: None,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -3951,6 +3991,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -3974,6 +4016,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4004,6 +4048,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let real_exec = db
@@ -4099,6 +4145,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         }
@@ -4170,6 +4218,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         // A second chore that will sit in `ready` because the
@@ -4183,6 +4233,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4298,6 +4350,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4315,6 +4369,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4397,6 +4453,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4410,6 +4468,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(
@@ -4558,6 +4618,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();

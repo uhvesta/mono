@@ -399,6 +399,8 @@ mod tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         db.update_work_item(

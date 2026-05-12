@@ -10,6 +10,75 @@ pub struct Product {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Per-product default model slug used when a task/chore on this
+    /// product has no `model_override` set. `None` → fall through to
+    /// the effort-level default / engine default (per the design's Q3
+    /// precedence). Stored verbatim — the engine does not validate the
+    /// slug, so a future Claude release can ship without a Boss
+    /// migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+/// Allowed values for `tasks.effort_level`. Per design §"Naming" /
+/// §Q1: `trivial | small | medium | large | max`. Stored as TEXT
+/// in SQLite (no `CHECK` constraint), validated in code by
+/// [`EffortLevel::from_str`].
+///
+/// `max` is the human-only escape hatch: the coordinator's
+/// heuristic never emits it; humans set it via `--effort max` when
+/// they want Claude's maximum reasoning depth regardless of what
+/// the scope markers suggest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Trivial,
+    Small,
+    Medium,
+    Large,
+    Max,
+}
+
+impl EffortLevel {
+    pub const ALL: &'static [EffortLevel] = &[
+        EffortLevel::Trivial,
+        EffortLevel::Small,
+        EffortLevel::Medium,
+        EffortLevel::Large,
+        EffortLevel::Max,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffortLevel::Trivial => "trivial",
+            EffortLevel::Small => "small",
+            EffortLevel::Medium => "medium",
+            EffortLevel::Large => "large",
+            EffortLevel::Max => "max",
+        }
+    }
+}
+
+impl std::fmt::Display for EffortLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for EffortLevel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "trivial" => Ok(EffortLevel::Trivial),
+            "small" => Ok(EffortLevel::Small),
+            "medium" => Ok(EffortLevel::Medium),
+            "large" => Ok(EffortLevel::Large),
+            "max" => Ok(EffortLevel::Max),
+            other => Err(format!(
+                "unknown effort level `{other}`; expected one of: trivial, small, medium, large, max"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +177,17 @@ pub struct Task {
     /// engine-managed attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_attempt_id: Option<String>,
+    /// Effort estimate for the work item. `None` means "no level set;
+    /// dispatcher falls through to product / engine default per design
+    /// §Q3." Set by the coordinator's heuristic at creation, or by an
+    /// explicit `--effort` flag on `boss task/chore create|edit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<EffortLevel>,
+    /// Explicit model slug override. `None` → resolve via the design's
+    /// Q3 precedence (effort default → product default → engine default).
+    /// Stored verbatim — the engine does not validate the slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -373,6 +453,14 @@ pub struct CreateTaskInput {
     /// caller-supplied URLs at write time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
+    /// Effort estimate. `None` → leave NULL on the row; dispatcher
+    /// falls through to product / engine default per design §Q3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<EffortLevel>,
+    /// Explicit model slug override. `None` → no override; dispatcher
+    /// resolves per design §Q3 precedence. Stored verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,6 +488,12 @@ pub struct CreateChoreInput {
     /// caller-supplied URLs at write time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
+    /// See [`CreateTaskInput::effort_level`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<EffortLevel>,
+    /// See [`CreateTaskInput::model_override`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
 }
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved
@@ -495,6 +589,23 @@ pub struct WorkItemPatch {
     pub repo_remote_url: Option<String>,
     pub pr_url: Option<String>,
     pub ordinal: Option<i64>,
+    /// Effort estimate to apply on this update. `None` → leave the
+    /// existing column value alone. `Some("")` → clear the column
+    /// (write NULL). Any other string is validated against the
+    /// [`EffortLevel`] enum at the engine boundary; invalid values
+    /// reject the entire patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
+    /// Model slug override. `None` → leave unchanged. `Some("")` →
+    /// clear the column. Any other string is stored verbatim (no
+    /// validation — `claude` is the source of truth on slugs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Product-level default model. Only honoured on
+    /// product-targeted updates; ignored when patching a task/chore/
+    /// project. `None` → leave unchanged. `Some("")` → clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
 }
 
 /// One row of the `work_item_dependencies` table — an edge from a
@@ -1139,5 +1250,100 @@ mod tests {
         }
         let back: ConflictResolution = serde_json::from_value(encoded).unwrap();
         assert_eq!(attempt, back);
+    }
+
+    #[test]
+    fn effort_level_parses_all_five_values() {
+        use std::str::FromStr;
+        assert_eq!(EffortLevel::from_str("trivial").unwrap(), EffortLevel::Trivial);
+        assert_eq!(EffortLevel::from_str("small").unwrap(), EffortLevel::Small);
+        assert_eq!(EffortLevel::from_str("medium").unwrap(), EffortLevel::Medium);
+        assert_eq!(EffortLevel::from_str("large").unwrap(), EffortLevel::Large);
+        assert_eq!(EffortLevel::from_str("max").unwrap(), EffortLevel::Max);
+    }
+
+    #[test]
+    fn effort_level_rejects_unknown_values() {
+        use std::str::FromStr;
+        let err = EffortLevel::from_str("galaxybrain").unwrap_err();
+        assert!(err.contains("galaxybrain"));
+        assert!(err.contains("trivial"));
+        assert!(err.contains("max"));
+    }
+
+    #[test]
+    fn effort_level_serializes_as_lowercase_string() {
+        let encoded = serde_json::to_value(EffortLevel::Large).unwrap();
+        assert_eq!(encoded, Value::String("large".into()));
+        let back: EffortLevel = serde_json::from_value(Value::String("trivial".into())).unwrap();
+        assert_eq!(back, EffortLevel::Trivial);
+    }
+
+    #[test]
+    fn task_decodes_without_effort_or_model_fields() {
+        let raw = sample_task_json(json!({}));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert!(task.effort_level.is_none());
+        assert!(task.model_override.is_none());
+    }
+
+    #[test]
+    fn task_skips_none_effort_and_model_on_encode() {
+        let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&task).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("effort_level"));
+        assert!(!obj.contains_key("model_override"));
+    }
+
+    #[test]
+    fn task_roundtrips_with_effort_and_model_set() {
+        let raw = sample_task_json(json!({
+            "effort_level": "large",
+            "model_override": "claude-opus-4-7",
+        }));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert_eq!(task.effort_level, Some(EffortLevel::Large));
+        assert_eq!(task.model_override.as_deref(), Some("claude-opus-4-7"));
+
+        let reencoded = serde_json::to_value(&task).unwrap();
+        let task2: Task = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(task.effort_level, task2.effort_level);
+        assert_eq!(task.model_override, task2.model_override);
+    }
+
+    #[test]
+    fn product_decodes_without_default_model() {
+        let raw = json!({
+            "id": "prod_1",
+            "name": "Boss",
+            "slug": "boss",
+            "description": "",
+            "repo_remote_url": Value::Null,
+            "status": "active",
+            "created_at": "1747000000",
+            "updated_at": "1747000000",
+        });
+        let product: Product = serde_json::from_value(raw).unwrap();
+        assert!(product.default_model.is_none());
+    }
+
+    #[test]
+    fn product_roundtrips_with_default_model() {
+        let raw = json!({
+            "id": "prod_1",
+            "name": "Boss",
+            "slug": "boss",
+            "description": "",
+            "repo_remote_url": Value::Null,
+            "status": "active",
+            "created_at": "1747000000",
+            "updated_at": "1747000000",
+            "default_model": "sonnet",
+        });
+        let product: Product = serde_json::from_value(raw).unwrap();
+        assert_eq!(product.default_model.as_deref(), Some("sonnet"));
+        let encoded = serde_json::to_value(&product).unwrap();
+        assert_eq!(encoded["default_model"], Value::String("sonnet".into()));
     }
 }

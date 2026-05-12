@@ -760,6 +760,8 @@ mod conflict_resolution_prompt_tests {
             repo_remote_url: None,
             blocked_reason: Some("merge_conflict".into()),
             blocked_attempt_id: Some("crz_x".into()),
+            effort_level: None,
+            model_override: None,
         })
     }
 
@@ -1078,6 +1080,8 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             blocked_reason: None,
             blocked_attempt_id: None,
+            effort_level: None,
+            model_override: None,
         })
     }
 
@@ -1365,6 +1369,8 @@ mod pane_spawn_tests {
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
 
