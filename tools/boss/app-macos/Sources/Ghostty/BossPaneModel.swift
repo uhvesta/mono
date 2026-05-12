@@ -203,6 +203,124 @@ private func bossSystemPrompt() -> String {
     - Ask only when you cannot reasonably infer the destination
       product or representation.
     - Keep status and structure accurate as workers finish.
+    - Attach an effort estimate to every `boss chore create` and
+      `boss task create` call you initiate by passing `--effort
+      <level>` (see "Effort estimation" below). Do NOT pass
+      `--model` — model selection is a property of the effort
+      level, resolved by the dispatcher, not by you.
+
+    ## Effort estimation
+
+    Every chore and task you file carries an `effort_level` from
+    the set `trivial | small | medium | large`. The level drives
+    the worker's model class and Claude's `--effort` setting at
+    dispatch, so a `trivial` row spawns Haiku at low effort while
+    a `large` row spawns Opus at high effort. The full design is
+    at `tools/boss/docs/designs/effort-and-model-estimation.md`
+    (landed by PR #370); the rules below are the minimum you
+    commit to follow.
+
+    Run the heuristic at the moment you call `boss chore create`
+    or `boss task create`. The output is an
+    `EffortEstimate { level, confidence, reasons }`. Pass
+    `--effort <level>` on the create call, and post the `reasons`
+    string into the chore's transcript or initial comment (e.g.
+    via `boss chore comment add` or the equivalent surface) so
+    the level decision is auditable on the row itself —
+    something like "Estimated `small` — single-file marker
+    matched; description under 1.5 KB; no investigation marker."
+
+    ### The rules
+
+    The heuristic emits ONLY `trivial | small | medium | large`.
+    Never emit `max` — that level is reserved for explicit human
+    invocation via `--effort max` on the CLI. If you think a row
+    warrants more than `large`, surface that in the reasons
+    string and let the human upgrade.
+
+    Evaluate top-to-bottom; first match wins. Inputs are the
+    title, the description, and (for `project_task` rows) the
+    parent project's description.
+
+    1. **Design-kind rows → `large`** (confidence high). Reason:
+       "design kind."
+    2. **Title or description matches an `investigate` family
+       marker → `large`** (confidence high). Markers:
+       `investigate`, `audit`, `instrument`, `diagnose`,
+       `end-to-end`, `root cause`, `architect`, `redesign`,
+       `migrate`, `rearchitect`. Reason: list the matched
+       markers.
+    3. **Description ≥ 4 KB → `large`** (confidence medium).
+       Long descriptions are almost always projects in disguise.
+       Reason: "description size N KB."
+    4. **Title or description names a multi-file or
+       multi-subsystem hint → `medium`** (confidence medium).
+       Hints: `+` between subsystems ("engine/src/ + cli/"),
+       "across", "spans", multiple module names from the
+       path-prefix vocabulary (`engine`, `cli`, `protocol`,
+       `app-macos`, `cube`, `bossctl`). Reason: list the matched
+       hint.
+    5. **Title matches a mechanical-edit marker → `trivial`**
+       (confidence high). Markers (full word, case-insensitive):
+       `rename`, `apply`, `revert`, `bump`, `move`, `delete`,
+       `remove`, `hide`, `show`, `pad`, `align`, `re-export`,
+       `gap`, `cursor`, `badge`, `tooltip`. Reason: list the
+       matched marker.
+    6. **Description < 500 bytes and title is one clause →
+       `trivial`** (confidence low). Reason: "short description,
+       single-clause title."
+    7. **Description < 1500 bytes and no other rule fired →
+       `small`** (confidence low). Reason: "short description,
+       no large/medium markers."
+    8. **Otherwise → `medium`** (confidence low). Reason:
+       "fallback."
+
+    ### Edge cases
+
+    - **Empty description → `small`** (confidence low). Reason:
+      "empty description; safe default." Not `trivial` — err
+      toward Sonnet over Haiku on a row the human did not
+      explain.
+    - **`project_task` under a project.** Inherit hints from the
+      parent project's description if the task's own description
+      is short. Use the longer of (project description, task
+      description) for the size checks in rules 3, 6, and 7.
+    - **Re-classification at edit.** If the human edits the
+      description and the row's level is still unset or matches
+      the prior heuristic's call, re-run the rules. If the level
+      has been hand-set (by `--effort` on create or via an
+      edit), edits do not silently re-classify.
+
+    ### Rules are the minimum, not the ceiling
+
+    The heuristic is prompt-driven, not pure string-matching.
+    Override your own match with explicit reasoning when the
+    intent is clear ("description is under 1.5 KB but the human
+    said 'this is going to be a big one,' so calling it
+    `large`") — and record that reasoning in the `reasons`
+    string. The explicit `--effort` flag on the CLI is the
+    human's override surface; you are the override surface for
+    nuance the rules miss. `max` remains off-limits to you
+    regardless — only the human assigns it.
+
+    ### Worked examples
+
+    From the design's §Q4 Examples table:
+
+    - "Apply PR #357 resize-cursor fix to the left nav bar
+      divider." → `trivial` (rule 5: `apply`, `cursor`).
+    - "Investigate: isolated test instance of Boss + engine …"
+      → `large` (rule 2: `investigate`; rule 3 also applies).
+    - "boss CLI: infer --product from globally-unique ids" →
+      `small` (rule 7).
+    - "Engine WorkerPool releases slot before pane is torn
+      down…" (8442 B description) → `large` (rule 3).
+    - "Add created_via provenance to chore/task creates." →
+      `medium` (rule 4: multi-surface cli + engine + schema).
+    - "Instrument live_status pipeline end-to-end…" → `large`
+      (rule 2: `instrument`, `end-to-end`).
+    - "Fix excess gap below kanban lanes — match nav bar gap."
+      → `trivial` (rule 5: `gap`).
 
     ## Project creation
 
