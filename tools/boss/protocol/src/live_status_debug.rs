@@ -306,6 +306,74 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_stats_report_json_includes_row_missing_field() {
+        // Pin the exact key the chore's investigation called out as
+        // "missing from the wire format I just captured". Even with
+        // every numeric field at its `Default::default()` (zero), the
+        // serializer must still emit `transcript_path_persist_row_missing`
+        // — it's a non-Option `u64`, so a serde-skip-default would
+        // also fail this assertion, and any future refactor that
+        // accidentally makes the field optional or skipped should be
+        // caught here. The other numeric counters get a co-located
+        // assertion so a regression that drops the wire format on
+        // the floor doesn't pass review.
+        let report = DispatcherStatsReport::default();
+        let text = serde_json::to_string(&report).unwrap();
+        assert!(
+            text.contains("\"transcript_path_persist_row_missing\":0"),
+            "transcript_path_persist_row_missing must be present as a number, not absent or null: {text}",
+        );
+        assert!(
+            text.contains("\"transcript_path_persist_updated\":0"),
+            "transcript_path_persist_updated must be present: {text}",
+        );
+        assert!(
+            text.contains("\"transcript_path_persist_noop\":0"),
+            "transcript_path_persist_noop must be present: {text}",
+        );
+        assert!(
+            text.contains("\"transcript_path_persist_err\":0"),
+            "transcript_path_persist_err must be present: {text}",
+        );
+        assert!(
+            text.contains("\"transcript_path_persist_from_cache\":0"),
+            "transcript_path_persist_from_cache must be present: {text}",
+        );
+
+        // jq one-liner shape: the field is reachable via
+        // `.dispatcher_stats.transcript_path_persist_row_missing` from
+        // the top-level report. Pin that path explicitly so a future
+        // refactor that reshapes the envelope doesn't break the
+        // operator-facing `bossctl live-status debug --json | jq …`
+        // command the chore brief calls out.
+        let full = LiveStatusDebugReport {
+            engine_build_sha: "deadbeef".into(),
+            engine_build_time: "2026-05-12T20:00:00Z".into(),
+            engine_binary_fingerprint: "cafebabe".into(),
+            engine_process_started_at: "2026-05-12T20:00:00Z".into(),
+            anthropic_api_key_present: false,
+            tracked_slot_count: 0,
+            disabled_slot_count: 0,
+            dispatcher_stats: DispatcherStatsReport {
+                transcript_path_persist_row_missing: 7,
+                ..DispatcherStatsReport::default()
+            },
+            slots: vec![],
+        };
+        let text = serde_json::to_string(&full).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let counter = value
+            .get("dispatcher_stats")
+            .and_then(|v| v.get("transcript_path_persist_row_missing"))
+            .cloned();
+        assert_eq!(
+            counter,
+            Some(serde_json::json!(7)),
+            "`.dispatcher_stats.transcript_path_persist_row_missing` must be a numeric field reachable at that exact JSON path: {text}",
+        );
+    }
+
+    #[test]
     fn slot_debug_unset_fields_serialize_as_null() {
         // The verb output should distinguish "no trigger received yet"
         // from "field absent because of a protocol mismatch" — Option

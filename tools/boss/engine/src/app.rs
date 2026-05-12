@@ -50,8 +50,27 @@ impl LiveStatusBroadcaster for ServerState {
 #[async_trait]
 impl TranscriptPathResolver for ServerState {
     async fn transcript_path(&self, run_id: &str) -> Option<std::path::PathBuf> {
-        match self.work_db.get_run(run_id) {
-            Ok(run) => run.transcript_path.map(std::path::PathBuf::from),
+        // The "run_id" the live-status manager hands us is actually the
+        // execution id (`exec_*`) — `LiveWorkerState.run_id` is stamped
+        // from `WorkItemBinding.execution_id` at spawn, and the rest of
+        // the engine is consistent with that aliasing. The pre-fix
+        // version of this resolver called `work_db.get_run(run_id)`
+        // (which joins on `work_runs.id`, an `run_*` namespace), so the
+        // lookup never matched and the per-slot summarizer never
+        // resolved a transcript path. That blocked `tail` from ever
+        // being instantiated, which in turn meant `snap.transcript_path`
+        // was never populated in the debug store — visible to the user
+        // as `bossctl live-status debug --json` reporting
+        // `slots[*].transcript_path: null` for every live slot.
+        //
+        // PR #384 fixed the same cross-namespace bug on the write side
+        // (`set_run_transcript_path_if_unset`). This is the read-side
+        // pair. Keep both routed through helpers that explicitly take
+        // an execution id so a future grep for `work_db.get_run` in this
+        // file can stay a strong "this is the wrong namespace" signal.
+        match self.work_db.transcript_path_for_execution(run_id) {
+            Ok(Some(path)) => Some(std::path::PathBuf::from(path)),
+            Ok(None) => None,
             Err(err) => {
                 tracing::debug!(run_id, ?err, "live_status: transcript path lookup failed");
                 None
@@ -2384,12 +2403,23 @@ async fn dispatch_probe_on_stop(
 /// the in-flight bookkeeping still tracks the dispatched probe, but
 /// `dispatch_probe_reply_on_stop` will skip emission with a warning
 /// rather than fabricate empty reply text.
+///
+/// The `run_id` argument is the execution id (`exec_*`) carried on
+/// the hook event — the same value
+/// `LiveStatusManager`/`dispatch_live_worker_state` plumb everywhere
+/// in this file. PR #384 flagged this code path as broken (its
+/// "Out of scope" section called out that `work_db.get_run(run_id)`
+/// was joining the wrong namespace). Fixed here alongside the
+/// `TranscriptPathResolver` impl.
 async fn transcript_offset_for_run(
     server_state: &Arc<ServerState>,
     run_id: &str,
 ) -> (Option<String>, u64) {
-    let path = match server_state.work_db.get_run(run_id) {
-        Ok(run) => run.transcript_path,
+    let path = match server_state
+        .work_db
+        .transcript_path_for_execution(run_id)
+    {
+        Ok(path) => path,
         Err(err) => {
             tracing::debug!(
                 run_id,
@@ -4574,15 +4604,23 @@ fn build_live_status_debug_report(
         // just been released will have a snapshot frozen with the
         // prior run's transcript path, which is more honest than a
         // None.
+        //
+        // `live.run_id` here is actually the execution id — see the
+        // resolver impl at the top of this file. The pre-fix fallback
+        // called `work_db.get_run(run_id)` (joining on `work_runs.id`),
+        // which produced `Err(unknown run)` every time and silently
+        // collapsed to `None`. That left `transcript_path: null` on the
+        // slot snapshot even when the underlying `work_runs` row had
+        // the column populated.
         let transcript_path = snap
             .transcript_path
             .clone()
             .or_else(|| {
-                let run_id = live.map(|s| s.run_id.as_str())?;
+                let execution_id = live.map(|s| s.run_id.as_str())?;
                 work_db
-                    .get_run(run_id)
+                    .transcript_path_for_execution(execution_id)
                     .ok()
-                    .and_then(|r| r.transcript_path)
+                    .flatten()
             });
         slots.push(LiveStatusSlotDebug {
             slot_id,
@@ -7057,6 +7095,247 @@ mod tests {
         );
 
         server_state.live_status_manager.stop_slot(slot_id);
+    }
+
+    /// Regression test for the 2026-05-12 follow-up to PR #384: the
+    /// write side of `transcript_path` was fixed there, but the
+    /// engine's read sites kept calling `work_db.get_run(run_id)`
+    /// where `run_id` was actually an `exec_*` execution id (the
+    /// `LiveWorkerState.run_id` field aliases the execution id;
+    /// `BOSS_RUN_ID` carries the same value). The join therefore
+    /// never matched and `build_live_status_debug_report` returned
+    /// `slots[*].transcript_path = null` even when the underlying
+    /// `work_runs.transcript_path` column had been populated by the
+    /// dispatcher — visible to the user as "Boss UI shows no live
+    /// updates" for the 4th time.
+    ///
+    /// This test pins the read path: after a hook event with
+    /// `transcript_path` lands and the dispatcher writes the column,
+    /// the slot snapshot rendered by `bossctl live-status debug`
+    /// must report the same path back.
+    #[tokio::test]
+    async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let (execution, run) = server_state
+            .work_db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+        assert!(
+            execution.id.starts_with("exec_"),
+            "precondition: execution id namespace is `exec_*`",
+        );
+        assert!(
+            run.id.starts_with("run_"),
+            "precondition: run id namespace is `run_*` (distinct from execution_id)",
+        );
+
+        // Production carries the execution id, not the work_runs.id,
+        // through `BOSS_RUN_ID`; the slot map and live-state registry
+        // mirror that.
+        let slot_id = 5u8;
+        server_state
+            .worker_registry
+            .register_run_slot(execution.id.clone(), slot_id);
+        server_state.live_worker_states.register_spawn(
+            slot_id,
+            execution.id.clone(),
+            "claude-opus-4-7",
+            0,
+            None,
+        );
+
+        let path = "/home/u/.claude/projects/foo/sess-1.jsonl";
+        let event = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(execution.id.clone()),
+            transcript_path: Some(path.into()),
+            event: WorkerEvent::PostToolUse {
+                session_id: "claude-sess-1".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+                tool_response: serde_json::Value::Null,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &event).await;
+
+        // Sanity: the write path stored the column on the right row.
+        // (This is the PR #384 invariant.)
+        let reread = server_state.work_db.get_run(&run.id).unwrap();
+        assert_eq!(
+            reread.transcript_path.as_deref(),
+            Some(path),
+            "precondition: write path persisted transcript_path on work_runs",
+        );
+
+        // The actual regression: render the debug report and assert
+        // the slot's `transcript_path` field is the same path. Pre-
+        // fix this would be `None`, because the fallback in
+        // `build_live_status_debug_report` did `work_db.get_run(
+        // execution_id)` and silently swallowed the resulting
+        // `Err(unknown run: exec_*)` as `None`.
+        let report = build_live_status_debug_report(&server_state, &server_state.work_db);
+        let slot = report
+            .slots
+            .iter()
+            .find(|s| s.slot_id == slot_id)
+            .expect("the registered slot must be present in the debug report");
+        assert_eq!(
+            slot.transcript_path.as_deref(),
+            Some(path),
+            "the slot snapshot must surface the persisted transcript_path — pre-fix this came back null and broke the UI's live-status read",
+        );
+    }
+
+    /// Companion to the test above, exercising the production read
+    /// path through `TranscriptPathResolver` (which is what the per-
+    /// slot live-status loop calls). The same wrong-namespace bug
+    /// lived here — the trait impl on `ServerState` did
+    /// `work_db.get_run(run_id)` where `run_id` was the execution id
+    /// — and pre-fix the resolver always returned `None`, so the
+    /// summarizer's `tail` never resolved a transcript path and
+    /// `debug_store.snap.transcript_path` was never populated.
+    /// That's the upstream source of the `transcript_path: null` the
+    /// user observed in the slot snapshot.
+    #[tokio::test]
+    async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
+        use crate::live_status_loop::TranscriptPathResolver;
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let (execution, run) = server_state
+            .work_db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+        let _ = run;
+
+        // Resolver returns None until the dispatcher persists the
+        // column; pin that as a precondition so the post-dispatch
+        // assertion has bite.
+        assert!(
+            <ServerState as TranscriptPathResolver>::transcript_path(
+                &server_state,
+                &execution.id,
+            )
+            .await
+            .is_none(),
+            "precondition: resolver returns None when transcript_path on the latest run is NULL",
+        );
+
+        let path = "/home/u/.claude/projects/foo/sess-1.jsonl";
+        let event = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(execution.id.clone()),
+            transcript_path: Some(path.into()),
+            event: WorkerEvent::SessionStart {
+                session_id: "claude-sess-1".into(),
+                source: crate::protocol::SessionStartSource::Startup,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &event).await;
+
+        let resolved = <ServerState as TranscriptPathResolver>::transcript_path(
+            &server_state,
+            &execution.id,
+        )
+        .await;
+        assert_eq!(
+            resolved.as_deref().map(|p| p.to_string_lossy().to_string()),
+            Some(path.to_owned()),
+            "TranscriptPathResolver must resolve an execution id to the latest work_runs row's transcript_path",
+        );
+
+        // And the wrong-namespace identifier (a `run_*`) must NOT
+        // resolve — that would be a regression to the pre-fix shape
+        // where the read sites happily accepted the wrong namespace.
+        // Note: passing run.id below is intentionally the wrong
+        // namespace for this trait method; the resolver's job is to
+        // refuse the wrong-namespace identifier rather than
+        // accidentally satisfy it.
+        let wrong = <ServerState as TranscriptPathResolver>::transcript_path(
+            &server_state,
+            &run.id,
+        )
+        .await;
+        assert!(
+            wrong.is_none(),
+            "resolver must not satisfy a work_runs.id lookup as if it were an execution id; got {wrong:?}",
+        );
     }
 
     /// `current_parent_pid` must NOT fall back to `getppid()` when

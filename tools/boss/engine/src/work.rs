@@ -1609,6 +1609,45 @@ impl WorkDb {
         }
     }
 
+    /// Read-side companion to [`set_run_transcript_path_if_unset`].
+    ///
+    /// **Namespace warning — same trap as the write side.** Every
+    /// caller in the engine that previously did
+    /// `work_db.get_run(run_id).transcript_path` was actually handing
+    /// in an `exec_*` (`work_executions.id`) and joining it against
+    /// `work_runs.id`, so the lookup never matched and the path
+    /// stayed NULL on the wire. The write-side path was fixed in PR
+    /// #384; the read side kept the same shape, which is why
+    /// `bossctl live-status debug --json` reported `transcript_path:
+    /// null` for live slots even when the underlying `work_runs` row
+    /// had the column populated. This helper closes that gap by
+    /// keying on `execution_id` and resolving the latest `work_runs`
+    /// row the same way the write side does (`ORDER BY created_at
+    /// DESC, id DESC LIMIT 1`).
+    ///
+    /// Returns `Ok(None)` when either the execution has no
+    /// `work_runs` row yet, or the latest row's `transcript_path`
+    /// column is still NULL — both are legitimate steady states
+    /// while a worker is still booting. Returns `Err` only on a real
+    /// SQL failure; callers should log-and-default rather than abort.
+    pub fn transcript_path_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let path: Option<Option<String>> = conn
+            .query_row(
+                "SELECT transcript_path FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path.flatten())
+    }
+
     /// Test-only helper: force `transcript_path` back to NULL on an
     /// existing row. Used by the dispatcher regression test to model
     /// the production race where a SessionStart's payload-driven
@@ -6956,6 +6995,34 @@ mod tests {
             after_second.transcript_path.as_deref(),
             Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
             "first writer must win — never clobber the path the summarizer tail watcher already opened",
+        );
+
+        // Read-side companion: `transcript_path_for_execution` must
+        // resolve the same execution id to the path the write side
+        // just stored, AND must do so when handed an `exec_*` (the
+        // namespace the in-engine read sites all carry). Pre-fix the
+        // engine used `get_run(execution_id)` instead and silently
+        // got `Err(unknown run)`, which is what kept the slot
+        // snapshot's `transcript_path` pinned at NULL even after the
+        // write path was fixed in PR #384.
+        assert_eq!(
+            db.transcript_path_for_execution(&execution.id)
+                .unwrap()
+                .as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+            "read-side lookup must accept an execution id and return the latest run's transcript_path",
+        );
+        assert!(
+            db.transcript_path_for_execution(&run.id)
+                .unwrap()
+                .is_none(),
+            "read-side lookup with a work_runs.id (wrong namespace) must NOT silently return a sibling run's path",
+        );
+        assert!(
+            db.transcript_path_for_execution("exec-does-not-exist")
+                .unwrap()
+                .is_none(),
+            "unknown execution must yield Ok(None), not Err — callers log-and-default",
         );
 
         // Unknown execution id must surface as RowMissing, not as a
