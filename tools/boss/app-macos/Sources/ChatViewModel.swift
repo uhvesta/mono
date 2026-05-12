@@ -1163,6 +1163,78 @@ final class ChatViewModel: ObservableObject {
         )
     }
 
+    /// Distinct repo URLs known under a product, ordered by recency
+    /// of the work item they last appeared on. Drives both the Repo:
+    /// row's `Change…` picker (per Follow-up chore #12) and the
+    /// work-item create form's recent-repos picker (chore #10) so the
+    /// two affordances agree on what counts as "recent". The product
+    /// default is always first when set; the rest sort by the work
+    /// item's `updatedAt` descending so the most-recently-edited
+    /// repo bubbles up.
+    ///
+    /// Pure derivation over the in-memory snapshot — no RPC. Empty
+    /// list is a legal answer (a brand-new product with no overrides
+    /// and no default).
+    func recentRepoURLs(forProduct productID: String) -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+
+        func push(_ value: String?) {
+            guard let trimmed = nonEmptyTrim(value) else { return }
+            if seen.insert(trimmed).inserted {
+                ordered.append(trimmed)
+            }
+        }
+
+        if let product = product(withID: productID) {
+            push(product.repoRemoteURL)
+        }
+
+        var taskRows: [WorkTask] = []
+        for project in projectsByProductID[productID] ?? [] {
+            taskRows.append(contentsOf: tasksByProjectID[project.id] ?? [])
+        }
+        taskRows.append(contentsOf: choresByProductID[productID] ?? [])
+        let byRecency = taskRows.sorted { lhs, rhs in
+            lhs.updatedAt > rhs.updatedAt
+        }
+        for task in byRecency {
+            push(task.repoRemoteURL)
+        }
+
+        return ordered
+    }
+
+    /// Set or clear the per-work-item repo override. `url == nil` (or
+    /// an empty/whitespace-only string) routes to the engine as
+    /// `repo_remote_url = ""`, which is the patch shape that clears
+    /// the column and falls back to product inheritance. No-ops when
+    /// the new value equals the current one.
+    func setRepoOverride(for taskID: String, to url: String?) {
+        guard let task = task(withID: taskID) else { return }
+        let trimmed = nonEmptyTrim(url) ?? ""
+        let current = nonEmptyTrim(task.repoRemoteURL) ?? ""
+        guard trimmed != current else { return }
+        engine.sendUpdateWorkItem(id: task.id, patch: ["repo_remote_url": trimmed])
+    }
+
+    /// Repo-row presentation for the work-item detail popover. Wraps
+    /// `RepoOverridePresentation.resolve` against the cached product
+    /// row so the view stays a thin reflection of a value type.
+    /// Returns `nil` only when the work item itself isn't loaded.
+    func repoOverridePresentation(for task: WorkTask) -> RepoOverridePresentation {
+        RepoOverridePresentation.resolve(
+            task: task,
+            product: product(withID: task.productID)
+        )
+    }
+
+    private func nonEmptyTrim(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// Per-card chip presentation, returning `nil` whenever the chip
     /// should not render: the board is in single-repo mode (chip
     /// already lives on the product header), or the card has no

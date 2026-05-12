@@ -687,6 +687,84 @@ struct RepoChipPresentation: Equatable {
     }
 }
 
+/// Pure-data presentation for the work-item detail "Repo:" row.
+/// Mirrors the CLI `boss <kind> show` Repo line so the macOS detail
+/// popover and the terminal output stay in lockstep on the
+/// provenance vocabulary (per Follow-up chore #12 of
+/// `multi-repo-work-modeling.md`). Three states correspond to the
+/// three branches of the engine's `resolve_repo_for_work_item`:
+/// override on the work item, inherited from the parent product, or
+/// no resolution at all (the work item cannot dispatch).
+///
+/// `provenanceLabel` is the parenthetical that follows the URL on
+/// the CLI; the `.none` case has no URL and the label is the entire
+/// line. The Swift view renders the label as a secondary-style
+/// caption beneath the URL.
+struct RepoOverridePresentation: Equatable {
+    let resolvedURL: String?
+    let provenanceLabel: String
+    let provenance: Provenance
+
+    enum Provenance: Equatable {
+        case taskOverride
+        case productDefault(productSlug: String)
+        case none
+    }
+
+    /// Full single-line form, matching the CLI `Repo: <url>
+    /// (<provenance>)` shape. Used by tests to pin the wire-shape
+    /// agreement between CLI and macOS UI; the view itself renders
+    /// the URL and label as separate text rows so each can carry its
+    /// own style.
+    var cliLine: String {
+        switch provenance {
+        case .taskOverride, .productDefault:
+            if let url = resolvedURL { return "\(url) (\(provenanceLabel))" }
+            return provenanceLabel
+        case .none:
+            return provenanceLabel
+        }
+    }
+
+    /// Build the presentation for one work item given its parent
+    /// product (or `nil` when the product can't be resolved — e.g. a
+    /// snapshot in flight). When the product is unavailable, we can
+    /// only honour the override; an empty override collapses to the
+    /// "cannot dispatch" state so the row never silently looks
+    /// inherited from a product that isn't there.
+    static func resolve(
+        task: WorkTask,
+        product: WorkProduct?
+    ) -> RepoOverridePresentation {
+        if let override = nonEmpty(task.repoRemoteURL) {
+            return RepoOverridePresentation(
+                resolvedURL: override,
+                provenanceLabel: "override on this work item",
+                provenance: .taskOverride
+            )
+        }
+        if let product, let inherited = nonEmpty(product.repoRemoteURL) {
+            return RepoOverridePresentation(
+                resolvedURL: inherited,
+                provenanceLabel: "inherited from product `\(product.slug)`",
+                provenance: .productDefault(productSlug: product.slug)
+            )
+        }
+        return RepoOverridePresentation(
+            resolvedURL: nil,
+            provenanceLabel: "(none — work item cannot dispatch)",
+            provenance: .none
+        )
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return value
+    }
+}
+
 extension WorkTask {
     /// Canonical mapping from engine status → kanban column.
     ///

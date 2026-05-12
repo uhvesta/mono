@@ -1362,6 +1362,12 @@ private struct WorkCardPopoverView: View {
     @ObservedObject var model: ChatViewModel
     let task: WorkTask
 
+    /// Drives presentation of the Repo Change… picker sheet. Bound to
+    /// the popover so the sheet inherits the popover's window context;
+    /// closing the sheet returns focus to the popover the user came
+    /// from rather than dropping back to the kanban underneath.
+    @State private var presentingRepoPicker: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 12) {
@@ -1392,6 +1398,7 @@ private struct WorkCardPopoverView: View {
                     value: task.status.replacingOccurrences(of: "_", with: " ").capitalized
                 )
                 priorityRow
+                repoRow
                 if let ordinal = task.ordinal, !task.isChore {
                     metadataRow("Phase", value: "\(ordinal)")
                 }
@@ -1442,6 +1449,61 @@ private struct WorkCardPopoverView: View {
         }
         .padding(20)
         .frame(width: 360, alignment: .leading)
+        .sheet(isPresented: $presentingRepoPicker) {
+            RepoOverridePicker(
+                presentation: model.repoOverridePresentation(for: task),
+                recentURLs: model.recentRepoURLs(forProduct: task.productID),
+                onCancel: { presentingRepoPicker = false },
+                onSelect: { url in
+                    model.setRepoOverride(for: task.id, to: url)
+                    presentingRepoPicker = false
+                },
+                onClear: {
+                    model.setRepoOverride(for: task.id, to: nil)
+                    presentingRepoPicker = false
+                }
+            )
+        }
+    }
+
+    /// "Repo:" row inside the popover. Mirrors the CLI `boss <kind>
+    /// show` Repo line — resolved URL on the first line, provenance
+    /// label below — and trails the row with a `Change…` button that
+    /// opens the override picker. Matches the CLI's three-state
+    /// vocabulary: override / inherited from product / none-can't-
+    /// dispatch.
+    @ViewBuilder
+    private var repoRow: some View {
+        let presentation = model.repoOverridePresentation(for: task)
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Repo")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                VStack(alignment: .leading, spacing: 1) {
+                    if let url = presentation.resolvedURL {
+                        Text(url)
+                            .font(.body)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(url)
+                        Text(presentation.provenanceLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(presentation.provenanceLabel)
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+                Button("Change…") {
+                    presentingRepoPicker = true
+                }
+                .accessibilityIdentifier("work-card-repo-change")
+            }
+        }
+        .accessibilityIdentifier("work-card-repo-row")
     }
 
     /// Truncated rendering of the task description so a long body
@@ -1577,6 +1639,123 @@ private struct WorkCardPopoverView: View {
                     .font(.body)
             }
         }
+    }
+}
+
+/// Picker sheet for the work-item detail Repo: row's `Change…`
+/// affordance (per Follow-up chore #12 of
+/// `multi-repo-work-modeling.md`). Reuses the create form's
+/// recent-repos source — the same per-product distinct-URL set the
+/// view model exposes — and adds two row types the create form
+/// doesn't need:
+///
+/// - **Custom URL…** lets the user pin an override the recent set
+///   doesn't yet contain (the empirical set bootstraps from the
+///   first explicit `--repo`, so brand-new URLs always start
+///   custom).
+/// - **Clear (inherit from product)** drops the override and falls
+///   back to product inheritance. Hidden when there's nothing to
+///   clear (current state is already inherited / unresolved).
+struct RepoOverridePicker: View {
+    let presentation: RepoOverridePresentation
+    let recentURLs: [String]
+    let onCancel: () -> Void
+    let onSelect: (String) -> Void
+    let onClear: () -> Void
+
+    @State private var customURL: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Change repo")
+                .font(.title3.weight(.semibold))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Current")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(presentation.cliLine)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            if !recentURLs.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Recent repos")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(recentURLs, id: \.self) { url in
+                            Button(action: { onSelect(url) }) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "folder")
+                                        .foregroundStyle(.secondary)
+                                    Text(shortRepoName(for: url))
+                                        .font(.body)
+                                    Text(url)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer(minLength: 4)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("repo-picker-recent-\(url)")
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Custom URL")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    TextField(
+                        "https://github.com/owner/repo.git",
+                        text: $customURL
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("repo-picker-custom-url")
+                    Button("Use") {
+                        onSelect(customURL)
+                    }
+                    .disabled(
+                        customURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                    .accessibilityIdentifier("repo-picker-custom-use")
+                }
+            }
+
+            if canClear {
+                Button(action: onClear) {
+                    Label("Clear (inherit from product)", systemImage: "arrow.uturn.backward")
+                }
+                .buttonStyle(.link)
+                .accessibilityIdentifier("repo-picker-clear")
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480, alignment: .leading)
+        .accessibilityIdentifier("repo-override-picker")
+    }
+
+    /// Whether the "Clear (inherit from product)" affordance has any
+    /// effect. The override only exists in the `.taskOverride` state;
+    /// `.productDefault` and `.none` are already inheriting (or have
+    /// nothing to inherit), so clearing would be a no-op and the
+    /// button stays hidden to avoid implying an action.
+    private var canClear: Bool {
+        presentation.provenance == .taskOverride
     }
 }
 
