@@ -26,8 +26,8 @@ use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_mer
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, InterruptWorkerPaneInput,
-    ReleaseWorkerPaneInput, SendToPaneInput, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES,
-    TopicEventPayload, execution_topic, probe_topic, work_product_topic,
+    ReleaseWorkerPaneInput, RequestExecutionInput, SendToPaneInput, TOPIC_WORK_PRODUCTS,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic, work_product_topic,
 };
 use crate::work::{Task, WorkDb, WorkItem};
 use crate::worker_registry::WorkerRegistry;
@@ -2740,6 +2740,11 @@ async fn handle_frontend_connection(
                 .await;
             }
             FrontendRequest::UpdateWorkItem { id, patch } => {
+                // Capture the task/chore status before the update so we
+                // can detect a transition into `active` after the patch
+                // applies. We only care about task/chore — products and
+                // projects have no execution lifecycle.
+                let previous_task_status = task_status_for_id(&work_db, &id);
                 match work_db.update_work_item(&id, patch) {
                     Ok(item) => {
                         let product_id = work_item_product_id(&item);
@@ -2760,6 +2765,59 @@ async fn handle_frontend_connection(
                             tokio::spawn(async move {
                                 handler.force_release(&execution_id).await;
                             });
+                        }
+                        // Kanban drop-into-Doing (and any other human
+                        // path that flips a task/chore to `active` via
+                        // UpdateWorkItem) must dispatch a worker — see
+                        // `tools/boss/docs/designs/work-kanban.md` §
+                        // "Doing column = live or queued". The macOS
+                        // client also fires `RequestExecution` after
+                        // the status patch, but doing it server-side
+                        // closes the gap for older clients (or any
+                        // future client that forgets the follow-up
+                        // RPC), which is the failure shape the
+                        // motivating bug exposed for `autostart=false`
+                        // chores parked in `todo`: the autostart gate
+                        // blocks creation-time dispatch, so until the
+                        // human drags the card there is no execution
+                        // at all, and a status flip with no follow-up
+                        // RequestExecution leaves an `active` card
+                        // with no worker.
+                        //
+                        // We only create a fresh execution when the
+                        // work item has no live/queued one — an
+                        // existing non-terminal execution already owns
+                        // the dispatch slot, and replacing it would
+                        // race the auto-dispatcher (and would void the
+                        // execution id the client is already tracking).
+                        // The reconcile / rescan paths handle
+                        // re-dispatch of stale (worker-died) cases.
+                        if task_transitioned_to_active(&previous_task_status, &item)
+                            && work_item_needs_dispatch(&work_db, &work_item_id(&item))
+                        {
+                            let live_states = server_state.live_worker_states.clone();
+                            let dispatch_input = RequestExecutionInput {
+                                work_item_id: work_item_id(&item),
+                                priority: None,
+                                preferred_workspace_id: None,
+                                force: false,
+                            };
+                            match work_db.request_execution_with_live_check(
+                                dispatch_input,
+                                |run_id| live_states.is_run_live(run_id),
+                            ) {
+                                Ok(_) => {
+                                    server_state.execution_coordinator.kick();
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        work_item_id = %work_item_id(&item),
+                                        ?err,
+                                        "UpdateWorkItem → active: auto-dispatch failed; \
+                                         status update kept, no worker spawned",
+                                    );
+                                }
+                            }
                         }
                         let revision = publish_work_invalidation(
                             &server_state,
@@ -4234,6 +4292,65 @@ fn work_item_product_id(item: &WorkItem) -> String {
         WorkItem::Product(product) => product.id.clone(),
         WorkItem::Project(project) => project.product_id.clone(),
         WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.clone(),
+    }
+}
+
+/// Look up the current `tasks.status` for `id`, returning `None` if
+/// `id` does not name a task/chore or the work item can't be loaded
+/// (already deleted, garbled id). Used by the UpdateWorkItem handler
+/// to detect a transition into `active` so it can auto-dispatch.
+fn task_status_for_id(work_db: &WorkDb, id: &str) -> Option<String> {
+    match work_db.get_work_item(id) {
+        Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => Some(task.status),
+        Ok(_) => None,
+        Err(_) => None,
+    }
+}
+
+/// True iff the work item has no execution at all, or its latest
+/// execution is in a terminal status. Used by the UpdateWorkItem
+/// handler's drop-into-Doing dispatch to decide whether to create a
+/// fresh execution after a human flips status to `active`. An
+/// existing non-terminal execution (`ready` / `running` /
+/// `waiting_*`) already owns the dispatch slot, so we leave it alone
+/// — the steady-state rescan and the dispatcher's normal flow take
+/// care of stale ones.
+fn work_item_needs_dispatch(work_db: &WorkDb, work_item_id: &str) -> bool {
+    match work_db.latest_execution_for_work_item(work_item_id) {
+        Ok(Some(existing)) => matches!(
+            existing.status.as_str(),
+            "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
+        ),
+        Ok(None) => true,
+        Err(err) => {
+            tracing::warn!(
+                %work_item_id,
+                ?err,
+                "work_item_needs_dispatch: failed to read latest execution; skipping auto-dispatch",
+            );
+            false
+        }
+    }
+}
+
+/// True iff `item` is a task/chore whose status just flipped from
+/// something other than `active` to `active`. Re-applying an `active`
+/// status on top of `active` (idempotent client retry) does not count.
+fn task_transitioned_to_active(previous_status: &Option<String>, item: &WorkItem) -> bool {
+    let task = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        _ => return false,
+    };
+    if task.status != "active" {
+        return false;
+    }
+    match previous_status {
+        Some(prev) => prev != "active",
+        // We didn't see the row before the update — assume this is the
+        // first time the engine has rendered it and treat it as a real
+        // transition. Idempotent `request_execution_with_live_check`
+        // collapses the duplicate-spawn case safely.
+        None => true,
     }
 }
 
