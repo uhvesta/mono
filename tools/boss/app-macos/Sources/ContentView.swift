@@ -844,57 +844,18 @@ private struct WorkSidebarFilterRow: View {
     }
 }
 
-struct SidebarProductPicker: NSViewRepresentable {
+struct SidebarProductPicker: View {
     @Binding var selection: String?
     let products: [WorkProduct]
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(selection: $selection)
-    }
-
-    func makeNSView(context: Context) -> NSPopUpButton {
-        let button = NSPopUpButton(frame: .zero, pullsDown: false)
-        button.bezelStyle = .rounded
-        button.target = context.coordinator
-        button.action = #selector(Coordinator.selectionDidChange(_:))
-        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return button
-    }
-
-    func updateNSView(_ nsView: NSPopUpButton, context: Context) {
-        context.coordinator.selection = $selection
-        context.coordinator.productIDs = products.map(\.id)
-
-        nsView.removeAllItems()
-        nsView.addItems(withTitles: products.map(\.name))
-
-        for (index, productID) in context.coordinator.productIDs.enumerated() {
-            nsView.item(at: index)?.representedObject = productID
-        }
-
-        let selectedID = selection ?? context.coordinator.productIDs.first
-        if let selectedID,
-           let index = context.coordinator.productIDs.firstIndex(of: selectedID) {
-            nsView.selectItem(at: index)
-        }
-    }
-
-    final class Coordinator: NSObject {
-        var selection: Binding<String?>
-        var productIDs: [String] = []
-
-        init(selection: Binding<String?>) {
-            self.selection = selection
-        }
-
-        @objc func selectionDidChange(_ sender: NSPopUpButton) {
-            let index = sender.indexOfSelectedItem
-            guard productIDs.indices.contains(index) else { return }
-            let selectedID = productIDs[index]
-            if selection.wrappedValue != selectedID {
-                selection.wrappedValue = selectedID
+    var body: some View {
+        Picker("Product", selection: $selection) {
+            ForEach(products) { product in
+                Text(product.name).tag(product.id as String?)
             }
         }
+        .labelsHidden()
+        .pickerStyle(.menu)
     }
 }
 
