@@ -101,16 +101,6 @@ enum LiveStatusAction {
 enum DispatchAction {
     /// Print recent dispatch events from `current.jsonl`. Filterable
     /// by stage / outcome. Defaults to the last 50 events.
-    ///
-    /// Covers both the entry pipeline (`status_transition` →
-    /// `request_recorded` → `worker_claimed` → `cube_repo_ensured` →
-    /// `cube_workspace_leased` → `cube_change_created` → `run_started`
-    /// → `pane_spawned`) and the exit pipeline
-    /// (`worker_stop_received` → `pr_detection_attempted` →
-    /// `pr_detection_result` → `status_transitioned`). Use
-    /// `--stage worker_stop_received` to inspect just the exit side
-    /// when diagnosing "the worker pushed but the chore stayed at
-    /// `active`" symptoms.
     Tail {
         /// Override the Boss state root (defaults to
         /// `$HOME/Library/Application Support/Boss`).

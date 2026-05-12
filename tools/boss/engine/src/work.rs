@@ -1108,35 +1108,6 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// Rows the PR auto-bind safety-net poller iterates: executions
-    /// in `running` / `waiting_human` that still have a `workspace_path`
-    /// (lease retained, `record_worker_pr_completion` hasn't run).
-    /// Returns oldest-started-first so the poller chews through the
-    /// most-likely-stuck rows on every sweep.
-    ///
-    /// This is deliberately *not* gated on `cube_lease_id IS NOT NULL`:
-    /// the safety-net runs PR detection by shelling out into
-    /// `workspace_path`, and the lease column is cleared by
-    /// `record_worker_pr_completion` in the same UPDATE that clears
-    /// `workspace_path`, so filtering on either field would still pick
-    /// up exactly the same rows. We use `workspace_path` because the
-    /// poller actually needs the value.
-    pub fn list_executions_pending_pr_auto_bind(&self) -> Result<Vec<WorkExecution>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
-                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at
-             FROM work_executions
-             WHERE status IN ('running', 'waiting_human')
-               AND workspace_path IS NOT NULL
-               AND workspace_path != ''
-             ORDER BY started_at ASC, created_at ASC, id ASC",
-        )?;
-        let rows = stmt.query_map([], map_execution)?;
-        collect_rows(rows)
-    }
-
     /// Return every `work_executions` row the engine considers "in
     /// flight": status is non-terminal AND a cube workspace lease was
     /// recorded against it (`cube_lease_id IS NOT NULL`). The startup

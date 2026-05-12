@@ -99,37 +99,6 @@ pub enum Stage {
     /// auto-remediate — the operator decides whether to retry,
     /// reap, or wait.
     StageStalled,
-    /// The engine received a worker `Stop` hook event and is about
-    /// to evaluate PR auto-binding. Emitted once per Stop event that
-    /// passes the run-id correlation gate; `details.run_id` is the
-    /// worker run id. Outcome is always `ok`. Before this stage
-    /// existed, a Stop with a stale slot mapping (PR #366 / #372
-    /// transcript-path miss) or a Stop that fell through one of the
-    /// completion-handler bail-outs produced no event at all and the
-    /// chore "mysteriously" stayed at `active` / `pr_url=null`.
-    WorkerStopReceived,
-    /// Started the PR detection step inside the completion handler.
-    /// `details.source` is `"stop_hook"` for the on-Stop path or
-    /// `"auto_bind_poller"` for the safety-net poller. `details` also
-    /// carries the `workspace_path` we'll probe and the `repo_slug`
-    /// so a failed detection has the inputs that drove it.
-    PrDetectionAttempted,
-    /// Result of the PR detection step. Outcome maps directly onto
-    /// the four [`crate::completion::StopOutcome`] PR shapes:
-    ///   - `ok` for `PrDetected` / `PrMerged` (`details.classification`
-    ///     distinguishes `fresh` vs `merged` vs `stale`),
-    ///   - `skipped` for `AwaitingInput` (no PR yet),
-    ///   - `error` for `DetectorFailed` (gh / jj tool failure).
-    /// `details.pr_url` is populated when a PR was found.
-    PrDetectionResult,
-    /// The completion path moved the work item to a new kanban
-    /// column (`in_review` for a fresh PR, `done` for an already-
-    /// merged PR). `details.from` / `details.to` carry the columns;
-    /// `details.work_item_id` and `details.pr_url` carry the row
-    /// identity. Outcome is `ok` for a real transition,
-    /// `skipped` for an idempotent no-op (e.g. the row was already
-    /// in the target column).
-    StatusTransitioned,
 }
 
 impl Stage {
@@ -146,10 +115,6 @@ impl Stage {
             Stage::RunStarted => "run_started",
             Stage::PaneSpawned => "pane_spawned",
             Stage::StageStalled => "stage_stalled",
-            Stage::WorkerStopReceived => "worker_stop_received",
-            Stage::PrDetectionAttempted => "pr_detection_attempted",
-            Stage::PrDetectionResult => "pr_detection_result",
-            Stage::StatusTransitioned => "status_transitioned",
         }
     }
 }

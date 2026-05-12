@@ -500,45 +500,19 @@ impl ServerState {
         });
         let cube_client: Arc<dyn CubeClient> = Arc::new(CommandCubeClient::new(cfg.clone()));
         let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
-
-        // Resolve the Boss state root from the db path's parent so the
-        // dispatch-event JSONL stream lands next to state.db /
-        // events.sock under the same root. Falls back to the user's
-        // `~/Library/Application Support/Boss/` if the db path has no
-        // parent (only possible in degenerate test configs).
-        //
-        // Constructed up here (rather than down inside `new_cyclic`)
-        // because the completion handler now also writes to the
-        // dispatch stream — see `Stage::WorkerStopReceived` /
-        // `Stage::PrDetectionAttempted` etc — and needs its own clone.
-        let dispatch_event_root: PathBuf = cfg
-            .work
-            .db_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join("Library/Application Support/Boss"))
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
-        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> = Arc::new(
-            crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()),
-        );
-
         // The pane releaser and probe queuer both need a Weak<ServerState>
         // to call back into ServerState methods, so they're late-bound
         // after the Arc<ServerState> exists. Same pattern as
         // `PaneSpawnRunner` below.
         let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
-        let completion_handler = Arc::new(WorkerCompletionHandler::with_dispatch_events(
+        let completion_handler = Arc::new(WorkerCompletionHandler::new(
             work_db.clone(),
             pr_detector,
             cube_client.clone(),
             publisher.clone(),
             pane_releaser.clone(),
             probe_queuer.clone(),
-            dispatch_events.clone(),
         ));
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -554,6 +528,24 @@ impl ServerState {
         let cube_client_for_state = cube_client.clone();
         let publisher_for_state = publisher.clone();
 
+        // Resolve the Boss state root from the db path's parent so the
+        // dispatch-event JSONL stream lands next to state.db /
+        // events.sock under the same root. Falls back to the user's
+        // `~/Library/Application Support/Boss/` if the db path has no
+        // parent (only possible in degenerate test configs).
+        let dispatch_event_root: PathBuf = cfg
+            .work
+            .db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join("Library/Application Support/Boss"))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> = Arc::new(
+            crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()),
+        );
         let dispatch_events_for_state = dispatch_events.clone();
         let dispatch_event_root_for_state = dispatch_event_root.clone();
 
@@ -1845,28 +1837,6 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
-    // Spawn the PR auto-bind safety net. The on-Stop hook path in
-    // `dispatch_completion_on_stop` is the primary signal for
-    // `active → in_review`, but it has shown up missing in
-    // production (claude exiting without firing Stop, events socket
-    // dropping during engine restart, `_boss_run_id` splice failing
-    // silently — see exec_18aebee6bbbbfaf8_7 / Worf on 2026-05-12
-    // where the chore stayed at `pr_url=null` until the coordinator
-    // manually ran `boss task bind-pr`). The poller re-runs the same
-    // completion path periodically over every non-terminal execution
-    // with a workspace_path, gated on the worker's `last_event_at`
-    // being older than `quiescence` so an active worker is never
-    // disturbed. The completion handler is idempotent at the DB
-    // layer (`record_worker_pr_completion` is status-gated), so a
-    // race with a live Stop event is a benign no-op.
-    let _pr_auto_bind_handle = crate::pr_auto_bind_poller::spawn_loop(
-        server_state.work_db.clone(),
-        server_state.completion_handler.clone(),
-        server_state.live_worker_states.clone(),
-        Duration::from_secs(30),
-        Duration::from_secs(30),
-    );
-
     // Watch in-flight dispatch timelines for stalled stages and emit
     // a `stage_stalled` event when one sits past the threshold
     // without progressing. Read-only against the per-execution
@@ -2586,30 +2556,11 @@ async fn dispatch_completion_on_stop(
     let WorkerEvent::Stop { .. } = incoming.event else {
         return;
     };
-    // Bumped from a silent return to warn: a Stop hook payload with
-    // no `_boss_run_id` (and no peer-pid ancestor match) is the
-    // single most common cause of "the worker pushed but the chore
-    // stayed `active`" — the same shape as the 2026-05-12 Worf
-    // incident. Without this log, the failure surfaces only as
-    // missing kanban state, hours after the worker has exited.
     let Some(run_id) = incoming.run_id.as_deref() else {
-        tracing::warn!(
-            peer_pid = ?incoming.peer_pid,
-            transcript_path = ?incoming.transcript_path,
-            "completion handler: Stop hook arrived without a run_id (no _boss_run_id payload field, no peer-pid ancestor match); PR auto-binding cannot fire — chore will stay at `active` until the safety-net poller catches it",
-        );
         return;
     };
-    let outcome = server_state
-        .completion_handler
-        .on_stop_from(run_id, crate::completion::CompletionTrigger::StopHook)
-        .await;
-    // Bumped from debug to info: the outcome line is the receipt that
-    // a Stop event made it all the way through the engine's exit
-    // pipeline. Without it, the only way to know whether
-    // `record_worker_pr_completion` was even attempted for a given
-    // run is to scrape `engine_audit.log` for indirect signals.
-    tracing::info!(run_id, ?outcome, "completion handler stop result");
+    let outcome = server_state.completion_handler.on_stop(run_id).await;
+    tracing::debug!(run_id, ?outcome, "completion handler stop result");
 }
 
 async fn handle_frontend_connection(
