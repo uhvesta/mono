@@ -381,6 +381,17 @@ struct WorkCreateRequest: Identifiable {
     let kind: WorkCreateKind
 }
 
+/// Static copy for the Product create form's repo-URL field. Extracted
+/// so the wording can be asserted in a unit test without driving the
+/// SwiftUI view itself — per design Q10, the form must surface the
+/// field as optional and explain that products spanning multiple repos
+/// rely on per-work-item overrides.
+enum ProductRepoFieldCopy {
+    static let placeholder = "Remote URL (optional)"
+    static let helperText =
+        "Optional. Leave blank if this product spans multiple repos; per-work-item repo overrides will be required."
+}
+
 struct WorkEditRequest: Identifiable {
     let id = UUID()
     let item: WorkItemPayload

@@ -1714,7 +1714,16 @@ private struct WorkCreateSheet: View {
             switch request.kind {
             case .product:
                 TextField("Description", text: $description)
-                TextField("Remote URL", text: $repoRemoteURL)
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField(
+                        ProductRepoFieldCopy.placeholder,
+                        text: $repoRemoteURL
+                    )
+                    Text(ProductRepoFieldCopy.helperText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             case .project:
                 TextField("Description", text: $description)
                 TextField("Goal", text: $goal)
