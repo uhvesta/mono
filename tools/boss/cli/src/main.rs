@@ -1318,7 +1318,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             .await?;
 
             print_entity(ctx, &serde_json::json!({ "project": project }), || {
-                print_project_details("Created project", &project);
+                print_project_details("Created project", &project, None);
             })
         }
         ProjectCommand::List(args) => {
@@ -1362,7 +1362,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                     "design_doc": design_doc,
                 }),
                 || {
-                    print_project_details("Project", &project);
+                    print_project_details("Project", &project, Some(&product));
                     if let Some(line) = format_project_design_doc_line(&design_doc.state) {
                         println!("Design doc: {line}");
                     }
@@ -1389,7 +1389,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let item = update_work_item(&mut client, &project.id, patch).await?;
             let project = expect_project(item)?;
             print_entity(ctx, &serde_json::json!({ "project": project }), || {
-                print_project_details("Updated project", &project);
+                print_project_details("Updated project", &project, None);
             })
         }
         ProjectCommand::Delete(args) => {
@@ -1429,7 +1429,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             };
             let moved = expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
             print_entity(ctx, &serde_json::json!({ "project": moved }), || {
-                print_project_details("Moved project", &moved);
+                print_project_details("Moved project", &moved, None);
             })
         }
         ProjectCommand::SetDesignDoc(args) => {
@@ -1462,7 +1462,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 ctx,
                 &serde_json::json!({ "project": updated, "design_doc": resolved }),
                 || {
-                    print_project_details("Updated project", &updated);
+                    print_project_details("Updated project", &updated, None);
                     if let Some(line) = format_project_design_doc_line(&resolved.state) {
                         println!("Design doc: {line}");
                     }
@@ -1520,7 +1520,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             )
             .await?;
             print_entity(ctx, &serde_json::json!({ "task": task }), || {
-                print_task_details("Created task", &task);
+                print_task_details("Created task", &task, None);
             })
         }
         TaskCommand::List(args) => {
@@ -1606,7 +1606,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             )
             .await?;
             print_entity(ctx, &serde_json::json!({ "chore": chore }), || {
-                print_task_details("Created chore", &chore);
+                print_task_details("Created chore", &chore, None);
             })
         }
         ChoreCommand::List(args) => {
@@ -1647,6 +1647,7 @@ async fn run_show_leaf(
     args: TaskIdArg,
 ) -> Result<(), CliError> {
     let (item, label) = expect_leaf_work_item(get_work_item(client, &args.id).await?)?;
+    let product = expect_product(get_work_item(client, &item.product_id).await?)?;
     let detail = list_dependencies_detailed(
         client,
         ListDependenciesInput {
@@ -1659,7 +1660,7 @@ async fn run_show_leaf(
         ctx,
         &serde_json::json!({ label: item, "dependencies": detail }),
         || {
-            print_task_details(label_titlecase(label), &item);
+            print_task_details(label_titlecase(label), &item, Some(&product));
             print_dependency_section(&detail);
         },
     )
@@ -1690,7 +1691,7 @@ async fn run_update_leaf(
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
-        print_task_details(&format!("Updated {label}"), &item);
+        print_task_details(&format!("Updated {label}"), &item, None);
     })
 }
 
@@ -1706,7 +1707,7 @@ async fn run_move_leaf(
     };
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
-        print_task_details(&format!("Moved {label}"), &item);
+        print_task_details(&format!("Moved {label}"), &item, None);
     })
 }
 
@@ -2135,7 +2136,7 @@ async fn run_bind_pr(
             "rebinding": prior_url.is_some(),
             "previous_pr_url": prior_url,
         }),
-        || print_task_details(&title, &updated),
+        || print_task_details(&title, &updated, None),
     )
 }
 
@@ -3161,13 +3162,43 @@ fn print_product_details(title: &str, product: &Product) {
     }
 }
 
-fn print_project_details(title: &str, project: &Project) {
+/// Render the trailing portion of the `Repo:` line emitted by `boss
+/// <kind> show` — i.e. everything after the `Repo: ` prefix. Mirrors
+/// the engine's `resolve_repo_for_work_item`: per-row override wins,
+/// otherwise the product default, otherwise "(none — work item cannot
+/// dispatch)".
+///
+/// `override_url` is the work item's own `repo_remote_url` column.
+/// Projects always pass `None` since they don't carry their own
+/// override column today; the parenthetical "(inherited from product
+/// `<slug>`)" is the only non-`none` shape projects can produce.
+fn format_repo_line(override_url: Option<&str>, product: &Product) -> String {
+    if let Some(url) = override_url.filter(|s| !s.is_empty()) {
+        return format!("{url} (override on this work item)");
+    }
+    if let Some(url) = product
+        .repo_remote_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        return format!("{url} (inherited from product `{}`)", product.slug);
+    }
+    "(none — work item cannot dispatch)".to_owned()
+}
+
+fn print_project_details(title: &str, project: &Project, parent_product: Option<&Product>) {
     println!("{title}");
     println!("ID: {}", project.id);
     println!("Product ID: {}", project.product_id);
     println!("Name: {}", project.name);
     println!("Slug: {}", project.slug);
     println!("Status: {}", project.status);
+    if let Some(product) = parent_product {
+        // Projects have no per-row override column today, so the
+        // override slot is always `None`; the line reduces to the
+        // product-inherited or "none" shape.
+        println!("Repo: {}", format_repo_line(None, product));
+    }
     println!("Priority: {}", project.priority);
     if !project.goal.is_empty() {
         println!("Goal: {}", project.goal);
@@ -3325,7 +3356,7 @@ fn decide_open_design_action(
     }
 }
 
-fn print_task_details(title: &str, task: &Task) {
+fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>) {
     println!("{title}");
     println!("ID: {}", task.id);
     println!("Product ID: {}", task.product_id);
@@ -3335,6 +3366,12 @@ fn print_task_details(title: &str, task: &Task) {
     println!("Name: {}", task.name);
     println!("Kind: {}", task.kind);
     println!("Status: {}", task.status);
+    if let Some(product) = parent_product {
+        println!(
+            "Repo: {}",
+            format_repo_line(task.repo_remote_url.as_deref(), product),
+        );
+    }
     println!("Priority: {}", task.priority);
     println!("Source: {}", task.created_via);
     if let Some(ordinal) = task.ordinal {
@@ -3355,7 +3392,7 @@ mod tests {
     use super::{
         BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, MoveTarget, OpenDesignAction,
         ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, TaskCommand,
-        classify_bind_pr, decide_open_design_action, expect_leaf_work_item,
+        classify_bind_pr, decide_open_design_action, expect_leaf_work_item, format_repo_line,
         format_project_design_doc_line, pick_by_index, short_name_for, validate_github_pr_url,
     };
     use boss_protocol::{
@@ -3507,6 +3544,74 @@ mod tests {
             design_doc_path: None,
         };
         assert!(expect_leaf_work_item(WorkItem::Project(project)).is_err());
+    }
+
+    /// Helper for the `format_repo_line` golden tests: build a Product
+    /// with `repo_remote_url` set or unset and a fixed slug so the
+    /// inherited-line text is predictable.
+    fn dummy_product(slug: &str, repo: Option<&str>) -> Product {
+        Product {
+            id: "prod_1".to_owned(),
+            name: slug.to_owned(),
+            slug: slug.to_owned(),
+            description: String::new(),
+            repo_remote_url: repo.map(str::to_owned),
+            status: "active".to_owned(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// Golden output: a work item with its own non-empty
+    /// `repo_remote_url` reports "(override on this work item)" — the
+    /// product's value is ignored in this branch even if it's also set.
+    #[test]
+    fn format_repo_line_override_on_work_item() {
+        let product = dummy_product("boss", Some("git@github.com:spinyfin/mono.git"));
+        let rendered = format_repo_line(Some("git@github.com:myorg/nimbus.git"), &product);
+        assert_eq!(
+            rendered,
+            "git@github.com:myorg/nimbus.git (override on this work item)",
+        );
+    }
+
+    /// Golden output: no override (or empty override) falls through to
+    /// the product's value, attributing via the product's slug.
+    #[test]
+    fn format_repo_line_inherits_from_product() {
+        let product = dummy_product("boss", Some("git@github.com:spinyfin/mono.git"));
+        let rendered = format_repo_line(None, &product);
+        assert_eq!(
+            rendered,
+            "git@github.com:spinyfin/mono.git (inherited from product `boss`)",
+        );
+
+        // Empty-string override is treated as "no override" — mirrors
+        // the `--repo ""` clear semantics on update.
+        let rendered = format_repo_line(Some(""), &product);
+        assert_eq!(
+            rendered,
+            "git@github.com:spinyfin/mono.git (inherited from product `boss`)",
+        );
+    }
+
+    /// Golden output: neither row supplies a URL → the work item
+    /// cannot dispatch. Matches the engine's `resolve_repo_for_work_item`
+    /// returning `None`.
+    #[test]
+    fn format_repo_line_none_when_nothing_resolves() {
+        let product = dummy_product("boss", None);
+        let rendered = format_repo_line(None, &product);
+        assert_eq!(rendered, "(none — work item cannot dispatch)");
+
+        // Empty string on the product is equivalent to unset.
+        let product = dummy_product("boss", Some(""));
+        let rendered = format_repo_line(None, &product);
+        assert_eq!(rendered, "(none — work item cannot dispatch)");
+
+        // Empty override + empty product still falls through to none.
+        let rendered = format_repo_line(Some(""), &product);
+        assert_eq!(rendered, "(none — work item cannot dispatch)");
     }
 
     #[test]
