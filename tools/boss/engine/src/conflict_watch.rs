@@ -29,8 +29,53 @@
 use boss_protocol::FrontendEvent;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
-use crate::merge_poller::PrLifecycleProbe;
+use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out};
 use crate::work::{PendingMergeCheck, WorkDb};
+
+/// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
+/// (per-product flag or per-PR label) suppresses this conflict-watch
+/// transition. Returns `true` to gate the path off, logging at debug
+/// for traceability. DB-read errors fall through to "not opted out"
+/// so a transient lookup failure doesn't silently drop a real signal —
+/// the per-PR label is the second line of defence in that case.
+///
+/// Phase 6 #18 / design Q7: both gates fire on either the conflict
+/// flip or the retire path; "opted out" means leave the row alone.
+fn auto_pr_maintenance_disabled(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+    labels: &[String],
+) -> bool {
+    if pr_labels_opt_out(labels) {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "conflict_watch: PR labelled with opt-out; skipping",
+        );
+        return true;
+    }
+    match work_db.product_auto_pr_maintenance_enabled(&candidate.product_id) {
+        Ok(true) => false,
+        Ok(false) => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                product_id = %candidate.product_id,
+                pr_url = %candidate.pr_url,
+                "conflict_watch: product opted out of auto_pr_maintenance; skipping",
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                product_id = %candidate.product_id,
+                ?err,
+                "conflict_watch: failed to read auto_pr_maintenance_enabled; treating as enabled",
+            );
+            false
+        }
+    }
+}
 
 /// Fire-once flip from `in_review` to `blocked: merge_conflict`.
 /// Returns `true` if the row actually transitioned (so the poller's
@@ -48,6 +93,12 @@ pub async fn on_conflict_detected(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {
+    // Phase 6 #18 / Q7: the unified opt-out gates the entire flow.
+    // Check it first so opted-out products never even probe the
+    // rebase-attempt table or touch the parent row.
+    if auto_pr_maintenance_disabled(work_db, candidate, &probe.labels) {
+        return false;
+    }
     // Q7: when `auto-rebase-stacked-prs` is already chasing this PR,
     // step aside. Auto-rebase escalation owns the slot until it
     // hits a terminal status; the next conflict-watch sweep will
@@ -154,7 +205,14 @@ pub async fn on_resolved(
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
     candidate: &PendingMergeCheck,
+    labels: &[String],
 ) -> bool {
+    // Phase 6 #18 / Q7: opt-out is symmetric — an opted-out product's
+    // retire path is also a no-op so the engine doesn't undo a manual
+    // intervention on a row it has stopped auto-managing.
+    if auto_pr_maintenance_disabled(work_db, candidate, labels) {
+        return false;
+    }
     // Look up the engine-owned attempt row first. If one exists, drive
     // the strict (attempt-id-guarded) retire path; otherwise fall back
     // to the relaxed pr_url-only WHERE clause so this module still
@@ -375,6 +433,20 @@ mod tests {
             url: pr_url.to_owned(),
             state,
             base_ref_oid: Some("abc123".into()),
+            labels: Vec::new(),
+        }
+    }
+
+    fn probe_with_labels(
+        pr_url: &str,
+        state: PrLifecycleState,
+        labels: &[&str],
+    ) -> PrLifecycleProbe {
+        PrLifecycleProbe {
+            url: pr_url.to_owned(),
+            state,
+            base_ref_oid: Some("abc123".into()),
+            labels: labels.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
 
@@ -450,7 +522,7 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
         )
         .await;
-        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
+        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(resolved);
 
         let (status, reason) = chore_status(&db, &chore);
@@ -472,7 +544,7 @@ mod tests {
 
         // First call: row is in_review (not blocked), so resolution is
         // a no-op — the WHERE guard misses, no event published.
-        let r1 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
+        let r1 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(!r1);
         assert!(pub_.events.lock().await.is_empty());
 
@@ -485,8 +557,8 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
         )
         .await;
-        let r2 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
-        let r3 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
+        let r2 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        let r3 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(r2);
         assert!(!r3);
     }
@@ -510,7 +582,7 @@ mod tests {
             )
             .await
         );
-        assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await);
+        assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await);
         assert!(
             on_conflict_detected(
                 &db,
@@ -599,7 +671,7 @@ mod tests {
         )
         .unwrap();
         let before_count = pub_.events.lock().await.len();
-        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
+        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(!r);
         assert_eq!(pub_.events.lock().await.len(), before_count);
     }
@@ -725,6 +797,7 @@ mod tests {
             pub_.as_ref(),
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
+            &[],
         )
         .await;
         assert!(resolved, "retire path must transition both rows");
@@ -831,6 +904,7 @@ mod tests {
             pub_.as_ref(),
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
+            &[],
         )
         .await;
 
@@ -886,6 +960,7 @@ mod tests {
             pub_.as_ref(),
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
+            &[],
         )
         .await;
         let second = on_resolved(
@@ -893,6 +968,7 @@ mod tests {
             pub_.as_ref(),
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
+            &[],
         )
         .await;
         assert!(first, "first retire transitions");
@@ -945,6 +1021,7 @@ mod tests {
             pub_.as_ref(),
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
+            &[],
         )
         .await;
         assert!(resolved, "retire transitions must still report success");
@@ -1077,5 +1154,260 @@ mod tests {
         let (status, _) = chore_status(&db, &chore);
         assert_eq!(status, "in_review", "row stays where it was");
         assert!(pub_.events.lock().await.is_empty());
+    }
+
+    /// Flip `products.auto_pr_maintenance_enabled` directly on the
+    /// SQLite file so opt-out tests can drive the gate without
+    /// exposing a setter that production code doesn't yet need.
+    fn set_product_auto_pr_maintenance(db_path: &std::path::Path, product_id: &str, enabled: bool) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE products SET auto_pr_maintenance_enabled = ?2 WHERE id = ?1",
+            rusqlite::params![product_id, if enabled { 1 } else { 0 }],
+        )
+        .unwrap();
+    }
+
+    // ----- Phase 6 #18: opt-out gates conflict-watch flows -----
+
+    #[tokio::test]
+    async fn detection_skipped_when_product_opt_out_flag_disabled() {
+        // Acceptance: an opted-out product's conflict-watch is a no-op.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/600";
+        let (product, chore) = make_in_review(&db, "C-optout-prod", pr);
+        set_product_auto_pr_maintenance(&db_path, &product, false);
+
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let r = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+        assert!(!r, "opted-out product must not flip to blocked");
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
+        assert!(pub_.events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detection_skipped_when_pr_has_opt_out_label() {
+        // Per-PR label is the finer-grained opt-out — even on a
+        // product with auto-maintenance enabled, a single labelled PR
+        // is left alone.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/601";
+        let (product, chore) = make_in_review(&db, "C-optout-label", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        let r = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe_with_labels(
+                pr,
+                PrLifecycleState::Open(OpenPrMergeability::Conflict),
+                &["boss/no-auto-rebase"],
+            ),
+        )
+        .await;
+        assert!(!r, "labelled PR must not flip to blocked");
+        let (status, _) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(pub_.events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opt_out_label_match_is_case_insensitive() {
+        // GitHub labels preserve case but the engine tolerates
+        // BOSS/No-Auto-Rebase / etc. on the same gate so users don't
+        // need to remember exact casing.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/602";
+        let (product, chore) = make_in_review(&db, "C-optout-case", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        let r = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe_with_labels(
+                pr,
+                PrLifecycleState::Open(OpenPrMergeability::Conflict),
+                &["Boss/No-Auto-Rebase"],
+            ),
+        )
+        .await;
+        assert!(!r);
+    }
+
+    #[tokio::test]
+    async fn resolution_skipped_when_product_opt_out_flag_disabled() {
+        // Symmetric retire-path gate: an opted-out product's retire
+        // is also a no-op so the engine doesn't undo a manual
+        // intervention on a row it has stopped auto-managing.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/603";
+        let (product, chore) = make_in_review(&db, "C-optout-retire", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Flip into blocked with maintenance enabled so the row is
+        // legitimately in `blocked: merge_conflict`; then flip the
+        // product flag off and assert the retire path no-ops.
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+        let before = pub_.events.lock().await.len();
+        set_product_auto_pr_maintenance(&db_path, &product, false);
+
+        let r = on_resolved(
+            &db,
+            pub_.as_ref(),
+            None,
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(!r, "opted-out product must not retire automatically");
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("merge_conflict"));
+        assert_eq!(pub_.events.lock().await.len(), before);
+    }
+
+    // ----- Phase 6 #16: churn guard -----
+
+    /// Re-open the SQLite file and back-date a `conflict_resolutions`
+    /// row's `created_at` so churn-guard tests can simulate "this
+    /// attempt is 30 minutes old without sleeping the test for 30
+    /// minutes." Pure plumbing — production code never touches
+    /// `created_at` after insert.
+    fn rewind_attempt_created_at(db_path: &std::path::Path, attempt_id: &str, secs_ago: i64) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let new_ts = (now_secs - secs_ago).to_string();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE conflict_resolutions SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![attempt_id, new_ts],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn churn_guard_pre_abandons_fourth_attempt_in_window() {
+        // Phase 6 #16 acceptance: 4 conflict-resolve cycles in <1h →
+        // 4th attempt is abandoned with `churn_threshold_exceeded`.
+        // We exercise the WorkDb insert path directly so the test
+        // doesn't need to thread through a full worker-spawn cycle.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/700";
+        let (product, chore) = make_in_review(&db, "C-churn", pr);
+        // Move parent into blocked so the insert path's task-side
+        // stamp matches its WHERE guard for the live attempts.
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+
+        // First three attempts inside the window go live.
+        let make_input = |sha: &str| crate::work::ConflictResolutionInsertInput {
+            product_id: product.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 700,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some(sha.into()),
+            head_sha_before: Some("head".into()),
+        };
+        let a1 = db.insert_conflict_resolution(make_input("sha-1")).unwrap().unwrap();
+        let a2 = db.insert_conflict_resolution(make_input("sha-2")).unwrap().unwrap();
+        let a3 = db.insert_conflict_resolution(make_input("sha-3")).unwrap().unwrap();
+        for id in [&a1.id, &a2.id, &a3.id] {
+            let row = db.get_conflict_resolution(id).unwrap().unwrap();
+            assert_eq!(row.status, "pending", "first three attempts must be live");
+            assert!(row.failure_reason.is_none());
+        }
+
+        // Fourth attempt — same hour — trips the guard.
+        let a4 = db.insert_conflict_resolution(make_input("sha-4")).unwrap().unwrap();
+        assert_eq!(
+            a4.status, "abandoned",
+            "fourth attempt inside the window must be pre-abandoned",
+        );
+        assert_eq!(
+            a4.failure_reason.as_deref(),
+            Some("churn_threshold_exceeded"),
+            "failure_reason must record the guard",
+        );
+        assert!(
+            a4.finished_at.is_some(),
+            "pre-abandoned attempt must carry finished_at so it's terminal",
+        );
+
+        // Parent's `blocked_attempt_id` must still point at the
+        // most-recent live attempt (a3), not the dead a4.
+        match db.get_work_item(&chore).unwrap() {
+            crate::work::WorkItem::Chore(t) => {
+                assert_eq!(
+                    t.blocked_attempt_id.as_deref(),
+                    Some(a3.id.as_str()),
+                    "blocked_attempt_id must not retarget at the pre-abandoned row",
+                );
+                assert_eq!(t.status, "blocked");
+                assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn churn_guard_does_not_count_attempts_older_than_window() {
+        // The guard's window is rolling-1h. Back-date three attempts
+        // to > 1h ago and a brand-new fourth must go live.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/701";
+        let (product, chore) = make_in_review(&db, "C-churn-rollover", pr);
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let make_input = |sha: &str| crate::work::ConflictResolutionInsertInput {
+            product_id: product.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.into(),
+            pr_number: 701,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some(sha.into()),
+            head_sha_before: Some("head".into()),
+        };
+        let a1 = db.insert_conflict_resolution(make_input("sha-1")).unwrap().unwrap();
+        let a2 = db.insert_conflict_resolution(make_input("sha-2")).unwrap().unwrap();
+        let a3 = db.insert_conflict_resolution(make_input("sha-3")).unwrap().unwrap();
+        // Push all three outside the 1h window (3700s > 3600s).
+        for id in [&a1.id, &a2.id, &a3.id] {
+            rewind_attempt_created_at(&db_path, id, 3_700);
+        }
+
+        let a4 = db.insert_conflict_resolution(make_input("sha-4")).unwrap().unwrap();
+        assert_eq!(
+            a4.status, "pending",
+            "older-than-window attempts must not contribute to the guard",
+        );
     }
 }

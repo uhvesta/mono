@@ -15,6 +15,18 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 /// case (writes are tiny) but cheap when uncontended.
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Sliding window for the merge-conflict churn-guard heuristic
+/// (`merge-conflict-handling-in-review.md` Q6 / Phase 6 #16): the
+/// 4th `conflict_resolutions` row for a given work item inside one
+/// hour is created as `abandoned` instead of `pending`.
+pub const CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
+/// Trailing-window count at which the next attempt is pre-abandoned.
+/// The first 3 attempts inside `CHURN_GUARD_WINDOW_SECS` go live; the
+/// 4th trips the guard.
+pub const CHURN_GUARD_THRESHOLD: i64 = 3;
+/// `failure_reason` stamped on the pre-abandoned row.
+pub const CHURN_GUARD_REASON: &str = "churn_threshold_exceeded";
+
 pub use boss_protocol::{
     AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, ConflictResolution,
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateManyChoresInput,
@@ -2869,6 +2881,27 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
+    /// Read the unified auto-maintenance opt-out flag for a product.
+    /// Defaults to `true` when the column is unset or the product row
+    /// is missing — i.e. the opt-out only takes effect when the
+    /// operator has explicitly disabled it.
+    ///
+    /// Used by the conflict-watch (and, in later phases, ci-watch /
+    /// auto-rebase) paths to skip auto-remediation for products whose
+    /// owner has set `auto_pr_maintenance_enabled = 0`
+    /// (`merge-conflict-handling-in-review.md` Q7 / Phase 6 #18).
+    pub fn product_auto_pr_maintenance_enabled(&self, product_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let enabled: Option<i64> = conn
+            .query_row(
+                "SELECT auto_pr_maintenance_enabled FROM products WHERE id = ?1",
+                params![product_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(enabled.map(|v| v != 0).unwrap_or(true))
+    }
+
     /// True iff there's a non-terminal `rebase_attempts` row covering
     /// the given PR url. Used by `conflict_watch::on_conflict_detected`
     /// to defer when the `auto-rebase-stacked-prs` flow already owns
@@ -2903,6 +2936,13 @@ impl WorkDb {
     /// Phase 3 of the merge-conflict design (Q4). The caller is
     /// `conflict_watch::on_conflict_detected` after the parent
     /// `tasks` row is already flipped to `blocked: merge_conflict`.
+    ///
+    /// Churn guard (Phase 6 #16, design Q6): if the work item has
+    /// already produced ≥ [`CHURN_GUARD_THRESHOLD`] conflict_resolutions
+    /// rows in the trailing [`CHURN_GUARD_WINDOW_SECS`], the new row is
+    /// inserted in `status='abandoned'` with
+    /// `failure_reason='churn_threshold_exceeded'` so the dispatcher
+    /// skips it and the parent stays `blocked` for human attention.
     pub fn insert_conflict_resolution(
         &self,
         input: ConflictResolutionInsertInput,
@@ -2911,12 +2951,35 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let id = next_id("crz");
         let now = now_string();
+
+        // Count the trailing-1h attempts for this work item; if we've
+        // already crossed the churn threshold, the new row is
+        // pre-abandoned. The count is computed in the same transaction
+        // as the insert so two concurrent probes can't both squeak past
+        // the bar.
+        let now_secs: i64 = now.parse().unwrap_or(0);
+        let cutoff_secs = now_secs - CHURN_GUARD_WINDOW_SECS;
+        let recent_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM conflict_resolutions
+              WHERE work_item_id = ?1
+                AND CAST(created_at AS INTEGER) >= ?2",
+            params![input.work_item_id, cutoff_secs],
+            |row| row.get(0),
+        )?;
+        let churn_tripped = recent_count >= CHURN_GUARD_THRESHOLD;
+        let (status, failure_reason, finished_at): (&str, Option<&str>, Option<&str>) =
+            if churn_tripped {
+                ("abandoned", Some("churn_threshold_exceeded"), Some(now.as_str()))
+            } else {
+                ("pending", None, None)
+            };
+
         let rows = tx.execute(
             "INSERT OR IGNORE INTO conflict_resolutions
                 (id, product_id, work_item_id, pr_url, pr_number,
                  head_branch, base_branch, base_sha_at_trigger,
-                 head_sha_before, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10)",
+                 head_sha_before, status, failure_reason, created_at, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 id,
                 input.product_id,
@@ -2927,25 +2990,31 @@ impl WorkDb {
                 input.base_branch,
                 input.base_sha_at_trigger,
                 input.head_sha_before,
+                status,
+                failure_reason,
                 now,
+                finished_at,
             ],
         )?;
         if rows == 0 {
             tx.commit()?;
             return Ok(None);
         }
-        // Stamp the parent's `blocked_attempt_id` so the kanban can
-        // one-click "show me the attempt that's holding this card."
-        tx.execute(
-            "UPDATE tasks
-                SET blocked_attempt_id = ?2,
-                    updated_at         = ?3
-              WHERE id = ?1
-                AND status = 'blocked'
-                AND blocked_reason = 'merge_conflict'
-                AND deleted_at IS NULL",
-            params![input.work_item_id, id, now],
-        )?;
+        // Only stamp the parent's `blocked_attempt_id` for live
+        // attempts; an immediately-abandoned churn-guard row would
+        // mis-point the kanban at a dead attempt.
+        if !churn_tripped {
+            tx.execute(
+                "UPDATE tasks
+                    SET blocked_attempt_id = ?2,
+                        updated_at         = ?3
+                  WHERE id = ?1
+                    AND status = 'blocked'
+                    AND blocked_reason = 'merge_conflict'
+                    AND deleted_at IS NULL",
+                params![input.work_item_id, id, now],
+            )?;
+        }
         let inserted = query_conflict_resolution(&tx, &id)?
             .with_context(|| format!("unknown conflict_resolution after insert: {id}"))?;
         tx.commit()?;

@@ -60,6 +60,11 @@ pub struct PrLifecycleProbe {
     /// `None` when GitHub didn't report one (rare; usually means the
     /// PR has been force-detached from its base).
     pub base_ref_oid: Option<String>,
+    /// Labels currently applied to the PR. Carried so the
+    /// conflict-watch / auto-rebase / ci-watch paths can honour the
+    /// per-PR opt-out label (`boss/no-auto-rebase`, design Q7 /
+    /// Phase 6 #18) without a second `gh` round trip.
+    pub labels: Vec<String>,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -121,15 +126,21 @@ impl MergeProbe for CommandMergeProbe {
                 "view",
                 pr_url,
                 "--json",
-                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid",
+                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,labels",
                 "--jq",
+                // The labels column is comma-separated so it can ride a
+                // single TSV row alongside the scalar fields. `gh`
+                // returns a label as `{name,…}`; we project only `.name`
+                // and join them. Labels with commas are not supported
+                // by GitHub, so the join is unambiguous.
                 r#"[
                     (.state // ""),
                     (.mergedAt // ""),
                     (.closedAt // ""),
                     (.mergeable // ""),
                     (.mergeStateStatus // ""),
-                    (.baseRefOid // "")
+                    (.baseRefOid // ""),
+                    ((.labels // []) | map(.name) | join(","))
                 ] | @tsv"#,
             ])
             .stdin(Stdio::null())
@@ -154,6 +165,7 @@ impl MergeProbe for CommandMergeProbe {
                     url: pr_url.to_owned(),
                     state: PrLifecycleState::ClosedUnmerged,
                     base_ref_oid: None,
+                    labels: Vec::new(),
                 });
             }
             return Err(anyhow!(
@@ -178,17 +190,45 @@ fn parse_probe(url: &str, line: &str) -> PrLifecycleProbe {
     let mergeable = parts.next().unwrap_or("").trim();
     let merge_state_status = parts.next().unwrap_or("").trim();
     let base_ref_oid = parts.next().unwrap_or("").trim();
+    let labels_raw = parts.next().unwrap_or("").trim();
     let state = classify_state(raw_state, merged_at, mergeable, merge_state_status);
     let base_ref_oid = if base_ref_oid.is_empty() {
         None
     } else {
         Some(base_ref_oid.to_owned())
     };
+    let labels = if labels_raw.is_empty() {
+        Vec::new()
+    } else {
+        labels_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
     PrLifecycleProbe {
         url: url.to_owned(),
         state,
         base_ref_oid,
+        labels,
     }
+}
+
+/// Per-PR opt-out label that suppresses every auto-remediation flow
+/// (conflict resolution, auto-rebase, CI fixing) for a single PR.
+/// Mirrors the auto-rebase design's Q8 string; this design extends
+/// the same label to the conflict-watch path (Q7 / Phase 6 #18).
+pub const OPT_OUT_LABEL: &str = "boss/no-auto-rebase";
+
+/// True iff `labels` contains the unified opt-out label
+/// ([`OPT_OUT_LABEL`]). Match is case-insensitive — GitHub labels are
+/// case-preserving but the engine should tolerate casing drift the
+/// user introduces.
+pub fn pr_labels_opt_out(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(OPT_OUT_LABEL))
 }
 
 /// Classification rules (design Q1):
@@ -315,7 +355,15 @@ async fn sweep_one(
             }
         }
         PrLifecycleState::Open(OpenPrMergeability::Clean) => {
-            if conflict_watch::on_resolved(work_db, publisher, cube_client, candidate).await {
+            if conflict_watch::on_resolved(
+                work_db,
+                publisher,
+                cube_client,
+                candidate,
+                &probe_result.labels,
+            )
+            .await
+            {
                 outcome.conflict_cleared += 1;
             }
         }
@@ -364,11 +412,18 @@ async fn mark_merged(
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at
-/// `interval`, with a small initial delay so engine startup isn't
-/// blocked on `gh` while the rest of the runtime comes online. The
-/// returned `JoinHandle` is detached by callers — the poller has no
-/// shutdown path; aborting the engine process is the only way out,
-/// which matches every other engine background task.
+/// `interval`. The returned `JoinHandle` is detached by callers —
+/// the poller has no shutdown path; aborting the engine process is
+/// the only way out, which matches every other engine background
+/// task.
+///
+/// Startup sweep (`chore-lifecycle-pr-closed-unmerged.md` Q9 /
+/// `merge-conflict-handling-in-review.md` Phase 6 #17): the first
+/// `run_one_pass` fires immediately on spawn so any chore whose PR
+/// merged or developed a conflict while the engine was offline gets
+/// reconciled on boot. The sweep runs inside the spawned task so
+/// engine startup isn't blocked on `gh`; subsequent passes are
+/// gated behind `interval`.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
@@ -377,9 +432,6 @@ pub fn spawn_loop(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Stagger startup by one tick so we don't pile a
-        // `gh`-per-chore on top of the engine's other startup work.
-        tokio::time::sleep(interval).await;
         loop {
             let outcome = run_one_pass(
                 work_db.as_ref(),
@@ -439,6 +491,19 @@ mod tests {
                     url: url.to_owned(),
                     state,
                     base_ref_oid: base_ref_oid.map(str::to_owned),
+                    labels: Vec::new(),
+                }),
+            );
+        }
+
+        fn set_with_labels(&self, url: &str, state: PrLifecycleState, labels: &[&str]) {
+            self.states.lock().unwrap().insert(
+                url.to_owned(),
+                Ok(PrLifecycleProbe {
+                    url: url.to_owned(),
+                    state,
+                    base_ref_oid: None,
+                    labels: labels.iter().map(|s| (*s).to_owned()).collect(),
                 }),
             );
         }
@@ -462,6 +527,7 @@ mod tests {
                     url: pr_url.to_owned(),
                     state: PrLifecycleState::Open(OpenPrMergeability::Clean),
                     base_ref_oid: None,
+                    labels: Vec::new(),
                 }),
             }
         }
@@ -1066,6 +1132,135 @@ mod tests {
                 "case `{}`: base_ref_oid mismatch",
                 case.label,
             );
+            assert!(
+                probe.labels.is_empty(),
+                "case `{}`: labels mismatch (no trailing column)",
+                case.label,
+            );
         }
+    }
+
+    /// Labels column rides in the 7th TSV slot. Empty stays empty;
+    /// commas split into individual labels. The conflict-watch opt-out
+    /// uses these to honour the per-PR `boss/no-auto-rebase` label.
+    #[test]
+    fn parse_probe_parses_labels_column() {
+        let row = "OPEN\t\t\tMERGEABLE\tCLEAN\tabc\tneeds-review,boss/no-auto-rebase";
+        let probe = parse_probe("https://example.test/pr/2", row);
+        assert_eq!(
+            probe.labels,
+            vec!["needs-review".to_owned(), "boss/no-auto-rebase".to_owned()],
+        );
+
+        let row_empty = "OPEN\t\t\tMERGEABLE\tCLEAN\tabc\t";
+        let probe_empty = parse_probe("https://example.test/pr/3", row_empty);
+        assert!(probe_empty.labels.is_empty());
+    }
+
+    #[test]
+    fn pr_labels_opt_out_recognises_label_regardless_of_case() {
+        assert!(super::pr_labels_opt_out(&["boss/no-auto-rebase".into()]));
+        assert!(super::pr_labels_opt_out(&["Boss/No-Auto-Rebase".into()]));
+        assert!(super::pr_labels_opt_out(&[
+            "needs-review".into(),
+            "BOSS/NO-AUTO-REBASE".into(),
+        ]));
+        assert!(!super::pr_labels_opt_out(&["needs-review".into()]));
+        assert!(!super::pr_labels_opt_out(&[]));
+    }
+
+    /// Phase 6 #17 acceptance proxy: a chore whose PR became
+    /// conflicting while the engine was offline gets reconciled by
+    /// the first `run_one_pass` that runs at startup. The poller
+    /// already runs `run_one_pass` immediately on spawn (see
+    /// `spawn_loop`), so this test exercises the same path the
+    /// startup-sweep relies on: a single in-process `run_one_pass`
+    /// flips a pre-existing `in_review` row to `blocked: merge_conflict`
+    /// without any prior poller activity.
+    #[tokio::test]
+    async fn startup_sweep_picks_up_offline_conflict_transition() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/800";
+        // Seed the chore in `in_review` with a PR, mirroring the
+        // post-restart state of a chore whose PR went CONFLICTING
+        // while the engine was down.
+        let (_product, chore) = make_chore_in_review(&db, "C-offline-conflict", pr);
+        let probe = StubProbe::new();
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // No prior probe activity — this is the very first sweep,
+        // exactly what runs at engine startup.
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        assert_eq!(
+            outcome.conflict_flagged, 1,
+            "startup sweep must pick up offline conflicts in one pass",
+        );
+
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "blocked");
+                assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_resolves_offline_clean_transition() {
+        // Mirror case: a chore that was `blocked: merge_conflict`
+        // before shutdown, whose PR is mergeable again at restart,
+        // must retire on the first startup sweep.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/801";
+        let (_product, chore) = make_chore_in_review(&db, "C-offline-clean", pr);
+        // Put the row into blocked: merge_conflict directly so the
+        // startup sweep has to drive the retire path on its first run.
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let probe = StubProbe::new();
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        assert_eq!(
+            outcome.conflict_cleared, 1,
+            "startup sweep must retire offline-resolved conflicts in one pass",
+        );
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn opt_out_label_blocks_conflict_flip_through_sweep() {
+        // Sweep-level end-to-end for Phase 6 #18: a labelled PR
+        // reporting CONFLICTING leaves the chore in `in_review` and
+        // records no transition.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/802";
+        let (_product, chore) = make_chore_in_review(&db, "C-optout-sweep", pr);
+        let probe = StubProbe::new();
+        probe.set_with_labels(
+            pr,
+            PrLifecycleState::Open(OpenPrMergeability::Conflict),
+            &["boss/no-auto-rebase"],
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        assert_eq!(outcome.conflict_flagged, 0);
+        assert_eq!(outcome.total_transitions(), 0);
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert!(publisher.work_events.lock().await.is_empty());
     }
 }
