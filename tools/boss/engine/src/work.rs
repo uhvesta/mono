@@ -3879,6 +3879,52 @@ fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<Str
     }
 }
 
+/// Resolve the canonical repo URL for a work item. Reads
+/// `tasks.repo_remote_url` first — when set and non-empty, it wins as
+/// the per-row override — and otherwise falls back to the parent
+/// `products.repo_remote_url`. `None` for both → `Ok(None)` (the
+/// caller decides what to do; today's dispatcher will record a
+/// `repo_unresolved` attention item per multi-repo Q5).
+///
+/// No project layer: projects don't carry their own override (Q2),
+/// they inherit transitively through their tasks. A non-task
+/// `work_item_id` therefore returns `Ok(None)` since project / product
+/// rows don't dispatch on their own.
+///
+/// Errors only when the task row references a `product_id` that is no
+/// longer in the products table (an orphan task — a referential-
+/// integrity break the caller should surface, not paper over with a
+/// silent fallback).
+///
+/// This is the single resolution point per the multi-repo design's R1
+/// mitigation: every dispatch and listing surface must route through
+/// this helper so the rule never diverges.
+pub(crate) fn resolve_repo_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<String>> {
+    let row: Option<(Option<String>, String)> = conn
+        .query_row(
+            "SELECT repo_remote_url, product_id FROM tasks WHERE id = ?1",
+            [work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    let Some((override_repo, product_id)) = row else {
+        return Ok(None);
+    };
+
+    if let Some(url) = override_repo.as_deref().filter(|s| !s.is_empty()) {
+        return Ok(Some(url.to_owned()));
+    }
+
+    let product = query_product(conn, &product_id)?.with_context(|| {
+        format!("orphan task {work_item_id}: parent product {product_id} missing")
+    })?;
+    Ok(product.repo_remote_url)
+}
+
 fn resolve_execution_repo_remote_url(
     conn: &Connection,
     work_item_id: &str,
@@ -10024,5 +10070,155 @@ mod tests {
         // so the temp dir doesn't leak.
         let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    /// Shared scaffold for the `resolve_repo_for_work_item` tests: a
+    /// product (with `product_repo`) carrying a project + one task
+    /// whose own `repo_remote_url` is left `NULL`. Tests plant the
+    /// override they want via `set_task_repo` and then exercise the
+    /// helper.
+    fn make_resolve_scaffold(
+        label: &str,
+        product_repo: Option<&str>,
+    ) -> (PathBuf, WorkDb, String, String) {
+        let path = temp_db_path(label);
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: product_repo.map(str::to_owned),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Project".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+            })
+            .unwrap();
+        let task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Task".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        (path, db, product.id, task.id)
+    }
+
+    /// `create_task` doesn't yet persist the override (the
+    /// `update_task` / `update_chore` patch wiring is a separate
+    /// dispatch-wiring chore), so the resolver tests plant the value
+    /// directly. Using `db.connect()` keeps the WAL / busy-timeout
+    /// pragmas consistent with the helper's read path.
+    fn set_task_repo(db: &WorkDb, task_id: &str, value: Option<&str>) {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET repo_remote_url = ?2 WHERE id = ?1",
+            params![task_id, value],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_repo_returns_task_override_when_set() {
+        let (_path, db, _product_id, task_id) = make_resolve_scaffold(
+            "resolve-override-set",
+            Some("git@github.com:spinyfin/product-default.git"),
+        );
+        set_task_repo(&db, &task_id, Some("git@github.com:spinyfin/per-task.git"));
+
+        let conn = db.connect().unwrap();
+        let resolved = resolve_repo_for_work_item(&conn, &task_id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:spinyfin/per-task.git"),
+            "non-empty task override must win over the product default",
+        );
+    }
+
+    #[test]
+    fn resolve_repo_treats_empty_override_as_unset() {
+        let (_path, db, _product_id, task_id) = make_resolve_scaffold(
+            "resolve-override-empty",
+            Some("git@github.com:spinyfin/product-default.git"),
+        );
+        set_task_repo(&db, &task_id, Some(""));
+
+        let conn = db.connect().unwrap();
+        let resolved = resolve_repo_for_work_item(&conn, &task_id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:spinyfin/product-default.git"),
+            "empty-string override must fall through to the product default",
+        );
+    }
+
+    #[test]
+    fn resolve_repo_falls_back_to_product_when_override_null() {
+        let (_path, db, _product_id, task_id) = make_resolve_scaffold(
+            "resolve-override-null",
+            Some("git@github.com:spinyfin/product-default.git"),
+        );
+        // Leave tasks.repo_remote_url at its insert-time NULL.
+
+        let conn = db.connect().unwrap();
+        let resolved = resolve_repo_for_work_item(&conn, &task_id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:spinyfin/product-default.git"),
+            "NULL override must inherit from the product",
+        );
+    }
+
+    #[test]
+    fn resolve_repo_returns_none_when_both_null() {
+        let (_path, db, _product_id, task_id) =
+            make_resolve_scaffold("resolve-both-null", None);
+        // Both tasks.repo_remote_url and products.repo_remote_url are
+        // NULL; the dispatcher will treat the Ok(None) as an
+        // unresolved row and record an attention item.
+
+        let conn = db.connect().unwrap();
+        let resolved = resolve_repo_for_work_item(&conn, &task_id).unwrap();
+        assert!(
+            resolved.is_none(),
+            "both-NULL must resolve to Ok(None), got {resolved:?}",
+        );
+    }
+
+    #[test]
+    fn resolve_repo_errors_when_parent_product_is_missing() {
+        let (path, db, product_id, task_id) = make_resolve_scaffold(
+            "resolve-orphan-product",
+            Some("git@github.com:spinyfin/product-default.git"),
+        );
+
+        // Drop the parent product behind FK enforcement so the task
+        // is left pointing at a non-existent product_id — the
+        // referential-integrity break the helper must surface.
+        let raw = Connection::open(&path).unwrap();
+        // PRAGMA foreign_keys defaults to OFF on a fresh connection,
+        // but state it explicitly so the test reads correctly.
+        raw.pragma_update(None, "foreign_keys", false).unwrap();
+        raw.execute("DELETE FROM products WHERE id = ?1", [&product_id])
+            .unwrap();
+        drop(raw);
+
+        let conn = db.connect().unwrap();
+        let err = resolve_repo_for_work_item(&conn, &task_id).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("orphan task") && message.contains(&task_id),
+            "expected an orphan-task error mentioning the task id, got: {message}",
+        );
     }
 }
