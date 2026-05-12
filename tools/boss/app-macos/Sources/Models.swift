@@ -612,17 +612,29 @@ enum WorkBoardRepoMode: Equatable {
 
 /// Pure-data presentation for the kanban repo chip — short name for
 /// the rendered text, full URL for the hover tooltip, and a
-/// provenance string ("Inherited from product" vs "Override on this
-/// card") that tells the reader where the URL came from. Lives outside
-/// the SwiftUI view so tests can pin chip text + tooltip without
-/// spinning up a host (mirrors `ProjectDesignDocAffordancePresentation`).
+/// provenance string that tells the reader where the URL came from.
+/// Lives outside the SwiftUI view so tests can pin chip text + tooltip
+/// without spinning up a host (mirrors
+/// `ProjectDesignDocAffordancePresentation`).
+///
+/// Per-card chips only render when the card carries information the
+/// product header can't: either an explicit override of the product
+/// default, or the card's own URL on a product with no default. A
+/// card that simply inherits the product default never gets a chip —
+/// the chip would be redundant with the header.
 struct RepoChipPresentation: Equatable {
     let shortName: String
     let fullURL: String
     let provenance: Provenance
 
     enum Provenance: Equatable {
+        /// Chip lives on the product header, identifying the product's
+        /// default repo. Not used for per-card chips.
         case productDefault
+        /// Card has its own `repoRemoteURL`. On a product with a
+        /// default this is a true override; on a no-default product
+        /// the card's URL is just the card's repo. Either way the
+        /// chip is informative.
         case taskOverride
     }
 
@@ -631,7 +643,7 @@ struct RepoChipPresentation: Equatable {
         case .productDefault:
             return "\(fullURL)\nInherited from product"
         case .taskOverride:
-            return "\(fullURL)\nOverride on this card"
+            return "\(fullURL)\nRepo set on this card"
         }
     }
 
@@ -640,32 +652,29 @@ struct RepoChipPresentation: Equatable {
         case .productDefault:
             return "Repo \(shortName), inherited from product"
         case .taskOverride:
-            return "Repo \(shortName), override on this card"
+            return "Repo \(shortName), set on this card"
         }
     }
 
     /// Build a chip for one card given the parent product's default.
-    /// Returns `nil` when neither the card nor the product carries a
-    /// URL — there is nothing to chip.
+    /// Returns `nil` when the card has no per-row `repoRemoteURL` —
+    /// either it inherits the product default (chip would duplicate
+    /// the product header) or no URL is resolvable at all. The
+    /// `productRepoURL` argument is retained for future provenance
+    /// distinctions but does not currently change the result.
     static func forCard(
         task: WorkTask,
         productRepoURL: String?
     ) -> RepoChipPresentation? {
-        if let override = nonEmpty(task.repoRemoteURL) {
-            return RepoChipPresentation(
-                shortName: shortRepoName(for: override),
-                fullURL: override,
-                provenance: .taskOverride
-            )
+        _ = productRepoURL
+        guard let override = nonEmpty(task.repoRemoteURL) else {
+            return nil
         }
-        if let productURL = nonEmpty(productRepoURL) {
-            return RepoChipPresentation(
-                shortName: shortRepoName(for: productURL),
-                fullURL: productURL,
-                provenance: .productDefault
-            )
-        }
-        return nil
+        return RepoChipPresentation(
+            shortName: shortRepoName(for: override),
+            fullURL: override,
+            provenance: .taskOverride
+        )
     }
 
     /// Build the chip carried on the product header in single-repo

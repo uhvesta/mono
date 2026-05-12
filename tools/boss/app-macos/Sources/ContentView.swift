@@ -1091,9 +1091,6 @@ struct WorkBoardCardView: View {
                                 .foregroundStyle(.orange)
                                 .accessibilityLabel("Blocked")
                         }
-                        if let repoChip {
-                            RepoChipView(presentation: repoChip)
-                        }
                         Text(task.name)
                             .font(.body.weight(.medium))
                             .foregroundStyle(.primary)
@@ -1140,6 +1137,9 @@ struct WorkBoardCardView: View {
                     }
                     if showsConflictClearedBadge {
                         ConflictClearedBadge()
+                    }
+                    if let repoChip {
+                        RepoChipView(presentation: repoChip)
                     }
                     Spacer()
                 }
@@ -2288,11 +2288,18 @@ private struct WorkEditSheet: View {
 
 /// Capsule chip surfacing a repo's short name on a kanban card or
 /// product header. Hover tooltip carries the full URL plus the
-/// provenance string ("Inherited from product" vs "Override on this
+/// provenance string ("Inherited from product" vs "Repo set on this
 /// card") so the reader can tell where the URL came from without
 /// digging into the popover. Pure view — all the mode/provenance
 /// logic lives on `RepoChipPresentation` so tests don't need a
 /// SwiftUI host.
+///
+/// The chip renders in a neutral style matching `WorkStatusBadge`
+/// (used by `Blocked` and the project tag). Earlier the override
+/// variant carried an accent-blue tint, but the color had no stable
+/// meaning to readers — and with per-card chips now only appearing
+/// on rows that carry their own repo, the "this row is special" signal
+/// is already conveyed by the chip's mere presence on the card.
 struct RepoChipView: View {
     let presentation: RepoChipPresentation
     var emphasized: Bool = false
@@ -2306,43 +2313,19 @@ struct RepoChipView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
-        .foregroundStyle(foregroundColor)
+        .foregroundStyle(Color(nsColor: .labelColor))
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
-        .background(backgroundColor)
+        .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(Capsule())
         .overlay(
-            Capsule().strokeBorder(borderColor, lineWidth: 0.5)
+            Capsule().strokeBorder(
+                Color(nsColor: .separatorColor),
+                lineWidth: 0.5
+            )
         )
         .help(presentation.tooltip)
         .accessibilityLabel(presentation.accessibilityLabel)
-    }
-
-    private var foregroundColor: Color {
-        switch presentation.provenance {
-        case .productDefault:
-            return Color(nsColor: .secondaryLabelColor)
-        case .taskOverride:
-            return .accentColor
-        }
-    }
-
-    private var backgroundColor: Color {
-        switch presentation.provenance {
-        case .productDefault:
-            return Color(nsColor: .controlBackgroundColor)
-        case .taskOverride:
-            return Color.accentColor.opacity(0.12)
-        }
-    }
-
-    private var borderColor: Color {
-        switch presentation.provenance {
-        case .productDefault:
-            return Color(nsColor: .separatorColor)
-        case .taskOverride:
-            return Color.accentColor.opacity(0.4)
-        }
     }
 }
 

@@ -102,26 +102,22 @@ final class KanbanRepoChipTests: XCTestCase {
 
     // MARK: - RepoChipPresentation
 
-    /// In multi-repo mode, a card with no override inherits its chip
-    /// from the product default. Tooltip surfaces "Inherited from
-    /// product" so the reader knows the URL is implicit, not pinned.
-    func testCardChipInheritsFromProductDefault() {
+    /// Per-card chip is suppressed on rows that inherit the product
+    /// default — the chip would just duplicate the product header.
+    /// This is the most common case (most cards under a single-repo
+    /// product carry no override), so suppressing it keeps cards
+    /// uncluttered.
+    func testCardChipIsSuppressedWhenInheritingProductDefault() {
         let chip = RepoChipPresentation.forCard(
             task: makeTask(id: "t_1", repoRemoteURL: nil),
             productRepoURL: "https://github.com/foo/bar.git"
         )
-        XCTAssertEqual(chip?.shortName, "bar")
-        XCTAssertEqual(chip?.fullURL, "https://github.com/foo/bar.git")
-        XCTAssertEqual(chip?.provenance, .productDefault)
-        XCTAssertEqual(
-            chip?.tooltip,
-            "https://github.com/foo/bar.git\nInherited from product"
-        )
+        XCTAssertNil(chip)
     }
 
-    /// A per-task override shows up in `.taskOverride` provenance —
-    /// the tooltip says "Override on this card" so the reader can
-    /// tell at a glance that this row pinned its own repo.
+    /// A per-task `repoRemoteURL` shows up in `.taskOverride`
+    /// provenance — the tooltip says "Repo set on this card" so the
+    /// reader can tell the URL lives on this row, not on the product.
     func testCardChipReflectsTaskOverrideAndTooltip() {
         let chip = RepoChipPresentation.forCard(
             task: makeTask(
@@ -135,8 +131,23 @@ final class KanbanRepoChipTests: XCTestCase {
         XCTAssertEqual(chip?.provenance, .taskOverride)
         XCTAssertEqual(
             chip?.tooltip,
-            "git@github.com:foo/nimbus.git\nOverride on this card"
+            "git@github.com:foo/nimbus.git\nRepo set on this card"
         )
+    }
+
+    /// On a product with no default repo, the card's own URL is what
+    /// the chip surfaces — there is nothing else to inherit from, so
+    /// the chip is informative on every card.
+    func testCardChipShowsOwnURLWhenProductHasNoDefault() {
+        let chip = RepoChipPresentation.forCard(
+            task: makeTask(
+                id: "t_1",
+                repoRemoteURL: "https://github.com/foo/bar.git"
+            ),
+            productRepoURL: nil
+        )
+        XCTAssertEqual(chip?.shortName, "bar")
+        XCTAssertEqual(chip?.provenance, .taskOverride)
     }
 
     /// Card-level chip is hidden when there is no resolvable URL:
@@ -184,11 +195,12 @@ final class KanbanRepoChipTests: XCTestCase {
     }
 
     /// End-to-end multi-repo: an override on one card flips the mode,
-    /// and `repoChip(for:)` now returns a chip for *every* card —
-    /// including the no-override card, which shows the inherited
-    /// provenance. That's the user-visible signal "all cards in this
-    /// column show their repo, even the one that's just inheriting".
-    func testModelExposesMultiRepoModeAndChipsEveryCard() {
+    /// and `repoChip(for:)` returns a chip only for the overriding
+    /// row. The inheriting row stays bare — its repo matches the
+    /// product default, so the chip would just duplicate the header.
+    /// This is the user-visible signal "only rows that differ from
+    /// the product default get called out".
+    func testModelExposesMultiRepoModeAndChipsOnlyTheOverrideRow() {
         let model = makeModel(
             productRepoURL: "https://github.com/foo/bar.git",
             taskOverrides: [nil, "https://github.com/foo/nimbus.git"]
@@ -197,8 +209,10 @@ final class KanbanRepoChipTests: XCTestCase {
 
         let chips = model.visibleWorkItems.map { model.repoChip(for: $0) }
         XCTAssertEqual(chips.count, 2)
-        XCTAssertEqual(chips[0]?.shortName, "bar")
-        XCTAssertEqual(chips[0]?.provenance, .productDefault)
+        XCTAssertNil(
+            chips[0],
+            "row inheriting the product default should not chip"
+        )
         XCTAssertEqual(chips[1]?.shortName, "nimbus")
         XCTAssertEqual(chips[1]?.provenance, .taskOverride)
     }
@@ -213,6 +227,30 @@ final class KanbanRepoChipTests: XCTestCase {
         for task in model.visibleWorkItems {
             XCTAssertNil(model.repoChip(for: task))
         }
+    }
+
+    /// Multi-repo product (no default) where every card carries its
+    /// own `repoRemoteURL`: the chip MUST render on every card
+    /// because the URL is the only place the repo is identified —
+    /// there is no product header chip to lift it to. Locks in the
+    /// "always show badge when product default is null" rule from
+    /// the work item description.
+    func testModelChipsEveryCardWhenProductHasNoDefault() {
+        let model = makeModel(
+            productRepoURL: nil,
+            taskOverrides: [
+                "https://github.com/foo/bar.git",
+                "https://github.com/foo/nimbus.git",
+            ]
+        )
+        XCTAssertEqual(model.workBoardRepoMode, .multiRepo)
+
+        let chips = model.visibleWorkItems.map { model.repoChip(for: $0) }
+        XCTAssertEqual(chips.count, 2)
+        XCTAssertEqual(chips[0]?.shortName, "bar")
+        XCTAssertEqual(chips[0]?.provenance, .taskOverride)
+        XCTAssertEqual(chips[1]?.shortName, "nimbus")
+        XCTAssertEqual(chips[1]?.provenance, .taskOverride)
     }
 
     // MARK: - Fixtures
