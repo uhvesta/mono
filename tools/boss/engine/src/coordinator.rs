@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -21,6 +22,21 @@ use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution, WorkItem, Wor
 /// pool, but values above this are clamped (with a warning). The V2
 /// design fixes 8 as the upper bound.
 pub const MAX_WORKER_POOL_SIZE: usize = 8;
+
+/// Upper bound on how long the engine waits for a single
+/// `cube workspace lease` subprocess invocation before declaring the
+/// attempt a timeout failure. The motivating incident
+/// (`exec_18aec07893bd2e30_29`, 2026-05-12) sat in `worker_claimed/ok`
+/// for ~46 seconds with no event because the cube subprocess never
+/// returned and the engine was awaiting it unboundedly. With this
+/// timeout the engine surfaces a `cube_workspace_lease_failed` event
+/// and either falls back or fails cleanly within seconds.
+const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Same upper bound for `cube repo ensure`. `ensure_repo` is normally
+/// fast (it's an idempotent record lookup), but the same hang class
+/// applies if cube wedges, so we time-bound it too.
+const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CubeRepoHandle {
@@ -923,13 +939,14 @@ impl ExecutionCoordinator {
             .with_context(|| format!("failed to resolve work item {}", execution.work_item_id))?;
         let task = execution_task_summary(execution, &work_item);
 
-        let repo = match self
-            .cube_client
-            .ensure_repo(&execution.repo_remote_url)
-            .await
+        let repo = match tokio::time::timeout(
+            CUBE_REPO_ENSURE_TIMEOUT,
+            self.cube_client.ensure_repo(&execution.repo_remote_url),
+        )
+        .await
         {
-            Ok(repo) => repo,
-            Err(err) => {
+            Ok(Ok(repo)) => repo,
+            Ok(Err(err)) => {
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -952,6 +969,37 @@ impl ExecutionCoordinator {
                 )?;
                 return Err(err);
             }
+            Err(_elapsed) => {
+                let err = anyhow!(
+                    "cube `repo ensure` timed out after {}s",
+                    CUBE_REPO_ENSURE_TIMEOUT.as_secs()
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::CubeRepoEnsured,
+                            DispatchOutcome::Error,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "reason": "timeout",
+                            "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                        })),
+                    )
+                    .await;
+                self.record_start_failure(
+                    execution,
+                    worker_id,
+                    None,
+                    "cube_repo_ensure_failed",
+                    "Cube `repo ensure` timed out",
+                    &err,
+                )?;
+                return Err(err);
+            }
         };
         self.dispatch_events
             .emit(
@@ -963,48 +1011,16 @@ impl ExecutionCoordinator {
             .await;
 
         let lease = match self
-            .cube_client
-            .lease_workspace(
-                &repo.repo_id,
-                &task,
-                execution.preferred_workspace_id.as_deref(),
-            )
+            .lease_workspace_with_fallback(execution, worker_id, &repo, &task)
             .await
         {
             Ok(lease) => lease,
             Err(err) => {
-                // Cube returns every lease failure (stale-recovery
-                // exhausted, repo missing, db lock, fs error,
-                // network, …) as a single anyhow chain whose
-                // message embeds the verbatim cube stderr. Log the
-                // full chain at error level *before*
-                // `record_start_failure` runs, so operators see
-                // exactly what cube said instead of just the bare
-                // anyhow string that lands on the work record.
-                // Stale-working-copy recovery itself is owned by
-                // cube (see cube PR #254); the engine treats every
-                // cube lease failure as final and does not retry.
-                tracing::error!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    worker_id,
-                    cube_repo_id = %repo.repo_id,
-                    error = format!("{err:#}"),
-                    "cube workspace lease failed; marking execution start as failed"
-                );
-                self.dispatch_events
-                    .emit(
-                        DispatchEvent::new(
-                            Stage::CubeWorkspaceLeased,
-                            DispatchOutcome::Error,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_cube_repo(&repo.repo_id)
-                        .with_error(&err),
-                    )
-                    .await;
+                // The lease helper has already emitted attempt /
+                // failure events for every try; convert the final
+                // failure into the start-failure record so the
+                // execution row flips to `failed` cleanly instead of
+                // wedging in `worker_claimed`.
                 self.record_start_failure(
                     execution,
                     worker_id,
@@ -1184,6 +1200,192 @@ impl ExecutionCoordinator {
                 )?;
                 Err(err)
             }
+        }
+    }
+
+    /// Lease a cube workspace for `execution`, emitting a structured
+    /// attempt/failure event for every try and falling back to "any
+    /// free workspace" when a `--prefer` request fails.
+    ///
+    /// Behaviour matrix:
+    ///
+    /// | preferred set? | first attempt    | on first failure                 |
+    /// |----------------|------------------|----------------------------------|
+    /// | yes            | with `--prefer`  | retry once without `--prefer`    |
+    /// | no             | without `--prefer` | terminal failure              |
+    ///
+    /// Each subprocess invocation is bounded by [`CUBE_LEASE_TIMEOUT`]
+    /// so the engine cannot wedge indefinitely waiting on cube — the
+    /// motivating incident sat in `worker_claimed/ok` for ~46s with
+    /// no event because the cube call never returned.
+    async fn lease_workspace_with_fallback(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        repo: &CubeRepoHandle,
+        task: &str,
+    ) -> Result<CubeWorkspaceLease> {
+        let prefer = execution.preferred_workspace_id.as_deref();
+        let fallback_policy = if prefer.is_some() {
+            "retry_any_on_failure"
+        } else {
+            "none"
+        };
+
+        // First attempt: use the preferred workspace if the caller
+        // pinned one. Emit `cube_workspace_lease_attempted` *before*
+        // the subprocess so the timeline shows what we tried even
+        // when cube hangs and never returns.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(
+                    Stage::CubeWorkspaceLeaseAttempted,
+                    DispatchOutcome::Ok,
+                    &execution.id,
+                )
+                .with_work_item(&execution.work_item_id)
+                .with_worker(worker_id)
+                .with_cube_repo(&repo.repo_id)
+                .with_details(serde_json::json!({
+                    "attempt": 1,
+                    "prefer_workspace_id": prefer,
+                    "fallback_policy": fallback_policy,
+                    "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                })),
+            )
+            .await;
+
+        let first_err = match self
+            .invoke_lease(repo, task, prefer, CUBE_LEASE_TIMEOUT)
+            .await
+        {
+            Ok(lease) => return Ok(lease),
+            Err((reason, err)) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_repo_id = %repo.repo_id,
+                    prefer = ?prefer,
+                    reason,
+                    error = format!("{err:#}"),
+                    "cube workspace lease attempt failed"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::CubeWorkspaceLeaseFailed,
+                            DispatchOutcome::Error,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "attempt": 1,
+                            "prefer_workspace_id": prefer,
+                            "reason": reason,
+                            "fallback_policy": fallback_policy,
+                        })),
+                    )
+                    .await;
+                err
+            }
+        };
+
+        // Fallback only kicks in when the first attempt asked for a
+        // specific workspace. With `prefer = None` the first attempt
+        // already let cube pick from anywhere and there's nothing
+        // left to try.
+        if prefer.is_none() {
+            return Err(first_err);
+        }
+
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(
+                    Stage::CubeWorkspaceLeaseAttempted,
+                    DispatchOutcome::Ok,
+                    &execution.id,
+                )
+                .with_work_item(&execution.work_item_id)
+                .with_worker(worker_id)
+                .with_cube_repo(&repo.repo_id)
+                .with_details(serde_json::json!({
+                    "attempt": 2,
+                    "prefer_workspace_id": serde_json::Value::Null,
+                    "fallback_policy": "none",
+                    "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                    "fallback_from_prefer": prefer,
+                })),
+            )
+            .await;
+
+        match self
+            .invoke_lease(repo, task, None, CUBE_LEASE_TIMEOUT)
+            .await
+        {
+            Ok(lease) => Ok(lease),
+            Err((reason, err)) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_repo_id = %repo.repo_id,
+                    reason,
+                    error = format!("{err:#}"),
+                    "cube workspace lease fallback also failed"
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::CubeWorkspaceLeaseFailed,
+                            DispatchOutcome::Error,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "attempt": 2,
+                            "prefer_workspace_id": serde_json::Value::Null,
+                            "reason": reason,
+                            "fallback_policy": "none",
+                            "fallback_from_prefer": prefer,
+                        })),
+                    )
+                    .await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Run one `cube workspace lease` invocation under
+    /// [`CUBE_LEASE_TIMEOUT`]. Returns `(reason, error)` so the caller
+    /// can label the dispatch event with `"timeout"` vs `"cube_error"`
+    /// without re-parsing the message.
+    async fn invoke_lease(
+        &self,
+        repo: &CubeRepoHandle,
+        task: &str,
+        prefer_workspace_id: Option<&str>,
+        timeout: Duration,
+    ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
+        match tokio::time::timeout(
+            timeout,
+            self.cube_client
+                .lease_workspace(&repo.repo_id, task, prefer_workspace_id),
+        )
+        .await
+        {
+            Ok(Ok(lease)) => Ok(lease),
+            Ok(Err(err)) => Err(("cube_error", err)),
+            Err(_elapsed) => Err((
+                "timeout",
+                anyhow!("cube workspace lease timed out after {}s", timeout.as_secs()),
+            )),
         }
     }
 
@@ -1691,6 +1893,12 @@ mod tests {
         force_release_calls: Mutex<Vec<(String, Option<String>)>>,
         fail_ensure: bool,
         fail_lease: bool,
+        /// Simulate cube refusing a `--prefer` request because the
+        /// preferred workspace is held: `lease_workspace` errors when
+        /// `prefer_workspace_id` is `Some(_)` and succeeds when the
+        /// engine retries without it. Models the fallback path that
+        /// the 2026-05-12 incident never triggered.
+        fail_lease_when_prefer_set: bool,
         fail_create: bool,
         next_workspace_id: Mutex<Option<String>>,
     }
@@ -1727,6 +1935,11 @@ mod tests {
             ));
             if self.fail_lease {
                 return Err(anyhow!("cube workspace lease failed"));
+            }
+            if self.fail_lease_when_prefer_set && prefer_workspace_id.is_some() {
+                return Err(anyhow!(
+                    "cube workspace lease failed: preferred workspace held by another worker"
+                ));
             }
             let workspace_id = self
                 .next_workspace_id
@@ -2354,9 +2567,7 @@ mod tests {
             .iter()
             .position(|line| {
                 line.contains("ERROR")
-                    && line.contains(
-                        "cube workspace lease failed; marking execution start as failed",
-                    )
+                    && line.contains("cube workspace lease attempt failed")
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -2586,12 +2797,16 @@ mod tests {
         // The stage timeline before the failure should also be
         // visible — request_recorded, worker_claimed, cube stages,
         // run_started — so an operator can confirm dispatch did get
-        // through every earlier handoff.
+        // through every earlier handoff. `cube_workspace_lease_attempted`
+        // sits between `cube_repo_ensured` and `cube_workspace_leased`
+        // and pins what the engine asked cube to do (preferred
+        // workspace, fallback policy) for diagnose visibility.
         let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
         for expected in [
             "request_recorded",
             "worker_claimed",
             "cube_repo_ensured",
+            "cube_workspace_lease_attempted",
             "cube_workspace_leased",
             "cube_change_created",
             "run_started",
@@ -2662,17 +2877,272 @@ mod tests {
             .contains("cube workspace lease failed"));
 
         let events = recording.events_for(&execution_id).await;
-        let lease_event = events
+        // The lease attempt event is emitted before the call, so the
+        // timeline pins what the engine *intended* to do even when
+        // cube refuses.
+        let attempt_event = events
             .iter()
-            .find(|event| event.stage == "cube_workspace_leased")
-            .expect("cube_workspace_leased event missing");
-        assert_eq!(lease_event.outcome, "error");
-        // The timeline must NOT include later stages — dispatch
-        // bailed at the lease step.
+            .find(|event| event.stage == "cube_workspace_lease_attempted")
+            .expect("cube_workspace_lease_attempted event missing");
+        assert_eq!(attempt_event.outcome, "ok");
+        assert_eq!(
+            attempt_event.details.get("attempt").and_then(|v| v.as_u64()),
+            Some(1),
+            "first attempt event should carry attempt=1; got {:?}",
+            attempt_event.details,
+        );
+
+        let lease_failed = events
+            .iter()
+            .find(|event| event.stage == "cube_workspace_lease_failed")
+            .expect("cube_workspace_lease_failed event missing");
+        assert_eq!(lease_failed.outcome, "error");
+        assert!(
+            lease_failed
+                .error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("cube workspace lease failed")),
+            "lease_failed event must carry the verbatim cube error; got {:?}",
+            lease_failed.error_message,
+        );
+        assert_eq!(
+            lease_failed.details.get("reason").and_then(|v| v.as_str()),
+            Some("cube_error"),
+            "lease_failed event must classify reason; got {:?}",
+            lease_failed.details,
+        );
+
+        // The success event must NOT be emitted, and the timeline
+        // must NOT include later stages — dispatch bailed at the
+        // lease step.
         let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert!(
+            !stages.contains(&"cube_workspace_leased"),
+            "cube_workspace_leased (success) must not appear when lease fails; got {stages:?}",
+        );
         assert!(!stages.contains(&"cube_change_created"));
         assert!(!stages.contains(&"run_started"));
         assert!(!stages.contains(&"pane_spawned"));
+    }
+
+    /// When the engine asks cube for a specific workspace via
+    /// `--prefer X` and cube refuses (because X is held), the engine
+    /// must retry once without `--prefer` so the execution lands on
+    /// any free workspace instead of failing terminally. The 2026-05-12
+    /// incident wedged in `worker_claimed` for ~46s with abundant
+    /// pool capacity precisely because this fallback wasn't wired up.
+    #[tokio::test]
+    async fn lease_falls_back_to_any_workspace_when_prefer_refused() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        db.request_execution(RequestExecutionInput {
+            work_item_id: chore.id.clone(),
+            priority: None,
+            preferred_workspace_id: Some("mono-agent-003".to_owned()),
+            force: false,
+        })
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease_when_prefer_set: true,
+            ..FakeCubeClient::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+
+        // Two cube lease invocations: first with --prefer (refused),
+        // second without (succeeds).
+        let calls = cube.lease_calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            2,
+            "engine must retry without --prefer when cube refuses; got {:?}",
+            calls
+        );
+        assert_eq!(calls[0].2.as_deref(), Some("mono-agent-003"));
+        assert_eq!(calls[1].2, None);
+        drop(calls);
+
+        let events = recording.events_for(&execution_id).await;
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+
+        // Timeline shape: attempted #1 → failed #1 → attempted #2 →
+        // leased (success). A single attempted-then-failed-then-leased
+        // pattern wouldn't pin the fallback decision.
+        let attempt_events: Vec<&crate::dispatch_events::DispatchEvent> = events
+            .iter()
+            .filter(|e| e.stage == "cube_workspace_lease_attempted")
+            .collect();
+        assert_eq!(
+            attempt_events.len(),
+            2,
+            "expected two lease_attempted events (initial + fallback); got stages {stages:?}"
+        );
+        assert_eq!(
+            attempt_events[0]
+                .details
+                .get("prefer_workspace_id")
+                .and_then(|v| v.as_str()),
+            Some("mono-agent-003"),
+        );
+        assert_eq!(
+            attempt_events[0]
+                .details
+                .get("fallback_policy")
+                .and_then(|v| v.as_str()),
+            Some("retry_any_on_failure"),
+        );
+        assert!(
+            attempt_events[1]
+                .details
+                .get("prefer_workspace_id")
+                .map(|v| v.is_null())
+                .unwrap_or(false),
+            "fallback attempt must have prefer_workspace_id=null; got {:?}",
+            attempt_events[1].details,
+        );
+        assert_eq!(
+            attempt_events[1]
+                .details
+                .get("fallback_policy")
+                .and_then(|v| v.as_str()),
+            Some("none"),
+        );
+
+        let failed_events: Vec<&crate::dispatch_events::DispatchEvent> = events
+            .iter()
+            .filter(|e| e.stage == "cube_workspace_lease_failed")
+            .collect();
+        assert_eq!(
+            failed_events.len(),
+            1,
+            "exactly one lease_failed event for the first attempt; got stages {stages:?}"
+        );
+
+        // Final state: a successful `cube_workspace_leased` event and
+        // the execution proceeded past the lease step.
+        let leased = events
+            .iter()
+            .find(|e| e.stage == "cube_workspace_leased")
+            .expect("cube_workspace_leased event missing after fallback");
+        assert_eq!(leased.outcome, "ok");
+
+        // No attention item should be raised — the fallback succeeded
+        // and the execution didn't fail.
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            attention_items.iter().all(|a| a.kind != "cube_workspace_lease_failed"),
+            "fallback success must not raise a lease-failure attention item; got {attention_items:?}",
+        );
+    }
+
+    /// When the fallback also fails the execution must transition to
+    /// `failed` with both `cube_workspace_lease_failed` events visible
+    /// — silent indefinite wait is not acceptable.
+    #[tokio::test]
+    async fn lease_fallback_failure_transitions_execution_to_failed() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        db.request_execution(RequestExecutionInput {
+            work_item_id: chore.id.clone(),
+            priority: None,
+            preferred_workspace_id: Some("mono-agent-003".to_owned()),
+            force: false,
+        })
+        .unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease: true,
+            ..FakeCubeClient::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+
+        let events = recording.events_for(&execution_id).await;
+        let attempt_count = events
+            .iter()
+            .filter(|e| e.stage == "cube_workspace_lease_attempted")
+            .count();
+        let failed_count = events
+            .iter()
+            .filter(|e| e.stage == "cube_workspace_lease_failed")
+            .count();
+        assert_eq!(
+            attempt_count, 2,
+            "expected initial + fallback attempt events; got {events:?}"
+        );
+        assert_eq!(
+            failed_count, 2,
+            "expected one lease_failed event per attempt; got {events:?}"
+        );
+
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            attention_items.len(),
+            1,
+            "terminal lease failure must raise exactly one attention item",
+        );
+        assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
     }
 
     #[tokio::test]
