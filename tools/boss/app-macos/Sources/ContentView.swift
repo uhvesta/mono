@@ -172,13 +172,21 @@ struct ContentView: View {
     }
 
     private var agentsView: some View {
+        // Agents is the only top-level mode that isn't a NavigationSplitView,
+        // so its content frame stops at the safe-area inset below the title
+        // bar. The Work mode's sidebar uses the sidebar material that bleeds
+        // up into that title bar region; with `.opacity(0)` the SwiftUI layer
+        // is hidden but the title-bar strip directly above the sidebar
+        // column is still visible chrome. Painting the agents background
+        // through the safe area covers that strip so the Work sidebar's
+        // top sliver doesn't show through when Agents is active.
         #if canImport(GhosttyKit)
         WorkersDetailView(
             workspace: workersWorkspace,
             liveStates: model.liveWorkerStates,
             liveStatusModel: model
         )
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
         #else
         VStack(alignment: .leading, spacing: 12) {
             Text("Agents mode requires GhosttyKit.")
@@ -191,7 +199,7 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
         #endif
     }
 
