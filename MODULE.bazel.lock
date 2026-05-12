@@ -6839,7 +6839,7 @@
         "bzlTransitiveDigest": "Xw40PG4Np8GLAvoUdMollPX81jUxX4BVeWMn6uuev4I=",
         "usagesDigest": "9aGGg0VnvzGufT6B7isS8jsW8XS1wMHm3m1/zfSOMf0=",
         "recordedFileInputs": {
-          "@@//tools/boss/app-macos/Package.resolved": "aa748c707f856cfabec8f3178e6c1db58666cd265b1fb3bbc3e66774b9200ddb"
+          "@@//tools/boss/app-macos/Package.resolved": "d5808e10fe876ab02d0f51ad6abf16ed78a7e0aa993ced4f8471308f9c191adb"
         },
         "recordedDirentsInputs": {},
         "envVariables": {},

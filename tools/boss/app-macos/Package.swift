@@ -7,6 +7,9 @@ let package = Package(
     products: [
         .executable(name: "Boss", targets: ["Boss"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/gonzalezreal/textual", from: "0.3.1"),
+    ],
     targets: [
         .binaryTarget(
             name: "GhosttyKit",
@@ -15,6 +18,7 @@ let package = Package(
         .executableTarget(
             name: "Boss",
             dependencies: [
+                .product(name: "Textual", package: "textual"),
                 "GhosttyKit",
             ],
             path: "Sources",

@@ -63,9 +63,11 @@ swift_deps = use_extension(
     "swift_deps",
 )
 swift_deps.from_package(
+    resolved = "//tools/boss/app-macos:Package.resolved",
     swift = "//tools/boss/app-macos:Package.swift",
 )
 use_repo(
     swift_deps,
     "swift_package",
+    "swiftpkg_textual",
 )

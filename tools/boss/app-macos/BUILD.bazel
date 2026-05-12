@@ -4,6 +4,7 @@ load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 package(default_visibility = ["//visibility:private"])
 
 exports_files([
+    "Package.resolved",
     "Package.swift",
 ])
 
@@ -16,6 +17,9 @@ swift_library(
     # through SwiftPM. The Workers mode in ContentView is gated on
     # `canImport(GhosttyKit)` and shows a placeholder under Bazel.
     srcs = glob(["Sources/*.swift"]),
+    deps = [
+        "@swiftpkg_textual//:Textual",
+    ],
 )
 
 macos_application(
