@@ -43,7 +43,7 @@ struct GlobalFlags {
 
     /// Suppress autostart side effects.
     ///
-    /// Two effects, both off-by-default:
+    /// Three effects, all off-by-default:
     ///   1. The CLI will not transparently start the engine when
     ///      its socket is unreachable.
     ///   2. `boss task create` / `boss chore create` create the work
@@ -51,6 +51,13 @@ struct GlobalFlags {
     ///      it. The new chore/task stays in the `todo` column until
     ///      something explicitly schedules it (`bossctl work start
     ///      <id>` or a kanban drag-to-Doing).
+    ///   3. `boss project create` still files the project AND its
+    ///      auto-spawned `kind=design` seed task, but the seed task
+    ///      is born with `autostart=false` so the engine does not
+    ///      dispatch a worker against it. Use this to author the
+    ///      design brief on the seed task (via `boss task update
+    ///      <design-task-id> --description ...`) before releasing it
+    ///      with `bossctl work start <design-task-id>`.
     #[arg(long, global = true)]
     no_autostart: bool,
 
@@ -1151,7 +1158,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Treat this reference output as the authoritative current CLI surface for this build.",
             "Do not use boss ... --help for syntax discovery when this reference is available.",
             "Omit --socket-path unless you explicitly need a non-default socket.",
-            "Omit --no-autostart unless you explicitly need to forbid engine startup or auto-dispatch on `task create` / `chore create`.",
+            "Omit --no-autostart unless you explicitly need to forbid engine startup or auto-dispatch on `task create` / `chore create` (also gates the auto-spawned `kind=design` seed task on `project create`).",
             "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
@@ -1173,6 +1180,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "If the work fits an existing project, create a task in that project.",
             "If it does not fit an existing project and is small and self-contained, create a chore.",
             "If it does not fit an existing project and is broad, ambiguous, investigative, or multi-stage, create a project.",
+            "`boss project create` auto-spawns a `kind=design` seed task under the new project (surfaced as `design_task` in the --json response). Do NOT follow up by filing a parallel \"Design\" task; populate the brief by running `boss task update <design_task.id> --description ...` on the seed task. Use `--no-autostart` on `project create` if you want to author the brief before the engine dispatches a worker against the seed task.",
         ],
         commands,
     })
@@ -1368,7 +1376,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let project = create_project(
                 &mut client,
                 CreateProjectInput {
-                    product_id: product.id,
+                    product_id: product.id.clone(),
                     name,
                     description,
                     goal,
@@ -1383,9 +1391,33 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
             .await?;
 
-            print_entity(ctx, &serde_json::json!({ "project": project }), || {
-                print_project_details("Created project", &project, None);
-            })
+            // Surface the auto-spawned `kind=design` seed task so
+            // callers (notably the coordinator) can write a design
+            // brief onto it without a follow-up `task list` call.
+            // `create_project` inserts the design task in the same
+            // sqlite transaction, so it's always present by the
+            // time we get the project back.
+            let design_task = list_tasks(&mut client, &product.id, Some(&project.id), None)
+                .await?
+                .into_iter()
+                .find(|t| t.kind == "design");
+
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "project": project,
+                    "design_task": design_task,
+                }),
+                || {
+                    print_project_details("Created project", &project, None);
+                    if let Some(task) = design_task.as_ref() {
+                        println!(
+                            "Design task: {} (autostart={}, status={})",
+                            task.id, task.autostart, task.status
+                        );
+                    }
+                },
+            )
         }
         ProjectCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;

@@ -148,5 +148,42 @@ private func bossSystemPrompt() -> String {
     - Ask only when you cannot reasonably infer the destination
       product or representation.
     - Keep status and structure accurate as workers finish.
+
+    ## Project creation
+
+    `boss project create` is special — it is not just an insert. The
+    engine atomically creates the project AND a `kind=design` seed
+    task under it (`created_via=engine_auto`, `autostart=true` by
+    default). That seed task is the project's design slot, and the
+    engine immediately dispatches a worker against it when the
+    project is autostart-enabled.
+
+    Treat the auto-created design task as authoritative. In
+    particular:
+
+    - DO NOT follow `boss project create` with `boss task create
+      --name "Design …"` or anything that looks like a parallel
+      design task. The engine already spawned one; filing a sibling
+      lights up a second Opus worker on the same job. (We burned a
+      slot exactly this way once — don't repeat it.)
+    - To populate the design brief, run `boss task update
+      <auto-design-id> --description "…"` against the seed task. The
+      auto-design task id is surfaced in `boss project create --json`
+      under the top-level `design_task` key (with `design_task.id` as
+      the field you want). If the response is unavailable, recover
+      with `boss task list --project <new-project-id> --json` and
+      pick the entry whose `kind == "design"`.
+    - If you want to author the brief BEFORE the worker starts, file
+      the project with `boss project create --no-autostart`. The
+      global `--no-autostart` flag gates the auto-design task's
+      autostart at insert time, so the seed task stays in `todo`
+      until you explicitly release it with `bossctl work start
+      <design-task-id>` (or a kanban drag-to-Doing). Verify by
+      checking the task's `autostart` flag in `boss task show --json`
+      — it should be `false` after creation under `--no-autostart`.
+
+    The same shape applies on update: every project always has
+    exactly one `kind=design` task. Reach for that task, don't
+    create new ones, when you're touching the design phase.
     """
 }
