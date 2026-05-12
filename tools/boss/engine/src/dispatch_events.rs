@@ -42,6 +42,15 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
+    /// `UpdateWorkItem` observed a `tasks.status` transition that
+    /// would normally trigger auto-dispatch (drag-to-Doing path
+    /// from #345). Fires whether or not the dispatch attempt
+    /// actually ran — the `details.did_dispatch` flag distinguishes
+    /// the two cases. Before this stage existed, a status flip that
+    /// fell through the `work_item_needs_dispatch` gate produced no
+    /// event at all and the symptom presented as "I dragged it and
+    /// nothing happened."
+    StatusTransition,
     /// Scheduler picked the execution off the ready queue and is
     /// about to attempt to claim a worker.
     RequestRecorded,
@@ -63,11 +72,19 @@ pub enum Stage {
     /// `failed` and released the lease without surfacing anything
     /// to the user.
     PaneSpawned,
+    /// A non-terminal stage exceeded its per-stage stalled-threshold
+    /// without progressing to the next stage. Fires periodically
+    /// from the engine's stage-stalled detector; surfaces via
+    /// `bossctl dispatch ghost-active --include-stalled`. Does NOT
+    /// auto-remediate — the operator decides whether to retry,
+    /// reap, or wait.
+    StageStalled,
 }
 
 impl Stage {
     pub fn as_str(self) -> &'static str {
         match self {
+            Stage::StatusTransition => "status_transition",
             Stage::RequestRecorded => "request_recorded",
             Stage::WorkerClaimed => "worker_claimed",
             Stage::CubeRepoEnsured => "cube_repo_ensured",
@@ -75,6 +92,7 @@ impl Stage {
             Stage::CubeChangeCreated => "cube_change_created",
             Stage::RunStarted => "run_started",
             Stage::PaneSpawned => "pane_spawned",
+            Stage::StageStalled => "stage_stalled",
         }
     }
 }

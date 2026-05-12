@@ -246,6 +246,18 @@ struct ServerState {
     /// (the merge poller, etc.) can publish work-item invalidations
     /// without standing up a second broker.
     publisher: Arc<dyn ExecutionPublisher>,
+    /// Shared dispatch-event sink. The execution coordinator emits
+    /// the per-stage events into this sink during dispatch; the
+    /// `UpdateWorkItem` handler emits a `StatusTransition` event
+    /// before dispatch even gets a chance to fire, which is the
+    /// only signal we have when the auto-dispatch gate decides to
+    /// skip (the "I dragged it and nothing happened" symptom).
+    dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink>,
+    /// Root path the dispatch-event sink writes under. Surfaced on
+    /// `ServerState` so the stage-stalled detector (spawned out of
+    /// `serve`) can run [`crate::dispatch_reader::pending_stalls`]
+    /// against the same files the sink populates.
+    dispatch_event_root: PathBuf,
     topic_broker: Arc<TopicBroker>,
     worker_registry: WorkerRegistry,
     /// Live runtime state per allocated worker slot. Updated as hook
@@ -518,8 +530,10 @@ impl ServerState {
                     .unwrap_or_else(|| PathBuf::from("."))
             });
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> = Arc::new(
-            crate::dispatch_events::JsonlFileSink::new(dispatch_event_root),
+            crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()),
         );
+        let dispatch_events_for_state = dispatch_events.clone();
+        let dispatch_event_root_for_state = dispatch_event_root.clone();
 
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
@@ -538,6 +552,8 @@ impl ServerState {
                 completion_handler,
                 cube_client: cube_client_for_state,
                 publisher: publisher_for_state,
+                dispatch_events: dispatch_events_for_state,
+                dispatch_event_root: dispatch_event_root_for_state,
                 topic_broker,
                 worker_registry: WorkerRegistry::new(),
                 live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
@@ -1769,6 +1785,17 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Watch in-flight dispatch timelines for stalled stages and emit
+    // a `stage_stalled` event when one sits past the threshold
+    // without progressing. Read-only against the per-execution
+    // dispatch.jsonl mirrors; never modifies dispatcher behavior.
+    let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
+        server_state.dispatch_event_root.clone(),
+        server_state.dispatch_events.clone(),
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
@@ -2848,32 +2875,83 @@ async fn handle_frontend_connection(
                         // execution id the client is already tracking).
                         // The reconcile / rescan paths handle
                         // re-dispatch of stale (worker-died) cases.
-                        if task_transitioned_to_active(&previous_task_status, &item)
-                            && work_item_needs_dispatch(&work_db, &work_item_id(&item))
-                        {
-                            let live_states = server_state.live_worker_states.clone();
-                            let dispatch_input = RequestExecutionInput {
-                                work_item_id: work_item_id(&item),
-                                priority: None,
-                                preferred_workspace_id: None,
-                                force: false,
-                            };
-                            match work_db.request_execution_with_live_check(
-                                dispatch_input,
-                                |run_id| live_states.is_run_live(run_id),
-                            ) {
-                                Ok(_) => {
-                                    server_state.execution_coordinator.kick();
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        work_item_id = %work_item_id(&item),
-                                        ?err,
-                                        "UpdateWorkItem → active: auto-dispatch failed; \
-                                         status update kept, no worker spawned",
-                                    );
-                                }
-                            }
+                        if task_transitioned_to_active(&previous_task_status, &item) {
+                            let work_item_id_for_event = work_item_id(&item);
+                            let from_status = previous_task_status.clone();
+                            let needs_dispatch =
+                                work_item_needs_dispatch(&work_db, &work_item_id_for_event);
+                            let (dispatched_execution_id, did_dispatch, skip_reason) =
+                                if needs_dispatch {
+                                    let live_states = server_state.live_worker_states.clone();
+                                    let dispatch_input = RequestExecutionInput {
+                                        work_item_id: work_item_id_for_event.clone(),
+                                        priority: None,
+                                        preferred_workspace_id: None,
+                                        force: false,
+                                    };
+                                    match work_db.request_execution_with_live_check(
+                                        dispatch_input,
+                                        |run_id| live_states.is_run_live(run_id),
+                                    ) {
+                                        Ok(execution) => {
+                                            server_state.execution_coordinator.kick();
+                                            (Some(execution.id), true, None)
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                work_item_id = %work_item_id_for_event,
+                                                ?err,
+                                                "UpdateWorkItem → active: auto-dispatch \
+                                                 failed; status update kept, no worker spawned",
+                                            );
+                                            (None, false, Some(format!("{err:#}")))
+                                        }
+                                    }
+                                } else {
+                                    // The auto-dispatch gate decided this transition
+                                    // already has an in-flight execution. Before this
+                                    // event existed the skip was silent — exactly the
+                                    // "I dragged it and nothing happened" shape.
+                                    (
+                                        None,
+                                        false,
+                                        Some(
+                                            "work_item_needs_dispatch=false (existing \
+                                             non-terminal execution owns dispatch slot)"
+                                                .to_owned(),
+                                        ),
+                                    )
+                                };
+                            // Pin the event's execution_id to the resolved exec id
+                            // when dispatch landed, falling back to the work item
+                            // id otherwise so the line stays correlatable with
+                            // anything the operator can grep for.
+                            let exec_for_event = dispatched_execution_id
+                                .clone()
+                                .unwrap_or_else(|| work_item_id_for_event.clone());
+                            let details = serde_json::json!({
+                                "from_status": from_status,
+                                "to_status": "active",
+                                "did_dispatch": did_dispatch,
+                                "reason_if_skipped": skip_reason,
+                                "dispatched_execution_id": dispatched_execution_id,
+                            });
+                            server_state
+                                .dispatch_events
+                                .emit(
+                                    crate::dispatch_events::DispatchEvent::new(
+                                        crate::dispatch_events::Stage::StatusTransition,
+                                        if did_dispatch {
+                                            crate::dispatch_events::Outcome::Ok
+                                        } else {
+                                            crate::dispatch_events::Outcome::Skipped
+                                        },
+                                        exec_for_event,
+                                    )
+                                    .with_work_item(work_item_id_for_event)
+                                    .with_details(details),
+                                )
+                                .await;
                         }
                         let revision = publish_work_invalidation(
                             &server_state,
