@@ -674,6 +674,227 @@ async fn agents_reap_unknown_run_returns_clear_error() -> Result<()> {
     Ok(())
 }
 
+/// Regression: dragging an `autostart=false` chore from Todo to
+/// Doing in the macOS kanban must dispatch a worker. The earlier
+/// failure shape was that `UpdateWorkItem` flipped status to `active`
+/// but no execution row appeared — `tasks.autostart=0` made reconcile
+/// silently skip the chore at create time and there was no
+/// server-side hook on the human transition to seed one. The
+/// kanban-drag fix now fires `RequestExecution` from the engine
+/// itself when a task/chore moves into `active` via UpdateWorkItem,
+/// so the invariant holds regardless of whether the client also fires
+/// the RPC.
+///
+/// Acceptance:
+/// - chore created with `autostart=false` has no execution row,
+/// - after `UpdateWorkItem` flips status to `active`, the chore has a
+///   non-terminal execution backing it.
+#[tokio::test]
+async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Parked chore".to_owned(),
+                description: None,
+                // The bug scenario: --no-autostart leaves the chore in
+                // `todo` with no execution, waiting for an explicit
+                // schedule trigger (drag-to-Doing or `bossctl work
+                // start`). Without the fix, the drag does not trigger
+                // dispatch and the card is "active" with no worker.
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+    assert_eq!(chore.status, "todo");
+    assert!(!chore.autostart);
+
+    // No execution at create time — autostart=false means the
+    // reconcile gate (`task_accepts_execution`) skips creation while
+    // the chore sits in `todo`.
+    let before = list_executions_for(&mut client, &chore.id).await?;
+    assert!(
+        before.is_empty(),
+        "autostart=false chore must not have a creation-time execution; got {before:?}"
+    );
+
+    // Drive the kanban drag-to-Doing: `UpdateWorkItem` with `status =
+    // active`. The fix makes this fire `RequestExecution` server-side
+    // — without it, the chore sat `active` with no execution.
+    let updated = match client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => item,
+        other => return Err(anyhow!("unexpected response to UpdateWorkItem: {other:?}")),
+    };
+    match updated {
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+        other => return Err(anyhow!("unexpected item kind: {other:?}")),
+    }
+
+    // After the drag, the chore must have a non-terminal execution.
+    let after = list_executions_for(&mut client, &chore.id).await?;
+    assert_eq!(
+        after.len(),
+        1,
+        "drag-to-Doing must create exactly one ready execution; got {after:?}"
+    );
+    let exec = &after[0];
+    assert!(
+        matches!(
+            exec.status.as_str(),
+            "ready" | "queued" | "running" | "waiting_human" | "waiting_dependency"
+        ),
+        "drag-to-Doing execution should be non-terminal; got status={status:?}",
+        status = exec.status
+    );
+    assert_eq!(exec.work_item_id, chore.id);
+
+    Ok(())
+}
+
+/// A second drag from `active` → `active` (idempotent client retry,
+/// or status patch from a different field landing alongside an
+/// already-active card) must not multiply executions. The fix only
+/// fires dispatch on a *transition* into `active`, and even then only
+/// when there is no existing non-terminal execution.
+#[tokio::test]
+async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Parked chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+
+    // First drag: creates exec #1.
+    let _ = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    let after_first = list_executions_for(&mut client, &chore.id).await?;
+    assert_eq!(after_first.len(), 1, "first drag should create exec");
+    let first_exec_id = after_first[0].id.clone();
+
+    // Second UpdateWorkItem that re-asserts `active` (e.g., a stray
+    // patch from a sibling field). Must not abandon the existing
+    // ready exec or insert a duplicate.
+    let _ = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    let after_second = list_executions_for(&mut client, &chore.id).await?;
+    assert_eq!(
+        after_second.len(),
+        1,
+        "no-op active→active must not create a new execution; got {after_second:?}"
+    );
+    assert_eq!(
+        after_second[0].id, first_exec_id,
+        "original execution must be preserved",
+    );
+
+    Ok(())
+}
+
+async fn list_executions_for(
+    client: &mut BossClient,
+    work_item_id: &str,
+) -> Result<Vec<boss_protocol::WorkExecution>> {
+    match client
+        .send_request(&FrontendRequest::ListExecutions {
+            work_item_id: Some(work_item_id.to_owned()),
+        })
+        .await?
+    {
+        FrontendEvent::ExecutionsList { executions, .. } => Ok(executions),
+        other => Err(anyhow!("unexpected response to ListExecutions: {other:?}")),
+    }
+}
+
 #[tokio::test]
 async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()> {
     // Live-coordinator-session repro: `bossctl workspace summary` was
