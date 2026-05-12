@@ -440,6 +440,31 @@ impl ServerState {
             .agent()
             .ok()
             .and_then(|agent| agent.anthropic_api_key.clone());
+        // One-time startup signal so the missing-API-key case is
+        // immediately visible in engine stderr — the chore calls out
+        // that the summarizer used to drop this silently and the user
+        // wants to confirm it's not the failure mode they're hitting.
+        // Logged at `info` for the happy path so a `grep "live_status:"`
+        // sweep still shows the engine made a decision.
+        if anthropic_api_key.is_some() {
+            tracing::info!(
+                "live_status: ANTHROPIC_API_KEY is configured; summarizer enabled",
+            );
+        } else {
+            tracing::error!(
+                "live_status: ANTHROPIC_API_KEY is NOT configured — \
+                 every summarizer call will return no_api_key and no \
+                 worker will get a live_status sentence. Set it in the \
+                 engine's agent config or via env to enable.",
+            );
+        }
+        // Engine build identity, logged once at startup so the user
+        // can grep `live_status:` and confirm which binary is live.
+        tracing::info!(
+            engine_build_sha = crate::build_info::git_sha(),
+            engine_build_time = crate::build_info::build_time(),
+            "live_status: engine starting (build identity)",
+        );
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
@@ -1988,14 +2013,45 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
 /// arrive before the run has been registered (e.g., the spawn flow
 /// hasn't recorded the slot yet) are silently dropped — once the
 /// registration lands, subsequent events will hit the live entry.
+fn worker_event_kind(event: &crate::protocol::WorkerEvent) -> &'static str {
+    use crate::protocol::WorkerEvent;
+    match event {
+        WorkerEvent::SessionStart { .. } => "session_start",
+        WorkerEvent::UserPromptSubmit { .. } => "user_prompt_submit",
+        WorkerEvent::PreToolUse { .. } => "pre_tool_use",
+        WorkerEvent::PostToolUse { .. } => "post_tool_use",
+        WorkerEvent::Stop { .. } => "stop",
+        WorkerEvent::Notification { .. } => "notification",
+        WorkerEvent::SessionEnd { .. } => "session_end",
+    }
+}
+
 async fn dispatch_live_worker_state(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
+    let event_kind = worker_event_kind(&incoming.event);
+    tracing::info!(
+        run_id = ?incoming.run_id,
+        peer_pid = ?incoming.peer_pid,
+        kind = event_kind,
+        has_transcript_path = incoming.transcript_path.is_some(),
+        "live_status: hook payload arrived at dispatcher",
+    );
     let Some(run_id) = incoming.run_id.as_deref() else {
+        tracing::warn!(
+            kind = event_kind,
+            peer_pid = ?incoming.peer_pid,
+            "live_status: dropping hook — neither _boss_run_id payload nor peer-pid ancestor walk produced a run_id",
+        );
         return;
     };
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        tracing::warn!(
+            run_id,
+            kind = event_kind,
+            "live_status: dropping hook — run_id is not registered against a slot (event ahead of register_run_slot or after take_slot_for_run)",
+        );
         return;
     };
     // Persist the transcript path the moment we see it on a hook
@@ -3941,6 +3997,14 @@ async fn handle_frontend_connection(
                     FrontendEvent::LiveStatusDisabledSlotsList { slot_ids },
                 );
             }
+            FrontendRequest::DebugLiveStatusPipeline => {
+                let report = build_live_status_debug_report(&server_state, &work_db);
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::LiveStatusDebugReportEvent { report },
+                );
+            }
             FrontendRequest::SetProjectDesignDoc { input } => {
                 match work_db.set_project_design_doc(input) {
                     Ok(project) => {
@@ -4021,6 +4085,105 @@ fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u8]) -> Resu
         .join(",");
     work_db.set_metadata(META_LIVE_STATUS_DISABLED_SLOTS, &joined)?;
     Ok(())
+}
+
+/// Build the per-slot diagnostic snapshot the `live-status debug`
+/// verb returns. Reads the manager's debug store, joins with the
+/// per-slot live state (for transcript_path lookup via WorkDb), and
+/// stamps engine-level facts (build SHA, API key presence). No
+/// blocking IO is acceptable here — this verb is called interactively
+/// and must return promptly even when the engine is busy.
+fn build_live_status_debug_report(
+    server_state: &Arc<ServerState>,
+    work_db: &WorkDb,
+) -> boss_protocol::LiveStatusDebugReport {
+    use boss_protocol::{LiveStatusDebugReport, LiveStatusSlotDebug};
+    let manager = &server_state.live_status_manager;
+    let live_states = server_state.live_worker_states.snapshot();
+    let store = manager.debug_store();
+    let store_snapshots = store.snapshot_all();
+    let active_slots = manager.active_slot_ids();
+    let disabled_set: std::collections::HashSet<u8> =
+        manager.disabled_snapshot().into_iter().collect();
+
+    // Union of every slot id we have *any* signal for — live state,
+    // diagnostic snapshot, or active task. Sorted ascending so the
+    // table renderer can walk in order.
+    let mut slot_ids: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    slot_ids.extend(live_states.iter().map(|s| s.slot_id));
+    slot_ids.extend(store_snapshots.keys().copied());
+    slot_ids.extend(active_slots.iter().copied());
+    slot_ids.extend(disabled_set.iter().copied());
+
+    let mut slots: Vec<LiveStatusSlotDebug> = Vec::with_capacity(slot_ids.len());
+    for slot_id in slot_ids {
+        let snap = store_snapshots.get(&slot_id).cloned().unwrap_or_default();
+        let live = live_states.iter().find(|s| s.slot_id == slot_id);
+        // Prefer the live-state run id (always present if there's a
+        // live entry) over the registry walk: a slot whose worker has
+        // just been released will have a snapshot frozen with the
+        // prior run's transcript path, which is more honest than a
+        // None.
+        let transcript_path = snap
+            .transcript_path
+            .clone()
+            .or_else(|| {
+                let run_id = live.map(|s| s.run_id.as_str())?;
+                work_db
+                    .get_run(run_id)
+                    .ok()
+                    .and_then(|r| r.transcript_path)
+            });
+        slots.push(LiveStatusSlotDebug {
+            slot_id,
+            task_running: active_slots.contains(&slot_id),
+            disabled: disabled_set.contains(&slot_id),
+            last_trigger_kind: snap.last_trigger_kind.clone(),
+            last_trigger_at: snap.last_trigger_at_epoch_s.map(format_epoch_iso8601),
+            last_outcome_tag: snap.last_outcome_tag.clone(),
+            last_outcome_detail: snap.last_outcome_detail.clone(),
+            last_outcome_at: snap.last_outcome_at_epoch_s.map(format_epoch_iso8601),
+            last_success_at: snap.last_success_at_epoch_s.map(format_epoch_iso8601),
+            last_success_text: snap.last_success_text.clone(),
+            transcript_path,
+            last_redacted_bytes: snap.last_redacted_bytes.map(|n| n as u64),
+        });
+    }
+
+    LiveStatusDebugReport {
+        engine_build_sha: crate::build_info::git_sha().to_owned(),
+        engine_build_time: crate::build_info::build_time().to_owned(),
+        anthropic_api_key_present: server_state.anthropic_api_key.is_some(),
+        tracked_slot_count: active_slots.len(),
+        disabled_slot_count: disabled_set.len(),
+        slots,
+    }
+}
+
+fn format_epoch_iso8601(epoch_secs: i64) -> String {
+    let days = epoch_secs.div_euclid(86_400);
+    let seconds_in_day = epoch_secs.rem_euclid(86_400);
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let second = seconds_in_day % 60;
+    let (year, month, day) = ymd_from_days_since_1970(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    )
+}
+
+fn ymd_from_days_since_1970(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Read the persisted disabled-slot list from the metadata KV.

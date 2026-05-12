@@ -344,6 +344,12 @@ pub enum FrontendRequest {
     /// summarizer disabled. The UI uses this to render the toggle
     /// state on the Agents-tab worker row.
     ListLiveStatusDisabledSlots,
+    /// One-shot diagnostic snapshot of the live-status pipeline.
+    /// Returns the engine build SHA, ANTHROPIC_API_KEY presence, and
+    /// per-slot detail covering trigger / outcome / transcript path —
+    /// see [`crate::LiveStatusDebugReport`]. Wired through to
+    /// `bossctl live-status debug`. Read-only; no side effects.
+    DebugLiveStatusPipeline,
     /// Set (or clear) a project's design-doc pointer. Persists the
     /// three `projects.design_doc_*` columns per
     /// [`SetProjectDesignDocInput`]'s semantics and replies with the
@@ -624,6 +630,12 @@ pub enum FrontendEvent {
     /// state on the Agents-tab worker row.
     LiveStatusDisabledSlotsList {
         slot_ids: Vec<u8>,
+    },
+    /// One-shot diagnostic snapshot of the live-status pipeline, in
+    /// response to [`FrontendRequest::DebugLiveStatusPipeline`]. The
+    /// full shape is documented on [`crate::LiveStatusDebugReport`].
+    LiveStatusDebugReportEvent {
+        report: crate::LiveStatusDebugReport,
     },
     /// Response to [`FrontendRequest::ResolveProjectDesignDoc`]: the
     /// resolved pointer state for a single project. Carried inline

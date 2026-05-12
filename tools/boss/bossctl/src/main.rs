@@ -17,8 +17,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, LiveWorkerState, RequestExecutionInput, ROSTER, WorkExecution,
-    WorkRun, WorkspacePoolEntry,
+    FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState,
+    RequestExecutionInput, ROSTER, WorkExecution, WorkRun, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -72,6 +72,19 @@ enum Command {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
+    /// Diagnose the live-status pipeline (engine build SHA, API key
+    /// presence, per-slot trigger/outcome/transcript-path detail).
+    /// Read-only; no side effects on the engine.
+    LiveStatus {
+        #[command(subcommand)]
+        action: LiveStatusAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LiveStatusAction {
+    /// One-shot snapshot of the live-status pipeline.
+    Debug,
 }
 
 #[derive(Subcommand, Debug)]
@@ -240,6 +253,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Workspace {
             action: WorkspaceAction::Summary,
         } => workspace_summary(&cli.socket_path, cli.json).await,
+        Command::LiveStatus {
+            action: LiveStatusAction::Debug,
+        } => live_status_debug(&cli.socket_path, cli.json).await,
         // Any remaining verbs that need engine surfaces that don't
         // exist yet print a structured "not_implemented" so the Boss
         // session can call them and see exactly which ones are
@@ -1005,7 +1021,102 @@ fn describe_verb(command: &Command) -> String {
         Command::Workspace { action } => match action {
             WorkspaceAction::Summary => "workspace summary".into(),
         },
+        Command::LiveStatus { action } => match action {
+            LiveStatusAction::Debug => "live-status debug".into(),
+        },
     }
+}
+
+/// One-shot diagnostic snapshot of the live-status pipeline. Mirrors
+/// the chore acceptance criteria: per-slot picture (task running,
+/// disabled flag, last trigger, last summarizer outcome, last
+/// successful summary, current transcript path) plus engine build
+/// SHA + ANTHROPIC_API_KEY presence.
+async fn live_status_debug(socket_path: &Option<String>, json: bool) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::DebugLiveStatusPipeline)
+        .await
+        .context("sending DebugLiveStatusPipeline")?;
+    let report = match response {
+        FrontendEvent::LiveStatusDebugReportEvent { report } => report,
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected live-status debug: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("LiveStatusDebugReport serializes"),
+        );
+    } else {
+        print_live_status_debug_human(&report);
+    }
+    Ok(())
+}
+
+fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
+    println!("live-status pipeline debug");
+    println!("  engine_build_sha:           {}", report.engine_build_sha);
+    println!("  engine_build_time:          {}", report.engine_build_time);
+    println!(
+        "  anthropic_api_key_present:  {}",
+        if report.anthropic_api_key_present { "yes" } else { "NO (summarizer cannot succeed)" },
+    );
+    println!("  tracked_slots:              {}", report.tracked_slot_count);
+    println!("  disabled_slots:             {}", report.disabled_slot_count);
+    if report.slots.is_empty() {
+        println!("  (no slots tracked)");
+        return;
+    }
+    println!();
+    for slot in &report.slots {
+        print_live_status_slot_debug(slot);
+    }
+}
+
+fn print_live_status_slot_debug(slot: &LiveStatusSlotDebug) {
+    println!("slot {}", slot.slot_id);
+    println!(
+        "  task_running:        {}",
+        if slot.task_running { "yes" } else { "no (notifies will drop)" },
+    );
+    println!(
+        "  disabled:            {}",
+        if slot.disabled { "yes" } else { "no" },
+    );
+    println!(
+        "  transcript_path:     {}",
+        slot.transcript_path.as_deref().unwrap_or("(unset — work_runs.transcript_path is NULL)"),
+    );
+    match (&slot.last_trigger_kind, &slot.last_trigger_at) {
+        (Some(kind), Some(at)) => {
+            println!("  last_trigger:        {kind} @ {at}");
+        }
+        _ => println!("  last_trigger:        (none yet)"),
+    }
+    match (&slot.last_outcome_tag, &slot.last_outcome_at) {
+        (Some(tag), Some(at)) => {
+            println!("  last_outcome:        {tag} @ {at}");
+            if let Some(detail) = &slot.last_outcome_detail {
+                println!("    detail:            {detail}");
+            }
+        }
+        _ => println!("  last_outcome:        (no summarizer attempt yet)"),
+    }
+    match (&slot.last_success_at, &slot.last_success_text) {
+        (Some(at), Some(text)) => {
+            println!("  last_success:        {at}");
+            println!("    text:              {text}");
+        }
+        _ => println!("  last_success:        (no successful summary yet)"),
+    }
+    if let Some(bytes) = slot.last_redacted_bytes {
+        println!("  last_redacted_bytes: {bytes}");
+    }
+    println!();
 }
 
 #[cfg(test)]
@@ -1104,5 +1215,42 @@ mod tests {
         assert!(looks_like_name_or_slot("La Forge"));
         assert!(looks_like_name_or_slot("3"));
         assert!(!looks_like_name_or_slot("exec_18ad6336fedcb190_12"));
+    }
+
+    /// Re-assert PR #340's invariant at the *bossctl* boundary — the
+    /// path the user's `agents list --json` actually flows through.
+    /// The protocol crate has its own test; this one catches a future
+    /// refactor that swaps the wire shape (or wraps it in a struct
+    /// that re-derives the serialization without `#[serde(default)]`).
+    /// The chore description specifically called out that the running
+    /// engine's output on the user's machine did not include these
+    /// keys.
+    #[test]
+    fn live_state_json_always_includes_live_status_keys_at_bossctl_boundary() {
+        // `agents list --json` uses `serde_json::json!({...})` to
+        // wrap a Vec<LiveWorkerState> — exercise the same wrapper.
+        let states = vec![live(7, "exec_dead")];
+        let payload = serde_json::json!({ "live_worker_states": states });
+        let text = serde_json::to_string(&payload).unwrap();
+        assert!(
+            text.contains("\"live_status\":null"),
+            "missing live_status key in bossctl serialization: {text}"
+        );
+        assert!(
+            text.contains("\"live_status_at\":null"),
+            "missing live_status_at key in bossctl serialization: {text}"
+        );
+
+        // `agents status <name>` uses `print_live_state` which
+        // serializes a single state directly. Pin that path too.
+        let single = serde_json::to_string(&states[0]).unwrap();
+        assert!(
+            single.contains("\"live_status\":null"),
+            "missing live_status key in single-state serialization: {single}"
+        );
+        assert!(
+            single.contains("\"live_status_at\":null"),
+            "missing live_status_at key in single-state serialization: {single}"
+        );
     }
 }

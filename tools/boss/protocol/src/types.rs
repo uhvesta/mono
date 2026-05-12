@@ -1005,28 +1005,13 @@ mod tests {
         assert_eq!(output, back);
     }
 
-    fn sample_task_json(extra: Value) -> Value {
-        let mut base = json!({
-            "id": "task_1",
-            "product_id": "prod_1",
-            "project_id": null,
-            "kind": "chore",
-            "name": "Demo",
-            "description": "",
-            "status": "todo",
-            "ordinal": null,
-            "pr_url": null,
-            "deleted_at": null,
-            "created_at": "1747000000",
-            "updated_at": "1747000000",
-        });
-        if let (Value::Object(target), Value::Object(extra)) = (&mut base, extra) {
-            for (k, v) in extra {
-                target.insert(k, v);
-            }
-        }
-        base
-    }
+    // Note: `sample_task_json` is defined earlier in this test module;
+    // the duplicate that previously sat here was a merge-resolution
+    // leftover that broke `cargo test -p boss-protocol`. The helper
+    // above carries the same field set; the timestamp shape change is
+    // harmless because Task's serde fields accept any string for the
+    // ISO-8601 columns. See the diagnostics PR description for why
+    // this one-line cleanup is bundled with the live_status work.
 
     #[test]
     fn task_decodes_without_blocked_fields() {
