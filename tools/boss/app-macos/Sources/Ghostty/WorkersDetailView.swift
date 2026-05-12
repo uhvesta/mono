@@ -148,10 +148,7 @@ private struct WorkerSlotView: View {
             }
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(WorkerNames.name(forSlot: slot.slotId))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                slotTaskLine
 
                 slotSubtitle
             }
@@ -222,16 +219,40 @@ private struct WorkerSlotView: View {
         return "\(base) · idle"
     }
 
-    /// Second line in the titlebar. When the engine has a live-status
-    /// sentence for this slot — refreshed by the summarizer in
-    /// `engine/src/live_status.rs` — that's the most informative
-    /// thing to surface, so it wins. Otherwise we fall back to the
-    /// static pane_summary gerund phrase ("Riker is fixing the
-    /// fencer scraper"), then to the run id, then to "idle". The
-    /// two summary shapes have different grammatical contracts on
-    /// purpose: live status is a full sentence rendered raw,
-    /// pane_summary is a verb phrase rendered with the `"<Name> is
-    /// "` prefix.
+    /// First line in the titlebar — the overall task this worker is
+    /// on, in gerund form, with the worker name as subject. Stable
+    /// for the duration of a run (sourced from
+    /// `engine/src/pane_summary.rs`, which caches a Claude-generated
+    /// gerund phrase per work item). For an idle slot or while the
+    /// engine hasn't shipped a summary yet, falls back to the bare
+    /// worker name (active run) or just the name (idle) — never
+    /// empty, never grammatically broken.
+    @ViewBuilder
+    private var slotTaskLine: some View {
+        let name = WorkerNames.name(forSlot: slot.slotId)
+        let text: String = {
+            if let summary = slot.summary, !summary.isEmpty {
+                return "\(name) is \(summary)"
+            }
+            if slot.runId != nil {
+                return "\(name) is working"
+            }
+            return name
+        }()
+        Text(text)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .help(slot.runId ?? "")
+    }
+
+    /// Second line in the titlebar — the engine's real-time
+    /// live-status sentence (refreshed by the summarizer in
+    /// `engine/src/live_status.rs`). When no live status is
+    /// available we fall through to the run id and then to "idle"
+    /// so the line still anchors the pane visually. The static
+    /// pane-summary gerund is rendered on the first line via
+    /// `slotTaskLine` and intentionally not duplicated here.
     @ViewBuilder
     private var slotSubtitle: some View {
         if let live = liveState?.liveStatus,
@@ -243,12 +264,6 @@ private struct WorkerSlotView: View {
                 .lineLimit(1)
                 .help(slot.runId ?? "")
                 .accessibilityLabel("Live status: \(live)")
-        } else if let summary = slot.summary, !summary.isEmpty {
-            Text("\(WorkerNames.name(forSlot: slot.slotId)) is \(summary)")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .help(slot.runId ?? "")
         } else if let runId = slot.runId {
             Text(runId)
                 .font(.caption2)
