@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis::ConflictDiagnosis;
 use crate::coordinator::slot_id_from_worker_id;
+use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
@@ -71,6 +72,15 @@ pub struct RunOutcome {
     /// means the runner doesn't have a pane (e.g., a test fake);
     /// the coordinator leaves agent_id alone.
     pub slot_id: Option<u8>,
+    /// Resolved per-execution effort + model knobs the runner used
+    /// to construct the worker's `claude` invocation. The coordinator
+    /// surfaces this on the `pane_spawned` dispatch event so
+    /// `bossctl dispatch diagnose <exec-id>` shows what model and
+    /// effort value the worker actually launched with — design §Q2:
+    /// "surfaces the chosen model, effort value, and level on the
+    /// dispatch instrumentation stream." `None` for fake runners that
+    /// don't go through the spawn-config resolver.
+    pub spawn_config: Option<SpawnConfig>,
 }
 
 #[async_trait]
@@ -269,6 +279,42 @@ impl ExecutionRunner for PaneSpawnRunner {
             cube_change_id,
             conflict_attempt.as_ref(),
         );
+
+        // Resolve the per-execution effort + model knobs (design §Q3
+        // precedence). Read both columns off the row, the parent
+        // product's `default_model`, and let the resolver pick the
+        // first non-empty value. The resolver also derives the
+        // `--effort` value and the optional prompt addendum from the
+        // row's `effort_level` (model_override never changes those —
+        // design §Q3).
+        let (row_effort, row_model_override, product_default_model) = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => {
+                let product_default = self
+                    .work_db
+                    .get_product(&task.product_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.default_model);
+                (task.effort_level, task.model_override.clone(), product_default)
+            }
+            _ => (None, None, None),
+        };
+        let spawn_config = resolve_spawn_config(
+            row_effort,
+            row_model_override.as_deref(),
+            product_default_model.as_deref(),
+        );
+
+        // Per-level prompt addendum lands at the very top of the file
+        // (design §Q2: "concatenated to .claude/initial-prompt.txt
+        // BEFORE the existing prompt body"). The existing task /
+        // design / conflict-resolution framing must stay byte-identical
+        // when the addendum is `None`.
+        let prompt_text = match spawn_config.prompt_addendum {
+            Some(addendum) => format!("{}\n\n{}", addendum, prompt_text),
+            None => prompt_text,
+        };
+
         let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
         if let Some(parent) = prompt_path.parent() {
             std::fs::create_dir_all(parent)
@@ -276,7 +322,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
         std::fs::write(&prompt_path, &prompt_text)
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
-        let initial_input = "claude \"$(cat .claude/initial-prompt.txt)\"\n".to_owned();
+        let initial_input = spawn_config.claude_invocation();
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for
         // this work item. The full run id is still used for logs and
@@ -322,6 +368,12 @@ impl ExecutionRunner for PaneSpawnRunner {
             execution_id = %execution.id,
             slot_id = started.slot_id,
             shell_pid = started.shell_pid,
+            effort_level = spawn_config
+                .effort_level
+                .map(|level| level.as_str())
+                .unwrap_or("none"),
+            claude_effort = spawn_config.claude_effort.unwrap_or("default"),
+            model = %spawn_config.model,
             "pane spawned for execution",
         );
 
@@ -333,6 +385,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             )),
             attention: None,
             slot_id: Some(started.slot_id),
+            spawn_config: Some(spawn_config),
         })
     }
 }
@@ -973,7 +1026,8 @@ mod pane_spawn_tests {
     };
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::work::{
-        CreateProductInput, CreateProjectInput, CreateTaskInput, Task, WorkExecution, WorkItem,
+        CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, EffortLevel,
+        Task, WorkExecution, WorkItem,
     };
     use crate::worker_registry::WorkerRegistry;
     use std::sync::Mutex as StdMutex;
@@ -1190,6 +1244,398 @@ mod pane_spawn_tests {
             "expected initial_input to invoke claude, got: {:?}",
             input.initial_input
         );
+    }
+
+    /// Build a runner driven against a real product + chore row so
+    /// the dispatcher's effort/model lookup hits actual SQLite rather
+    /// than the synthetic `sample_chore` fixture. Returns the spawner
+    /// and the created chore id so the caller can re-use the row.
+    async fn run_once_with_chore(
+        workspace: &TempDir,
+        chore_input: CreateChoreInput,
+        product_default_model: Option<&str>,
+    ) -> Result<(Arc<CapturingSpawner>, Task)> {
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+            })
+            .unwrap();
+        if let Some(model) = product_default_model {
+            work_db
+                .set_product_default_model(&product.id, Some(model))
+                .unwrap();
+        }
+        let mut chore_input = chore_input;
+        chore_input.product_id = product.id.clone();
+        let chore = work_db.create_chore(chore_input).unwrap();
+
+        let runner = PaneSpawnRunner::new(cfg, work_db);
+        runner.set_server_state(weak);
+
+        let mut execution = sample_execution(workspace.path());
+        execution.work_item_id = chore.id.clone();
+
+        runner
+            .run_execution(
+                "worker-1",
+                &execution,
+                &WorkItem::Chore(chore.clone()),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await?;
+
+        Ok((spawner, chore))
+    }
+
+    /// Untagged row (NULL effort_level, NULL model_override, no
+    /// product default) must produce the same spawn line today's
+    /// engine produces — minus the implicit `claude` model selection,
+    /// plus an explicit `--model <engine-default-slug>`. No
+    /// `--effort` flag, no prompt addendum. Design §Q2 / task spec
+    /// regression test: "byte-equivalent to today's `claude
+    /// "$(cat .claude/initial-prompt.txt)"` plus the explicit
+    /// `--model <engine-default-slug>`."
+    #[tokio::test]
+    async fn untagged_row_spawn_matches_engine_default() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput {
+            product_id: String::new(),
+            name: "Untagged chore".to_owned(),
+            description: Some("plain row, no effort/model".to_owned()),
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+        };
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
+        let input = spawner.spawn_input();
+
+        assert_eq!(
+            input.initial_input,
+            format!(
+                "claude --model {} \"$(cat .claude/initial-prompt.txt)\"\n",
+                crate::effort::ENGINE_DEFAULT_MODEL
+            ),
+            "untagged row should spawn with the engine default model and no --effort",
+        );
+
+        // No addendum prepended — the existing implementation framing
+        // must be the first thing the worker sees.
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+        assert!(
+            prompt.starts_with("You are a reusable Boss worker"),
+            "untagged-row prompt must start with the original framing, got: {prompt:?}",
+        );
+        assert!(
+            !prompt.contains("Sketch a brief plan"),
+            "untagged-row prompt must not carry the medium addendum",
+        );
+        assert!(
+            !prompt.starts_with("Begin with a written plan"),
+            "untagged-row prompt must not carry the large/max addendum",
+        );
+    }
+
+    /// Smoke test for the design-spec acceptance criterion: a
+    /// `trivial` row dispatches with `--model claude-haiku-4-5-20251001
+    /// --effort low` and no prompt addendum.
+    #[tokio::test]
+    async fn trivial_row_spawn_uses_haiku_at_low_effort() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput {
+            product_id: String::new(),
+            name: "Apply resize-cursor fix to nav divider".to_owned(),
+            description: Some("one-line CSS tweak".to_owned()),
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: Some(EffortLevel::Trivial),
+            model_override: None,
+        };
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
+        let input = spawner.spawn_input();
+
+        assert!(
+            input
+                .initial_input
+                .contains("--model claude-haiku-4-5-20251001"),
+            "trivial row must spawn Haiku, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--effort low"),
+            "trivial row must pass --effort low, got: {:?}",
+            input.initial_input,
+        );
+
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+        assert!(
+            !prompt.starts_with("Sketch") && !prompt.starts_with("Begin with"),
+            "trivial row prompt must have no addendum prepended, got: {prompt:?}",
+        );
+    }
+
+    /// Smoke test for the second design-spec acceptance criterion:
+    /// `medium` + explicit `model_override = 'opus'` spawns `--model
+    /// opus --effort high`, and the medium prompt addendum is
+    /// prepended verbatim. Verifies that `model_override` changes only
+    /// the model — the effort value and addendum still follow the
+    /// row's `effort_level` (design §Q3).
+    #[tokio::test]
+    async fn medium_with_opus_override_uses_override_model_and_medium_addendum() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput {
+            product_id: String::new(),
+            name: "Add created_via provenance to chore/task creates".to_owned(),
+            description: Some("multi-file edit with judgement calls".to_owned()),
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: Some(EffortLevel::Medium),
+            model_override: Some("opus".to_owned()),
+        };
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
+        let input = spawner.spawn_input();
+
+        assert!(
+            input.initial_input.contains("--model opus"),
+            "model_override should win precedence, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--effort high"),
+            "medium effort_level must still produce --effort high, got: {:?}",
+            input.initial_input,
+        );
+
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+        assert!(
+            prompt.starts_with("Sketch a brief plan before you start editing."),
+            "medium addendum must be prepended verbatim, got: {prompt:?}",
+        );
+    }
+
+    /// Large rows get Opus at `xhigh` plus the planning-heavy
+    /// addendum. Confirms the third level boundary the design pins.
+    #[tokio::test]
+    async fn large_row_spawn_uses_opus_at_xhigh_with_planning_addendum() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput {
+            product_id: String::new(),
+            name: "Investigate isolated test instance".to_owned(),
+            description: Some("multi-subsystem investigation".to_owned()),
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: Some(EffortLevel::Large),
+            model_override: None,
+        };
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
+        let input = spawner.spawn_input();
+
+        assert!(
+            input.initial_input.contains("--model claude-opus-4-7"),
+            "large row must spawn Opus, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--effort xhigh"),
+            "large row must pass --effort xhigh, got: {:?}",
+            input.initial_input,
+        );
+
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+        assert!(
+            prompt.starts_with("Begin with a written plan."),
+            "large addendum must be prepended verbatim, got: {prompt:?}",
+        );
+    }
+
+    /// `products.default_model` only kicks in when both
+    /// `model_override` and `effort_level` are unset (design §Q3
+    /// step 3). With a product default in place but no effort tag,
+    /// the dispatch should pick the product slug rather than the
+    /// engine default — and still omit `--effort`.
+    #[tokio::test]
+    async fn product_default_model_fills_in_when_row_is_untagged() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput {
+            product_id: String::new(),
+            name: "Untagged on Sonnet-defaulted product".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+        };
+        let (spawner, _chore) =
+            run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
+                .await
+                .unwrap();
+        let input = spawner.spawn_input();
+
+        assert!(
+            input.initial_input.contains("--model claude-sonnet-4-6"),
+            "product default_model should fill in, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            !input.initial_input.contains("--effort"),
+            "untagged row must not pass --effort, got: {:?}",
+            input.initial_input,
+        );
+    }
+
+    /// The runner must return the resolved spawn config on
+    /// `RunOutcome.spawn_config` so the coordinator can attach it to
+    /// the `pane_spawned` dispatch event. Drives `run_execution`
+    /// directly (rather than through `run_once_with_chore`, which
+    /// drops the outcome) so the returned tuple is observable.
+    #[tokio::test]
+    async fn run_outcome_carries_resolved_spawn_config() {
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+            })
+            .unwrap();
+        let chore = work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Trivial chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: Some(EffortLevel::Trivial),
+                model_override: None,
+            })
+            .unwrap();
+
+        let runner = PaneSpawnRunner::new(cfg, work_db);
+        runner.set_server_state(weak);
+
+        let mut execution = sample_execution(workspace.path());
+        execution.work_item_id = chore.id.clone();
+
+        let outcome = runner
+            .run_execution(
+                "worker-1",
+                &execution,
+                &WorkItem::Chore(chore),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await
+            .unwrap();
+
+        let spawn = outcome
+            .spawn_config
+            .expect("PaneSpawnRunner should always populate spawn_config");
+        assert_eq!(spawn.effort_level, Some(EffortLevel::Trivial));
+        assert_eq!(spawn.claude_effort, Some("low"));
+        assert_eq!(spawn.model, "claude-haiku-4-5-20251001");
+        assert_eq!(spawn.prompt_addendum, None);
+    }
+
+    /// **No env vars related to effort or token caps appear on the
+    /// worker subprocess.** Design §Q2 §"Knobs explicitly not in v1"
+    /// rejects `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, `MAX_THINKING_TOKENS`,
+    /// and any per-execution token cap explicitly — claude's
+    /// `--effort` is the canonical control. Locks the rule in via the
+    /// captured spawn env.
+    #[tokio::test]
+    async fn spawn_env_does_not_carry_effort_or_token_cap_env_vars() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput {
+            product_id: String::new(),
+            name: "Any chore".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: Some(EffortLevel::Large),
+            model_override: None,
+        };
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
+        let input = spawner.spawn_input();
+
+        // The forbidden list from design §Q2 plus the obvious
+        // adjacents an over-eager future patch might add.
+        for forbidden in [
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+            "MAX_THINKING_TOKENS",
+            "ANTHROPIC_MAX_TOKENS",
+            "BOSS_EFFORT_LEVEL",
+            "CLAUDE_EFFORT",
+        ] {
+            assert!(
+                !input.env.iter().any(|EnvVar { key, .. }| key == forbidden),
+                "env must not carry {forbidden} (design §Q2 forbids token-cap env knobs)",
+            );
+        }
     }
 
     #[tokio::test]

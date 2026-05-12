@@ -1633,6 +1633,15 @@ impl ExecutionCoordinator {
 
         match run_outcome {
             Ok(outcome) => {
+                // Capture the resolved spawn knobs (effort level,
+                // claude effort value, model) before `outcome` moves
+                // into `record_run_completion` — they ride along on
+                // the `pane_spawned` dispatch event below so a
+                // diagnose verb can answer "what did the worker
+                // actually launch with" without scraping process
+                // argv. `None` from test fake runners that don't go
+                // through `effort::resolve_spawn_config`.
+                let spawn_config_for_event = outcome.spawn_config.clone();
                 // If the runner allocated a real pane slot for this
                 // run, stamp it onto the run record's agent_id so
                 // `bossctl agents list` and related views show one
@@ -1673,7 +1682,23 @@ impl ExecutionCoordinator {
                 // Successful spawn → emit a structured `pane_spawned`
                 // event so consumers can pair it with the
                 // `cube_workspace_leased` event that preceded it and
-                // see the full timeline.
+                // see the full timeline. The `spawn_config` details
+                // carry the effort + model tuple the dispatcher just
+                // resolved — design §Q2 calls this out explicitly so
+                // `bossctl dispatch diagnose <exec-id>` can answer
+                // "which model / effort did this worker actually
+                // launch with."
+                let mut details = serde_json::json!({
+                    "run_id": run.id,
+                });
+                if let Some(spawn) = spawn_config_for_event {
+                    details["spawn_config"] = serde_json::json!({
+                        "effort_level": spawn.effort_level.map(|level| level.as_str()),
+                        "claude_effort": spawn.claude_effort,
+                        "model": spawn.model,
+                        "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
+                    });
+                }
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Ok, &execution.id)
@@ -1681,9 +1706,7 @@ impl ExecutionCoordinator {
                             .with_worker(&worker_id)
                             .with_cube_lease(&lease.lease_id)
                             .with_cube_workspace(&lease.workspace_id)
-                            .with_details(serde_json::json!({
-                                "run_id": run.id,
-                            })),
+                            .with_details(details),
                     )
                     .await;
             }
@@ -2156,6 +2179,12 @@ mod tests {
         /// coordinator stamps the slot-based agent_id onto the run
         /// record.
         slot_id: Option<u8>,
+        /// Resolved spawn knobs the fake runner reports back. `None`
+        /// matches the default fake-runner contract (no effort/model
+        /// resolution happened). Production `PaneSpawnRunner` always
+        /// fills this in — tests that want to assert on the
+        /// dispatcher's effort/model surfacing set it explicitly.
+        spawn_config: Option<crate::effort::SpawnConfig>,
     }
 
     impl Default for FakeExecutionRunner {
@@ -2165,6 +2194,7 @@ mod tests {
                 fail: false,
                 pending: false,
                 slot_id: None,
+                spawn_config: None,
             }
         }
     }
@@ -2201,6 +2231,7 @@ mod tests {
                     body_markdown: format!("Review {}", test_work_item_name(work_item)),
                 }),
                 slot_id: self.slot_id,
+                spawn_config: self.spawn_config.clone(),
             })
         }
     }
@@ -2957,6 +2988,82 @@ mod tests {
                 "stage `{expected}` missing from dispatch timeline; got {stages:?}",
             );
         }
+    }
+
+    /// The `pane_spawned: ok` event must carry the resolved spawn
+    /// knobs (effort level, claude effort value, model) so
+    /// `bossctl dispatch diagnose <exec-id>` can answer "what did
+    /// this worker actually launch with" — design §Q2 ("surfaces the
+    /// chosen model, effort value, and level on the dispatch
+    /// instrumentation stream"). The fake runner reports a synthetic
+    /// `SpawnConfig`; this test pins that the coordinator forwards
+    /// it into the event's `details.spawn_config` field.
+    #[tokio::test]
+    async fn pane_spawned_event_carries_spawn_config_details() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Trivial chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: Some(crate::work::EffortLevel::Trivial),
+                model_override: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            slot_id: Some(1),
+            spawn_config: Some(crate::effort::SpawnConfig {
+                effort_level: Some(crate::work::EffortLevel::Trivial),
+                claude_effort: Some("low"),
+                model: "claude-haiku-4-5-20251001".to_owned(),
+                prompt_addendum: None,
+            }),
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner)
+                .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+
+        let events = recording.events_for(&execution_id).await;
+        let pane_event = events
+            .iter()
+            .find(|event| event.stage == "pane_spawned" && event.outcome == "ok")
+            .unwrap_or_else(|| {
+                panic!("expected pane_spawned:ok event for {execution_id}; got {events:#?}")
+            });
+        let spawn = pane_event
+            .details
+            .get("spawn_config")
+            .unwrap_or_else(|| {
+                panic!(
+                    "pane_spawned event missing spawn_config in details: {:?}",
+                    pane_event.details
+                )
+            });
+        assert_eq!(spawn["effort_level"], "trivial");
+        assert_eq!(spawn["claude_effort"], "low");
+        assert_eq!(spawn["model"], "claude-haiku-4-5-20251001");
+        assert_eq!(spawn["prompt_addendum_applied"], false);
     }
 
     /// Cube lease failures also need the loud-failure contract: a

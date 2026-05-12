@@ -571,6 +571,17 @@ impl WorkDb {
         query_project(&conn, id)?.with_context(|| format!("unknown project: {id}"))
     }
 
+    /// Fetch a single product row by id. Returns `None` when no row
+    /// matches so the dispatcher can fall through the design's Q3
+    /// precedence (product default → engine default) without
+    /// distinguishing "no product default set" from "the row's
+    /// product id doesn't resolve" — both produce the same engine
+    /// fall-through behaviour for the spawn config resolver.
+    pub fn get_product(&self, id: &str) -> Result<Option<Product>> {
+        let conn = self.connect()?;
+        query_product(&conn, id)
+    }
+
     /// Set (or clear) a product's `default_model` per the
     /// effort-and-model-estimation design (PR #370). `model = None`
     /// or `Some("")` clears the column; any other slug is stored
