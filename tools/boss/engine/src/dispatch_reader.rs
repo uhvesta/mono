@@ -31,6 +31,50 @@ use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
 
+/// Per-stage stalled-detection thresholds. The watchdog used to apply
+/// a single global threshold to every stage, but the cube-lease
+/// hang incident (`exec_18aec07893bd2e30_29`, 2026-05-12) showed that
+/// a 120s default is too coarse for the early dispatch stages — the
+/// engine had wedged in `worker_claimed` for 46 seconds without any
+/// `stage_stalled` event firing, because the global threshold hadn't
+/// elapsed yet. Per-stage overrides let us flag the early handoffs
+/// (worker_claimed → cube_repo_ensured → cube_workspace_leased)
+/// faster while keeping the longer pane-spawn stages on a generous
+/// threshold.
+#[derive(Debug, Clone)]
+pub struct StageThresholds {
+    default_ms: u128,
+    overrides: BTreeMap<String, u128>,
+}
+
+impl StageThresholds {
+    pub fn new(default: Duration) -> Self {
+        Self {
+            default_ms: default.as_millis(),
+            overrides: BTreeMap::new(),
+        }
+    }
+
+    /// Override the threshold for a specific stage. Pass the wire
+    /// stage name (e.g. `"worker_claimed"`) — the watchdog matches
+    /// against `DispatchEvent::stage`.
+    pub fn with_override(mut self, stage: impl Into<String>, threshold: Duration) -> Self {
+        self.overrides.insert(stage.into(), threshold.as_millis());
+        self
+    }
+
+    pub fn for_stage(&self, stage: &str) -> u128 {
+        self.overrides
+            .get(stage)
+            .copied()
+            .unwrap_or(self.default_ms)
+    }
+
+    pub fn default_ms(&self) -> u128 {
+        self.default_ms
+    }
+}
+
 /// Default Boss state root used by the file-scan readers when the
 /// caller didn't override it. Mirrors the writer's default (see
 /// [`crate::dispatch_events::JsonlFileSink`] callers in `app.rs`).
@@ -249,14 +293,14 @@ pub struct StalledStage {
 /// Walk every per-execution mirror under `root` and return the
 /// stalls that haven't yet been surfaced. An execution is stalled
 /// when its last "real" stage event (any non-`stage_stalled` event)
-/// is non-terminal AND older than `threshold_ms`. To avoid duplicate
-/// `stage_stalled` lines for the same wedge, we skip executions whose
-/// timeline already contains a `stage_stalled` line referencing the
-/// current stalled stage.
+/// is non-terminal AND older than the per-stage threshold from
+/// `thresholds`. To avoid duplicate `stage_stalled` lines for the
+/// same wedge, we skip executions whose timeline already contains a
+/// `stage_stalled` line referencing the current stalled stage.
 pub fn pending_stalls(
     root: &Path,
     now_ms: u128,
-    threshold_ms: u128,
+    thresholds: &StageThresholds,
 ) -> Result<Vec<StalledStage>> {
     let executions_dir = root.join("executions");
     let read_dir = match fs::read_dir(&executions_dir) {
@@ -283,7 +327,7 @@ pub fn pending_stalls(
         }
         let events = read_jsonl(&dispatch_path)?;
         let Some(stall) =
-            stall_to_emit_for(execution_id, &events, now_ms, threshold_ms)
+            stall_to_emit_for(execution_id, &events, now_ms, thresholds)
         else {
             continue;
         };
@@ -313,14 +357,14 @@ pub fn build_stalled_event(stall: &StalledStage) -> DispatchEvent {
 /// [`spawn_stage_stalled_detector`].
 pub async fn run_stage_stalled_pass(
     root: &Path,
-    threshold_ms: u128,
+    thresholds: &StageThresholds,
     sink: &dyn DispatchEventSink,
 ) -> Result<usize> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let stalls = pending_stalls(root, now_ms, threshold_ms)?;
+    let stalls = pending_stalls(root, now_ms, thresholds)?;
     let count = stalls.len();
     for stall in stalls {
         sink.emit(build_stalled_event(&stall)).await;
@@ -334,7 +378,7 @@ pub async fn run_stage_stalled_pass(
 pub fn spawn_stage_stalled_detector(
     root: PathBuf,
     sink: Arc<dyn DispatchEventSink>,
-    threshold: Duration,
+    thresholds: StageThresholds,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -342,12 +386,11 @@ pub fn spawn_stage_stalled_detector(
         // sweep while the rest of init is still running.
         tokio::time::sleep(interval).await;
         loop {
-            let threshold_ms = threshold.as_millis();
-            match run_stage_stalled_pass(&root, threshold_ms, sink.as_ref()).await {
+            match run_stage_stalled_pass(&root, &thresholds, sink.as_ref()).await {
                 Ok(emitted) if emitted > 0 => {
                     tracing::info!(
                         emitted,
-                        threshold_ms = threshold_ms as u64,
+                        default_threshold_ms = thresholds.default_ms() as u64,
                         "stage_stalled detector: emitted events",
                     );
                 }
@@ -369,13 +412,14 @@ fn stall_to_emit_for(
     execution_id: &str,
     events: &[DispatchEvent],
     now_ms: u128,
-    threshold_ms: u128,
+    thresholds: &StageThresholds,
 ) -> Option<StalledStage> {
     let last_real = events.iter().rev().find(|e| e.stage != "stage_stalled")?;
     if is_terminal_event(last_real) {
         return None;
     }
     let elapsed = now_ms.saturating_sub(last_real.ts_epoch_ms);
+    let threshold_ms = thresholds.for_stage(&last_real.stage);
     if elapsed < threshold_ms {
         return None;
     }
@@ -583,6 +627,10 @@ mod tests {
         assert_eq!(durations, vec![150, 0]);
     }
 
+    fn flat_thresholds(ms: u64) -> StageThresholds {
+        StageThresholds::new(Duration::from_millis(ms))
+    }
+
     #[tokio::test]
     async fn pending_stalls_emits_when_threshold_passed_and_no_prior_flag() {
         let dir = TempDir::new().unwrap();
@@ -596,7 +644,7 @@ mod tests {
         b.ts_epoch_ms = 1_000;
         write(&sink, b).await;
 
-        let stalls = pending_stalls(dir.path(), 10_000, 5_000).unwrap();
+        let stalls = pending_stalls(dir.path(), 10_000, &flat_thresholds(5_000)).unwrap();
         assert_eq!(stalls.len(), 1);
         assert_eq!(stalls[0].execution_id, "exec-stuck");
         assert_eq!(stalls[0].stalled_stage, "cube_change_created");
@@ -612,7 +660,7 @@ mod tests {
         a.ts_epoch_ms = 1_000;
         write(&sink, a).await;
 
-        let stalls = pending_stalls(dir.path(), 9_999_999, 5_000).unwrap();
+        let stalls = pending_stalls(dir.path(), 9_999_999, &flat_thresholds(5_000)).unwrap();
         assert!(stalls.is_empty());
     }
 
@@ -633,7 +681,7 @@ mod tests {
         });
         write(&sink, flag).await;
 
-        let stalls = pending_stalls(dir.path(), 10_000, 5_000).unwrap();
+        let stalls = pending_stalls(dir.path(), 10_000, &flat_thresholds(5_000)).unwrap();
         assert!(stalls.is_empty(), "got {stalls:?}");
     }
 
@@ -661,9 +709,45 @@ mod tests {
         write(&sink, b).await;
 
         // At now=15s the new stage has been stuck for 8s.
-        let stalls = pending_stalls(dir.path(), 15_000, 5_000).unwrap();
+        let stalls = pending_stalls(dir.path(), 15_000, &flat_thresholds(5_000)).unwrap();
         assert_eq!(stalls.len(), 1);
         assert_eq!(stalls[0].stalled_stage, "cube_change_created");
+    }
+
+    #[tokio::test]
+    async fn pending_stalls_honours_per_stage_threshold_overrides() {
+        let dir = TempDir::new().unwrap();
+        let sink = JsonlFileSink::new(dir.path());
+
+        // worker_claimed at t=0, now=35_000 → 35s in stage. Default
+        // threshold is 120s (would NOT fire), but worker_claimed has
+        // a 30s override → should fire.
+        let mut a = DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-claimed");
+        a.ts_epoch_ms = 0;
+        write(&sink, a).await;
+
+        // pane_spawned-style longer stage: cube_change_created at
+        // t=0 (also 35s elapsed) but no override → falls under the
+        // 120s default and should NOT fire.
+        let mut b = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-changing");
+        b.ts_epoch_ms = 0;
+        write(&sink, b).await;
+
+        let thresholds = StageThresholds::new(Duration::from_secs(120))
+            .with_override("worker_claimed", Duration::from_secs(30));
+        let stalls = pending_stalls(dir.path(), 35_000, &thresholds).unwrap();
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(stalls[0].execution_id, "exec-claimed");
+        assert_eq!(stalls[0].stalled_stage, "worker_claimed");
+    }
+
+    #[test]
+    fn stage_thresholds_falls_back_to_default_for_unknown_stages() {
+        let t = StageThresholds::new(Duration::from_secs(120))
+            .with_override("worker_claimed", Duration::from_secs(30));
+        assert_eq!(t.for_stage("worker_claimed"), 30_000);
+        assert_eq!(t.for_stage("cube_repo_ensured"), 120_000);
+        assert_eq!(t.for_stage("anything_else"), 120_000);
     }
 
     #[test]

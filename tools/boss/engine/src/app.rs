@@ -1841,11 +1841,24 @@ pub async fn serve(
     // a `stage_stalled` event when one sits past the threshold
     // without progressing. Read-only against the per-execution
     // dispatch.jsonl mirrors; never modifies dispatcher behavior.
+    //
+    // Per-stage overrides: the early dispatch handoffs (worker
+    // claim → cube repo ensure → cube workspace lease) should
+    // never sit for more than ~30s in healthy operation, so flag
+    // them faster than the 120s default. The 2026-05-12 cube-lease
+    // hang spent 46s in `worker_claimed` with no event firing
+    // because the global threshold hadn't elapsed; a 30s override
+    // catches it on the first sweep after the wedge.
+    let stage_thresholds =
+        crate::dispatch_reader::StageThresholds::new(Duration::from_secs(120))
+            .with_override("worker_claimed", Duration::from_secs(30))
+            .with_override("cube_repo_ensured", Duration::from_secs(30))
+            .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
     let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
         server_state.dispatch_event_root.clone(),
         server_state.dispatch_events.clone(),
-        Duration::from_secs(120),
-        Duration::from_secs(30),
+        stage_thresholds,
+        Duration::from_secs(15),
     );
 
     let coordinator = server_state.execution_coordinator.clone();

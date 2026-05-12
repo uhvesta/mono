@@ -59,8 +59,28 @@ pub enum Stage {
     WorkerClaimed,
     /// `cube repo ensure` returned a repo handle.
     CubeRepoEnsured,
+    /// Engine is about to call `cube workspace lease`. Emitted *before*
+    /// the subprocess invocation so an operator can see what the
+    /// engine intended to do (preferred workspace id, fallback
+    /// policy) even if the cube call itself hangs and never returns.
+    /// The motivating incident hit this exact gap — the engine had
+    /// claimed a worker, made the cube call, and then sat silent for
+    /// ~46 seconds with no event between `worker_claimed` and the
+    /// next stage. Adding an explicit "attempted" record means
+    /// `bossctl dispatch diagnose` can show "lease was attempted with
+    /// these inputs but the subprocess never came back."
+    CubeWorkspaceLeaseAttempted,
     /// `cube workspace lease` returned a lease.
     CubeWorkspaceLeased,
+    /// `cube workspace lease` failed (cube returned an error, the
+    /// engine timed out the subprocess, or any other reason the
+    /// preceding `cube_workspace_lease_attempted` did not progress to
+    /// `cube_workspace_leased`). The `error_message` field carries
+    /// the verbatim cube stderr / timeout message so a diagnose verb
+    /// can render the reason without going back to tracing logs.
+    /// Distinct from `cube_workspace_leased` with `outcome=error` so
+    /// readers don't have to disambiguate by outcome.
+    CubeWorkspaceLeaseFailed,
     /// `cube change create` returned a change handle.
     CubeChangeCreated,
     /// `start_execution_run` committed and `tasks.status` flipped
@@ -88,7 +108,9 @@ impl Stage {
             Stage::RequestRecorded => "request_recorded",
             Stage::WorkerClaimed => "worker_claimed",
             Stage::CubeRepoEnsured => "cube_repo_ensured",
+            Stage::CubeWorkspaceLeaseAttempted => "cube_workspace_lease_attempted",
             Stage::CubeWorkspaceLeased => "cube_workspace_leased",
+            Stage::CubeWorkspaceLeaseFailed => "cube_workspace_lease_failed",
             Stage::CubeChangeCreated => "cube_change_created",
             Stage::RunStarted => "run_started",
             Stage::PaneSpawned => "pane_spawned",
