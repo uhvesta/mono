@@ -2242,9 +2242,18 @@ private class ResizeDividerView: NSView {
         for area in trackingAreas {
             removeTrackingArea(area)
         }
+        // `.cursorUpdate` is what actually drives the resize cursor.
+        // The SwiftUI overlay hosts this NSView inside the detail pane
+        // of a NavigationSplitView (NSSplitView under the hood), and
+        // that container intercepts the AppKit cursor-rect machinery —
+        // `resetCursorRects` / `addCursorRect` is not called reliably
+        // for descendant views, so the cursor never flips on hover.
+        // Routing cursor swaps through the tracking area's
+        // `cursorUpdate(_:)` event bypasses that and works regardless
+        // of the parent container.
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .cursorUpdate, .activeInKeyWindow, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
@@ -2271,23 +2280,32 @@ private class ResizeDividerView: NSView {
         }
     }
 
-    /// AppKit calls this whenever cursor rects need to be reset.
-    /// Using `addCursorRect` instead of `NSCursor.push/pop` so the
-    /// system manages cursor swapping — no stale resize cursor
-    /// surviving a layout change or window-key transition (the
-    /// "cursor stuck after the agent finished" symptom).
-    override func resetCursorRects() {
-        discardCursorRects()
-        addCursorRect(bounds, cursor: .resizeLeftRight)
+    /// Fires while the cursor is inside the tracking area. Setting
+    /// the cursor here (instead of via `addCursorRect`) sidesteps the
+    /// NSSplitView ancestor that would otherwise swallow cursor-rect
+    /// management for descendant SwiftUI-hosted views. AppKit clears
+    /// the cursor automatically when the pointer leaves the tracking
+    /// area, so there's no stale-resize-cursor risk.
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.resizeLeftRight.set()
     }
 
     override func mouseEntered(with event: NSEvent) {
         isHovering = true
+        // Belt-and-suspenders: `cursorUpdate` is the primary path, but
+        // setting on entry guarantees the swap fires on the first
+        // hover even if the tracking area's initial `cursorUpdate`
+        // hasn't been dispatched yet.
+        NSCursor.resizeLeftRight.set()
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovering = false
+        // Restore the arrow on exit. Without this, the resize cursor
+        // can linger on app-focus changes or when leaving via a route
+        // that doesn't trigger another view's `cursorUpdate`.
+        NSCursor.arrow.set()
         needsDisplay = true
     }
 
