@@ -12,10 +12,14 @@
 //! print a structured "not_implemented" response so the Boss session
 //! can call them and see which ones are pending.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
+use boss_engine::dispatch_events::DispatchEvent;
+use boss_engine::dispatch_reader;
 use boss_protocol::{
     FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState,
     RequestExecutionInput, ROSTER, WorkExecution, WorkRun, WorkspacePoolEntry,
@@ -79,12 +83,69 @@ enum Command {
         #[command(subcommand)]
         action: LiveStatusAction,
     },
+    /// Inspect the dispatch-pipeline event stream (file-scan only —
+    /// works when the engine is wedged).
+    Dispatch {
+        #[command(subcommand)]
+        action: DispatchAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum LiveStatusAction {
     /// One-shot snapshot of the live-status pipeline.
     Debug,
+}
+
+#[derive(Subcommand, Debug)]
+enum DispatchAction {
+    /// Print recent dispatch events from `current.jsonl`. Filterable
+    /// by stage / outcome. Defaults to the last 50 events.
+    Tail {
+        /// Override the Boss state root (defaults to
+        /// `$HOME/Library/Application Support/Boss`).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        /// Maximum number of events to print (most recent first).
+        #[arg(short = 'n', long = "n", default_value_t = 50)]
+        n: usize,
+        /// Restrict to events matching this `stage` value (e.g.
+        /// `pane_spawned`).
+        #[arg(long)]
+        stage: Option<String>,
+        /// Restrict to events matching this `outcome` value (`ok`,
+        /// `error`, `skipped`).
+        #[arg(long)]
+        outcome: Option<String>,
+    },
+    /// Print the full per-execution timeline for one execution id,
+    /// with stage durations and the full `error_message` on any
+    /// failure event.
+    Diagnose {
+        execution_id: String,
+        /// Override the Boss state root.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// List executions whose dispatch timeline started but never
+    /// reached a terminal stage (`pane_spawned ok` or any error).
+    /// Useful when the engine logs a successful dispatch but no
+    /// worker pane ever appeared in the Doing column.
+    GhostActive {
+        /// Override the Boss state root.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        /// Only include entries whose last event is older than this
+        /// many seconds (matches the writer-side `stage_stalled`
+        /// threshold). 0 means "list every non-terminal timeline".
+        #[arg(long, default_value_t = 60)]
+        stalled_after_secs: u64,
+        /// When set, restrict the output to entries the reader
+        /// considers `stalled` (last event older than
+        /// `--stalled-after-secs`).
+        #[arg(long)]
+        include_stalled: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -256,11 +317,231 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::LiveStatus {
             action: LiveStatusAction::Debug,
         } => live_status_debug(&cli.socket_path, cli.json).await,
+        Command::Dispatch {
+            action:
+                DispatchAction::Tail {
+                    state_root,
+                    n,
+                    stage,
+                    outcome,
+                },
+        } => dispatch_tail(cli.json, state_root, n, stage, outcome),
+        Command::Dispatch {
+            action:
+                DispatchAction::Diagnose {
+                    execution_id,
+                    state_root,
+                },
+        } => dispatch_diagnose(cli.json, state_root, &execution_id),
+        Command::Dispatch {
+            action:
+                DispatchAction::GhostActive {
+                    state_root,
+                    stalled_after_secs,
+                    include_stalled,
+                },
+        } => dispatch_ghost_active(cli.json, state_root, stalled_after_secs, include_stalled),
         // Any remaining verbs that need engine surfaces that don't
         // exist yet print a structured "not_implemented" so the Boss
         // session can call them and see exactly which ones are
         // pending.
         other => print_not_implemented(cli.json, &describe_verb(&other)),
+    }
+}
+
+fn resolve_state_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    dispatch_reader::default_state_root().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve Boss state root: HOME is unset and no --state-root was provided"
+        )
+    })
+}
+
+fn now_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn dispatch_tail(
+    json: bool,
+    state_root: Option<PathBuf>,
+    n: usize,
+    stage_filter: Option<String>,
+    outcome_filter: Option<String>,
+) -> Result<()> {
+    let root = resolve_state_root(state_root)?;
+    let events = dispatch_reader::read_current(&root)?;
+    let slice = filter_and_tail(&events, n, stage_filter.as_deref(), outcome_filter.as_deref());
+
+    if json {
+        println!("{}", build_tail_json(slice));
+    } else if slice.is_empty() {
+        println!("no dispatch events");
+    } else {
+        for event in slice {
+            print_dispatch_event_short(event);
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_diagnose(json: bool, state_root: Option<PathBuf>, execution_id: &str) -> Result<()> {
+    let root = resolve_state_root(state_root)?;
+    let events = dispatch_reader::read_execution(&root, execution_id)?;
+    if events.is_empty() {
+        if json {
+            println!("{}", build_diagnose_json(execution_id, &[], &[]));
+        } else {
+            println!("no dispatch events recorded for execution {execution_id}");
+        }
+        return Ok(());
+    }
+    let now = now_epoch_ms();
+    let durations = dispatch_reader::stage_durations_ms(&events, now);
+
+    if json {
+        println!("{}", build_diagnose_json(execution_id, &events, &durations));
+    } else {
+        println!("dispatch timeline for execution {execution_id}");
+        for (event, duration_ms) in events.iter().zip(durations.iter()) {
+            print_dispatch_event_detailed(event, *duration_ms);
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_ghost_active(
+    json: bool,
+    state_root: Option<PathBuf>,
+    stalled_after_secs: u64,
+    include_stalled: bool,
+) -> Result<()> {
+    let root = resolve_state_root(state_root)?;
+    let now = now_epoch_ms();
+    let threshold_ms = (stalled_after_secs as u128).saturating_mul(1000);
+    let mut entries = dispatch_reader::ghost_active(&root, now, threshold_ms)?;
+    if include_stalled {
+        entries.retain(|e| e.stalled);
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ghost_active": entries,
+            })
+        );
+    } else if entries.is_empty() {
+        println!("no ghost-active executions");
+    } else {
+        for entry in &entries {
+            let elapsed_s = entry.elapsed_since_last_ms / 1000;
+            let stalled_tag = if entry.stalled { "  [stalled]" } else { "" };
+            let work_item = entry.work_item_id.as_deref().unwrap_or("-");
+            println!(
+                "{}  last={}/{}  elapsed={}s  work_item={}{}",
+                entry.execution_id,
+                entry.last_stage,
+                entry.last_outcome,
+                elapsed_s,
+                work_item,
+                stalled_tag,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn filter_and_tail<'a>(
+    events: &'a [DispatchEvent],
+    n: usize,
+    stage: Option<&str>,
+    outcome: Option<&str>,
+) -> Vec<&'a DispatchEvent> {
+    let mut filtered: Vec<&DispatchEvent> = events
+        .iter()
+        .filter(|e| stage.is_none_or(|s| e.stage == s))
+        .filter(|e| outcome.is_none_or(|o| e.outcome == o))
+        .collect();
+    let total = filtered.len();
+    let start = total.saturating_sub(n);
+    filtered.drain(..start);
+    filtered
+}
+
+fn build_tail_json(slice: Vec<&DispatchEvent>) -> serde_json::Value {
+    let events: Vec<&DispatchEvent> = slice;
+    serde_json::json!({
+        "events": events,
+    })
+}
+
+fn build_diagnose_json(
+    execution_id: &str,
+    events: &[DispatchEvent],
+    durations: &[u128],
+) -> serde_json::Value {
+    let detailed: Vec<serde_json::Value> = events
+        .iter()
+        .zip(durations.iter())
+        .map(|(event, dur)| {
+            let mut value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "stage_duration_ms".into(),
+                    serde_json::Value::from(*dur as u64),
+                );
+            }
+            value
+        })
+        .collect();
+    serde_json::json!({
+        "execution_id": execution_id,
+        "events": detailed,
+    })
+}
+
+fn print_dispatch_event_short(event: &DispatchEvent) {
+    let worker = event.worker_id.as_deref().unwrap_or("-");
+    let err = event.error_message.as_deref().unwrap_or("");
+    if err.is_empty() {
+        println!(
+            "{}  {}/{}  exec={}  worker={}",
+            event.ts_epoch_ms, event.stage, event.outcome, event.execution_id, worker,
+        );
+    } else {
+        println!(
+            "{}  {}/{}  exec={}  worker={}  error={}",
+            event.ts_epoch_ms, event.stage, event.outcome, event.execution_id, worker, err,
+        );
+    }
+}
+
+fn print_dispatch_event_detailed(event: &DispatchEvent, stage_duration_ms: u128) {
+    let worker = event.worker_id.as_deref().unwrap_or("-");
+    println!(
+        "  {}  {}/{}  +{}ms  worker={}",
+        event.ts_epoch_ms, event.stage, event.outcome, stage_duration_ms, worker,
+    );
+    if let Some(lease) = &event.cube_lease_id {
+        println!("    lease:     {lease}");
+    }
+    if let Some(workspace) = &event.cube_workspace_id {
+        println!("    workspace: {workspace}");
+    }
+    if let Some(err) = &event.error_message {
+        println!("    error:     {err}");
+    }
+    if !event.details.is_null() {
+        match serde_json::to_string(&event.details) {
+            Ok(text) => println!("    details:   {text}"),
+            Err(_) => println!("    details:   <unserializable>"),
+        }
     }
 }
 
@@ -1024,6 +1305,11 @@ fn describe_verb(command: &Command) -> String {
         Command::LiveStatus { action } => match action {
             LiveStatusAction::Debug => "live-status debug".into(),
         },
+        Command::Dispatch { action } => match action {
+            DispatchAction::Tail { .. } => "dispatch tail".into(),
+            DispatchAction::Diagnose { .. } => "dispatch diagnose".into(),
+            DispatchAction::GhostActive { .. } => "dispatch ghost-active".into(),
+        },
     }
 }
 
@@ -1206,6 +1492,88 @@ mod tests {
         let hit = resolve_agent_ref("1", &states).unwrap();
         assert_eq!(hit.run_id, "1");
         assert_eq!(hit.slot_id, 2);
+    }
+
+    fn ev(ts: u128, stage: &str, outcome: &str, exec: &str) -> DispatchEvent {
+        DispatchEvent {
+            ts_epoch_ms: ts,
+            stage: stage.into(),
+            outcome: outcome.into(),
+            execution_id: exec.into(),
+            work_item_id: None,
+            worker_id: None,
+            cube_repo_id: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            error_message: None,
+            details: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn filter_and_tail_returns_last_n() {
+        let events = vec![
+            ev(1, "request_recorded", "ok", "e1"),
+            ev(2, "worker_claimed", "ok", "e1"),
+            ev(3, "cube_repo_ensured", "ok", "e1"),
+            ev(4, "cube_workspace_leased", "ok", "e1"),
+            ev(5, "pane_spawned", "ok", "e1"),
+        ];
+        let slice = filter_and_tail(&events, 2, None, None);
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0].stage, "cube_workspace_leased");
+        assert_eq!(slice[1].stage, "pane_spawned");
+    }
+
+    #[test]
+    fn filter_and_tail_filters_stage_and_outcome() {
+        let events = vec![
+            ev(1, "request_recorded", "ok", "e1"),
+            ev(2, "pane_spawned", "ok", "e1"),
+            ev(3, "pane_spawned", "error", "e2"),
+            ev(4, "pane_spawned", "error", "e3"),
+        ];
+        let slice = filter_and_tail(&events, 10, Some("pane_spawned"), Some("error"));
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0].execution_id, "e2");
+        assert_eq!(slice[1].execution_id, "e3");
+    }
+
+    #[test]
+    fn build_tail_json_round_trips_events_as_array() {
+        let events = vec![
+            ev(1, "request_recorded", "ok", "e1"),
+            ev(2, "pane_spawned", "error", "e1"),
+        ];
+        let slice = filter_and_tail(&events, 10, None, None);
+        let json = build_tail_json(slice);
+        let arr = json.get("events").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["stage"], "request_recorded");
+        assert_eq!(arr[1]["outcome"], "error");
+    }
+
+    #[test]
+    fn build_diagnose_json_attaches_stage_duration_ms_to_each_event() {
+        let events = vec![
+            ev(100, "request_recorded", "ok", "e1"),
+            ev(450, "pane_spawned", "ok", "e1"),
+        ];
+        let durations = vec![350u128, 0u128];
+        let json = build_diagnose_json("e1", &events, &durations);
+        assert_eq!(json["execution_id"], "e1");
+        let arr = json["events"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["stage_duration_ms"], 350);
+        assert_eq!(arr[1]["stage_duration_ms"], 0);
+        assert_eq!(arr[0]["stage"], "request_recorded");
+    }
+
+    #[test]
+    fn build_diagnose_json_returns_empty_events_when_none() {
+        let json = build_diagnose_json("exec-missing", &[], &[]);
+        assert_eq!(json["execution_id"], "exec-missing");
+        assert!(json["events"].as_array().unwrap().is_empty());
     }
 
     #[test]

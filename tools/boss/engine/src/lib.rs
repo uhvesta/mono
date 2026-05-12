@@ -8,6 +8,7 @@ pub mod conflict_diagnosis;
 pub mod conflict_watch;
 pub mod coordinator;
 pub mod dispatch_events;
+pub mod dispatch_reader;
 pub mod events_socket;
 pub mod live_status;
 pub mod live_status_loop;

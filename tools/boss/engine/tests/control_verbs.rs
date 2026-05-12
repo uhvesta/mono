@@ -76,6 +76,13 @@ impl TestEngine {
     fn socket_str(&self) -> &str {
         self.socket_path.to_str().expect("socket path is utf-8")
     }
+
+    fn state_root(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .expect("db path has parent in tempdir")
+            .to_path_buf()
+    }
 }
 
 impl Drop for TestEngine {
@@ -875,6 +882,113 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
     assert_eq!(
         after_second[0].id, first_exec_id,
         "original execution must be preserved",
+    );
+
+    Ok(())
+}
+
+/// A kanban drag-to-Doing fires the `status_transition` dispatch
+/// event so an operator running `bossctl dispatch tail` can see
+/// exactly when (and whether) the engine decided to auto-dispatch
+/// after the human flipped the card.
+#[tokio::test]
+async fn kanban_drag_emits_status_transition_event() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Parked chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+
+    let _ = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+
+    // Drain a beat so the async emit lands on disk before we read.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
+    let transition: Vec<_> = events
+        .iter()
+        .filter(|e| e.stage == "status_transition")
+        .collect();
+    assert_eq!(
+        transition.len(),
+        1,
+        "expected exactly one status_transition event; got {transition:?}"
+    );
+    assert_eq!(transition[0].outcome, "ok");
+    assert_eq!(transition[0].work_item_id.as_deref(), Some(chore.id.as_str()));
+    assert_eq!(
+        transition[0].details.get("did_dispatch"),
+        Some(&serde_json::Value::Bool(true)),
+        "first drag should have did_dispatch=true; got {:?}",
+        transition[0].details
+    );
+
+    // Second drag is a no-op (already active) — must NOT emit a
+    // duplicate status_transition because `task_transitioned_to_active`
+    // requires an actual transition.
+    let _ = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events_after = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
+    let transitions_after: Vec<_> = events_after
+        .iter()
+        .filter(|e| e.stage == "status_transition")
+        .collect();
+    assert_eq!(
+        transitions_after.len(),
+        1,
+        "no-op active→active must not emit a second status_transition event",
     );
 
     Ok(())

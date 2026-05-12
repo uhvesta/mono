@@ -15,6 +15,7 @@ rust_library(
         "src/conflict_watch.rs",
         "src/coordinator.rs",
         "src/dispatch_events.rs",
+        "src/dispatch_reader.rs",
         "src/events_socket.rs",
         "src/lib.rs",
         "src/live_status.rs",
@@ -36,6 +37,7 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     visibility = [
+        "//tools/boss/bossctl:__pkg__",
         "//tools/boss/cli:__pkg__",
         "//tools/boss/client:__pkg__",
         "//tools/boss/engine:__pkg__",

@@ -244,10 +244,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boss-client",
+ "boss-engine",
  "boss-protocol",
  "clap",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
