@@ -32,6 +32,7 @@ rust_library(
         "src/work.rs",
         "src/work_dependencies.rs",
         "src/worker_registry.rs",
+        "src/worker_sandbox_audit.rs",
         "src/worker_setup.rs",
     ],
     crate_root = "src/lib.rs",
