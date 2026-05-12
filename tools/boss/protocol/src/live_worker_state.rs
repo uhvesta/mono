@@ -134,13 +134,20 @@ pub struct LiveWorkerState {
     /// — Doing-card subtitle, Agents-tab worker header subtitle.
     /// Sits alongside [`Self::activity`] rather than replacing it:
     /// the enum is still load-bearing for the kanban dot and gating.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Always serialized (as `null` while unset) so JSON consumers can
+    /// distinguish "engine doesn't know about this field" from "engine
+    /// hasn't summarized this slot yet". `serde(default)` keeps the
+    /// decode path tolerant of payloads from older engines that omit
+    /// the key entirely.
+    #[serde(default)]
     pub live_status: Option<String>,
     /// ISO-8601 timestamp of the most recent successful update to
     /// `live_status`. The UI uses this to dim/strike-through stale
     /// values; the engine uses it to drive the timer-floor cadence
-    /// in `live_status::tick`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// in `live_status::tick`. Always serialized (as `null` while
+    /// unset) — see `live_status` for why.
+    #[serde(default)]
     pub live_status_at: Option<String>,
     /// Work item this run was dispatched against. `None` for spawns
     /// that happen outside the work-item dispatch path (today: tests
@@ -303,7 +310,21 @@ mod tests {
         assert!(!json.contains("work_item_id"), "json: {json}");
         assert!(!json.contains("work_item_name"), "json: {json}");
         assert!(!json.contains("execution_id"), "json: {json}");
-        assert!(!json.contains("live_status"), "json: {json}");
+    }
+
+    #[test]
+    fn live_worker_state_always_serializes_live_status_fields() {
+        // The kanban Doing-card and Agents-tab header bind to
+        // `live_status` / `live_status_at` and treat "key absent" as a
+        // protocol-version signal rather than a missing summary. Always
+        // emitting the keys (even when `None` serializes as `null`)
+        // keeps `bossctl agents list --json` self-describing — a JSON
+        // consumer can distinguish "the engine doesn't ship live_status"
+        // from "this worker hasn't been summarized yet".
+        let state = LiveWorkerState::new_spawning(1, "exec-1", "claude-opus-4-7", 0, None);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"live_status\":null"), "json: {json}");
+        assert!(json.contains("\"live_status_at\":null"), "json: {json}");
     }
 
     #[test]
