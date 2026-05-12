@@ -665,6 +665,53 @@ pub enum FrontendEvent {
     ConflictResolutionMarkedFailed {
         attempt: ConflictResolution,
     },
+    /// Activity-feed push: a fresh conflict-resolution attempt has been
+    /// created for an in-review PR and a worker is about to take over
+    /// (Phase 4 / design Q8). Broadcast on the parent product's
+    /// work-tree topic so the macOS app can render an activity-feed
+    /// entry without having to poll.
+    ConflictResolutionStarted {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+    },
+    /// Activity-feed push: the engine observed the parent PR back at
+    /// mergeable and retired the conflict-resolution attempt. The
+    /// parent has been flipped from `blocked: merge_conflict` back to
+    /// `in_review`; the attempt row is `succeeded`; the worker's cube
+    /// workspace lease has been released (if not already).
+    ConflictResolutionSucceeded {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+    },
+    /// Activity-feed push: a conflict-resolution attempt terminated in
+    /// `failed`. Emitted when the worker calls
+    /// `boss engine conflicts mark-failed`, when the completion path's
+    /// catch-all (`no_push_no_stop_condition`) fires, or any other
+    /// terminal-failure transition. The parent remains `blocked:
+    /// merge_conflict`; the user is the next actor.
+    ConflictResolutionFailed {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+        failure_reason: String,
+    },
+    /// Activity-feed push: a conflict-resolution attempt terminated in
+    /// `abandoned`. Distinct from `failed` in that the engine stepped
+    /// away on purpose (PR closed, parent merged externally, manual
+    /// override). The parent has typically already moved out of
+    /// `blocked: merge_conflict` by some other path.
+    ConflictResolutionAbandoned {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+        failure_reason: String,
+    },
 }
 
 /// One row of the cube workspace pool, as exposed via

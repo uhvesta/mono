@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use boss_protocol::FrontendEvent;
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -541,6 +542,17 @@ pub trait ExecutionPublisher: Send + Sync {
         work_item_id: &str,
         reason: &str,
     );
+
+    /// Push a typed [`FrontendEvent`] verbatim on the work item's
+    /// product topic. Used for activity-feed events such as
+    /// `ConflictResolutionStarted` / `Succeeded` / `Failed` /
+    /// `Abandoned` (design Q8) where subscribers need the full
+    /// payload, not just a "refetch" hint.
+    async fn publish_frontend_event_on_product(
+        &self,
+        product_id: &str,
+        event: FrontendEvent,
+    );
 }
 
 #[derive(Default)]
@@ -550,6 +562,7 @@ pub struct NoopExecutionPublisher;
 impl ExecutionPublisher for NoopExecutionPublisher {
     async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
     async fn publish_work_item_changed(&self, _: &str, _: &str, _: &str) {}
+    async fn publish_frontend_event_on_product(&self, _: &str, _: FrontendEvent) {}
 }
 
 /// Tiny abstraction so the coordinator can bump the shared work-revision
@@ -1626,7 +1639,7 @@ mod tests {
 
     use super::{
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
-        ExecutionCoordinator, ExecutionPublisher, MAX_WORKER_POOL_SIZE, WorkerPool,
+        ExecutionCoordinator, ExecutionPublisher, FrontendEvent, MAX_WORKER_POOL_SIZE, WorkerPool,
         slot_id_from_worker_id,
     };
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
@@ -1857,6 +1870,13 @@ mod tests {
                 work_item_id.to_owned(),
                 reason.to_owned(),
             ));
+        }
+
+        async fn publish_frontend_event_on_product(
+            &self,
+            _product_id: &str,
+            _event: FrontendEvent,
+        ) {
         }
     }
 
