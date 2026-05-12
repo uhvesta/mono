@@ -263,6 +263,15 @@ final class ChatViewModel: ObservableObject {
     }
 
     private let engine: EngineClient
+    /// Test-only hook: forwarded to `EngineClient.outboundRecorder`
+    /// so an XCTest can assert that the form's submit lands the
+    /// expected `repo_remote_url` on the wire. The real socket write
+    /// still runs (against a stub path that fails harmlessly in
+    /// tests).
+    var outboundRecorder: (([String: Any]) -> Void)? {
+        get { engine.outboundRecorder }
+        set { engine.outboundRecorder = newValue }
+    }
     private let processController = EngineProcessController()
     private let socketPath: String
     private let showSystemMessages: Bool
@@ -476,12 +485,14 @@ final class ChatViewModel: ObservableObject {
         name: String,
         description: String,
         repoRemoteURL: String = "",
-        goal: String = ""
+        goal: String = "",
+        setAsProductDefault: Bool = false
     ) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
 
         workErrorMessage = nil
+        let repoOverride = repoRemoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
         switch request.kind {
         case .product:
             engine.sendCreateProduct(
@@ -501,17 +512,90 @@ final class ChatViewModel: ObservableObject {
                 productId: productID,
                 projectId: projectID,
                 name: trimmedName,
-                description: description
+                description: description,
+                repoRemoteURL: repoOverride.isEmpty ? nil : repoOverride
             )
+            if setAsProductDefault && !repoOverride.isEmpty {
+                engine.sendUpdateWorkItem(
+                    id: productID,
+                    patch: ["repo_remote_url": repoOverride]
+                )
+            }
         case .chore(let productID):
             engine.sendCreateChore(
                 productId: productID,
                 name: trimmedName,
-                description: description
+                description: description,
+                repoRemoteURL: repoOverride.isEmpty ? nil : repoOverride
             )
+            if setAsProductDefault && !repoOverride.isEmpty {
+                engine.sendUpdateWorkItem(
+                    id: productID,
+                    patch: ["repo_remote_url": repoOverride]
+                )
+            }
         }
 
         pendingWorkCreateRequest = nil
+    }
+
+    /// Empirical known-repo set for `productID`, mirroring the CLI's
+    /// `known_repos_for_product` (multi-repo design Q4). Returns the
+    /// distinct, non-empty `repo_remote_url` values across the
+    /// product's tasks and chores, plus the product's own default if
+    /// set. Sorted by short-name for stable picker ordering, with the
+    /// product default first when present so the picker leads with
+    /// the "obvious" choice.
+    ///
+    /// All inputs come from the work tree the model already has on
+    /// hand; no engine RPC. Returns an empty array when the product
+    /// is unknown.
+    func knownReposForProduct(_ productID: String) -> [String] {
+        guard products.contains(where: { $0.id == productID }) else {
+            return []
+        }
+        var seen: Set<String> = []
+        var result: [String] = []
+        let productDefault = products
+            .first(where: { $0.id == productID })?
+            .repoRemoteURL?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let productDefault, !productDefault.isEmpty {
+            seen.insert(productDefault)
+            result.append(productDefault)
+        }
+        var rest: [String] = []
+        let projects = projectsByProductID[productID] ?? []
+        for project in projects {
+            for task in tasksByProjectID[project.id] ?? [] {
+                if let url = task.repoRemoteURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !url.isEmpty, !seen.contains(url) {
+                    seen.insert(url)
+                    rest.append(url)
+                }
+            }
+        }
+        for chore in choresByProductID[productID] ?? [] {
+            if let url = chore.repoRemoteURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !url.isEmpty, !seen.contains(url) {
+                seen.insert(url)
+                rest.append(url)
+            }
+        }
+        rest.sort { shortRepoName(for: $0) < shortRepoName(for: $1) }
+        result.append(contentsOf: rest)
+        return result
+    }
+
+    /// Product default repo URL, looked up by id. Used by
+    /// `WorkCreateSheet` to construct a `WorkCreateRepoFormState`
+    /// without reaching into `products` itself. `nil` for an unknown
+    /// product or one whose URL is empty / whitespace.
+    func productDefaultRepoURL(_ productID: String) -> String? {
+        let raw = products.first(where: { $0.id == productID })?.repoRemoteURL
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty { return trimmed }
+        return nil
     }
 
     func submitWorkEditRequest(

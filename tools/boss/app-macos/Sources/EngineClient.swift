@@ -268,25 +268,44 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
-    func sendCreateTask(productId: String, projectId: String, name: String, description: String) {
-        sendLine([
+    func sendCreateTask(
+        productId: String,
+        projectId: String,
+        name: String,
+        description: String,
+        repoRemoteURL: String? = nil
+    ) {
+        var payload: [String: Any] = [
             "type": "create_task",
             "product_id": productId,
             "project_id": projectId,
             "name": name,
             "description": description,
             "created_via": "mac_app",
-        ])
+        ]
+        if let repoRemoteURL, !repoRemoteURL.isEmpty {
+            payload["repo_remote_url"] = repoRemoteURL
+        }
+        sendLine(payload)
     }
 
-    func sendCreateChore(productId: String, name: String, description: String) {
-        sendLine([
+    func sendCreateChore(
+        productId: String,
+        name: String,
+        description: String,
+        repoRemoteURL: String? = nil
+    ) {
+        var payload: [String: Any] = [
             "type": "create_chore",
             "product_id": productId,
             "name": name,
             "description": description,
             "created_via": "mac_app",
-        ])
+        ]
+        if let repoRemoteURL, !repoRemoteURL.isEmpty {
+            payload["repo_remote_url"] = repoRemoteURL
+        }
+        sendLine(payload)
     }
 
     func sendUpdateWorkItem(id: String, patch: [String: Any]) {
@@ -511,7 +530,18 @@ final class EngineClient: @unchecked Sendable {
         }
     }
 
+    /// Test-only spy: invoked on every outbound payload before
+    /// JSON-encoding. Tests inject a recorder to assert that the
+    /// chore/task create flow puts `repo_remote_url` on the wire as
+    /// expected (multi-repo work modeling design Q10). Setting the
+    /// hook does not bypass the real send — the socket write still
+    /// runs when a connection exists, so production-path callers see
+    /// no behaviour change.
+    var outboundRecorder: (([String: Any]) -> Void)?
+
     private func sendLine(_ payload: [String: Any]) {
+        outboundRecorder?(payload)
+
         guard let connection else {
             emit(.error(message:"engine connection is not established"))
             return

@@ -138,14 +138,17 @@ struct ContentView: View {
         .sheet(item: $model.pendingWorkCreateRequest) { request in
             WorkCreateSheet(
                 request: request,
+                productDefaultRepoURL: productDefaultRepoURL(for: request),
+                knownRepos: knownRepos(for: request),
                 onCancel: { model.dismissWorkCreateRequest() },
-                onCreate: { name, description, repoRemoteURL, goal in
+                onCreate: { name, description, repoRemoteURL, goal, setAsDefault in
                     model.submitWorkCreateRequest(
                         request,
                         name: name,
                         description: description,
                         repoRemoteURL: repoRemoteURL,
-                        goal: goal
+                        goal: goal,
+                        setAsProductDefault: setAsDefault
                     )
                 }
             )
@@ -179,6 +182,32 @@ struct ContentView: View {
                     .frame(width: 6)
                     .pointerStyle(.frameResize(position: .trailing))
             }
+    }
+
+    /// Look up the parent product's default repo URL for a pending
+    /// create request, used by `WorkCreateSheet` to pick the repo
+    /// field's render mode (design Q10). Product / project requests
+    /// have no parent-product-default context that's relevant to the
+    /// repo field, so we return `nil` there.
+    private func productDefaultRepoURL(for request: WorkCreateRequest) -> String? {
+        switch request.kind {
+        case .product, .project:
+            return nil
+        case .task(let productID, _), .chore(let productID):
+            return model.productDefaultRepoURL(productID)
+        }
+    }
+
+    /// Empirical known-repo set for the parent product of a pending
+    /// create request. Empty for product / project requests — neither
+    /// form surfaces a recent-repos picker.
+    private func knownRepos(for request: WorkCreateRequest) -> [String] {
+        switch request.kind {
+        case .product, .project:
+            return []
+        case .task(let productID, _), .chore(let productID):
+            return model.knownReposForProduct(productID)
+        }
     }
 
     private var detail: some View {
@@ -1718,13 +1747,46 @@ private struct PRURLLink: View {
 
 private struct WorkCreateSheet: View {
     let request: WorkCreateRequest
+    /// Parent product's default repo URL when the request is for a
+    /// task or chore. Drives the chore/task form's repo render mode
+    /// per design Q10: hidden-with-disclosure when set, shown-required
+    /// when nil.
+    let productDefaultRepoURL: String?
+    /// Empirical known-repo set for the parent product. Powers the
+    /// "Recent repos" picker. Empty when the form is for a product or
+    /// project.
+    let knownRepos: [String]
     let onCancel: () -> Void
-    let onCreate: (String, String, String, String) -> Void
+    /// Callback args: `(name, description, repoRemoteURL, goal,
+    /// setAsProductDefault)`. The last flag is meaningful only on
+    /// task/chore submissions made against a product without a
+    /// default repo where the user typed a fresh URL.
+    let onCreate: (String, String, String, String, Bool) -> Void
 
     @State private var name = ""
     @State private var description = ""
-    @State private var repoRemoteURL = ""
     @State private var goal = ""
+    @State private var repoFormState: WorkCreateRepoFormState
+
+    init(
+        request: WorkCreateRequest,
+        productDefaultRepoURL: String?,
+        knownRepos: [String],
+        onCancel: @escaping () -> Void,
+        onCreate: @escaping (String, String, String, String, Bool) -> Void
+    ) {
+        self.request = request
+        self.productDefaultRepoURL = productDefaultRepoURL
+        self.knownRepos = knownRepos
+        self.onCancel = onCancel
+        self.onCreate = onCreate
+        _repoFormState = State(
+            initialValue: WorkCreateRepoFormState(
+                productRepoURL: productDefaultRepoURL,
+                knownRepos: knownRepos
+            )
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -1737,9 +1799,13 @@ private struct WorkCreateSheet: View {
             case .product:
                 TextField("Description", text: $description)
                 VStack(alignment: .leading, spacing: 4) {
+                    // Product-create repo field is independent of the
+                    // chore/task form state — same wire field, but the
+                    // form mode + recent-repos picker only make sense
+                    // *under* an existing product.
                     TextField(
                         ProductRepoFieldCopy.placeholder,
-                        text: $repoRemoteURL
+                        text: productCreateRepoBinding
                     )
                     Text(ProductRepoFieldCopy.helperText)
                         .font(.caption)
@@ -1751,20 +1817,160 @@ private struct WorkCreateSheet: View {
                 TextField("Goal", text: $goal)
             case .task, .chore:
                 TextField("Description", text: $description)
+                workItemRepoField
             }
 
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)
                 Button("Create") {
-                    onCreate(name, description, repoRemoteURL, goal)
+                    onCreate(
+                        name,
+                        description,
+                        submittedRepoURL,
+                        goal,
+                        repoFormState.shouldSetAsProductDefault
+                    )
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(isSubmitDisabled)
             }
         }
         .padding(20)
-        .frame(width: 420)
+        .frame(width: 460)
+    }
+
+    /// Repo field for chore/task creation. Renders the disclosure
+    /// form in product-has-default mode and the required form in
+    /// product-has-no-default mode, with the "Recent repos" picker
+    /// and "Set as product default" affordance gated as the design
+    /// describes.
+    @ViewBuilder
+    private var workItemRepoField: some View {
+        switch repoFormState.mode {
+        case .productHasDefault(let defaultURL):
+            DisclosureGroup(
+                WorkItemRepoFieldCopy.overrideDisclosureLabel,
+                isExpanded: $repoFormState.overrideEnabled
+            ) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Inherits from product: \(defaultURL)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    recentReposPicker
+                    TextField(
+                        WorkItemRepoFieldCopy.overridePlaceholder,
+                        text: $repoFormState.enteredURL
+                    )
+                    Text(WorkItemRepoFieldCopy.overrideHelperText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 4)
+            }
+        case .productHasNoDefault:
+            VStack(alignment: .leading, spacing: 6) {
+                recentReposPicker
+                TextField(
+                    WorkItemRepoFieldCopy.requiredPlaceholder,
+                    text: $repoFormState.enteredURL
+                )
+                Text(WorkItemRepoFieldCopy.requiredHelperText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if repoFormState.showSetAsProductDefaultCheckbox {
+                    Toggle(
+                        WorkItemRepoFieldCopy.setAsProductDefaultLabel,
+                        isOn: $repoFormState.setAsProductDefault
+                    )
+                    .font(.caption)
+                }
+            }
+        }
+    }
+
+    /// "Recent repos" picker — surfaces the product's empirical
+    /// known-repo set. The first option is a no-op placeholder that
+    /// the picker shows when the user hasn't picked anything yet;
+    /// selecting any other entry copies its URL into the text field.
+    @ViewBuilder
+    private var recentReposPicker: some View {
+        if !knownRepos.isEmpty {
+            Picker(
+                WorkItemRepoFieldCopy.recentReposLabel,
+                selection: pickerSelectionBinding
+            ) {
+                Text("Choose…").tag(Optional<String>.none)
+                ForEach(knownRepos, id: \.self) { url in
+                    Text("\(shortRepoName(for: url)) — \(url)")
+                        .tag(Optional<String>.some(url))
+                }
+            }
+            .pickerStyle(.menu)
+        }
+    }
+
+    /// Two-way binding between the recent-repos `Picker` and the text
+    /// field. Reading reports the URL when it exactly matches a known
+    /// entry; writing copies the chosen URL into the entered text.
+    private var pickerSelectionBinding: Binding<String?> {
+        Binding(
+            get: {
+                let trimmed = repoFormState.enteredURL
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return knownRepos.contains(trimmed) ? trimmed : nil
+            },
+            set: { newValue in
+                guard let newValue else { return }
+                repoFormState.enteredURL = newValue
+                repoFormState.setAsProductDefault = false
+            }
+        )
+    }
+
+    /// Binding for the product-create repo field. Product creation
+    /// doesn't share the chore/task form state — the field is a
+    /// vanilla text input — so we keep the value alongside the rest
+    /// of the chore/task form state in the same `enteredURL` slot
+    /// (the two cases are mutually exclusive by request kind, so the
+    /// reuse is safe and avoids a parallel `@State`).
+    private var productCreateRepoBinding: Binding<String> {
+        $repoFormState.enteredURL
+    }
+
+    /// The URL string to forward to `onCreate`. For chore/task in
+    /// `.productHasDefault` mode with the override disclosure closed,
+    /// the value is the empty string — submission falls through to
+    /// the product default, matching the engine's
+    /// "absent field → inherit" semantics.
+    private var submittedRepoURL: String {
+        switch request.kind {
+        case .product:
+            return repoFormState.enteredURL
+        case .project:
+            return ""
+        case .task, .chore:
+            return repoFormState.submittedURL ?? ""
+        }
+    }
+
+    /// Encodes the submission gate. Name is always required; the
+    /// repo field adds a second gate for chore/task creation under a
+    /// product with no default.
+    private var isSubmitDisabled: Bool {
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        switch request.kind {
+        case .product, .project:
+            return false
+        case .task, .chore:
+            return repoFormState.isSubmissionBlocked
+        }
     }
 
     private var title: String {
