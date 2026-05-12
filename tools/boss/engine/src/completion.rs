@@ -2003,6 +2003,8 @@ PR #379. PR #379.";
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db
@@ -2135,6 +2137,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 priority: None,
                 created_via: None,
                 repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
             })
             .unwrap();
         let execution = db

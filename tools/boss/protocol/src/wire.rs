@@ -287,11 +287,28 @@ pub enum FrontendRequest {
     ReapRun {
         run_id: String,
     },
-    /// Tail the most recent transcript chunk for `run_id`. The engine
-    /// reads `WorkRun.transcript_path` and returns the trailing
-    /// `lines` lines (raw JSONL — the caller decides how to render).
-    /// Returns `WorkError` if the run is unknown or has no transcript
-    /// path recorded yet.
+    /// Tail the most recent transcript chunk for `run_id`. `run_id`
+    /// may be either an `exec_*` (execution) or `run_*` (work_runs)
+    /// id — `bossctl agents transcript` passes the execution id (the
+    /// alias the live registry uses); programmatic callers may pass
+    /// the work_runs id.
+    ///
+    /// The engine resolves the transcript path via the dispatcher's
+    /// in-memory cache, falling back to either DB namespace, and
+    /// returns the trailing `lines` lines (raw JSONL — the caller
+    /// decides how to render).
+    ///
+    /// Error shapes (all `WorkError`, distinguishable by message
+    /// prefix so callers can branch):
+    /// - `transcript not yet available for run <id>: …` — the run is
+    ///   known and live, but no hook has carried a `transcript_path`
+    ///   yet. Transient; retry in a few seconds. (Use this prefix to
+    ///   distinguish a still-buffering live worker from a genuinely
+    ///   unknown id — pre-fix the engine reported both as `unknown
+    ///   run`, which masked the live-vs-stale distinction.)
+    /// - `run <id> has no transcript path recorded` — the run/execution
+    ///   is known but terminal and never persisted a transcript path.
+    /// - `unknown run: <id>` — no live entry, no DB row matches.
     TailRunTranscript {
         run_id: String,
         lines: usize,
