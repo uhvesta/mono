@@ -2987,6 +2987,19 @@ async fn handle_frontend_connection(
                                 },
                             );
                         } else {
+                            // Log every queued request so an operator can pair
+                            // a `bossctl work start` call with the engine-side
+                            // outcome even when the scheduler races the row
+                            // (the kick-noop/lost-wakeup class of bug). The
+                            // structured `spawn_attempt` line lands in
+                            // `run_scheduler` once it picks the row up; this
+                            // line bookends the request itself.
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                work_item_id = %execution.work_item_id,
+                                execution_status = %execution.status,
+                                "RequestExecution accepted -> kicking scheduler"
+                            );
                             server_state.execution_coordinator.kick();
                             send_response(
                                 &sink,

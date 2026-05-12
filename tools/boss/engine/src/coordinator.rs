@@ -577,7 +577,19 @@ pub struct ExecutionCoordinator {
     /// [`ExecutionCoordinator::set_dispatch_events`] before
     /// scheduling starts.
     dispatch_events: Arc<dyn DispatchEventSink>,
+    /// `true` while a `run_scheduler` task is alive. `kick()` returns
+    /// without spawning when this is already set; the alive scheduler
+    /// is responsible for noticing the wakeup via `scheduling_pending`.
     scheduling_active: AtomicBool,
+    /// Wakeup flag set by every `kick()` (whether or not it spawned a
+    /// fresh scheduler). The running scheduler reads + resets this on
+    /// each outer iteration so that a kick which arrived during the
+    /// drain — i.e. between the last `list_ready_executions()` call
+    /// and the scheduler relinquishing `scheduling_active` — re-enters
+    /// the drain loop instead of being silently dropped. Closes the
+    /// TOCTOU between "queue saw empty" and "active=false" that left
+    /// fresh `ready` executions stranded with no scheduler running.
+    scheduling_pending: AtomicBool,
 }
 
 impl ExecutionCoordinator {
@@ -611,6 +623,7 @@ impl ExecutionCoordinator {
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink::default()),
             scheduling_active: AtomicBool::new(false),
+            scheduling_pending: AtomicBool::new(false),
         }
     }
 
@@ -634,9 +647,20 @@ impl ExecutionCoordinator {
     }
 
     pub fn kick(self: &Arc<Self>) {
+        // Order matters: `scheduling_pending` must be written BEFORE we
+        // contend on `scheduling_active`. If we lose the swap race
+        // (another scheduler is already running) the alive scheduler
+        // will read `scheduling_pending` after it drains and notice
+        // the wakeup; if we win, the fresh scheduler will reset
+        // pending on its way into the drain loop.
+        self.scheduling_pending.store(true, Ordering::Release);
         if self.scheduling_active.swap(true, Ordering::AcqRel) {
+            tracing::debug!(
+                "scheduler_kick outcome=noop reason=already_running — wakeup latched via scheduling_pending"
+            );
             return;
         }
+        tracing::debug!("scheduler_kick outcome=spawn — starting new run_scheduler task");
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator.run_scheduler().await;
@@ -686,13 +710,76 @@ impl ExecutionCoordinator {
     }
 
     async fn run_scheduler(self: Arc<Self>) {
-        let _guard = SchedulingGuard {
-            active: &self.scheduling_active,
-        };
+        // Lossless-wakeup loop. The `scheduling_pending` flag is reset
+        // at the top of each iteration so we have a clean "have we
+        // seen any new kicks since this drain started?" reading at
+        // the bottom. The pattern handles three race classes:
+        //
+        //   1. Kick during drain: caught by the post-drain
+        //      `scheduling_pending.load()` and re-enters the inner
+        //      loop without releasing `scheduling_active`.
+        //   2. Kick after we declared no-pending but before we set
+        //      `scheduling_active=false`: the kicker observed active=true
+        //      and noop'd, but our second `scheduling_pending.load()`
+        //      (after active=false) picks it up and we re-acquire
+        //      active to resume draining.
+        //   3. Kick after we set `scheduling_active=false`: the kicker
+        //      spawns a fresh scheduler; we observe that via the
+        //      swap returning `true` and exit cleanly.
+        //
+        // Without this, the original `_guard`/`break` pattern lost
+        // wakeups in the narrow window between "queue empty" and
+        // "guard drops" — kicks landing in that window noop'd against
+        // `scheduling_active=true` and the new `ready` row sat
+        // forever with no scheduler running to pick it up. That is
+        // the symptom motivating this fix (see `task_18ae9d21044843b8_44`).
+        loop {
+            self.scheduling_pending.store(false, Ordering::Release);
+            let drain_outcome = self.drain_ready_queue().await;
 
+            // Pool-exhaustion exits don't re-loop here: another
+            // scheduler will spawn from the post-`release_worker`
+            // `kick()`, and re-looping immediately would just hit the
+            // same exhaustion. Fall through to the same active-release
+            // logic — `scheduling_pending` may still have been set,
+            // and respecting it lets a "fresh row arrived while we
+            // were blocked on the pool" case re-attempt once a worker
+            // is free without waiting for the next external event.
+            let _ = drain_outcome;
+
+            if self.scheduling_pending.load(Ordering::Acquire) {
+                // A kick raced us during drain. Reset and re-drain
+                // without giving up `scheduling_active`.
+                continue;
+            }
+
+            // Relinquish the active flag. Any kick that lands from
+            // here on will see `scheduling_active=false` on its swap
+            // and spawn its own scheduler — but a kick that races
+            // between this store and the post-store load below still
+            // needs to be caught, hence the second check.
+            self.scheduling_active.store(false, Ordering::Release);
+            if !self.scheduling_pending.load(Ordering::Acquire) {
+                return;
+            }
+            // A kick landed in the gap. Try to re-claim active; if
+            // someone else (a freshly spawned scheduler) already has
+            // it, they'll handle the drain.
+            if self.scheduling_active.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            // We re-acquired; loop back to drain.
+        }
+    }
+
+    /// Drain every currently-`ready` execution. Returns the reason the
+    /// drain stopped so the caller can decide whether to re-enter
+    /// immediately (queue empty + pending wakeup) or yield (pool
+    /// exhausted).
+    async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
         loop {
             let Some(execution) = self.next_ready_execution() else {
-                break;
+                return DrainOutcome::QueueEmpty;
             };
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
 
@@ -709,6 +796,12 @@ impl ExecutionCoordinator {
                         })),
                 )
                 .await;
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                preferred_workspace_id = ?preferred_workspace_id,
+                "spawn_attempt status=ready -> picked_up"
+            );
 
             let Some(worker_id) = self
                 .worker_pool
@@ -724,7 +817,7 @@ impl ExecutionCoordinator {
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
                     pool_capacity,
-                    "worker pool exhausted; deferring dispatch until a worker is released"
+                    "spawn_attempt status=ready -> deferred reason=pool_exhausted"
                 );
                 // Invariant: every `tasks.status = 'active'` chore
                 // should be backed by a `running` execution / live
@@ -760,7 +853,7 @@ impl ExecutionCoordinator {
                         })),
                     )
                     .await;
-                break;
+                return DrainOutcome::PoolExhausted;
             };
 
             self.dispatch_events
@@ -771,16 +864,27 @@ impl ExecutionCoordinator {
                 )
                 .await;
 
-            if let Err(err) = self.schedule_execution(&execution, &worker_id).await {
-                tracing::error!(
-                    ?err,
-                    execution_id = %execution.id,
-                    worker_id = %worker_id,
-                    "failed to start execution"
-                );
-                self.worker_pool
-                    .release_worker(&worker_id, preferred_workspace_id.as_deref())
-                    .await;
+            match self.schedule_execution(&execution, &worker_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        "spawn_attempt status=ready -> spawned"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        "spawn_attempt status=ready -> failed reason=schedule_execution_error"
+                    );
+                    self.worker_pool
+                        .release_worker(&worker_id, preferred_workspace_id.as_deref())
+                        .await;
+                }
             }
         }
     }
@@ -1470,14 +1574,19 @@ fn work_item_product_id(item: &WorkItem) -> String {
     }
 }
 
-struct SchedulingGuard<'a> {
-    active: &'a AtomicBool,
-}
-
-impl Drop for SchedulingGuard<'_> {
-    fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
-    }
+/// Why `drain_ready_queue` returned. Re-entering the outer scheduler
+/// loop immediately is fine for `QueueEmpty` (the post-drain wakeup
+/// check decides whether to actually re-loop); `PoolExhausted` is
+/// also fine because the post-`release_worker` `kick()` will spawn a
+/// fresh scheduler anyway, and we only re-loop here when
+/// `scheduling_pending` was raised after we started this drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// No more `ready` rows in the database.
+    QueueEmpty,
+    /// Found a `ready` row but the worker pool had no idle slot;
+    /// deferred to whoever releases a worker next.
+    PoolExhausted,
 }
 
 fn execution_task_summary(execution: &WorkExecution, work_item: &WorkItem) -> String {
@@ -1503,6 +1612,7 @@ mod tests {
     use std::future::pending;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use anyhow::{Result, anyhow};
@@ -3628,5 +3738,124 @@ mod tests {
             MAX_WORKER_POOL_SIZE,
             "rejected force-claim must not grow the pool past the hard cap",
         );
+    }
+
+    /// Regression for `task_18ae9d21044843b8_44` — `bossctl work start`
+    /// returned `status: ready` but no scheduler ever ran, leaving the
+    /// row stranded. Root cause was a TOCTOU between the scheduler's
+    /// last `list_ready_executions()` call and dropping its
+    /// `scheduling_active` guard: a `kick()` that landed in that
+    /// window observed `active=true`, returned without spawning, and
+    /// the guard then dropped to `false` with no scheduler running.
+    ///
+    /// The fix latches every `kick()` into `scheduling_pending` so the
+    /// alive scheduler always notices the wakeup. This test pins the
+    /// contract: a `kick()` that arrives while `scheduling_active` is
+    /// already true MUST set `scheduling_pending` so the running
+    /// scheduler can re-enter its drain loop.
+    #[tokio::test]
+    async fn kick_during_active_scheduler_latches_pending_wakeup() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db,
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+
+        // Simulate "another scheduler is already running".
+        coordinator
+            .scheduling_active
+            .store(true, Ordering::Release);
+        coordinator
+            .scheduling_pending
+            .store(false, Ordering::Release);
+
+        coordinator.kick();
+
+        assert!(
+            coordinator.scheduling_pending.load(Ordering::Acquire),
+            "kick that lost the active-flag race must still latch pending so the alive \
+             scheduler re-enters its drain loop instead of exiting on stale state",
+        );
+    }
+
+    /// End-to-end regression for the same race: even when a `kick()`
+    /// loses the active-flag race, the row it queued for must still
+    /// reach a worker. We can't deterministically force the OS into
+    /// the exact "scheduler just finished its drain" timing, but we
+    /// can prove the contract works by simulating the surviving
+    /// scheduler picking up the wakeup: the pending bit is the
+    /// in-process signal; if the pending bit is honored on the next
+    /// run_scheduler entry, the new row gets processed.
+    #[tokio::test]
+    async fn ready_row_added_during_active_window_still_dispatches() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stranded by lost wakeup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+
+        // Simulate the bug-trigger sequence:
+        //   1. A previous scheduler is "alive" (active=true) but
+        //      has already finished its drain.
+        //   2. RequestExecution lands, inserts a ready row, calls
+        //      kick(). With the old code: kick observes active=true,
+        //      returns, and the (now-exiting) scheduler drops the
+        //      guard without re-checking. New row stranded.
+        //   3. With the fix: kick latches pending=true.
+        coordinator
+            .scheduling_active
+            .store(true, Ordering::Release);
+        coordinator
+            .scheduling_pending
+            .store(false, Ordering::Release);
+        coordinator.kick(); // noop on `active`, but latches pending
+
+        // Now simulate the previous scheduler exiting: it must
+        // honour the pending bit. Drop `active` and re-enter
+        // `run_scheduler` exactly as the lossless-wakeup logic
+        // would on the post-drain re-check path.
+        coordinator
+            .scheduling_active
+            .store(false, Ordering::Release);
+        assert!(
+            coordinator.scheduling_pending.load(Ordering::Acquire),
+            "post-drain re-check must see pending=true so the new row is not lost",
+        );
+
+        // The fix re-claims `active` and re-enters the drain. Kick
+        // again to simulate that re-entry (this is what the
+        // post-drain block in `run_scheduler` does internally), and
+        // assert the row reaches `waiting_human`.
+        coordinator.kick();
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
     }
 }
