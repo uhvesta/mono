@@ -3976,20 +3976,8 @@ async fn handle_frontend_connection(
                     );
                     continue;
                 }
-                match server_state.work_db.get_run(&run_id) {
-                    Ok(run) => {
-                        let Some(transcript_path) = run.transcript_path.clone() else {
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: format!(
-                                        "run {run_id} has no transcript path recorded"
-                                    ),
-                                },
-                            );
-                            continue;
-                        };
+                match resolve_transcript_for_tail(&server_state, &run_id) {
+                    TranscriptResolution::Found { transcript_path } => {
                         match read_transcript_tail(&transcript_path, lines).await {
                             Ok((lines_out, truncated)) => {
                                 send_response(
@@ -4016,12 +4004,32 @@ async fn handle_frontend_connection(
                             }
                         }
                     }
-                    Err(err) => {
+                    TranscriptResolution::Buffering => {
                         send_response(
                             &sink,
                             &request_id,
                             FrontendEvent::WorkError {
-                                message: err.to_string(),
+                                message: format!(
+                                    "{TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX}{run_id}: engine has not yet received a hook event carrying transcript_path (retry in a few seconds)"
+                                ),
+                            },
+                        );
+                    }
+                    TranscriptResolution::KnownNoTranscript => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("run {run_id} has no transcript path recorded"),
+                            },
+                        );
+                    }
+                    TranscriptResolution::Unknown => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("unknown run: {run_id}"),
                             },
                         );
                     }
@@ -5100,6 +5108,101 @@ fn terminal_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Option<String>
 /// decide how to render. A missing file is reported as an io error
 /// instead of returning an empty result so callers can distinguish
 /// "no transcript yet" from "transcript is empty".
+/// Machine-parseable prefix for the "transcript not yet available"
+/// WorkError. Callers can match against this to distinguish a live
+/// worker whose first transcript-bearing hook hasn't fired yet
+/// (transient, retry) from a run id that's genuinely unknown to the
+/// engine (terminal, surface as user error). Keep stable — the
+/// coordinator parses it.
+const TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX: &str = "transcript not yet available for run ";
+
+/// Outcome of [`resolve_transcript_for_tail`].
+#[derive(Debug, PartialEq, Eq)]
+enum TranscriptResolution {
+    /// A transcript path was resolved and can be read.
+    Found { transcript_path: String },
+    /// The id refers to a worker the engine knows is live (or whose
+    /// execution row exists) but no hook event has yet carried a
+    /// `transcript_path` for it — the dispatcher hasn't populated the
+    /// column or the in-memory cache yet. Surfacing this separately
+    /// from `Unknown` is the structural fix for the 2026-05-12
+    /// incident where `bossctl agents list` knew about a live run but
+    /// `bossctl agents transcript` rejected the same id as `unknown
+    /// run`, breaking the coordinator's diagnostic path.
+    Buffering,
+    /// The id resolves to a `work_runs` row or `work_executions` row
+    /// that has finished (or never recorded a transcript path).
+    KnownNoTranscript,
+    /// No `work_runs` row, no `work_executions` row, no live registry
+    /// entry — the id is genuinely unknown to the engine.
+    Unknown,
+}
+
+/// Resolve a transcript path for the `TailRunTranscript` verb.
+///
+/// `bossctl agents transcript` always passes
+/// [`LiveWorkerState::run_id`], which aliases the *execution* id
+/// (`exec_*`) — the spawn flow stamps `WorkItemBinding.execution_id`
+/// onto the registry entry. The pre-fix handler called
+/// `work_db.get_run(run_id)`, which joins against `work_runs.id`
+/// (`run_*`), so every transcript tail for a live worker returned
+/// `unknown run` even when `agents list` reported the same worker
+/// as `working`. This mirrors the cross-namespace bug fixed on the
+/// write side in PR #384 and on the [`TranscriptPathResolver`] read
+/// side immediately after. The resolver here is the
+/// `TailRunTranscript` analogue: it tries the cache first (the
+/// dispatcher's hot path), then both DB namespaces, and finally falls
+/// back to the live registry so a worker that's been registered but
+/// hasn't yet emitted a transcript-bearing hook surfaces as
+/// `Buffering` rather than `Unknown`.
+fn resolve_transcript_for_tail(
+    server_state: &ServerState,
+    run_id: &str,
+) -> TranscriptResolution {
+    // Hot path: the dispatcher's in-memory cache, keyed on the same
+    // execution-id namespace the live registry uses. Populated by
+    // every hook event that carries `transcript_path`, so once the
+    // first transcript-bearing hook lands this resolves immediately
+    // even if the SQL write hasn't completed yet.
+    if let Some(transcript_path) = server_state.transcript_path_cache.get(run_id) {
+        return TranscriptResolution::Found { transcript_path };
+    }
+
+    // Persisted path: try the `run_*` namespace, then the `exec_*`
+    // namespace. Either may succeed depending on what the caller had
+    // in hand. `bossctl` passes `exec_*`; programmatic callers may
+    // pass `run_*`.
+    let run_lookup = server_state.work_db.get_run(run_id).ok();
+    if let Some(transcript_path) = run_lookup
+        .as_ref()
+        .and_then(|run| run.transcript_path.clone())
+    {
+        return TranscriptResolution::Found { transcript_path };
+    }
+    let exec_path = server_state
+        .work_db
+        .transcript_path_for_execution(run_id)
+        .ok()
+        .flatten();
+    if let Some(transcript_path) = exec_path {
+        return TranscriptResolution::Found { transcript_path };
+    }
+
+    // No path on either row. Decide between "known but no transcript",
+    // "live worker still buffering", and "genuinely unknown".
+    let run_known = run_lookup.is_some();
+    let execution_known = server_state.work_db.get_execution(run_id).is_ok();
+    let is_live = server_state.live_worker_states.is_run_live(run_id);
+
+    if is_live {
+        return TranscriptResolution::Buffering;
+    }
+    if run_known || execution_known {
+        return TranscriptResolution::KnownNoTranscript;
+    }
+    TranscriptResolution::Unknown
+}
+
 async fn read_transcript_tail(
     transcript_path: &str,
     lines: usize,
@@ -7382,6 +7485,187 @@ mod tests {
         assert!(
             wrong.is_none(),
             "resolver must not satisfy a work_runs.id lookup as if it were an execution id; got {wrong:?}",
+        );
+    }
+
+    /// Regression test for the 2026-05-12 bug where `bossctl agents
+    /// transcript` rejected a live worker's transcript as `unknown
+    /// run`. The reproduction:
+    ///
+    /// 1. `agents list` reports the worker with `run = exec_*` (its
+    ///    `LiveWorkerState.run_id`, which aliases the execution id).
+    /// 2. The worker has been registered via `register_spawn` but has
+    ///    not yet emitted a hook event with `transcript_path`, so
+    ///    `work_runs.transcript_path` is still NULL.
+    /// 3. `TailRunTranscript` resolved the path with
+    ///    `work_db.get_run(run_id)`, which joins against
+    ///    `work_runs.id` (a `run_*` namespace) — the lookup never
+    ///    matched and the verb bailed with `unknown run: exec_*`.
+    ///
+    /// The post-fix [`resolve_transcript_for_tail`] tries both
+    /// namespaces and falls back to the live registry, so this case
+    /// must return [`TranscriptResolution::Buffering`] (the engine
+    /// will then surface a stable `transcript not yet available`
+    /// WorkError to the caller).
+    #[tokio::test]
+    async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() {
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let (execution, _run) = server_state
+            .work_db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        // Mirror the production spawn flow: the live registry is
+        // stamped with the execution id (see `spawn_flow::start_worker`).
+        // No hook events have fired yet, so transcript_path is NULL
+        // on the work_runs row and absent from the cache.
+        let slot_id = 6u8;
+        server_state
+            .live_worker_states
+            .register_spawn(slot_id, execution.id.clone(), "claude-opus-4-7", 0, None);
+
+        // Pre-fix this returned `Unknown` (the `get_run(exec_*)`
+        // call bailed) — the post-fix resolver must surface
+        // `Buffering` so the verb's caller knows the run is live and
+        // the transcript will materialise shortly.
+        let resolution = resolve_transcript_for_tail(&server_state, &execution.id);
+        assert_eq!(
+            resolution,
+            TranscriptResolution::Buffering,
+            "live worker with no transcript_path yet must resolve as Buffering, not Unknown — pre-fix the verb rejected `agents transcript` for in-flight workers"
+        );
+
+        // Genuinely unknown ids must still resolve as `Unknown` so the
+        // caller can distinguish a typo / stale id from a live worker
+        // mid-spawn.
+        assert_eq!(
+            resolve_transcript_for_tail(&server_state, "exec_does_not_exist"),
+            TranscriptResolution::Unknown,
+            "an id with no DB row and no live entry must resolve as Unknown",
+        );
+    }
+
+    /// Companion to the test above: once a hook event carries the
+    /// `transcript_path`, the cache and the persisted `work_runs.transcript_path`
+    /// both surface the same path through the resolver, regardless of
+    /// whether the caller passes the `exec_*` or `run_*` namespace.
+    #[tokio::test]
+    async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let (execution, run) = server_state
+            .work_db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        let path = "/home/u/.claude/projects/foo/sess-1.jsonl";
+        let event = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(execution.id.clone()),
+            transcript_path: Some(path.into()),
+            event: WorkerEvent::SessionStart {
+                session_id: "claude-sess-1".into(),
+                source: crate::protocol::SessionStartSource::Startup,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &event).await;
+
+        // Both reference shapes resolve to the same path. This is what
+        // breaks `agents transcript exec_*` and `agents transcript
+        // <run_*>` when the engine resolves the wrong namespace.
+        assert_eq!(
+            resolve_transcript_for_tail(&server_state, &execution.id),
+            TranscriptResolution::Found {
+                transcript_path: path.to_owned(),
+            },
+            "execution-id lookup must surface the persisted transcript_path",
+        );
+        assert_eq!(
+            resolve_transcript_for_tail(&server_state, &run.id),
+            TranscriptResolution::Found {
+                transcript_path: path.to_owned(),
+            },
+            "work_runs-id lookup must surface the persisted transcript_path",
         );
     }
 
