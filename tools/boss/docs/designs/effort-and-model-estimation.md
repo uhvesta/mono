@@ -39,10 +39,10 @@ This doc is the contract those three tasks implement against.
 
 ## Naming
 
-- New column: **`effort_level`** on the `tasks` table. Enum: `trivial | small | medium | large`. Stored as TEXT for legibility in `sqlite3` dumps; constrained in code, not by a `CHECK`.
+- New column: **`effort_level`** on the `tasks` table. Enum: `trivial | small | medium | large | max`. Stored as TEXT for legibility in `sqlite3` dumps; constrained in code, not by a `CHECK`. `trivial`–`large` are the four scope-flavored values the coordinator's heuristic emits; `max` is an explicit escape-hatch the heuristic never assigns (Q1).
 - New column: **`model_override`** on the `tasks` table. Nullable TEXT containing a *model slug*. Empty / NULL means "no override."
 - Model slugs are the same strings `claude --model` accepts: `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, and the short aliases `opus`, `sonnet`, `haiku`. The dispatcher does not invent new slugs; the worker is what consumes them and `claude` is the source of truth on what resolves.
-- CLI flags: `--effort {trivial|small|medium|large}` and `--model <slug>` on `boss chore create`, `boss task create`, and the chore/task `edit` verbs.
+- CLI flags: `--effort {trivial|small|medium|large|max}` and `--model <slug>` on `boss chore create`, `boss task create`, and the chore/task `edit` verbs.
 - Heuristic output type (in the coordinator): **`EffortEstimate { level, confidence, reasons }`**. `reasons` is a short list of strings ("description length > 4 KB", "matches `investigate` marker") so the coordinator can explain its choice in the chore's creation message.
 
 ---
@@ -52,19 +52,21 @@ This doc is the contract those three tasks implement against.
 ### Options
 
 - **(a) Three values: `small | medium | large`.** Matches t-shirt sizing. Concise.
-- **(b) Four values: `trivial | small | medium | large`.** Adds an explicit "this is mechanical / one-line" tier.
-- **(c) Five values: `trivial | small | medium | large | xlarge`.** Adds an explicit "investigation across many files" tier above `large`.
+- **(b) Four scope-flavored values plus a max escape hatch: `trivial | small | medium | large | max`.** Four levels the coordinator can pick from based on scope; `max` reserved for explicit human override.
+- **(c) Adopt Claude's effort vocabulary directly: `low | medium | high | xhigh | max`.** Removes any translation layer; the column stores exactly what `claude --effort` expects.
 - **(d) Numeric 1–5.** Maximum flexibility, zero memorability.
 
 ### Decision
 
-**(b) — `trivial | small | medium | large`.**
+**(b) — `trivial | small | medium | large | max`.**
 
 Three is too few: the `trivial` cases (one-line CSS fixes, dependency bumps, apply-the-same-fix-elsewhere chores) are common enough and cheap enough that conflating them with `small` loses the very signal we are introducing the enum to capture. The Haiku-vs-Sonnet decision happens right at the `trivial`/`small` boundary; collapsing them removes the boundary.
 
-Five is too many: the difference between `large` and `xlarge` is not a model decision (both pin to Opus) and is not a token-cap decision (Opus's defaults already accommodate both). It is at most a *planning step* decision, and the cost of getting the planning step wrong is small. The extra level adds classification anxiety for the coordinator without changing dispatch behaviour.
+Adopting Claude's vocabulary directly (option c) is genuinely attractive — it removes the level-to-effort translation layer in the dispatcher and keeps the column legible against `claude --help`. We reject it for one specific reason: the coordinator's heuristic in Q4 is fundamentally *scope-classifying* ("description ≥ 4 KB → large", "matches `investigate` marker → large"). The labels `trivial / small / medium / large` carry that scope meaning faithfully; `low / medium / high / xhigh` carry token-spend meaning, which is one inference away from scope. Keeping the column scope-flavored makes the heuristic's reasons strings ("estimated `large` — investigate marker matched") read naturally to a human reviewing a chore. The mapping to Claude's effort values is a single small table in the dispatcher (Q2); we pay that cost once.
 
-Four values give us exactly the boundaries where dispatch actually changes (see Q2). Numeric is rejected on legibility grounds — `effort_level = 'small'` in a SQLite dump is self-documenting; `effort_level = 2` is not.
+`max` is added as a fifth value with a deliberately different naming pattern: it is *not* a scope description, it is an escape hatch. The coordinator's heuristic in Q4 never emits `max` — only humans set it, via `--effort max` on the CLI. Use cases: "this is genuinely frontier work and the cost is justified," or "the human evaluated this carefully and wants Opus 4.7 at maximum effort regardless of what the markers suggest." Reserving `max` here (rather than only as a `--model`-side override) keeps the effort axis self-contained: humans don't have to think about model overrides when what they really want is more reasoning depth.
+
+Numeric is rejected on legibility grounds — `effort_level = 'small'` in a SQLite dump is self-documenting; `effort_level = 2` is not.
 
 ### Concrete examples per level (drawn from real chores)
 
@@ -96,47 +98,58 @@ Four values give us exactly the boundaries where dispatch actually changes (see 
 
 `design`-kind tasks (per [`design-producing-tasks`](design-producing-tasks.md)) are implicitly `large` — a design doc is an investigation by definition. The coordinator may still attach an explicit `effort_level = 'large'` for clarity, but the dispatcher treats unset-on-design as `large`.
 
+`max` deliberately has no example list. By construction it is reached only via explicit `--effort max` on the CLI; if you find yourself wanting an example of "a `max` chore," you almost certainly want `large` and trust the dispatcher to pick `xhigh` effort. Use `max` when the human's evaluation says the chore is worth Claude's absolute-maximum reasoning depth — frontier debugging across many subsystems, design synthesis under unusual ambiguity, the kind of case where the doc on Claude's `effort` parameter says "reserve for genuinely frontier problems."
+
 ---
 
 ## Design Question 2 — What Each Level Controls at Dispatch Time
 
 ### The candidate knob list
 
-The project description names five candidates: default model, per-execution token cap, default subagent depth, whether the worker plans before executing, default timeout. We add one more from inspection of the spawn flow: the `claude` thinking-token budget.
+The project description names five candidates: default model, per-execution token cap, default subagent depth, whether the worker plans before executing, default timeout. We add one more: a small per-level prompt addendum.
 
-For v1, we keep **only the knobs whose configuration the dispatcher actually has a clean path to set today**. Anything that requires a new RPC to the worker, or a new claude-side feature, is filed as a follow-up.
+For v1, we keep **only the knobs whose configuration the dispatcher actually has a clean path to set today** — and we prefer Claude's native controls to anything we'd reinvent. Anything that requires a new RPC to the worker, or a new claude-side feature, is filed as a follow-up.
 
-### What the dispatcher can wire today
+### Use Claude's native effort parameter, not env-var token caps
 
-The dispatcher's spawn path is `runner.rs:279` writing a single shell line into the pty. It can change:
+An earlier draft of this doc set `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and `MAX_THINKING_TOKENS` env vars on the worker subprocess to bound spend per level. That was reinventing something Claude already exposes natively: the **`output_config.effort`** API parameter, documented at <https://platform.claude.com/docs/en/build-with-claude/effort>. The accepted values are `low | medium | high | xhigh | max`. Crucially, effort affects *all* output tokens — text, tool calls, and (for adaptive-thinking models) extended thinking — without us having to hand-roll separate token caps. The Claude docs explicitly recommend effort as the replacement for `budget_tokens` on Opus 4.6 / Sonnet 4.6, and as the canonical control on Opus 4.7's adaptive thinking.
 
-- The `claude` command line it writes — adding `--model <slug>`.
-- The env vars in `SpawnWorkerPaneInput.env` (which propagate to the claude subprocess) — setting `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, `MAX_THINKING_TOKENS` (where supported), and any future claude env knobs.
-- The initial prompt text written to `.claude/initial-prompt.txt` (`runner.rs:272`) — adding a small per-level addendum (e.g. for `large`, "start with a brief plan before editing").
-- The worker-pane `settings.json` rendered by `worker_setup.rs:render_settings_json` — but that file is currently a hook config and we do not propose making per-level edits to it. Settings stay shared.
+The `claude` CLI (Claude Code) exposes this as `--effort <level>` with the same five values (`claude --help`). Today's spawn line, `claude "$(cat .claude/initial-prompt.txt)"` at `engine/src/runner.rs:279`, becomes `claude --model <slug> --effort <level> "$(cat .claude/initial-prompt.txt)"`. One CLI flag, one API parameter, no env-var token caps anywhere in the dispatch path.
 
-That gives us a clean trio: **model**, **token caps**, **prompt addendum**. Everything else either requires new claude features or duplicates one of those three.
+### What the dispatcher wires per level
+
+Two knobs come out of `effort_level`, plus one independent knob from `model_override`:
+
+| Knob | Source | How the dispatcher applies it |
+|---|---|---|
+| **Claude effort** | `effort_level` (Q1 enum) → Claude effort value via the mapping table below | `claude --effort <claude-value>` |
+| **Model** | Q3 precedence: `model_override` → effort default → product default → engine default | `claude --model <slug>` |
+| **Prompt addendum** | `effort_level` (Q1 enum) | Appended to `.claude/initial-prompt.txt` before the existing prompt body |
+
+The prompt addendum is explicitly **additive and secondary** to the native effort signal. Claude's `--effort` does the heavy lifting on how thoroughly the worker reasons and how many tokens it spends; the addendum is a light nudge on *behaviour* — "sketch a plan first" — that complements but does not replace the native control. If a level's addendum is `none`, the prompt is unchanged from today.
 
 ### The chosen mapping
 
-| Level | Default model | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `MAX_THINKING_TOKENS` | Prompt addendum |
-|---|---|---|---|---|
-| `trivial` | `claude-haiku-4-5-20251001` | 8192 | 0 (no thinking) | none — direct execution |
-| `small` | `claude-sonnet-4-6` | 16384 | 4096 | none |
-| `medium` | `claude-sonnet-4-6` | 32768 | 16384 | "Sketch a brief plan before you start editing." |
-| `large` | `claude-opus-4-7` | 65536 | 32768 | "Begin with a written plan. Identify the files you expect to touch and the order you'll touch them in. Confirm the approach against the work item's description before writing code." |
+| Level | Default model | `claude --effort` | Prompt addendum |
+|---|---|---|---|
+| `trivial` | `claude-haiku-4-5-20251001` | `low` | none — direct execution |
+| `small` | `claude-sonnet-4-6` | `medium` | none |
+| `medium` | `claude-sonnet-4-6` | `high` | "Sketch a brief plan before you start editing." |
+| `large` | `claude-opus-4-7` | `xhigh` | "Begin with a written plan. Identify the files you expect to touch and the order you'll touch them in. Confirm the approach against the work item's description before writing code." |
+| `max` | `claude-opus-4-7` | `max` | "Begin with a written plan. Identify the files you expect to touch and the order you'll touch them in. Confirm the approach against the work item's description before writing code." |
 
-A couple of notes on the table:
+A few notes on the table:
 
-- **Model defaults bracket the price/latency curve.** Haiku for `trivial`, Sonnet for the middle, Opus for `large`. The boundary between `small` and `medium` is on Sonnet specifically because the difference there is *prompt + budget*, not model class.
-- **Token caps are headroom, not targets.** Most `trivial` runs finish under 2K output tokens; 8K is just enough to avoid biting on a misclassified row. The cap exists because Opus's defaults are generous enough that a runaway worker on a misclassified `trivial` could burn 100K tokens before it noticed.
-- **`MAX_THINKING_TOKENS=0` on `trivial`** disables extended thinking entirely. For a mechanical edit, thinking is pure overhead.
-- **Prompt addenda are concatenated to the existing spawn prompt** in `spawn_flow.rs` (the prompt the worker reads from `.claude/initial-prompt.txt`). They are not template-replacements of the existing prompt — the existing prompt's task-implementation framing stays.
+- **The effort mapping follows Claude's published guidance.** The Claude docs recommend `medium` as the Sonnet 4.6 default and `xhigh` as the Opus 4.7 starting point for coding/agentic work; the table aligns with that. `trivial → low` matches Claude's "simpler tasks, lowest cost" use case for Haiku.
+- **Model defaults bracket the price/latency curve.** Haiku for `trivial`, Sonnet for the middle, Opus for `large` and `max`. The boundary between `small` and `medium` is on Sonnet specifically because the difference there is *effort + prompt*, not model class.
+- **`max` and `large` share a model and prompt addendum** — they diverge only on the effort value. That captures the intent of `max`: "treat this as a `large` row but explicitly authorize Claude to spend up to its maximum reasoning depth."
+- **Prompt addenda are concatenated to the existing spawn prompt** in the path that writes `.claude/initial-prompt.txt` (currently `runner.rs:272`). They are not template-replacements of the existing prompt — the existing prompt's task-implementation framing stays. If a level's addendum is `none`, the prompt is byte-identical to today.
 
 ### Knobs explicitly *not* in v1
 
+- **Per-level env-var token caps** (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, `MAX_THINKING_TOKENS`). Superseded by `--effort`. Claude's effort parameter already affects all output tokens including extended thinking; the env vars would either fight the effort signal or be redundant with it. If we ever observe a level whose `--effort` setting gives the wrong shape of spend, raise it as a re-tune of the table above, not as a parallel cap mechanism.
 - **Default timeout.** The engine already has a worker-watchdog story (independent of effort); a separate per-level timeout adds a second escape hatch we do not need. Re-evaluate after we have data from a few weeks of `large` runs.
-- **Default subagent depth.** Claude already lets the worker spawn subagents at its own discretion. The right knob would be a *budget* on subagent spawns, not a depth limit, and we do not have that surface yet. Filed as a follow-up.
+- **Default subagent depth.** Claude already lets the worker spawn subagents at its own discretion, and the effort parameter already biases the model toward fewer tool/subagent calls at lower levels. The right additional knob would be an explicit *budget* on subagent spawns, not a depth limit, and we do not have that surface yet. Filed as a follow-up.
 - **Per-execution wall-clock cost cap.** Out of scope for v1; this is the per-product budget non-goal.
 
 ---
@@ -159,11 +172,11 @@ The CLI surface autocompletes against the short aliases; the column stores whate
 When the dispatcher picks the model for a worker, it resolves in this order, taking the first non-empty value:
 
 1. **`tasks.model_override`** — explicit per-row override.
-2. **Effort-level default** — `trivial → haiku`, `small / medium → sonnet`, `large → opus` (per Q2).
+2. **Effort-level default** — `trivial → haiku`, `small / medium → sonnet`, `large / max → opus` (per Q2).
 3. **Product default** — `products.default_model` (new column, nullable). Lets a product owner say "default everything on this product to Sonnet."
 4. **Engine default** — whatever `claude` resolves to with no `--model` flag (currently Opus 4.7).
 
-Token caps and the prompt addendum follow effort level *only*; `model_override` does not change them. The rationale: a user who overrides to Haiku on a `medium` row is asking "use Haiku for this one," not "treat this as a trivial." If they want a `trivial`-shaped run, they set `effort_level = 'trivial'`.
+The effort value and the prompt addendum follow `effort_level` *only*; `model_override` does not change them. The rationale: a user who overrides to Haiku on a `medium` row is asking "use Haiku for this one," not "treat this as a trivial." If they want a `trivial`-shaped run (Haiku at `low` effort, no addendum), they set `effort_level = 'trivial'`.
 
 ### What lives where
 
@@ -194,6 +207,8 @@ It does **not** have access to repo structure, file paths the work might touch, 
 ### Outputs
 
 `EffortEstimate { level, confidence: low | medium | high, reasons: Vec<String> }`. The coordinator stores `level` on the row and posts `reasons` as a short message into the chore's transcript when it files it ("Estimated `small` — single-file marker matched; description under 1.5 KB; no investigation marker.").
+
+The heuristic emits only `trivial | small | medium | large`. It never assigns `max`; that level is reserved for explicit human invocation via `--effort max` (per Q1). If the coordinator believes a chore warrants more effort than `large`, the right action is to surface that recommendation in the reasons string and let the human upgrade to `max`, not to make the call automatically.
 
 ### The rules
 
@@ -273,9 +288,10 @@ Three reasons:
 These are deliberately *not* answered in v1, to keep the implementation tasks narrow.
 
 1. **Do we expose `effort_level` on the kanban card?** Probably yes (a small badge), but the visual design is the macOS app's call. Filed against the existing kanban design surface.
-2. **What's the right default for `medium` token caps?** 32K is a guess. The dispatcher task should make these caps trivial to tune without a schema change (e.g. read from a config table or constants module). Tune after a few weeks of real runs.
-3. **Does `effort_level` carry across when a worker spawns subagents?** The subagent inherits the worker's claude session and therefore its model; we do not have a separate dispatch path for subagents. No action needed unless we add one.
-4. **Should `model_override` accept a *list* of fallbacks?** ("Try Sonnet; if it 5xxes, drop to Haiku.") Not needed today; `claude` has its own fallback logic. Revisit if we see API-side outages biting in practice.
+2. **Is the Q2 effort mapping right per model?** `medium → high` on Sonnet and `large → xhigh` on Opus 4.7 follow Claude's published recommendations, but the mapping is a guess for our specific workload distribution. The dispatcher task should make the table trivial to tune without a schema change (e.g. read from a constants module). Re-evaluate after a few weeks of real runs by looking at which levels stall, escalate, or finish underspending.
+3. **Does `effort_level` carry across when a worker spawns subagents?** The subagent inherits the worker's claude session and therefore its model and effort; we do not have a separate dispatch path for subagents. No action needed unless we add one.
+4. **Should `model_override` accept a *list* of fallbacks?** ("Try Sonnet; if it 5xxes, drop to Haiku.") Not needed today; `claude` has its own fallback logic via `--fallback-model`. Revisit if we see API-side outages biting in practice.
+5. **Should we add a `boss product set-default-effort`?** Symmetric with `set-default-model`. Not in v1 because no product has yet asked for a default that disagrees with the heuristic. File if we see a product whose chores systematically classify wrong out of the box.
 
 ---
 
@@ -285,7 +301,7 @@ These are deliberately *not* answered in v1, to keep the implementation tasks na
 
 **R2 — `model_override` slugs drift.** A row written today with `model_override = 'claude-opus-4-7'` becomes invalid the day Opus 4.8 ships and 4.7 retires. Mitigation: store the slug verbatim; on the day of retirement claude will surface an error; the human edits the row or clears the override. We do not silently rewrite stored slugs.
 
-**R3 — Token caps clip legitimate output.** A `medium` worker that hits 32K of output tokens and is then clipped looks like a worker stall. Mitigation: the dispatcher logs the cap it set; the existing dispatch instrumentation ([`engine-dispatch-instrumentation`](engine-dispatch-instrumentation.md)) surfaces this on the live-status pane. If we see clips, raise the cap or escalate the level.
+**R3 — Effort-level mistuning under-scopes legitimate work.** Claude's effort parameter is a behavioural signal, not a strict cap, but a worker spawned at `--effort low` will systematically explore less than the same chore at `--effort high`. If our `trivial → low` and `small → medium` defaults are too aggressive for some chore shape, the worker stops short. Mitigation: the dispatcher logs the effort value it set; the existing dispatch instrumentation ([`engine-dispatch-instrumentation`](engine-dispatch-instrumentation.md)) surfaces this on the live-status pane. If we see workers stalling at lower effort levels, retune the Q2 table or escalate via Q5.
 
 **R4 — Haiku is not capable enough for a "trivial" we labelled wrong.** A misclassified `trivial` running on Haiku produces a worse result than the same chore on Sonnet would. Mitigation: the Stop-boundary escalation path (Q5) covers this; the worker stops short, the coordinator re-classifies, the next dispatch uses Sonnet.
 
@@ -304,10 +320,9 @@ The three sibling tasks of this project are exactly the right granularity:
 1. **Schema + CLI surface for `effort_level` and `model_override`** (`task_18aebf113fe16d20_e`). Adds `tasks.effort_level`, `tasks.model_override`, `products.default_model`. Adds `--effort` and `--model` flags to `boss chore create`, `boss task create`, and the `edit` verbs. Adds `boss product set-default-model`. Migration is a no-op for existing rows (level stays NULL; dispatcher treats NULL as "fall through to product/engine default" — see Q3).
 2. **Dispatcher: honour `effort_level` and `model_override` at worker spawn** (`task_18aebf12c23f1ff0_f`). `engine/src/runner.rs:279` learns to read both fields and:
    - resolve the model per Q3's precedence,
-   - construct `claude --model <slug>` instead of bare `claude`,
-   - set `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and `MAX_THINKING_TOKENS` env vars per Q2's table via `SpawnWorkerPaneInput.env`,
-   - append the per-level prompt addendum to `.claude/initial-prompt.txt`.
-   Surfaces the chosen model and level on the dispatch instrumentation stream so it's visible per-spawn.
+   - construct `claude --model <slug> --effort <claude-value>` instead of bare `claude`, mapping `effort_level` → Claude effort value via Q2's table,
+   - append the per-level prompt addendum to `.claude/initial-prompt.txt` when the level has one.
+   No env vars are set on the worker process for token caps — Claude's `--effort` handles spend. Surfaces the chosen model, effort value, and level on the dispatch instrumentation stream so they are visible per-spawn.
 3. **Boss coordinator: attach estimates at creation time** (`task_18aebf144b365660_10`). The coordinator runs the Q4 heuristic on every `boss chore create` / `boss task create` call it initiates and passes `--effort` accordingly. Posts the `reasons` string into the chore's transcript or initial comment. Does not write `model_override`.
 
 After all three land, two follow-ups become natural:
