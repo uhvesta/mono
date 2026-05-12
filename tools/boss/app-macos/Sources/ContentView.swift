@@ -365,20 +365,36 @@ struct ContentView: View {
 
     private var workBossPanel: some View {
         let isCollapsed = model.isBossPanelCollapsed
+        let expandedWidth = model.bossPanelWidth
 
         return VStack(spacing: 0) {
             bossAgentHeader(isCollapsed: isCollapsed)
 
-            if isCollapsed {
-                Spacer(minLength: 0)
-                Text("Picard")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .rotationEffect(.degrees(-90))
-                Spacer(minLength: 0)
-            } else {
+            ZStack(alignment: .leading) {
+                // The boss terminal is always mounted, even while the
+                // panel is collapsed. Two things would otherwise reset
+                // the boss claude session:
+                //
+                //   1. A structural `if`/`else` that excludes
+                //      BossPaneTerminalView in the collapsed branch
+                //      deinits GhosttyTerminalHostView; its deinit
+                //      calls ghostty_surface_free, killing the PTY
+                //      child and so the boss claude process. Same
+                //      failure mode the Agents↔Work toggle avoids in
+                //      `body` above.
+                //   2. Shrinking the surface to the 88pt collapsed
+                //      strip width would SIGWINCH claude to ~10
+                //      columns and reflow its TUI; the session
+                //      survives but the visible buffer comes back
+                //      mangled. Pinning the terminal's frame to the
+                //      expanded width and clipping the outer panel
+                //      keeps the surface size stable across collapse.
                 #if canImport(GhosttyKit)
                 BossPaneTerminalView(boss: bossPane)
+                    .frame(width: expandedWidth)
+                    .frame(maxHeight: .infinity)
+                    .opacity(isCollapsed ? 0 : 1)
+                    .allowsHitTesting(!isCollapsed)
                 #else
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Boss pane requires GhosttyKit.")
@@ -390,11 +406,29 @@ struct ContentView: View {
                     Spacer()
                 }
                 .padding(14)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .frame(width: expandedWidth)
+                .frame(maxHeight: .infinity, alignment: .topLeading)
+                .opacity(isCollapsed ? 0 : 1)
+                .allowsHitTesting(!isCollapsed)
                 #endif
+
+                if isCollapsed {
+                    VStack {
+                        Spacer(minLength: 0)
+                        Text("Picard")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(-90))
+                        Spacer(minLength: 0)
+                    }
+                    .frame(width: workBossPanelCollapsedWidth)
+                    .frame(maxHeight: .infinity)
+                }
             }
+            .frame(maxHeight: .infinity)
+            .clipped()
         }
-        .frame(width: isCollapsed ? workBossPanelCollapsedWidth : model.bossPanelWidth)
+        .frame(width: isCollapsed ? workBossPanelCollapsedWidth : expandedWidth)
         .frame(maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .leading) {
