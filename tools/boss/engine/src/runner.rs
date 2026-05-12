@@ -399,17 +399,21 @@ fn compose_execution_prompt(
         prompt.push('\n');
     }
     prompt.push('\n');
-    prompt.push_str(match execution.kind.as_str() {
+    match execution.kind.as_str() {
         "project_design" => {
-            "Expected outcome for this run:\n- inspect the repository and relevant context,\n- draft or update a repo-backed design artifact,\n- identify likely follow-up tasks or phases,\n- stop once the design pass is in a state a human can review.\n"
+            prompt.push_str(&compose_design_directive(parent_project));
         }
         "task_implementation" | "chore_implementation" => {
-            "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n"
+            prompt.push_str(
+                "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n",
+            );
         }
         _ => {
-            "Expected outcome for this run:\n- make concrete progress on the assigned work,\n- leave the workspace in a reviewable state,\n- stop with a concise review summary.\n"
+            prompt.push_str(
+                "Expected outcome for this run:\n- make concrete progress on the assigned work,\n- leave the workspace in a reviewable state,\n- stop with a concise review summary.\n",
+            );
         }
-    });
+    }
     if matches!(
         execution.kind.as_str(),
         "task_implementation" | "chore_implementation" | "project_design"
@@ -431,6 +435,57 @@ fn compose_execution_prompt(
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
+}
+
+/// Directive block for the synthetic `kind = 'design'` task that the
+/// engine auto-creates with every project. Without this block the
+/// `project_design` worker only sees the generic "draft or update a
+/// repo-backed design artifact" line and frequently starts
+/// implementing — observed against worker O'Brien
+/// (exec_18aebf0caa1187e8_b). State up front that the deliverable is
+/// a markdown design doc (not code), name the canonical path, and
+/// list the section shape the reader expects so the worker doesn't
+/// invent its own.
+fn compose_design_directive(parent_project: Option<&Project>) -> String {
+    let mut out = String::new();
+    out.push_str("Expected outcome for this run:\n");
+    out.push_str("- the deliverable is a **design document**, not an implementation. Do not edit code, do not start prototyping, do not open partial implementation PRs.\n");
+    out.push_str("- the PR for this run contains **only the design doc** (one new or updated markdown file). If you find yourself touching `.rs`, `.ts`, `.swift`, build files, or anything else, stop — you are out of scope.\n");
+    if let Some(path_line) = canonical_design_doc_path_line(parent_project) {
+        out.push_str(&path_line);
+    }
+    out.push_str("- the design must cover, at minimum, these sections (use these as headings unless the parent project's description specifies a different shape):\n");
+    out.push_str("  - **Goals** — what this project is trying to achieve, pulled from the parent project's goal/description above.\n");
+    out.push_str("  - **Non-goals** — what is explicitly out of scope so reviewers don't have to guess.\n");
+    out.push_str("  - **Alternatives considered** — at least two distinct approaches and why they were not chosen.\n");
+    out.push_str("  - **Chosen approach** — the design itself, with enough detail that a follow-up implementation task can be filed against it.\n");
+    out.push_str("  - **Risks / open questions** — anything the author wants a human reviewer to land on before implementation starts.\n");
+    out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up work items the human files after the design is approved.\n");
+    out
+}
+
+/// If the parent project has an explicit `design_doc_path` pointer
+/// (set via `boss project design-doc`), emit that as the canonical
+/// path. Otherwise fall back to the `<repo>/docs/designs/<slug>.md`
+/// convention, anchored on the project's slug so two design tasks
+/// don't collide. Returns `None` only when we have no project at
+/// all — in practice the dispatcher always has one for
+/// `kind = 'design'` rows, but the runner stays defensive.
+fn canonical_design_doc_path_line(parent_project: Option<&Project>) -> Option<String> {
+    let project = parent_project?;
+    if let Some(path) = project.design_doc_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        return Some(format!(
+            "- the canonical path for this design doc is `{path}` (set on the project's `design_doc_path` pointer). Write the doc there.\n",
+        ));
+    }
+    let slug = if project.slug.trim().is_empty() {
+        "design"
+    } else {
+        project.slug.trim()
+    };
+    Some(format!(
+        "- the project's `design_doc_path` pointer is not yet set. Place the doc at `docs/designs/{slug}.md` (the repo's convention; adjust to the product's docs layout if the repo already has one — e.g. `tools/boss/docs/designs/{slug}.md` for the Boss product). After you create the file, set the pointer with `boss project set-design-doc --project <id> --path <path>` so the next run resolves it directly.\n",
+    ))
 }
 
 /// Templated prompt for the `conflict_resolution` execution kind
@@ -1346,6 +1401,231 @@ mod pane_spawn_tests {
         assert!(
             prompt.contains("'why did this task spawn now'"),
             "prompt missing parent project goal:\n{prompt}",
+        );
+    }
+
+    /// `boss project create` auto-files a `kind = 'design'` task as
+    /// ordinal-0 of every new project. When that task dispatches it
+    /// becomes a `project_design` execution. The worker prompt must
+    /// state up front that the deliverable is a design document — not
+    /// an implementation. Without this guard the worker has only the
+    /// project's name/goal to go on and frequently starts coding;
+    /// observed against worker O'Brien (exec_18aebf0caa1187e8_b).
+    #[tokio::test]
+    async fn spawn_prompt_for_auto_design_task_states_design_only_directive() {
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+            })
+            .unwrap();
+        let project = work_db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Worker live-status dashboard".to_owned(),
+                description: Some(
+                    "Surface every running worker's live state on the kanban without polling."
+                        .to_owned(),
+                ),
+                goal: Some(
+                    "Operators can see what every active worker is doing without opening panes."
+                        .to_owned(),
+                ),
+                autostart: false,
+            })
+            .unwrap();
+
+        // Find the design task `create_project` auto-filed for this
+        // project. It sorts ordinal-0 with `kind = 'design'`.
+        let design_task = work_db
+            .list_tasks(&product.id, Some(&project.id), None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.kind == "design")
+            .expect("create_project should auto-file a kind='design' task");
+
+        let runner = PaneSpawnRunner::new(cfg, work_db);
+        runner.set_server_state(weak);
+
+        let mut execution = sample_execution(workspace.path());
+        execution.kind = "project_design".into();
+        execution.work_item_id = design_task.id.clone();
+
+        runner
+            .run_execution(
+                "worker-1",
+                &execution,
+                &WorkItem::Task(design_task),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await
+            .unwrap();
+
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+
+        // The deliverable directive must be unmistakable.
+        assert!(
+            prompt.contains("the deliverable is a **design document**"),
+            "design prompt must state the deliverable is a design doc:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("only the design doc"),
+            "design prompt must scope the PR to the design doc only:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Do not edit code"),
+            "design prompt must forbid code edits:\n{prompt}",
+        );
+
+        // Canonical path uses the project slug since no design_doc_path
+        // pointer is configured on this brand-new project.
+        assert!(
+            prompt.contains(&format!("docs/designs/{}.md", project.slug)),
+            "design prompt must include the canonical doc path derived from the project slug `{}`:\n{prompt}",
+            project.slug,
+        );
+
+        // Required section shape — all five anchors must be named so
+        // the worker doesn't invent its own headings.
+        for heading in [
+            "**Goals**",
+            "**Non-goals**",
+            "**Alternatives considered**",
+            "**Chosen approach**",
+            "**Risks / open questions**",
+        ] {
+            assert!(
+                prompt.contains(heading),
+                "design prompt missing required section `{heading}`:\n{prompt}",
+            );
+        }
+
+        // The parent project's goal must come through verbatim — that
+        // is the whole point of pulling project context at spawn time.
+        assert!(
+            prompt.contains(
+                "Operators can see what every active worker is doing without opening panes."
+            ),
+            "design prompt must surface the parent project's goal verbatim:\n{prompt}",
+        );
+
+        // The PR-URL acceptance criterion still applies to design
+        // runs — they produce a PR, it just contains the doc only.
+        assert!(
+            prompt.contains("the deliverable is a PR URL"),
+            "design prompt must keep the PR-URL acceptance criterion:\n{prompt}",
+        );
+    }
+
+    /// When the project already has a `design_doc_path` pointer set
+    /// (the resumed-design-pass case — a doc was filed, then the
+    /// engine respawned the design task to revise it), the canonical
+    /// path in the worker prompt must come from that pointer verbatim
+    /// instead of the slug-derived default. Otherwise the worker
+    /// could write to two different files across runs.
+    #[tokio::test]
+    async fn spawn_prompt_for_design_task_uses_explicit_design_doc_path() {
+        use crate::work::SetProjectDesignDocInput;
+
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig {
+                cwd: workspace.path().to_path_buf(),
+                db_path: workspace.path().join("state.db"),
+                worker_pool_size: 1,
+            },
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+            })
+            .unwrap();
+        let project = work_db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Merge poller cadence tuning".to_owned(),
+                description: Some("Pick the right merge-poller cadence.".to_owned()),
+                goal: Some("Reduce GitHub API spend without lagging merges.".to_owned()),
+                autostart: false,
+            })
+            .unwrap();
+
+        work_db
+            .set_project_design_doc(SetProjectDesignDocInput {
+                project_id: project.id.clone(),
+                design_doc_repo_remote_url: None,
+                design_doc_branch: None,
+                design_doc_path: Some("tools/boss/docs/designs/merge-poller-cadence.md".into()),
+                unset: false,
+            })
+            .unwrap();
+
+        let design_task = work_db
+            .list_tasks(&product.id, Some(&project.id), None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.kind == "design")
+            .expect("create_project should auto-file a kind='design' task");
+
+        let runner = PaneSpawnRunner::new(cfg, work_db);
+        runner.set_server_state(weak);
+
+        let mut execution = sample_execution(workspace.path());
+        execution.kind = "project_design".into();
+        execution.work_item_id = design_task.id.clone();
+
+        runner
+            .run_execution(
+                "worker-1",
+                &execution,
+                &WorkItem::Task(design_task),
+                workspace.path(),
+                Some("change-1"),
+            )
+            .await
+            .unwrap();
+
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+
+        assert!(
+            prompt.contains("`tools/boss/docs/designs/merge-poller-cadence.md`"),
+            "design prompt must use the project's explicit design_doc_path pointer:\n{prompt}",
+        );
+        // And it should NOT also fall through to the slug-derived
+        // suggestion line — that would be ambiguous.
+        assert!(
+            !prompt.contains("`design_doc_path` pointer is not yet set"),
+            "design prompt should not emit the pointer-missing fallback when the pointer is set:\n{prompt}",
         );
     }
 
