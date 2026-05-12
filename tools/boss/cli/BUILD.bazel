@@ -75,3 +75,27 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+# End-to-end coverage for the creation-time repo resolver (design
+# §Q4 / follow-up chore #6). Same shape as the other CLI integration
+# tests — drives the `boss` binary against an in-process engine to
+# confirm the inference chain (explicit → prompt parser → recent →
+# default → no-input refuse) behaves as designed.
+rust_test(
+    name = "repo_resolution_test",
+    srcs = ["tests/repo_resolution.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)

@@ -148,7 +148,11 @@ async fn chore_create_with_effort_and_model_round_trips_through_show() -> Result
         CreateProductInput {
             name: "Boss".to_owned(),
             description: None,
-            repo_remote_url: None,
+            // Test product has a repo so creation-time repo
+            // resolution (design §Q4) doesn't refuse in --no-input;
+            // this test is about effort / model fields, not repo
+            // inference.
+            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
         },
     )
     .await?;
@@ -198,7 +202,11 @@ async fn chore_create_rejects_invalid_effort_level() -> Result<()> {
         CreateProductInput {
             name: "Boss".to_owned(),
             description: None,
-            repo_remote_url: None,
+            // Test product has a repo so creation-time repo
+            // resolution (design §Q4) doesn't refuse in --no-input;
+            // this test is about effort / model fields, not repo
+            // inference.
+            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
         },
     )
     .await?;
@@ -235,7 +243,11 @@ async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
         CreateProductInput {
             name: "Boss".to_owned(),
             description: None,
-            repo_remote_url: None,
+            // Test product has a repo so creation-time repo
+            // resolution (design §Q4) doesn't refuse in --no-input;
+            // this test is about effort / model fields, not repo
+            // inference.
+            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
         },
     )
     .await?;
@@ -302,7 +314,11 @@ async fn product_set_default_model_lifecycle_round_trips() -> Result<()> {
         CreateProductInput {
             name: "Boss".to_owned(),
             description: None,
-            repo_remote_url: None,
+            // Test product has a repo so creation-time repo
+            // resolution (design §Q4) doesn't refuse in --no-input;
+            // this test is about effort / model fields, not repo
+            // inference.
+            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
         },
     )
     .await?;
@@ -352,7 +368,11 @@ async fn model_override_passes_through_unrecognised_slug() -> Result<()> {
         CreateProductInput {
             name: "Boss".to_owned(),
             description: None,
-            repo_remote_url: None,
+            // Test product has a repo so creation-time repo
+            // resolution (design §Q4) doesn't refuse in --no-input;
+            // this test is about effort / model fields, not repo
+            // inference.
+            repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
         },
     )
     .await?;

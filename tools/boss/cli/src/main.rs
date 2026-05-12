@@ -20,6 +20,8 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;
 
+mod repo_resolution;
+
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]
 struct Cli {
@@ -1740,6 +1742,18 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
             let name = required_text(args.name, "Task name", ctx)?;
             let description = optional_text(args.description, "Description", ctx)?;
+            let prompt_text = compose_prompt_text(&name, description.as_deref());
+            let resolved_repo = repo_resolution::resolve_repo_at_create_time(
+                &mut client,
+                &product,
+                args.repo_remote_url.as_deref(),
+                &prompt_text,
+                ctx.allow_input,
+            )
+            .await?;
+            if resolved_repo.is_none() && !ctx.allow_input {
+                return Err(repo_resolution::unresolved_repo_error(&product.slug));
+            }
             let task = create_task(
                 &mut client,
                 CreateTaskInput {
@@ -1750,7 +1764,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: normalize_non_empty(args.repo_remote_url),
+                    repo_remote_url: resolved_repo,
                     effort_level: args.effort.map(EffortLevel::from),
                     model_override: normalize_non_empty(args.model),
                 },
@@ -1841,6 +1855,18 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let name = required_text(args.name, "Chore name", ctx)?;
             let description = optional_text(args.description, "Description", ctx)?;
+            let prompt_text = compose_prompt_text(&name, description.as_deref());
+            let resolved_repo = repo_resolution::resolve_repo_at_create_time(
+                &mut client,
+                &product,
+                args.repo_remote_url.as_deref(),
+                &prompt_text,
+                ctx.allow_input,
+            )
+            .await?;
+            if resolved_repo.is_none() && !ctx.allow_input {
+                return Err(repo_resolution::unresolved_repo_error(&product.slug));
+            }
             let chore = create_chore(
                 &mut client,
                 CreateChoreInput {
@@ -1850,7 +1876,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     autostart: !ctx.no_autostart,
                     priority: args.priority.map(|priority| priority.as_str().to_owned()),
                     created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: normalize_non_empty(args.repo_remote_url),
+                    repo_remote_url: resolved_repo,
                     effort_level: args.effort.map(EffortLevel::from),
                     model_override: normalize_non_empty(args.model),
                 },
@@ -3423,6 +3449,21 @@ fn prompt_index_or_selector(label: &str, count: usize) -> Result<String> {
             continue;
         }
         return Ok(trimmed.to_owned());
+    }
+}
+
+/// Glue together the name and optional description into the
+/// "prompt text" fed to the repo parser. Mirrors what the engine
+/// will eventually see as the chore's contents; the parser only does
+/// case-insensitive substring search, so the simple `name\n\ndesc`
+/// shape is exactly enough.
+fn compose_prompt_text(name: &str, description: Option<&str>) -> String {
+    match description.and_then(|d| {
+        let trimmed = d.trim();
+        if trimmed.is_empty() { None } else { Some(d) }
+    }) {
+        Some(desc) => format!("{name}\n\n{desc}"),
+        None => name.to_owned(),
     }
 }
 
