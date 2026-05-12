@@ -456,12 +456,11 @@ struct MarkdownBodyView: View {
     }
 }
 
-/// Stand-alone scrolling viewer that wraps `MarkdownBodyView` with a
-/// title row, used by `MarkdownViewerWindowController` to render long
-/// task / chore descriptions in their own window. The chrome matches
-/// `MarkdownDocumentView` so the popover's "Read full description"
-/// affordance lands the reader in a layout that visually mirrors the
-/// Designs file viewer.
+/// Stand-alone scrolling viewer used by `MarkdownViewerWindowController`
+/// to render long task / chore descriptions in their own window. The
+/// chrome matches `MarkdownDocumentView` so the popover's "Read full
+/// description" affordance lands the reader in a layout that visually
+/// mirrors the Designs file viewer.
 struct MarkdownViewerView: View {
     let title: String
     let source: String
@@ -473,7 +472,9 @@ struct MarkdownViewerView: View {
                     .font(.title3.weight(.semibold))
                     .fixedSize(horizontal: false, vertical: true)
                 Divider()
-                MarkdownBodyView(source: source)
+                StructuredText(markdown: source)
+                    .bossMarkdown()
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)

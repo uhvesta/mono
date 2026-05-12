@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Boss
 
@@ -170,5 +172,55 @@ final class MarkdownParserTests: XCTestCase {
         if case .paragraph(let text) = blocks[0] {
             XCTAssertEqual(text, source)
         } else { XCTFail("expected paragraph, got \(blocks[0])") }
+    }
+}
+
+/// `MarkdownViewerView` is the SwiftUI root of the "Read full description"
+/// window. Step 2 of the markdown-renderer migration swapped it from the
+/// hand-rolled `MarkdownBodyView` to Textual's `StructuredText`; this test
+/// is the canary that the view still builds and lays out against a
+/// representative description (paragraphs, fenced code, a table, a nested
+/// list) so a Textual upgrade that breaks the style protocol fails here
+/// rather than silently at runtime when a user clicks the affordance.
+@MainActor
+final class MarkdownViewerViewTests: XCTestCase {
+    func testRendersRepresentativeDescription() {
+        let source = """
+        # Task title
+
+        Some intro paragraph with **bold**, *italic*, `inline code`, and a
+        [link](https://example.com).
+
+        ```swift
+        struct Greeter {
+            let name: String
+        }
+        ```
+
+        | Column A | Column B |
+        | -------- | -------- |
+        | one      | two      |
+
+        - top level
+          - nested one
+          - nested two
+        - another top
+        """
+
+        let view = MarkdownViewerView(title: "Read full description", source: source)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+
+        XCTAssertGreaterThan(hosting.fittingSize.height, 0)
+        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
+    }
+
+    func testRendersEmptySourceWithoutCrashing() {
+        let view = MarkdownViewerView(title: "Empty", source: "")
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThanOrEqual(hosting.fittingSize.height, 0)
     }
 }
