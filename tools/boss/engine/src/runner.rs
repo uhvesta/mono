@@ -6,10 +6,11 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 
 use crate::config::RuntimeConfig;
+use crate::conflict_diagnosis::ConflictDiagnosis;
 use crate::coordinator::slot_id_from_worker_id;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
-use crate::work::{Project, Task, WorkDb, WorkExecution, WorkItem};
+use crate::work::{ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
 use boss_protocol::WorkItemBinding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,12 +247,27 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .and_then(|project_id| self.work_db.get_project(project_id).ok()),
             _ => None,
         };
+        // For conflict-resolution executions, the worker's prompt
+        // embeds the engine's pre-spawn diagnosis. The attempt row is
+        // created at conflict-detection time (Phase 2 wiring) and
+        // updated with the diagnosis JSON pre-spawn. Look it up by
+        // work_item_id so the prompt composer renders the templated
+        // markdown surface regardless of how the row got there.
+        let conflict_attempt = if execution.kind == "conflict_resolution" {
+            self.work_db
+                .active_conflict_resolution_for_work_item(&execution.work_item_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let prompt_text = compose_execution_prompt(
             execution,
             work_item,
             parent_project.as_ref(),
             workspace_path,
             cube_change_id,
+            conflict_attempt.as_ref(),
         );
         let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
         if let Some(parent) = prompt_path.parent() {
@@ -327,7 +343,27 @@ fn compose_execution_prompt(
     parent_project: Option<&Project>,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
+    conflict_attempt: Option<&ConflictResolution>,
 ) -> String {
+    // The conflict_resolution kind has a wholly different shape than
+    // implementation/design kinds — it carries an embedded diagnosis,
+    // a tight playbook, and explicit stop conditions. Render it via
+    // a dedicated composer instead of trying to splice into the
+    // generic flow. Falls through to the generic prompt if (somehow)
+    // the conflict-resolution attempt row is missing — better to ship
+    // a generic worker prompt than to fail the spawn.
+    if execution.kind == "conflict_resolution" {
+        if let Some(attempt) = conflict_attempt {
+            return compose_conflict_resolution_prompt(
+                execution,
+                work_item,
+                workspace_path,
+                cube_change_id,
+                attempt,
+                /* test_command */ None,
+            );
+        }
+    }
     let mut prompt = String::new();
     prompt.push_str(
         "You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n",
@@ -397,6 +433,173 @@ fn compose_execution_prompt(
     prompt
 }
 
+/// Templated prompt for the `conflict_resolution` execution kind
+/// (design Q4 of `tools/boss/docs/designs/merge-conflict-handling-in-review.md`).
+///
+/// Embeds the engine's pre-spawn diagnosis (parsed back from the JSON
+/// the engine stored on `conflict_resolutions.conflict_diagnosis`)
+/// and the project's `test_command` if one is configured. The worker
+/// is *not* asked to add scope — the prompt is explicit that the only
+/// allowed change is resolving the rebase conflict and pushing the
+/// resolved branch.
+fn compose_conflict_resolution_prompt(
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+    workspace_path: &Path,
+    cube_change_id: Option<&str>,
+    attempt: &ConflictResolution,
+    test_command: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(&format!(
+        "## Conflict resolution: PR #{pr_num} has merge conflicts against `{base}`\n\n",
+        pr_num = attempt.pr_number,
+        base = attempt.base_branch,
+    ));
+    prompt.push_str(&format!("**PR**: {}\n", attempt.pr_url));
+    prompt.push_str(&format!(
+        "**Branch**: `{}` based off `{}`\n",
+        attempt.head_branch, attempt.base_branch,
+    ));
+    if let Some(base_sha) = attempt.base_sha_at_trigger.as_deref() {
+        prompt.push_str(&format!(
+            "**Base sha at conflict detection**: `{base_sha}` (current `{}` may be ahead)\n",
+            attempt.base_branch,
+        ));
+    }
+    prompt.push_str(&format!("**Workspace**: `{}`\n", workspace_path.display()));
+    prompt.push_str(&format!("**Attempt id**: `{}`\n", attempt.id));
+    prompt.push_str(&format!("**Execution id**: `{}`\n", execution.id));
+    if let Some(change) = cube_change_id {
+        prompt.push_str(&format!("**Local change**: `{change}`\n"));
+    }
+    prompt.push_str(&format!(
+        "**Work item**: `{}`\n\n",
+        work_item_name(work_item),
+    ));
+    prompt.push_str(
+        "This PR was in code review when `main` moved under it. The PR's diff against\n\
+         the current `main` does not apply cleanly. Your job is to resolve the conflicts,\n\
+         push the resolved branch, and stop. **You are not adding new work to this PR.**\n\n",
+    );
+    prompt.push_str("### Steps\n\n");
+    prompt.push_str("1. `jj git fetch`\n");
+    prompt.push_str(&format!("2. `jj edit {}`\n", attempt.head_branch));
+    prompt.push_str(&format!(
+        "3. `jj rebase -d {} -b {}`\n",
+        attempt.base_branch, attempt.head_branch,
+    ));
+    prompt.push_str(
+        "4. If the rebase reports a conflict:\n\
+            - Inspect with `jj st`, `jj resolve --list <file>`.\n\
+            - Resolve each conflict. Read the conflict diagnosis below for what was\n  \
+              touched on the upstream side.\n",
+    );
+    match test_command {
+        Some(cmd) => prompt.push_str(&format!(
+            "5. Run the project's tests with `{cmd}`. If green, push. If red and the\n   \
+                failure is rebase-induced, fix it. If red and the failure was pre-existing,\n   \
+                stop and surface it via the stop-condition path below.\n",
+        )),
+        None => prompt.push_str(
+            "5. No `test_command` is configured for this product; skip the local test\n   \
+                run and rely on CI to verify the push.\n",
+        ),
+    }
+    prompt.push_str(&format!(
+        "6. `jj git push --bookmark {}`\n",
+        attempt.head_branch,
+    ));
+    prompt.push_str(&format!(
+        "7. `gh pr comment {} --body \"<post-resolution comment — see template below>\"`\n",
+        attempt.pr_number,
+    ));
+    prompt.push_str(
+        "8. Stop. Do not change the PR base, do not change the PR title or description,\n   \
+            do not push new commits beyond the resolved rebase.\n\n",
+    );
+    prompt.push_str("### Conflict diagnosis (from the engine's pre-spawn pass)\n\n");
+    match attempt
+        .conflict_diagnosis
+        .as_deref()
+        .map(serde_json::from_str::<ConflictDiagnosis>)
+    {
+        Some(Ok(diagnosis)) => prompt.push_str(&render_diagnosis_markdown(&diagnosis)),
+        Some(Err(err)) => {
+            prompt.push_str(&format!(
+                "_Engine could not re-parse the diagnosis JSON (error: {err}). The\n\
+                 raw blob is on `conflict_resolutions.conflict_diagnosis` if you need it._\n",
+            ));
+        }
+        None => {
+            prompt.push_str(
+                "_No engine-collected diagnosis is available for this attempt. Use\n\
+                 `jj st` and `jj resolve --list` after the rebase to discover the\n\
+                 conflicts directly._\n",
+            );
+        }
+    }
+    prompt.push_str("\n### Stop conditions\n\n");
+    prompt.push_str(
+        "If any of the following applies, comment on the PR explaining the situation,\n\
+         do NOT push, and run `boss engine conflicts mark-failed <attempt-id> --reason <r>`\n\
+         with the appropriate reason — the engine will mark the attempt `failed`:\n\n\
+            1. **Semantic obsolescence** — the upstream change accomplished what this PR\n   \
+            was trying to do. Reason: `obsolescence_suspected`.\n\
+            2. **Product decision required** — the conflict needs a human choice between\n   \
+            two valid resolutions. Reason: `product_decision_required`.\n\
+            3. **Architectural mismatch** — the upstream removed an abstraction this PR\n   \
+            was extending. Reason: `architectural_mismatch`.\n\n\
+         Do NOT close the PR yourself. Closing is the human's call.\n\n",
+    );
+    prompt.push_str("### Post-resolution PR comment template\n\n");
+    prompt.push_str(
+        "```\n\
+         🤖 boss resolved merge conflicts on this PR after `main` moved.\n\n\
+         Resolutions:\n\
+         - <per-file resolution summary>\n\n\
+         <If a test command was configured, paste its result here.>\n\
+         Branch force-pushed; per branch protection, prior approvals have been dismissed.\n\
+         Re-review when ready.\n\
+         ```\n\n",
+    );
+    prompt.push_str("Respond with concise markdown using exactly these sections:\n");
+    prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
+    prompt
+}
+
+fn render_diagnosis_markdown(diagnosis: &ConflictDiagnosis) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Schema v{}. Base sha `{}`, dependent head sha `{}`.\n\n",
+        diagnosis.schema_version, diagnosis.base_sha, diagnosis.head_sha,
+    ));
+    if let Some(err) = diagnosis.error.as_deref() {
+        out.push_str(&format!(
+            "_Engine-side probe failed: {err}. The list below may be incomplete; trust\n\
+             `jj st` after the rebase as the source of truth._\n\n",
+        ));
+    }
+    if diagnosis.files.is_empty() {
+        if diagnosis.error.is_none() {
+            out.push_str(
+                "_No conflicted files reported by the engine's pre-spawn probe. The\n\
+                 conflict may have been transient; run `jj rebase` and trust `jj st`._\n",
+            );
+        }
+        return out;
+    }
+    out.push_str(&format!("Conflicted files ({}):\n\n", diagnosis.files.len()));
+    for file in &diagnosis.files {
+        out.push_str(&format!("- `{}` — {}", file.path, file.shape));
+        if let Some(count) = file.marker_count {
+            out.push_str(&format!(" ({count} marker block(s))"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn work_item_name(work_item: &WorkItem) -> &str {
     match work_item {
         WorkItem::Product(product) => &product.name,
@@ -449,6 +652,247 @@ fn task_details(task: &Task) -> Option<String> {
         }
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+#[cfg(test)]
+mod conflict_resolution_prompt_tests {
+    //! Pure tests for the conflict-resolution prompt composer. The
+    //! function takes a `ConflictResolution` + execution context and
+    //! emits the templated markdown the worker pane will see.
+
+    use super::*;
+    use crate::conflict_diagnosis::{ConflictDiagnosis, ConflictedFile};
+    use crate::work::ConflictResolution;
+    use boss_protocol::WorkExecution;
+
+    fn sample_execution() -> WorkExecution {
+        WorkExecution {
+            id: "exec-cr-1".into(),
+            work_item_id: "task_1".into(),
+            kind: "conflict_resolution".into(),
+            status: "running".into(),
+            repo_remote_url: "git@example.invalid:foo/bar.git".into(),
+            cube_repo_id: Some("foo".into()),
+            cube_lease_id: Some("lease-1".into()),
+            cube_workspace_id: Some("ws-1".into()),
+            workspace_path: Some("/tmp/workspace".into()),
+            priority: 0,
+            preferred_workspace_id: None,
+            created_at: "1700000000".into(),
+            started_at: Some("1700000010".into()),
+            finished_at: None,
+        }
+    }
+
+    fn sample_work_item() -> WorkItem {
+        WorkItem::Chore(crate::work::Task {
+            id: "task_1".into(),
+            product_id: "prod_1".into(),
+            project_id: None,
+            kind: "chore".into(),
+            name: "Some in-review chore".into(),
+            description: String::new(),
+            status: "blocked".into(),
+            ordinal: None,
+            pr_url: Some("https://github.com/foo/bar/pull/42".into()),
+            deleted_at: None,
+            created_at: "1700000000".into(),
+            updated_at: "1700000000".into(),
+            autostart: false,
+            last_status_actor: "engine".into(),
+            priority: "medium".into(),
+            created_via: "engine_auto".into(),
+            repo_remote_url: None,
+            blocked_reason: Some("merge_conflict".into()),
+            blocked_attempt_id: Some("crz_x".into()),
+        })
+    }
+
+    fn attempt_with_diagnosis(diag_json: Option<String>) -> ConflictResolution {
+        ConflictResolution {
+            id: "crz_42".into(),
+            product_id: "prod_1".into(),
+            work_item_id: "task_1".into(),
+            pr_url: "https://github.com/foo/bar/pull/42".into(),
+            pr_number: 42,
+            head_branch: "riker/feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("abc123".into()),
+            head_sha_before: Some("def456".into()),
+            head_sha_after: None,
+            status: "running".into(),
+            failure_reason: None,
+            cube_lease_id: Some("lease-1".into()),
+            cube_workspace_id: Some("ws-1".into()),
+            worker_id: Some("worker-1".into()),
+            conflict_diagnosis: diag_json,
+            created_at: "1700000000".into(),
+            started_at: Some("1700000010".into()),
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn prompt_embeds_pr_branch_and_attempt_id() {
+        let diag = ConflictDiagnosis {
+            schema_version: 1,
+            base_sha: "abc123".into(),
+            head_sha: "def456".into(),
+            files: vec![ConflictedFile {
+                path: "src/foo.rs".into(),
+                marker_count: Some(2),
+                shape: "content".into(),
+            }],
+            error: None,
+        };
+        let json = serde_json::to_string(&diag).unwrap();
+        let attempt = attempt_with_diagnosis(Some(json));
+
+        let prompt = compose_conflict_resolution_prompt(
+            &sample_execution(),
+            &sample_work_item(),
+            std::path::Path::new("/tmp/workspace"),
+            Some("chg_1"),
+            &attempt,
+            None,
+        );
+
+        assert!(
+            prompt.contains("## Conflict resolution: PR #42"),
+            "missing PR-number header:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("riker/feature"),
+            "missing head branch:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("`crz_42`"),
+            "missing attempt id:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("`exec-cr-1`"),
+            "missing execution id:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Base sha at conflict detection"),
+            "missing base sha line:\n{prompt}",
+        );
+        // Steps refer to the head branch verbatim.
+        assert!(
+            prompt.contains("jj edit riker/feature"),
+            "missing rebase step:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("jj git push --bookmark riker/feature"),
+            "missing push step:\n{prompt}",
+        );
+        // Diagnosis surface renders the conflicted file.
+        assert!(
+            prompt.contains("`src/foo.rs`"),
+            "missing diagnosis file:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn prompt_includes_test_command_when_configured() {
+        let attempt = attempt_with_diagnosis(None);
+        let prompt = compose_conflict_resolution_prompt(
+            &sample_execution(),
+            &sample_work_item(),
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            &attempt,
+            Some("bazel test //..."),
+        );
+        assert!(
+            prompt.contains("bazel test //..."),
+            "configured test command should appear verbatim:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn prompt_omits_test_step_when_test_command_is_none() {
+        let attempt = attempt_with_diagnosis(None);
+        let prompt = compose_conflict_resolution_prompt(
+            &sample_execution(),
+            &sample_work_item(),
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            &attempt,
+            None,
+        );
+        assert!(
+            prompt.contains("No `test_command` is configured"),
+            "prompt should explicitly note the omission:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn prompt_calls_out_mark_failed_for_stop_conditions() {
+        let attempt = attempt_with_diagnosis(None);
+        let prompt = compose_conflict_resolution_prompt(
+            &sample_execution(),
+            &sample_work_item(),
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            &attempt,
+            None,
+        );
+        assert!(
+            prompt.contains("boss engine conflicts mark-failed"),
+            "prompt must point workers at the mark-failed CLI:\n{prompt}",
+        );
+        // All three canonical reasons appear by name.
+        for reason in [
+            "obsolescence_suspected",
+            "product_decision_required",
+            "architectural_mismatch",
+        ] {
+            assert!(
+                prompt.contains(reason),
+                "stop-condition reason {reason} missing:\n{prompt}",
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_handles_unparsable_diagnosis_gracefully() {
+        let attempt = attempt_with_diagnosis(Some("{not valid json".into()));
+        let prompt = compose_conflict_resolution_prompt(
+            &sample_execution(),
+            &sample_work_item(),
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            &attempt,
+            None,
+        );
+        assert!(
+            prompt.contains("could not re-parse the diagnosis JSON"),
+            "missing fallback for bad diagnosis JSON:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn prompt_renders_diagnosis_error_surface() {
+        let diag = ConflictDiagnosis::errored("abc", "def", "git not on PATH");
+        let attempt = attempt_with_diagnosis(Some(serde_json::to_string(&diag).unwrap()));
+        let prompt = compose_conflict_resolution_prompt(
+            &sample_execution(),
+            &sample_work_item(),
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            &attempt,
+            None,
+        );
+        assert!(
+            prompt.contains("Engine-side probe failed"),
+            "prompt should surface the engine probe error:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("git not on PATH"),
+            "prompt should include the probe error message:\n{prompt}",
+        );
+    }
 }
 
 #[cfg(test)]

@@ -16,12 +16,12 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use boss_protocol::{
-    AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, CreateAttentionItemInput,
-    CreateChoreInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection,
-    DependencyEdge, DependencyFilter, ExecutionReconcileResult, ListDependenciesInput, Product,
-    Project, ProjectDesignDocState, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
+    AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, ConflictResolution,
+    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateManyChoresInput,
+    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput,
+    DependencyDirection, DependencyEdge, DependencyFilter, ExecutionReconcileResult,
+    ListDependenciesInput, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
     SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
     WorkTree, is_known_created_via,
@@ -2747,6 +2747,192 @@ impl WorkDb {
         Ok(count > 0)
     }
 
+    /// Insert a `conflict_resolutions` row with `status='pending'`
+    /// alongside a `tasks.blocked_attempt_id` pointer to the new
+    /// attempt id. `(work_item_id, base_sha_at_trigger)` is the
+    /// idempotency key — a second probe for the same `(item, sha)`
+    /// finds the row already pending and returns `Ok(None)` (caller
+    /// reads the existing row via [`Self::active_conflict_resolution_for_work_item`]).
+    ///
+    /// Phase 3 of the merge-conflict design (Q4). The caller is
+    /// `conflict_watch::on_conflict_detected` after the parent
+    /// `tasks` row is already flipped to `blocked: merge_conflict`.
+    pub fn insert_conflict_resolution(
+        &self,
+        input: ConflictResolutionInsertInput,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let id = next_id("crz");
+        let now = now_string();
+        let rows = tx.execute(
+            "INSERT OR IGNORE INTO conflict_resolutions
+                (id, product_id, work_item_id, pr_url, pr_number,
+                 head_branch, base_branch, base_sha_at_trigger,
+                 head_sha_before, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10)",
+            params![
+                id,
+                input.product_id,
+                input.work_item_id,
+                input.pr_url,
+                input.pr_number,
+                input.head_branch,
+                input.base_branch,
+                input.base_sha_at_trigger,
+                input.head_sha_before,
+                now,
+            ],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        // Stamp the parent's `blocked_attempt_id` so the kanban can
+        // one-click "show me the attempt that's holding this card."
+        tx.execute(
+            "UPDATE tasks
+                SET blocked_attempt_id = ?2,
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND deleted_at IS NULL",
+            params![input.work_item_id, id, now],
+        )?;
+        let inserted = query_conflict_resolution(&tx, &id)?
+            .with_context(|| format!("unknown conflict_resolution after insert: {id}"))?;
+        tx.commit()?;
+        Ok(Some(inserted))
+    }
+
+    /// Fetch a single attempt row by id. `Ok(None)` if the row is
+    /// missing.
+    pub fn get_conflict_resolution(&self, attempt_id: &str) -> Result<Option<ConflictResolution>> {
+        let conn = self.connect()?;
+        query_conflict_resolution(&conn, attempt_id)
+    }
+
+    /// Latest non-terminal attempt for `work_item_id`. Used by the
+    /// conflict-detection path to detect "an attempt is already in
+    /// flight" and by the worker prompt composer to find the row to
+    /// embed the diagnosis from.
+    pub fn active_conflict_resolution_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+                    base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
+                    cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
+                    created_at, started_at, finished_at
+             FROM conflict_resolutions
+             WHERE work_item_id = ?1
+               AND status IN ('pending', 'running')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([work_item_id], map_conflict_resolution)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Store the engine-collected diagnosis JSON on a pending attempt.
+    /// Idempotent — calling twice overwrites. Returns the updated row;
+    /// `Ok(None)` when the id is missing.
+    pub fn set_conflict_resolution_diagnosis(
+        &self,
+        attempt_id: &str,
+        diagnosis_json: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET conflict_diagnosis = ?2
+              WHERE id = ?1",
+            params![attempt_id, diagnosis_json],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Flip a `pending` attempt to `running` and stamp the lease
+    /// triple (`cube_lease_id`, `cube_workspace_id`, `worker_id`) the
+    /// coordinator just acquired. Idempotent — a second call with the
+    /// same triple is a no-op. Returns the updated row.
+    pub fn mark_conflict_resolution_running(
+        &self,
+        attempt_id: &str,
+        cube_lease_id: &str,
+        cube_workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET status            = 'running',
+                    cube_lease_id     = ?2,
+                    cube_workspace_id = ?3,
+                    worker_id         = ?4,
+                    started_at        = COALESCE(started_at, ?5)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, cube_lease_id, cube_workspace_id, worker_id, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Worker-visible terminal transition: flip an attempt to
+    /// `failed` with a reason. The Boss-tier `boss engine conflicts
+    /// mark-failed` CLI lands here. `Ok(None)` when the id is unknown
+    /// or already terminal.
+    ///
+    /// The companion success path is part of the auto-retire flow
+    /// elsewhere; this method intentionally only handles the failure
+    /// signal a worker emits when it hits a stop condition.
+    pub fn mark_conflict_resolution_failed(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET status         = 'failed',
+                    failure_reason = ?2,
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, reason, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
     /// `workspace_path` on `execution_id`. Returns the prior lease id
     /// — `Some` means the caller is responsible for issuing the cube
@@ -2943,6 +3129,65 @@ fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
         created_at: row.get(6)?,
         resolved_at: row.get(7)?,
     })
+}
+
+fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<ConflictResolution> {
+    Ok(ConflictResolution {
+        id: row.get(0)?,
+        product_id: row.get(1)?,
+        work_item_id: row.get(2)?,
+        pr_url: row.get(3)?,
+        pr_number: row.get(4)?,
+        head_branch: row.get(5)?,
+        base_branch: row.get(6)?,
+        base_sha_at_trigger: row.get(7)?,
+        head_sha_before: row.get(8)?,
+        head_sha_after: row.get(9)?,
+        status: row.get(10)?,
+        failure_reason: row.get(11)?,
+        cube_lease_id: row.get(12)?,
+        cube_workspace_id: row.get(13)?,
+        worker_id: row.get(14)?,
+        conflict_diagnosis: row.get(15)?,
+        created_at: row.get(16)?,
+        started_at: row.get(17)?,
+        finished_at: row.get(18)?,
+    })
+}
+
+fn query_conflict_resolution(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<ConflictResolution>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+                base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
+                cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
+                created_at, started_at, finished_at
+         FROM conflict_resolutions
+         WHERE id = ?1",
+    )?;
+    let row = stmt
+        .query_row([id], map_conflict_resolution)
+        .optional()?;
+    Ok(row)
+}
+
+/// Pre-insert payload for [`WorkDb::insert_conflict_resolution`].
+/// Fields mirror the `conflict_resolutions` schema; everything the
+/// engine knows at detection time is required, everything the engine
+/// stamps post-spawn (`head_sha_after`, `cube_lease_id`, …) is
+/// omitted.
+#[derive(Debug, Clone)]
+pub struct ConflictResolutionInsertInput {
+    pub product_id: String,
+    pub work_item_id: String,
+    pub pr_url: String,
+    pub pr_number: i64,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub base_sha_at_trigger: Option<String>,
+    pub head_sha_before: Option<String>,
 }
 
 fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> {
@@ -9119,6 +9364,145 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, "6");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Round-trip the conflict-resolution attempt lifecycle: insert
+    /// → set diagnosis → mark running → mark failed. Covers the new
+    /// WorkDb surface that the worker spawn flow + the worker-facing
+    /// `boss engine conflicts mark-failed` CLI both depend on.
+    #[test]
+    fn conflict_resolution_round_trip() {
+        let path = temp_db_path("conflict-resolution-rt");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".into(),
+                description: None,
+                repo_remote_url: Some("git@example.invalid:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "C".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        // Flip the chore into `blocked: merge_conflict` so the
+        // insert path's UPDATE-tasks side stamps blocked_attempt_id.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/foo/bar/pull/42".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_merge_conflict(&chore.id, "https://github.com/foo/bar/pull/42")
+            .unwrap();
+
+        let attempt = db
+            .insert_conflict_resolution(super::ConflictResolutionInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/42".into(),
+                pr_number: 42,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("abc123".into()),
+                head_sha_before: Some("def456".into()),
+            })
+            .unwrap()
+            .expect("first insert must produce a row");
+        assert_eq!(attempt.status, "pending");
+        assert_eq!(attempt.pr_number, 42);
+        assert_eq!(attempt.head_branch, "feature");
+        assert_eq!(attempt.base_sha_at_trigger.as_deref(), Some("abc123"));
+
+        // Parent's blocked_attempt_id is stamped to the new attempt.
+        let task = db.get_work_item(&chore.id).unwrap();
+        match task {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.blocked_attempt_id.as_deref(), Some(attempt.id.as_str()));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // Idempotent on the (work_item_id, base_sha) key.
+        let second = db
+            .insert_conflict_resolution(super::ConflictResolutionInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/42".into(),
+                pr_number: 42,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("abc123".into()),
+                head_sha_before: Some("def456".into()),
+            })
+            .unwrap();
+        assert!(second.is_none(), "second insert on same key must be a no-op");
+
+        // Active-attempt lookup returns the pending row.
+        let active = db
+            .active_conflict_resolution_for_work_item(&chore.id)
+            .unwrap()
+            .expect("pending attempt should be active");
+        assert_eq!(active.id, attempt.id);
+
+        // Diagnosis store / read.
+        let json = r#"{"schema_version":1,"base_sha":"abc","head_sha":"def","files":[],"error":null}"#;
+        let stored = db
+            .set_conflict_resolution_diagnosis(&attempt.id, json)
+            .unwrap()
+            .expect("diagnosis update returns updated row");
+        assert_eq!(stored.conflict_diagnosis.as_deref(), Some(json));
+
+        // pending → running.
+        let running = db
+            .mark_conflict_resolution_running(&attempt.id, "lease-1", "ws-1", "worker-1")
+            .unwrap()
+            .expect("running flip returns updated row");
+        assert_eq!(running.status, "running");
+        assert_eq!(running.cube_lease_id.as_deref(), Some("lease-1"));
+        assert_eq!(running.cube_workspace_id.as_deref(), Some("ws-1"));
+        assert_eq!(running.worker_id.as_deref(), Some("worker-1"));
+        assert!(running.started_at.is_some());
+
+        // running → failed via the worker-facing surface.
+        let failed = db
+            .mark_conflict_resolution_failed(&attempt.id, "obsolescence_suspected")
+            .unwrap()
+            .expect("failure flip returns updated row");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("obsolescence_suspected"),
+        );
+        assert!(failed.finished_at.is_some());
+
+        // mark_failed is idempotent on terminal rows — second call
+        // matches no rows and returns Ok(None).
+        let again = db
+            .mark_conflict_resolution_failed(&attempt.id, "redundant")
+            .unwrap();
+        assert!(
+            again.is_none(),
+            "second mark-failed on terminal row must be a no-op",
+        );
+
+        // Unknown attempt id → Ok(None).
+        let missing = db
+            .mark_conflict_resolution_failed("crz_does_not_exist", "x")
+            .unwrap();
+        assert!(missing.is_none());
 
         let _ = std::fs::remove_file(path);
     }

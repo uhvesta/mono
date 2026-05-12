@@ -4,6 +4,7 @@ pub mod build_info;
 pub mod cli;
 pub mod completion;
 pub mod config;
+pub mod conflict_diagnosis;
 pub mod conflict_watch;
 pub mod coordinator;
 pub mod dispatch_events;

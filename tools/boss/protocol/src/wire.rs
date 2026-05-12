@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
-    AddDependencyInput, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRunInput, CreateTaskInput, DependencyFilter, ListDependenciesInput, Product, Project,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    AddDependencyInput, ConflictResolution, CreateAttentionItemInput, CreateChoreInput,
+    CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyFilter, ListDependenciesInput,
+    Product, Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
     SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
@@ -370,6 +370,18 @@ pub enum FrontendRequest {
     /// [`ProjectDesignDocState::Resolved::local_workspace_available`].
     /// No DB writes; no topic events.
     ResolveProjectDesignDoc { project_id: String },
+    /// Worker-facing escape hatch for the merge-conflict resolution
+    /// flow: flip a `conflict_resolutions` attempt to `failed` with a
+    /// reason. The CLI surface is `boss engine conflicts mark-failed
+    /// <attempt-id> --reason <r>` — workers call it when they hit one
+    /// of the stop conditions (semantic obsolescence, product decision
+    /// required, architectural mismatch) and decide not to push. See
+    /// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`
+    /// Q4 / Q11.
+    MarkConflictResolutionFailed {
+        attempt_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +656,14 @@ pub enum FrontendEvent {
     /// envelope.
     ProjectDesignDocResolved {
         output: ResolveProjectDesignDocOutput,
+    },
+    /// Response to
+    /// [`FrontendRequest::MarkConflictResolutionFailed`]: the
+    /// post-update `conflict_resolutions` row. Carries the full row
+    /// so the CLI can pretty-print "attempt foo flipped to failed,
+    /// reason bar" without a follow-up `get`.
+    ConflictResolutionMarkedFailed {
+        attempt: ConflictResolution,
     },
 }
 
