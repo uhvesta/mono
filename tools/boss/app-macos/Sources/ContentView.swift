@@ -1887,14 +1887,8 @@ private struct PRURLLink: View {
                     .truncationMode(.middle)
             }
             .buttonStyle(.plain)
+            .pointerStyle(.link)
             .help(urlString)
-            .onHover { hovering in
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
         } else {
             Text(label)
                 .font(font)
