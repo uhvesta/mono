@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::conflict_watch;
-use crate::coordinator::ExecutionPublisher;
+use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::work::{PendingMergeCheck, WorkDb};
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -242,10 +242,16 @@ impl SweepOutcome {
 /// the poller cares about (in_review with a PR, plus rows currently
 /// blocked on merge_conflict so we can detect resolution). Returns
 /// per-bucket counters so callers can log a one-line summary.
+///
+/// `cube_client` is threaded into the conflict-watch retire path so
+/// `on_resolved` can release the cube workspace lease the resolution
+/// worker held (design Q5). Pass `None` for sweeps that don't need to
+/// drive lease release — pre-Phase-3 wiring, tests, etc.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
 ) -> SweepOutcome {
     let in_review = match work_db.list_chores_pending_merge_check() {
         Ok(items) => items,
@@ -270,7 +276,7 @@ pub async fn run_one_pass(
     }
     let mut outcome = SweepOutcome::default();
     for candidate in in_review.iter().chain(blocked_conflict.iter()) {
-        sweep_one(work_db, probe, publisher, candidate, &mut outcome).await;
+        sweep_one(work_db, probe, publisher, cube_client, candidate, &mut outcome).await;
     }
     outcome
 }
@@ -279,6 +285,7 @@ async fn sweep_one(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
     candidate: &PendingMergeCheck,
     outcome: &mut SweepOutcome,
 ) {
@@ -308,7 +315,7 @@ async fn sweep_one(
             }
         }
         PrLifecycleState::Open(OpenPrMergeability::Clean) => {
-            if conflict_watch::on_resolved(work_db, publisher, candidate).await {
+            if conflict_watch::on_resolved(work_db, publisher, cube_client, candidate).await {
                 outcome.conflict_cleared += 1;
             }
         }
@@ -366,6 +373,7 @@ pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
     publisher: Arc<dyn ExecutionPublisher>,
+    cube_client: Arc<dyn CubeClient>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -373,8 +381,13 @@ pub fn spawn_loop(
         // `gh`-per-chore on top of the engine's other startup work.
         tokio::time::sleep(interval).await;
         loop {
-            let outcome =
-                run_one_pass(work_db.as_ref(), probe.as_ref(), publisher.as_ref()).await;
+            let outcome = run_one_pass(
+                work_db.as_ref(),
+                probe.as_ref(),
+                publisher.as_ref(),
+                Some(cube_client.as_ref()),
+            )
+            .await;
             if outcome.total_transitions() > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -474,6 +487,12 @@ mod tests {
                 reason.to_owned(),
             ));
         }
+        async fn publish_frontend_event_on_product(
+            &self,
+            _product_id: &str,
+            _event: boss_protocol::FrontendEvent,
+        ) {
+        }
     }
 
     /// Build a `kind = 'project_task'` row in `in_review` with a PR
@@ -564,7 +583,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Merged);
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome.merged, 1);
 
         let item = db.get_work_item(&chore_id).unwrap();
@@ -595,7 +614,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.conflict_flagged, 0);
         // No `blocked: merge_conflict` row in the corpus, so the clean
@@ -623,7 +642,7 @@ mod tests {
         let publisher = Arc::new(RecordingPublisher::default());
 
         // The error on pr_a must not prevent pr_b from being promoted.
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome.merged, 1);
         match db.get_work_item(&chore_a).unwrap() {
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
@@ -657,7 +676,7 @@ mod tests {
 
         // Both kinds are mergeable, so a single sweep should promote
         // both rows — the project_task one being the regression case.
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(
             outcome.merged, 2,
             "merge poller must sweep both chore and project_task rows",
@@ -698,7 +717,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome.total_transitions(), 0);
         match db.get_work_item(&project_task_id).unwrap() {
             WorkItem::Task(t) => assert_eq!(t.status, "in_review"),
@@ -714,7 +733,7 @@ mod tests {
         // No chores in review at all → no work, no errors, no events.
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome.total_transitions(), 0);
         assert!(publisher.work_events.lock().await.is_empty());
     }
@@ -735,7 +754,7 @@ mod tests {
 
         // Pass 1: probe reports Conflict; row flips to blocked.
         probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict));
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome.conflict_flagged, 1);
         assert_eq!(outcome.conflict_cleared, 0);
         assert_eq!(outcome.merged, 0);
@@ -750,13 +769,13 @@ mod tests {
         // Pass 2 with no change: idempotent — probe still reports
         // Conflict, but row is already blocked, so the
         // mark-conflict UPDATE matches zero rows.
-        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome2.total_transitions(), 0);
 
         // Pass 3: probe flips to Clean; the blocked-conflict slice
         // picks the row up and clears it back to in_review.
         probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
-        let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome3.conflict_cleared, 1);
         assert_eq!(outcome3.conflict_flagged, 0);
         match db.get_work_item(&chore).unwrap() {
@@ -768,7 +787,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         // Pass 4 with no change: the clear is also idempotent.
-        let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome4.total_transitions(), 0);
 
         // Event trail: blocked → resolved, plus the noop-passes
@@ -790,6 +809,137 @@ mod tests {
         );
     }
 
+    /// Stub `CubeClient` that records every `release_workspace` call.
+    #[derive(Default)]
+    struct RecordingCubeClient {
+        releases: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CubeClient for RecordingCubeClient {
+        async fn ensure_repo(
+            &self,
+            _origin: &str,
+        ) -> Result<crate::coordinator::CubeRepoHandle> {
+            unreachable!("not used in merge_poller tests")
+        }
+        async fn lease_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<crate::coordinator::CubeWorkspaceLease> {
+            unreachable!("not used in merge_poller tests")
+        }
+        async fn create_change(
+            &self,
+            _: &std::path::PathBuf,
+            _: &str,
+        ) -> Result<crate::coordinator::CubeChangeHandle> {
+            unreachable!("not used in merge_poller tests")
+        }
+        async fn release_workspace(&self, lease_id: &str) -> Result<()> {
+            self.releases.lock().await.push(lease_id.to_owned());
+            Ok(())
+        }
+        async fn workspace_status(
+            &self,
+            _: &std::path::Path,
+        ) -> Result<crate::coordinator::CubeWorkspaceStatus> {
+            unreachable!()
+        }
+        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+        async fn force_release_lease(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn list_workspaces(
+            &self,
+        ) -> Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_with_attempt_runs_retire_path_end_to_end() {
+        // Phase 4 #10 acceptance: a successful push → next probe →
+        // retire path runs end-to-end through `run_one_pass`. The
+        // attempt row flips to `succeeded`, the parent goes back to
+        // `in_review`, the cube lease is released, and the typed
+        // ConflictResolutionSucceeded event lands on the product
+        // topic.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/600";
+        let (product, chore) = make_chore_in_review(&db, "C-attempt-cycle", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let cube = Arc::new(RecordingCubeClient::default());
+
+        // Pass 1: flip to blocked. Then install the attempt (mirroring
+        // Phase 3's worker-spawn path) so the next pass exercises the
+        // attempt-aware retire path.
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict));
+        run_one_pass(
+            &db,
+            probe.as_ref(),
+            publisher.as_ref(),
+            Some(cube.as_ref() as &dyn CubeClient),
+        )
+        .await;
+        let attempt = db
+            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 600,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base".into()),
+                head_sha_before: Some("head".into()),
+            })
+            .unwrap()
+            .unwrap();
+        db.mark_conflict_resolution_running(&attempt.id, "lease-600", "ws-600", "worker-600")
+            .unwrap();
+
+        // Pass 2: probe flips to Clean. Retire runs.
+        probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Clean));
+        let outcome = run_one_pass(
+            &db,
+            probe.as_ref(),
+            publisher.as_ref(),
+            Some(cube.as_ref() as &dyn CubeClient),
+        )
+        .await;
+        assert_eq!(outcome.conflict_cleared, 1);
+
+        // Parent in_review with blocked columns cleared.
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
+                assert!(t.blocked_attempt_id.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // Attempt is succeeded.
+        let attempt = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert_eq!(attempt.status, "succeeded");
+        assert!(attempt.finished_at.is_some());
+        // Lease released exactly once.
+        assert_eq!(
+            cube.releases.lock().await.as_slice(),
+            ["lease-600"],
+            "retire path must release the attempt's cube lease through the poller",
+        );
+    }
+
     #[tokio::test]
     async fn sweep_promotes_merged_pr_even_when_row_was_blocked() {
         // A blocked-on-conflict row whose PR was force-merged via
@@ -806,7 +956,7 @@ mod tests {
 
         // First pass: flip to blocked.
         probe.set(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict));
-        run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => assert_eq!(t.status, "blocked"),
             other => panic!("expected chore, got {other:?}"),
@@ -814,7 +964,7 @@ mod tests {
 
         // Second pass: GitHub reports MERGED.
         probe.set(pr, PrLifecycleState::Merged);
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref()).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
         assert_eq!(outcome.merged, 1);
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {

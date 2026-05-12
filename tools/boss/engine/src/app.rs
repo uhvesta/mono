@@ -1196,6 +1196,21 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
             )
             .await;
     }
+
+    async fn publish_frontend_event_on_product(
+        &self,
+        product_id: &str,
+        event: FrontendEvent,
+    ) {
+        let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let topic = work_product_topic(product_id);
+        self.topic_broker
+            .publish(
+                &topic,
+                FrontendEventEnvelope::push_with_revision(revision, event),
+            )
+            .await;
+    }
 }
 
 /// Maximum events that can be queued for one session before we treat the
@@ -1795,6 +1810,7 @@ pub async fn serve(
         server_state.work_db.clone(),
         merge_probe,
         server_state.publisher.clone(),
+        server_state.cube_client.clone(),
         Duration::from_secs(60),
     );
 
@@ -4175,6 +4191,23 @@ async fn handle_frontend_connection(
                             %reason,
                             "mark_conflict_resolution_failed: attempt flipped to failed",
                         );
+                        // Phase 4 #12: broadcast the typed activity-feed
+                        // event so subscribers (the macOS app) can
+                        // render the failed-attempt entry without
+                        // round-tripping through the CLI's response.
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &attempt.product_id,
+                                FrontendEvent::ConflictResolutionFailed {
+                                    product_id: attempt.product_id.clone(),
+                                    work_item_id: attempt.work_item_id.clone(),
+                                    attempt_id: attempt.id.clone(),
+                                    pr_url: attempt.pr_url.clone(),
+                                    failure_reason: reason.clone(),
+                                },
+                            )
+                            .await;
                         send_response(
                             &sink,
                             &request_id,

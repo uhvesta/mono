@@ -11,7 +11,9 @@
 //!
 //!   - [`on_resolved`] — fired when the probe reports a previously
 //!     conflicting PR back in [`OpenPrMergeability::Clean`]. Flips
-//!     the parent back to `in_review`. The WHERE guard ensures we
+//!     the parent back to `in_review`, flips the engine-owned
+//!     `conflict_resolutions` row to `succeeded`, and releases the
+//!     worker's cube lease (design Q5). The WHERE guard ensures we
 //!     only undo engine-owned transitions; a human who manually
 //!     reclassified the row stays in charge.
 //!
@@ -19,17 +21,14 @@
 //! `(work_item, pr_url)` finds the row already in the target state
 //! and updates zero rows, so re-firing on every sweep is harmless.
 //!
-//! Worker spawn and the [`conflict_resolutions`] side table are
-//! scoped to Phase 3 of the design (not this module). For now, the
-//! parent's `blocked_attempt_id` stays `NULL` after
-//! `on_conflict_detected` and is unaffected by `on_resolved`. When
-//! Phase 3 lands it will tighten both transitions to also touch the
-//! attempt row.
+//! Worker spawn lives in Phase 3 (`runner.rs`); this module reads the
+//! attempt row written by that path to drive the retire side.
 //!
 //! [`OpenPrMergeability`]: crate::merge_poller::OpenPrMergeability
-//! [`conflict_resolutions`]: https://example.invalid
 
-use crate::coordinator::ExecutionPublisher;
+use boss_protocol::FrontendEvent;
+
+use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::PrLifecycleProbe;
 use crate::work::{PendingMergeCheck, WorkDb};
 
@@ -38,6 +37,11 @@ use crate::work::{PendingMergeCheck, WorkDb};
 /// per-sweep counter can record it). All paths that *don't*
 /// transition — WHERE-guard miss, auto-rebase owns the slot, DB
 /// error — return `false` and log at the appropriate level.
+///
+/// When a freshly-inserted `conflict_resolutions` row accompanies the
+/// flip (Phase 3 wiring), this path also publishes a typed
+/// [`FrontendEvent::ConflictResolutionStarted`] envelope so activity-feed
+/// subscribers can render the start-of-attempt entry without polling.
 pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -97,6 +101,26 @@ pub async fn on_conflict_detected(
             "blocked_merge_conflict",
         )
         .await;
+    // If a `conflict_resolutions` row already exists for this work item
+    // (Phase 3's worker-spawn path created it pre-flip, or a concurrent
+    // sweep won the insert), emit the typed activity-feed event so the
+    // macOS app can paint the "engine is on it" entry. The lookup is
+    // best-effort — a failure here doesn't roll back the parent flip.
+    if let Ok(Some(attempt)) =
+        work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id)
+    {
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::ConflictResolutionStarted {
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    attempt_id: attempt.id,
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+    }
     tracing::info!(
         work_item_id = %updated.id,
         kind = %updated.kind,
@@ -115,16 +139,54 @@ pub async fn on_conflict_detected(
 /// `Clean` probe for an already-`in_review` row is a no-op via the
 /// WHERE guard), so wiring stays simple — every `Clean` result
 /// passes through here.
+///
+/// When an engine-owned `conflict_resolutions` row covers the chore
+/// (Phase 3+), this path also (a) flips the attempt row to
+/// `succeeded`, (b) releases the worker's cube workspace lease via
+/// `cube_client`, and (c) broadcasts a typed
+/// [`FrontendEvent::ConflictResolutionSucceeded`] envelope. `cube_client`
+/// is taken as `Option` so tests / pre-Phase-3 wiring can run without a
+/// cube. When `None`, the lease release is a no-op (the worker's
+/// `record_worker_pr_completion` already released the lease on the Stop
+/// event).
 pub async fn on_resolved(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
     candidate: &PendingMergeCheck,
 ) -> bool {
-    let updated = match work_db
-        .clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
+    // Look up the engine-owned attempt row first. If one exists, drive
+    // the strict (attempt-id-guarded) retire path; otherwise fall back
+    // to the relaxed pr_url-only WHERE clause so this module still
+    // closes the loop when Phase 3 wiring hasn't shipped yet.
+    let attempt = match work_db
+        .active_conflict_resolution_for_work_item(&candidate.work_item_id)
     {
-        Ok(Some(task)) => task,
-        Ok(None) => return false,
+        Ok(found) => found,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "conflict_watch: failed to look up active conflict_resolutions row; falling back to relaxed retire",
+            );
+            None
+        }
+    };
+
+    let task_result = if let Some(attempt) = attempt.as_ref() {
+        work_db.clear_chore_blocked_merge_conflict_for_attempt(
+            &candidate.work_item_id,
+            &candidate.pr_url,
+            &attempt.id,
+        )
+    } else {
+        work_db.clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
+    };
+
+    let task_transitioned = match task_result {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
@@ -135,14 +197,81 @@ pub async fn on_resolved(
             return false;
         }
     };
-    publisher
-        .publish_work_item_changed(&candidate.product_id, &updated.id, "merge_conflict_resolved")
-        .await;
+
+    // The attempt row's update is independent of the parent flip. The
+    // design (Q5) requires both to happen even if one of them has
+    // already been moved by a concurrent path (manual override, on-Stop
+    // completion, etc.).
+    let mut attempt_transitioned = false;
+    if let Some(attempt) = attempt.as_ref() {
+        match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
+            Ok(Some(succeeded)) => {
+                attempt_transitioned = true;
+                // Release the cube workspace lease the attempt owned.
+                // Idempotent on the cube side — the lease may already
+                // have been released by the worker's on-Stop completion
+                // path, in which case cube returns a benign error that
+                // we log at debug.
+                if let (Some(client), Some(lease_id)) =
+                    (cube_client, succeeded.cube_lease_id.as_deref())
+                {
+                    if let Err(err) = client.release_workspace(lease_id).await {
+                        tracing::debug!(
+                            attempt_id = %succeeded.id,
+                            lease_id,
+                            ?err,
+                            "conflict_watch: lease release on retire failed (likely already released)",
+                        );
+                    }
+                }
+                publisher
+                    .publish_frontend_event_on_product(
+                        &candidate.product_id,
+                        FrontendEvent::ConflictResolutionSucceeded {
+                            product_id: candidate.product_id.clone(),
+                            work_item_id: candidate.work_item_id.clone(),
+                            attempt_id: succeeded.id.clone(),
+                            pr_url: candidate.pr_url.clone(),
+                        },
+                    )
+                    .await;
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    work_item_id = %candidate.work_item_id,
+                    "conflict_watch: attempt row already terminal; skipping succeeded UPDATE",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "conflict_watch: failed to mark conflict_resolution succeeded",
+                );
+            }
+        }
+    }
+
+    if !task_transitioned && !attempt_transitioned {
+        return false;
+    }
+    if task_transitioned {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "merge_conflict_resolved",
+            )
+            .await;
+    }
     tracing::info!(
-        work_item_id = %updated.id,
-        kind = %updated.kind,
+        work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
-        "conflict_watch: PR mergeable again; work item returned to in_review",
+        attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
+        task_transitioned,
+        attempt_transitioned,
+        "conflict_watch: PR mergeable again; retire path ran",
     );
     true
 }
@@ -165,6 +294,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingPublisher {
         events: Mutex<Vec<(String, String, String)>>,
+        typed_events: Mutex<Vec<(String, FrontendEvent)>>,
     }
 
     #[async_trait]
@@ -181,6 +311,16 @@ mod tests {
                 work_item_id.to_owned(),
                 reason.to_owned(),
             ));
+        }
+        async fn publish_frontend_event_on_product(
+            &self,
+            product_id: &str,
+            event: FrontendEvent,
+        ) {
+            self.typed_events
+                .lock()
+                .await
+                .push((product_id.to_owned(), event));
         }
     }
 
@@ -310,7 +450,7 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
         )
         .await;
-        let resolved = on_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr)).await;
+        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
         assert!(resolved);
 
         let (status, reason) = chore_status(&db, &chore);
@@ -332,7 +472,7 @@ mod tests {
 
         // First call: row is in_review (not blocked), so resolution is
         // a no-op — the WHERE guard misses, no event published.
-        let r1 = on_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr)).await;
+        let r1 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
         assert!(!r1);
         assert!(pub_.events.lock().await.is_empty());
 
@@ -345,8 +485,8 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
         )
         .await;
-        let r2 = on_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr)).await;
-        let r3 = on_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr)).await;
+        let r2 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
+        let r3 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
         assert!(r2);
         assert!(!r3);
     }
@@ -370,7 +510,7 @@ mod tests {
             )
             .await
         );
-        assert!(on_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr)).await);
+        assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await);
         assert!(
             on_conflict_detected(
                 &db,
@@ -459,9 +599,442 @@ mod tests {
         )
         .unwrap();
         let before_count = pub_.events.lock().await.len();
-        let r = on_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr)).await;
+        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr)).await;
         assert!(!r);
         assert_eq!(pub_.events.lock().await.len(), before_count);
+    }
+
+    /// `CubeClient` that records every `release_workspace` call so the
+    /// retire-path tests can assert the lease release fired without
+    /// standing up a real cube process.
+    #[derive(Default)]
+    struct RecordingCubeClient {
+        releases: Mutex<Vec<String>>,
+        release_should_fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::coordinator::CubeClient for RecordingCubeClient {
+        async fn ensure_repo(
+            &self,
+            _origin: &str,
+        ) -> anyhow::Result<crate::coordinator::CubeRepoHandle> {
+            unreachable!("not used in conflict_watch tests")
+        }
+        async fn lease_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> anyhow::Result<crate::coordinator::CubeWorkspaceLease> {
+            unreachable!("not used in conflict_watch tests")
+        }
+        async fn create_change(
+            &self,
+            _: &std::path::PathBuf,
+            _: &str,
+        ) -> anyhow::Result<crate::coordinator::CubeChangeHandle> {
+            unreachable!("not used in conflict_watch tests")
+        }
+        async fn release_workspace(&self, lease_id: &str) -> anyhow::Result<()> {
+            self.releases.lock().await.push(lease_id.to_owned());
+            if self
+                .release_should_fail
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(anyhow::anyhow!("simulated lease release failure"))
+            } else {
+                Ok(())
+            }
+        }
+        async fn workspace_status(
+            &self,
+            _: &std::path::Path,
+        ) -> anyhow::Result<crate::coordinator::CubeWorkspaceStatus> {
+            unreachable!()
+        }
+        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn force_release_lease(
+            &self,
+            _: &str,
+            _: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list_workspaces(
+            &self,
+        ) -> anyhow::Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Insert a `conflict_resolutions` row in `running` for the given
+    /// work item and stamp the parent's `blocked_attempt_id`. Mirrors
+    /// what Phase 3's worker-spawn path will do at runtime; lets the
+    /// retire-path tests run without standing up the worker pipeline.
+    fn install_running_attempt(
+        db: &WorkDb,
+        product_id: &str,
+        work_item_id: &str,
+        pr_url: &str,
+        lease_id: &str,
+    ) -> String {
+        let attempt = db
+            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: product_id.to_owned(),
+                work_item_id: work_item_id.to_owned(),
+                pr_url: pr_url.to_owned(),
+                pr_number: 99,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base-sha".into()),
+                head_sha_before: Some("head-sha".into()),
+            })
+            .unwrap()
+            .expect("attempt insert returns Some when no row exists yet");
+        db.mark_conflict_resolution_running(&attempt.id, lease_id, "ws-1", "worker-1")
+            .unwrap()
+            .expect("mark_running must flip the freshly-inserted row");
+        attempt.id
+    }
+
+    #[tokio::test]
+    async fn retire_with_attempt_flips_parent_releases_lease_and_emits_typed_event() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/20";
+        let (product, chore) = make_in_review(&db, "C-retire", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Flip to blocked and install a running attempt so the retire
+        // path has both a parent row and an attempt row to update.
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+        let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-42");
+
+        let cube = Arc::new(RecordingCubeClient::default());
+        let resolved = on_resolved(
+            &db,
+            pub_.as_ref(),
+            Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
+            &candidate(&product, &chore, pr),
+        )
+        .await;
+        assert!(resolved, "retire path must transition both rows");
+
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert!(
+                    t.blocked_attempt_id.is_none(),
+                    "blocked_attempt_id must be cleared on retire",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let attempt_row = db
+            .get_conflict_resolution(&attempt_id)
+            .unwrap()
+            .expect("attempt row must still exist post-retire");
+        assert_eq!(attempt_row.status, "succeeded");
+        assert!(attempt_row.finished_at.is_some());
+
+        assert_eq!(
+            cube.releases.lock().await.as_slice(),
+            ["lease-42"],
+            "retire path must release the attempt's cube lease",
+        );
+
+        let work_events = pub_.events.lock().await.clone();
+        assert!(
+            work_events.iter().any(|(_, _, r)| r == "merge_conflict_resolved"),
+            "expected merge_conflict_resolved work-item event, got {work_events:?}",
+        );
+
+        let typed = pub_.typed_events.lock().await.clone();
+        let succeeded_event = typed
+            .iter()
+            .find(|(pid, ev)| {
+                pid == &product
+                    && matches!(
+                        ev,
+                        FrontendEvent::ConflictResolutionSucceeded { attempt_id: id, .. } if id == &attempt_id
+                    )
+            });
+        assert!(
+            succeeded_event.is_some(),
+            "expected ConflictResolutionSucceeded event with attempt_id={attempt_id}, got {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_events_arrive_in_started_then_succeeded_order() {
+        // Phase 4 #12 acceptance: a full conflict-resolve cycle emits
+        // exactly one ConflictResolutionStarted and one
+        // ConflictResolutionSucceeded, in that order, with matching
+        // attempt_id payloads.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/25";
+        let (product, chore) = make_in_review(&db, "C-evt-order", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Phase 3 wiring: insert the attempt row before flipping the
+        // parent so the started-event has a row to broadcast against.
+        // (We invoke mark_chore_blocked_merge_conflict directly to set
+        // up the insert pre-condition, then restore status to in_review
+        // so on_conflict_detected has work to do.)
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let attempt = db
+            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 25,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base-sha".into()),
+                head_sha_before: Some("head-sha".into()),
+            })
+            .unwrap()
+            .unwrap();
+        db.mark_conflict_resolution_running(&attempt.id, "lease-25", "ws-25", "worker-25")
+            .unwrap();
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+        let cube = Arc::new(RecordingCubeClient::default());
+        on_resolved(
+            &db,
+            pub_.as_ref(),
+            Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
+            &candidate(&product, &chore, pr),
+        )
+        .await;
+
+        let typed = pub_.typed_events.lock().await.clone();
+        let kinds: Vec<&'static str> = typed
+            .iter()
+            .map(|(_, ev)| match ev {
+                FrontendEvent::ConflictResolutionStarted { .. } => "started",
+                FrontendEvent::ConflictResolutionSucceeded { .. } => "succeeded",
+                FrontendEvent::ConflictResolutionFailed { .. } => "failed",
+                FrontendEvent::ConflictResolutionAbandoned { .. } => "abandoned",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["started", "succeeded"],
+            "expected started → succeeded ordering, got {kinds:?}",
+        );
+        for (_, ev) in &typed {
+            match ev {
+                FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. }
+                | FrontendEvent::ConflictResolutionSucceeded { attempt_id: a, .. } => {
+                    assert_eq!(a, &attempt.id, "attempt_id payload must match");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retire_is_idempotent_on_repeated_probes_with_active_attempt() {
+        // Second sweep over a row already retired must NOT re-emit
+        // events nor re-release the cube lease.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/21";
+        let (product, chore) = make_in_review(&db, "C-retire-idem", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+        install_running_attempt(&db, &product, &chore, pr, "lease-99");
+
+        let cube = Arc::new(RecordingCubeClient::default());
+        let first = on_resolved(
+            &db,
+            pub_.as_ref(),
+            Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
+            &candidate(&product, &chore, pr),
+        )
+        .await;
+        let second = on_resolved(
+            &db,
+            pub_.as_ref(),
+            Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
+            &candidate(&product, &chore, pr),
+        )
+        .await;
+        assert!(first, "first retire transitions");
+        assert!(!second, "second probe must be a no-op");
+
+        assert_eq!(
+            cube.releases.lock().await.len(),
+            1,
+            "lease must be released exactly once across duplicate probes",
+        );
+        let succeeded_count = pub_
+            .typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionSucceeded { .. }))
+            .count();
+        assert_eq!(
+            succeeded_count, 1,
+            "ConflictResolutionSucceeded must fire exactly once across duplicate probes",
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_tolerates_lease_release_failure() {
+        // Cube release failures during retire must not block the
+        // database transitions — the attempt is succeeded, the parent
+        // is in_review, and we log + move on.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/22";
+        let (product, chore) = make_in_review(&db, "C-retire-leasefail", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+        let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-zz");
+
+        let cube = Arc::new(RecordingCubeClient::default());
+        cube.release_should_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let resolved = on_resolved(
+            &db,
+            pub_.as_ref(),
+            Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
+            &candidate(&product, &chore, pr),
+        )
+        .await;
+        assert!(resolved, "retire transitions must still report success");
+        let attempt_row = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt_row.status, "succeeded");
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn detection_emits_started_event_when_attempt_row_exists() {
+        // Phase 3 will create the conflict_resolutions row pre-flip;
+        // the started-event publish is gated on that row existing.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/23";
+        let (product, chore) = make_in_review(&db, "C-detect-evt", pr);
+
+        // Move to blocked manually first so the attempt INSERT path's
+        // task-side stamp matches its WHERE guard.
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let attempt = db
+            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 23,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base-sha".into()),
+                head_sha_before: Some("head-sha".into()),
+            })
+            .unwrap()
+            .unwrap();
+        // Reset to in_review so on_conflict_detected has work to do.
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let transitioned = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+        assert!(transitioned);
+
+        let typed = pub_.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(_, ev)| matches!(
+                ev,
+                FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. } if a == &attempt.id
+            )),
+            "expected ConflictResolutionStarted event for attempt {}, got {typed:?}",
+            attempt.id,
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_emits_no_started_event_without_attempt_row() {
+        // Pre-Phase-3: the parent flips to blocked but no attempt row
+        // exists yet — the typed-event publish must be silent so we
+        // don't broadcast an attempt-id-less Started.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/24";
+        let (product, chore) = make_in_review(&db, "C-detect-noevt", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+        )
+        .await;
+
+        let typed = pub_.typed_events.lock().await.clone();
+        assert!(
+            typed.is_empty(),
+            "no Started event must fire when no attempt row exists yet, got {typed:?}",
+        );
     }
 
     #[tokio::test]

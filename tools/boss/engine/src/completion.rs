@@ -37,8 +37,17 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use tokio::process::Command;
 
+use boss_protocol::FrontendEvent;
+
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::work::{WorkDb, WorkItem, WorkerPrCompletionTarget};
+
+/// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
+/// when the bound worker exits without pushing and without otherwise
+/// classifying the failure via `boss engine conflicts mark-failed`
+/// (design Q5 / Phase 4 #11). The activity-feed surface renders it
+/// loudly so the user knows the engine gave up rather than churning.
+pub const CONFLICT_NO_PUSH_REASON: &str = "no_push_no_stop_condition";
 
 /// Asks the registered app session to tear down the libghostty pane
 /// hosting `run_id`. Implementations must be idempotent: a duplicate
@@ -415,6 +424,22 @@ impl WorkerCompletionHandler {
     /// Handle a `Stop` event for `execution_id`. Returns the outcome
     /// classification so callers can log/test what happened.
     pub async fn on_stop(&self, execution_id: &str) -> StopOutcome {
+        let outcome = self.on_stop_inner(execution_id).await;
+        // Phase 4 #11: for `conflict_resolution` executions, run the
+        // catch-all attempt finalizer regardless of how the inner path
+        // resolved. The finalizer decides whether to mark the bound
+        // `conflict_resolutions` row `failed` based on whether the
+        // worker pushed (see [`Self::finalize_conflict_resolution_attempt`]).
+        if let Ok(execution) = self.work_db.get_execution(execution_id) {
+            if execution.kind == "conflict_resolution" {
+                self.finalize_conflict_resolution_attempt(&execution, &outcome)
+                    .await;
+            }
+        }
+        outcome
+    }
+
+    async fn on_stop_inner(&self, execution_id: &str) -> StopOutcome {
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) => execution,
             Err(err) => {
@@ -566,6 +591,135 @@ impl WorkerCompletionHandler {
             );
             StopOutcome::PrDetected { pr_url }
         }
+    }
+
+    /// Phase 4 #11: catch-all finaliser for `conflict_resolution`
+    /// workers. Fires for every Stop event on a `conflict_resolution`
+    /// execution; decides whether to mark the bound
+    /// `conflict_resolutions` row `failed` with the catch-all reason
+    /// (`no_push_no_stop_condition`).
+    ///
+    /// The rule (design Q5): if the attempt is still `running`,
+    /// `head_sha_after IS NULL`, `failure_reason IS NULL`, AND the
+    /// worker exited without pushing (PR not freshly bound), the
+    /// engine has no signal that the worker classified its own
+    /// outcome — default to failed with the catch-all reason. On
+    /// `Fresh` / `Merged` outcomes the merge poller's `on_resolved`
+    /// retire path will mark the attempt `succeeded` shortly; we
+    /// don't pre-empt it. On `Stale` / `DetectorFailed` we stay
+    /// quiet because the on-Stop probe path is already chasing the
+    /// situation (probe queued, worker may push again).
+    ///
+    /// Idempotent — the underlying [`WorkDb::mark_conflict_resolution_failed`]
+    /// WHERE-guards on `status IN ('pending', 'running')`, so a
+    /// duplicate finalizer call after a terminal transition is a no-op.
+    pub async fn finalize_conflict_resolution_attempt(
+        &self,
+        execution: &crate::work::WorkExecution,
+        outcome: &StopOutcome,
+    ) {
+        let attempt = match self
+            .work_db
+            .active_conflict_resolution_for_work_item(&execution.work_item_id)
+        {
+            Ok(Some(attempt)) => attempt,
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    "conflict-resolution finalizer: no active attempt; nothing to do",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "conflict-resolution finalizer: failed to look up active attempt",
+                );
+                return;
+            }
+        };
+        // Already past the "running with no outcome" window — the
+        // worker reported via mark-failed, the poller already retired
+        // it, or some other path closed the row. Nothing for the
+        // catch-all to do.
+        if attempt.status != "running"
+            || attempt.head_sha_after.is_some()
+            || attempt.failure_reason.is_some()
+        {
+            return;
+        }
+
+        let should_mark_failed = match outcome {
+            // Worker pushed (or the PR is already merged from this run).
+            // The merge poller's on_resolved retire path will mark the
+            // attempt `succeeded` on the next sweep.
+            StopOutcome::PrDetected { .. } | StopOutcome::PrMerged { .. } => false,
+            // Worker pushed something but the PR head still trails the
+            // worker's local commits. The on-Stop path has already
+            // queued a probe asking the worker to push again; don't
+            // pre-empt that with a failed mark.
+            StopOutcome::StalePr { .. } => false,
+            // Race with an already-finalized execution (a second Stop
+            // for the same worker, or finalize_run racing). Skip.
+            StopOutcome::AlreadyTerminal | StopOutcome::UnknownExecution => false,
+            // Catch-all branches: the worker exited and we have no
+            // evidence of a push.
+            StopOutcome::AwaitingInput
+            | StopOutcome::DetectorFailed
+            | StopOutcome::NoWorkspace
+            | StopOutcome::DbError => true,
+        };
+        if !should_mark_failed {
+            return;
+        }
+
+        let updated = match self
+            .work_db
+            .mark_conflict_resolution_failed(&attempt.id, CONFLICT_NO_PUSH_REASON)
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    "conflict-resolution finalizer: attempt already terminal between probes",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "conflict-resolution finalizer: failed to mark attempt failed",
+                );
+                return;
+            }
+        };
+
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            attempt_id = %updated.id,
+            pr_url = %updated.pr_url,
+            reason = CONFLICT_NO_PUSH_REASON,
+            ?outcome,
+            "conflict-resolution finalizer: worker exited without pushing; attempt marked failed",
+        );
+
+        self.publisher
+            .publish_frontend_event_on_product(
+                &updated.product_id,
+                FrontendEvent::ConflictResolutionFailed {
+                    product_id: updated.product_id.clone(),
+                    work_item_id: updated.work_item_id.clone(),
+                    attempt_id: updated.id.clone(),
+                    pr_url: updated.pr_url.clone(),
+                    failure_reason: CONFLICT_NO_PUSH_REASON.to_owned(),
+                },
+            )
+            .await;
     }
 
     /// Force-release the resources backing `execution_id`: tear down
@@ -848,6 +1002,7 @@ mod tests {
     struct RecordingPublisher {
         events: Mutex<Vec<(String, String, String, String)>>,
         work_events: Mutex<Vec<(String, String, String)>>,
+        typed_events: Mutex<Vec<(String, boss_protocol::FrontendEvent)>>,
     }
 
     #[async_trait]
@@ -871,6 +1026,16 @@ mod tests {
                 work_item_id.to_owned(),
                 reason.to_owned(),
             ));
+        }
+        async fn publish_frontend_event_on_product(
+            &self,
+            product_id: &str,
+            event: boss_protocol::FrontendEvent,
+        ) {
+            self.typed_events
+                .lock()
+                .await
+                .push((product_id.to_owned(), event));
         }
     }
 
@@ -1400,6 +1565,286 @@ mod tests {
         let queued = probes.snapshot();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].1, PROBE_NO_PR);
+    }
+
+    /// Build a `kind = 'conflict_resolution'` execution against a chore
+    /// that is currently `blocked: merge_conflict`. Also inserts the
+    /// matching `conflict_resolutions` row in `running` so the
+    /// completion finalizer has something to look up. Mirrors the
+    /// engine state after Phase 3 wiring spawns a resolution worker.
+    fn conflict_fixture(
+        workspace_path: &Path,
+    ) -> (Arc<WorkDb>, String, String, String, String) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Resolve conflict".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/77";
+        db.update_work_item(
+            &chore.id,
+            crate::work::WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.mark_chore_blocked_merge_conflict(&chore.id, pr_url).unwrap();
+        let attempt = db
+            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr_url.into(),
+                pr_number: 77,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base".into()),
+                head_sha_before: Some("head".into()),
+            })
+            .unwrap()
+            .unwrap();
+        db.mark_conflict_resolution_running(&attempt.id, "lease-1", "ws-1", "worker-1")
+            .unwrap();
+
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "conflict_resolution".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        (db, product.id, chore.id, execution.id, attempt.id)
+    }
+
+    #[tokio::test]
+    async fn conflict_resolution_worker_exits_without_push_marks_attempt_failed() {
+        // Worker bound to a conflict_resolutions row exits with no PR
+        // (the resolver gave up without pushing). The completion path's
+        // catch-all must flip the attempt to `failed` with
+        // `no_push_no_stop_condition` and broadcast the typed event.
+        let workspace = tempdir().unwrap();
+        let (db, product_id, _chore_id, execution_id, attempt_id) =
+            conflict_fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(attempt.failure_reason.as_deref(), Some(CONFLICT_NO_PUSH_REASON));
+        assert!(attempt.finished_at.is_some());
+
+        let typed = publisher.typed_events.lock().await.clone();
+        let failed_event = typed.iter().find(|(pid, ev)| {
+            pid == &product_id
+                && matches!(
+                    ev,
+                    boss_protocol::FrontendEvent::ConflictResolutionFailed {
+                        attempt_id: a,
+                        failure_reason,
+                        ..
+                    } if a == &attempt_id && failure_reason == CONFLICT_NO_PUSH_REASON
+                )
+        });
+        assert!(
+            failed_event.is_some(),
+            "expected ConflictResolutionFailed event for {attempt_id}, got {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_resolution_worker_pushed_does_not_mark_attempt_failed() {
+        // Worker pushed (PrStatus::Fresh) — the merge poller's
+        // `on_resolved` will mark the attempt `succeeded` on the next
+        // sweep. The completion finalizer must NOT pre-empt that with
+        // a `failed` mark.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id, attempt_id) =
+            conflict_fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/77"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube,
+            publisher.clone(),
+            pane,
+            probes,
+        );
+        let _ = handler.on_stop(&execution_id).await;
+
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "running",
+            "fresh-PR finalization must leave the attempt for the poller",
+        );
+        assert!(attempt.failure_reason.is_none());
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().all(|(_, ev)| !matches!(
+                ev,
+                boss_protocol::FrontendEvent::ConflictResolutionFailed { .. }
+            )),
+            "no Failed event must fire when the worker pushed",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_resolution_worker_with_mark_failed_already_set_is_skipped() {
+        // Worker called `boss engine conflicts mark-failed` first.
+        // The catch-all finalizer must observe the existing
+        // `failure_reason` and NOT overwrite with the catch-all.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id, attempt_id) =
+            conflict_fixture(workspace.path());
+        db.mark_conflict_resolution_failed(&attempt_id, "obsolescence_suspected")
+            .unwrap();
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube,
+            publisher.clone(),
+            pane,
+            probes,
+        );
+        let _ = handler.on_stop(&execution_id).await;
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(
+            attempt.failure_reason.as_deref(),
+            Some("obsolescence_suspected"),
+            "catch-all must not overwrite an existing failure_reason",
+        );
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().all(|(_, ev)| !matches!(
+                ev,
+                boss_protocol::FrontendEvent::ConflictResolutionFailed { .. }
+            )),
+            "Failed event must not be re-broadcast by the catch-all",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_conflict_kind_execution_does_not_invoke_finalizer() {
+        // The standard chore_implementation kind must NOT trip the
+        // conflict-resolution finalizer even if a conflict_resolutions
+        // row happens to exist for the same work item (e.g. a prior
+        // attempt was archived).
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // Pre-existing failed attempt unrelated to this execution.
+        let attempt = db
+            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: "any".into(),
+                work_item_id: chore_id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/99".into(),
+                pr_number: 99,
+                head_branch: "x".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("bsha".into()),
+                head_sha_before: None,
+            })
+            .unwrap()
+            .unwrap();
+        db.mark_conflict_resolution_running(&attempt.id, "lease-x", "ws-x", "worker-x")
+            .unwrap();
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube,
+            publisher.clone(),
+            pane,
+            probes,
+        );
+        let _ = handler.on_stop(&execution_id).await;
+
+        // The chore_implementation execution must not touch the
+        // sibling conflict_resolutions row; if it did, the attempt
+        // would now be `failed` instead of `running`.
+        let after = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert_eq!(
+            after.status, "running",
+            "non-conflict-kind executions must not trip the conflict-resolution finalizer",
+        );
     }
 
     #[test]

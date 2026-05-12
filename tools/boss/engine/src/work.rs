@@ -2780,6 +2780,49 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
+    /// Stricter variant of [`Self::clear_chore_blocked_merge_conflict`]
+    /// that also requires `blocked_attempt_id = ?attempt_id` in the
+    /// WHERE clause (design Q5). Used by the auto-retire path when an
+    /// engine-managed `conflict_resolutions` row exists for the
+    /// transition: the attempt-id guard guarantees we only undo *our
+    /// own* blocked rows, even if a human concurrently re-flipped the
+    /// chore to a fresh `blocked: merge_conflict` under a different
+    /// attempt id. Idempotent; returns `Ok(None)` on WHERE-guard miss.
+    pub fn clear_chore_blocked_merge_conflict_for_attempt(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        attempt_id: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET status             = 'in_review',
+                    blocked_reason     = NULL,
+                    blocked_attempt_id = NULL,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?4
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason = 'merge_conflict'
+                AND pr_url = ?2
+                AND blocked_attempt_id = ?3
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, attempt_id, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_task(&tx, work_item_id)?.with_context(|| {
+            format!("unknown task after merge_conflict clear: {work_item_id}")
+        })?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// True iff there's a non-terminal `rebase_attempts` row covering
     /// the given PR url. Used by `conflict_watch::on_conflict_detected`
     /// to defer when the `auto-rebase-stacked-prs` flow already owns
@@ -2975,6 +3018,68 @@ impl WorkDb {
         let rows = tx.execute(
             "UPDATE conflict_resolutions
                 SET status         = 'failed',
+                    failure_reason = ?2,
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, reason, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Auto-retire transition: flip an attempt from `running` to
+    /// `succeeded`, stamping `head_sha_after` if known and a fresh
+    /// `finished_at`. Idempotent — a second call with the row already
+    /// terminal returns `Ok(None)` and writes nothing. Phase 4 / design
+    /// Q5: invoked by the merge poller's `on_resolved` path when
+    /// GitHub reports the PR mergeable again.
+    pub fn mark_conflict_resolution_succeeded(
+        &self,
+        attempt_id: &str,
+        head_sha_after: Option<&str>,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET status         = 'succeeded',
+                    head_sha_after = COALESCE(?2, head_sha_after),
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status = 'running'",
+            params![attempt_id, head_sha_after, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Engine-side abandon: flip a non-terminal attempt to `abandoned`
+    /// with the provided reason. Used for "we stepped away on purpose"
+    /// terminations (parent PR closed, parent merged externally,
+    /// manual override) where `failed` would be misleading. Idempotent.
+    pub fn mark_conflict_resolution_abandoned(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET status         = 'abandoned',
                     failure_reason = ?2,
                     finished_at    = COALESCE(finished_at, ?3)
               WHERE id = ?1
