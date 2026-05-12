@@ -815,6 +815,9 @@ mod conflict_resolution_prompt_tests {
             blocked_attempt_id: Some("crz_x".into()),
             effort_level: None,
             model_override: None,
+            ci_attempt_budget: None,
+            ci_attempts_used: 0,
+            blocked_signals: Vec::new(),
         })
     }
 
@@ -1136,6 +1139,9 @@ mod pane_spawn_tests {
             blocked_attempt_id: None,
             effort_level: None,
             model_override: None,
+            ci_attempt_budget: None,
+            ci_attempts_used: 0,
+            blocked_signals: Vec::new(),
         })
     }
 

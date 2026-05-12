@@ -413,6 +413,9 @@ mod tests {
             blocked_attempt_id: None,
             effort_level: None,
             model_override: None,
+            ci_attempt_budget: None,
+            ci_attempts_used: 0,
+            blocked_signals: Vec::new(),
         })
     }
 

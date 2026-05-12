@@ -1865,7 +1865,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1876,7 +1876,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -1959,7 +1959,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1968,7 +1968,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -2067,7 +2067,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -2286,7 +2286,8 @@ impl WorkDb {
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                default_model TEXT
+                default_model TEXT,
+                ci_attempt_budget INTEGER NOT NULL DEFAULT 3
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -2326,7 +2327,9 @@ impl WorkDb {
                 repo_remote_url TEXT,
                 created_via TEXT NOT NULL DEFAULT 'unknown',
                 effort_level TEXT,
-                model_override TEXT
+                model_override TEXT,
+                ci_attempt_budget INTEGER,
+                ci_attempts_used INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -2462,8 +2465,14 @@ impl WorkDb {
         migrate_work_attention_items_work_item_id(&conn)?;
         migrate_tasks_effort_and_model_columns(&conn)?;
         migrate_products_default_model(&conn)?;
+        migrate_task_blocked_signals_table(&conn)?;
+        migrate_ci_remediations_table(&conn)?;
+        migrate_ci_failure_suppressions_table(&conn)?;
+        migrate_tasks_ci_attempt_columns(&conn)?;
+        migrate_products_ci_attempt_budget(&conn)?;
+        migrate_backfill_task_blocked_signals(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '7')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '8')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -3653,6 +3662,15 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         repo_remote_url: row.get(18)?,
         effort_level,
         model_override: row.get::<_, Option<String>>(20)?.filter(|s| !s.is_empty()),
+        ci_attempt_budget: row.get(21)?,
+        ci_attempts_used: row.get(22)?,
+        // The multi-signal projection is built from the
+        // `task_blocked_signals` side table by the engine's signal-
+        // aggregation path (`merge-conflict-handling-in-review.md` §Q2),
+        // which lands in a later phase. Until then the wire field is
+        // always empty; consumers fall back to the scalar
+        // `blocked_reason` / `blocked_attempt_id` cache above.
+        blocked_signals: Vec::new(),
     })
 }
 
@@ -3967,7 +3985,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -4030,7 +4048,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -4601,6 +4619,157 @@ fn migrate_backfill_blocked_reason_dependency(conn: &Connection) -> Result<()> {
                    OR (pp.id IS NOT NULL AND pp.status <> 'done' AND pp.status <> 'archived')
                  )
             )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Create the `task_blocked_signals` side table — the multi-signal
+/// companion to the scalar `tasks.blocked_reason` cache. One row per
+/// active blocked-reason for a work item; the `(work_item_id, reason)`
+/// PK doubles as the idempotency lock so re-observing the same signal
+/// is an upsert rather than a duplicate row. `cleared_at` retains
+/// history (alongside `conflict_resolutions` and `ci_remediations`).
+/// See `merge-conflict-handling-in-review.md` §Q2 for rationale.
+fn migrate_task_blocked_signals_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_blocked_signals (
+             work_item_id  TEXT NOT NULL,
+             reason        TEXT NOT NULL,
+             attempt_id    TEXT,
+             created_at    TEXT NOT NULL,
+             cleared_at    TEXT,
+             PRIMARY KEY (work_item_id, reason)
+         );
+         CREATE INDEX IF NOT EXISTS task_blocked_signals_active_idx
+             ON task_blocked_signals(work_item_id, reason)
+             WHERE cleared_at IS NULL;",
+    )?;
+    Ok(())
+}
+
+/// Create the `ci_remediations` side table — parallel to
+/// `conflict_resolutions`, one row per engine attempt to clear a CI
+/// failure on an in-review PR. Unique key
+/// `(work_item_id, head_sha_at_trigger, attempt_kind)` keeps a
+/// re-trigger and a fix on the same failing head sha distinct while
+/// still locking out duplicate probes for the same triplet. See
+/// `merge-conflict-handling-in-review.md` §Q3 for the side-table-not-
+/// tasks-row rationale and the per-PR-not-per-failure budget choice.
+fn migrate_ci_remediations_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ci_remediations (
+             id                  TEXT PRIMARY KEY,
+             product_id          TEXT NOT NULL,
+             work_item_id        TEXT NOT NULL,
+             pr_url              TEXT NOT NULL,
+             pr_number           INTEGER NOT NULL,
+             head_branch         TEXT NOT NULL,
+             head_sha_at_trigger TEXT NOT NULL,
+             head_sha_after      TEXT,
+             attempt_kind        TEXT NOT NULL,
+             consumes_budget     INTEGER NOT NULL,
+             failed_checks       TEXT NOT NULL,
+             triage_class        TEXT,
+             log_excerpt         TEXT,
+             status              TEXT NOT NULL,
+             failure_reason      TEXT,
+             cube_lease_id       TEXT,
+             cube_workspace_id   TEXT,
+             worker_id           TEXT,
+             created_at          TEXT NOT NULL,
+             started_at          TEXT,
+             finished_at         TEXT,
+             UNIQUE (work_item_id, head_sha_at_trigger, attempt_kind)
+         );
+         CREATE INDEX IF NOT EXISTS ci_remediations_status_idx
+             ON ci_remediations(status);
+         CREATE INDEX IF NOT EXISTS ci_remediations_work_item_idx
+             ON ci_remediations(work_item_id);
+         CREATE INDEX IF NOT EXISTS ci_remediations_product_idx
+             ON ci_remediations(product_id);",
+    )?;
+    Ok(())
+}
+
+/// Create the `ci_failure_suppressions` table — the thin escape
+/// hatch consulted by `ci_watch::on_ci_failure_detected` when the
+/// user has manually moved a chore out of `blocked: ci_failure`. A
+/// row pins suppression for one `(work_item, head_sha)` pair; a new
+/// head sha invalidates it automatically. See
+/// `merge-conflict-handling-in-review.md` §Q5 ("Manual override
+/// (CI)") for the lifecycle.
+fn migrate_ci_failure_suppressions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ci_failure_suppressions (
+             work_item_id  TEXT NOT NULL,
+             head_sha      TEXT NOT NULL,
+             created_at    TEXT NOT NULL,
+             PRIMARY KEY (work_item_id, head_sha)
+         );",
+    )?;
+    Ok(())
+}
+
+/// Add `tasks.ci_attempt_budget` (per-PR override, NULL = inherit
+/// the product default) and `tasks.ci_attempts_used` (counter,
+/// default 0). Existing rows pick up NULL / 0 — the budget kicks in
+/// only when the parent enters the CI-failure flow, so legacy
+/// in-flight PRs are unaffected until they next go red. See
+/// `merge-conflict-handling-in-review.md` §Q3 for the reset rules
+/// and the "what counts as one attempt" definition.
+fn migrate_tasks_ci_attempt_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "ci_attempt_budget")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN ci_attempt_budget INTEGER", [])?;
+    }
+    if !table_has_column(conn, "tasks", "ci_attempts_used")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN ci_attempts_used INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Add `products.ci_attempt_budget` — the product-level default the
+/// engine falls back to when a task / chore has no per-PR
+/// `tasks.ci_attempt_budget` set. Default 3 per design §Q3 ("Default
+/// 3 attempts per PR"). Existing product rows inherit the default.
+fn migrate_products_ci_attempt_budget(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "ci_attempt_budget")? {
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN ci_attempt_budget INTEGER NOT NULL DEFAULT 3",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Mirror existing `tasks.blocked_reason` scalars into the side
+/// table so the multi-signal projection is internally consistent on
+/// first open after the schema lands. The pre-Phase-7 invariant is
+/// at most one reason per row, so a single INSERT-from-SELECT pass
+/// is correct.
+///
+/// `attempt_id` carries through `tasks.blocked_attempt_id` (it is
+/// the soft FK already discriminated by reason). `created_at` uses
+/// the row's `updated_at` as a best-effort timestamp for when the
+/// block was last touched — better than `NULL`, and the engine
+/// re-stamps with `now()` on the next sweep that observes the
+/// signal anyway.
+///
+/// Idempotent: re-running the migration after the first open is a
+/// no-op because the existing rows already match the
+/// `(work_item_id, reason)` PK (`INSERT OR IGNORE`).
+fn migrate_backfill_task_blocked_signals(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO task_blocked_signals
+             (work_item_id, reason, attempt_id, created_at, cleared_at)
+         SELECT id, blocked_reason, blocked_attempt_id, updated_at, NULL
+           FROM tasks
+          WHERE blocked_reason IS NOT NULL
+            AND status = 'blocked'
+            AND deleted_at IS NULL",
         [],
     )?;
     Ok(())
@@ -10333,7 +10502,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         let _ = std::fs::remove_file(path);
     }
 
@@ -10513,7 +10682,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         let _ = std::fs::remove_file(path);
     }
 
@@ -10533,7 +10702,7 @@ mod tests {
 
     /// Fresh init lands the new `tasks.repo_remote_url` column, the
     /// partial `tasks_repo_idx` index, and bumps the recorded
-    /// `schema_version` to 7.
+    /// `schema_version` to the current value.
     #[test]
     fn fresh_init_includes_tasks_repo_remote_url() {
         let path = temp_db_path("tasks-repo-fresh");
@@ -10559,7 +10728,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
 
         let _ = std::fs::remove_file(path);
     }
@@ -10567,7 +10736,8 @@ mod tests {
     /// A pre-v5 database (no `repo_remote_url` column on `tasks`,
     /// `schema_version = 4`) should pick up the new column with
     /// existing rows defaulting to `NULL`, get the partial index
-    /// created, and have `schema_version` bumped to 7.
+    /// created, and have `schema_version` bumped to the current
+    /// value.
     #[test]
     fn migration_from_v4_adds_tasks_repo_remote_url() {
         let path = temp_db_path("tasks-repo-migrate");
@@ -10638,7 +10808,7 @@ mod tests {
             .unwrap();
         assert_eq!(index_exists, 1);
 
-        // schema_version moves from 4 → 7.
+        // schema_version moves from 4 → current.
         let version: String = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'schema_version'",
@@ -10646,7 +10816,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
 
         let _ = std::fs::remove_file(path);
     }
@@ -11103,6 +11273,362 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count_dependency, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Fresh init lands the CI Phase-7 schema: the multi-signal side
+    /// table, the `ci_remediations` + `ci_failure_suppressions`
+    /// tables, the per-PR budget columns on `tasks`, and the
+    /// product-level budget default on `products`. Pairs with
+    /// [`fresh_init_includes_merge_conflict_schema`] for the
+    /// Phase-1 columns.
+    #[test]
+    fn fresh_init_includes_ci_phase7_schema() {
+        let path = temp_db_path("ci-p7-fresh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        for table in [
+            "task_blocked_signals",
+            "ci_remediations",
+            "ci_failure_suppressions",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} table should exist after fresh init");
+        }
+        assert!(table_has_column(&conn, "tasks", "ci_attempt_budget").unwrap());
+        assert!(table_has_column(&conn, "tasks", "ci_attempts_used").unwrap());
+        assert!(table_has_column(&conn, "products", "ci_attempt_budget").unwrap());
+
+        // The fresh-init `CREATE TABLE` for products carries the
+        // design's documented default budget (3). A product inserted
+        // through the normal path picks that up without the caller
+        // having to set it.
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let budget: i64 = conn
+            .query_row(
+                "SELECT ci_attempt_budget FROM products WHERE id = ?1",
+                [&product.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(budget, 3, "product budget must default to 3 on fresh init");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A database carrying the Phase-1 merge-conflict schema (but
+    /// not yet Phase-7's CI columns) should pick up the new tables
+    /// and columns transparently on re-open, and existing rows whose
+    /// `blocked_reason` was scalar-only get a mirroring row in the
+    /// `task_blocked_signals` side table. Idempotent across re-opens.
+    #[test]
+    fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
+        let path = temp_db_path("ci-p7-migrate");
+        // Stand up a "MC P1-only" schema: tasks have blocked_reason
+        // + blocked_attempt_id (the Phase-1 additions), there's a
+        // conflict_resolutions table, but none of the Phase-7
+        // tables or columns. We seed two blocked rows so the
+        // backfill has something to mirror.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 auto_pr_maintenance_enabled INTEGER NOT NULL DEFAULT 1);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human');
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 priority TEXT NOT NULL DEFAULT 'medium',
+                 created_via TEXT NOT NULL DEFAULT 'unknown',
+                 blocked_reason TEXT,
+                 blocked_attempt_id TEXT);
+             CREATE TABLE conflict_resolutions (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL,
+                 work_item_id TEXT NOT NULL, pr_url TEXT NOT NULL,
+                 pr_number INTEGER NOT NULL, head_branch TEXT NOT NULL,
+                 base_branch TEXT NOT NULL,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL);
+             INSERT INTO products(id, name, slug, status, created_at, updated_at)
+             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
+             INSERT INTO tasks(id, product_id, project_id, kind, name, status,
+                                created_at, updated_at, autostart,
+                                last_status_actor, priority, created_via,
+                                blocked_reason, blocked_attempt_id)
+             VALUES
+              ('task_mc',  'prod_1', NULL, 'chore', 'mc-blocked',
+               'blocked', '1700000000', '1700000050',
+               1, 'engine', 'medium', 'cli',
+               'merge_conflict', 'conflict_18ab_1'),
+              ('task_dep', 'prod_1', NULL, 'chore', 'dep-blocked',
+               'blocked', '1700000000', '1700000060',
+               1, 'engine', 'medium', 'cli',
+               'dependency', NULL),
+              ('task_clean', 'prod_1', NULL, 'chore', 'not-blocked',
+               'in_review', '1700000000', '1700000070',
+               1, 'human', 'medium', 'cli', NULL, NULL),
+              ('task_deleted', 'prod_1', NULL, 'chore', 'soft-deleted',
+               'blocked', '1700000000', '1700000080',
+               1, 'engine', 'medium', 'cli',
+               'merge_conflict', 'conflict_18ab_2');
+             -- The soft-deleted row should NOT be backfilled.
+             UPDATE tasks SET deleted_at = '1700000090' WHERE id = 'task_deleted';
+             INSERT INTO metadata(key, value) VALUES ('schema_version','7');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // New tables exist.
+        for table in [
+            "task_blocked_signals",
+            "ci_remediations",
+            "ci_failure_suppressions",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "{table} should land via the migration");
+        }
+
+        // New columns exist on tasks / products.
+        assert!(table_has_column(&conn, "tasks", "ci_attempt_budget").unwrap());
+        assert!(table_has_column(&conn, "tasks", "ci_attempts_used").unwrap());
+        assert!(table_has_column(&conn, "products", "ci_attempt_budget").unwrap());
+
+        // The product budget column gets the documented default of
+        // 3 for the existing row added through the migration path.
+        let preserved: i64 = conn
+            .query_row(
+                "SELECT ci_attempt_budget FROM products WHERE id = 'prod_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 3);
+
+        // Backfill: each `blocked` row with a non-NULL
+        // `blocked_reason` becomes one row in the side table.
+        // Soft-deleted rows are excluded; clean rows (no
+        // blocked_reason) produce no row.
+        let signals: Vec<(String, String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT work_item_id, reason, attempt_id
+                     FROM task_blocked_signals
+                     ORDER BY work_item_id",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            signals,
+            vec![
+                (
+                    "task_dep".to_owned(),
+                    "dependency".to_owned(),
+                    None,
+                ),
+                (
+                    "task_mc".to_owned(),
+                    "merge_conflict".to_owned(),
+                    Some("conflict_18ab_1".to_owned()),
+                ),
+            ],
+            "backfill must mirror exactly the active, non-deleted \
+             blocked rows",
+        );
+
+        // Idempotency: a second open is a no-op. Counts stay put
+        // and the schema_version stamp is the current value.
+        drop(conn);
+        let db2 = WorkDb::open(path.clone()).unwrap();
+        let conn2 = db2.connect().unwrap();
+        let again: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM task_blocked_signals",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, 2);
+        let version: String = conn2
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "8");
+
+        // After migration we can also write a fresh `blocked` row
+        // and re-backfill is still a no-op (the existing rows
+        // satisfy the `(work_item_id, reason)` PK so OR IGNORE
+        // covers them; the new row is picked up). This is the
+        // "engine sweep" simulation from the design's §Q2 note.
+        conn2
+            .execute(
+                "INSERT INTO tasks(id, product_id, project_id, kind, name, status,
+                                    created_at, updated_at, autostart,
+                                    last_status_actor, priority, created_via,
+                                    blocked_reason, blocked_attempt_id)
+                 VALUES ('task_ci', 'prod_1', NULL, 'chore', 'ci-blocked',
+                         'blocked', '1700001000', '1700001050',
+                         1, 'engine', 'medium', 'cli',
+                         'ci_failure', 'ci_18ab_1')",
+                [],
+            )
+            .unwrap();
+        super::migrate_backfill_task_blocked_signals(&conn2).unwrap();
+        let new_signal_reason: String = conn2
+            .query_row(
+                "SELECT reason FROM task_blocked_signals WHERE work_item_id = 'task_ci'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_signal_reason, "ci_failure");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `ci_remediations` enforces idempotency on its unique key
+    /// `(work_item_id, head_sha_at_trigger, attempt_kind)`. A second
+    /// insert with the same triplet must fail (so the engine's
+    /// `INSERT OR IGNORE` pattern lands one row per probe). A fix
+    /// attempt and a retrigger attempt on the same head sha are
+    /// distinct, because `attempt_kind` is part of the key.
+    #[test]
+    fn ci_remediations_unique_key_enforced() {
+        let path = temp_db_path("ci-rem-unique");
+        let _db = WorkDb::open(path.clone()).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let insert = |id: &str, head: &str, kind: &str| -> rusqlite::Result<usize> {
+            conn.execute(
+                "INSERT INTO ci_remediations
+                     (id, product_id, work_item_id, pr_url, pr_number,
+                      head_branch, head_sha_at_trigger, attempt_kind,
+                      consumes_budget, failed_checks, status, created_at)
+                 VALUES (?1, 'prod_1', 'task_77',
+                         'https://github.com/foo/bar/pull/1', 1,
+                         'feat/banana', ?2, ?3, 1, '[]', 'pending',
+                         '1700000000')",
+                params![id, head, kind],
+            )
+        };
+        insert("ci_1", "abc123", "fix").unwrap();
+        // Same triplet → unique-key violation.
+        let dup = insert("ci_2", "abc123", "fix");
+        assert!(
+            dup.is_err(),
+            "duplicate (item, head_sha, kind) must be rejected",
+        );
+        // A retrigger attempt on the same head sha is a *separate*
+        // row because `attempt_kind` discriminates.
+        insert("ci_3", "abc123", "retrigger").unwrap();
+        // A fix attempt on a *new* head sha is also separate.
+        insert("ci_4", "def456", "fix").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ci_remediations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `task_blocked_signals` upserts on `(work_item_id, reason)` —
+    /// re-observing the same signal is a no-op via `INSERT OR
+    /// IGNORE`, not a duplicate row. A different reason on the same
+    /// work item is a separate row (this is the multi-signal case
+    /// the side table exists to model).
+    #[test]
+    fn task_blocked_signals_pk_enforced() {
+        let path = temp_db_path("tbs-pk");
+        let _db = WorkDb::open(path.clone()).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO task_blocked_signals
+                 (work_item_id, reason, attempt_id, created_at)
+             VALUES ('task_77', 'ci_failure', 'ci_18ab_1', '1700000000')",
+            [],
+        )
+        .unwrap();
+        // Same (item, reason) → PK violation under plain INSERT.
+        let dup = conn.execute(
+            "INSERT INTO task_blocked_signals
+                 (work_item_id, reason, attempt_id, created_at)
+             VALUES ('task_77', 'ci_failure', 'ci_18ab_2', '1700000010')",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate (item, reason) must be rejected");
+        // INSERT OR IGNORE on the same pair is a silent no-op.
+        let or_ignore = conn
+            .execute(
+                "INSERT OR IGNORE INTO task_blocked_signals
+                     (work_item_id, reason, attempt_id, created_at)
+                 VALUES ('task_77', 'ci_failure', 'ci_18ab_3', '1700000020')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(or_ignore, 0);
+        // Different reason → separate row (the multi-signal case).
+        conn.execute(
+            "INSERT INTO task_blocked_signals
+                 (work_item_id, reason, attempt_id, created_at)
+             VALUES ('task_77', 'merge_conflict', 'conflict_18ab_1', '1700000030')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_blocked_signals WHERE work_item_id = 'task_77'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
         let _ = std::fs::remove_file(path);
     }
 

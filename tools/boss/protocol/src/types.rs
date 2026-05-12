@@ -188,6 +188,32 @@ pub struct Task {
     /// Stored verbatim — the engine does not validate the slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// Per-PR override of the CI auto-fix attempt budget. `None` →
+    /// inherit the product default (`products.ci_attempt_budget`,
+    /// default 3). `Some(0)` means "notify only" (no auto-fix on this
+    /// PR). See `merge-conflict-handling-in-review.md` §Q3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_attempt_budget: Option<i64>,
+    /// Number of CI fix attempts the engine has already consumed for
+    /// the current cycle. Reset to 0 when the parent transitions back
+    /// to `in_review` after a successful auto-fix (or when the user
+    /// runs `boss engine ci retry`). Only `attempt_kind = 'fix'`
+    /// attempts that progressed past the worker's go/no-go decision
+    /// count. Existing rows from before this column was introduced
+    /// default to 0.
+    #[serde(default)]
+    pub ci_attempts_used: i64,
+    /// Every active block reason currently in flight on this work
+    /// item — the multi-signal companion to the scalar
+    /// `blocked_reason` cache. Mirrors the `task_blocked_signals`
+    /// side table. Empty when the row is not blocked. The scalar
+    /// `blocked_reason` / `blocked_attempt_id` fields above remain the
+    /// denormalised "primary reason" cache for UI rendering and resolve
+    /// to the highest-priority entry in this list per the design's
+    /// §Q2 priority order. Existing rows from before this column was
+    /// introduced default to an empty list.
+    #[serde(default)]
+    pub blocked_signals: Vec<BlockedSignal>,
 }
 
 fn default_true() -> bool {
@@ -345,6 +371,116 @@ pub struct ConflictResolution {
     /// forward without bumping this type; consumers parse on demand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_diagnosis: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+/// One active or historical blocked-reason for a work item — the
+/// wire shape of a `task_blocked_signals` row. The set of rows for
+/// one `work_item_id` is the parent's multi-signal block state; the
+/// scalar `Task::blocked_reason` is a denormalised "primary reason"
+/// cache derived from this set per the design's §Q2 priority order.
+///
+/// `reason` is one of the documented signals (`'dependency'`,
+/// `'merge_conflict'`, `'review_feedback'`, `'ci_failure'`,
+/// `'ci_failure_exhausted'`); the engine treats the set as open so
+/// new reasons can ship without bumping this type. `attempt_id` is a
+/// soft FK into the attempt table for the matching reason
+/// (`conflict_resolutions` for `'merge_conflict'`, `ci_remediations`
+/// for the CI signals, etc.) and is `None` for `'dependency'` (the
+/// prereqs are queried via `work_item_dependencies` instead).
+///
+/// `cleared_at` is `None` while the signal is active and is stamped
+/// when the signal clears; rows are retained as history alongside
+/// `conflict_resolutions` and `ci_remediations`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockedSignal {
+    pub work_item_id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<String>,
+}
+
+/// One engine attempt to clear a CI failure on an `in_review` PR —
+/// the wire shape of a `ci_remediations` row. Sibling of
+/// [`ConflictResolution`]; the side-table-not-tasks-row rationale is
+/// the same (`merge-conflict-handling-in-review.md` §Q3). Stored as
+/// a sibling to `WorkExecution` rather than as a `Task` because the
+/// attempt is not itself a kanban work item; it's an engine-managed
+/// remediation tied to its parent via `work_item_id`.
+///
+/// `status` values: `pending` (row created, worker not yet
+/// dispatched), `running` (worker holds a lease and is editing),
+/// `succeeded` (push landed, CI green again), `superseded` (a newer
+/// attempt — or a human push — replaced this one), `failed` (worker
+/// gave up / errored), `abandoned` (engine declined to spawn, e.g.
+/// budget exhausted or product opt-out).
+///
+/// `attempt_kind` distinguishes `'fix'` (the worker reads logs and
+/// pushes a code change) from `'retrigger'` (the engine just re-runs
+/// the failing job — cheap, doesn't consume budget). Re-triggers are
+/// chosen pre-spawn for unambiguous infra signals (`STARTUP_FAILURE`);
+/// the worker may also pivot from `'fix'` to a re-trigger if its
+/// triage classifies the failure as `'flaky_or_infra'`.
+///
+/// `consumes_budget` is the engine's post-hoc answer to "did this
+/// count against `tasks.ci_attempts_used`?" — `1` for a fix attempt
+/// that actually pushed, `0` for re-triggers and triage-bailouts.
+/// `triage_class` is the worker's classification of the failure
+/// after reading the log (`'tractable'` / `'flaky_or_infra'` /
+/// `'unfixable'`); `None` until the worker fills it.
+///
+/// `failed_checks` is a JSON-encoded list of `{name, conclusion,
+/// provider, target_url, provider_job_id}` snapshots captured at
+/// trigger time; `log_excerpt` is the failing-job log tail the
+/// engine fetched pre-spawn and seeded into the worker prompt
+/// (typically the last 200 lines).
+///
+/// `pr_url` / `pr_number` / `head_branch` are snapshots of the
+/// parent's PR state at trigger time so the row stays interpretable
+/// after the parent's branch is recycled. `head_sha_at_trigger` is
+/// the discriminator that the UNIQUE key
+/// (`(work_item_id, head_sha_at_trigger, attempt_kind)`) uses to
+/// keep two probes on the same failure from creating two rows.
+/// `head_sha_after` brackets the worker's push (`None` on failure
+/// or for re-trigger-only attempts).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CiRemediation {
+    pub id: String,
+    pub product_id: String,
+    pub work_item_id: String,
+    pub pr_url: String,
+    pub pr_number: i64,
+    pub head_branch: String,
+    pub head_sha_at_trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha_after: Option<String>,
+    pub attempt_kind: String,
+    pub consumes_budget: i64,
+    /// JSON-encoded list of failing-check snapshots, one entry per
+    /// failed required check at trigger time. Wire-encoded as a
+    /// string so the engine can roll the schema forward without
+    /// bumping this type; consumers parse on demand.
+    pub failed_checks: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_excerpt: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
@@ -1345,5 +1481,164 @@ mod tests {
         assert_eq!(product.default_model.as_deref(), Some("sonnet"));
         let encoded = serde_json::to_value(&product).unwrap();
         assert_eq!(encoded["default_model"], Value::String("sonnet".into()));
+    }
+
+    #[test]
+    fn task_decodes_without_ci_attempt_fields() {
+        let raw = sample_task_json(json!({}));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert!(task.ci_attempt_budget.is_none());
+        assert_eq!(task.ci_attempts_used, 0);
+        assert!(task.blocked_signals.is_empty());
+    }
+
+    #[test]
+    fn task_skips_default_ci_attempt_fields_on_encode() {
+        let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&task).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("ci_attempt_budget"));
+        // `ci_attempts_used` and `blocked_signals` carry zero/empty
+        // defaults rather than `Option::None`, so they round-trip
+        // through the wire as concrete values. `serde(default)` on the
+        // decode side is what makes the omitted-from-payload shape
+        // legal.
+        assert_eq!(obj.get("ci_attempts_used"), Some(&Value::from(0_i64)));
+        assert_eq!(
+            obj.get("blocked_signals"),
+            Some(&Value::Array(Vec::new())),
+        );
+    }
+
+    #[test]
+    fn task_roundtrips_with_ci_attempt_fields_set() {
+        let raw = sample_task_json(json!({
+            "ci_attempt_budget": 5,
+            "ci_attempts_used": 2,
+            "blocked_signals": [
+                {
+                    "work_item_id": "task_1",
+                    "reason": "ci_failure",
+                    "attempt_id": "ci_18ab_1",
+                    "created_at": "1747000000",
+                    "cleared_at": Value::Null,
+                },
+                {
+                    "work_item_id": "task_1",
+                    "reason": "merge_conflict",
+                    "attempt_id": "conflict_18ab_1",
+                    "created_at": "1747000010",
+                },
+            ],
+        }));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert_eq!(task.ci_attempt_budget, Some(5));
+        assert_eq!(task.ci_attempts_used, 2);
+        assert_eq!(task.blocked_signals.len(), 2);
+        assert_eq!(task.blocked_signals[0].reason, "ci_failure");
+        assert_eq!(
+            task.blocked_signals[0].attempt_id.as_deref(),
+            Some("ci_18ab_1"),
+        );
+
+        let reencoded = serde_json::to_value(&task).unwrap();
+        let task2: Task = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(task.ci_attempt_budget, task2.ci_attempt_budget);
+        assert_eq!(task.ci_attempts_used, task2.ci_attempts_used);
+        assert_eq!(task.blocked_signals, task2.blocked_signals);
+    }
+
+    #[test]
+    fn blocked_signal_skips_optional_fields_on_encode() {
+        let signal = BlockedSignal {
+            work_item_id: "task_1".into(),
+            reason: "dependency".into(),
+            attempt_id: None,
+            created_at: "1747000000".into(),
+            cleared_at: None,
+        };
+        let encoded = serde_json::to_value(&signal).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("attempt_id"));
+        assert!(!obj.contains_key("cleared_at"));
+        let back: BlockedSignal = serde_json::from_value(encoded).unwrap();
+        assert_eq!(signal, back);
+    }
+
+    #[test]
+    fn ci_remediation_roundtrips_with_all_fields() {
+        let attempt = CiRemediation {
+            id: "ci_18ab_1".into(),
+            product_id: "prod_1".into(),
+            work_item_id: "task_77".into(),
+            pr_url: "https://github.com/foo/bar/pull/647".into(),
+            pr_number: 647,
+            head_branch: "feat/banana".into(),
+            head_sha_at_trigger: "abc123".into(),
+            head_sha_after: Some("def456".into()),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[{\"name\":\"test\"}]".into(),
+            triage_class: Some("tractable".into()),
+            log_excerpt: Some("error: ...".into()),
+            status: "succeeded".into(),
+            failure_reason: None,
+            cube_lease_id: Some("lease_1".into()),
+            cube_workspace_id: Some("ws_1".into()),
+            worker_id: Some("worker_1".into()),
+            created_at: "1747000000".into(),
+            started_at: Some("1747000010".into()),
+            finished_at: Some("1747000100".into()),
+        };
+        let raw = serde_json::to_value(&attempt).unwrap();
+        let back: CiRemediation = serde_json::from_value(raw).unwrap();
+        assert_eq!(attempt, back);
+    }
+
+    #[test]
+    fn ci_remediation_pending_skips_optional_fields_on_encode() {
+        let attempt = CiRemediation {
+            id: "ci_18ab_2".into(),
+            product_id: "prod_1".into(),
+            work_item_id: "task_77".into(),
+            pr_url: "https://github.com/foo/bar/pull/648".into(),
+            pr_number: 648,
+            head_branch: "feat/coconut".into(),
+            head_sha_at_trigger: "abc123".into(),
+            head_sha_after: None,
+            attempt_kind: "retrigger".into(),
+            consumes_budget: 0,
+            failed_checks: "[]".into(),
+            triage_class: None,
+            log_excerpt: None,
+            status: "pending".into(),
+            failure_reason: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            worker_id: None,
+            created_at: "1747000000".into(),
+            started_at: None,
+            finished_at: None,
+        };
+        let encoded = serde_json::to_value(&attempt).unwrap();
+        let obj = encoded.as_object().unwrap();
+        for absent in [
+            "head_sha_after",
+            "triage_class",
+            "log_excerpt",
+            "failure_reason",
+            "cube_lease_id",
+            "cube_workspace_id",
+            "worker_id",
+            "started_at",
+            "finished_at",
+        ] {
+            assert!(
+                !obj.contains_key(absent),
+                "expected {absent} omitted on encode",
+            );
+        }
+        let back: CiRemediation = serde_json::from_value(encoded).unwrap();
+        assert_eq!(attempt, back);
     }
 }
