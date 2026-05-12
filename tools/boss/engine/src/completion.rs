@@ -40,6 +40,7 @@ use tokio::process::Command;
 use boss_protocol::FrontendEvent;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
+use crate::dispatch_events::{DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome, Stage};
 use crate::work::{WorkDb, WorkItem, WorkerPrCompletionTarget};
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -389,6 +390,30 @@ impl ProbeQueuer for NoopProbeQueuer {
     fn queue_probe(&self, _run_id: &str, _text: &str) {}
 }
 
+/// Source label for `WorkerStopReceived` / `PrDetectionAttempted` /
+/// `PrDetectionResult` dispatch events — distinguishes the on-Stop
+/// hook path from the periodic safety-net poller so `dispatch tail`
+/// can tell which surface drove a given transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionTrigger {
+    /// `dispatch_completion_on_stop` invoked us because the events
+    /// socket delivered a claude `Stop` hook payload.
+    StopHook,
+    /// `pr_auto_bind_poller` invoked us because it spotted a
+    /// non-terminal execution sitting past its quiescence window
+    /// without a Stop event having fired.
+    AutoBindPoller,
+}
+
+impl CompletionTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            CompletionTrigger::StopHook => "stop_hook",
+            CompletionTrigger::AutoBindPoller => "auto_bind_poller",
+        }
+    }
+}
+
 /// Orchestrates the on-Stop completion flow: detect PR, transition
 /// state in the work DB, release the cube lease, publish the right
 /// invalidation events. Stateless — keeps the wiring side at the call
@@ -400,6 +425,7 @@ pub struct WorkerCompletionHandler {
     publisher: Arc<dyn ExecutionPublisher>,
     pane_releaser: Arc<dyn WorkerPaneReleaser>,
     probe_queuer: Arc<dyn ProbeQueuer>,
+    dispatch_events: Arc<dyn DispatchEventSink>,
 }
 
 impl WorkerCompletionHandler {
@@ -411,6 +437,26 @@ impl WorkerCompletionHandler {
         pane_releaser: Arc<dyn WorkerPaneReleaser>,
         probe_queuer: Arc<dyn ProbeQueuer>,
     ) -> Self {
+        Self::with_dispatch_events(
+            work_db,
+            pr_detector,
+            cube_client,
+            publisher,
+            pane_releaser,
+            probe_queuer,
+            Arc::new(NoopDispatchEventSink),
+        )
+    }
+
+    pub fn with_dispatch_events(
+        work_db: Arc<WorkDb>,
+        pr_detector: Arc<dyn PrDetector>,
+        cube_client: Arc<dyn CubeClient>,
+        publisher: Arc<dyn ExecutionPublisher>,
+        pane_releaser: Arc<dyn WorkerPaneReleaser>,
+        probe_queuer: Arc<dyn ProbeQueuer>,
+        dispatch_events: Arc<dyn DispatchEventSink>,
+    ) -> Self {
         Self {
             work_db,
             pr_detector,
@@ -418,13 +464,40 @@ impl WorkerCompletionHandler {
             publisher,
             pane_releaser,
             probe_queuer,
+            dispatch_events,
         }
+    }
+
+    /// Test/debug helper: returns the dispatch sink installed on this
+    /// handler. Used by the safety-net poller wiring so it doesn't
+    /// have to thread the sink through a second time.
+    pub fn dispatch_events(&self) -> Arc<dyn DispatchEventSink> {
+        self.dispatch_events.clone()
     }
 
     /// Handle a `Stop` event for `execution_id`. Returns the outcome
     /// classification so callers can log/test what happened.
+    ///
+    /// Equivalent to [`Self::on_stop_from`] with
+    /// `CompletionTrigger::StopHook`; kept for callers that don't
+    /// care about the source label on dispatch events (tests, etc.).
     pub async fn on_stop(&self, execution_id: &str) -> StopOutcome {
-        let outcome = self.on_stop_inner(execution_id).await;
+        self.on_stop_from(execution_id, CompletionTrigger::StopHook)
+            .await
+    }
+
+    /// Like [`Self::on_stop`] but the caller specifies whether this
+    /// invocation came from the on-Stop hook path or from the periodic
+    /// safety-net poller. The trigger is stamped onto the
+    /// `WorkerStopReceived` / `PrDetectionAttempted` / `PrDetectionResult`
+    /// dispatch events so `bossctl dispatch tail` can tell which
+    /// surface drove a given transition.
+    pub async fn on_stop_from(
+        &self,
+        execution_id: &str,
+        trigger: CompletionTrigger,
+    ) -> StopOutcome {
+        let outcome = self.on_stop_inner(execution_id, trigger).await;
         // Phase 4 #11: for `conflict_resolution` executions, run the
         // catch-all attempt finalizer regardless of how the inner path
         // resolved. The finalizer decides whether to mark the bound
@@ -439,7 +512,11 @@ impl WorkerCompletionHandler {
         outcome
     }
 
-    async fn on_stop_inner(&self, execution_id: &str) -> StopOutcome {
+    async fn on_stop_inner(
+        &self,
+        execution_id: &str,
+        trigger: CompletionTrigger,
+    ) -> StopOutcome {
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) => execution,
             Err(err) => {
@@ -448,9 +525,33 @@ impl WorkerCompletionHandler {
                     ?err,
                     "stop event: execution unknown — likely a non-execution worker run"
                 );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::WorkerStopReceived, Outcome::Skipped, execution_id)
+                            .with_details(serde_json::json!({
+                                "source": trigger.as_str(),
+                                "reason": "unknown_execution",
+                            })),
+                    )
+                    .await;
                 return StopOutcome::UnknownExecution;
             }
         };
+
+        // The Stop event reached the engine and resolved to a real
+        // execution — record that fact regardless of how the rest of
+        // the path resolves, so `dispatch tail <exec>` shows the
+        // moment the engine first saw the worker idle.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::WorkerStopReceived, Outcome::Ok, execution_id)
+                    .with_work_item(execution.work_item_id.clone())
+                    .with_details(serde_json::json!({
+                        "source": trigger.as_str(),
+                        "execution_status": execution.status,
+                    })),
+            )
+            .await;
 
         // Already completed/failed/cancelled — nothing more to do.
         if !matches!(execution.status.as_str(), "running" | "waiting_human") {
@@ -464,9 +565,35 @@ impl WorkerCompletionHandler {
                     execution_id,
                     "stop event: execution has no workspace_path — cannot detect PR"
                 );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::PrDetectionAttempted,
+                            Outcome::Skipped,
+                            execution_id,
+                        )
+                        .with_work_item(execution.work_item_id.clone())
+                        .with_details(serde_json::json!({
+                            "source": trigger.as_str(),
+                            "reason": "no_workspace_path",
+                        })),
+                    )
+                    .await;
                 return StopOutcome::NoWorkspace;
             }
         };
+
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::PrDetectionAttempted, Outcome::Ok, execution_id)
+                    .with_work_item(execution.work_item_id.clone())
+                    .with_details(serde_json::json!({
+                        "source": trigger.as_str(),
+                        "workspace_path": workspace_path.display().to_string(),
+                        "repo_remote_url": execution.repo_remote_url,
+                    })),
+            )
+            .await;
 
         let pr_status = match self
             .pr_detector
@@ -481,9 +608,29 @@ impl WorkerCompletionHandler {
                     ?err,
                     "stop event: PR detection failed; surfacing as awaiting input"
                 );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::PrDetectionResult,
+                            Outcome::Error,
+                            execution_id,
+                        )
+                        .with_work_item(execution.work_item_id.clone())
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "source": trigger.as_str(),
+                            "classification": "detector_failed",
+                        })),
+                    )
+                    .await;
                 self.publish_awaiting_input(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_DETECTOR_FAILURE);
+                if matches!(trigger, CompletionTrigger::StopHook) {
+                    // Probe the worker so it can confirm/push a PR. The
+                    // safety-net poller deliberately skips this; the
+                    // worker may not even be in a state to receive a probe.
+                    self.probe_queuer
+                        .queue_probe(execution_id, PROBE_DETECTOR_FAILURE);
+                }
                 return StopOutcome::DetectorFailed;
             }
         };
@@ -495,9 +642,25 @@ impl WorkerCompletionHandler {
                     workspace = %workspace_path.display(),
                     "stop event: worker idle without an active PR — probing to push and open one"
                 );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::PrDetectionResult,
+                            Outcome::Skipped,
+                            execution_id,
+                        )
+                        .with_work_item(execution.work_item_id.clone())
+                        .with_details(serde_json::json!({
+                            "source": trigger.as_str(),
+                            "classification": "no_pr",
+                        })),
+                    )
+                    .await;
                 self.publish_awaiting_pr(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_NO_PR);
+                if matches!(trigger, CompletionTrigger::StopHook) {
+                    self.probe_queuer
+                        .queue_probe(execution_id, PROBE_NO_PR);
+                }
                 return StopOutcome::AwaitingInput;
             }
             PrStatus::Stale { url, reason } => {
@@ -508,9 +671,27 @@ impl WorkerCompletionHandler {
                     %reason,
                     "stop event: PR exists but local commits are unpushed — probing to push"
                 );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::PrDetectionResult,
+                            Outcome::Skipped,
+                            execution_id,
+                        )
+                        .with_work_item(execution.work_item_id.clone())
+                        .with_details(serde_json::json!({
+                            "source": trigger.as_str(),
+                            "classification": "stale",
+                            "pr_url": url,
+                            "reason": reason,
+                        })),
+                    )
+                    .await;
                 self.publish_awaiting_pr(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_STALE_PR);
+                if matches!(trigger, CompletionTrigger::StopHook) {
+                    self.probe_queuer
+                        .queue_probe(execution_id, PROBE_STALE_PR);
+                }
                 return StopOutcome::StalePr { pr_url: url, reason };
             }
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
@@ -518,6 +699,19 @@ impl WorkerCompletionHandler {
         };
         let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::PrDetectionResult, Outcome::Ok, execution_id)
+                    .with_work_item(execution.work_item_id.clone())
+                    .with_details(serde_json::json!({
+                        "source": trigger.as_str(),
+                        "classification": if merged { "merged" } else { "fresh" },
+                        "pr_url": pr_url,
+                    })),
+            )
+            .await;
+
+        let prior_status = execution.status.clone();
         let completion = match self.work_db.record_worker_pr_completion(
             execution_id,
             &pr_url,
@@ -536,6 +730,20 @@ impl WorkerCompletionHandler {
                     ?err,
                     "stop event: failed to record PR completion"
                 );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::StatusTransitioned,
+                            Outcome::Error,
+                            execution_id,
+                        )
+                        .with_work_item(execution.work_item_id.clone())
+                        .with_error(&err)
+                        .with_details(serde_json::json!({
+                            "source": trigger.as_str(),
+                        })),
+                    )
+                    .await;
                 return StopOutcome::DbError;
             }
         };
@@ -573,6 +781,21 @@ impl WorkerCompletionHandler {
             .await;
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, publish_reason)
+            .await;
+        let work_item_status_after = work_item_status_str(&completion.work_item).to_owned();
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::StatusTransitioned, Outcome::Ok, execution_id)
+                    .with_work_item(completion.execution.work_item_id.clone())
+                    .with_details(serde_json::json!({
+                        "source": trigger.as_str(),
+                        "from": prior_status,
+                        "to": completion.execution.status,
+                        "work_item_status": work_item_status_after,
+                        "pr_url": pr_url,
+                        "publish_reason": publish_reason,
+                    })),
+            )
             .await;
         if merged {
             tracing::info!(
@@ -848,6 +1071,17 @@ fn work_item_id(item: &WorkItem) -> String {
         WorkItem::Product(product) => product.id.clone(),
         WorkItem::Project(project) => project.id.clone(),
         WorkItem::Task(task) | WorkItem::Chore(task) => task.id.clone(),
+    }
+}
+
+/// Snapshot of the kanban status string on a work item — used to
+/// stamp `StatusTransitioned.details.work_item_status` so the
+/// dispatch tail records what column the row landed in (e.g.
+/// `in_review`, `done`).
+fn work_item_status_str(item: &WorkItem) -> &str {
+    match item {
+        WorkItem::Product(_) | WorkItem::Project(_) => "",
+        WorkItem::Task(task) | WorkItem::Chore(task) => &task.status,
     }
 }
 
@@ -1870,5 +2104,188 @@ mod tests {
         // surfacing an explicit error keeps the failure mode obvious.
         assert!(parse_repo_slug("git@gitlab.com:foo/bar.git").is_err());
         assert!(parse_repo_slug("https://github.com/spinyfin").is_err());
+    }
+
+    /// Regression for the 2026-05-12 Worf incident
+    /// (`exec_18aebee6bbbbfaf8_7`, PR #377): a worker pushes a PR and
+    /// claude fires the `Stop` hook. The engine MUST bind the PR url
+    /// and move the chore to `in_review` without manual intervention,
+    /// and the exit-pipeline dispatch events MUST be emitted in order
+    /// so `bossctl dispatch tail` shows the same timeline.
+    #[tokio::test]
+    async fn stop_hook_with_fresh_pr_binds_url_moves_to_in_review_and_emits_dispatch_events() {
+        use crate::dispatch_events::RecordingDispatchEventSink;
+
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/377"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let dispatch_sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let handler = WorkerCompletionHandler::with_dispatch_events(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+            dispatch_sink.clone(),
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+
+        // Behaviour: chore at `in_review` with `pr_url` populated,
+        // execution finalised, lease released. These match the
+        // acceptance criterion from the task description verbatim:
+        // "tasks.pr_url populated + tasks.status moved to in-review
+        // within 10s" — here, synchronously.
+        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/377"));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // Visibility: every step of the exit pipeline lands on the
+        // dispatch stream in order. Without this, the next failure in
+        // production would again surface only as missing kanban state,
+        // hours after the fact (the bug pattern that motivated this
+        // change).
+        let events = dispatch_sink.events_for(&execution_id).await;
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert_eq!(
+            stages,
+            vec![
+                "worker_stop_received",
+                "pr_detection_attempted",
+                "pr_detection_result",
+                "status_transitioned",
+            ],
+            "exit pipeline must emit all four stages in order, got {events:?}",
+        );
+        for event in &events {
+            assert_eq!(event.outcome, "ok", "stage `{}` outcome wrong: {event:?}", event.stage);
+            let source = event.details.get("source").and_then(|v| v.as_str());
+            assert_eq!(
+                source,
+                Some("stop_hook"),
+                "details.source must be `stop_hook` for the on-Stop path; got {event:?}",
+            );
+        }
+
+        // `pr_detection_result` carries the classification so a tail
+        // filtered by stage can tell `fresh` apart from `merged` /
+        // `no_pr` without re-reading the timeline.
+        let pr_result = events
+            .iter()
+            .find(|e| e.stage == "pr_detection_result")
+            .expect("pr_detection_result must be in the stream");
+        assert_eq!(
+            pr_result.details.get("classification").and_then(|v| v.as_str()),
+            Some("fresh"),
+        );
+
+        // `status_transitioned` carries the from/to so the tail makes
+        // the lifecycle change machine-greppable.
+        let transition = events
+            .iter()
+            .find(|e| e.stage == "status_transitioned")
+            .expect("status_transitioned must be in the stream");
+        assert_eq!(
+            transition.details.get("from").and_then(|v| v.as_str()),
+            Some("waiting_human"),
+        );
+        assert_eq!(
+            transition.details.get("to").and_then(|v| v.as_str()),
+            Some("completed"),
+        );
+        assert_eq!(
+            transition.details.get("work_item_status").and_then(|v| v.as_str()),
+            Some("in_review"),
+        );
+    }
+
+    /// The safety-net poller path must drive the same transitions as
+    /// the Stop hook, with `details.source = "auto_bind_poller"` so a
+    /// tail tells which surface drove the bind.
+    #[tokio::test]
+    async fn auto_bind_poller_trigger_binds_pr_and_marks_source_on_dispatch_events() {
+        use crate::dispatch_events::RecordingDispatchEventSink;
+
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/9"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let dispatch_sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let handler = WorkerCompletionHandler::with_dispatch_events(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+            dispatch_sink.clone(),
+        );
+        let outcome = handler
+            .on_stop_from(&execution_id, CompletionTrigger::AutoBindPoller)
+            .await;
+
+        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        let events = dispatch_sink.events_for(&execution_id).await;
+        assert!(!events.is_empty());
+        for event in &events {
+            let source = event.details.get("source").and_then(|v| v.as_str());
+            assert_eq!(
+                source,
+                Some("auto_bind_poller"),
+                "details.source must be `auto_bind_poller` for the safety-net path; got {event:?}",
+            );
+        }
+    }
+
+    /// Stop hook fires while the worker is sitting without a PR. The
+    /// `Stop`-hook flavor probes the worker. The auto-bind-poller
+    /// flavor must NOT probe — the worker may not be in a state to
+    /// receive a probe (we're firing because Stop never arrived).
+    #[tokio::test]
+    async fn auto_bind_poller_does_not_queue_probes() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler
+            .on_stop_from(&execution_id, CompletionTrigger::AutoBindPoller)
+            .await;
+
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+        assert!(
+            probes.snapshot().is_empty(),
+            "auto-bind poller must NOT queue probes; the worker may not be live",
+        );
     }
 }

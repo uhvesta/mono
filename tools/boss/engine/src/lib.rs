@@ -16,6 +16,7 @@ pub mod live_status_redact;
 pub mod live_worker_state;
 pub mod merge_poller;
 pub mod pane_summary;
+pub mod pr_auto_bind_poller;
 pub mod protocol;
 pub mod run_reconcile;
 pub mod runner;
