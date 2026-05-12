@@ -269,6 +269,20 @@ struct ServerState {
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
     live_status_manager: Arc<LiveStatusManager>,
+    /// Engine-wide counters for the hook-event dispatcher. Surfaced
+    /// by the `bossctl live-status debug` verb so an operator can
+    /// see at a glance whether hooks are arriving, whether their
+    /// payloads carry `transcript_path`, and whether the persist
+    /// call into `work_runs` succeeded. Added as the visibility
+    /// surface that PR #366 did not have — without it, a stalled
+    /// pipeline looked indistinguishable from a healthy one.
+    dispatcher_stats: Arc<crate::live_status_loop::DispatcherStats>,
+    /// Per-run in-memory `transcript_path` cache. The dispatcher
+    /// populates this whenever a hook payload carries the field and
+    /// uses it as a fallback whenever a subsequent hook for the same
+    /// run lacks the field. See [`TranscriptPathCache`] for why this
+    /// is the structural fix for the 2026-05-12 incident.
+    transcript_path_cache: Arc<crate::live_status_loop::TranscriptPathCache>,
     /// Snapshot of the Anthropic API key captured at engine startup.
     /// Used by the live-status summarizer for the per-slot task; the
     /// pane-titlebar summarizer continues to resolve the key
@@ -558,6 +572,10 @@ impl ServerState {
                 worker_registry: WorkerRegistry::new(),
                 live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
                 live_status_manager: Arc::new(LiveStatusManager::new()),
+                dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new()),
+                transcript_path_cache: Arc::new(
+                    crate::live_status_loop::TranscriptPathCache::new(),
+                ),
                 anthropic_api_key,
                 next_session_id: AtomicU64::new(1),
                 work_revision,
@@ -716,6 +734,11 @@ impl ServerState {
         // doesn't await the task's exit so a wedged Anthropic call
         // can't block the release path.
         self.live_status_manager.stop_slot(slot_id);
+        // Drop the cached transcript path for this run so the cache
+        // doesn't grow without bound across long engine lifetimes.
+        // No correctness consequence — the work_runs row is the
+        // durable source of truth — but a bounded cache is hygienic.
+        self.transcript_path_cache.forget(run_id);
         self.broadcast_live_worker_states().await;
     }
 
@@ -2087,6 +2110,7 @@ async fn dispatch_live_worker_state(
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
     let event_kind = worker_event_kind(&incoming.event);
+    server_state.dispatcher_stats.inc_hook_events_total();
     tracing::info!(
         run_id = ?incoming.run_id,
         peer_pid = ?incoming.peer_pid,
@@ -2095,6 +2119,9 @@ async fn dispatch_live_worker_state(
         "live_status: hook payload arrived at dispatcher",
     );
     let Some(run_id) = incoming.run_id.as_deref() else {
+        server_state
+            .dispatcher_stats
+            .inc_dropped_missing_run_id();
         tracing::warn!(
             kind = event_kind,
             peer_pid = ?incoming.peer_pid,
@@ -2102,6 +2129,9 @@ async fn dispatch_live_worker_state(
         );
         return;
     };
+    server_state
+        .dispatcher_stats
+        .record_last_hook(run_id, event_kind);
     // Persist the transcript path the moment we see it on a hook
     // payload. `start_execution_run` inserts the work_runs row with
     // `transcript_path = NULL` (the engine has no way to know the
@@ -2121,19 +2151,60 @@ async fn dispatch_live_worker_state(
     // not need the slot mapping — gating it under that lookup was the
     // gap that pinned `work_runs.transcript_path` at NULL across
     // engine restarts.
-    if let Some(path) = incoming.transcript_path.as_deref() {
-        match server_state.work_db.set_run_transcript_path_if_unset(run_id, path) {
-            Ok(true) => tracing::info!(
-                run_id,
-                transcript_path = %path,
-                "recorded transcript_path on work_run from hook payload",
-            ),
-            Ok(false) => {}
-            Err(err) => tracing::warn!(
-                run_id,
-                ?err,
-                "failed to persist transcript_path from hook payload",
-            ),
+    //
+    // **2026-05-12 follow-up:** PR #366's persist branch only fires
+    // when the current hook's payload carries `transcript_path`. In
+    // production that turned out to be insufficient — claude does
+    // not include the field on every event kind, and the work_runs
+    // row may not even exist yet at the moment a SessionStart fires
+    // (the engine inserts it from a separate code path that races
+    // the worker's startup hooks). The fix is to cache the path
+    // engine-side keyed by run id, so a later PostToolUse / Stop /
+    // whatever can persist the cached value even when its own
+    // payload omits the field.
+    let payload_path = incoming.transcript_path.as_deref();
+    let (resolved_path, from_cache) = match payload_path {
+        Some(path) => {
+            server_state.dispatcher_stats.inc_with_transcript_path();
+            let _ = server_state.transcript_path_cache.record_if_unset(run_id, path);
+            (Some(path.to_owned()), false)
+        }
+        None => {
+            server_state.dispatcher_stats.inc_without_transcript_path();
+            match server_state.transcript_path_cache.get(run_id) {
+                Some(cached) => (Some(cached), true),
+                None => (None, false),
+            }
+        }
+    };
+    if let Some(path) = resolved_path.as_deref() {
+        match server_state
+            .work_db
+            .set_run_transcript_path_if_unset(run_id, path)
+        {
+            Ok(true) => {
+                server_state.dispatcher_stats.inc_persist_updated();
+                if from_cache {
+                    server_state.dispatcher_stats.inc_persist_from_cache();
+                }
+                tracing::info!(
+                    run_id,
+                    transcript_path = %path,
+                    from_cache,
+                    "recorded transcript_path on work_run from hook payload",
+                );
+            }
+            Ok(false) => {
+                server_state.dispatcher_stats.inc_persist_noop();
+            }
+            Err(err) => {
+                server_state.dispatcher_stats.inc_persist_err();
+                tracing::warn!(
+                    run_id,
+                    ?err,
+                    "failed to persist transcript_path from hook payload",
+                );
+            }
         }
     }
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
@@ -4318,6 +4389,13 @@ fn build_live_status_debug_report(
             disabled: disabled_set.contains(&slot_id),
             last_trigger_kind: snap.last_trigger_kind.clone(),
             last_trigger_at: snap.last_trigger_at_epoch_s.map(format_epoch_iso8601),
+            last_real_trigger_kind: snap.last_real_trigger_kind.clone(),
+            last_real_trigger_at: snap
+                .last_real_trigger_at_epoch_s
+                .map(format_epoch_iso8601),
+            last_synthetic_trigger_at: snap
+                .last_synthetic_trigger_at_epoch_s
+                .map(format_epoch_iso8601),
             last_outcome_tag: snap.last_outcome_tag.clone(),
             last_outcome_detail: snap.last_outcome_detail.clone(),
             last_outcome_at: snap.last_outcome_at_epoch_s.map(format_epoch_iso8601),
@@ -4328,9 +4406,29 @@ fn build_live_status_debug_report(
         });
     }
 
+    let stats = server_state.dispatcher_stats.snapshot();
+    let dispatcher_stats = boss_protocol::DispatcherStatsReport {
+        hook_events_total: stats.hook_events_total,
+        hook_events_dropped_missing_run_id: stats.hook_events_dropped_missing_run_id,
+        hook_events_with_transcript_path_in_payload: stats
+            .hook_events_with_transcript_path_in_payload,
+        hook_events_without_transcript_path_in_payload: stats
+            .hook_events_without_transcript_path_in_payload,
+        transcript_path_persist_updated: stats.transcript_path_persist_updated,
+        transcript_path_persist_noop: stats.transcript_path_persist_noop,
+        transcript_path_persist_err: stats.transcript_path_persist_err,
+        transcript_path_persist_from_cache: stats.transcript_path_persist_from_cache,
+        last_hook_run_id: stats.last_hook.as_ref().map(|h| h.run_id.clone()),
+        last_hook_kind: stats.last_hook.as_ref().map(|h| h.kind.clone()),
+        last_hook_at: stats.last_hook.as_ref().map(|h| format_epoch_iso8601(h.epoch_s)),
+    };
+
     LiveStatusDebugReport {
         engine_build_sha: crate::build_info::git_sha().to_owned(),
         engine_build_time: crate::build_info::build_time().to_owned(),
+        engine_binary_fingerprint: crate::build_info::binary_fingerprint().to_owned(),
+        engine_process_started_at: crate::build_info::process_started_at().to_owned(),
+        dispatcher_stats,
         anthropic_api_key_present: server_state.anthropic_api_key.is_some(),
         tracked_slot_count: active_slots.len(),
         disabled_slot_count: disabled_set.len(),
@@ -6211,6 +6309,336 @@ mod tests {
             Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
             "dispatcher must persist transcript_path on work_runs even when the slot mapping is missing",
         );
+    }
+
+    /// Regression test for the 2026-05-12 follow-up to PR #366: the
+    /// running engine kept reporting `work_runs.transcript_path` as
+    /// NULL even though `last_trigger_kind=post_tool_use` was being
+    /// recorded on the slot. The cause was that claude's PostToolUse
+    /// (and PreToolUse / UserPromptSubmit) hook payloads do not
+    /// necessarily carry `transcript_path` — only SessionStart and
+    /// Stop reliably do — and the dispatcher's persist branch was
+    /// gated on `incoming.transcript_path.is_some()`. A PostToolUse
+    /// without the field landed past the slot lookup, fired the
+    /// notify, and left the work_runs row untouched. The summarizer
+    /// then early-outed every tick on "no transcript path yet".
+    ///
+    /// The fix: cache the path in memory per `run_id` whenever any
+    /// hook delivers it, then use the cache on subsequent hooks
+    /// whose payload lacks the field. This test asserts the cache
+    /// fallback by:
+    ///   1. Dispatching a SessionStart event with `transcript_path`
+    ///      set — populates the cache and persists the path.
+    ///   2. Resetting the row's `transcript_path` back to NULL (the
+    ///      real-world equivalent: the work_runs row did not exist
+    ///      at the moment SessionStart fired, so the UPDATE was a
+    ///      zero-row no-op). The cache, however, retains the path.
+    ///   3. Dispatching a PostToolUse event with `transcript_path =
+    ///      None` and asserting the row picks up the cached path on
+    ///      this second hook.
+    ///
+    /// Without the cache, step 3 leaves `transcript_path` NULL.
+    #[tokio::test]
+    async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
+        use crate::protocol::{WorkerEvent, SessionStartSource};
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let run = server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: None,
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        // Register a slot so this run is past the slot-lookup guard —
+        // the chore's running-engine condition is "slot present,
+        // transcript_path null".
+        server_state
+            .worker_registry
+            .register_run_slot(run.id.clone(), 5);
+
+        // Step 1: SessionStart populates the cache AND the row.
+        let session_start = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run.id.clone()),
+            transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+            event: WorkerEvent::SessionStart {
+                session_id: "claude-sess-1".into(),
+                source: SessionStartSource::Startup,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &session_start).await;
+        assert_eq!(
+            server_state
+                .work_db
+                .get_run(&run.id)
+                .unwrap()
+                .transcript_path
+                .as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+            "SessionStart with transcript_path must persist to work_runs",
+        );
+
+        // Step 2: simulate the real-world race where the work_runs
+        // row was not yet present when SessionStart fired — the
+        // UPDATE was a no-op. We clear the column directly to model
+        // that condition; the in-memory cache survives because the
+        // dispatcher populated it BEFORE the persist attempt.
+        server_state
+            .work_db
+            .clear_run_transcript_path_for_test(&run.id)
+            .unwrap();
+        assert!(
+            server_state
+                .work_db
+                .get_run(&run.id)
+                .unwrap()
+                .transcript_path
+                .is_none(),
+            "precondition: row is back to NULL, mirroring the race the chore reproduces",
+        );
+
+        // Step 3: PostToolUse with NO transcript_path on the
+        // payload. Pre-fix this was a silent drop; post-fix the
+        // cached path is persisted.
+        let post_tool_use = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run.id.clone()),
+            transcript_path: None,
+            event: WorkerEvent::PostToolUse {
+                session_id: "claude-sess-1".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+                tool_response: serde_json::Value::Null,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &post_tool_use).await;
+        assert_eq!(
+            server_state
+                .work_db
+                .get_run(&run.id)
+                .unwrap()
+                .transcript_path
+                .as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+            "PostToolUse without transcript_path in payload must persist the cached path",
+        );
+
+        // The cache-backed persist must be counted distinctly so an
+        // operator can verify at runtime that the fallback is doing
+        // actual work.
+        let stats = server_state.dispatcher_stats.snapshot();
+        assert!(
+            stats.transcript_path_persist_from_cache >= 1,
+            "dispatcher_stats.transcript_path_persist_from_cache must increment on the cache-backed persist; got {}",
+            stats.transcript_path_persist_from_cache,
+        );
+        assert!(
+            stats.hook_events_without_transcript_path_in_payload >= 1,
+            "PostToolUse event with no payload transcript_path must be counted; got {}",
+            stats.hook_events_without_transcript_path_in_payload,
+        );
+        assert_eq!(
+            stats.last_hook.as_ref().map(|h| h.kind.as_str()),
+            Some("post_tool_use"),
+            "last_hook kind must reflect the most recent dispatch",
+        );
+    }
+
+    /// Regression test that pins the synthetic vs real trigger
+    /// distinction in the per-slot debug snapshot. Before the
+    /// 2026-05-12 fix this ambiguity was the *reason* the running-
+    /// engine report looked like real hooks were arriving (the
+    /// `last_trigger_kind=post_tool_use` value): the per-slot loop's
+    /// 60-second timer wrote the same field. Now the snapshot keeps
+    /// `last_real_trigger_*` separate so an operator can tell at a
+    /// glance which side of the line they're on.
+    #[tokio::test]
+    async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
+        use crate::live_status_loop::{LiveStatusBroadcaster, TranscriptPathResolver};
+        use crate::protocol::WorkerEvent;
+        use async_trait::async_trait;
+        use boss_protocol::{
+            CreateChoreInput, CreateProductInput, RequestExecutionInput,
+        };
+        use std::path::PathBuf;
+
+        // The slot loop spawns and lives for the duration of the
+        // test; broadcaster + resolver stubs do nothing so the
+        // summarizer path is a no-op and we only exercise the
+        // trigger fan-in.
+        struct NopBroadcaster;
+        #[async_trait]
+        impl LiveStatusBroadcaster for NopBroadcaster {
+            async fn broadcast_live_worker_states(&self) {}
+        }
+        struct NopResolver;
+        #[async_trait]
+        impl TranscriptPathResolver for NopResolver {
+            async fn transcript_path(&self, _run_id: &str) -> Option<PathBuf> {
+                None
+            }
+        }
+
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let run = server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: None,
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let slot_id = 5u8;
+        server_state
+            .worker_registry
+            .register_run_slot(run.id.clone(), slot_id);
+        // Register the slot's LiveWorkerState entry so apply_event
+        // has something to mutate.
+        server_state.live_worker_states.register_spawn(
+            slot_id,
+            run.id.clone(),
+            "claude-opus-4-7",
+            0,
+            None,
+        );
+
+        // Start a real per-slot task so the notify pathway is
+        // exercised end-to-end. The summarizer's `resolver` returns
+        // None, so the loop will skip to "no transcript path yet"
+        // and never call the model — exactly what we want.
+        let broadcaster: std::sync::Arc<dyn LiveStatusBroadcaster> =
+            std::sync::Arc::new(NopBroadcaster);
+        let resolver: std::sync::Arc<dyn TranscriptPathResolver> =
+            std::sync::Arc::new(NopResolver);
+        server_state.live_status_manager.start_slot(
+            slot_id,
+            run.id.clone(),
+            None,
+            server_state.live_worker_states.clone(),
+            broadcaster,
+            resolver,
+        );
+
+        let event = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run.id.clone()),
+            transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+            event: WorkerEvent::PostToolUse {
+                session_id: "claude-sess-1".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+                tool_response: serde_json::Value::Null,
+            },
+        };
+        dispatch_live_worker_state(&server_state, &event).await;
+
+        // Yield to let the slot task service the queued triggers.
+        // The PostToolUse fan-out queues both a Trigger::PostToolUse
+        // and a Trigger::ActivityChanged(Working); both must land
+        // on the loop before we inspect the debug store.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let snap = server_state
+                .live_status_manager
+                .debug_store()
+                .snapshot_for(slot_id);
+            if snap.last_real_trigger_kind.is_some() {
+                break;
+            }
+        }
+
+        let snap = server_state
+            .live_status_manager
+            .debug_store()
+            .snapshot_for(slot_id);
+        assert!(
+            snap.last_real_trigger_kind.is_some(),
+            "real hook arrival must update last_real_trigger_kind; got {snap:?}",
+        );
+        assert!(
+            snap.last_real_trigger_at_epoch_s.is_some(),
+            "real hook arrival must update last_real_trigger_at_epoch_s; got {snap:?}",
+        );
+        assert!(
+            snap.last_synthetic_trigger_at_epoch_s.is_none(),
+            "a real hook must not be misattributed to the synthetic timer; got {snap:?}",
+        );
+
+        server_state.live_status_manager.stop_slot(slot_id);
     }
 
     /// `current_parent_pid` must NOT fall back to `getppid()` when

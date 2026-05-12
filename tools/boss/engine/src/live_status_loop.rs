@@ -36,6 +36,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -56,8 +57,25 @@ use crate::transcript_tail::TranscriptTail;
 #[derive(Debug, Clone, Default)]
 pub struct SlotDebugSnapshot {
     /// Last trigger the per-slot loop received (any variant).
+    ///
+    /// **Ambiguous on its own.** Both real hook fan-outs and the
+    /// per-slot loop's synthetic 60-second timer write this field
+    /// with the same `post_tool_use` label. To distinguish, read
+    /// `last_real_trigger_*` and `last_synthetic_trigger_at` — these
+    /// were added by the 2026-05-12 follow-up to PR #366 specifically
+    /// because that ambiguity made it look like real hooks were
+    /// arriving when only the synthetic timer was firing.
     pub last_trigger_kind: Option<String>,
     pub last_trigger_at_epoch_s: Option<i64>,
+    /// Last trigger received from a real hook fan-out (i.e. a
+    /// `notify()` call from `dispatch_live_worker_state`). Excludes
+    /// the synthetic timer-floor firings, so a `None` here while
+    /// `last_trigger_kind` is `Some` is the smoking gun for
+    /// "the synthetic timer is firing but no hooks ever reach the
+    /// slot loop".
+    pub last_real_trigger_kind: Option<String>,
+    pub last_real_trigger_at_epoch_s: Option<i64>,
+    pub last_synthetic_trigger_at_epoch_s: Option<i64>,
     /// Outcome tag of the most recent summarizer call (the four
     /// distinguishable cases from [`SummarizerOutcome::tag`]).
     pub last_outcome_tag: Option<String>,
@@ -126,6 +144,206 @@ fn epoch_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Engine-wide counters for the hook-event dispatcher. One instance
+/// is shared by `Arc` from `ServerState` so every call into
+/// `dispatch_live_worker_state` can bump the appropriate counters.
+///
+/// Each counter is monotonic across the engine process lifetime and
+/// only resets when the engine itself restarts (which the debug
+/// verb's top-level `engine_process_started_at` field documents). The
+/// counters answer the question PR #366's regression test couldn't:
+/// did the dispatcher actually attempt the persist, and what did it
+/// return?
+#[derive(Default)]
+pub struct DispatcherStats {
+    pub hook_events_total: AtomicU64,
+    pub hook_events_dropped_missing_run_id: AtomicU64,
+    pub hook_events_with_transcript_path_in_payload: AtomicU64,
+    pub hook_events_without_transcript_path_in_payload: AtomicU64,
+    pub transcript_path_persist_updated: AtomicU64,
+    pub transcript_path_persist_noop: AtomicU64,
+    pub transcript_path_persist_err: AtomicU64,
+    pub transcript_path_persist_from_cache: AtomicU64,
+    /// Last hook event the dispatcher processed. Held behind a mutex
+    /// rather than atomics because the run id is a String.
+    last_hook: StdMutex<Option<LastHookSnapshot>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LastHookSnapshot {
+    pub run_id: String,
+    pub kind: String,
+    pub epoch_s: i64,
+}
+
+impl DispatcherStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn inc_hook_events_total(&self) {
+        self.hook_events_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_dropped_missing_run_id(&self) {
+        self.hook_events_dropped_missing_run_id
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_with_transcript_path(&self) {
+        self.hook_events_with_transcript_path_in_payload
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_without_transcript_path(&self) {
+        self.hook_events_without_transcript_path_in_payload
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_persist_updated(&self) {
+        self.transcript_path_persist_updated
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_persist_noop(&self) {
+        self.transcript_path_persist_noop
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_persist_err(&self) {
+        self.transcript_path_persist_err
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_persist_from_cache(&self) {
+        self.transcript_path_persist_from_cache
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_last_hook(&self, run_id: &str, kind: &str) {
+        let mut guard = self.last_hook.lock().expect("last_hook mutex poisoned");
+        *guard = Some(LastHookSnapshot {
+            run_id: run_id.to_owned(),
+            kind: kind.to_owned(),
+            epoch_s: epoch_now(),
+        });
+    }
+
+    pub fn last_hook(&self) -> Option<LastHookSnapshot> {
+        self.last_hook
+            .lock()
+            .expect("last_hook mutex poisoned")
+            .clone()
+    }
+
+    /// Read-only snapshot of every counter as plain `u64`. Used by
+    /// the live-status debug RPC handler to populate the wire
+    /// `DispatcherStatsReport`.
+    pub fn snapshot(&self) -> DispatcherStatsSnapshot {
+        DispatcherStatsSnapshot {
+            hook_events_total: self.hook_events_total.load(Ordering::Relaxed),
+            hook_events_dropped_missing_run_id: self
+                .hook_events_dropped_missing_run_id
+                .load(Ordering::Relaxed),
+            hook_events_with_transcript_path_in_payload: self
+                .hook_events_with_transcript_path_in_payload
+                .load(Ordering::Relaxed),
+            hook_events_without_transcript_path_in_payload: self
+                .hook_events_without_transcript_path_in_payload
+                .load(Ordering::Relaxed),
+            transcript_path_persist_updated: self
+                .transcript_path_persist_updated
+                .load(Ordering::Relaxed),
+            transcript_path_persist_noop: self
+                .transcript_path_persist_noop
+                .load(Ordering::Relaxed),
+            transcript_path_persist_err: self
+                .transcript_path_persist_err
+                .load(Ordering::Relaxed),
+            transcript_path_persist_from_cache: self
+                .transcript_path_persist_from_cache
+                .load(Ordering::Relaxed),
+            last_hook: self.last_hook(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DispatcherStatsSnapshot {
+    pub hook_events_total: u64,
+    pub hook_events_dropped_missing_run_id: u64,
+    pub hook_events_with_transcript_path_in_payload: u64,
+    pub hook_events_without_transcript_path_in_payload: u64,
+    pub transcript_path_persist_updated: u64,
+    pub transcript_path_persist_noop: u64,
+    pub transcript_path_persist_err: u64,
+    pub transcript_path_persist_from_cache: u64,
+    pub last_hook: Option<LastHookSnapshot>,
+}
+
+/// Engine-wide in-memory cache of the most recent `transcript_path`
+/// the dispatcher learned for a given `run_id`. Populated whenever a
+/// hook event arrives with a non-empty `transcript_path` field; read
+/// whenever a hook event arrives WITHOUT one so the dispatcher can
+/// still call `set_run_transcript_path_if_unset` with a known-good
+/// path.
+///
+/// This is the structural fix for the failure mode where claude
+/// emits `transcript_path` on `SessionStart` / `Stop` but not on
+/// `PostToolUse` / `PreToolUse` / `UserPromptSubmit` — without this
+/// cache, the dispatcher would skip the persist on every event that
+/// happens to lack the field, and if the work_runs row was inserted
+/// AFTER the SessionStart fired (the chore's reported reproduction)
+/// the persist call from SessionStart was an `UPDATE … WHERE id=?`
+/// that affected zero rows. The cache lets the next hook for the
+/// same run finally win.
+#[derive(Default)]
+pub struct TranscriptPathCache {
+    inner: StdMutex<HashMap<String, String>>,
+}
+
+impl TranscriptPathCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store the path for `run_id` if it's not already cached.
+    /// Returns whether the cache was updated (true) or already had a
+    /// value (false). Cache is first-writer-wins to match the
+    /// idempotency of `set_run_transcript_path_if_unset` — a later
+    /// SessionStart/resume must NOT clobber the path the tail
+    /// watcher has already opened against the original session.
+    pub fn record_if_unset(&self, run_id: &str, path: &str) -> bool {
+        let mut guard = self.inner.lock().expect("transcript path cache poisoned");
+        if guard.contains_key(run_id) {
+            return false;
+        }
+        guard.insert(run_id.to_owned(), path.to_owned());
+        true
+    }
+
+    pub fn get(&self, run_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("transcript path cache poisoned")
+            .get(run_id)
+            .cloned()
+    }
+
+    /// Drop the cache entry for `run_id`. Called when a run is
+    /// released so the cache doesn't grow without bound.
+    pub fn forget(&self, run_id: &str) {
+        self.inner
+            .lock()
+            .expect("transcript path cache poisoned")
+            .remove(run_id);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("transcript path cache poisoned")
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 fn trigger_kind(t: &Trigger) -> &'static str {
@@ -507,9 +725,16 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             activity = last_activity.as_str(),
             "live_status: slot loop received trigger",
         );
+        let now_epoch = epoch_now();
         debug_store.update(slot_id, |snap| {
             snap.last_trigger_kind = Some(kind.to_owned());
-            snap.last_trigger_at_epoch_s = Some(epoch_now());
+            snap.last_trigger_at_epoch_s = Some(now_epoch);
+            if synthetic {
+                snap.last_synthetic_trigger_at_epoch_s = Some(now_epoch);
+            } else {
+                snap.last_real_trigger_kind = Some(kind.to_owned());
+                snap.last_real_trigger_at_epoch_s = Some(now_epoch);
+            }
         });
 
         match trigger {
