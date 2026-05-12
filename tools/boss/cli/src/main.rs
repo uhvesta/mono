@@ -275,6 +275,38 @@ enum EngineCommand {
     Status,
     Start,
     Stop,
+    /// Inspect and manage the merge-conflict resolution attempt table
+    /// (`conflict_resolutions`). Worker-facing surface for the in-review
+    /// merge-conflict handling flow.
+    Conflicts {
+        #[command(subcommand)]
+        command: EngineConflictsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineConflictsCommand {
+    /// Flip a `conflict_resolutions` attempt to `failed` with a
+    /// reason. Worker-facing escape hatch: the resolution worker calls
+    /// this when it hits a stop condition (semantic obsolescence,
+    /// product decision required, architectural mismatch) and chooses
+    /// not to push.
+    MarkFailed(EngineConflictsMarkFailedArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineConflictsMarkFailedArgs {
+    /// Attempt id from the `conflict_resolutions` table (e.g.
+    /// `crz_…`). The current attempt id is part of the worker's
+    /// spawn prompt.
+    attempt_id: String,
+
+    /// Free-form failure reason. The design canonicalises three:
+    /// `obsolescence_suspected`, `product_decision_required`,
+    /// `architectural_mismatch`. Any string is accepted; the engine
+    /// stores it verbatim on the attempt row.
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1766,6 +1798,44 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
                     }
                 },
             )
+        }
+        EngineCommand::Conflicts { command } => run_engine_conflicts_command(command, ctx).await,
+    }
+}
+
+async fn run_engine_conflicts_command(
+    command: EngineConflictsCommand,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    match command {
+        EngineConflictsCommand::MarkFailed(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::MarkConflictResolutionFailed {
+                    attempt_id: args.attempt_id.clone(),
+                    reason: args.reason.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ConflictResolutionMarkedFailed { attempt } => print_entity(
+                    ctx,
+                    &serde_json::to_value(&attempt).unwrap_or(serde_json::Value::Null),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "Conflict resolution {} marked failed (reason: {}).",
+                                attempt.id,
+                                attempt.failure_reason.as_deref().unwrap_or("<unset>"),
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("conflicts mark-failed", &other)),
+            }
         }
     }
 }

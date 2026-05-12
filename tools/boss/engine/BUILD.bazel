@@ -10,6 +10,7 @@ rust_library(
         "src/cli.rs",
         "src/completion.rs",
         "src/config.rs",
+        "src/conflict_diagnosis.rs",
         "src/conflict_watch.rs",
         "src/coordinator.rs",
         "src/dispatch_events.rs",

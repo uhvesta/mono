@@ -3994,6 +3994,52 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            FrontendRequest::MarkConflictResolutionFailed { attempt_id, reason } => {
+                // Worker-facing stop-condition surface. `User` tier:
+                // the worker pane invokes `boss engine conflicts
+                // mark-failed`, which descends from a worker pane and
+                // therefore wouldn't pass `AppOrBoss`. The only state
+                // change is on a `conflict_resolutions` row keyed by
+                // an opaque id — a worker forging an attempt id has
+                // no row to clobber, so authority gates aren't
+                // load-bearing here.
+                match work_db.mark_conflict_resolution_failed(&attempt_id, &reason) {
+                    Ok(Some(attempt)) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            work_item_id = %attempt.work_item_id,
+                            pr_url = %attempt.pr_url,
+                            %reason,
+                            "mark_conflict_resolution_failed: attempt flipped to failed",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ConflictResolutionMarkedFailed { attempt },
+                        );
+                    }
+                    Ok(None) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "conflict resolution attempt {attempt_id:?} is unknown or already terminal",
+                                ),
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
 

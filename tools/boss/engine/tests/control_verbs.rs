@@ -895,6 +895,119 @@ async fn list_executions_for(
     }
 }
 
+/// End-to-end smoke for the worker-facing `boss engine conflicts
+/// mark-failed` surface (chore #9 of the merge-conflict design's
+/// Phase 3): seed a `conflict_resolutions` row, send the RPC, and
+/// assert that the engine flips the row to `failed` with the supplied
+/// reason. Also covers the "unknown attempt id" arm and the
+/// "already-terminal row" idempotency arm.
+#[tokio::test]
+async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+
+    // Seed a product → in_review chore → conflict_resolutions row by
+    // talking to the engine's own WorkDb. We avoid the RPC surface
+    // for the seed because there's no public protocol-level
+    // `insert_conflict_resolution`; that's an engine-internal flow.
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let product = work_db.create_product(CreateProductInput {
+        name: "P".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
+    })?;
+    let chore = work_db.create_chore(CreateChoreInput {
+        product_id: product.id.clone(),
+        name: "C".to_owned(),
+        description: None,
+        autostart: false,
+        priority: None,
+        created_via: None,
+        repo_remote_url: None,
+    })?;
+    work_db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some("https://github.com/foo/bar/pull/42".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    work_db.mark_chore_blocked_merge_conflict(&chore.id, "https://github.com/foo/bar/pull/42")?;
+    let attempt = work_db
+        .insert_conflict_resolution(boss_engine::work::ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/42".to_owned(),
+            pr_number: 42,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("abc123".to_owned()),
+            head_sha_before: Some("def456".to_owned()),
+        })?
+        .expect("insert should succeed on a fresh row");
+
+    // Drive the engine's WorkDb through a fresh connection of the
+    // engine binary by talking to its frontend socket — release the
+    // direct handle so its lock doesn't clash with the engine's.
+    drop(work_db);
+
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::MarkConflictResolutionFailed {
+            attempt_id: attempt.id.clone(),
+            reason: "product_decision_required".to_owned(),
+        })
+        .await?;
+    let flipped = match response {
+        FrontendEvent::ConflictResolutionMarkedFailed { attempt } => attempt,
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    };
+    assert_eq!(flipped.id, attempt.id);
+    assert_eq!(flipped.status, "failed");
+    assert_eq!(
+        flipped.failure_reason.as_deref(),
+        Some("product_decision_required"),
+    );
+    assert!(flipped.finished_at.is_some(), "finished_at must be stamped");
+
+    // Idempotency: a second call on a now-terminal row surfaces a
+    // structured error rather than silently no-op'ing.
+    let response = client
+        .send_request(&FrontendRequest::MarkConflictResolutionFailed {
+            attempt_id: attempt.id.clone(),
+            reason: "ignored".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("already terminal") || message.contains("unknown"),
+                "expected terminal/unknown message, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+
+    // Unknown attempt id: same error surface, distinguishable by the
+    // bogus id in the message body.
+    let response = client
+        .send_request(&FrontendRequest::MarkConflictResolutionFailed {
+            attempt_id: "crz_does_not_exist".to_owned(),
+            reason: "nope".to_owned(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("crz_does_not_exist"),
+                "expected message to name the bogus id, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()> {
     // Live-coordinator-session repro: `bossctl workspace summary` was
