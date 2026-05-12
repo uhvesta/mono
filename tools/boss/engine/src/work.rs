@@ -234,6 +234,23 @@ impl WorkDb {
         is_live: F,
     ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
+        // Pre-check the resolver outside the transaction. If the work
+        // item has no repo resolution, write a sticky attention item
+        // via a *separate* short-lived tx that commits before the
+        // bail unwinds — the kanban Attention lane must surface the
+        // same failure the CLI exit code does, per multi-repo Q5.
+        // Doing this inside the dispatch tx would lose the attention
+        // item to the rollback.
+        if resolve_repo_for_work_item(&conn, &input.work_item_id)?.is_none() {
+            let label = repo_unresolved_kind_label(&conn, &input.work_item_id)?;
+            let attn_tx = conn.transaction()?;
+            record_repo_unresolved_attention(&attn_tx, &input.work_item_id, label)?;
+            attn_tx.commit()?;
+            bail!(
+                "{}",
+                repo_unresolved_attention_body(&input.work_item_id, label)
+            );
+        }
         let tx = conn.transaction()?;
         let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
         tx.commit()?;
@@ -894,7 +911,8 @@ impl WorkDb {
         );
 
         let item = self.create_attention_item(CreateAttentionItemInput {
-            execution_id: execution_id.to_owned(),
+            execution_id: Some(execution_id.to_owned()),
+            work_item_id: None,
             kind: "design_doc_pointer_conflict".to_owned(),
             status: None,
             title,
@@ -1108,13 +1126,16 @@ impl WorkDb {
     ) -> Result<ExecutionReconcileResult> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let product = query_product(&tx, product_id)?
+        let _product = query_product(&tx, product_id)?
             .with_context(|| format!("unknown product: {product_id}"))?;
         let _projects = list_projects_for_product(&tx, product_id)?;
         let tasks = list_tasks_for_product(&tx, product_id)?;
         let mut result = ExecutionReconcileResult::default();
 
-        let repo_remote_url = product.repo_remote_url.clone();
+        // Per-row repo resolution lives inside
+        // `reconcile_work_item_execution` now — the product default
+        // is one of several fallbacks the resolver applies, not the
+        // sole signal threaded through here.
 
         // Bucket the product's project-bound tasks by parent. Both
         // `kind = 'design'` and `kind = 'project_task'` share the
@@ -1138,7 +1159,6 @@ impl WorkDb {
                             &task.id,
                             "chore_implementation",
                             "ready",
-                            repo_remote_url.as_deref(),
                         )?;
                     }
                 }
@@ -1184,7 +1204,6 @@ impl WorkDb {
                     &task.id,
                     execution_kind,
                     desired_status,
-                    repo_remote_url.as_deref(),
                 )?;
             }
         }
@@ -1391,10 +1410,20 @@ impl WorkDb {
         )?;
 
         let attention_item = if let Some(input) = attention {
-            if input.execution_id != execution_id {
+            // `finish_execution_run` only ever attaches to the
+            // execution it just finished. The caller threading a
+            // `work_item_id` instead is a bug — the work-item-scoped
+            // attention path goes through `create_attention_item`.
+            if input.work_item_id.is_some() {
                 bail!(
-                    "attention item execution `{}` does not match finished execution `{execution_id}`",
-                    input.execution_id
+                    "finish_execution_run attention payload must not set work_item_id (got {:?})",
+                    input.work_item_id
+                );
+            }
+            let provided = input.execution_id.as_deref().unwrap_or(execution_id);
+            if provided != execution_id {
+                bail!(
+                    "attention item execution `{provided}` does not match finished execution `{execution_id}`",
                 );
             }
 
@@ -1403,8 +1432,8 @@ impl WorkDb {
             let resolved_at = normalize_optional_text(input.resolved_at);
             tx.execute(
                 "INSERT INTO work_attention_items (
-                    id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     attention_id,
                     execution_id,
@@ -1543,7 +1572,7 @@ impl WorkDb {
     ) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        ensure_execution_exists(&tx, &input.execution_id)?;
+        let (execution_id, work_item_id) = attention_target_from_input(&tx, &input)?;
 
         let id = next_id("attn");
         let now = now_string();
@@ -1552,11 +1581,12 @@ impl WorkDb {
 
         tx.execute(
             "INSERT INTO work_attention_items (
-                id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
-                input.execution_id,
+                execution_id,
+                work_item_id,
                 input.kind,
                 status,
                 input.title,
@@ -1577,12 +1607,33 @@ impl WorkDb {
         ensure_execution_exists(&conn, execution_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
+            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
              FROM work_attention_items
              WHERE execution_id = ?1
              ORDER BY created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([execution_id], map_attention_item)?;
+        collect_rows(rows)
+    }
+
+    /// List the sticky, pre-dispatch attention items attached to a
+    /// work item (i.e. `work_item_id IS NOT NULL`). Used by the
+    /// `repo_unresolved` surface and any future work-item-scoped
+    /// attention flows. Errors if the work item id is unknown so
+    /// callers can't accidentally silently no-op on a typo.
+    pub fn list_attention_items_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Vec<WorkAttentionItem>> {
+        let conn = self.connect()?;
+        let _ = product_id_for_work_item(&conn, work_item_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+             FROM work_attention_items
+             WHERE work_item_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([work_item_id], map_attention_item)?;
         collect_rows(rows)
     }
 
@@ -2161,13 +2212,18 @@ impl WorkDb {
 
             CREATE TABLE IF NOT EXISTS work_attention_items (
                 id TEXT PRIMARY KEY,
-                execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+                execution_id TEXT REFERENCES work_executions(id) ON DELETE CASCADE,
+                work_item_id TEXT,
                 kind TEXT NOT NULL,
                 status TEXT NOT NULL,
                 title TEXT NOT NULL,
                 body_markdown TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                resolved_at TEXT
+                resolved_at TEXT,
+                CHECK (
+                    (execution_id IS NOT NULL AND work_item_id IS NULL)
+                    OR (execution_id IS NULL AND work_item_id IS NOT NULL)
+                )
             );
 
             CREATE INDEX IF NOT EXISTS work_attention_items_execution_idx
@@ -2241,8 +2297,9 @@ impl WorkDb {
         migrate_products_auto_pr_maintenance_enabled(&conn)?;
         migrate_conflict_resolutions_table(&conn)?;
         migrate_backfill_blocked_reason_dependency(&conn)?;
+        migrate_work_attention_items_work_item_id(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '6')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '7')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -2936,12 +2993,13 @@ fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentionItem> {
     Ok(WorkAttentionItem {
         id: row.get(0)?,
         execution_id: row.get(1)?,
-        kind: row.get(2)?,
-        status: row.get(3)?,
-        title: row.get(4)?,
-        body_markdown: row.get(5)?,
-        created_at: row.get(6)?,
-        resolved_at: row.get(7)?,
+        work_item_id: row.get(2)?,
+        kind: row.get(3)?,
+        status: row.get(4)?,
+        title: row.get(5)?,
+        body_markdown: row.get(6)?,
+        created_at: row.get(7)?,
+        resolved_at: row.get(8)?,
     })
 }
 
@@ -3173,7 +3231,7 @@ fn query_run(conn: &Connection, id: &str) -> Result<Option<WorkRun>> {
 
 fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttentionItem>> {
     conn.query_row(
-        "SELECT id, execution_id, kind, status, title, body_markdown, created_at, resolved_at
+        "SELECT id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
          FROM work_attention_items
          WHERE id = ?1",
         [id],
@@ -3660,6 +3718,56 @@ fn migrate_conflict_resolutions_table(conn: &Connection) -> Result<()> {
 /// `NULL` (legacy "blocked by a human for some untracked reason").
 /// Idempotent — the `blocked_reason IS NULL` guard means re-running
 /// the migration is a no-op once values are written.
+/// Schema v7: relax `work_attention_items.execution_id` to nullable
+/// and add a `work_item_id` column so an attention item can attach to
+/// a work item that has no execution row yet (`repo_unresolved` per
+/// `multi-repo-work-modeling.md` Q5). SQLite cannot drop a `NOT NULL`
+/// constraint in place, so we rebuild the table.
+///
+/// Idempotent: the table rebuild is guarded by the presence of the
+/// new column. The index DDL is `IF NOT EXISTS` and runs every time
+/// so fresh-init databases (which create the table directly in its
+/// v7 shape) also pick up the index.
+fn migrate_work_attention_items_work_item_id(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_attention_items", "work_item_id")? {
+        conn.execute_batch(
+            "CREATE TABLE work_attention_items_v7 (
+                 id TEXT PRIMARY KEY,
+                 execution_id TEXT REFERENCES work_executions(id) ON DELETE CASCADE,
+                 work_item_id TEXT,
+                 kind TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 body_markdown TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 resolved_at TEXT,
+                 CHECK (
+                     (execution_id IS NOT NULL AND work_item_id IS NULL)
+                     OR (execution_id IS NULL AND work_item_id IS NOT NULL)
+                 )
+             );
+             INSERT INTO work_attention_items_v7
+                 (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at)
+             SELECT id, execution_id, NULL, kind, status, title, body_markdown, created_at, resolved_at
+                 FROM work_attention_items;
+             DROP TABLE work_attention_items;
+             ALTER TABLE work_attention_items_v7 RENAME TO work_attention_items;
+             CREATE INDEX IF NOT EXISTS work_attention_items_execution_idx
+                 ON work_attention_items(execution_id, created_at);",
+        )?;
+    }
+    // Index DDL runs unconditionally — the table is always v7-shaped
+    // by this point, and `IF NOT EXISTS` makes it idempotent. Fresh
+    // init lands here too (the new-shape `CREATE TABLE IF NOT EXISTS`
+    // creates the table but not this column-specific index).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS work_attention_items_work_item_idx
+            ON work_attention_items(work_item_id, created_at)",
+        [],
+    )?;
+    Ok(())
+}
+
 fn migrate_backfill_blocked_reason_dependency(conn: &Connection) -> Result<()> {
     // The dep-graph machinery defines "gating" as a `relation = 'blocks'`
     // edge whose prereq has not reached a satisfied terminal status. For
@@ -3687,6 +3795,100 @@ fn migrate_backfill_blocked_reason_dependency(conn: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+/// Validate the `(execution_id, work_item_id)` discriminant on a
+/// `CreateAttentionItemInput` and return the canonical pair to write.
+/// Exactly one of the two must be set; both-set or neither-set is a
+/// caller bug. Also confirms the referenced row actually exists so
+/// the CHECK constraint and FK don't blow up on insert.
+fn attention_target_from_input(
+    conn: &Connection,
+    input: &CreateAttentionItemInput,
+) -> Result<(Option<String>, Option<String>)> {
+    let exec = input.execution_id.as_deref().filter(|s| !s.is_empty());
+    let work = input.work_item_id.as_deref().filter(|s| !s.is_empty());
+    match (exec, work) {
+        (Some(execution_id), None) => {
+            ensure_execution_exists(conn, execution_id)?;
+            Ok((Some(execution_id.to_owned()), None))
+        }
+        (None, Some(work_item_id)) => {
+            let _ = product_id_for_work_item(conn, work_item_id)?;
+            Ok((None, Some(work_item_id.to_owned())))
+        }
+        (Some(_), Some(_)) => bail!(
+            "attention item must reference either execution_id or work_item_id, not both"
+        ),
+        (None, None) => bail!(
+            "attention item must reference either execution_id or work_item_id"
+        ),
+    }
+}
+
+/// Emit a sticky `repo_unresolved` attention item against
+/// `work_item_id`, unless one is already open. Idempotent: repeated
+/// reconcile passes against the same work item don't pile up rows.
+/// Caller supplies the kind label (`task`, `chore`, `project`) so
+/// the message names the right CLI verb.
+fn record_repo_unresolved_attention(
+    conn: &Connection,
+    work_item_id: &str,
+    kind_label: &str,
+) -> Result<()> {
+    let already_open: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM work_attention_items
+             WHERE work_item_id = ?1
+               AND kind = 'repo_unresolved'
+               AND status = 'open'
+         )",
+        [work_item_id],
+        |row| row.get(0),
+    )?;
+    if already_open != 0 {
+        return Ok(());
+    }
+    let id = next_id("attn");
+    let now = now_string();
+    let title = format!("Work item {work_item_id} has no repo resolution");
+    let body = repo_unresolved_attention_body(work_item_id, kind_label);
+    conn.execute(
+        "INSERT INTO work_attention_items (
+            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+         ) VALUES (?1, NULL, ?2, 'repo_unresolved', 'open', ?3, ?4, ?5, NULL)",
+        params![id, work_item_id, title, body, now],
+    )?;
+    Ok(())
+}
+
+/// The exact message text both the attention item and the
+/// `request_execution` bail path use. Single source so the two
+/// surfaces never drift, per the design doc's R1 mitigation.
+fn repo_unresolved_attention_body(work_item_id: &str, kind_label: &str) -> String {
+    format!(
+        "work item {work_item_id} has no repo resolution; set one with `boss {kind_label} update --repo <url>` or set a product default."
+    )
+}
+
+/// Kind label for the `boss <kind> update` hint in the
+/// `repo_unresolved` message. Tasks under a project use `task`;
+/// project-less rows are `chore`. Projects don't dispatch directly,
+/// so the message there falls back to the safe generic.
+fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) -> Result<&'static str> {
+    Ok(match classify_id(work_item_id)? {
+        ItemKind::Task => {
+            let task = query_task(conn, work_item_id)?
+                .filter(|task| task.deleted_at.is_none())
+                .with_context(|| format!("unknown task: {work_item_id}"))?;
+            match task.kind.as_str() {
+                "chore" => "chore",
+                _ => "task",
+            }
+        }
+        ItemKind::Project => "project",
+        ItemKind::Product => "product",
+    })
 }
 
 fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
@@ -3800,7 +4002,6 @@ fn reconcile_work_item_execution(
     work_item_id: &str,
     kind: &str,
     desired_status: &str,
-    repo_remote_url: Option<&str>,
 ) -> Result<()> {
     // Dispatcher gate (Q8): if the work item has any unmet `blocks`
     // prereq, downgrade its desired execution status to
@@ -3824,7 +4025,14 @@ fn reconcile_work_item_execution(
             }
         }
         None => {
-            let Some(repo_remote_url) = repo_remote_url else {
+            // Resolve through the single helper so per-row overrides
+            // beat the product default (multi-repo design Q5). On a
+            // `None` we don't create an execution row — instead a
+            // sticky `repo_unresolved` attention item surfaces the
+            // problem in the kanban Attention lane.
+            let Some(repo_remote_url) = resolve_repo_for_work_item(conn, work_item_id)? else {
+                let label = repo_unresolved_kind_label(conn, work_item_id)?;
+                record_repo_unresolved_attention(conn, work_item_id, label)?;
                 return Ok(());
             };
             let created = insert_execution(
@@ -3833,7 +4041,7 @@ fn reconcile_work_item_execution(
                     work_item_id: work_item_id.to_owned(),
                     kind: kind.to_owned(),
                     status: Some(effective_status.to_owned()),
-                    repo_remote_url: Some(repo_remote_url.to_owned()),
+                    repo_remote_url: Some(repo_remote_url),
                     cube_repo_id: None,
                     cube_lease_id: None,
                     cube_workspace_id: None,
@@ -3880,6 +4088,19 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         bail!(
             "cannot start {work_item_id}: gated by [{names}] — use `boss <kind> depend rm` to remove the edge or wait for the prereq to complete"
         );
+    }
+
+    // Multi-repo Q5: route through the single resolver so the
+    // explicit `bossctl work start` path refuses with the same
+    // message the reconciler would have surfaced. The matching
+    // sticky attention item is written by the public
+    // `request_execution_with_live_check` wrapper from a separate
+    // transaction — doing it here would let the bail's rollback
+    // erase the kanban surface alongside the dispatch attempt.
+    let resolved_repo = resolve_repo_for_work_item(conn, &work_item_id)?;
+    if resolved_repo.is_none() {
+        let label = repo_unresolved_kind_label(conn, &work_item_id)?;
+        bail!("{}", repo_unresolved_attention_body(&work_item_id, label));
     }
 
     if let Some(existing) = query_latest_execution_for_work_item(conn, &work_item_id)? {
@@ -3937,7 +4158,12 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             work_item_id,
             kind,
             status: Some("ready".to_owned()),
-            repo_remote_url: None,
+            // The early return above guarantees this is `Some(_)`;
+            // we pass it through explicitly so `insert_execution`
+            // doesn't redo the resolution and so per-row overrides
+            // stay authoritative even when `update_task` patches
+            // them between resolve and insert.
+            repo_remote_url: resolved_repo,
             cube_repo_id: None,
             cube_lease_id: None,
             cube_workspace_id: None,
@@ -4089,12 +4315,12 @@ fn resolve_execution_repo_remote_url(
         return Ok(repo_remote_url);
     }
 
-    let product_id = product_id_for_work_item(conn, work_item_id)?;
-    let product = query_product(conn, &product_id)?
-        .with_context(|| format!("unknown product: {product_id}"))?;
-    product.repo_remote_url.with_context(|| {
+    // Multi-repo Q5: route through the single resolver so per-row
+    // overrides on `tasks.repo_remote_url` beat the product default.
+    // Errors keep the same shape the bossctl path expects.
+    resolve_repo_for_work_item(conn, work_item_id)?.with_context(|| {
         format!(
-            "work item {work_item_id} does not resolve to a product repo_remote_url; provide one explicitly"
+            "work item {work_item_id} does not resolve to a repo_remote_url; provide one explicitly"
         )
     })
 }
@@ -5403,7 +5629,8 @@ mod tests {
             .unwrap();
         let attention = db
             .create_attention_item(CreateAttentionItemInput {
-                execution_id: execution.id.clone(),
+                execution_id: Some(execution.id.clone()),
+                work_item_id: None,
                 kind: "decision_required".to_owned(),
                 status: Some("open".to_owned()),
                 title: "Need product call".to_owned(),
@@ -5467,7 +5694,8 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains("does not resolve to a product repo_remote_url")
+                .contains("does not resolve to a repo_remote_url"),
+            "expected resolver error in `{err}`",
         );
 
         let execution = db
@@ -5723,6 +5951,244 @@ mod tests {
         let task_execution = db.list_executions(Some(&task.id)).unwrap();
         assert_eq!(task_execution.len(), 1);
         assert_eq!(task_execution[0].status, "ready");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Acceptance (a) for multi-repo Q5 dispatch wiring: a chore that
+    /// supplies its own `repo_remote_url` override dispatches against
+    /// the override URL, not the parent product default. The two URLs
+    /// differ so the test can't accidentally pass on inheritance.
+    #[test]
+    fn reconcile_dispatches_chore_against_repo_override() {
+        let path = temp_db_path("reconcile-chore-override");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Nimbus migration".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
+            })
+            .unwrap();
+
+        let result = db.reconcile_product_executions(&product.id).unwrap();
+        assert_eq!(result.created.len(), 1, "chore should dispatch on first pass");
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].repo_remote_url,
+            "git@github.com:myorg/nimbus.git",
+            "the row should carry the chore's override, not the product default",
+        );
+        assert_eq!(executions[0].status, "ready");
+
+        // No sticky attention items raised for a resolvable row.
+        assert!(
+            db.list_attention_items_for_work_item(&chore.id)
+                .unwrap()
+                .is_empty(),
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Acceptance (b) for multi-repo Q5 dispatch wiring: a chore with
+    /// no resolvable repo (product has no default and the chore has
+    /// no override) surfaces a sticky `repo_unresolved`
+    /// `WorkAttentionItem` and creates NO execution row. The item
+    /// dedupes across reconcile passes so the user doesn't end up with
+    /// a pile of identical entries.
+    #[test]
+    fn reconcile_surfaces_repo_unresolved_attention_when_unresolvable() {
+        let path = temp_db_path("reconcile-repo-unresolved");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Orphan".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+
+        let first_pass = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(first_pass.created.is_empty(), "no execution row when repo unresolved");
+        assert!(
+            db.list_executions(None).unwrap().is_empty(),
+            "the failure is sticky-via-attention, not via a phantom execution row",
+        );
+
+        let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
+        assert_eq!(items.len(), 1, "one sticky attention item per work item");
+        let item = &items[0];
+        assert_eq!(item.kind, "repo_unresolved");
+        assert_eq!(item.status, "open");
+        assert_eq!(item.execution_id, None);
+        assert_eq!(item.work_item_id.as_deref(), Some(chore.id.as_str()));
+        assert!(
+            item.body_markdown.contains("boss chore update --repo <url>"),
+            "body should tell the user how to fix it (got `{}`)",
+            item.body_markdown,
+        );
+        assert!(
+            item.body_markdown.contains(&chore.id),
+            "body should name the work item (got `{}`)",
+            item.body_markdown,
+        );
+
+        // Sticky: a second reconcile pass does not duplicate the row.
+        let second_pass = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(second_pass.created.is_empty());
+        assert!(second_pass.updated.is_empty());
+        assert_eq!(
+            db.list_attention_items_for_work_item(&chore.id)
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Acceptance (c) for multi-repo Q5 dispatch wiring: the explicit
+    /// `bossctl work start` path (i.e.
+    /// `request_execution_with_live_check`) refuses with the same
+    /// error message the reconciler's attention item carries, and it
+    /// raises (or reuses) the sticky attention item so the kanban
+    /// also surfaces the failure.
+    #[test]
+    fn request_execution_refuses_when_repo_unresolvable() {
+        let path = temp_db_path("request-exec-repo-unresolved");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Orphan".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+
+        let err = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: chore.id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| true,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("has no repo resolution"),
+            "expected the same repo_unresolved error as reconcile (got `{err}`)",
+        );
+        assert!(
+            err.to_string().contains("boss chore update --repo <url>"),
+            "error should name the CLI fix (got `{err}`)",
+        );
+
+        assert!(
+            db.list_executions(None).unwrap().is_empty(),
+            "the refused request must not leave an execution row behind",
+        );
+
+        let items = db.list_attention_items_for_work_item(&chore.id).unwrap();
+        assert_eq!(items.len(), 1, "the kanban surface mirrors the CLI error");
+        assert_eq!(items[0].kind, "repo_unresolved");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Adjunct to (a) above: once the user supplies an override URL
+    /// on a previously-unresolvable chore, the next reconcile creates
+    /// the execution row against that URL. The sticky attention item
+    /// stays around until the user explicitly resolves it — the engine
+    /// does not auto-resolve, matching the design's "sticky" wording.
+    #[test]
+    fn reconcile_dispatches_after_override_repairs_unresolvable_chore() {
+        let path = temp_db_path("reconcile-repair-override");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Orphan".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+
+        let first_pass = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(first_pass.created.is_empty());
+        assert_eq!(
+            db.list_attention_items_for_work_item(&chore.id)
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let second_pass = db.reconcile_product_executions(&product.id).unwrap();
+        assert_eq!(second_pass.created.len(), 1);
+        let executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].repo_remote_url,
+            "git@github.com:myorg/nimbus.git",
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -7686,7 +8152,8 @@ mod tests {
                 None,
                 false,
                 Some(CreateAttentionItemInput {
-                    execution_id: execution.id.clone(),
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
                     kind: "review_required".to_owned(),
                     status: None,
                     title: "Review implementation output for Cleanup".to_owned(),
@@ -8809,7 +9276,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
         let _ = std::fs::remove_file(path);
     }
 
@@ -8985,7 +9452,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
         let _ = std::fs::remove_file(path);
     }
 
@@ -9005,7 +9472,7 @@ mod tests {
 
     /// Fresh init lands the new `tasks.repo_remote_url` column, the
     /// partial `tasks_repo_idx` index, and bumps the recorded
-    /// `schema_version` to 6.
+    /// `schema_version` to 7.
     #[test]
     fn fresh_init_includes_tasks_repo_remote_url() {
         let path = temp_db_path("tasks-repo-fresh");
@@ -9031,7 +9498,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
 
         let _ = std::fs::remove_file(path);
     }
@@ -9039,7 +9506,7 @@ mod tests {
     /// A pre-v5 database (no `repo_remote_url` column on `tasks`,
     /// `schema_version = 4`) should pick up the new column with
     /// existing rows defaulting to `NULL`, get the partial index
-    /// created, and have `schema_version` bumped to 6.
+    /// created, and have `schema_version` bumped to 7.
     #[test]
     fn migration_from_v4_adds_tasks_repo_remote_url() {
         let path = temp_db_path("tasks-repo-migrate");
@@ -9110,7 +9577,7 @@ mod tests {
             .unwrap();
         assert_eq!(index_exists, 1);
 
-        // schema_version moves from 4 → 6.
+        // schema_version moves from 4 → 7.
         let version: String = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'schema_version'",
@@ -9118,7 +9585,117 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Schema v7 migration: a pre-v7 `work_attention_items` table
+    /// (NOT NULL `execution_id`, no `work_item_id`) is rebuilt in
+    /// place. Existing rows survive with their `execution_id` intact
+    /// and a `NULL` `work_item_id`, the new column lands, and the
+    /// CHECK constraint accepts work-item-scoped writes afterwards.
+    #[test]
+    fn migration_v6_to_v7_relaxes_work_attention_items() {
+        let path = temp_db_path("attn-v7-migrate");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Stand up just enough of the v6 schema to land an existing
+        // attention item against an execution row. Everything else
+        // the `WorkDb::open` migration touches will be created via
+        // the fresh-init path when it doesn't already exist.
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, name TEXT NOT NULL,
+                 slug TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                 goal TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 priority TEXT NOT NULL, created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human');
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 last_status_actor TEXT NOT NULL DEFAULT 'human',
+                 priority TEXT NOT NULL DEFAULT 'medium');
+             CREATE TABLE work_executions (
+                 id TEXT PRIMARY KEY,
+                 work_item_id TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 repo_remote_url TEXT NOT NULL,
+                 cube_repo_id TEXT,
+                 cube_lease_id TEXT,
+                 cube_workspace_id TEXT,
+                 workspace_path TEXT,
+                 priority INTEGER NOT NULL DEFAULT 0,
+                 preferred_workspace_id TEXT,
+                 created_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT);
+             CREATE TABLE work_attention_items (
+                 id TEXT PRIMARY KEY,
+                 execution_id TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 body_markdown TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 resolved_at TEXT);
+             INSERT INTO products(id, name, slug, status, created_at, updated_at)
+                 VALUES ('prod_legacy', 'L', 'l', 'active', '1700000000', '1700000000');
+             INSERT INTO tasks(id, product_id, project_id, kind, name, status,
+                               created_at, updated_at)
+                 VALUES ('task_legacy', 'prod_legacy', NULL, 'chore', 'old',
+                         'todo', '1700000000', '1700000000');
+             INSERT INTO work_executions(id, work_item_id, kind, status, repo_remote_url,
+                                          created_at)
+                 VALUES ('exec_legacy', 'task_legacy', 'chore_implementation', 'ready',
+                         'git@github.com:legacy/repo.git', '1700000000');
+             INSERT INTO work_attention_items(id, execution_id, kind, status, title,
+                                              body_markdown, created_at)
+                 VALUES ('attn_legacy', 'exec_legacy', 'review_required', 'open',
+                         'Legacy item', 'Body.', '1700000000');
+             INSERT INTO metadata(key, value) VALUES ('schema_version','6');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "work_attention_items", "work_item_id").unwrap());
+        let (exec_id, work_item_id): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT execution_id, work_item_id FROM work_attention_items WHERE id = 'attn_legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(exec_id.as_deref(), Some("exec_legacy"));
+        assert_eq!(work_item_id, None);
+
+        // The new code path accepts a work-item-scoped insert,
+        // proving the CHECK constraint is the relaxed v7 shape.
+        let new_attn = db
+            .create_attention_item(CreateAttentionItemInput {
+                execution_id: None,
+                work_item_id: Some("task_legacy".to_owned()),
+                kind: "repo_unresolved".to_owned(),
+                status: None,
+                title: "T".to_owned(),
+                body_markdown: "B".to_owned(),
+                resolved_at: None,
+            })
+            .unwrap();
+        assert_eq!(new_attn.execution_id, None);
+        assert_eq!(new_attn.work_item_id.as_deref(), Some("task_legacy"));
 
         let _ = std::fs::remove_file(path);
     }

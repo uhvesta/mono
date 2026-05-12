@@ -1211,7 +1211,8 @@ impl ExecutionCoordinator {
             err = format!("{error:#}"),
         );
         if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
-            execution_id: execution.id.clone(),
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
             kind: attention_kind.to_owned(),
             status: None,
             title: attention_title.to_owned(),
@@ -1359,7 +1360,8 @@ impl ExecutionCoordinator {
                 // `ListAttentionItems`. The structured event below
                 // gives tooling a parallel signal.
                 let attention = Some(CreateAttentionItemInput {
-                    execution_id: execution.id.clone(),
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
                     kind: "pane_spawn_failed".to_owned(),
                     status: None,
                     title: "Worker pane failed to spawn".to_owned(),
@@ -1516,7 +1518,8 @@ impl ExecutionCoordinator {
         };
 
         let attention = outcome.attention.map(|attention| CreateAttentionItemInput {
-            execution_id: execution.id.clone(),
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
             kind: attention.kind,
             status: None,
             title: attention.title,

@@ -192,7 +192,18 @@ pub struct WorkRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkAttentionItem {
     pub id: String,
-    pub execution_id: String,
+    /// The execution this item attaches to, when the failure has a
+    /// concrete execution row (e.g. a worker run failed mid-flight).
+    /// `None` when the item attaches to a work item directly because
+    /// no execution row exists yet — the `repo_unresolved` flow per
+    /// `multi-repo-work-modeling.md` Q5 is the load-bearing case.
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    /// The work item this item attaches to when there is no execution
+    /// row (sticky, pre-dispatch failures). Mutually exclusive with
+    /// `execution_id` — exactly one of the two is `Some`.
+    #[serde(default)]
+    pub work_item_id: Option<String>,
     pub kind: String,
     pub status: String,
     pub title: String,
@@ -457,7 +468,16 @@ pub struct CreateRunInput {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateAttentionItemInput {
-    pub execution_id: String,
+    /// The execution this item attaches to. `Some` for the common
+    /// execution-scoped case; `None` together with `work_item_id =
+    /// Some(...)` for sticky pre-dispatch items like `repo_unresolved`.
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    /// The work item this item attaches to when no execution row
+    /// exists. Mutually exclusive with `execution_id` — the engine
+    /// rejects inputs where both are set or both are missing.
+    #[serde(default)]
+    pub work_item_id: Option<String>,
     pub kind: String,
     pub status: Option<String>,
     pub title: String,
