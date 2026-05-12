@@ -28,6 +28,11 @@ struct ContentView: View {
             } detail: {
                 detail
             }
+            // Agents has no sidebar, so the NavigationSplitView-injected toggle
+            // would be an orphan. The removal modifier must sit directly on the
+            // NavigationSplitView that contributes the default item — applied
+            // at the outer ZStack level it does not reach the injected toggle.
+            .toolbar(removing: model.navigationMode == .agents ? .sidebarToggle : nil)
             .opacity(model.navigationMode == .work ? 1 : 0)
             .allowsHitTesting(model.navigationMode == .work)
 
@@ -67,9 +72,6 @@ struct ContentView: View {
         .task {
             model.startIfNeeded()
         }
-        // Agents has no sidebar, so the NavigationSplitView-injected toggle
-        // would be an orphan — suppress it when Agents is active.
-        .toolbar(removing: model.navigationMode == .agents ? .sidebarToggle : nil)
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Picker("Mode", selection: Binding(

@@ -216,6 +216,10 @@ struct DesignsView: View {
             detail
                 .background(Color(nsColor: .windowBackgroundColor))
         }
+        // Agents shares the window toolbar with Designs; suppress this
+        // NavigationSplitView's injected sidebar-toggle when Agents is the
+        // active mode so the orphan button doesn't appear in the toolbar.
+        .toolbar(removing: chat.navigationMode == .agents ? .sidebarToggle : nil)
         .task {
             model.refresh(products: chat.activeProducts)
         }
