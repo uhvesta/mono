@@ -1547,6 +1547,23 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Test-only helper: force `transcript_path` back to NULL on an
+    /// existing row. Used by the dispatcher regression test to model
+    /// the production race where a SessionStart's payload-driven
+    /// persist fired against a work_runs row that did not exist
+    /// yet, leaving the column NULL after the row was later
+    /// inserted. The cache fallback (this PR) is what allows a
+    /// subsequent hook to finally win.
+    #[cfg(test)]
+    pub fn clear_run_transcript_path_for_test(&self, run_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_runs SET transcript_path = NULL WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
     /// Stamp the actual pane-slot identity onto an existing run record.
     /// The coordinator inserts the run with the worker-pool placeholder
     /// (`worker-N` from capacity tracking), then calls this once the

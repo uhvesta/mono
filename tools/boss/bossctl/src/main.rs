@@ -1348,11 +1348,21 @@ fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
     println!("  engine_build_sha:           {}", report.engine_build_sha);
     println!("  engine_build_time:          {}", report.engine_build_time);
     println!(
+        "  engine_binary_fingerprint:  {}",
+        report.engine_binary_fingerprint,
+    );
+    println!(
+        "  engine_process_started_at:  {}",
+        report.engine_process_started_at,
+    );
+    println!(
         "  anthropic_api_key_present:  {}",
         if report.anthropic_api_key_present { "yes" } else { "NO (summarizer cannot succeed)" },
     );
     println!("  tracked_slots:              {}", report.tracked_slot_count);
     println!("  disabled_slots:             {}", report.disabled_slot_count);
+    println!();
+    print_dispatcher_stats(&report.dispatcher_stats);
     if report.slots.is_empty() {
         println!("  (no slots tracked)");
         return;
@@ -1360,6 +1370,49 @@ fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
     println!();
     for slot in &report.slots {
         print_live_status_slot_debug(slot);
+    }
+}
+
+fn print_dispatcher_stats(stats: &boss_protocol::DispatcherStatsReport) {
+    println!("dispatcher stats");
+    println!("  hook_events_total:                          {}", stats.hook_events_total);
+    println!(
+        "  hook_events_dropped_missing_run_id:         {}",
+        stats.hook_events_dropped_missing_run_id,
+    );
+    println!(
+        "  hook_events_with_transcript_path_in_payload:    {}",
+        stats.hook_events_with_transcript_path_in_payload,
+    );
+    println!(
+        "  hook_events_without_transcript_path_in_payload: {}",
+        stats.hook_events_without_transcript_path_in_payload,
+    );
+    println!(
+        "  transcript_path_persist_updated:             {}",
+        stats.transcript_path_persist_updated,
+    );
+    println!(
+        "  transcript_path_persist_noop:                {}",
+        stats.transcript_path_persist_noop,
+    );
+    println!(
+        "  transcript_path_persist_err:                 {}",
+        stats.transcript_path_persist_err,
+    );
+    println!(
+        "  transcript_path_persist_from_cache:          {}",
+        stats.transcript_path_persist_from_cache,
+    );
+    match (
+        stats.last_hook_kind.as_deref(),
+        stats.last_hook_run_id.as_deref(),
+        stats.last_hook_at.as_deref(),
+    ) {
+        (Some(kind), Some(run_id), Some(at)) => {
+            println!("  last_hook: {kind} for {run_id} @ {at}");
+        }
+        _ => println!("  last_hook: (no hook events dispatched yet)"),
     }
 }
 
@@ -1379,9 +1432,19 @@ fn print_live_status_slot_debug(slot: &LiveStatusSlotDebug) {
     );
     match (&slot.last_trigger_kind, &slot.last_trigger_at) {
         (Some(kind), Some(at)) => {
-            println!("  last_trigger:        {kind} @ {at}");
+            println!("  last_trigger:        {kind} @ {at} (any source)");
         }
         _ => println!("  last_trigger:        (none yet)"),
+    }
+    match (&slot.last_real_trigger_kind, &slot.last_real_trigger_at) {
+        (Some(kind), Some(at)) => {
+            println!("  last_real_trigger:   {kind} @ {at} (from real hook fan-out)");
+        }
+        _ => println!("  last_real_trigger:   (none yet — no hook ever reached the slot loop)"),
+    }
+    match &slot.last_synthetic_trigger_at {
+        Some(at) => println!("  last_synthetic:      timer-floor fired @ {at}"),
+        None => println!("  last_synthetic:      (timer floor has not fired)"),
     }
     match (&slot.last_outcome_tag, &slot.last_outcome_at) {
         (Some(tag), Some(at)) => {

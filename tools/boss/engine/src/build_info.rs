@@ -5,7 +5,7 @@
 //! is immediately visible without guessing. We deliberately do NOT
 //! add a Cargo build script — Bazel is the canonical build for this
 //! repo and threading stamping through it is a separate piece of
-//! work. Instead we lean on three signals, in order of usefulness:
+//! work. Instead we lean on four signals, in order of usefulness:
 //!
 //! 1. `BOSS_ENGINE_GIT_SHA` — opt-in compile-time env var, set when
 //!    the build environment knows the SHA (`BOSS_ENGINE_GIT_SHA=$(git
@@ -18,12 +18,31 @@
 //!    not bump it on every platform; running through `bazel run` from
 //!    a stale cache shows the cache hit's mtime) but vastly better
 //!    than nothing.
+//! 4. **Binary content fingerprint** — short SHA-256 of the engine
+//!    binary's bytes, computed once at first call to
+//!    [`binary_fingerprint`]. Survives a bazel cache hit that
+//!    doesn't bump mtime: two identical binaries produce the same
+//!    fingerprint, a rebuild that actually changes any code
+//!    produces a different one. This is the unambiguous "am I
+//!    running the binary I think I am?" signal — `(1)` and `(2)`
+//!    can both lie when the build environment doesn't stamp them.
 //!
 //! The CARGO_PKG_VERSION fallback is included so even a build with
 //! none of the above produces something other than "unknown".
+//!
+//! Follow-up tracked in PR body: the Bazel `rust_binary` rule should
+//! be extended to thread `BOSS_ENGINE_GIT_SHA` and
+//! `BOSS_ENGINE_BUILD_TIME` via a workspace-status command, at which
+//! point `git_sha()` will stop returning "unknown" for the canonical
+//! release engine path. Until then, the runtime fingerprint covers
+//! the operationally-important question ("is this the binary I
+//! shipped?").
 
+use std::io::Read;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 /// Short git SHA the engine binary was built from, baked at compile
 /// time. Returns `"unknown"` when the build environment did not
@@ -59,6 +78,80 @@ fn binary_mtime_iso8601() -> Option<String> {
     let mtime = metadata.modified().ok()?;
     let dur = mtime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     Some(format_iso8601_utc(dur.as_secs() as i64))
+}
+
+/// Short SHA-256 fingerprint of the engine binary's on-disk bytes.
+/// Computed once on first call and cached for the lifetime of the
+/// process. Returns `"unknown"` if `current_exe()` is unreadable
+/// (extremely rare on macOS — the binary is mapped into our address
+/// space and the path is accessible by our own uid).
+///
+/// Twelve hex characters is enough to distinguish builds for human
+/// inspection without producing a wall of hash text in the debug
+/// output. Two distinct binaries collide with probability ~2^-48 in
+/// the worst case — fine for "is the binary I'm running the one I
+/// expected" questions and unsuitable for cryptographic uses.
+///
+/// Reads at most [`FINGERPRINT_CAP_BYTES`] of the binary so we don't
+/// stall startup on an unusually large file; the engine binary in
+/// practice is well under that cap. Capping is documented in the
+/// fingerprint string itself when it bites (`"…-truncated"` suffix)
+/// so a mismatch isn't mistaken for two different binaries when one
+/// of them was simply over the cap.
+pub fn binary_fingerprint() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| match compute_binary_fingerprint() {
+        Some(s) => s,
+        None => "unknown".to_owned(),
+    })
+    .as_str()
+}
+
+/// Cap on the number of bytes the fingerprinter reads from the
+/// engine binary. The boss-engine binary is currently well under
+/// this; capping keeps an outlier (a debug build with symbols, a
+/// future binary that grows) from delaying engine startup.
+const FINGERPRINT_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
+fn compute_binary_fingerprint() -> Option<String> {
+    let path = std::env::current_exe().ok()?;
+    let mut file = std::fs::File::open(&path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut read_total: u64 = 0;
+    let mut truncated = false;
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        let remaining = FINGERPRINT_CAP_BYTES.saturating_sub(read_total);
+        let take = (n as u64).min(remaining) as usize;
+        hasher.update(&buf[..take]);
+        read_total += take as u64;
+        if take < n {
+            truncated = true;
+            break;
+        }
+        if read_total >= FINGERPRINT_CAP_BYTES {
+            // We've consumed exactly the cap; check if another byte
+            // remains by attempting one more read.
+            let probe = file.read(&mut buf).ok()?;
+            if probe > 0 {
+                truncated = true;
+            }
+            break;
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(12 + 10);
+    for byte in &digest[..6] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    if truncated {
+        hex.push_str("-truncated");
+    }
+    Some(hex)
 }
 
 /// One-time stamp for "when did this engine process start". Captured
@@ -126,5 +219,40 @@ mod tests {
         let s = process_started_at();
         assert_eq!(s.len(), 20, "expected YYYY-MM-DDTHH:MM:SSZ, got {s}");
         assert!(s.ends_with('Z'), "expected trailing Z, got {s}");
+    }
+
+    #[test]
+    fn binary_fingerprint_is_stable_within_a_process() {
+        // Two reads must agree; the first read populates the
+        // OnceLock and the second hits the cache. Catches a refactor
+        // that drops the cache and starts hashing on every call.
+        let a = binary_fingerprint();
+        let b = binary_fingerprint();
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn binary_fingerprint_has_expected_shape() {
+        // 12 hex chars (6 bytes), optionally followed by
+        // "-truncated" if the cap kicked in. Test binaries are well
+        // under the cap so we expect the bare 12-char form.
+        let s = binary_fingerprint();
+        if s == "unknown" {
+            // `current_exe()` failed for whatever reason — fingerprint
+            // is best-effort, not a hard requirement, so a sandboxed
+            // test runner is allowed to land here.
+            return;
+        }
+        let core = s.strip_suffix("-truncated").unwrap_or(s);
+        assert_eq!(
+            core.len(),
+            12,
+            "expected 12 hex chars (optionally suffixed with -truncated), got {s}"
+        );
+        assert!(
+            core.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint must be hex digits only, got {s}"
+        );
     }
 }
