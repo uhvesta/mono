@@ -568,7 +568,8 @@ impl WorkDb {
     pub fn set_project_design_doc(&self, input: SetProjectDesignDocInput) -> Result<Project> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        ensure_project_exists(&tx, &input.project_id)?;
+        let before = query_project(&tx, &input.project_id)?
+            .with_context(|| format!("unknown project: {}", input.project_id))?;
         let now = now_string();
 
         if input.unset {
@@ -581,42 +582,39 @@ impl WorkDb {
                  WHERE id = ?1",
                 params![input.project_id, now],
             )?;
-            let updated = query_project(&tx, &input.project_id)?
-                .with_context(|| format!("unknown project: {}", input.project_id))?;
-            tx.commit()?;
-            return Ok(updated);
-        }
+        } else {
+            let repo = canonicalize_design_doc_repo_remote_url(input.design_doc_repo_remote_url);
+            let branch = normalize_optional_text(input.design_doc_branch);
 
-        let repo = canonicalize_design_doc_repo_remote_url(input.design_doc_repo_remote_url);
-        let branch = normalize_optional_text(input.design_doc_branch);
-
-        match input.design_doc_path {
-            Some(raw_path) => {
-                let path = validate_design_doc_path(&raw_path)?;
-                tx.execute(
-                    "UPDATE projects
-                     SET design_doc_repo_remote_url = ?2,
-                         design_doc_branch = ?3,
-                         design_doc_path = ?4,
-                         updated_at = ?5
-                     WHERE id = ?1",
-                    params![input.project_id, repo, branch, path, now],
-                )?;
-            }
-            None => {
-                tx.execute(
-                    "UPDATE projects
-                     SET design_doc_repo_remote_url = ?2,
-                         design_doc_branch = ?3,
-                         updated_at = ?4
-                     WHERE id = ?1",
-                    params![input.project_id, repo, branch, now],
-                )?;
+            match input.design_doc_path {
+                Some(raw_path) => {
+                    let path = validate_design_doc_path(&raw_path)?;
+                    tx.execute(
+                        "UPDATE projects
+                         SET design_doc_repo_remote_url = ?2,
+                             design_doc_branch = ?3,
+                             design_doc_path = ?4,
+                             updated_at = ?5
+                         WHERE id = ?1",
+                        params![input.project_id, repo, branch, path, now],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE projects
+                         SET design_doc_repo_remote_url = ?2,
+                             design_doc_branch = ?3,
+                             updated_at = ?4
+                         WHERE id = ?1",
+                        params![input.project_id, repo, branch, now],
+                    )?;
+                }
             }
         }
 
         let updated = query_project(&tx, &input.project_id)?
             .with_context(|| format!("unknown project: {}", input.project_id))?;
+        record_design_doc_audit(&tx, &input.project_id, &before, &updated, AUDIT_ACTOR_HUMAN, &now)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -747,9 +745,9 @@ impl WorkDb {
 
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let project = query_project(&tx, project_id)?
+        let before = query_project(&tx, project_id)?
             .with_context(|| format!("unknown project: {project_id}"))?;
-        if project.design_doc_path.is_some() {
+        if before.design_doc_path.is_some() {
             return Ok(false);
         }
         let now = now_string();
@@ -762,8 +760,52 @@ impl WorkDb {
              WHERE id = ?1",
             params![project_id, repo, branch, validated_path, now],
         )?;
+        let after = query_project(&tx, project_id)?
+            .with_context(|| format!("unknown project: {project_id}"))?;
+        record_design_doc_audit(
+            &tx,
+            project_id,
+            &before,
+            &after,
+            AUDIT_ACTOR_DESIGN_DETECTOR,
+            &now,
+        )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Read the append-only audit trail of property edits on
+    /// `project_id`. Returns rows in chronological order (oldest
+    /// first), with a stable secondary sort on row id so two writes
+    /// landing in the same `changed_at` second still serialise.
+    ///
+    /// v1 records design-doc pointer columns
+    /// (`design_doc_repo_remote_url`, `design_doc_branch`,
+    /// `design_doc_path`); the schema is general so future edits to
+    /// other project properties can ride along without a re-migration.
+    pub fn list_project_property_audit(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectPropertyAuditEntry>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, property, old_value, new_value, actor, changed_at
+             FROM project_property_audit
+             WHERE project_id = ?1
+             ORDER BY changed_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(ProjectPropertyAuditEntry {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                property: row.get(2)?,
+                old_value: row.get(3)?,
+                new_value: row.get(4)?,
+                actor: row.get(5)?,
+                changed_at: row.get(6)?,
+            })
+        })?;
+        collect_rows(rows)
     }
 
     /// Surface a `WorkAttentionItem` when an `ApproveDesign` event
@@ -2152,6 +2194,19 @@ impl WorkDb {
 
             CREATE INDEX IF NOT EXISTS work_item_dependencies_dependent_idx
                 ON work_item_dependencies(dependent_id, relation);
+
+            CREATE TABLE IF NOT EXISTS project_property_audit (
+                id          TEXT PRIMARY KEY,
+                project_id  TEXT NOT NULL,
+                property    TEXT NOT NULL,
+                old_value   TEXT,
+                new_value   TEXT,
+                actor       TEXT NOT NULL,
+                changed_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS project_property_audit_project_idx
+                ON project_property_audit(project_id, changed_at);
             ",
         )?;
         migrate_work_executions_v3(&conn)?;
@@ -2162,6 +2217,7 @@ impl WorkDb {
         migrate_tasks_created_via(&conn)?;
         migrate_backfill_project_design_tasks(&conn)?;
         migrate_tasks_repo_remote_url(&conn)?;
+        migrate_project_property_audit_table(&conn)?;
         // Index creation must follow migration: pre-v3 databases don't
         // have `priority` until `migrate_work_executions_v3` adds it,
         // and SQLite's `CREATE INDEX IF NOT EXISTS` errors on missing
@@ -3282,6 +3338,34 @@ fn migrate_project_design_doc_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Create the `project_property_audit` side table for the
+/// design-doc-pointer audit log (chore #15 of the
+/// `project-design-doc-pointer` design). Append-only history of
+/// `projects.design_doc_*` writes, with one row per (column, write)
+/// pair where the value actually changed.
+///
+/// `project_id` is intentionally *not* a foreign key — projects can
+/// be soft-deleted out from under their history, but the forensic
+/// goal of the table is to survive that. The index keyed on
+/// `(project_id, changed_at)` covers the only read pattern v1 ships
+/// (list-by-project, chronological).
+fn migrate_project_property_audit_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_property_audit (
+             id          TEXT PRIMARY KEY,
+             project_id  TEXT NOT NULL,
+             property    TEXT NOT NULL,
+             old_value   TEXT,
+             new_value   TEXT,
+             actor       TEXT NOT NULL,
+             changed_at  TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS project_property_audit_project_idx
+             ON project_property_audit(project_id, changed_at);",
+    )?;
+    Ok(())
+}
+
 /// Backfill a `kind = 'design'` task for every project that doesn't
 /// have one yet. Brings databases that predate
 /// design-as-task up to the new shape so the kanban renders them
@@ -3900,6 +3984,80 @@ fn default_slug(base_slug: &str) -> String {
     } else {
         base_slug.to_owned()
     }
+}
+
+/// Actor literal recorded against `project_property_audit` rows
+/// produced by CLI / app callers (`SetProjectDesignDoc` RPC). Boss
+/// is single-user today (per design Q10), so this is currently the
+/// only "human" actor; the field exists so a future multi-user
+/// layer can swap in caller identity without a schema change.
+pub const AUDIT_ACTOR_HUMAN: &str = "human";
+
+/// Actor literal recorded when the engine's design-doc detector
+/// auto-populates an empty project pointer (sync rule 1 of design
+/// Q6, via `sync_project_design_doc_from_detector`).
+pub const AUDIT_ACTOR_DESIGN_DETECTOR: &str = "engine_design_detector";
+
+/// A single append-only row in the `project_property_audit` table.
+/// Records that `actor` changed `property` on `project_id` from
+/// `old_value` to `new_value` at `changed_at` (epoch seconds, the
+/// same format as `projects.updated_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPropertyAuditEntry {
+    pub id: String,
+    pub project_id: String,
+    pub property: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub actor: String,
+    pub changed_at: String,
+}
+
+/// Emit one `project_property_audit` row for each of the three
+/// `design_doc_*` columns whose value actually changed between
+/// `before` and `after`. No-op when nothing changed (e.g. an
+/// `unset = true` call on a project that was already unset, or a
+/// branch-only edit that matched the existing branch). Runs inside
+/// the caller's transaction so the audit row commits with the
+/// underlying write.
+fn record_design_doc_audit(
+    conn: &Connection,
+    project_id: &str,
+    before: &Project,
+    after: &Project,
+    actor: &str,
+    now: &str,
+) -> Result<()> {
+    let columns: [(&str, &Option<String>, &Option<String>); 3] = [
+        (
+            "design_doc_repo_remote_url",
+            &before.design_doc_repo_remote_url,
+            &after.design_doc_repo_remote_url,
+        ),
+        (
+            "design_doc_branch",
+            &before.design_doc_branch,
+            &after.design_doc_branch,
+        ),
+        (
+            "design_doc_path",
+            &before.design_doc_path,
+            &after.design_doc_path,
+        ),
+    ];
+    for (property, old, new) in columns {
+        if old == new {
+            continue;
+        }
+        let id = next_id("paud");
+        conn.execute(
+            "INSERT INTO project_property_audit
+                (id, project_id, property, old_value, new_value, actor, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, project_id, property, old, new, actor, now],
+        )?;
+    }
+    Ok(())
 }
 
 fn next_id(prefix: &str) -> String {
@@ -9476,6 +9634,163 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("repo-relative"), "got: {err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_records_first_set_as_old_null_new_value() {
+        let path = temp_db_path("audit-first-set");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(set_design_doc_input(
+            &project.id,
+            "tools/boss/docs/designs/foo.md",
+        ))
+        .unwrap();
+
+        let audit = db.list_project_property_audit(&project.id).unwrap();
+        assert_eq!(
+            audit.len(),
+            1,
+            "path-only edit on a fresh project should produce exactly one row, got {audit:#?}",
+        );
+        assert_eq!(audit[0].property, "design_doc_path");
+        assert!(audit[0].old_value.is_none());
+        assert_eq!(
+            audit[0].new_value.as_deref(),
+            Some("tools/boss/docs/designs/foo.md"),
+        );
+        assert_eq!(audit[0].actor, AUDIT_ACTOR_HUMAN);
+        assert_eq!(audit[0].project_id, project.id);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_records_one_row_per_changed_column() {
+        let path = temp_db_path("audit-three-cols");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
+            design_doc_branch: Some("docs".to_owned()),
+            design_doc_path: Some("designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+
+        let audit = db.list_project_property_audit(&project.id).unwrap();
+        let properties: HashSet<&str> = audit.iter().map(|e| e.property.as_str()).collect();
+        assert_eq!(properties.len(), 3, "got: {audit:#?}");
+        assert!(properties.contains("design_doc_repo_remote_url"));
+        assert!(properties.contains("design_doc_branch"));
+        assert!(properties.contains("design_doc_path"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_no_op_writes_emit_no_extra_rows() {
+        let path = temp_db_path("audit-noop");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let input = SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
+            design_doc_branch: Some("docs".to_owned()),
+            design_doc_path: Some("designs/foo.md".to_owned()),
+            unset: false,
+        };
+        db.set_project_design_doc(input.clone()).unwrap();
+        let after_first = db.list_project_property_audit(&project.id).unwrap().len();
+        db.set_project_design_doc(input).unwrap();
+        let after_second = db.list_project_property_audit(&project.id).unwrap().len();
+        assert_eq!(
+            after_first, after_second,
+            "second identical write should not emit any audit rows",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_records_unset_as_old_value_new_null() {
+        let path = temp_db_path("audit-unset");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
+            design_doc_branch: Some("docs".to_owned()),
+            design_doc_path: Some("designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: None,
+            unset: true,
+        })
+        .unwrap();
+
+        let audit = db.list_project_property_audit(&project.id).unwrap();
+        assert_eq!(
+            audit.len(),
+            6,
+            "3 set + 3 unset = 6 rows, got: {audit:#?}",
+        );
+        for entry in &audit[3..] {
+            assert!(
+                entry.old_value.is_some(),
+                "unset row should retain the prior value as old_value",
+            );
+            assert!(
+                entry.new_value.is_none(),
+                "unset row should record new_value as NULL",
+            );
+            assert_eq!(entry.actor, AUDIT_ACTOR_HUMAN);
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_records_detector_actor_on_sync() {
+        let path = temp_db_path("audit-detector-actor");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let wrote = db
+            .sync_project_design_doc_from_detector(
+                &project.id,
+                Some("git@github.com:spinyfin/mono.git"),
+                Some("main"),
+                "tools/boss/docs/designs/foo.md",
+            )
+            .unwrap();
+        assert!(wrote);
+
+        let audit = db.list_project_property_audit(&project.id).unwrap();
+        assert!(
+            !audit.is_empty(),
+            "detector sync should emit at least one audit row",
+        );
+        for entry in &audit {
+            assert_eq!(
+                entry.actor, AUDIT_ACTOR_DESIGN_DETECTOR,
+                "detector-sync rows must carry the engine actor: {entry:#?}",
+            );
+        }
+        let property_set: HashSet<&str> = audit.iter().map(|e| e.property.as_str()).collect();
+        assert!(property_set.contains("design_doc_path"));
 
         let _ = std::fs::remove_file(path);
     }
