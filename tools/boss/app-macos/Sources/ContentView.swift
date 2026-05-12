@@ -582,6 +582,7 @@ struct ContentView: View {
                 }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.bottom, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
