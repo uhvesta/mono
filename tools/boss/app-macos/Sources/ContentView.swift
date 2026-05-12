@@ -323,7 +323,7 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.top, 8)
         }
     }
 
@@ -587,7 +587,6 @@ struct ContentView: View {
                 }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.bottom, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
