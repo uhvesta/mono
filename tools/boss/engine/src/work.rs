@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -52,21 +53,70 @@ pub use boss_protocol::{
 use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MEM_DB_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone)]
+/// Keeps a named shared-cache in-memory SQLite database alive. `Connection`
+/// is `Send` but not `Sync`; wrapping in `Mutex` makes the anchor `Sync`.
+/// `Arc` lets `WorkDb::clone` share the anchor across copies of the same
+/// in-memory database (needed by the concurrent-insert test).
+#[derive(Clone)]
+struct InMemoryAnchor {
+    uri: String,
+    _conn: Arc<Mutex<Connection>>,
+}
+
 pub struct WorkDb {
     path: PathBuf,
+    /// Present only when the database is in-memory (path == ":memory:").
+    memory: Option<InMemoryAnchor>,
+}
+
+impl Clone for WorkDb {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            memory: self.memory.clone(),
+        }
+    }
 }
 
 impl WorkDb {
     pub fn open(path: PathBuf) -> Result<Self> {
+        if path == Path::new(":memory:") {
+            return Self::open_in_memory();
+        }
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create work db directory {}", parent.display())
             })?;
         }
 
-        let db = Self { path };
+        let db = Self { path, memory: None };
+        db.init()?;
+        Ok(db)
+    }
+
+    /// Create a per-call named shared-cache in-memory database. Each call
+    /// gets a unique name so parallel tests never share state. The anchor
+    /// connection keeps the database alive until the `WorkDb` is dropped.
+    fn open_in_memory() -> Result<Self> {
+        let id = NEXT_MEM_DB_ID.fetch_add(1, Ordering::Relaxed);
+        let uri = format!("file:boss_mem_{id}?mode=memory&cache=shared");
+        let anchor = Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("failed to open in-memory db {uri}"))?;
+        let db = Self {
+            path: PathBuf::from(":memory:"),
+            memory: Some(InMemoryAnchor {
+                uri,
+                _conn: Arc::new(Mutex::new(anchor)),
+            }),
+        };
         db.init()?;
         Ok(db)
     }
@@ -2633,8 +2683,19 @@ impl WorkDb {
     }
 
     fn connect(&self) -> Result<Connection> {
-        let mut conn = Connection::open(&self.path)
-            .with_context(|| format!("failed to open work db {}", self.path.display()))?;
+        let mut conn = if let Some(mem) = &self.memory {
+            // For in-memory databases, connect via the named shared-cache URI
+            // so every connect() call shares the same database instance.
+            Connection::open_with_flags(
+                &mem.uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .with_context(|| format!("failed to connect to in-memory db {}", mem.uri))?
+        } else {
+            Connection::open(&self.path)
+                .with_context(|| format!("failed to open work db {}", self.path.display()))?
+        };
         // WAL lets readers and writers coexist (read-side concurrency
         // is unaffected by an in-flight write) and `busy_timeout`
         // turns lock contention into latency rather than an error
@@ -7228,7 +7289,20 @@ fn lookup_last_status_actor(conn: &Connection, work_item_id: &str) -> Result<Opt
 mod tests {
     use super::*;
 
-    fn temp_db_path(label: &str) -> PathBuf {
+    /// Returns the `:memory:` sentinel so `WorkDb::open` allocates a
+    /// per-test named shared-cache in-memory database. Each call to
+    /// `WorkDb::open(PathBuf::from(":memory:"))` gets a unique database;
+    /// the `label` parameter is kept for call-site readability only.
+    fn temp_db_path(_label: &str) -> PathBuf {
+        PathBuf::from(":memory:")
+    }
+
+    /// Returns a real on-disk temp path. Use this only for tests that
+    /// open a raw `rusqlite::Connection` alongside the `WorkDb` (e.g.
+    /// schema-migration tests that pre-populate a legacy schema and then
+    /// re-open via `WorkDb::open`). All other tests should use
+    /// `temp_db_path` so the database stays in RAM.
+    fn disk_db_path(label: &str) -> PathBuf {
         let file = format!("boss-{label}-{}.sqlite3", next_id("test"));
         std::env::temp_dir().join(file)
     }
@@ -7721,7 +7795,7 @@ mod tests {
     /// index without erroring.
     #[test]
     fn opens_pre_v3_database_without_priority_column() {
-        let path = temp_db_path("pre-v3");
+        let path = disk_db_path("pre-v3");
         // Build a minimal pre-v3 schema: just the table the migration
         // touches, missing the three v3 columns.
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -10216,7 +10290,7 @@ mod tests {
     /// card sits at the head of each project's chain on next open.
     #[test]
     fn migration_backfills_design_tasks_for_existing_projects() {
-        let path = temp_db_path("migration-design-backfill");
+        let path = disk_db_path("migration-design-backfill");
         // First open establishes the schema. We then forcibly delete
         // the auto-created design task to mirror a database created
         // before this column existed.
@@ -10324,7 +10398,7 @@ mod tests {
     /// drags wait their turn.
     #[test]
     fn rescan_orders_candidates_by_updated_at_ascending() {
-        let path = temp_db_path("rescan-fifo");
+        let path = disk_db_path("rescan-fifo");
         let db = WorkDb::open(path.clone()).unwrap();
         let product = db
             .create_product(CreateProductInput {
@@ -10386,7 +10460,7 @@ mod tests {
     /// for every later candidate too.
     #[test]
     fn rescan_skips_gated_active_chore_silently() {
-        let path = temp_db_path("rescan-gated");
+        let path = disk_db_path("rescan-gated");
         let db = WorkDb::open(path.clone()).unwrap();
         let product = db
             .create_product(CreateProductInput {
@@ -11829,7 +11903,7 @@ mod tests {
     /// the engine writes the latest `schema_version`.
     #[test]
     fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
-        let path = temp_db_path("deps-migrate");
+        let path = disk_db_path("deps-migrate");
         // Stand up a minimal v3 schema: just `tasks`, `projects`,
         // `metadata`, no dep table, no last_status_actor.
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -11888,7 +11962,7 @@ mod tests {
     /// `None` on each pointer field.
     #[test]
     fn migration_adds_project_design_doc_columns() {
-        let path = temp_db_path("design-doc-migrate");
+        let path = disk_db_path("design-doc-migrate");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -12008,7 +12082,7 @@ mod tests {
     /// writes that follow continue to set their own value.
     #[test]
     fn migration_adds_created_via_with_unknown_default() {
-        let path = temp_db_path("created-via-migrate");
+        let path = disk_db_path("created-via-migrate");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -12115,7 +12189,7 @@ mod tests {
     /// value.
     #[test]
     fn migration_from_v4_adds_tasks_repo_remote_url() {
-        let path = temp_db_path("tasks-repo-migrate");
+        let path = disk_db_path("tasks-repo-migrate");
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Stand up a minimal v4 schema: just enough to round-trip a
         // single task row that pre-dates the new column.
@@ -12203,7 +12277,7 @@ mod tests {
     /// CHECK constraint accepts work-item-scoped writes afterwards.
     #[test]
     fn migration_v6_to_v7_relaxes_work_attention_items() {
-        let path = temp_db_path("attn-v7-migrate");
+        let path = disk_db_path("attn-v7-migrate");
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Stand up just enough of the v6 schema to land an existing
         // attention item against an execution row. Everything else
@@ -12479,7 +12553,7 @@ mod tests {
     /// Idempotent across re-opens.
     #[test]
     fn migration_renames_auto_rebase_enabled_when_present() {
-        let path = temp_db_path("mc-rename-auto-rebase");
+        let path = disk_db_path("mc-rename-auto-rebase");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -12547,7 +12621,7 @@ mod tests {
     /// `done` (legacy human-set block).
     #[test]
     fn migration_backfills_blocked_reason_for_active_prereqs() {
-        let path = temp_db_path("mc-blocked-backfill");
+        let path = disk_db_path("mc-blocked-backfill");
         // Stand up the pre-Phase-1 schema by hand: needs `tasks`,
         // `projects`, `products`, `work_item_dependencies`, plus
         // `last_status_actor`. We pre-seed two blocked dependents,
@@ -12809,7 +12883,7 @@ mod tests {
     /// `task_blocked_signals` side table. Idempotent across re-opens.
     #[test]
     fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
-        let path = temp_db_path("ci-p7-migrate");
+        let path = disk_db_path("ci-p7-migrate");
         // Stand up a "MC P1-only" schema: tasks have blocked_reason
         // + blocked_attempt_id (the Phase-1 additions), there's a
         // conflict_resolutions table, but none of the Phase-7
@@ -13015,7 +13089,7 @@ mod tests {
     /// distinct, because `attempt_kind` is part of the key.
     #[test]
     fn ci_remediations_unique_key_enforced() {
-        let path = temp_db_path("ci-rem-unique");
+        let path = disk_db_path("ci-rem-unique");
         let _db = WorkDb::open(path.clone()).unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
         let insert = |id: &str, head: &str, kind: &str| -> rusqlite::Result<usize> {
@@ -13058,7 +13132,7 @@ mod tests {
     /// the side table exists to model).
     #[test]
     fn task_blocked_signals_pk_enforced() {
-        let path = temp_db_path("tbs-pk");
+        let path = disk_db_path("tbs-pk");
         let _db = WorkDb::open(path.clone()).unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
@@ -14049,7 +14123,9 @@ mod tests {
         label: &str,
         product_repo: Option<&str>,
     ) -> (PathBuf, WorkDb, String, String) {
-        let path = temp_db_path(label);
+        // disk_db_path so that resolve_repo_errors_when_parent_product_is_missing
+        // can open a second raw connection to the same database file.
+        let path = disk_db_path(label);
         let db = WorkDb::open(path.clone()).unwrap();
         let product = db
             .create_product(CreateProductInput {

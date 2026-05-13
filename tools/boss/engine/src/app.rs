@@ -554,17 +554,16 @@ impl ServerState {
         // dispatch-event JSONL stream lands next to state.db /
         // events.sock under the same root. Falls back to the user's
         // `~/Library/Application Support/Boss/` if the db path has no
-        // parent (only possible in degenerate test configs).
+        // parent (only possible in degenerate test configs). When the db
+        // path is `:memory:`, its parent is an empty string; fall back to
+        // `cwd` so dispatch events land next to the other test artifacts.
         let dispatch_event_root: PathBuf = cfg
             .work
             .db_path
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join("Library/Application Support/Boss"))
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
+            .unwrap_or_else(|| cfg.work.cwd.clone());
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> = Arc::new(
             crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()),
         );
