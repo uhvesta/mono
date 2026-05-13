@@ -71,6 +71,21 @@ rust_binary(
 )
 
 rust_test(
+    name = "engine_lib_test",
+    crate = ":engine_lib",
+    edition = "2024",
+    size = "small",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+rust_test(
     name = "work_crud_test",
     srcs = ["tests/work_crud.rs"],
     edition = "2024",
