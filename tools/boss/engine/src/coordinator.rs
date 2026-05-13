@@ -13,6 +13,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
+use crate::conflict_diagnosis;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
@@ -725,6 +726,14 @@ pub trait ExecutionPublisher: Send + Sync {
         product_id: &str,
         event: FrontendEvent,
     );
+
+    /// Nudge the execution scheduler to drain its ready queue. Called
+    /// by the merge-poller's conflict-detection path after inserting a
+    /// `conflict_resolution` execution so the worker is dispatched
+    /// promptly rather than waiting for the next opportunistic kick.
+    /// Default is a no-op — only the production `BrokerExecutionPublisher`
+    /// overrides this.
+    fn kick_scheduler(&self) {}
 }
 
 #[derive(Default)]
@@ -1752,6 +1761,13 @@ impl ExecutionCoordinator {
             worker_id.clone(),
         );
 
+        // Pre-spawn: collect conflict-file diagnosis for conflict_resolution
+        // executions so the worker prompt can embed it without running git itself.
+        if execution.kind == "conflict_resolution" {
+            self.collect_conflict_diagnosis_pre_spawn(&execution, &lease)
+                .await;
+        }
+
         let run_outcome = self
             .execution_runner
             .run_execution(
@@ -1976,6 +1992,99 @@ impl ExecutionCoordinator {
         if !defer_pool_slot_release {
             self.release_worker_and_kick(&worker_id, Some(lease.workspace_id.as_str()))
                 .await;
+        }
+    }
+
+    /// Run `conflict_diagnosis::collect` in the leased workspace and persist
+    /// the result on the matching `conflict_resolutions` row before the worker
+    /// spawns. Failures are logged but never propagate — if the diagnosis
+    /// can't be collected we still spawn the worker, which starts from a fresh
+    /// `jj rebase -d main` without the pre-collected hint.
+    async fn collect_conflict_diagnosis_pre_spawn(
+        &self,
+        execution: &WorkExecution,
+        lease: &CubeWorkspaceLease,
+    ) {
+        let attempt = match self
+            .work_db
+            .active_conflict_resolution_for_work_item(&execution.work_item_id)
+        {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    "collect_conflict_diagnosis: no active attempt row; skipping pre-spawn diagnosis",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "collect_conflict_diagnosis: failed to look up attempt row; skipping",
+                );
+                return;
+            }
+        };
+
+        let base_sha = attempt.base_sha_at_trigger.as_deref().unwrap_or("");
+        let head_sha = attempt.head_sha_before.as_deref().unwrap_or("");
+        if base_sha.is_empty() || head_sha.is_empty() {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                "collect_conflict_diagnosis: missing base/head sha; skipping",
+            );
+            return;
+        }
+
+        let diagnosis = match conflict_diagnosis::collect(
+            &lease.workspace_path,
+            base_sha,
+            head_sha,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    workspace_path = %lease.workspace_path.display(),
+                    ?err,
+                    "collect_conflict_diagnosis: git spawn failed; using errored diagnosis",
+                );
+                conflict_diagnosis::ConflictDiagnosis::errored(
+                    base_sha,
+                    head_sha,
+                    format!("git spawn failed: {err}"),
+                )
+            }
+        };
+
+        let json = match serde_json::to_string(&diagnosis) {
+            Ok(j) => j,
+            Err(err) => {
+                tracing::warn!(attempt_id = %attempt.id, ?err, "collect_conflict_diagnosis: failed to serialize diagnosis");
+                return;
+            }
+        };
+
+        if let Err(err) = self
+            .work_db
+            .set_conflict_resolution_diagnosis(&attempt.id, &json)
+        {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                ?err,
+                "collect_conflict_diagnosis: failed to persist diagnosis; continuing without it",
+            );
+        } else {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                conflicted_files = diagnosis.files.len(),
+                "collect_conflict_diagnosis: diagnosis persisted",
+            );
         }
     }
 

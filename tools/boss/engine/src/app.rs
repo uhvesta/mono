@@ -514,10 +514,12 @@ impl ServerState {
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
-        let publisher: Arc<dyn ExecutionPublisher> = Arc::new(BrokerExecutionPublisher {
+        let publisher_impl = Arc::new(BrokerExecutionPublisher {
             topic_broker: topic_broker.clone(),
             work_revision: work_revision.clone(),
+            kick: std::sync::OnceLock::new(),
         });
+        let publisher: Arc<dyn ExecutionPublisher> = publisher_impl.clone();
         let cube_client: Arc<dyn CubeClient> = Arc::new(CommandCubeClient::new(cfg.clone()));
         let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
         // The pane releaser and probe queuer both need a Weak<ServerState>
@@ -618,6 +620,13 @@ impl ServerState {
         pane_runner.set_server_state(weak_spawner);
         pane_releaser.set_server_state(Arc::downgrade(&server_state));
         probe_queuer.set_server_state(Arc::downgrade(&server_state));
+
+        // Late-bind the scheduler kick into the publisher so the
+        // conflict-detection path can wake the scheduler after inserting
+        // a ready execution. The coordinator must exist before this is
+        // called — hence the late bind.
+        let coord_for_kick = server_state.execution_coordinator.clone();
+        publisher_impl.set_kick(move || coord_for_kick.kick());
 
         // Seed the live-status manager's disabled-slot set from the
         // engine metadata KV — survives restarts of the engine
@@ -1191,6 +1200,16 @@ impl ServerState {
 struct BrokerExecutionPublisher {
     topic_broker: Arc<TopicBroker>,
     work_revision: Arc<AtomicU64>,
+    /// Late-bound kick function set after the coordinator is created.
+    /// `None` until [`BrokerExecutionPublisher::set_kick`] is called;
+    /// `kick_scheduler` is a no-op until the coordinator is wired up.
+    kick: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl BrokerExecutionPublisher {
+    fn set_kick(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.kick.set(Arc::new(f));
+    }
 }
 
 #[async_trait]
@@ -1253,6 +1272,12 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
                 FrontendEventEnvelope::push_with_revision(revision, event),
             )
             .await;
+    }
+
+    fn kick_scheduler(&self) {
+        if let Some(f) = self.kick.get() {
+            f();
+        }
     }
 }
 

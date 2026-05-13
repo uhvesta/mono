@@ -29,8 +29,8 @@
 use boss_protocol::FrontendEvent;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
-use crate::merge_poller::{PrLifecycleProbe, pr_labels_opt_out};
-use crate::work::{PendingMergeCheck, WorkDb};
+use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
+use crate::work::{ConflictResolutionInsertInput, CreateExecutionInput, PendingMergeCheck, WorkDb};
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
 /// (per-product flag or per-PR label) suppresses this conflict-watch
@@ -152,31 +152,95 @@ pub async fn on_conflict_detected(
             "blocked_merge_conflict",
         )
         .await;
-    // If a `conflict_resolutions` row already exists for this work item
-    // (Phase 3's worker-spawn path created it pre-flip, or a concurrent
-    // sweep won the insert), emit the typed activity-feed event so the
-    // macOS app can paint the "engine is on it" entry. The lookup is
-    // best-effort — a failure here doesn't roll back the parent flip.
-    if let Ok(Some(attempt)) =
-        work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id)
-    {
+
+    // Insert the `conflict_resolutions` attempt row now that the parent
+    // is blocked. The UNIQUE key is `(work_item_id, base_sha_at_trigger)`,
+    // so a second sweep for the same base sha returns `Ok(None)` —
+    // idempotent and safe to call on every conflict-detected event.
+    // The churn guard pre-abandons the 4th attempt inside a rolling 1h
+    // window; those rows get no execution request.
+    let attempt = match work_db.insert_conflict_resolution(ConflictResolutionInsertInput {
+        product_id: candidate.product_id.clone(),
+        work_item_id: candidate.work_item_id.clone(),
+        pr_url: candidate.pr_url.clone(),
+        pr_number: parse_pr_number(&candidate.pr_url).unwrap_or(0),
+        head_branch: probe.head_ref_name.as_deref().unwrap_or("").to_owned(),
+        base_branch: probe.base_ref_name.as_deref().unwrap_or("").to_owned(),
+        base_sha_at_trigger: probe.base_ref_oid.clone(),
+        head_sha_before: probe.head_ref_oid.clone(),
+    }) {
+        Ok(Some(a)) => Some(a),
+        Ok(None) => {
+            // UNIQUE collision — a row for this base sha already exists.
+            // Fall back to a lookup so the started-event still fires.
+            work_db
+                .active_conflict_resolution_for_work_item(&candidate.work_item_id)
+                .unwrap_or(None)
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "conflict_watch: failed to insert conflict_resolution attempt; continuing without execution request",
+            );
+            None
+        }
+    };
+
+    // Request a conflict_resolution execution for live (pending) attempts.
+    // Pre-abandoned churn-guard rows get no execution so the scheduler
+    // doesn't dispatch a worker that would immediately fail the same way.
+    if let Some(ref a) = attempt {
+        if a.status == "pending" {
+            match work_db.create_execution(CreateExecutionInput {
+                work_item_id: candidate.work_item_id.clone(),
+                kind: "conflict_resolution".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            }) {
+                Ok(_) => publisher.kick_scheduler(),
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        attempt_id = %a.id,
+                        ?err,
+                        "conflict_watch: failed to create conflict_resolution execution; worker will not be dispatched",
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(ref a) = attempt {
         publisher
             .publish_frontend_event_on_product(
                 &candidate.product_id,
                 FrontendEvent::ConflictResolutionStarted {
                     product_id: candidate.product_id.clone(),
                     work_item_id: candidate.work_item_id.clone(),
-                    attempt_id: attempt.id,
+                    attempt_id: a.id.clone(),
                     pr_url: candidate.pr_url.clone(),
                 },
             )
             .await;
     }
+
     tracing::info!(
         work_item_id = %updated.id,
         kind = %updated.kind,
         pr_url = %candidate.pr_url,
         base_ref_oid = ?probe.base_ref_oid,
+        attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
+        attempt_status = ?attempt.as_ref().map(|a| a.status.as_str()),
         "conflict_watch: PR conflicts with base; work item flipped to blocked: merge_conflict",
     );
     true
@@ -435,7 +499,9 @@ mod tests {
             url: pr_url.to_owned(),
             state,
             base_ref_oid: Some("abc123".into()),
-            head_ref_oid: None,
+            head_ref_oid: Some("head456".into()),
+            head_ref_name: Some("feature".into()),
+            base_ref_name: Some("main".into()),
             labels: Vec::new(),
         }
     }
@@ -449,7 +515,9 @@ mod tests {
             url: pr_url.to_owned(),
             state,
             base_ref_oid: Some("abc123".into()),
-            head_ref_oid: None,
+            head_ref_oid: Some("head456".into()),
+            head_ref_name: Some("feature".into()),
+            base_ref_name: Some("main".into()),
             labels: labels.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
@@ -860,46 +928,16 @@ mod tests {
 
     #[tokio::test]
     async fn typed_events_arrive_in_started_then_succeeded_order() {
-        // Phase 4 #12 acceptance: a full conflict-resolve cycle emits
-        // exactly one ConflictResolutionStarted and one
-        // ConflictResolutionSucceeded, in that order, with matching
-        // attempt_id payloads.
+        // Full conflict-resolve cycle: on_conflict_detected emits
+        // ConflictResolutionStarted; on_resolved emits Succeeded; both
+        // events carry the same attempt_id.
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/25";
         let (product, chore) = make_in_review(&db, "C-evt-order", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
-        // Phase 3 wiring: insert the attempt row before flipping the
-        // parent so the started-event has a row to broadcast against.
-        // (We invoke mark_chore_blocked_merge_conflict directly to set
-        // up the insert pre-condition, then restore status to in_review
-        // so on_conflict_detected has work to do.)
-        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-        let attempt = db
-            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
-                product_id: product.clone(),
-                work_item_id: chore.clone(),
-                pr_url: pr.into(),
-                pr_number: 25,
-                head_branch: "feature".into(),
-                base_branch: "main".into(),
-                base_sha_at_trigger: Some("base-sha".into()),
-                head_sha_before: Some("head-sha".into()),
-            })
-            .unwrap()
-            .unwrap();
-        db.mark_conflict_resolution_running(&attempt.id, "lease-25", "ws-25", "worker-25")
-            .unwrap();
-        db.update_work_item(
-            &chore,
-            WorkItemPatch {
-                status: Some("in_review".into()),
-                ..WorkItemPatch::default()
-            },
-        )
-        .unwrap();
-
+        // on_conflict_detected creates the attempt and emits Started.
         on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -907,6 +945,20 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
+
+        let started_attempt_id = {
+            let typed = pub_.typed_events.lock().await.clone();
+            match typed
+                .iter()
+                .find(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionStarted { .. }))
+            {
+                Some((_, FrontendEvent::ConflictResolutionStarted { attempt_id, .. })) => {
+                    attempt_id.clone()
+                }
+                other => panic!("expected ConflictResolutionStarted, got {other:?}"),
+            }
+        };
+
         let cube = Arc::new(RecordingCubeClient::default());
         on_resolved(
             &db,
@@ -937,7 +989,7 @@ mod tests {
             match ev {
                 FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. }
                 | FrontendEvent::ConflictResolutionSucceeded { attempt_id: a, .. } => {
-                    assert_eq!(a, &attempt.id, "attempt_id payload must match");
+                    assert_eq!(a, &started_attempt_id, "attempt_id payload must match");
                 }
                 _ => {}
             }
@@ -1042,31 +1094,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detection_emits_started_event_when_attempt_row_exists() {
-        // Phase 3 will create the conflict_resolutions row pre-flip;
-        // the started-event publish is gated on that row existing.
+    async fn detection_emits_started_event_reuses_existing_row_on_same_base_sha() {
+        // When on_conflict_detected is called a second time for the same
+        // base sha (UNIQUE key collision), insert_conflict_resolution
+        // returns Ok(None) and we fall back to the existing attempt for
+        // the started-event. Both events must reference the original row.
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/23";
         let (product, chore) = make_in_review(&db, "C-detect-evt", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
 
-        // Move to blocked manually first so the attempt INSERT path's
-        // task-side stamp matches its WHERE guard.
-        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-        let attempt = db
-            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
-                product_id: product.clone(),
-                work_item_id: chore.clone(),
-                pr_url: pr.into(),
-                pr_number: 23,
-                head_branch: "feature".into(),
-                base_branch: "main".into(),
-                base_sha_at_trigger: Some("base-sha".into()),
-                head_sha_before: Some("head-sha".into()),
-            })
-            .unwrap()
-            .unwrap();
-        // Reset to in_review so on_conflict_detected has work to do.
+        // First call — creates the attempt and flips to blocked.
+        let first = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        assert!(first);
+        let first_events = pub_.typed_events.lock().await.clone();
+        assert_eq!(first_events.len(), 1, "exactly one started event on first call");
+        let first_attempt_id = match &first_events[0].1 {
+            FrontendEvent::ConflictResolutionStarted { attempt_id, .. } => attempt_id.clone(),
+            other => panic!("unexpected event {other:?}"),
+        };
+
+        // Reset to in_review with the same probe (same base sha → UNIQUE collision).
         db.update_work_item(
             &chore,
             WorkItemPatch {
@@ -1076,7 +1131,45 @@ mod tests {
         )
         .unwrap();
 
+        let second = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        assert!(second, "second call with same pr must still flip the row");
+
+        let all_events = pub_.typed_events.lock().await.clone();
+        let started: Vec<_> = all_events
+            .iter()
+            .filter(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionStarted { .. }))
+            .collect();
+        assert_eq!(started.len(), 2, "started event fires on each flip");
+        for (_, ev) in &started {
+            match ev {
+                FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. } => {
+                    assert_eq!(
+                        a, &first_attempt_id,
+                        "both events must reference the same original attempt",
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detection_inserts_attempt_and_emits_started_event() {
+        // on_conflict_detected now inserts the conflict_resolution attempt
+        // and emits ConflictResolutionStarted in the same call that flips
+        // the parent to blocked — no pre-wiring needed.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/24";
+        let (product, chore) = make_in_review(&db, "C-detect-noevt", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
+
         let transitioned = on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -1086,40 +1179,23 @@ mod tests {
         .await;
         assert!(transitioned);
 
+        let attempt = db
+            .active_conflict_resolution_for_work_item(&chore)
+            .unwrap();
+        assert!(
+            attempt.is_some(),
+            "on_conflict_detected must insert a conflict_resolution row",
+        );
+        let attempt = attempt.unwrap();
+        assert_eq!(attempt.status, "pending");
+
         let typed = pub_.typed_events.lock().await.clone();
         assert!(
             typed.iter().any(|(_, ev)| matches!(
                 ev,
                 FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. } if a == &attempt.id
             )),
-            "expected ConflictResolutionStarted event for attempt {}, got {typed:?}",
-            attempt.id,
-        );
-    }
-
-    #[tokio::test]
-    async fn detection_emits_no_started_event_without_attempt_row() {
-        // Pre-Phase-3: the parent flips to blocked but no attempt row
-        // exists yet — the typed-event publish must be silent so we
-        // don't broadcast an attempt-id-less Started.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/24";
-        let (product, chore) = make_in_review(&db, "C-detect-noevt", pr);
-        let pub_ = Arc::new(RecordingPublisher::default());
-
-        on_conflict_detected(
-            &db,
-            pub_.as_ref(),
-            &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
-        )
-        .await;
-
-        let typed = pub_.typed_events.lock().await.clone();
-        assert!(
-            typed.is_empty(),
-            "no Started event must fire when no attempt row exists yet, got {typed:?}",
+            "ConflictResolutionStarted must fire with the new attempt id, got {typed:?}",
         );
     }
 

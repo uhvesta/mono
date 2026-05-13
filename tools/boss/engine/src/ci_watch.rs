@@ -36,7 +36,7 @@ use boss_protocol::FrontendEvent;
 use serde::Serialize;
 
 use crate::coordinator::ExecutionPublisher;
-use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, pr_labels_opt_out};
+use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
 use crate::work::{CiRemediationInsertInput, PendingMergeCheck, WorkDb};
 
 /// Unified opt-out gate. Mirrors `conflict_watch::auto_pr_maintenance_disabled`;
@@ -521,14 +521,6 @@ fn provider_str(p: crate::merge_poller::CiProvider) -> &'static str {
     }
 }
 
-/// Best-effort parse of a PR number out of `https://github.com/<o>/<r>/pull/<n>`.
-fn parse_pr_number(pr_url: &str) -> Option<i64> {
-    let stripped = pr_url.split('?').next().unwrap_or(pr_url);
-    let stripped = stripped.split('#').next().unwrap_or(stripped);
-    let tail = stripped.rsplit_once("/pull/")?.1;
-    let n = tail.split(|c: char| !c.is_ascii_digit()).next()?;
-    n.parse::<i64>().ok()
-}
 
 #[cfg(test)]
 mod tests {
@@ -622,6 +614,8 @@ mod tests {
             state: PrLifecycleState::Open(OpenPrStatus::clean()),
             base_ref_oid: Some("base-1".into()),
             head_ref_oid: Some(head_sha.to_owned()),
+            head_ref_name: None,
+            base_ref_name: None,
             labels: Vec::new(),
         }
     }
@@ -632,6 +626,8 @@ mod tests {
             state: PrLifecycleState::Open(OpenPrStatus::clean()),
             base_ref_oid: Some("base-1".into()),
             head_ref_oid: Some(head_sha.to_owned()),
+            head_ref_name: None,
+            base_ref_name: None,
             labels: labels.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
@@ -989,23 +985,6 @@ mod tests {
         let (status, reason) = chore_state(&db, &chore);
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
-    }
-
-    #[test]
-    fn parse_pr_number_handles_common_shapes() {
-        assert_eq!(
-            super::parse_pr_number("https://github.com/foo/bar/pull/123"),
-            Some(123),
-        );
-        assert_eq!(
-            super::parse_pr_number("https://github.com/foo/bar/pull/123/files"),
-            Some(123),
-        );
-        assert_eq!(
-            super::parse_pr_number("https://github.com/foo/bar/pull/123?foo=1"),
-            Some(123),
-        );
-        assert_eq!(super::parse_pr_number("https://example.test/not-a-pr"), None);
     }
 
     #[test]

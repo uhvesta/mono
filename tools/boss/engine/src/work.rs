@@ -1321,7 +1321,7 @@ impl WorkDb {
                  updated_at = ?2
              WHERE id = ?1
                AND deleted_at IS NULL
-               AND status NOT IN ('done', 'archived')",
+               AND status NOT IN ('done', 'archived', 'blocked')",
             params![execution.work_item_id, now],
         )?;
 

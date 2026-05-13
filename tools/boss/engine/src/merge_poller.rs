@@ -66,6 +66,14 @@ pub struct PrLifecycleProbe {
     /// attempt_kind)`) needs this; `None` when GitHub didn't report
     /// it (rare).
     pub head_ref_oid: Option<String>,
+    /// Name of the PR's head branch (e.g. `"my-feature"`). Required by
+    /// the conflict-resolution attempt row (`head_branch` column); `None`
+    /// when GitHub didn't report it.
+    pub head_ref_name: Option<String>,
+    /// Name of the PR's base branch (e.g. `"main"`). Required by the
+    /// conflict-resolution attempt row (`base_branch` column); `None`
+    /// when GitHub didn't report it.
+    pub base_ref_name: Option<String>,
     /// Labels currently applied to the PR. Carried so the
     /// conflict-watch / auto-rebase / ci-watch paths can honour the
     /// per-PR opt-out label (`boss/no-auto-rebase`, design Q7 /
@@ -296,7 +304,7 @@ impl MergeProbe for CommandMergeProbe {
                 // the same probe"); the previous TSV-via-jq shape
                 // can't carry it without escaping headaches, so we
                 // take the raw JSON document from gh instead.
-                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,labels,statusCheckRollup",
+                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -321,6 +329,8 @@ impl MergeProbe for CommandMergeProbe {
                     state: PrLifecycleState::ClosedUnmerged,
                     base_ref_oid: None,
                     head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
                     labels: Vec::new(),
                 });
             }
@@ -367,6 +377,16 @@ fn parse_probe_json(url: &str, body: &str) -> Result<PrLifecycleProbe> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let head_ref_name = root
+        .get("headRefName")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let base_ref_name = root
+        .get("baseRefName")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let labels = root
         .get("labels")
         .and_then(|v| v.as_array())
@@ -388,6 +408,8 @@ fn parse_probe_json(url: &str, body: &str) -> Result<PrLifecycleProbe> {
         state,
         base_ref_oid,
         head_ref_oid,
+        head_ref_name,
+        base_ref_name,
         labels,
     })
 }
@@ -793,6 +815,22 @@ async fn mark_merged(
 /// Startup sweep (`chore-lifecycle-pr-closed-unmerged.md` Q9 /
 /// `merge-conflict-handling-in-review.md` Phase 6 #17): the first
 /// `run_one_pass` fires immediately on spawn so any chore whose PR
+/// Extract the PR number from a GitHub PR URL.
+///
+/// Handles common URL shapes:
+/// - `https://github.com/owner/repo/pull/123`
+/// - `https://github.com/owner/repo/pull/123/files`
+/// - `https://github.com/owner/repo/pull/123?foo=1`
+///
+/// Returns `None` when the URL doesn't contain `/pull/<digits>`.
+pub(crate) fn parse_pr_number(pr_url: &str) -> Option<i64> {
+    let stripped = pr_url.split('?').next().unwrap_or(pr_url);
+    let stripped = stripped.split('#').next().unwrap_or(stripped);
+    let tail = stripped.rsplit_once("/pull/")?.1;
+    let n = tail.split(|c: char| !c.is_ascii_digit()).next()?;
+    n.parse::<i64>().ok()
+}
+
 /// merged or developed a conflict while the engine was offline gets
 /// reconciled on boot. The sweep runs inside the spawned task so
 /// engine startup isn't blocked on `gh`; subsequent passes are
@@ -867,6 +905,8 @@ mod tests {
                     state,
                     base_ref_oid: base_ref_oid.map(str::to_owned),
                     head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
                     labels: Vec::new(),
                 }),
             );
@@ -880,6 +920,8 @@ mod tests {
                     state,
                     base_ref_oid: None,
                     head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
                     labels: labels.iter().map(|s| (*s).to_owned()).collect(),
                 }),
             );
@@ -905,6 +947,8 @@ mod tests {
                     state: PrLifecycleState::Open(OpenPrStatus::clean()),
                     base_ref_oid: None,
                     head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
                     labels: Vec::new(),
                 }),
             }
@@ -1406,6 +1450,8 @@ mod tests {
             }])),
             base_ref_oid: Some("base-1".into()),
             head_ref_oid: Some(head_sha.to_owned()),
+            head_ref_name: None,
+            base_ref_name: None,
             labels: Vec::new(),
         }
     }
@@ -1416,6 +1462,8 @@ mod tests {
             state: PrLifecycleState::Open(OpenPrStatus::clean()),
             base_ref_oid: Some("base-1".into()),
             head_ref_oid: Some(head_sha.to_owned()),
+            head_ref_name: None,
+            base_ref_name: None,
             labels: Vec::new(),
         }
     }
