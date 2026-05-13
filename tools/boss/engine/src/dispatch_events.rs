@@ -99,6 +99,13 @@ pub enum Stage {
     /// auto-remediate — the operator decides whether to retry,
     /// reap, or wait.
     StageStalled,
+    /// The periodic orphan-active sweep found a work item in `active`
+    /// status with no live execution and inserted a fresh `ready`
+    /// execution to drive it back into the dispatch pipeline. Distinct
+    /// from `status_transition` (which fires on kanban drags) so
+    /// `bossctl dispatch tail` can filter orphan-sweep redispatches
+    /// separately from human-initiated ones.
+    OrphanActiveRedispatch,
 }
 
 impl Stage {
@@ -115,6 +122,7 @@ impl Stage {
             Stage::RunStarted => "run_started",
             Stage::PaneSpawned => "pane_spawned",
             Stage::StageStalled => "stage_stalled",
+            Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
         }
     }
 }

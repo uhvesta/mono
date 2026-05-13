@@ -27,6 +27,15 @@ pub const CHURN_GUARD_THRESHOLD: i64 = 3;
 /// `failure_reason` stamped on the pre-abandoned row.
 pub const CHURN_GUARD_REASON: &str = "churn_threshold_exceeded";
 
+/// Sliding window for the orphan-active redispatch churn guard: the
+/// 4th orphan-redispatch for a given work item inside one hour is
+/// skipped and a warning is logged instead.
+pub const ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
+/// Trailing-window terminal-execution count at which the next
+/// orphan-redispatch is skipped. The first 3 cycles inside the window
+/// go live; the 4th trips the guard.
+pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
+
 pub use boss_protocol::{
     AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, CiRemediation,
     ConflictResolution, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
@@ -529,6 +538,68 @@ impl WorkDb {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Return the work item ids that are candidates for orphan-active
+    /// redispatch. A candidate satisfies all of:
+    ///
+    /// 1. `tasks.status = 'active'` and not deleted.
+    /// 2. `tasks.updated_at` is more than `min_age_secs` old (guards
+    ///    against false-positive on a fresh transition whose worker is
+    ///    still spinning up).
+    /// 3. No `ready` execution exists (if one does, it is already
+    ///    queued for dispatch; no action needed).
+    ///
+    /// The caller is responsible for checking whether the latest
+    /// non-terminal execution (if any) is claimed by a live worker
+    /// slot — that check requires in-memory worker-pool state that the
+    /// DB layer does not have access to.
+    pub fn list_orphan_active_candidates(&self, min_age_secs: i64) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now_secs - min_age_secs;
+        let mut stmt = conn.prepare(
+            "SELECT t.id FROM tasks t
+             WHERE t.status = 'active'
+               AND t.deleted_at IS NULL
+               AND CAST(t.updated_at AS INTEGER) < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_executions we
+                   WHERE we.work_item_id = t.id
+                     AND we.status = 'ready'
+               )
+             ORDER BY t.updated_at ASC, t.id ASC",
+        )?;
+        let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Count how many terminal executions (`orphaned`, `abandoned`,
+    /// `failed`) the work item has produced within the trailing
+    /// `since_epoch_secs` window. Used by the orphan-active churn
+    /// guard to stop auto-redispatching a work item that keeps dying.
+    pub fn count_recent_terminal_executions(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+    ) -> Result<i64> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM work_executions
+              WHERE work_item_id = ?1
+                AND status IN ('orphaned', 'abandoned', 'failed')
+                AND CAST(created_at AS INTEGER) >= ?2",
+            params![work_item_id, since_epoch_secs],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
@@ -1699,6 +1770,36 @@ impl WorkDb {
     /// yet, leaving the column NULL after the row was later
     /// inserted. The cache fallback (this PR) is what allows a
     /// subsequent hook to finally win.
+    #[cfg(test)]
+    pub fn force_updated_at_for_test(&self, work_item_id: &str, epoch_secs: i64) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            params![work_item_id, epoch_secs.to_string()],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn insert_terminal_execution_for_test(
+        &self,
+        work_item_id: &str,
+        status: &str,
+        created_at_epoch: i64,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let id = format!("exec-test-{}-{}", work_item_id, created_at_epoch);
+        conn.execute(
+            "INSERT INTO work_executions
+               (id, work_item_id, kind, status, repo_remote_url,
+                priority, created_at)
+             VALUES (?1, ?2, 'chore_implementation', ?3,
+                     'https://github.com/test/repo', 0, ?4)",
+            params![id, work_item_id, status, created_at_epoch.to_string()],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn clear_run_transcript_path_for_test(&self, run_id: &str) -> Result<()> {
         let conn = self.connect()?;

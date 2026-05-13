@@ -1857,6 +1857,18 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Periodic orphan-active reconciler: re-dispatches `active` work
+    // items that have no live execution (the post-crash "stuck-in-Doing"
+    // fix). Runs every 60s and fires immediately on boot so items left
+    // orphaned by the previous crash are recovered without waiting for
+    // the first interval.
+    let _orphan_sweep_handle = crate::orphan_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        Duration::from_secs(60),
+    );
+
     // Watch in-flight dispatch timelines for stalled stages and emit
     // a `stage_stalled` event when one sits past the threshold
     // without progressing. Read-only against the per-execution

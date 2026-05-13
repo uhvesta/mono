@@ -18,6 +18,7 @@ pub mod live_status_loop;
 pub mod live_status_redact;
 pub mod live_worker_state;
 pub mod merge_poller;
+pub mod orphan_sweep;
 pub mod pane_summary;
 pub mod protocol;
 pub mod run_reconcile;

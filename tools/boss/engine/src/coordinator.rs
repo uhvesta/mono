@@ -645,6 +645,28 @@ impl WorkerPool {
         inner.workers.len()
     }
 
+    /// Return true if at least one worker slot is idle (not currently
+    /// claimed by an in-flight execution). Used by the orphan-active
+    /// sweep to bail early rather than touching the DB when no worker
+    /// could pick up a newly-queued execution.
+    pub async fn has_idle_worker(&self) -> bool {
+        let inner = self.inner.lock().await;
+        inner.workers.iter().any(|w| w.execution_id.is_none())
+    }
+
+    /// Return the set of execution ids currently claimed by a worker
+    /// slot. Used by the orphan-active sweep as the `is_live` oracle:
+    /// an execution that is not claimed has no live worker driving it
+    /// even if its DB status is still non-terminal.
+    pub async fn claimed_execution_ids(&self) -> std::collections::HashSet<String> {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .iter()
+            .filter_map(|w| w.execution_id.clone())
+            .collect()
+    }
+
     /// Format a worker id for slot `slot_id`. Inverse of
     /// [`slot_id_from_worker_id`]; both sides of the
     /// engine-owns-allocation refactor lean on this string format
