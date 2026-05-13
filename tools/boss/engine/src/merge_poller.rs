@@ -2479,7 +2479,7 @@ mod tests {
         let db_path = dir.path().join("boss.db");
         let db = WorkDb::open(db_path.clone()).unwrap();
         let pr = "https://github.com/foo/bar/pull/904";
-        let (product, chore, _attempt) =
+        let (product, _chore, _attempt) =
             make_chore_blocked_with_pending_attempt(&db, "C-optout-stranded", pr);
 
         set_product_auto_pr_maintenance(&db_path, &product, false);
