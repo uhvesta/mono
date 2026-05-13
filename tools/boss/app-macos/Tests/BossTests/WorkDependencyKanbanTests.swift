@@ -138,6 +138,100 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertNil(model.cardProjectBadge(for: chore))
     }
 
+    /// An active task with `blocked_reason=dependency` must surface its
+    /// prereqs via `dependencyPrereqs` so the card can render "Waiting
+    /// on: <name>". This mirrors the real repro: `status=active`,
+    /// `blocked_reason=dependency` — the engine left the field set after
+    /// the last block evaluation.
+    func testActiveTaskWithBlockedReasonDependencyExposesPrereqs() {
+        let model = makeFixture()
+        guard let dependent = model.taskByName("Phase 4") else {
+            XCTFail("expected fixture to include the gated task"); return
+        }
+        // Phase 4 is status=blocked in the fixture; inject an active
+        // clone with the same dependency edge to exercise the
+        // non-blocked-status path.
+        let productID = model.products.first?.id ?? "prod_test"
+        let projectID = model.projectsByProductID[productID]?.first?.id ?? "proj_test"
+        let activeGated = WorkTask(
+            id: "task_active_gated",
+            productID: productID,
+            projectID: projectID,
+            kind: "task",
+            name: "Active But Gated",
+            description: "",
+            status: "active",
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "engine",
+            blockedReason: "dependency"
+        )
+        var tasks = model.tasksByProjectID[projectID] ?? []
+        tasks.append(activeGated)
+        model.tasksByProjectID[projectID] = tasks
+        model.dependenciesByProductID[productID, default: []].append(
+            WorkItemDependency(
+                dependentID: activeGated.id,
+                prerequisiteID: dependent.id,
+                relation: "blocks"
+            )
+        )
+        // dependencyPrereqs drives the "Waiting on:" subtitle — must
+        // include the prereq even when the card status is not "blocked".
+        let prereqs = model.dependencyPrereqs(for: activeGated.id)
+        XCTAssertEqual(prereqs.map(\.title), ["Phase 4"])
+    }
+
+    /// Stale dependency block: `blocked_reason=dependency` is set but
+    /// the sole prereq is already done. `dependencyPrereqs` must still
+    /// return the prereq row (for the "Waiting on:" label) even though
+    /// `gatingPrereqs` returns empty (nothing incomplete). The card
+    /// uses the full set so the stale block is still visible.
+    func testStaleDependencyBlockStillExposesPrereqsForCard() {
+        let model = makeFixture()
+        guard let done = model.taskByName("Phase 1") else {
+            XCTFail("expected fixture"); return
+        }
+        let productID = model.products.first?.id ?? "prod_test"
+        let projectID = model.projectsByProductID[productID]?.first?.id ?? "proj_test"
+        let staleGated = WorkTask(
+            id: "task_stale_gated",
+            productID: productID,
+            projectID: projectID,
+            kind: "task",
+            name: "Stale Gated",
+            description: "",
+            status: "active",
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "engine",
+            blockedReason: "dependency"
+        )
+        var tasks = model.tasksByProjectID[projectID] ?? []
+        tasks.append(staleGated)
+        model.tasksByProjectID[projectID] = tasks
+        model.dependenciesByProductID[productID, default: []].append(
+            WorkItemDependency(
+                dependentID: staleGated.id,
+                prerequisiteID: done.id,
+                relation: "blocks"
+            )
+        )
+        // Phase 1 is done — no gating prereqs, but the edge still exists.
+        XCTAssertEqual(model.gatingPrereqs(for: staleGated.id), [])
+        // The full prereq list is non-empty — the card must show "Waiting on: Phase 1".
+        let allPrereqs = model.dependencyPrereqs(for: staleGated.id)
+        XCTAssertEqual(allPrereqs.map(\.title), ["Phase 1"])
+    }
+
     /// A manual-block row with no gating edges should still be
     /// movable — the engine accepts a manual unblock once the prereq
     /// set is empty, so the kanban must not pre-empt that.
