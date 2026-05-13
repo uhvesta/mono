@@ -82,6 +82,10 @@ pub enum PrStatus {
     /// PR's pushed head sha. Treat as "no PR yet" for completion
     /// purposes; the worker is probed to push.
     Stale { url: String, reason: String },
+    /// PR exists and head_match, but `changed_files == 0` — the worker
+    /// pushed a commit with no file changes. Do not advance to
+    /// `in_review`; probe the worker to make real edits or close the PR.
+    EmptyDiff { url: String },
     /// PR exists and is already merged. Move the work item straight
     /// to `done`.
     Merged { url: String },
@@ -98,6 +102,7 @@ impl PrStatus {
             PrStatus::None => None,
             PrStatus::Fresh { url }
             | PrStatus::Stale { url, .. }
+            | PrStatus::EmptyDiff { url }
             | PrStatus::Merged { url }
             | PrStatus::Closed { url } => Some(url),
         }
@@ -205,6 +210,8 @@ struct ApiPr {
     state: String,
     merged_at: Option<String>,
     head_sha: String,
+    /// Number of files changed in the PR. Zero means the PR has an empty diff.
+    changed_files: i64,
 }
 
 fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
@@ -244,7 +251,18 @@ fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
         return PrStatus::None;
     }
     if head_match {
-        PrStatus::Fresh { url: pr.url }
+        // Use file-count rather than tree-SHA equality: `changed_files`
+        // is available on the PR object without an extra API round-trip
+        // (the `commits/{sha}/pulls` endpoint returns full PR objects),
+        // whereas tree-equality would require a separate `commits/{sha}`
+        // call to get the tree sha. Zero files means the worker pushed
+        // an empty commit — surface it so the worker is asked to fix or
+        // close the PR rather than letting it advance to review.
+        if pr.changed_files == 0 {
+            PrStatus::EmptyDiff { url: pr.url }
+        } else {
+            PrStatus::Fresh { url: pr.url }
+        }
     } else {
         PrStatus::Stale {
             url: pr.url,
@@ -315,7 +333,7 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
             "-H",
             "Accept: application/vnd.github+json",
             "--jq",
-            r#"first | select(.) | [(.html_url // ""), (.state // ""), (.merged_at // ""), (.head.sha // "")] | @tsv"#,
+            r#"first | select(.) | [(.html_url // ""), (.state // ""), (.merged_at // ""), (.head.sha // ""), ((.changed_files // 0) | tostring)] | @tsv"#,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -351,6 +369,7 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
     let state = parts.next().unwrap_or("").trim().to_owned();
     let merged_at_raw = parts.next().unwrap_or("").trim();
     let head_sha = parts.next().unwrap_or("").trim().to_owned();
+    let changed_files_raw = parts.next().unwrap_or("0").trim();
     if url.is_empty() {
         return Ok(None);
     }
@@ -359,11 +378,13 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
     } else {
         Some(merged_at_raw.to_owned())
     };
+    let changed_files = changed_files_raw.parse::<i64>().unwrap_or(0);
     Ok(Some(ApiPr {
         url,
         state,
         merged_at,
         head_sha,
+        changed_files,
     }))
 }
 
@@ -539,6 +560,18 @@ impl WorkerCompletionHandler {
                     .queue_probe(execution_id, PROBE_STALE_PR);
                 return StopOutcome::StalePr { pr_url: url, reason };
             }
+            PrStatus::EmptyDiff { url } => {
+                tracing::warn!(
+                    execution_id,
+                    workspace = %workspace_path.display(),
+                    pr_url = %url,
+                    "stop event: PR has an empty diff — worker pushed a no-op change; probing to fix or close"
+                );
+                self.publish_awaiting_pr(&execution).await;
+                self.probe_queuer
+                    .queue_probe(execution_id, PROBE_EMPTY_PR);
+                return StopOutcome::EmptyDiffPr { pr_url: url };
+            }
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
@@ -684,10 +717,10 @@ impl WorkerCompletionHandler {
             // attempt `succeeded` on the next sweep.
             StopOutcome::PrDetected { .. } | StopOutcome::PrMerged { .. } => false,
             // Worker pushed something but the PR head still trails the
-            // worker's local commits. The on-Stop path has already
-            // queued a probe asking the worker to push again; don't
-            // pre-empt that with a failed mark.
-            StopOutcome::StalePr { .. } => false,
+            // worker's local commits, or pushed an empty diff. The
+            // on-Stop path has already queued a probe asking the worker
+            // to fix the situation; don't pre-empt that with a failed mark.
+            StopOutcome::StalePr { .. } | StopOutcome::EmptyDiffPr { .. } => false,
             // Race with an already-finalized execution (a second Stop
             // for the same worker, or finalize_run racing). Skip.
             StopOutcome::AlreadyTerminal | StopOutcome::UnknownExecution => false,
@@ -841,6 +874,15 @@ a PR for this branch (the `gh` query failed). If a PR exists, paste its URL on i
 own line. If not, push your branch and open one with `gh pr create`. If you're \
 blocked, explain what you need.";
 
+/// Probe text dispatched when a PR exists and head_match is satisfied,
+/// but the PR contains no file changes (`changed_files == 0`). The
+/// worker likely pushed an empty commit without making any edits.
+pub const PROBE_EMPTY_PR: &str = "The PR you opened has an empty diff — no files were \
+changed. This usually means you committed and pushed without making any edits. \
+Run `jj diff -r @` to verify your working-copy changes. If the diff is empty, \
+you have not made any changes — do not keep this PR open. Either make the required \
+edits and push them, or close the PR and explain what went wrong.";
+
 /// What happened during a stop event handler invocation. The runtime
 /// only logs this; tests assert on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -865,6 +907,10 @@ pub enum StopOutcome {
     /// worker is probed to push the missing commits; the work item
     /// stays in its current state until the next Stop reports a fresh PR.
     StalePr { pr_url: String, reason: String },
+    /// PR exists and head_match, but has zero file changes. The worker
+    /// is probed to make real edits or close the PR; the work item
+    /// stays in its current state.
+    EmptyDiffPr { pr_url: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }
@@ -1908,6 +1954,7 @@ mod tests {
             state: "closed".into(),
             merged_at: Some("2026-05-12T03:51:00Z".into()),
             head_sha: "branch_head_sha_aaaaaaaaaaaaaaaaaa".into(),
+            changed_files: 3,
         };
         let local_shas = vec![
             "worker_at_sha_111111111111111111111".into(),
@@ -1931,6 +1978,7 @@ mod tests {
             state: "closed".into(),
             merged_at: None,
             head_sha: "branch_head_sha_bbbbbbbbbbbbbbbbbb".into(),
+            changed_files: 2,
         };
         let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
         assert_eq!(classify_pr(pr, &local_shas), PrStatus::None);
@@ -1948,6 +1996,7 @@ mod tests {
             state: "closed".into(),
             merged_at: Some("2026-05-12T04:00:00Z".into()),
             head_sha: "worker_at_sha_111111111111111111111".into(),
+            changed_files: 5,
         };
         let local_shas = vec![
             "worker_at_sha_111111111111111111111".into(),
@@ -1959,6 +2008,114 @@ mod tests {
                 url: "https://github.com/foo/bar/pull/42".into(),
             },
         );
+    }
+
+    /// Guard: a head-matched PR with `changed_files == 0` classifies
+    /// as `EmptyDiff`, not `Fresh`. The head-sha match confirms the
+    /// worker pushed something, but zero files changed means the diff
+    /// is empty — the work item must not advance to `in_review`.
+    #[test]
+    fn classify_pr_returns_empty_diff_when_head_matches_but_changed_files_is_zero() {
+        let pr = ApiPr {
+            url: "https://github.com/foo/bar/pull/55".into(),
+            state: "open".into(),
+            merged_at: None,
+            head_sha: "worker_at_sha_111111111111111111111".into(),
+            changed_files: 0,
+        };
+        let local_shas = vec![
+            "worker_at_sha_111111111111111111111".into(),
+            "worker_parent_sha_222222222222222222222".into(),
+        ];
+        assert_eq!(
+            classify_pr(pr, &local_shas),
+            PrStatus::EmptyDiff {
+                url: "https://github.com/foo/bar/pull/55".into(),
+            },
+        );
+    }
+
+    /// Confirm that a head-matched PR with `changed_files > 0` still
+    /// classifies as `Fresh` — the empty-diff guard only fires on zero.
+    #[test]
+    fn classify_pr_returns_fresh_when_head_matches_and_changed_files_nonzero() {
+        let pr = ApiPr {
+            url: "https://github.com/foo/bar/pull/56".into(),
+            state: "open".into(),
+            merged_at: None,
+            head_sha: "worker_at_sha_111111111111111111111".into(),
+            changed_files: 1,
+        };
+        let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
+        assert_eq!(
+            classify_pr(pr, &local_shas),
+            PrStatus::Fresh {
+                url: "https://github.com/foo/bar/pull/56".into(),
+            },
+        );
+    }
+
+    /// Integration: the handler must publish `awaiting_pr` and queue
+    /// `PROBE_EMPTY_PR` when the detector reports `EmptyDiff`. The
+    /// work item must stay in `active` and the cube lease must NOT
+    /// be released — the worker is alive and must fix its PR first.
+    #[tokio::test]
+    async fn empty_diff_pr_publishes_awaiting_pr_and_queues_empty_pr_probe() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok_status(PrStatus::EmptyDiff {
+            url: "https://github.com/foo/bar/pull/77".into(),
+        });
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+
+        match outcome {
+            StopOutcome::EmptyDiffPr { pr_url } => {
+                assert_eq!(pr_url, "https://github.com/foo/bar/pull/77");
+            }
+            other => panic!("expected EmptyDiffPr, got {other:?}"),
+        }
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(
+                    t.status, "active",
+                    "empty-diff PR must NOT move the work item to in_review",
+                );
+                assert!(t.pr_url.is_none(), "empty-diff PR must NOT stamp pr_url");
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "waiting_human");
+        assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "empty-diff PR must NOT release the cube workspace",
+        );
+        assert!(pane.calls.lock().await.is_empty(), "empty-diff PR must NOT release the pane");
+
+        let events = publisher.events.lock().await.clone();
+        assert!(
+            events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_pr"),
+            "empty-diff PR must publish worker_awaiting_pr, got {events:?}",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "expected one probe, got {queued:?}");
+        assert_eq!(queued[0].0, execution_id);
+        assert_eq!(queued[0].1, PROBE_EMPTY_PR);
     }
 
     /// End-to-end regression mirror of the user-reported symptom:
