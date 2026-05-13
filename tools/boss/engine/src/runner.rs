@@ -355,8 +355,15 @@ impl ExecutionRunner for PaneSpawnRunner {
             .agent()
             .ok()
             .and_then(|agent| agent.anthropic_api_key.clone());
-        let title_summary =
-            pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await;
+        // For conflict-resolution executions the pane summary must reflect
+        // resolution activity, not the original task's gerund. We skip the
+        // cache and Claude call entirely — the phrase is fully determined by
+        // the execution kind and a truncation of the parent task name.
+        let title_summary = if execution.kind == "conflict_resolution" {
+            pane_summary::conflict_resolution_summary(work_item_name(work_item))
+        } else {
+            pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await
+        };
 
         let work_item_binding = Some(WorkItemBinding {
             work_item_id: work_item_id(work_item).to_owned(),
@@ -841,7 +848,6 @@ mod conflict_resolution_prompt_tests {
             ci_attempts_used: 0,
             short_id: None,
             blocked_signals: Vec::new(),
-            short_id: None,
         })
     }
 
@@ -1167,7 +1173,6 @@ mod pane_spawn_tests {
             ci_attempts_used: 0,
             short_id: None,
             blocked_signals: Vec::new(),
-            short_id: None,
         })
     }
 
