@@ -1819,7 +1819,9 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 ctx.allow_input,
             )
             .await?;
-            if resolved_repo.is_none() && !ctx.allow_input {
+            // Only error on unresolved repo for multi-repo products (no product default).
+            // Single-repo products return None intentionally; the engine inherits from the product.
+            if product.repo_remote_url.is_none() && resolved_repo.is_none() && !ctx.allow_input {
                 return Err(repo_resolution::unresolved_repo_error(&product.slug));
             }
             let task = create_task(
@@ -1932,7 +1934,9 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 ctx.allow_input,
             )
             .await?;
-            if resolved_repo.is_none() && !ctx.allow_input {
+            // Only error on unresolved repo for multi-repo products (no product default).
+            // Single-repo products return None intentionally; the engine inherits from the product.
+            if product.repo_remote_url.is_none() && resolved_repo.is_none() && !ctx.allow_input {
                 return Err(repo_resolution::unresolved_repo_error(&product.slug));
             }
             let chore = create_chore(

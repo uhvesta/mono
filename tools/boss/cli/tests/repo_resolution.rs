@@ -150,21 +150,21 @@ fn run_boss_expect_failure(socket: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stderr)?)
 }
 
-/// Prompt names a known repo → resolver picks that repo even though
-/// the product default points elsewhere. This is the "parser overrides
-/// recent / default" arm of the inference chain.
+/// Multi-repo product: prompt names a known repo → resolver picks it.
+/// This is the "parser" arm of the Q4 inference chain for products
+/// that have no default repo of their own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    // Product default is `console`; the known-repo set additionally
-    // includes `nimbus` once we seed a chore with that override.
+    // Product has NO repo (multi-repo product). The known-repo set is
+    // bootstrapped from the seed chore's row-level override.
     let product = create_product(
         &mut client,
         CreateProductInput {
             name: "Work".to_owned(),
             description: None,
-            repo_remote_url: Some("git@github.com:foo/console.git".to_owned()),
+            repo_remote_url: None,
         },
     )
     .await?;
@@ -200,15 +200,16 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
     assert_eq!(
         created["chore"]["repo_remote_url"].as_str(),
         Some("git@github.com:foo/nimbus.git"),
-        "prompt named nimbus → resolver should pick nimbus, not the product default"
+        "prompt named nimbus → resolver should pick nimbus from the known-repo set"
     );
     Ok(())
 }
 
-/// Prompt doesn't name any known repo → fall through to the product
-/// default (`console`).
+/// Single-repo product: chore created without --repo stores NULL in
+/// `repo_remote_url`. The engine resolves the repo from the product at
+/// dispatch time — the row does not need to carry a redundant copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chore_create_with_unrelated_prompt_falls_through_to_product_default() -> Result<()> {
+async fn chore_create_on_single_repo_product_stores_null_repo_remote_url() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(
@@ -234,10 +235,10 @@ async fn chore_create_with_unrelated_prompt_falls_through_to_product_default() -
             "",
         ],
     )?;
-    assert_eq!(
-        created["chore"]["repo_remote_url"].as_str(),
-        Some("git@github.com:foo/console.git"),
-        "prompt named no repo and no recent override → use product default"
+    assert!(
+        created["chore"]["repo_remote_url"].is_null(),
+        "single-repo product: task row must store NULL, not the product's URL; got: {}",
+        created["chore"]["repo_remote_url"]
     );
     Ok(())
 }
@@ -287,10 +288,11 @@ async fn chore_create_no_input_with_no_resolution_errors_clearly() -> Result<()>
     Ok(())
 }
 
-/// `--repo` is the explicit override. It wins over a prompt that names
-/// a different known repo and over the product default.
+/// `--repo` on a single-repo product is rejected with a clear error.
+/// Products that have their own `repo_remote_url` do not allow per-task
+/// overrides; the error message names the product and its repo.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chore_create_explicit_repo_overrides_prompt_and_default() -> Result<()> {
+async fn chore_create_explicit_repo_rejected_on_single_repo_product() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(
@@ -302,23 +304,53 @@ async fn chore_create_explicit_repo_overrides_prompt_and_default() -> Result<()>
         },
     )
     .await?;
-    create_chore(
+
+    let stderr = run_boss_expect_failure(
+        engine.socket_str(),
+        &[
+            "chore",
+            "create",
+            "--product",
+            &product.id,
+            "--name",
+            "do a thing",
+            "--description",
+            "",
+            "--repo",
+            "git@github.com:foo/other.git",
+        ],
+    )?;
+    assert!(
+        stderr.contains("cannot set per-task repo override"),
+        "stderr should explain the override is not allowed: {stderr}"
+    );
+    assert!(
+        stderr.contains(&product.slug),
+        "stderr should name the product: {stderr}"
+    );
+    assert!(
+        stderr.contains("console.git"),
+        "stderr should name the product's repo: {stderr}"
+    );
+    Ok(())
+}
+
+/// `--repo` on a multi-repo product (no product default) is accepted and
+/// stored in the task row. This is the legitimate per-task override path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chore_create_explicit_repo_accepted_on_multi_repo_product() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "seed nimbus".to_owned(),
+        CreateProductInput {
+            name: "Greenfield".to_owned(),
             description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some("git@github.com:foo/nimbus.git".to_owned()),
-            effort_level: None,
-            model_override: None,
+            repo_remote_url: None,
         },
     )
     .await?;
 
-    // Prompt names nimbus, but --repo points at ledger → ledger wins.
     let created = run_boss(
         engine.socket_str(),
         &[
@@ -327,17 +359,17 @@ async fn chore_create_explicit_repo_overrides_prompt_and_default() -> Result<()>
             "--product",
             &product.id,
             "--name",
-            "in the nimbus repo, do a thing",
+            "bootstrap the new service",
             "--description",
             "",
             "--repo",
-            "git@github.com:foo/ledger.git",
+            "git@github.com:foo/new-service.git",
         ],
     )?;
     assert_eq!(
         created["chore"]["repo_remote_url"].as_str(),
-        Some("git@github.com:foo/ledger.git"),
-        "explicit --repo should beat the parser and the product default"
+        Some("git@github.com:foo/new-service.git"),
+        "multi-repo product: explicit --repo should be stored in the row"
     );
     Ok(())
 }

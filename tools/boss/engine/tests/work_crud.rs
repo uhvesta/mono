@@ -226,7 +226,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
         CreateProductInput {
             name: "Priorities".to_owned(),
             description: None,
-            repo_remote_url: None,
+            repo_remote_url: Some("git@example.com:priorities.git".to_owned()),
         },
     )
     .await?;
@@ -471,7 +471,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
         CreateProductInput {
             name: "Live".to_owned(),
             description: None,
-            repo_remote_url: None,
+            repo_remote_url: Some("git@example.com:live.git".to_owned()),
         },
     )
     .await?;
@@ -555,7 +555,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
         CreateProductInput {
             name: "Sequenced".to_owned(),
             description: None,
-            repo_remote_url: None,
+            repo_remote_url: Some("git@example.com:sequenced.git".to_owned()),
         },
     )
     .await?;
@@ -619,7 +619,7 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
         CreateProductInput {
             name: "Bindable".to_owned(),
             description: None,
-            repo_remote_url: None,
+            repo_remote_url: Some("git@example.com:bindable.git".to_owned()),
         },
     )
     .await?;
@@ -1169,7 +1169,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
         CreateProductInput {
             name: "DepTest".to_owned(),
             description: None,
-            repo_remote_url: None,
+            repo_remote_url: Some("git@example.com:deptest.git".to_owned()),
         },
     )
     .await?;
@@ -1791,6 +1791,330 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
     // The rejected write must not have touched the row.
     let after_reject = resolve_project_design_doc(&mut client, &project.id).await?;
     assert!(matches!(after_reject.state, ProjectDesignDocState::NotSet));
+
+    Ok(())
+}
+
+/// Engine invariant: creating a task/chore under a single-repo product
+/// (product has `repo_remote_url`) without an override stores `NULL` in
+/// the task row. The engine must NOT materialise the product's repo into
+/// the task row — the dispatcher resolves it from the product at runtime.
+#[tokio::test]
+async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 1".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+        },
+    )
+    .await?;
+
+    let task = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Wire socket client".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+        },
+    )
+    .await?;
+    assert!(
+        task.repo_remote_url.is_none(),
+        "task under single-repo product must store NULL, not the product URL; got {:?}",
+        task.repo_remote_url,
+    );
+
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Trim stale work".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+        },
+    )
+    .await?;
+    assert!(
+        chore.repo_remote_url.is_none(),
+        "chore under single-repo product must store NULL, not the product URL; got {:?}",
+        chore.repo_remote_url,
+    );
+
+    Ok(())
+}
+
+/// Engine invariant: attempting to create a task/chore under a
+/// single-repo product WITH an explicit repo override is rejected. The
+/// engine returns a `WorkError` whose message matches the expected
+/// shape so the CLI can propagate it faithfully.
+#[tokio::test]
+async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 1".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+        },
+    )
+    .await?;
+
+    match client
+        .send_request(&FrontendRequest::CreateTask {
+            input: CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Override attempt".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
+                effort_level: None,
+                model_override: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("cannot set per-task repo override"),
+                "error should describe the invariant violation: {message}"
+            );
+            assert!(
+                message.contains("boss"),
+                "error should name the product slug: {message}"
+            );
+        }
+        other => return Err(unexpected_event("expected WorkError for task override rejection", other)),
+    }
+
+    // Same enforcement for chores.
+    match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Override chore attempt".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
+                effort_level: None,
+                model_override: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("cannot set per-task repo override"),
+                "chore: error should describe the invariant violation: {message}"
+            );
+        }
+        other => return Err(unexpected_event("expected WorkError for chore override rejection", other)),
+    }
+
+    Ok(())
+}
+
+/// Engine invariant: creating a task/chore under a no-repo product
+/// (product has no `repo_remote_url`) requires the caller to supply a
+/// repo override. When no override is given the engine rejects the
+/// insert with a `WorkError`.
+#[tokio::test]
+async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Greenfield".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 1".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+        },
+    )
+    .await?;
+
+    match client
+        .send_request(&FrontendRequest::CreateTask {
+            input: CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "No repo".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("no repo"),
+                "error should explain that a repo is required: {message}"
+            );
+        }
+        other => return Err(unexpected_event("expected WorkError for missing repo", other)),
+    }
+
+    // Same enforcement for chores.
+    match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "No repo chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("no repo"),
+                "chore: error should explain that a repo is required: {message}"
+            );
+        }
+        other => return Err(unexpected_event("expected WorkError for missing chore repo", other)),
+    }
+
+    Ok(())
+}
+
+/// Engine invariant: creating a task/chore under a no-repo product
+/// WITH an explicit override stores the override in the row.
+#[tokio::test]
+async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Greenfield".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 1".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+        },
+    )
+    .await?;
+
+    let task = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Repo override".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: Some("git@github.com:foo/service.git".to_owned()),
+            effort_level: None,
+            model_override: None,
+        },
+    )
+    .await?;
+    assert_eq!(
+        task.repo_remote_url.as_deref(),
+        Some("git@github.com:foo/service.git"),
+        "no-repo product: explicit override must be stored in the row",
+    );
+
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Chore with repo".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: Some("git@github.com:foo/other.git".to_owned()),
+            effort_level: None,
+            model_override: None,
+        },
+    )
+    .await?;
+    assert_eq!(
+        chore.repo_remote_url.as_deref(),
+        Some("git@github.com:foo/other.git"),
+        "no-repo product: explicit chore override must be stored in the row",
+    );
 
     Ok(())
 }

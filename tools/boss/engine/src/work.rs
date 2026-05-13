@@ -2475,8 +2475,9 @@ impl WorkDb {
         migrate_products_ci_attempt_budget(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
+        migrate_null_redundant_task_repo_remote_urls(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '8')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '9')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -2613,6 +2614,22 @@ impl WorkDb {
         apply_text_patch(&mut task.description, patch.description);
         apply_text_patch(&mut task.status, patch.status);
         apply_optional_patch(&mut task.pr_url, patch.pr_url);
+        // Reject non-empty repo override when the product has its own repo.
+        if let Some(ref repo_patch) = patch.repo_remote_url {
+            if !repo_patch.trim().is_empty() {
+                let product = query_product(&tx, &task.product_id)?
+                    .with_context(|| format!("orphan task {id}: parent product {} missing", task.product_id))?;
+                if let Some(product_repo) = product.repo_remote_url.as_deref() {
+                    bail!(
+                        "cannot set per-task repo override on product `{}`: \
+                         product has its own repo (`{}`). \
+                         Clear the product's repo first, or omit --repo to inherit.",
+                        product.slug,
+                        product_repo,
+                    );
+                }
+            }
+        }
         apply_repo_remote_url_patch(&mut task.repo_remote_url, patch.repo_remote_url);
         if let Some(priority_patch) = patch.priority {
             task.priority = normalize_priority(Some(&priority_patch))?;
@@ -4482,6 +4499,8 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
     ensure_product_exists(conn, &input.product_id)?;
     ensure_project_belongs_to_product(conn, &input.project_id, &input.product_id)?;
 
+    let product = query_product(conn, &input.product_id)?
+        .with_context(|| format!("missing product after existence check: {}", input.product_id))?;
     let id = next_id("task");
     let now = now_string();
     let ordinal = next_task_ordinal(conn, &input.project_id)?;
@@ -4489,7 +4508,7 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "task");
-    let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
+    let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
 
@@ -4505,13 +4524,15 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
 fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
 
+    let product = query_product(conn, &input.product_id)?
+        .with_context(|| format!("missing product after existence check: {}", input.product_id))?;
     let id = next_id("task");
     let now = now_string();
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "chore");
-    let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
+    let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
 
@@ -5508,6 +5529,32 @@ fn migrate_effort_escalations_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// NULL out `tasks.repo_remote_url` where the override simply mirrors
+/// the parent product's own repo. These rows were stamped incorrectly
+/// by the creation-time resolver (which used to materialise the product
+/// default into the task row instead of leaving it `NULL`).
+///
+/// Idempotent: rows already `NULL` are not touched; rows whose override
+/// genuinely differs from their product (legitimate multi-repo task
+/// overrides) are left unchanged.
+fn migrate_null_redundant_task_repo_remote_urls(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET repo_remote_url = NULL
+         WHERE repo_remote_url IS NOT NULL
+           AND id IN (
+               SELECT t.id
+               FROM tasks t
+               JOIN products p ON p.id = t.product_id
+               WHERE t.repo_remote_url IS NOT NULL
+                 AND p.repo_remote_url IS NOT NULL
+                 AND t.repo_remote_url = p.repo_remote_url
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Validate the `(execution_id, work_item_id)` discriminant on a
 /// `CreateAttentionItemInput` and return the canonical pair to write.
 /// Exactly one of the two must be set; both-set or neither-set is a
@@ -6259,6 +6306,45 @@ fn validate_design_doc_path(path: &str) -> Result<String> {
 /// already routes through this function.
 pub fn canonicalize_repo_remote_url(value: Option<String>) -> Option<String> {
     normalize_optional_text(value)
+}
+
+/// Enforce the repo-override invariant for task / chore inserts.
+///
+/// Rule: a task row carries `repo_remote_url` only when its parent
+/// product has **no** repo of its own (multi-repo products). When the
+/// product has a repo, the row must be `NULL`; the resolved repo is
+/// always the product's.
+///
+/// Returns the canonicalised URL to write, or `None` when the product
+/// owns the repo. Errors when the caller violates the invariant:
+///   - product has a repo AND caller supplied a non-empty override
+///   - product has no repo AND caller supplied no repo
+fn enforce_task_repo_invariant(
+    product: &Product,
+    input_repo: Option<String>,
+) -> Result<Option<String>> {
+    let canonicalized = canonicalize_repo_remote_url(input_repo);
+    if let Some(product_repo) = product.repo_remote_url.as_deref() {
+        if canonicalized.is_some() {
+            bail!(
+                "cannot set per-task repo override on product `{}`: \
+                 product has its own repo (`{}`). \
+                 Clear the product's repo first, or omit --repo to inherit.",
+                product.slug,
+                product_repo,
+            );
+        }
+        Ok(None)
+    } else {
+        match canonicalized {
+            Some(url) => Ok(Some(url)),
+            None => bail!(
+                "work item under product `{}` has no repo; \
+                 provide one via repo_remote_url (product has no default).",
+                product.slug,
+            ),
+        }
+    }
 }
 
 /// Per design Q3 (`tools/boss/docs/designs/multi-repo-work-modeling.md`):
@@ -11235,7 +11321,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         let _ = std::fs::remove_file(path);
     }
 
@@ -11415,7 +11501,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         let _ = std::fs::remove_file(path);
     }
 
@@ -11461,7 +11547,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
 
         let _ = std::fs::remove_file(path);
     }
@@ -11549,7 +11635,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
 
         let _ = std::fs::remove_file(path);
     }
@@ -12332,7 +12418,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
 
         // After migration we can also write a fresh `blocked` row
         // and re-backfill is still a no-op (the existing rows
@@ -13425,8 +13511,23 @@ mod tests {
                 autostart: false,
             })
             .unwrap();
-        let task = db
-            .create_task(CreateTaskInput {
+        // When the product has no repo, `create_task` now rejects a
+        // None override (multi-repo products require a row-level repo).
+        // These resolver tests need to probe pre-existing legacy rows
+        // that have both task and product repo = NULL, so we bypass the
+        // creation-time validation and insert directly via SQL.
+        let task_id = if product_repo.is_none() {
+            let conn = db.connect().unwrap();
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+                 VALUES (?1, ?2, ?3, 'project_task', 'Task', '', 'todo', 1, NULL, NULL, ?4, ?4, 0, 'medium', 'test')",
+                params![id, product.id, project.id, now],
+            ).unwrap();
+            id
+        } else {
+            db.create_task(CreateTaskInput {
                 product_id: product.id.clone(),
                 project_id: project.id.clone(),
                 name: "Task".to_owned(),
@@ -13438,15 +13539,16 @@ mod tests {
                 effort_level: None,
                 model_override: None,
             })
-            .unwrap();
-        (path, db, product.id, task.id)
+            .unwrap()
+            .id
+        };
+        (path, db, product.id, task_id)
     }
 
-    /// `create_task` doesn't yet persist the override (the
-    /// `update_task` / `update_chore` patch wiring is a separate
-    /// dispatch-wiring chore), so the resolver tests plant the value
-    /// directly. Using `db.connect()` keeps the WAL / busy-timeout
-    /// pragmas consistent with the helper's read path.
+    /// Resolver tests plant the override directly via SQL so they can
+    /// probe arbitrary combinations (including legacy rows that violate
+    /// the new invariant). Using `db.connect()` keeps the WAL /
+    /// busy-timeout pragmas consistent with the helper's read path.
     fn set_task_repo(db: &WorkDb, task_id: &str, value: Option<&str>) {
         let conn = db.connect().unwrap();
         conn.execute(
@@ -13957,6 +14059,98 @@ mod tests {
         assert!(chore_model.is_none());
         assert!(product_model.is_none());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Cleanup migration: rows where `tasks.repo_remote_url` mirrors the
+    /// parent product's repo get set to NULL; rows with a genuinely
+    /// divergent override (legitimate multi-repo task overrides) are
+    /// left unchanged.
+    #[test]
+    fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_divergent() {
+        let path = temp_db_path("migration-null-redundant-repos");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Product with repo_remote_url = "git@example.com:foo.git".
+        let product = db.create_product(CreateProductInput {
+            name: "Foo".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+        }).unwrap();
+        let project = db.create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Proj".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+        }).unwrap();
+
+        // Seed 3 chores that mirror the product's repo (the legacy bug).
+        // We bypass the API to plant the now-invalid state directly.
+        let mirrored_ids: Vec<String> = (0..3).map(|i| {
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url)
+                 VALUES (?1, ?2, NULL, 'chore', ?3, '', 'todo', NULL, NULL, NULL, ?4, ?4, 0, 'medium', 'test', 'git@example.com:foo.git')",
+                params![id, product.id, format!("chore-mirror-{i}"), now],
+            ).unwrap();
+            id
+        }).collect();
+
+        // Seed 1 chore with a legitimately different repo (multi-repo override).
+        let divergent_id = next_id("task");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url)
+             VALUES (?1, ?2, NULL, 'chore', 'divergent', '', 'todo', NULL, NULL, NULL, ?3, ?3, 0, 'medium', 'test', 'git@example.com:other.git')",
+            params![divergent_id, product.id, now],
+        ).unwrap();
+
+        // Also seed a task (with project_id) that mirrors the product's repo.
+        let mirrored_task_id = next_id("task");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url)
+             VALUES (?1, ?2, ?3, 'project_task', 'mirrored-task', '', 'todo', 5, NULL, NULL, ?4, ?4, 0, 'medium', 'test', 'git@example.com:foo.git')",
+            params![mirrored_task_id, product.id, project.id, now],
+        ).unwrap();
+
+        // Re-open the DB to trigger the migration.
+        drop(conn);
+        let db2 = WorkDb::open(path.clone()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        // All mirrored rows must now have repo_remote_url = NULL.
+        for id in &mirrored_ids {
+            let val: Option<String> = conn2.query_row(
+                "SELECT repo_remote_url FROM tasks WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            ).unwrap();
+            assert!(val.is_none(), "mirrored chore {id} must be NULL after migration, got {val:?}");
+        }
+        let mirrored_task_val: Option<String> = conn2.query_row(
+            "SELECT repo_remote_url FROM tasks WHERE id = ?1",
+            [&mirrored_task_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(mirrored_task_val.is_none(), "mirrored task must be NULL after migration, got {mirrored_task_val:?}");
+
+        // The divergent override must remain unchanged.
+        let divergent_val: Option<String> = conn2.query_row(
+            "SELECT repo_remote_url FROM tasks WHERE id = ?1",
+            [&divergent_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            divergent_val.as_deref(),
+            Some("git@example.com:other.git"),
+            "divergent override must survive migration unchanged",
+        );
+
+        drop(conn2);
         let _ = std::fs::remove_file(path);
     }
 }

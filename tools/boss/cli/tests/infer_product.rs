@@ -196,7 +196,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
         CreateProductInput {
             name: "Boss".to_owned(),
             description: None,
-            repo_remote_url: None,
+            repo_remote_url: Some("git@example.com:boss.git".to_owned()),
         },
     )
     .await?;

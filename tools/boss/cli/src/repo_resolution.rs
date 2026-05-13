@@ -91,6 +91,12 @@ pub fn run_chain(
 /// and takes the already-fetched [`Product`] so the caller's existing
 /// product-resolution path is reused.
 ///
+/// When the product has its own `repo_remote_url`, the new work item
+/// must NOT carry a row-level override — the engine resolves from the
+/// product at read time. In this case we return `Ok(None)` unless the
+/// caller supplied an explicit non-empty `--repo`, in which case we
+/// return an error.
+///
 /// Returns `Ok(None)` only when the deterministic chain whiffed *and*
 /// either `interactive == false` or the user skipped the interactive
 /// prompt. Callers should error out on `(false, None)` with a message
@@ -102,13 +108,30 @@ pub async fn resolve_repo_at_create_time(
     prompt_text: &str,
     interactive: bool,
 ) -> Result<Option<String>, CliError> {
+    // Single-repo product: the row must be NULL; the product's repo is
+    // resolved at dispatch time. Reject an explicit --repo override.
+    if let Some(product_repo) = product.repo_remote_url.as_deref() {
+        if explicit_flag.and_then(non_empty).is_some() {
+            return Err(CliError::usage(format!(
+                "cannot set per-task repo override on product `{}`: \
+                 product has its own repo (`{}`). \
+                 Clear the product's repo first, or omit --repo to inherit.",
+                product.slug,
+                product_repo,
+            )));
+        }
+        return Ok(None);
+    }
+
+    // Multi-repo product (no product default): run the full chain.
+
     // Short-circuit: explicit flag wins without touching the engine.
     if let Some(url) = explicit_flag.and_then(non_empty) {
         return Ok(Some(url.to_owned()));
     }
 
     let items = list_all_work_items_for_product(client, &product.id).await?;
-    let known_repos = collect_known_repos(product.repo_remote_url.as_deref(), &items);
+    let known_repos = collect_known_repos(None, &items);
     let recent_repo = recent_repo_for_product(&items);
 
     match run_chain(
@@ -116,7 +139,7 @@ pub async fn resolve_repo_at_create_time(
         prompt_text,
         &known_repos,
         recent_repo.as_deref(),
-        product.repo_remote_url.as_deref(),
+        None,
     ) {
         ChainOutcome::Resolved { url, .. } => Ok(Some(url)),
         ChainOutcome::AskOrFail => {
