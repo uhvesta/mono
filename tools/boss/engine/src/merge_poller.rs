@@ -1605,7 +1605,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.ci_flagged, 1, "first sweep must flip to ci_failure");
         assert_eq!(outcome.conflict_flagged, 0);
         match db.get_work_item(&chore).unwrap() {
@@ -1617,7 +1617,7 @@ mod tests {
         }
 
         // Pass 2: probe still reports the same failure.
-        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(
             outcome2.total_transitions(),
             0,
@@ -1630,7 +1630,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
-        let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome3.ci_cleared, 1, "next clean probe must retire");
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
@@ -1641,7 +1641,7 @@ mod tests {
         }
 
         // Pass 4: idempotent retire.
-        let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome4.total_transitions(), 0);
 
         // Event trail: blocked → resolved.

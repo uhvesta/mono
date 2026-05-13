@@ -1904,6 +1904,20 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Scheduler heartbeat: periodic `kick()` so a ready row stranded
+    // by a dropped wakeup (the `status_transition` → `request_recorded`
+    // stall class — see `exec_18af3ba5259d32a8_12`, 2026-05-13) is
+    // picked up within one interval instead of waiting for the 90s
+    // orphan-active reconciler. Logs a `warn!` when a stranded row is
+    // observed so an operator notices the dropped wakeup on the first
+    // occurrence rather than only inferring it from the redispatch
+    // event. PR #429's reconciler remains the safety net for execution
+    // rows whose worker has died — the heartbeat only re-kicks the
+    // scheduler, it does not abandon or insert rows.
+    let _scheduler_heartbeat_handle = server_state
+        .execution_coordinator
+        .spawn_scheduler_heartbeat(Duration::from_secs(15));
+
     // Watch in-flight dispatch timelines for stalled stages and emit
     // a `stage_stalled` event when one sits past the threshold
     // without progressing. Read-only against the per-execution

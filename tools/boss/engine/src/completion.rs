@@ -2477,7 +2477,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn merge_poller_recovers_missed_pr_open_for_waiting_human_execution() {
         use crate::merge_poller::{
-            MergeProbe, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState,
+            MergeProbe, OpenPrStatus, PrLifecycleProbe, PrLifecycleState,
         };
 
         // Fixture leaves the chore in `active` and the execution in
@@ -2515,8 +2515,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             async fn probe(&self, _: &str) -> anyhow::Result<PrLifecycleProbe> {
                 Ok(PrLifecycleProbe {
                     url: String::new(),
-                    state: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                    state: PrLifecycleState::Open(OpenPrStatus::clean()),
                     base_ref_oid: None,
+                    head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
                     labels: Vec::new(),
                 })
             }

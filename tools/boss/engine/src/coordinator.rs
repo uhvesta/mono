@@ -892,6 +892,108 @@ impl ExecutionCoordinator {
         });
     }
 
+    /// Spawn a background task that periodically wakes the scheduler and
+    /// surfaces a warning when a `ready` execution has been sitting in
+    /// the queue for longer than one heartbeat interval.
+    ///
+    /// Rationale. The dispatch happy path is: kanban drag → insert
+    /// `ready` execution → [`kick`] → `run_scheduler` picks the row up
+    /// and emits `request_recorded` within milliseconds. PR #345 closed
+    /// the canonical kick/drain TOCTOU by latching every kick into
+    /// [`scheduling_pending`], but a `ready` row that stalls at
+    /// `status_transition` (no follow-up `request_recorded`) was seen
+    /// in the wild — see `exec_18af3ba5259d32a8_12` (2026-05-13), which
+    /// sat for 131s before the 90s-age orphan-active reconciler
+    /// (PR #429) abandoned it and inserted a fresh redispatch.
+    ///
+    /// The heartbeat is a second line of defence, not a replacement for
+    /// either mechanism:
+    ///
+    /// * It calls [`kick`] regardless of the in-memory active flag, so
+    ///   any kick that was lost to a race the existing latching can't
+    ///   cover is re-issued within one interval. The scheduler still
+    ///   serializes drains through `scheduling_active`, so two
+    ///   schedulers can never run concurrently.
+    /// * When the heartbeat actually observes a stranded `ready` row
+    ///   (anything older than the interval), it logs a `warn!` line
+    ///   carrying the execution id so an operator sees the failure on
+    ///   the first occurrence instead of waiting for the orphan
+    ///   reconciler. "Fail loudly" was an explicit constraint of the
+    ///   reporting work item.
+    /// * PR #429's orphan-active reconciler stays intact: that path
+    ///   handles the harder case where the execution row itself is
+    ///   stale (worker dead, row claimed but not `ready`), which this
+    ///   heartbeat does NOT address.
+    pub fn spawn_scheduler_heartbeat(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            // Stagger startup so the first beat doesn't race the
+            // engine's own boot-time `kick()` (see `app.rs`).
+            tokio::time::sleep(interval).await;
+            let interval_ms = interval.as_millis() as u64;
+            loop {
+                let stranded = coordinator.stranded_ready_executions(interval_ms);
+                if !stranded.is_empty() {
+                    tracing::warn!(
+                        count = stranded.len(),
+                        oldest_age_ms = stranded
+                            .iter()
+                            .map(|(_, age_ms)| *age_ms)
+                            .max()
+                            .unwrap_or(0),
+                        execution_ids = ?stranded
+                            .iter()
+                            .map(|(id, _)| id.as_str())
+                            .collect::<Vec<_>>(),
+                        "scheduler heartbeat: ready execution(s) older than \
+                         the heartbeat interval found — kick/drain handoff \
+                         may have dropped a wakeup; re-kicking now",
+                    );
+                }
+                coordinator.kick();
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+
+    /// Return every `ready` execution whose `created_at` is older than
+    /// `min_age_ms` milliseconds ago, paired with its age in
+    /// milliseconds. Used by [`spawn_scheduler_heartbeat`] to surface
+    /// stranded rows; kept as a separate method so the heartbeat path
+    /// is testable without involving any timers.
+    fn stranded_ready_executions(&self, min_age_ms: u64) -> Vec<(String, u64)> {
+        let ready = match self.work_db.list_ready_executions() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "scheduler heartbeat: failed to list ready executions; skipping pass",
+                );
+                return Vec::new();
+            }
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff_ms = min_age_ms;
+        ready
+            .into_iter()
+            .filter_map(|exec| {
+                let created_at_secs: u64 = exec.created_at.parse().ok()?;
+                let age_ms = now_secs.saturating_sub(created_at_secs).saturating_mul(1000);
+                if age_ms >= cutoff_ms {
+                    Some((exec.id, age_ms))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Skip-the-queue dispatch for `bossctl agents launch`. Looks the
     /// execution up directly, claims a worker via
     /// `WorkerPool::claim_worker_force` (which grows the pool by one
@@ -5561,6 +5663,135 @@ mod tests {
         assert_eq!(
             beats_final, beats_after_drop_snapshot,
             "heartbeat must stop firing after the guard is dropped",
+        );
+    }
+
+    /// Regression for `exec_18af3ba5259d32a8_12` (2026-05-13): a `ready`
+    /// execution row that misses its scheduler wakeup sits at
+    /// `status_transition` until the 90s-age orphan-active reconciler
+    /// rescues it. With the heartbeat installed, the same stranded row
+    /// reaches a worker within one heartbeat interval — no abandon /
+    /// redispatch needed.
+    ///
+    /// The test simulates the failure mode by inserting a `ready` row
+    /// without calling `kick()`, then spawning the heartbeat with a
+    /// short interval. The heartbeat must observe the stranded row
+    /// (the "fail loudly" surface for operators) and re-kick so the
+    /// scheduler drains it.
+    #[tokio::test]
+    async fn heartbeat_rekicks_when_ready_row_was_orphaned_by_a_dropped_kick() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stranded by lost wakeup".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        // Inserts a `ready` execution row but does NOT call `kick()`.
+        // This mirrors the post-mortem evidence: the row exists, the
+        // status_transition event was written, but no scheduler ever
+        // picked the row up.
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+
+        // Confirm the precondition: the row is `ready` and no scheduler
+        // is running. (No `kick()` has been called.)
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            "ready",
+            "precondition: row must be `ready` before the heartbeat fires",
+        );
+
+        // Install the heartbeat with a short interval so the test
+        // doesn't have to sleep for 15s of production cadence. The
+        // heartbeat's startup-stagger sleep also uses this interval.
+        let _handle = coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
+
+        // Within a few intervals the heartbeat should kick the
+        // scheduler, drain the row, and move it through to
+        // `waiting_human` via the fake runner.
+        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+    }
+
+    /// `stranded_ready_executions` is the read-side helper the heartbeat
+    /// uses to surface dropped-wakeup symptoms. This test pins its
+    /// contract directly so the heartbeat's `warn!` line is asserted on
+    /// without depending on timer behaviour: a row younger than the
+    /// configured threshold is invisible to the helper; once the row
+    /// crosses the threshold it appears with its actual age.
+    #[tokio::test]
+    async fn stranded_ready_executions_only_returns_rows_past_the_threshold() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Age boundary".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+
+        // Threshold far in the future: the freshly-inserted row is too
+        // young to count as stranded.
+        let fresh = coordinator.stranded_ready_executions(60_000);
+        assert!(
+            fresh.is_empty(),
+            "row younger than the threshold must not be flagged as stranded: {fresh:?}",
+        );
+
+        // Threshold of zero: any ready row should appear. The
+        // execution we just inserted is in the queue with age >= 0.
+        let any = coordinator.stranded_ready_executions(0);
+        assert!(
+            any.iter().any(|(id, _)| id == &execution_id),
+            "with min_age_ms=0 the helper must surface the freshly-inserted ready row; \
+             got {any:?}",
         );
     }
 }
