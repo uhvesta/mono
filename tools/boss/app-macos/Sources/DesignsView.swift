@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import SwiftUI
 import Textual
@@ -438,11 +437,19 @@ private struct MarkdownDocumentView: View {
     }
 }
 
-/// Stand-alone scrolling viewer used by `MarkdownViewerWindowController`
-/// to render long task / chore descriptions in their own window. The
-/// chrome matches `MarkdownDocumentView` so the popover's "Read full
-/// description" affordance lands the reader in a layout that visually
-/// mirrors the Designs file viewer.
+/// Payload passed to the `"markdown-viewer"` WindowGroup scene via
+/// `openWindow(id:value:)`. Codable for state restoration; Hashable so
+/// macOS can track one window per unique title+markdown pair.
+struct MarkdownViewerContent: Codable, Hashable {
+    let title: String
+    let markdown: String
+}
+
+/// Stand-alone scrolling viewer for long task / chore descriptions.
+/// Rendered inside the `"markdown-viewer"` WindowGroup scene. The
+/// chrome matches `MarkdownDocumentView` so the "Read full description"
+/// affordance lands in a layout that visually mirrors the Designs file
+/// viewer.
 struct MarkdownViewerView: View {
     let title: String
     let source: String
@@ -465,45 +472,3 @@ struct MarkdownViewerView: View {
     }
 }
 
-/// Owns the NSWindows hosting `MarkdownViewerView`. macOS deallocates
-/// non-document windows immediately on close by default — we set
-/// `isReleasedWhenClosed = false` and hold strong references here so
-/// the SwiftUI view tree survives until the user dismisses the
-/// window, then drop the reference in `windowWillClose` so it doesn't
-/// leak.
-@MainActor
-final class MarkdownViewerWindowController: NSObject, NSWindowDelegate {
-    static let shared = MarkdownViewerWindowController()
-
-    private var openWindows: [NSWindow] = []
-
-    private override init() {
-        super.init()
-    }
-
-    func present(title: String, markdown: String) {
-        let content = MarkdownViewerView(title: title, source: markdown)
-        let hosting = NSHostingView(rootView: content)
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 640),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = title
-        window.contentView = hosting
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-
-        openWindows.append(window)
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        openWindows.removeAll { $0 === window }
-    }
-}
