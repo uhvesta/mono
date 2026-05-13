@@ -603,6 +603,13 @@ pub struct SweepOutcome {
     /// re-emitted. Covers the engine-restart / worker-die gap where
     /// no normal sweep would otherwise rescue the attempt.
     pub conflict_redispatched: usize,
+    /// Number of `waiting_human` executions where this sweep ran a
+    /// recheck but the detector still did not resolve a bindable PR
+    /// (returned `None`, `Stale`, `EmptyDiff`, or errored). Mirrors
+    /// the info-level log in `sweep_pending_pr` so callers (and tests)
+    /// can assert the recheck path actually reached the executions in
+    /// its candidate list, even when no transition fired.
+    pub pr_recheck_unresolved: usize,
 }
 
 impl SweepOutcome {
@@ -759,12 +766,35 @@ async fn sweep_pending_pr(
             );
         }
         // Quiet branches — still no PR, transient detector failure,
-        // or the execution moved on between list and recheck.
-        StopOutcome::AwaitingInput
+        // or the execution moved on between list and recheck. Log at
+        // info so a worker stuck in `waiting_human` with `pr_url=null`
+        // leaves a breadcrumb on every sweep instead of failing
+        // silently. Without this, the 2026-05-13 three-concurrent-
+        // workers regression (where Worf/Crusher/Troi pushed real PRs
+        // but the engine never bound them) had zero engine-log
+        // evidence — the merge poller was running, the candidate query
+        // listed the executions, but the recheck loop's silent return
+        // hid the fact that `detect_pr` was returning Stale/None on
+        // every pass.
+        quiet @ (StopOutcome::AwaitingInput
         | StopOutcome::DetectorFailed
         | StopOutcome::StalePr { .. }
-        | StopOutcome::EmptyDiffPr { .. }
-        | StopOutcome::AlreadyTerminal
+        | StopOutcome::EmptyDiffPr { .. }) => {
+            outcome.pr_recheck_unresolved += 1;
+            tracing::info!(
+                execution_id,
+                outcome = ?quiet,
+                "merge poller: PR-detection recheck did not resolve this pass — \
+                 worker still listed as waiting_human with no `pr_url`; \
+                 will retry on next sweep (see `pr_detect:` log above for \
+                 the underlying detector classification)",
+            );
+        }
+        // These four are genuinely silent — the execution moved on
+        // between `list` and `recheck` (raced with on-Stop / manual
+        // intervention) or hit a transient DB error. No log on these:
+        // they're not stuck-worker indicators.
+        StopOutcome::AlreadyTerminal
         | StopOutcome::UnknownExecution
         | StopOutcome::NoWorkspace
         | StopOutcome::DbError => {}
@@ -963,7 +993,7 @@ pub fn spawn_loop(
                 Some(completion_handler.as_ref()),
             )
             .await;
-            if outcome.total_transitions() > 0 {
+            if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
                     conflict_flagged = outcome.conflict_flagged,
@@ -972,6 +1002,7 @@ pub fn spawn_loop(
                     ci_flagged = outcome.ci_flagged,
                     ci_cleared = outcome.ci_cleared,
                     pr_recheck_recovered = outcome.pr_recheck_recovered,
+                    pr_recheck_unresolved = outcome.pr_recheck_unresolved,
                     "merge poller: sweep transitions",
                 );
             }
