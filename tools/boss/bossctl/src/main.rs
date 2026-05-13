@@ -56,8 +56,13 @@ enum Command {
         #[command(subcommand)]
         action: AgentsAction,
     },
-    /// Inject a probe prompt that a worker answers on its next Stop
-    /// boundary; the reply is observed via the worker's transcript.
+    /// Inject a probe prompt into a worker. By default the probe is
+    /// queued and delivered on the worker's next Stop boundary. With
+    /// `--urgent`, the probe is delivered at the next tool-call
+    /// boundary (PostToolUse) so the coordinator can redirect a
+    /// mid-task worker without waiting for it to finish its current
+    /// turn. The engine always waits for any in-flight tool call to
+    /// return before injecting, so no work is discarded.
     Probe {
         /// Worker reference: run id, slot id, or crew name (e.g.
         /// `Riker`). Crew names resolve only over currently-live
@@ -65,6 +70,13 @@ enum Command {
         agent: String,
         /// Probe text the worker will see as its next prompt.
         text: String,
+        /// Deliver the probe at the next tool-call boundary
+        /// (PostToolUse) instead of the next Stop boundary. Urgent
+        /// probes jump ahead of any queued non-urgent probes and are
+        /// prefixed with `[coordinator-nudge]` in the transcript so
+        /// the worker and human readers can identify them.
+        #[arg(long)]
+        urgent: bool,
     },
     /// Work-item dispatch aliases for symmetry with `boss`.
     Work {
@@ -269,8 +281,8 @@ fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Probe { agent, text } => {
-            probe_run(&cli.socket_path, cli.json, agent, text).await
+        Command::Probe { agent, text, urgent } => {
+            probe_run(&cli.socket_path, cli.json, agent, text, urgent).await
         }
         Command::Agents {
             action: AgentsAction::Status { agent },
@@ -672,6 +684,7 @@ async fn probe_run(
     json: bool,
     agent: String,
     text: String,
+    urgent: bool,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -680,19 +693,25 @@ async fn probe_run(
         .send_request(&FrontendRequest::ProbeRun {
             run_id: run_id.clone(),
             text,
+            urgent,
         })
         .await
         .context("sending ProbeRun")?;
     match response {
-        FrontendEvent::ProbeQueued { run_id: returned, probe_id } => {
+        FrontendEvent::ProbeQueued { run_id: returned, probe_id, urgent: is_urgent } => {
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "status": "queued",
+                        "status": if is_urgent { "urgent" } else { "queued" },
                         "run_id": returned,
                         "probe_id": probe_id,
+                        "urgent": is_urgent,
                     })
+                );
+            } else if is_urgent {
+                println!(
+                    "urgent probe queued for run {returned} (probe_id={probe_id}); will inject at next tool boundary"
                 );
             } else {
                 println!("probe queued for run {returned} (probe_id={probe_id})");

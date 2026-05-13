@@ -201,8 +201,8 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         };
         // Completion-driven probes don't need the minted id — only
         // the human-driven `ProbeRun` RPC surfaces it back to the
-        // caller. Discard it here.
-        let _ = server.queue_probe(run_id.to_owned(), text.to_owned());
+        // caller. Discard it here. Completion probes are never urgent.
+        let _ = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
     }
 }
 
@@ -211,6 +211,10 @@ impl ProbeQueuer for ServerStateProbeQueuer {
 struct PendingProbe {
     probe_id: String,
     text: String,
+    /// When `true`, dispatch at the next `PostToolUse` boundary
+    /// rather than waiting for the next `Stop`. Urgent probes are
+    /// always inserted at the front of the per-run queue.
+    urgent: bool,
 }
 
 /// One probe that has been written into the worker's pane and is
@@ -970,22 +974,31 @@ impl ServerState {
         *self.boss_pid.lock().expect("boss_pid mutex poisoned")
     }
 
-    /// Push probe text onto the FIFO for `run_id`, mint a fresh
+    /// Push probe text onto the queue for `run_id`, mint a fresh
     /// `probe_id`, and return it so the caller can correlate the
     /// queued probe with the eventual `FrontendEvent::ProbeReplied`
-    /// push. Multiple probes for the same run queue in order; the
-    /// events-socket consumer pops one per `Stop` hook event.
-    pub fn queue_probe(&self, run_id: String, text: String) -> String {
+    /// push. Non-urgent probes append to the back (FIFO); urgent
+    /// probes push to the front so they fire before any queued
+    /// non-urgent probes. The events-socket consumer delivers one
+    /// probe per `Stop` event (non-urgent) or per `PostToolUse`
+    /// event (urgent).
+    pub fn queue_probe(&self, run_id: String, text: String, urgent: bool) -> String {
         let probe_id = self.allocate_probe_id();
-        self.pending_probes
+        let probe = PendingProbe {
+            probe_id: probe_id.clone(),
+            text,
+            urgent,
+        };
+        let mut guard = self
+            .pending_probes
             .lock()
-            .expect("pending_probes mutex poisoned")
-            .entry(run_id)
-            .or_default()
-            .push_back(PendingProbe {
-                probe_id: probe_id.clone(),
-                text,
-            });
+            .expect("pending_probes mutex poisoned");
+        let queue = guard.entry(run_id).or_default();
+        if urgent {
+            queue.push_front(probe);
+        } else {
+            queue.push_back(probe);
+        }
         probe_id
     }
 
@@ -2184,6 +2197,12 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 &incoming.event,
                             );
                             dispatch_live_worker_state(&server_state, &incoming).await;
+                            // Urgent probes fire on PostToolUse so
+                            // the coordinator can redirect a worker
+                            // mid-task without waiting for Stop. The
+                            // tool call has already returned at this
+                            // point, so no in-flight work is lost.
+                            dispatch_urgent_probe_on_post_tool_use(&server_state, &incoming).await;
                             // ProbeReplied runs *before* dispatch so a
                             // single Stop never both fires the reply
                             // for the prior probe and the dispatch of
@@ -2511,6 +2530,89 @@ async fn dispatch_probe_on_stop(
             // the same probe id — callers waiting on the matching
             // `ProbeReplied` event must not see their id silently
             // reissued.
+            server_state.requeue_probe_front(run_id.to_owned(), probe);
+        }
+    }
+}
+
+/// On the `PostToolUse` boundary, check whether the front probe in the
+/// per-run queue is urgent. If so, pop it and dispatch it immediately
+/// via `SendToPane`, prefixing the text with `[coordinator-nudge]` so
+/// the worker and human readers can identify coordinator-injected
+/// urgent text. The tool call has already completed at this point, so
+/// no in-flight Bash is cancelled. On failure the probe is pushed back
+/// to the front so the next `PostToolUse` retries with the same id.
+///
+/// Non-urgent probes are ignored here; they wait for `dispatch_probe_on_stop`.
+async fn dispatch_urgent_probe_on_post_tool_use(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::protocol::{EngineToAppRequest, SendToPaneInput, WorkerEvent};
+    let WorkerEvent::PostToolUse { .. } = incoming.event else {
+        return;
+    };
+    let Some(run_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+    // Peek at the front probe and pop it only if it's urgent.
+    // The lock must be released before any async call.
+    let probe = {
+        let mut guard = server_state
+            .pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned");
+        let Some(queue) = guard.get_mut(run_id) else {
+            return;
+        };
+        if !queue.front().map(|p| p.urgent).unwrap_or(false) {
+            return;
+        }
+        let probe = queue.pop_front().unwrap();
+        if queue.is_empty() {
+            guard.remove(run_id);
+        }
+        probe
+    };
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        tracing::warn!(
+            run_id,
+            "urgent probe ready but no slot mapping; dropping probe",
+        );
+        return;
+    };
+    let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
+    let marked_text = format!("[coordinator-nudge] {}", probe.text);
+    let request = EngineToAppRequest::SendToPane(SendToPaneInput {
+        slot_id,
+        text: marked_text,
+    });
+    match server_state
+        .send_to_app(request, Duration::from_secs(5))
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                "urgent probe injected at tool boundary",
+            );
+            server_state.note_probe_dispatched(
+                run_id.to_owned(),
+                probe.probe_id,
+                transcript_path,
+                offset_bytes,
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                "urgent probe injection failed; pushing back onto queue",
+            );
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
@@ -3779,7 +3881,7 @@ async fn handle_frontend_connection(
                     .deliver_app_response(&session_id, &response_request_id, response)
                     .await;
             }
-            FrontendRequest::ProbeRun { run_id, text } => {
+            FrontendRequest::ProbeRun { run_id, text, urgent } => {
                 // `bossctl probe` is a coordinator-essential verb (the
                 // coordinator contract names probing as the right tool
                 // for low-confidence handoffs). The earlier BossOnly
@@ -3804,9 +3906,13 @@ async fn handle_frontend_connection(
                     );
                     continue;
                 }
-                let probe_id = server_state.queue_probe(run_id.clone(), text);
-                tracing::info!(run_id = %run_id, probe_id = %probe_id, "probe queued");
-                send_response(&sink, &request_id, FrontendEvent::ProbeQueued { run_id, probe_id });
+                let probe_id = server_state.queue_probe(run_id.clone(), text, urgent);
+                tracing::info!(run_id = %run_id, probe_id = %probe_id, urgent, "probe queued");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::ProbeQueued { run_id, probe_id, urgent },
+                );
             }
             FrontendRequest::StopRun { run_id } => {
                 // `bossctl agents stop` is the coordinator superset's
@@ -6617,8 +6723,8 @@ mod tests {
     #[test]
     fn queue_probe_mints_unique_probe_ids() {
         let server_state = test_server_state();
-        let id_one = server_state.queue_probe("run-x".into(), "first".into());
-        let id_two = server_state.queue_probe("run-x".into(), "second".into());
+        let id_one = server_state.queue_probe("run-x".into(), "first".into(), false);
+        let id_two = server_state.queue_probe("run-x".into(), "second".into(), false);
         assert_ne!(id_one, id_two, "probe ids must be unique per call");
         assert!(id_one.starts_with("probe-"));
         assert!(id_two.starts_with("probe-"));
@@ -6793,7 +6899,7 @@ mod tests {
 
         // Queue a probe and pull the minted probe_id back out of the
         // queue head so we can assert it threads through to ProbeReplied.
-        let probe_id = server_state.queue_probe(run.id.clone(), "what now?".into());
+        let probe_id = server_state.queue_probe(run.id.clone(), "what now?".into(), false);
 
         // Fire the first Stop boundary. This dispatches the probe to
         // the (fake) app session and records the in-flight entry.

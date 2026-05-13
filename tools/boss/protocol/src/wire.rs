@@ -222,16 +222,31 @@ pub enum FrontendRequest {
         request_id: String,
         response: EngineToAppResponse,
     },
-    /// Boss-tier RPC: queue a probe prompt for `run_id`. The engine
-    /// holds the text until the next `Stop` hook event for that run,
-    /// then writes it into the worker's pty as if it were typed by
-    /// the user. Returns immediately with a `ProbeQueued` event
-    /// carrying the engine-minted `probe_id`; the worker's reply is
-    /// surfaced asynchronously via [`FrontendEvent::ProbeReplied`] on
-    /// the [`probe_topic`] for `run_id`.
+    /// Boss-tier RPC: queue a probe prompt for `run_id`. By default
+    /// the engine holds the text until the next `Stop` hook event for
+    /// that run, then writes it into the worker's pty as if it were
+    /// typed by the user. When `urgent` is `true`, the engine delivers
+    /// the probe at the next `PostToolUse` boundary instead — after the
+    /// current tool call finishes (so no in-flight Bash is cancelled)
+    /// but before the worker starts its next tool call. Urgent probes
+    /// are pushed to the front of the per-run queue so they always
+    /// land before any queued non-urgent probes. Returns immediately
+    /// with a `ProbeQueued` event carrying the engine-minted `probe_id`;
+    /// the worker's reply is surfaced asynchronously via
+    /// [`FrontendEvent::ProbeReplied`] on the [`probe_topic`] for
+    /// `run_id`. Urgent probes are prefixed with `[coordinator-nudge]`
+    /// in the transcript so the worker and human readers can identify
+    /// coordinator-injected text.
     ProbeRun {
         run_id: String,
         text: String,
+        /// When `true`, deliver at the next tool-call boundary
+        /// (PostToolUse) rather than the next Stop boundary. The
+        /// engine waits for any in-flight tool call to return before
+        /// injecting, so no work is discarded. Omit or set to `false`
+        /// for the original queue-for-Stop behaviour.
+        #[serde(default)]
+        urgent: bool,
     },
     /// Boss-tier RPC: tear down the libghostty pane hosting `run_id`
     /// and release the cube workspace its execution still holds.
@@ -602,10 +617,17 @@ pub enum FrontendEvent {
     /// engine-minted `probe_id` lets callers correlate a queued probe
     /// with the eventual [`FrontendEvent::ProbeReplied`] push, which
     /// arrives on the [`probe_topic`] for `run_id` once the worker's
-    /// follow-up Stop boundary lands.
+    /// follow-up Stop boundary lands. `urgent` echoes the flag from
+    /// the originating [`FrontendRequest::ProbeRun`] call so the
+    /// caller can confirm the delivery semantics that were accepted.
     ProbeQueued {
         run_id: String,
         probe_id: String,
+        /// Echoes the `urgent` flag from the originating `ProbeRun`
+        /// request. When `true`, the probe will be delivered at the
+        /// next `PostToolUse` boundary rather than the next `Stop`.
+        #[serde(default)]
+        urgent: bool,
     },
     /// Push: the worker for `run_id` has replied to a previously
     /// dispatched probe. Emitted on the Stop boundary that follows
