@@ -341,7 +341,7 @@ async fn project_show_hash_prefixed_short_id() -> Result<()> {
 
 // ── wrong-kind errors ────────────────────────────────────────────────────────
 
-/// `boss chore show 42` when #42 is a project_task → error naming `boss task show`.
+/// `boss chore show 42` when T42 is a project_task → error naming `boss task show`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chore_show_wrong_kind_task_names_correct_verb() -> Result<()> {
     let engine = TestEngine::spawn().await?;
@@ -360,8 +360,8 @@ async fn chore_show_wrong_kind_task_names_correct_verb() -> Result<()> {
         "expected error to suggest `boss task show`, got: {stderr}"
     );
     assert!(
-        stderr.contains(&format!("#{short_id}")),
-        "expected error to mention #{short_id}, got: {stderr}"
+        stderr.contains(&format!("T{short_id}")),
+        "expected error to mention T{short_id}, got: {stderr}"
     );
     Ok(())
 }
