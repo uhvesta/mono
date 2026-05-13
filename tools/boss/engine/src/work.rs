@@ -2798,6 +2798,9 @@ impl WorkDb {
             };
         }
         apply_optional_string_patch(&mut task.model_override, patch.model_override);
+        if let Some(autostart) = patch.autostart {
+            task.autostart = autostart;
+        }
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
         }
@@ -2814,7 +2817,7 @@ impl WorkDb {
             "UPDATE tasks
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
                  priority = ?9, repo_remote_url = ?10,
-                 effort_level = ?11, model_override = ?12,
+                 effort_level = ?11, model_override = ?12, autostart = ?13,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
              WHERE id = ?1",
             params![
@@ -2830,6 +2833,7 @@ impl WorkDb {
                 task.repo_remote_url,
                 effort_level_value,
                 task.model_override,
+                task.autostart as i64,
             ],
         )?;
 

@@ -1611,6 +1611,18 @@ final class ChatViewModel: ObservableObject {
     func attemptMoveTask(_ taskID: String, to column: WorkBoardColumnKey) -> Bool {
         guard let task = task(withID: taskID) else { return false }
         let targetStatus = column.targetStatus
+
+        // Dispatch-pending rows (status=todo, autostart=true) show in the
+        // Doing column but their status is already "todo" — same as Backlog's
+        // targetStatus. The normal status-equality guard would silently refuse
+        // the drop. Instead, accept Doing→Backlog for these rows and flip
+        // autostart=false; lane routing then moves the card to Backlog.
+        let isDispatchPending = task.status == "todo" && task.autostart
+        if isDispatchPending && column == .backlog {
+            engine.sendUpdateWorkItem(id: task.id, patch: ["autostart": false])
+            return true
+        }
+
         guard task.status != targetStatus else { return false }
 
         if task.status == "blocked",
