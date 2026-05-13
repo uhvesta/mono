@@ -357,6 +357,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 extra_env: vec![],
                 title_summary,
                 work_item_binding,
+                model: spawn_config.model.clone(),
             },
             StdDuration::from_secs(30),
         )
