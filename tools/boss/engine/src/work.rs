@@ -146,7 +146,7 @@ impl WorkDb {
         // so the dispatcher picks it up before the project's own
         // tasks (which start at `ordinal = 1` per the
         // task-creation default).
-        insert_design_task_for_project_in_tx(&tx, &input.product_id, &id, input.autostart)?;
+        insert_design_task_for_project_in_tx(&tx, &input.product_id, &id, &input.name, input.autostart)?;
 
         let project = query_project(&tx, &id)?
             .with_context(|| format!("missing project after insert: {id}"))?;
@@ -4009,15 +4009,17 @@ fn insert_design_task_for_project_in_tx(
     conn: &Connection,
     product_id: &str,
     project_id: &str,
+    project_name: &str,
     autostart: bool,
 ) -> Result<Task> {
     let id = next_id("task");
     let now = now_string();
     let autostart_value: i64 = if autostart { 1 } else { 0 };
+    let name = format!("Design {project_name}");
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
-         VALUES (?1, ?2, ?3, 'design', 'Design', '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6)",
-        params![id, product_id, project_id, now, autostart_value, CREATED_VIA_ENGINE_AUTO],
+         VALUES (?1, ?2, ?3, 'design', ?7, '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6)",
+        params![id, product_id, project_id, now, autostart_value, CREATED_VIA_ENGINE_AUTO, name],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))
 }
@@ -9061,14 +9063,14 @@ mod tests {
             .unwrap();
 
         // The project comes with a `kind = 'design'` task already
-        // attached, named "Design" and parked at `ordinal = 0` so it
+        // attached, named "Design <project name>" and parked at `ordinal = 0` so it
         // sorts first in the project's chain.
         let tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
         let design = tasks
             .iter()
             .find(|t| t.kind == "design")
             .expect("project should have an auto-created design task");
-        assert_eq!(design.name, "Design");
+        assert_eq!(design.name, "Design Engine dispatch instrumentation");
         assert_eq!(design.status, "todo");
         assert_eq!(design.ordinal, Some(0));
         assert_eq!(design.project_id.as_deref(), Some(project.id.as_str()));
