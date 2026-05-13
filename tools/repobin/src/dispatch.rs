@@ -95,7 +95,16 @@ fn plan_from_target<B: BazelAdapter>(
     let executable_path = bazel.resolve_executable(repo_root, target)?;
 
     if let Some(root) = cache_root {
-        if let Err(error) = dispatch_cache::record_in(root, repo_root, target, &executable_path) {
+        let source_files = match bazel.resolve_source_files(repo_root, target) {
+            Ok(files) => files,
+            Err(error) => {
+                trace(format_args!("dispatch-cache source query failed: {error}"));
+                Vec::new()
+            }
+        };
+        if let Err(error) =
+            dispatch_cache::record_in(root, repo_root, target, &executable_path, &source_files)
+        {
             trace(format_args!("dispatch-cache record failed: {error}"));
         }
     }
@@ -145,6 +154,7 @@ mod tests {
         builds: RefCell<Vec<(PathBuf, String)>>,
         queries: RefCell<Vec<(PathBuf, String)>>,
         executable: PathBuf,
+        source_files: Vec<PathBuf>,
     }
 
     impl BazelAdapter for FakeBazel {
@@ -164,6 +174,14 @@ mod tests {
                 .borrow_mut()
                 .push((repo_root.to_path_buf(), target.to_string()));
             Ok(self.executable.clone())
+        }
+
+        fn resolve_source_files(
+            &self,
+            _repo_root: &Path,
+            _target: &str,
+        ) -> Result<Vec<PathBuf>, crate::app::RepobinError> {
+            Ok(self.source_files.clone())
         }
     }
 
@@ -389,5 +407,77 @@ mod tests {
         }
         assert_eq!(bazel.builds.borrow().len(), 3);
         assert_eq!(bazel.queries.borrow().len(), 3);
+    }
+
+    #[test]
+    fn source_change_invalidates_dispatch_cache_no_bazel_on_hit() {
+        // Regression for: .rs edits with BUILD.bazel unchanged must miss the cache,
+        // and a back-to-back dispatch after rebuild must NOT invoke bazel again.
+        let temp = TempDir::new().unwrap();
+        let cache_root = temp.path().join("cache");
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/boss/cli:boss";
+        let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
+        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
+        let src = repo_root.join("tools/boss/cli/src/main.rs");
+
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(build.parent().unwrap()).unwrap();
+        fs::write(&build, b"rust_binary(...)\n").unwrap();
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, b"fn main() {}\n").unwrap();
+
+        let bazel = FakeBazel {
+            executable: exe.clone(),
+            source_files: vec![src.clone()],
+            ..FakeBazel::default()
+        };
+
+        // Cold dispatch: triggers build + cquery + source query.
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
+            .expect("cold plan");
+        assert_eq!(bazel.builds.borrow().len(), 1, "cold: one bazel build");
+
+        // Warm dispatch: no source change → must not call bazel.
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
+            .expect("warm plan");
+        assert_eq!(
+            bazel.builds.borrow().len(),
+            1,
+            "warm hit must not invoke bazel build"
+        );
+        assert_eq!(
+            bazel.queries.borrow().len(),
+            1,
+            "warm hit must not invoke bazel cquery"
+        );
+
+        // Source file mtime advances (simulates editing a .rs file; BUILD.bazel untouched).
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        // Dispatch after source change: must miss and rebuild.
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
+            .expect("invalidated plan");
+        assert_eq!(
+            bazel.builds.borrow().len(),
+            2,
+            "source change with unchanged BUILD.bazel must trigger bazel rebuild"
+        );
+
+        // Immediately after rebuild: warm hit again, no extra bazel call.
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
+            .expect("re-warm plan");
+        assert_eq!(
+            bazel.builds.borrow().len(),
+            2,
+            "dispatch right after rebuild must be a cache hit"
+        );
     }
 }

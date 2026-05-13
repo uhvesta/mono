@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app::RepobinError;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_SUBDIR: &str = "dispatch";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,12 +64,13 @@ pub fn record_in(
     repo_root: &Path,
     target: &str,
     executable_path: &Path,
+    source_files: &[PathBuf],
 ) -> Result<(), RepobinError> {
     let Some(binary_mtime_ns) = mtime_ns(executable_path) else {
         return Ok(());
     };
 
-    let build_witnesses = build_witnesses_for(repo_root, target);
+    let build_witnesses = build_witnesses_for(repo_root, target, source_files);
 
     let cache = CacheFile {
         version: CACHE_VERSION,
@@ -98,21 +99,31 @@ pub fn record_in(
     write_atomic(&entry_path, &serialized)
 }
 
-fn build_witnesses_for(repo_root: &Path, target: &str) -> Vec<BuildWitness> {
-    let Some(package_dir) = package_dir_for(target) else {
-        return Vec::new();
-    };
-    let dir = repo_root.join(package_dir);
+fn build_witnesses_for(repo_root: &Path, target: &str, source_files: &[PathBuf]) -> Vec<BuildWitness> {
     let mut out = Vec::new();
-    for candidate in ["BUILD.bazel", "BUILD"] {
-        let path = dir.join(candidate);
-        if let Some(mtime_ns) = mtime_ns(&path) {
+
+    if let Some(package_dir) = package_dir_for(target) {
+        let dir = repo_root.join(package_dir);
+        for candidate in ["BUILD.bazel", "BUILD"] {
+            let path = dir.join(candidate);
+            if let Some(mtime_ns) = mtime_ns(&path) {
+                out.push(BuildWitness {
+                    path: path.to_string_lossy().into_owned(),
+                    mtime_ns,
+                });
+            }
+        }
+    }
+
+    for path in source_files {
+        if let Some(mtime_ns) = mtime_ns(path) {
             out.push(BuildWitness {
                 path: path.to_string_lossy().into_owned(),
                 mtime_ns,
             });
         }
     }
+
     out
 }
 
@@ -175,6 +186,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), RepobinError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     use tempfile::TempDir;
@@ -232,7 +244,7 @@ mod tests {
         touch(&exe, "binary");
         touch(&build, "rust_binary(...)");
 
-        record_in(&cache_root, &repo_root, target, &exe).expect("record");
+        record_in(&cache_root, &repo_root, target, &exe, &[]).expect("record");
 
         let hit = lookup_in(&cache_root, &repo_root, target).expect("hit");
         assert_eq!(hit, exe);
@@ -249,7 +261,7 @@ mod tests {
 
         touch(&exe, "binary");
         touch(&build, "rust_binary(...)");
-        record_in(&cache_root, &repo_root, target, &exe).expect("record");
+        record_in(&cache_root, &repo_root, target, &exe, &[]).expect("record");
 
         fs::remove_file(&exe).unwrap();
         assert!(lookup_in(&cache_root, &repo_root, target).is_none());
@@ -266,11 +278,66 @@ mod tests {
 
         touch(&exe, "binary");
         touch(&build, "rust_binary(...)");
-        record_in(&cache_root, &repo_root, target, &exe).expect("record");
+        record_in(&cache_root, &repo_root, target, &exe, &[]).expect("record");
 
         assert!(lookup_in(&cache_root, &repo_root, target).is_some());
         bump_mtime(&build);
         assert!(lookup_in(&cache_root, &repo_root, target).is_none());
+    }
+
+    #[test]
+    fn source_mtime_advance_invalidates() {
+        let temp = TempDir::new().unwrap();
+        let cache_root = temp.path().join("cache");
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/boss/cli:boss";
+        let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
+        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
+        let src = repo_root.join("tools/boss/cli/src/main.rs");
+
+        touch(&exe, "binary");
+        touch(&build, "rust_binary(...)");
+        touch(&src, "fn main() {}");
+
+        record_in(&cache_root, &repo_root, target, &exe, &[src.clone()]).expect("record");
+
+        assert!(lookup_in(&cache_root, &repo_root, target).is_some());
+        bump_mtime(&src);
+        assert!(
+            lookup_in(&cache_root, &repo_root, target).is_none(),
+            "source file mtime change must invalidate cache"
+        );
+    }
+
+    #[test]
+    fn build_unchanged_source_changed_invalidates() {
+        // Regression: PR #428 changed .rs files without touching BUILD.bazel;
+        // old witnesses (BUILD.bazel only) would have served a stale binary.
+        let temp = TempDir::new().unwrap();
+        let cache_root = temp.path().join("cache");
+        let repo_root = temp.path().join("repo");
+        let target = "//tools/boss/cli:boss";
+        let exe = repo_root.join("bazel-bin/tools/boss/cli/boss");
+        let build = repo_root.join("tools/boss/cli/BUILD.bazel");
+        let src_cli = repo_root.join("tools/boss/cli/src/lib.rs");
+        let src_engine = repo_root.join("tools/boss/engine/src/engine.rs");
+
+        touch(&exe, "binary");
+        touch(&build, "rust_binary(...)");
+        touch(&src_cli, "pub fn cli() {}");
+        touch(&src_engine, "pub fn engine() {}");
+
+        let sources: Vec<PathBuf> = vec![src_cli.clone(), src_engine.clone()];
+        record_in(&cache_root, &repo_root, target, &exe, &sources).expect("record");
+
+        assert!(lookup_in(&cache_root, &repo_root, target).is_some());
+
+        // Engine source changes but BUILD.bazel stays the same.
+        bump_mtime(&src_engine);
+        assert!(
+            lookup_in(&cache_root, &repo_root, target).is_none(),
+            "transitive source change must invalidate even when BUILD.bazel is untouched"
+        );
     }
 
     #[test]
@@ -325,14 +392,14 @@ mod tests {
         let build_a = repo_a.join("tools/boss/cli/BUILD.bazel");
         touch(&exe_a, "a");
         touch(&build_a, "a");
-        record_in(&cache_root, &repo_a, target, &exe_a).expect("record a");
+        record_in(&cache_root, &repo_a, target, &exe_a, &[]).expect("record a");
 
         let repo_b = temp.path().join("repo-b");
         let exe_b = repo_b.join("bazel-bin/tools/boss/cli/boss");
         let build_b = repo_b.join("tools/boss/cli/BUILD.bazel");
         touch(&exe_b, "b");
         touch(&build_b, "b");
-        record_in(&cache_root, &repo_b, target, &exe_b).expect("record b");
+        record_in(&cache_root, &repo_b, target, &exe_b, &[]).expect("record b");
 
         assert_eq!(
             lookup_in(&cache_root, &repo_a, target).unwrap(),

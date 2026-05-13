@@ -491,6 +491,14 @@ mod tests {
         ) -> Result<PathBuf, RepobinError> {
             panic!("bazel cquery should not be invoked in this test")
         }
+
+        fn resolve_source_files(
+            &self,
+            _repo_root: &Path,
+            _target: &str,
+        ) -> Result<Vec<PathBuf>, RepobinError> {
+            panic!("bazel query should not be invoked in this test")
+        }
     }
 
     #[test]
