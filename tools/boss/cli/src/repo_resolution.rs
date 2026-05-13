@@ -476,7 +476,7 @@ mod tests {
             model_override: None,
             ci_attempt_budget: None,
             ci_attempts_used: 0,
-            blocked_signals: vec![],
+            blocked_signals: Vec::new(),
         }
     }
 

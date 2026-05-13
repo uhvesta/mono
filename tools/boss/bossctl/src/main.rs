@@ -233,7 +233,23 @@ enum WorkspaceAction {
     Summary,
 }
 
+fn bossctl_version_string() -> String {
+    let sha = option_env!("BOSS_GIT_SHA").unwrap_or("unknown");
+    let time = option_env!("BOSS_BUILD_TIME").unwrap_or("unknown");
+    format!("bossctl 0+{sha} built {time}")
+}
+
 fn main() -> ExitCode {
+    // Intercept --version/-V before Cli::parse() so we print the
+    // canonical "bossctl 0+<sha> built <time>" format (design doc Q7).
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|s| s.as_str()) == Some("--version")
+        || argv.get(1).map(|s| s.as_str()) == Some("-V")
+    {
+        println!("{}", bossctl_version_string());
+        return ExitCode::SUCCESS;
+    }
+
     let cli = Cli::parse();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,

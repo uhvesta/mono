@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use boss_engine::app;
 use boss_engine::audit::{self, StartContext};
+use boss_engine::build_info;
 use boss_engine::cli::Cli;
 
 const DEFAULT_LOG_PATH: &str = "/tmp/boss-engine.log";
@@ -75,6 +76,18 @@ fn open_log_file(path: &Path) -> Result<File> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle --version before the full startup so we print our custom
+    // "boss-engine 0+<sha> built <time>" format and exit cleanly
+    // without initialising logging or touching the audit log.
+    // Q-Risk-3 from the design doc: this flag did not exist before this change.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|s| s.as_str()) == Some("--version")
+        || argv.get(1).map(|s| s.as_str()) == Some("-V")
+    {
+        println!("{}", build_info::version_string("boss-engine"));
+        return Ok(());
+    }
+
     let log_path = resolve_log_path();
     let file_writer = match open_log_file(&log_path) {
         Ok(file) => Some(Arc::new(Mutex::new(file))),

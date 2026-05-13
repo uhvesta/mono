@@ -142,7 +142,13 @@ impl PaneSpawnRunner {
         let engine_path = std::env::current_exe().unwrap_or_default();
         let workspace = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
         let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
-        resolve_boss_event_binary(&engine_path, workspace.as_deref(), env_override.as_deref())
+        let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
+        resolve_boss_event_binary(
+            &engine_path,
+            workspace.as_deref(),
+            env_override.as_deref(),
+            boss_bin_dir.as_deref(),
+        )
     }
 }
 
@@ -153,25 +159,39 @@ impl PaneSpawnRunner {
 ///
 /// Resolution order:
 ///   1. `BOSS_EVENT_BIN` env override (caller-controlled).
-///   2. Bazel runfiles next to the engine binary
+///   2. `$BOSS_BIN_DIR/boss-event` — installed-mode path. The app
+///      sets `BOSS_BIN_DIR` to `Boss.app/Contents/Resources/bin/` and
+///      passes it to the engine; all bundled CLIs and the shim live
+///      there. This is checked ahead of the dev-mode paths so an
+///      installed bundle never falls through to a workspace clone.
+///   3. Bazel runfiles next to the engine binary
 ///      (`<engine_path>.runfiles/_main/tools/boss/event-shim/boss-event`).
 ///      Requires the engine `rust_binary` to declare a `data` dep
 ///      on `//tools/boss/event-shim:boss-event` — without it bazel
 ///      doesn't include the shim in the engine's runfiles.
-///   3. Workspace `bazel-bin` symlink
+///   4. Workspace `bazel-bin` symlink
 ///      (`<workspace>/bazel-bin/tools/boss/event-shim/boss-event`)
 ///      when `BUILD_WORKSPACE_DIRECTORY` is set (i.e., the engine
 ///      was launched via `bazel run` from a checkout).
-///   4. Cargo / hand-built sibling: `<engine_dir>/boss-event`.
-///   5. Bare name `boss-event` — only useful if the worker's PATH
+///   5. Cargo / hand-built sibling: `<engine_dir>/boss-event`.
+///   6. Bare name `boss-event` — only useful if the worker's PATH
 ///      happens to include it (today it doesn't, on purpose).
 pub(crate) fn resolve_boss_event_binary(
     engine_path: &Path,
     workspace_dir: Option<&Path>,
     env_override: Option<&Path>,
+    boss_bin_dir: Option<&Path>,
 ) -> PathBuf {
     if let Some(override_path) = env_override {
         return override_path.to_path_buf();
+    }
+
+    // Installed mode: BOSS_BIN_DIR is Boss.app/Contents/Resources/bin/.
+    if let Some(bin_dir) = boss_bin_dir {
+        let candidate = bin_dir.join("boss-event");
+        if candidate.exists() {
+            return candidate;
+        }
     }
 
     // Bazel constructs runfiles at `<binary>.runfiles/_main/<workspace_relative_path>`.
@@ -2172,8 +2192,32 @@ mod pane_spawn_tests {
         let engine = dir.path().join("engine");
         std::fs::write(&engine, b"").unwrap();
         let override_path = PathBuf::from("/opt/whatever/boss-event");
-        let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path));
+        let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path), None);
         assert_eq!(resolved, override_path);
+    }
+
+    /// `BOSS_BIN_DIR` is the installed-mode path; it wins over the
+    /// dev-mode runfiles and workspace-bazel-bin candidates so a
+    /// deployed Boss.app never silently falls through to a workspace clone.
+    #[test]
+    fn resolve_boss_event_prefers_boss_bin_dir_over_runfiles() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        // Synthesize the bundle bin/ directory (installed mode).
+        let bundle_bin = dir.path().join("bundle-bin");
+        std::fs::create_dir_all(&bundle_bin).unwrap();
+        let bundle_shim = bundle_bin.join("boss-event");
+        std::fs::write(&bundle_shim, b"").unwrap();
+
+        // Also synthesize runfiles (dev mode) — must NOT be picked.
+        let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
+        std::fs::create_dir_all(&runfiles).unwrap();
+        std::fs::write(runfiles.join("boss-event"), b"").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, None, None, Some(&bundle_bin));
+        assert_eq!(resolved, bundle_shim);
     }
 
     /// When the engine binary has runfiles at the bazel-conventional
@@ -2195,7 +2239,7 @@ mod pane_spawn_tests {
         let shim = runfiles.join("boss-event");
         std::fs::write(&shim, b"").unwrap();
 
-        let resolved = resolve_boss_event_binary(&engine, None, None);
+        let resolved = resolve_boss_event_binary(&engine, None, None, None);
         assert_eq!(resolved, shim);
     }
 
@@ -2215,7 +2259,7 @@ mod pane_spawn_tests {
         let shim = bazel_bin.join("boss-event");
         std::fs::write(&shim, b"").unwrap();
 
-        let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None);
+        let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None, None);
         assert_eq!(resolved, shim);
     }
 
@@ -2228,7 +2272,7 @@ mod pane_spawn_tests {
         let dir = TempDir::new().unwrap();
         let engine = dir.path().join("engine");
         std::fs::write(&engine, b"").unwrap();
-        let resolved = resolve_boss_event_binary(&engine, None, None);
+        let resolved = resolve_boss_event_binary(&engine, None, None, None);
         assert_eq!(resolved, PathBuf::from("boss-event"));
     }
 }

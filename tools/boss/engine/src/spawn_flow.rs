@@ -238,6 +238,23 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         }
     }
 
+    // Installed mode: propagate BOSS_BIN_DIR (set by the app when
+    // launching the engine from Boss.app/Contents/Resources/bin/).
+    // Workers prepend this directory to PATH so `boss` / `boss-event`
+    // callbacks resolve the bundled copies. Unset in dev mode (no bundle
+    // bin/ directory) — workers fall back to PATH as today.
+    if let Ok(boss_bin_dir) = std::env::var("BOSS_BIN_DIR") {
+        if !boss_bin_dir.is_empty() {
+            env.push(EnvVar {
+                key: "BOSS_BIN_DIR".into(),
+                value: boss_bin_dir.clone(),
+            });
+            if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
+                path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
+            }
+        }
+    }
+
     let claimed_slot = input.slot_id;
     let response = spawner
         .send_to_app_request(

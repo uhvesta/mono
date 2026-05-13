@@ -1242,8 +1242,24 @@ struct RunContext {
     no_autostart: bool,
 }
 
+fn boss_version_string() -> String {
+    let sha = option_env!("BOSS_GIT_SHA").unwrap_or("unknown");
+    let time = option_env!("BOSS_BUILD_TIME").unwrap_or("unknown");
+    format!("boss 0+{sha} built {time}")
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Intercept --version/-V before Cli::parse() so we print the
+    // canonical "boss 0+<sha> built <time>" format (design doc Q7).
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|s| s.as_str()) == Some("--version")
+        || argv.get(1).map(|s| s.as_str()) == Some("-V")
+    {
+        println!("{}", boss_version_string());
+        return ExitCode::SUCCESS;
+    }
+
     let cli = Cli::parse();
     match run_cli(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -4308,7 +4324,6 @@ fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Result<(),
 
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -4427,7 +4442,7 @@ mod tests {
             model_override: None,
             ci_attempt_budget: None,
             ci_attempts_used: 0,
-            blocked_signals: vec![],
+            blocked_signals: Vec::new(),
         }
     }
 

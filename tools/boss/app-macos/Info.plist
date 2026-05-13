@@ -16,10 +16,14 @@
     <string>Boss</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- TODO(chore-1): replace with ${BAZEL_STAMP_STABLE_BOSS_GIT_SHA} once
+         workspace-status.sh + the --stamp build config from chore 1 are wired.
+         Until then CFBundleShortVersionString carries "0+unknown" so at least
+         the version format is consistent with the CLI --version output (Q7). -->
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>0+unknown</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>0+unknown</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>NSPrincipalClass</key>
