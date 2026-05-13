@@ -570,38 +570,49 @@ struct ContentView: View {
     }
 
     private func workBoard(product: WorkProduct) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top) {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(product.name)
-                        .font(.title2.weight(.semibold))
-                    if case .singleRepo(let url) = model.workBoardRepoMode {
-                        RepoChipView(
-                            presentation: RepoChipPresentation.forProductHeader(
-                                productRepoURL: url
-                            )
-                        )
-                    }
-                    Text(model.projectFilterDescription)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                Spacer()
-                Picker(
-                    "Group",
-                    selection: Binding(
-                        get: { model.workBoardGrouping },
-                        set: { model.setWorkBoardGrouping($0) }
+        let titleRow = HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(product.name)
+                .font(.title2.weight(.semibold))
+                .fixedSize(horizontal: true, vertical: false)
+            if case .singleRepo(let url) = model.workBoardRepoMode {
+                RepoChipView(
+                    presentation: RepoChipPresentation.forProductHeader(
+                        productRepoURL: url
                     )
-                ) {
-                    ForEach(WorkBoardGrouping.allCases) { grouping in
-                        Text(grouping.title).tag(grouping)
-                    }
+                )
+            }
+            Text(model.projectFilterDescription)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+
+        let groupPicker = Picker(
+            "Group",
+            selection: Binding(
+                get: { model.workBoardGrouping },
+                set: { model.setWorkBoardGrouping($0) }
+            )
+        ) {
+            ForEach(WorkBoardGrouping.allCases) { grouping in
+                Text(grouping.title).tag(grouping)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 220)
+
+        return VStack(alignment: .leading, spacing: 16) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top) {
+                    titleRow
+                    Spacer(minLength: 16)
+                    groupPicker
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 220)
+                VStack(alignment: .leading, spacing: 10) {
+                    titleRow
+                    groupPicker
+                }
             }
             .padding(.horizontal, workBoardHorizontalPadding)
             .padding(.top, 20)
