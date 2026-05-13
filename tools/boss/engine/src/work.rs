@@ -3765,6 +3765,37 @@ impl WorkDb {
         }
     }
 
+    /// Return every `conflict_resolutions` row that is `status='pending'`
+    /// but has no `work_executions` row with `kind='conflict_resolution'`
+    /// for the same `work_item_id`. Used by the startup backfill that
+    /// recovers attempts orphaned before `on_conflict_detected` began
+    /// writing the execution request in the same call (pre-PR #430).
+    ///
+    /// The query is idempotent: once an execution is created the row no
+    /// longer satisfies the `NOT EXISTS` predicate and is excluded on
+    /// every subsequent call.
+    pub fn pending_conflict_resolutions_without_execution(
+        &self,
+    ) -> Result<Vec<ConflictResolution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT cr.id, cr.product_id, cr.work_item_id, cr.pr_url, cr.pr_number,
+                    cr.head_branch, cr.base_branch, cr.base_sha_at_trigger,
+                    cr.head_sha_before, cr.head_sha_after, cr.status, cr.failure_reason,
+                    cr.cube_lease_id, cr.cube_workspace_id, cr.worker_id,
+                    cr.conflict_diagnosis, cr.created_at, cr.started_at, cr.finished_at
+             FROM conflict_resolutions cr
+             WHERE cr.status = 'pending'
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_executions we
+                   WHERE we.work_item_id = cr.work_item_id
+                     AND we.kind = 'conflict_resolution'
+               )",
+        )?;
+        let rows = stmt.query_map([], map_conflict_resolution)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// Store the engine-collected diagnosis JSON on a pending attempt.
     /// Idempotent — calling twice overwrites. Returns the updated row;
     /// `Ok(None)` when the id is missing.

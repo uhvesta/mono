@@ -1865,6 +1865,15 @@ pub async fn serve(
         }
     }
 
+    // Backfill execution_request rows for any conflict_resolutions
+    // attempts that were inserted before PR #430 wired the
+    // create_execution call into on_conflict_detected. Idempotent: a
+    // second run finds zero orphans and fast-returns.
+    crate::conflict_watch::backfill_orphaned_executions(
+        &server_state.work_db,
+        server_state.publisher.as_ref(),
+    );
+
     // Spawn the merge-detection poller. Workers can land their PRs
     // long after their Stop event has fired (and lease has been
     // released), so the on-Stop completion path can't catch every
