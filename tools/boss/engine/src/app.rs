@@ -2203,16 +2203,21 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                             // tool call has already returned at this
                             // point, so no in-flight work is lost.
                             dispatch_urgent_probe_on_post_tool_use(&server_state, &incoming).await;
-                            // ProbeReplied runs *before* dispatch so a
-                            // single Stop never both fires the reply
-                            // for the prior probe and the dispatch of
-                            // the next one — without the ordering, the
-                            // probe-just-dispatched would be picked up
-                            // for emission immediately, with no reply
-                            // text actually written yet.
+                            // ProbeReplied runs first: emit the reply for the
+                            // prior probe before dispatching the next one so
+                            // a single Stop never fires both reply and dispatch
+                            // for the same probe (the reply text hasn't been
+                            // written yet at dispatch time).
+                            //
+                            // Completion runs before probe dispatch: probes
+                            // queued by the completion handler (e.g.
+                            // PROBE_NO_PR) must be visible to `dispatch_probe_on_stop`
+                            // so they are delivered on the *same* Stop that
+                            // triggered them rather than stalling until the
+                            // next Stop (which never comes for an idle worker).
                             dispatch_probe_reply_on_stop(&server_state, &incoming).await;
-                            dispatch_probe_on_stop(&server_state, &incoming).await;
                             dispatch_completion_on_stop(&server_state, &incoming).await;
+                            dispatch_probe_on_stop(&server_state, &incoming).await;
                         }
                         Err(err) => {
                             tracing::warn!(?err, "events socket: failed to handle connection");
@@ -2618,6 +2623,81 @@ async fn dispatch_urgent_probe_on_post_tool_use(
     }
 }
 
+/// Immediately dispatch a queued probe to `run_id`'s worker pane if
+/// the worker is currently idle (i.e. between turns, waiting for
+/// input). Called from the `ProbeRun` frontend handler so that
+/// `bossctl probe` delivers the text without waiting for the next Stop
+/// boundary — a Stop never arrives for a worker that is already idle,
+/// so the on-Stop path alone would silently stall these probes.
+///
+/// If the worker is actively running (Working/WaitingForInput/Spawning)
+/// this function is a no-op: the probe stays in `pending_probes` and
+/// `dispatch_probe_on_stop` picks it up at the next Stop boundary.
+///
+/// Uses the same `SendToPane` path as `dispatch_probe_on_stop` and
+/// records an in-flight entry so `dispatch_probe_reply_on_stop` can
+/// emit `ProbeReplied` when the worker responds.
+async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_id: &str) {
+    use crate::protocol::{EngineToAppRequest, SendToPaneInput};
+    use boss_protocol::WorkerActivity;
+
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        // Worker not yet mapped to a slot (spawning) — probe stays queued.
+        tracing::debug!(run_id, "probe-if-idle: no slot mapping; probe waits for Stop");
+        return;
+    };
+    let is_idle = server_state
+        .live_worker_states
+        .get(slot_id)
+        .map(|s| s.activity == WorkerActivity::Idle)
+        .unwrap_or(false);
+    if !is_idle {
+        tracing::debug!(
+            run_id,
+            slot_id,
+            "probe-if-idle: worker not idle; probe will fire at next Stop",
+        );
+        return;
+    }
+
+    let Some(probe) = server_state.pop_pending_probe(run_id) else {
+        return;
+    };
+    let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
+    let request = EngineToAppRequest::SendToPane(SendToPaneInput {
+        slot_id,
+        text: probe.text.clone(),
+    });
+    match server_state
+        .send_to_app(request, Duration::from_secs(5))
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                "probe injected into idle worker pane (immediate dispatch)",
+            );
+            server_state.note_probe_dispatched(
+                run_id.to_owned(),
+                probe.probe_id,
+                transcript_path,
+                offset_bytes,
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                "probe immediate-dispatch failed; pushing back onto queue",
+            );
+            server_state.requeue_probe_front(run_id.to_owned(), probe);
+        }
+    }
+}
 /// Look up the transcript path the run is currently writing to (via
 /// `WorkRun`), and stat its current byte size so we can use that as
 /// the lower bound for the next reply-extraction read. Returns
@@ -2814,9 +2894,13 @@ fn extract_last_assistant_text(chunk: &str) -> Option<String> {
 /// and the cube workspace is released. If not, an `awaiting_input`
 /// signal is published for the execution topic so the pane indicator
 /// can reflect that the worker is idle without losing the active
-/// kanban state. Runs after `dispatch_probe_on_stop` so probe
-/// injection (which keeps the worker working) wins over completion
-/// (which assumes the worker is idle).
+/// kanban state.
+///
+/// Runs **before** `dispatch_probe_on_stop` in the event loop so that
+/// probes the completion handler queues (e.g. `PROBE_NO_PR`) are
+/// visible when probe dispatch fires on the same Stop boundary — if
+/// completion ran after, those probes would stall until the next Stop
+/// (which never arrives for a worker that is already idle).
 async fn dispatch_completion_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
@@ -3908,6 +3992,16 @@ async fn handle_frontend_connection(
                 }
                 let probe_id = server_state.queue_probe(run_id.clone(), text, urgent);
                 tracing::info!(run_id = %run_id, probe_id = %probe_id, urgent, "probe queued");
+                // Immediately deliver the probe if the worker is already idle
+                // (between turns). An idle worker has no Stop boundary coming
+                // — `dispatch_probe_on_stop` would never fire — so we push the
+                // text into the pane right now. If the worker is active the
+                // call is a no-op and the probe waits for the next Stop.
+                let server_for_idle = server_state.clone();
+                let run_id_for_idle = run_id.clone();
+                tokio::spawn(async move {
+                    dispatch_probe_if_idle(&server_for_idle, &run_id_for_idle).await;
+                });
                 send_response(
                     &sink,
                     &request_id,
@@ -6971,6 +7065,250 @@ mod tests {
         assert!(
             drain.is_err(),
             "duplicate Stop must not produce a second ProbeReplied for the same probe id",
+        );
+    }
+
+    /// Regression: `dispatch_probe_if_idle` must deliver a probe
+    /// immediately to a worker whose activity is `Idle` — i.e. one that
+    /// is between turns and has no Stop boundary coming. Before the fix,
+    /// `bossctl probe` targeted at an idle worker would stall forever
+    /// because `dispatch_probe_on_stop` only fires on Stop events and an
+    /// idle worker never produces another Stop without receiving input
+    /// first.
+    #[tokio::test]
+    async fn probe_queued_for_idle_worker_dispatches_immediately() {
+        use boss_protocol::{
+            CreateChoreInput, CreateProductInput, RequestExecutionInput, WorkerActivity,
+            WorkerEvent,
+        };
+
+        let server_state = test_server_state();
+
+        // Minimal DB rows so transcript lookup has something to resolve.
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let run = server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: None,
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        // Register slot and set activity to Idle (worker between turns).
+        server_state
+            .worker_registry
+            .register_run_slot(run.id.clone(), 1);
+        server_state
+            .live_worker_states
+            .register_spawn(1, run.id.clone(), "claude-opus-4-7", 0, None);
+        // Apply a Stop event to transition Spawning → Idle.
+        server_state
+            .live_worker_states
+            .apply_event(1, &WorkerEvent::Stop {
+                session_id: "sess-1".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Completed,
+            });
+        assert_eq!(
+            server_state.live_worker_states.get(1).unwrap().activity,
+            WorkerActivity::Idle,
+            "precondition: worker must be idle",
+        );
+
+        // Register a fake app session to receive the SendToPane.
+        let app_sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), app_sink.clone())
+            .await;
+        let server_for_app = server_state.clone();
+        let app_responder = tokio::spawn(async move {
+            let envelope = app_sink
+                .next()
+                .await
+                .expect("SendToPane must arrive for idle worker");
+            let request_id = match &envelope.payload {
+                FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+                other => panic!("expected EngineRequest, got {other:?}"),
+            };
+            server_for_app
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::SendToPane {
+                        result: Ok(crate::protocol::SendToPaneResult {}),
+                    },
+                )
+                .await;
+        });
+
+        // Queue the probe and call dispatch_probe_if_idle directly.
+        server_state.queue_probe(run.id.clone(), "coordinator nudge".into());
+        dispatch_probe_if_idle(&server_state, &run.id).await;
+
+        // The app_responder task must have seen the SendToPane by now.
+        tokio::time::timeout(Duration::from_secs(2), app_responder)
+            .await
+            .expect("timed out waiting for SendToPane round-trip")
+            .expect("app_responder panicked");
+
+        // Probe must have been consumed (popped from pending_probes and
+        // an in-flight entry recorded).
+        assert!(
+            server_state.pop_pending_probe(&run.id).is_none(),
+            "probe must be consumed, not left in pending_probes",
+        );
+    }
+
+    /// Regression: probes queued by the completion handler during a Stop
+    /// event must be dispatched on the SAME Stop, not stalled until the
+    /// next one. The event-loop order change (completion before probe
+    /// dispatch) enables this: `dispatch_completion_on_stop` adds to
+    /// `pending_probes`, then `dispatch_probe_on_stop` picks them up.
+    #[tokio::test]
+    async fn completion_probe_dispatched_on_same_stop_as_completion() {
+        use crate::protocol::WorkerEvent;
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+        let server_state = test_server_state();
+
+        let product = server_state
+            .work_db
+            .create_product(CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let execution = server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap();
+        let run = server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: None,
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        server_state
+            .worker_registry
+            .register_run_slot(run.id.clone(), 1);
+
+        // Queue a probe manually (simulating what the completion handler does)
+        // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.
+        server_state.queue_probe(run.id.clone(), "push your PR".into());
+
+        // Register a fake app session to capture the SendToPane.
+        let app_sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), app_sink.clone())
+            .await;
+        let server_for_app = server_state.clone();
+        let app_responder = tokio::spawn(async move {
+            let envelope = app_sink
+                .next()
+                .await
+                .expect("SendToPane must arrive on the same Stop that completion queued it");
+            let request_id = match &envelope.payload {
+                FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+                other => panic!("expected EngineRequest, got {other:?}"),
+            };
+            server_for_app
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::SendToPane {
+                        result: Ok(crate::protocol::SendToPaneResult {}),
+                    },
+                )
+                .await;
+        });
+
+        // Fire the Stop event. With the new ordering, dispatch_probe_on_stop
+        // runs after dispatch_completion_on_stop and sees the queued probe.
+        let stop = crate::events_socket::IncomingHookEvent {
+            peer_pid: None,
+            run_id: Some(run.id.clone()),
+            transcript_path: None,
+            event: WorkerEvent::Stop {
+                session_id: "sess-1".into(),
+                stop_hook_active: false,
+                stop_reason: crate::protocol::StopReason::Completed,
+            },
+        };
+        dispatch_probe_on_stop(&server_state, &stop).await;
+        tokio::time::timeout(Duration::from_secs(2), app_responder)
+            .await
+            .expect("timed out waiting for SendToPane from completion probe")
+            .expect("app_responder panicked");
+
+        assert!(
+            server_state.pop_pending_probe(&run.id).is_none(),
+            "probe must be consumed by dispatch_probe_on_stop",
         );
     }
 
