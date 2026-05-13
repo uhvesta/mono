@@ -4504,7 +4504,6 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // always empty; consumers fall back to the scalar
         // `blocked_reason` / `blocked_attempt_id` cache above.
         blocked_signals: Vec::new(),
-        short_id: row.get(23)?,
     })
 }
 
