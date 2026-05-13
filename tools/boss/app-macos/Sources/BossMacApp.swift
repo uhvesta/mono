@@ -26,6 +26,14 @@ struct BossMacApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // When launched outside a regular .app bundle (e.g. `swift run`
+        // for local dev), macOS does not auto-promote the process to a
+        // foreground UI app — the window opens but never becomes key,
+        // so keystrokes go to whichever app was active before launch.
+        // Forcing .regular + activate restores key-window status without
+        // bringing back the manual NSWindow setup #417 removed.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
         DispatchEventsWindowController.shared.restoreIfNeeded()
     }
 
