@@ -155,13 +155,14 @@ impl RepoCacheLock {
             .arg(&self.cache.url)
             .arg(&self.cache.checkout)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .output()
             .map_err(|source| RepobinError::SpawnGit {
                 action: "clone".to_string(),
                 source,
             })?;
         forward_to_stderr(&output.stdout);
+        forward_to_stderr(&output.stderr);
         if !output.status.success() {
             return Err(RepobinError::GitFailed {
                 action: format!("clone {}", self.cache.url),
@@ -232,11 +233,14 @@ fn ls_remote_head(checkout: &Path) -> Result<String, RepobinError> {
         .arg("origin")
         .arg("HEAD")
         .current_dir(checkout)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|source| RepobinError::SpawnGit {
             action: "ls-remote".to_string(),
             source,
         })?;
+    forward_to_stderr(&output.stderr);
     if !output.status.success() {
         return Err(RepobinError::GitFailed {
             action: "ls-remote origin HEAD".to_string(),
@@ -264,13 +268,14 @@ fn fetch_and_reset(checkout: &Path) -> Result<(), RepobinError> {
         .arg("HEAD")
         .current_dir(checkout)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|source| RepobinError::SpawnGit {
             action: "fetch".to_string(),
             source,
         })?;
     forward_to_stderr(&fetch.stdout);
+    forward_to_stderr(&fetch.stderr);
     if !fetch.status.success() {
         return Err(RepobinError::GitFailed {
             action: "fetch origin HEAD".to_string(),
@@ -283,13 +288,14 @@ fn fetch_and_reset(checkout: &Path) -> Result<(), RepobinError> {
         .arg("FETCH_HEAD")
         .current_dir(checkout)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|source| RepobinError::SpawnGit {
             action: "reset".to_string(),
             source,
         })?;
     forward_to_stderr(&reset.stdout);
+    forward_to_stderr(&reset.stderr);
     if !reset.status.success() {
         return Err(RepobinError::GitFailed {
             action: "reset --hard FETCH_HEAD".to_string(),
@@ -341,7 +347,7 @@ fn parse_ttl() -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepoCache, repo_dir_name, url_slug};
+    use super::{EnsureOutcome, RepoCache, repo_dir_name, url_slug};
     use tempfile::TempDir;
 
     #[test]
@@ -396,6 +402,86 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(50),
             "second lock returned in {elapsed:?} despite holder still holding"
+        );
+    }
+
+    // Regression test: git fetch/reset output must not leak to stdout.
+    // The fix routes all git subprocess output (stdout and stderr) through
+    // Stdio::piped() + forward_to_stderr(), so no git fd inherits the parent's
+    // stdout. This test exercises the full clone → fetch → reset path using a
+    // local bare repo so no network access is needed.
+    #[test]
+    fn ensure_up_to_date_routes_git_output_through_stderr() {
+        use std::process::Command;
+
+        let temp = TempDir::new().unwrap();
+        let remote = temp.path().join("remote.git");
+        let work = temp.path().join("work");
+
+        // Create a bare remote repo and an initial commit.
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["clone"])
+            .arg(&remote)
+            .arg(&work)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["-c", "user.email=t@t.com", "-c", "user.name=T"])
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["push", "origin", "HEAD:main"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+
+        // Clone into the cache.
+        let cache_root = temp.path().join("cache");
+        let url = format!("file://{}", remote.display());
+        let cache = RepoCache::for_url(&cache_root, &url);
+        let lock = cache.lock().unwrap();
+        let outcome = lock.ensure_up_to_date().unwrap();
+        assert!(
+            matches!(outcome, EnsureOutcome::Cloned { .. }),
+            "expected Cloned on first call, got {outcome:?}"
+        );
+
+        // Advance the remote with a new commit.
+        std::fs::write(work.join("file.txt"), "world").unwrap();
+        Command::new("git")
+            .args(["-c", "user.email=t@t.com", "-c", "user.name=T"])
+            .args(["add", "."])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["-c", "user.email=t@t.com", "-c", "user.name=T"])
+            .args(["commit", "-m", "update"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["push", "origin", "HEAD:main"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+
+        // Remove the fetch stamp so ensure_up_to_date skips the TTL cache and
+        // actually calls ls-remote + fetch_and_reset.
+        let stamp = lock.cache().dir.join("fetch_stamp");
+        std::fs::remove_file(&stamp).ok();
+
+        let outcome = lock.ensure_up_to_date().unwrap();
+        assert!(
+            matches!(outcome, EnsureOutcome::Updated { .. }),
+            "expected Updated after remote advanced, got {outcome:?}"
         );
     }
 }
