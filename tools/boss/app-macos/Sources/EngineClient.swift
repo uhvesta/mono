@@ -928,7 +928,8 @@ final class EngineClient: @unchecked Sendable {
             repoRemoteURL: payload["repo_remote_url"] as? String,
             blockedReason: payload["blocked_reason"] as? String,
             blockedAttemptID: payload["blocked_attempt_id"] as? String,
-            shortID: (payload["short_id"] as? NSNumber)?.intValue
+            shortID: (payload["short_id"] as? NSNumber)?.intValue,
+            autostart: (payload["autostart"] as? Bool) ?? false
         )
     }
 

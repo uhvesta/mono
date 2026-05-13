@@ -968,6 +968,24 @@ private struct WorkBoardCardItem: View {
             return liveStates.byRunID[executionID]
         }()
 
+        // A dispatch-pending card has status=todo+autostart=true; it
+        // landed in Doing because the engine intends to run it but no
+        // slot is free yet. We give it its own activity state and a
+        // "waiting for a slot" subtitle distinct from an active worker.
+        let isDispatchPending = task.status == "todo" && task.autostart
+
+        let activityState: AgentActivityState? = column == .doing
+            ? (isDispatchPending
+                ? .dispatchPending
+                : AgentActivityState(runtime: runtime, liveState: liveState))
+            : nil
+
+        let liveStatusForCard: String? = {
+            guard column == .doing else { return nil }
+            if isDispatchPending { return "Waiting for a slot" }
+            return liveState?.liveStatus
+        }()
+
         let blockedBy: String? = {
             if task.status == "blocked" {
                 return model.blockedByLabel(for: task)
@@ -995,12 +1013,10 @@ private struct WorkBoardCardItem: View {
                     task: task,
                     projectName: projectName,
                     isSelected: isSelected,
-                    activityState: column == .doing
-                        ? AgentActivityState(runtime: runtime, liveState: liveState)
-                        : nil,
+                    activityState: activityState,
                     assignedSlotId: column == .doing ? liveState?.slotId : nil,
-                    liveStatus: column == .doing ? liveState?.liveStatus : nil,
-                    liveStatusActivity: column == .doing ? liveState?.activity : nil,
+                    liveStatus: liveStatusForCard,
+                    liveStatusActivity: isDispatchPending ? nil : (column == .doing ? liveState?.activity : nil),
                     blockedBy: blockedBy,
                     isAutoBlocked: isAutoBlocked,
                     gatingPrereqs: gatingPrereqs,
@@ -1415,11 +1431,20 @@ private struct AgentActivityDot: View {
     let state: AgentActivityState
 
     var body: some View {
-        Circle()
-            .fill(fillColor)
-            .frame(width: 7, height: 7)
-            .help(state.tooltip)
-            .accessibilityLabel(state.tooltip)
+        Group {
+            if case .dispatchPending = state {
+                Image(systemName: "hourglass")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
+                    .frame(width: 7, height: 7)
+            } else {
+                Circle()
+                    .fill(fillColor)
+                    .frame(width: 7, height: 7)
+            }
+        }
+        .help(state.tooltip)
+        .accessibilityLabel(state.tooltip)
     }
 
     private var fillColor: Color {
@@ -1431,6 +1456,8 @@ private struct AgentActivityDot: View {
         case .errored:
             return .red
         case .none:
+            return Color(nsColor: .tertiaryLabelColor)
+        case .dispatchPending:
             return Color(nsColor: .tertiaryLabelColor)
         }
     }

@@ -268,6 +268,14 @@ struct WorkTask: Identifiable, Hashable {
     /// (the engine backfills these at startup, so `nil` is transient).
     /// Mirrors `Task.short_id` on the wire.
     var shortID: Int? = nil
+    /// When `true` the engine will dispatch a worker the moment a slot
+    /// is free. Rows with `status=todo AND autostart=true` that have no
+    /// active execution are "dispatch-pending" — the engine has committed
+    /// to running them but the pool is full. The kanban routes these to
+    /// the Doing column with a distinct waiting indicator rather than
+    /// leaving them in Backlog. Defaults to `false` when absent from the
+    /// wire so legacy rows without the field stay in Backlog (unchanged).
+    var autostart: Bool = false
 
     var isChore: Bool {
         kind == "chore"
@@ -812,6 +820,13 @@ extension WorkTask {
     /// start a gated row, so from the user's perspective it sits with
     /// the not-yet-active pile rather than with Doing. The card itself
     /// surfaces the gating with an icon + "Blocked by …" subtitle.
+    ///
+    /// Dispatch-pending rows (`status=todo AND autostart=true`) route to
+    /// Doing rather than Backlog. From the user's perspective these rows
+    /// are already committed — the engine will start them the moment a
+    /// slot frees up — so they belong visually with active work, not with
+    /// unscheduled backlog items. The card renders a distinct hourglass
+    /// indicator to distinguish "queued" from "working".
     var boardColumn: WorkBoardColumnKey {
         switch status {
         case "active":
@@ -820,6 +835,8 @@ extension WorkTask {
             return .review
         case "done":
             return .done
+        case "todo" where autostart:
+            return .doing
         default:
             return .backlog
         }
@@ -917,6 +934,11 @@ enum AgentActivityState {
     case waiting(reason: String)
     case errored(reason: String)
     case none
+    /// The row is `status=todo, autostart=true` and no worker slot is
+    /// free yet. The engine has committed to dispatching it; the pool
+    /// is just full. Renders as a hourglass rather than a coloured dot
+    /// so it reads as "queued" rather than "active or paused worker".
+    case dispatchPending
 
     /// Build from the persisted task runtime status alone. Used as
     /// the fallback when no LiveWorkerState is available (worker
@@ -989,6 +1011,8 @@ enum AgentActivityState {
             return reason
         case .none:
             return "No agent attached"
+        case .dispatchPending:
+            return "Queued — waiting for a worker slot"
         }
     }
 }
