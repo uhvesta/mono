@@ -23,7 +23,7 @@ use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
-use crate::live_worker_state::{DEFAULT_LAUNCH_MODEL, LiveWorkerStateRegistry};
+use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
     SpawnWorkerPaneResult,
@@ -92,6 +92,10 @@ pub struct StartWorkerInput {
     /// worker on chore X" without prompting for a slot. `None` from
     /// callers that don't have a work item (tests).
     pub work_item_binding: Option<WorkItemBinding>,
+    /// The model that was actually passed to the claude CLI via `--model`.
+    /// Stamped onto `LiveWorkerState` at spawn so `bossctl agents list`
+    /// reports the real dispatched model instead of a hardcoded default.
+    pub model: String,
 }
 
 #[derive(Debug)]
@@ -297,7 +301,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         live_states.register_spawn(
             slot_id,
             input.run_id.clone(),
-            DEFAULT_LAUNCH_MODEL,
+            input.model,
             shell_pid,
             input.work_item_binding,
         );
@@ -390,6 +394,7 @@ mod tests {
             extra_env: vec![],
             title_summary: None,
             work_item_binding: None,
+            model: "claude-opus-4-7".into(),
         }
     }
 
