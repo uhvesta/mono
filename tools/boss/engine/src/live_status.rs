@@ -16,7 +16,7 @@
 //!   the gerund-style sentence we want with no fuss.
 //! - Input cap: 800 tokens. The redactor trims oldest-first if the
 //!   transcript window overflows.
-//! - Output cap: 100 tokens. The prompt asks for ≤ 25 words; the
+//! - Output cap: 30 tokens. The prompt asks for ≤ 8 words; the
 //!   cap exists to catch a runaway response.
 //! - Timeout: 5 s. P99 is usually closer to 2 s; we'd rather keep
 //!   the prior value than block the loop.
@@ -56,9 +56,9 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// see Q3 in the design doc.
 pub const SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
 
-/// Output ceiling. The prompt asks for ≤ 25 words; this is the
+/// Output ceiling. The prompt asks for ≤ 8 words; this is the
 /// safety net.
-pub const SUMMARY_MAX_TOKENS: u32 = 100;
+pub const SUMMARY_MAX_TOKENS: u32 = 30;
 
 /// Worst-case wall-clock budget for the API round trip. P99 on Haiku
 /// for ~800 input tokens is comfortably under this.
@@ -75,10 +75,9 @@ pub const MAX_PROMPT_BYTES: usize = 3_200;
 /// chatty workers; 30 covers the most recent few turns.
 pub const MAX_TRANSCRIPT_ENTRIES: usize = 30;
 
-/// Maximum render length we'll write to `live_status`. Keeps the
-/// kanban subtitle to a sensible single-line shape even when the
-/// model ignores the prompt's word-count guidance.
-pub const MAX_LIVE_STATUS_LEN: usize = 240;
+/// Maximum render length we'll write to `live_status`. Hard-caps the
+/// kanban card subtitle to a single line at default card width (~60 chars).
+pub const MAX_LIVE_STATUS_LEN: usize = 60;
 
 /// Literal string used by the trigger fan-in when `activity` flips
 /// to `WaitingForInput` and no prior summary is available. Written
@@ -372,30 +371,33 @@ pub fn build_messages(transcript: &str) -> (String, String) {
     user.push_str(
         "Below is a redacted tail of the worker's transcript. Lines may be \
          truncated and any sensitive substrings are replaced with <redacted>. \
-         Return one short present-continuous sentence (≤ 25 words) describing \
-         what the worker is doing right now. Do not quote literal values \
-         longer than four words from the transcript. Do not include file \
-         paths, URLs, tokens, keys, or anything that looks like a password. \
-         If you cannot tell what the worker is doing, return the literal \
-         string \"working\" with no other text.\n\nTranscript tail:\n",
+         Return a 4–8 word verb-led phrase (no subject) describing what the \
+         worker is doing right now. Do not quote literal values longer than \
+         two words from the transcript. Do not include file paths, URLs, \
+         tokens, keys, or anything that looks like a password. \
+         If you cannot tell what the worker is doing, return the single word \
+         \"working\" with no other text.\n\nTranscript tail:\n",
     );
     user.push_str(transcript);
-    user.push_str("\n\nOne-sentence status:");
+    user.push_str("\n\nShort status phrase:");
     (system, user)
 }
 
 const SYSTEM_PROMPT: &str = "\
-You summarise a coding worker's moment-to-moment activity in one \
-short present-continuous sentence for an internal developer UI. \
-Examples of the shape we want: \"investigating why the scroll \
-handler doesn't fire when lane content overflows\", \"running tests \
-after the layout fix\", \"editing the redactor module's deny-list\". \
+You label a coding worker's current activity for a kanban card subtitle. \
+Output a 4–8 word verb-led phrase — no subject, no trailing period. \
+Examples of the exact style required:\n\
+- \"Reading work-board header view\"\n\
+- \"Grepping for repo badge rendering\"\n\
+- \"Editing card layout\"\n\
+- \"Running bazel build\"\n\
+- \"Waiting on CI\"\n\
+- \"Investigating scroll handler bug\"\n\
 Strict rules:\n\
-- One sentence, ≤ 25 words, no leading subject, present-continuous.\n\
-- Describe the *action*, not the *content*. \"Reading the auth \
-config\" is fine; \"reading file containing <a literal>\" is not.\n\
-- Never quote any literal value longer than four words from the \
-input.\n\
+- 4–8 words max, present-continuous verb first, no leading subject.\n\
+- Describe the *action*, not the *content* — \"Reading auth config\" \
+not \"reading file containing <value>\".\n\
+- Never quote any literal value longer than two words from the input.\n\
 - Never include file paths, URLs, API tokens, keys, passwords, or \
 strings that look like secrets.\n\
 - If the transcript is uninformative, reply with the single word \
