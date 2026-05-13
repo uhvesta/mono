@@ -40,6 +40,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::ci_watch;
+use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::work::{PendingMergeCheck, WorkDb};
@@ -563,6 +564,13 @@ pub struct SweepOutcome {
     pub conflict_cleared: usize,
     pub ci_flagged: usize,
     pub ci_cleared: usize,
+    /// Number of `waiting_human` executions whose chore was missing a
+    /// `pr_url` but whose workspace now resolves to a fresh PR. These
+    /// are the rows the on-Stop hook missed (typically because GitHub's
+    /// `commits/{sha}/pulls` index lagged a fresh `gh pr create`). The
+    /// recheck moved them to `in_review` (or `done` if the PR was
+    /// already merged).
+    pub pr_recheck_recovered: usize,
 }
 
 impl SweepOutcome {
@@ -572,23 +580,33 @@ impl SweepOutcome {
             + self.conflict_cleared
             + self.ci_flagged
             + self.ci_cleared
+            + self.pr_recheck_recovered
     }
 }
 
 /// Run one full lifecycle sweep over every chore and project_task
 /// the poller cares about (in_review with a PR, plus rows currently
-/// blocked on merge_conflict so we can detect resolution). Returns
-/// per-bucket counters so callers can log a one-line summary.
+/// blocked on merge_conflict so we can detect resolution, plus
+/// `waiting_human` executions whose chore is still missing a
+/// `pr_url`). Returns per-bucket counters so callers can log a
+/// one-line summary.
 ///
 /// `cube_client` is threaded into the conflict-watch retire path so
 /// `on_resolved` can release the cube workspace lease the resolution
 /// worker held (design Q5). Pass `None` for sweeps that don't need to
 /// drive lease release — pre-Phase-3 wiring, tests, etc.
+///
+/// `completion_handler` is threaded in so the pending-PR-detection
+/// recheck can reuse the on-Stop transition path (`record_worker_pr_completion`
+/// + cube release + pane teardown + event publish). Pass `None` for
+/// pre-`completion_handler` wiring and tests that exercise only the
+/// in-review and conflict paths.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
+    completion_handler: Option<&WorkerCompletionHandler>,
 ) -> SweepOutcome {
     let in_review = match work_db.list_chores_pending_merge_check() {
         Ok(items) => items,
@@ -617,7 +635,18 @@ pub async fn run_one_pass(
             Vec::new()
         }
     };
-    let total = in_review.len() + blocked_conflict.len() + blocked_ci.len();
+    let pending_pr_recheck = match work_db.list_executions_pending_pr_detection() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: failed to list executions pending PR detection",
+            );
+            Vec::new()
+        }
+    };
+    let total =
+        in_review.len() + blocked_conflict.len() + blocked_ci.len() + pending_pr_recheck.len();
     if total == 0 {
         return SweepOutcome::default();
     }
@@ -636,7 +665,58 @@ pub async fn run_one_pass(
         }
         sweep_one(work_db, probe, publisher, cube_client, candidate, &mut outcome).await;
     }
+    if let Some(handler) = completion_handler {
+        for execution_id in &pending_pr_recheck {
+            sweep_pending_pr(handler, execution_id, &mut outcome).await;
+        }
+    } else if !pending_pr_recheck.is_empty() {
+        tracing::debug!(
+            count = pending_pr_recheck.len(),
+            "merge poller: pending PR-detection candidates skipped (no completion_handler wired)",
+        );
+    }
     outcome
+}
+
+/// Re-run PR detection against an execution that the on-Stop hook
+/// classified as having no PR but whose chore is still `active` (i.e.,
+/// the worker stopped, the engine missed the PR-open transition, and
+/// the chore is stuck in `active`). Delegates to
+/// [`WorkerCompletionHandler::recheck_for_pr`], which transitions the
+/// chore on `Fresh`/`Merged` and stays quiet on the no-PR / stale-PR
+/// branches so the poller doesn't spam probes or awaiting-input events.
+async fn sweep_pending_pr(
+    handler: &WorkerCompletionHandler,
+    execution_id: &str,
+    outcome: &mut SweepOutcome,
+) {
+    match handler.recheck_for_pr(execution_id).await {
+        StopOutcome::PrDetected { pr_url } => {
+            outcome.pr_recheck_recovered += 1;
+            tracing::info!(
+                execution_id,
+                pr_url = %pr_url,
+                "merge poller: recovered missed PR-open for waiting_human worker",
+            );
+        }
+        StopOutcome::PrMerged { pr_url } => {
+            outcome.pr_recheck_recovered += 1;
+            tracing::info!(
+                execution_id,
+                pr_url = %pr_url,
+                "merge poller: recovered missed PR-open (PR already merged) for waiting_human worker",
+            );
+        }
+        // Quiet branches — still no PR, transient detector failure,
+        // or the execution moved on between list and recheck.
+        StopOutcome::AwaitingInput
+        | StopOutcome::DetectorFailed
+        | StopOutcome::StalePr { .. }
+        | StopOutcome::AlreadyTerminal
+        | StopOutcome::UnknownExecution
+        | StopOutcome::NoWorkspace
+        | StopOutcome::DbError => {}
+    }
 }
 
 async fn sweep_one(
@@ -802,6 +882,7 @@ pub fn spawn_loop(
     probe: Arc<dyn MergeProbe>,
     publisher: Arc<dyn ExecutionPublisher>,
     cube_client: Arc<dyn CubeClient>,
+    completion_handler: Arc<WorkerCompletionHandler>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -811,6 +892,7 @@ pub fn spawn_loop(
                 probe.as_ref(),
                 publisher.as_ref(),
                 Some(cube_client.as_ref()),
+                Some(completion_handler.as_ref()),
             )
             .await;
             if outcome.total_transitions() > 0 {
@@ -820,6 +902,7 @@ pub fn spawn_loop(
                     conflict_cleared = outcome.conflict_cleared,
                     ci_flagged = outcome.ci_flagged,
                     ci_cleared = outcome.ci_cleared,
+                    pr_recheck_recovered = outcome.pr_recheck_recovered,
                     "merge poller: sweep transitions",
                 );
             }
@@ -1031,7 +1114,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Merged);
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.merged, 1);
 
         let item = db.get_work_item(&chore_id).unwrap();
@@ -1062,7 +1145,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.conflict_flagged, 0);
         // No `blocked: merge_conflict` row in the corpus, so the clean
@@ -1090,7 +1173,7 @@ mod tests {
         let publisher = Arc::new(RecordingPublisher::default());
 
         // The error on pr_a must not prevent pr_b from being promoted.
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.merged, 1);
         match db.get_work_item(&chore_a).unwrap() {
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
@@ -1124,7 +1207,7 @@ mod tests {
 
         // Both kinds are mergeable, so a single sweep should promote
         // both rows — the project_task one being the regression case.
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(
             outcome.merged, 2,
             "merge poller must sweep both chore and project_task rows",
@@ -1165,7 +1248,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.total_transitions(), 0);
         match db.get_work_item(&project_task_id).unwrap() {
             WorkItem::Task(t) => assert_eq!(t.status, "in_review"),
@@ -1181,7 +1264,7 @@ mod tests {
         // No chores in review at all → no work, no errors, no events.
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.total_transitions(), 0);
         assert!(publisher.work_events.lock().await.is_empty());
     }
@@ -1202,7 +1285,7 @@ mod tests {
 
         // Pass 1: probe reports Conflict; row flips to blocked.
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.conflict_flagged, 1);
         assert_eq!(outcome.conflict_cleared, 0);
         assert_eq!(outcome.merged, 0);
@@ -1217,13 +1300,13 @@ mod tests {
         // Pass 2 with no change: idempotent — probe still reports
         // Conflict, but row is already blocked, so the
         // mark-conflict UPDATE matches zero rows.
-        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome2.total_transitions(), 0);
 
         // Pass 3: probe flips to Clean; the blocked-conflict slice
         // picks the row up and clears it back to in_review.
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-        let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome3.conflict_cleared, 1);
         assert_eq!(outcome3.conflict_flagged, 0);
         match db.get_work_item(&chore).unwrap() {
@@ -1235,7 +1318,7 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         // Pass 4 with no change: the clear is also idempotent.
-        let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome4.total_transitions(), 0);
 
         // Event trail: blocked → resolved, plus the noop-passes
@@ -1343,6 +1426,7 @@ mod tests {
             probe.as_ref(),
             publisher.as_ref(),
             Some(cube.as_ref() as &dyn CubeClient),
+            None,
         )
         .await;
         let attempt = db
@@ -1368,6 +1452,7 @@ mod tests {
             probe.as_ref(),
             publisher.as_ref(),
             Some(cube.as_ref() as &dyn CubeClient),
+            None,
         )
         .await;
         assert_eq!(outcome.conflict_cleared, 1);
@@ -1560,7 +1645,7 @@ mod tests {
 
         // First pass: flip to blocked.
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => assert_eq!(t.status, "blocked"),
             other => panic!("expected chore, got {other:?}"),
@@ -1568,7 +1653,7 @@ mod tests {
 
         // Second pass: GitHub reports MERGED.
         probe.set(pr, PrLifecycleState::Merged);
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.merged, 1);
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
@@ -2086,7 +2171,7 @@ mod tests {
 
         // No prior probe activity — this is the very first sweep,
         // exactly what runs at engine startup.
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(
             outcome.conflict_flagged, 1,
             "startup sweep must pick up offline conflicts in one pass",
@@ -2117,7 +2202,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(
             outcome.conflict_cleared, 1,
             "startup sweep must retire offline-resolved conflicts in one pass",
@@ -2148,7 +2233,7 @@ mod tests {
         );
         let publisher = Arc::new(RecordingPublisher::default());
 
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.conflict_flagged, 0);
         assert_eq!(outcome.total_transitions(), 0);
         match db.get_work_item(&chore).unwrap() {
