@@ -1025,6 +1025,15 @@ private struct WorkBoardCardItem: View {
                 )
             }
             .buttonStyle(.plain)
+            .contextMenu {
+                if let id = task.shortID {
+                    Button("Copy Friendly ID") {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        pb.setString("#\(id)", forType: .string)
+                    }
+                }
+            }
             .popover(
                 isPresented: Binding(
                     get: { isSelected },
@@ -1241,6 +1250,16 @@ struct WorkBoardCardView: View {
                 )
         )
         .draggable(task.id)
+        .overlay(alignment: .topTrailing) {
+            if let id = task.shortID {
+                Text("#\(id)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.trailing, 10)
+                    .padding(.top, 8)
+                    .accessibilityLabel("Friendly ID \(id)")
+            }
+        }
     }
 
     /// The footer renders the priority chip on every card so a glance
@@ -1479,8 +1498,16 @@ private struct WorkCardPopoverView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(task.name)
-                        .font(.title3.weight(.semibold))
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(task.name)
+                            .font(.title3.weight(.semibold))
+                        if let id = task.shortID {
+                            Text("#\(id)")
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .accessibilityLabel("Friendly ID \(id)")
+                        }
+                    }
                     Text(task.isChore ? "Chore" : "Task")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
