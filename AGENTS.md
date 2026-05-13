@@ -1,2 +1,3 @@
 - always use minimal bazel visibility, never default to public. Maintain bazel visibility health.
 - Documentation-only changes (markdown files, design docs, plans, READMEs) should be pushed directly to `main` instead of opening a PR.
+- Prefer `bazel test` / `bazel build` over `cargo test` / `cargo build`. Bazel's test cache reuses results across runs when sources are unchanged, which cargo cannot. For the engine specifically, run `bazel test //tools/boss/engine/...` instead of `cargo test -p boss-engine`. `cargo` is fine for quick local iteration on a single file, but PR-validation runs and "is this still passing?" sanity checks should go through bazel so the cache earns its keep.
