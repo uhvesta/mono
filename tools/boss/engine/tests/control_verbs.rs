@@ -458,6 +458,7 @@ async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
         .send_request(&FrontendRequest::ProbeRun {
             run_id: "run-does-not-exist".to_owned(),
             text: "ping".to_owned(),
+            urgent: false,
         })
         .await?;
     match response {
@@ -516,12 +517,14 @@ async fn probe_run_returns_unique_probe_ids() -> Result<()> {
         .send_request(&FrontendRequest::ProbeRun {
             run_id: "run-xyz".to_owned(),
             text: "first".to_owned(),
+            urgent: false,
         })
         .await?;
     let second = client
         .send_request(&FrontendRequest::ProbeRun {
             run_id: "run-xyz".to_owned(),
             text: "second".to_owned(),
+            urgent: false,
         })
         .await?;
     let id_first = match first {
@@ -535,6 +538,46 @@ async fn probe_run_returns_unique_probe_ids() -> Result<()> {
     assert!(!id_first.is_empty(), "probe_id must be populated");
     assert!(!id_second.is_empty(), "probe_id must be populated");
     assert_ne!(id_first, id_second, "back-to-back probes must mint distinct ids");
+    Ok(())
+}
+
+#[tokio::test]
+async fn urgent_probe_echoes_urgent_flag_in_queued_response() -> Result<()> {
+    // Wire-shape smoke for the urgency indicator: a `ProbeRun` with
+    // `urgent: true` must echo `urgent: true` in the `ProbeQueued`
+    // response so the caller (`bossctl probe --urgent`) can confirm
+    // the delivery semantics the engine accepted. A non-urgent probe
+    // must echo `urgent: false` (backwards-compatible default).
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let urgent_resp = client
+        .send_request(&FrontendRequest::ProbeRun {
+            run_id: "run-urgent".to_owned(),
+            text: "course-correct now".to_owned(),
+            urgent: true,
+        })
+        .await?;
+    match urgent_resp {
+        FrontendEvent::ProbeQueued { urgent, .. } => {
+            assert!(urgent, "urgent probe must echo urgent: true");
+        }
+        other => return Err(anyhow!("unexpected response to urgent probe: {other:?}")),
+    }
+
+    let normal_resp = client
+        .send_request(&FrontendRequest::ProbeRun {
+            run_id: "run-normal".to_owned(),
+            text: "check in later".to_owned(),
+            urgent: false,
+        })
+        .await?;
+    match normal_resp {
+        FrontendEvent::ProbeQueued { urgent, .. } => {
+            assert!(!urgent, "non-urgent probe must echo urgent: false");
+        }
+        other => return Err(anyhow!("unexpected response to normal probe: {other:?}")),
+    }
     Ok(())
 }
 
