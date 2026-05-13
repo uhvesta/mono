@@ -121,6 +121,12 @@ pub struct Project {
     /// `None` the other two are ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_doc_path: Option<String>,
+    /// Short per-product sequential id (e.g. 42, rendered as `#42`).
+    /// Allocated at insert time from `short_id_sequences`; `None` only
+    /// on legacy rows that predate the migration (in practice never
+    /// seen after engine boot runs the backfill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +230,12 @@ pub struct Task {
     /// introduced default to an empty list.
     #[serde(default)]
     pub blocked_signals: Vec<BlockedSignal>,
+    /// Short per-product sequential id (e.g. 42, rendered as `#42`).
+    /// Allocated at insert time from `short_id_sequences`; `None` only
+    /// on legacy rows that predate the migration (in practice never
+    /// seen after engine boot runs the backfill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<i64>,
 }
 
 fn default_true() -> bool {

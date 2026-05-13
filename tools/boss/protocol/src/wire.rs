@@ -123,6 +123,14 @@ pub enum FrontendRequest {
     GetWorkItem {
         id: String,
     },
+    /// Look up a work item by its per-product short_id (the friendly
+    /// numeric id, e.g. 42 for `#42`). Searches both `tasks` and
+    /// `projects` tables. Replies with `WorkItemResult` on success or
+    /// `WorkError` when no match exists.
+    GetWorkItemByShortId {
+        product_id: String,
+        short_id: i64,
+    },
     CreateProject {
         #[serde(flatten)]
         input: CreateProjectInput,

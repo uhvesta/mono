@@ -525,6 +525,10 @@ struct ProjectListArgs {
     #[arg(long)]
     product: Option<String>,
 
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    with_primary_id: bool,
+
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
     status: Vec<ProjectStatus>,
@@ -560,6 +564,11 @@ struct ProjectShowArgs {
     #[arg(long)]
     product: Option<String>,
 
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    with_primary_id: bool,
+
+    /// Project id, short id (#42 or 42), or slug.
     selector: String,
 }
 
@@ -688,6 +697,10 @@ struct TaskListArgs {
     #[arg(long)]
     project: Option<String>,
 
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    with_primary_id: bool,
+
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
     status: Vec<TaskStatus>,
@@ -805,6 +818,10 @@ struct ChoreListArgs {
     #[arg(long)]
     product: Option<String>,
 
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    with_primary_id: bool,
+
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
     status: Vec<TaskStatus>,
@@ -878,7 +895,17 @@ impl DependencyFilterArgs {
 
 #[derive(Debug, Clone, Args)]
 struct TaskIdArg {
+    /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
+    /// (`42` or `#42`), or cross-product form (`boss/42` or `boss/#42`).
     id: String,
+    /// Resolve a friendly short id (`42` or `#42`) against this product
+    /// (slug or id). Ignored when the selector already embeds a product
+    /// slug (`boss/42`) or when the selector is a primary id.
+    #[arg(long)]
+    product: Option<String>,
+    /// Also display the primary id alongside the friendly id.
+    #[arg(long = "with-primary-id")]
+    with_primary_id: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1335,8 +1362,10 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
         ],
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
-            "Project selectors accept a project id, slug, or 1-based interactive index within the selected product. For agent use, prefer slug or id, not numeric indexes.",
-            "Task and chore commands that operate on an existing item use the item id, not slug. The id alone disambiguates kind, so `boss task move <chore-id>` and `boss chore move <task-id>` are accepted equivalents of `boss task move <task-id>` / `boss chore move <chore-id>`.",
+            "Project selectors accept a project id, slug, short id (#42 or 42), or 1-based interactive index within the selected product. For agent use, prefer slug, short id, or primary id; avoid numeric indexes.",
+            "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `42` or `#42` within the context product, `boss/42` or `boss/#42` for a specific product. For agent use, prefer the short id form (#42) when talking to a human, and the primary id when calling other engine RPCs.",
+            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
+            "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         status_semantics: vec![
             "CLI status values use in-review on the command line.",
@@ -1614,7 +1643,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                     "design_task": design_task,
                 }),
                 || {
-                    print_project_details("Created project", &project, None);
+                    print_project_details("Created project", &project, None, false);
                     if let Some(task) = design_task.as_ref() {
                         println!(
                             "Design task: {} (autostart={}, status={})",
@@ -1641,10 +1670,11 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             print_entity(
                 ctx,
                 &serde_json::json!({ "product": product, "projects": projects }),
-                || print_projects_table(&projects),
+                || print_projects_table(&projects, args.with_primary_id),
             )
         }
         ProjectCommand::Show(args) => {
+            let with_primary_id = args.with_primary_id;
             let product =
                 resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
                     .await?;
@@ -1667,7 +1697,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                     "design_doc": design_doc,
                 }),
                 || {
-                    print_project_details("Project", &project, Some(&product));
+                    print_project_details("Project", &project, Some(&product), with_primary_id);
                     if let Some(line) = format_project_design_doc_line(&design_doc.state) {
                         println!("Design doc: {line}");
                     }
@@ -1696,7 +1726,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let item = update_work_item(&mut client, &project.id, patch).await?;
             let project = expect_project(item)?;
             print_entity(ctx, &serde_json::json!({ "project": project }), || {
-                print_project_details("Updated project", &project, None);
+                print_project_details("Updated project", &project, None, false);
             })
         }
         ProjectCommand::Delete(args) => {
@@ -1740,7 +1770,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             };
             let moved = expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
             print_entity(ctx, &serde_json::json!({ "project": moved }), || {
-                print_project_details("Moved project", &moved, None);
+                print_project_details("Moved project", &moved, None, false);
             })
         }
         ProjectCommand::SetDesignDoc(args) => {
@@ -1775,7 +1805,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 ctx,
                 &serde_json::json!({ "project": updated, "design_doc": resolved }),
                 || {
-                    print_project_details("Updated project", &updated, None);
+                    print_project_details("Updated project", &updated, None, false);
                     if let Some(line) = format_project_design_doc_line(&resolved.state) {
                         println!("Design doc: {line}");
                     }
@@ -1857,7 +1887,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             )
             .await?;
             print_entity(ctx, &serde_json::json!({ "task": task }), || {
-                print_task_details("Created task", &task, None);
+                print_task_details("Created task", &task, None, false);
             })
         }
         TaskCommand::List(args) => {
@@ -1894,10 +1924,10 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 product.repo_remote_url.as_deref(),
             );
             print_entity(ctx, &serde_json::json!({ "tasks": tasks }), || {
-                print_tasks_table(&tasks)
+                print_tasks_table(&tasks, args.with_primary_id)
             })
         }
-        TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args).await,
+        TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
@@ -1971,7 +2001,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             )
             .await?;
             print_entity(ctx, &serde_json::json!({ "chore": chore }), || {
-                print_task_details("Created chore", &chore, None);
+                print_task_details("Created chore", &chore, None, false);
             })
         }
         ChoreCommand::List(args) => {
@@ -1990,10 +2020,10 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 product.repo_remote_url.as_deref(),
             );
             print_entity(ctx, &serde_json::json!({ "chores": chores }), || {
-                print_tasks_table(&chores)
+                print_tasks_table(&chores, args.with_primary_id)
             })
         }
-        ChoreCommand::Show(args) => run_show_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Show(args) => run_show_leaf(&mut client, ctx, args, true).await,
         ChoreCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
@@ -2006,12 +2036,35 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
 /// Shared handler for `boss task show <id>` and `boss chore show <id>`.
 /// Routes any leaf work item id through the same path; the JSON key
 /// and human-mode label match the actual kind of the returned item.
+///
+/// `chore_only`: when `true` (called from `boss chore show`), resolving
+/// a friendly short id to a non-chore task-table row produces a
+/// "wrong kind" error naming the correct verb.
 async fn run_show_leaf(
     client: &mut BossClient,
     ctx: &RunContext,
     args: TaskIdArg,
+    chore_only: bool,
 ) -> Result<(), CliError> {
-    let (item, label) = expect_leaf_work_item(get_work_item(client, &args.id).await?)?;
+    let with_primary_id = args.with_primary_id;
+    let work_item = match parse_work_item_selector(&args.id) {
+        WorkItemSelector::ShortId(n) => {
+            let product = resolve_product(client, args.product, ctx).await?;
+            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            check_task_kind_for_verb(&item, n, chore_only)?;
+            item
+        }
+        WorkItemSelector::ProductShortId { product_slug, n } => {
+            let product = resolve_product(client, Some(product_slug), ctx).await?;
+            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            check_task_kind_for_verb(&item, n, chore_only)?;
+            item
+        }
+        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => {
+            get_work_item(client, &id).await?
+        }
+    };
+    let (item, label) = expect_leaf_work_item(work_item)?;
     let product = expect_product(get_work_item(client, &item.product_id).await?)?;
     let detail = list_dependencies_detailed(
         client,
@@ -2025,10 +2078,29 @@ async fn run_show_leaf(
         ctx,
         &serde_json::json!({ label: item, "dependencies": detail }),
         || {
-            print_task_details(label_titlecase(label), &item, Some(&product));
+            print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
             print_dependency_section(&detail);
         },
     )
+}
+
+/// Check whether a work item resolved from a short id matches the verb
+/// context. When `chore_only` is true and the item is a non-chore task,
+/// return a user-friendly error naming the right verb.
+fn check_task_kind_for_verb(item: &WorkItem, short_id: i64, chore_only: bool) -> Result<(), CliError> {
+    if !chore_only {
+        return Ok(());
+    }
+    match item {
+        WorkItem::Task(t) => Err(CliError::application(format!(
+            "#{short_id} is a {} (kind={}), not a chore — use `boss task show {short_id}`",
+            t.kind, t.kind
+        ))),
+        WorkItem::Project(_) => Err(CliError::application(format!(
+            "#{short_id} is a project, not a chore — use `boss project show {short_id}`"
+        ))),
+        WorkItem::Chore(_) | WorkItem::Product(_) => Ok(()),
+    }
 }
 
 /// Shared handler for `boss task update` and `boss chore update`.
@@ -2068,7 +2140,7 @@ async fn run_update_leaf(
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
-        print_task_details(&format!("Updated {label}"), &item, None);
+        print_task_details(&format!("Updated {label}"), &item, None, false);
     })
 }
 
@@ -2084,7 +2156,7 @@ async fn run_move_leaf(
     };
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
-        print_task_details(&format!("Moved {label}"), &item, None);
+        print_task_details(&format!("Moved {label}"), &item, None, false);
     })
 }
 
@@ -2790,7 +2862,7 @@ async fn run_bind_pr(
             "rebinding": prior_url.is_some(),
             "previous_pr_url": prior_url,
         }),
-        || print_task_details(&title, &updated, None),
+        || print_task_details(&title, &updated, None, false),
     )
 }
 
@@ -2914,7 +2986,7 @@ async fn run_task_create_many(
         || {
             if !ctx.quiet {
                 println!("Created {} tasks:", created.len());
-                print_tasks_table(&created);
+                print_tasks_table(&created, false);
             }
         },
     )?;
@@ -2958,7 +3030,7 @@ async fn run_chore_create_many(
         || {
             if !ctx.quiet {
                 println!("Created {} chores:", created.len());
-                print_tasks_table(&created);
+                print_tasks_table(&created, false);
             }
         },
     )
@@ -3353,6 +3425,86 @@ fn is_typed_work_item_id(s: &str) -> bool {
     s.starts_with("prod_") || s.starts_with("proj_") || s.starts_with("task_")
 }
 
+/// Parsed form of a task/chore/project selector.
+///
+/// Priority order per design Q5:
+/// 1. `#42` or `42` → short id
+/// 2. `boss/42` or `boss/#42` → cross-product short id
+/// 3. `task_…` / `proj_…` / `prod_…` → primary id (typed)
+/// 4. anything else → slug / existing resolution
+#[derive(Debug, Clone)]
+enum WorkItemSelector {
+    /// `42` or `#42` — short id within the context product.
+    ShortId(i64),
+    /// `boss/42` or `boss/#42` — short id in the named product slug.
+    ProductShortId { product_slug: String, n: i64 },
+    /// `task_…` / `proj_…` / `prod_…` — primary engine id.
+    PrimaryId(String),
+    /// Slug or other selector; fall through to existing resolution.
+    Other(String),
+}
+
+/// Parse `s` into a [`WorkItemSelector`] per design Q5 grammar.
+fn parse_work_item_selector(s: &str) -> WorkItemSelector {
+    let s = s.trim();
+    // Cross-product form: "boss/42" or "boss/#42"
+    if let Some(slash) = s.find('/') {
+        let product_slug = &s[..slash];
+        let rest = s[slash + 1..].trim_start_matches('#');
+        if !product_slug.is_empty() {
+            if let Ok(n) = rest.parse::<i64>() {
+                if n > 0 {
+                    return WorkItemSelector::ProductShortId {
+                        product_slug: product_slug.to_owned(),
+                        n,
+                    };
+                }
+            }
+        }
+    }
+    // `#42` form (explicit friendly-id prefix)
+    if let Some(rest) = s.strip_prefix('#') {
+        if let Ok(n) = rest.parse::<i64>() {
+            if n > 0 {
+                return WorkItemSelector::ShortId(n);
+            }
+        }
+    }
+    // Plain integer → short id (Q5 step 2: `#` is optional)
+    if let Ok(n) = s.parse::<i64>() {
+        if n > 0 {
+            return WorkItemSelector::ShortId(n);
+        }
+    }
+    // Primary id prefixes
+    if is_typed_work_item_id(s) {
+        return WorkItemSelector::PrimaryId(s.to_owned());
+    }
+    WorkItemSelector::Other(s.to_owned())
+}
+
+/// Call the engine's `GetWorkItemByShortId` RPC and return the result.
+async fn get_work_item_by_short_id_rpc(
+    client: &mut BossClient,
+    product_id: &str,
+    short_id: i64,
+) -> Result<WorkItem, CliError> {
+    match client
+        .send_request(&FrontendRequest::GetWorkItemByShortId {
+            product_id: product_id.to_owned(),
+            short_id,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemResult { item } => Ok(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("work item fetch by short id", &other)),
+    }
+}
+
 /// If `selector` is a typed engine work-item id, look it up and return
 /// its product id. Returns `Ok(None)` when the selector isn't shaped
 /// like a typed id; callers then fall back to slug / interactive
@@ -3480,6 +3632,18 @@ fn match_products(products: &[Product], selector: &str) -> Result<Product, CliEr
 }
 
 fn match_projects(projects: &[Project], selector: &str) -> Result<Project, CliError> {
+    // Short id form: "42" or "#42" → match by short_id.
+    // This takes priority over the 1-based index so that `boss project show 42`
+    // consistently means "the project with short_id 42" everywhere.
+    if let WorkItemSelector::ShortId(n) = parse_work_item_selector(selector) {
+        let matches = projects
+            .iter()
+            .filter(|p| p.short_id == Some(n))
+            .cloned()
+            .collect::<Vec<_>>();
+        return resolve_single_match(matches, format!("no project with id #{n}"));
+    }
+
     if let Some(project) = pick_by_index(projects, selector)? {
         return Ok(project);
     }
@@ -3890,33 +4054,59 @@ fn print_products_table(products: &[Product]) {
     println!("{table}");
 }
 
-fn print_projects_table(projects: &[Project]) {
+fn print_projects_table(projects: &[Project], with_primary_id: bool) {
+    let show_short_id = projects.iter().any(|p| p.short_id.is_some());
     let mut table = Table::new();
+    let mut header: Vec<&str> = Vec::new();
+    if show_short_id {
+        header.push("#");
+    }
+    if !show_short_id || with_primary_id {
+        header.push("ID");
+    }
+    header.extend_from_slice(&["SLUG", "NAME", "STATUS", "PRIORITY", "GOAL"]);
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["ID", "SLUG", "NAME", "STATUS", "PRIORITY", "GOAL"]);
+        .set_header(header);
     for project in projects {
-        table.add_row(vec![
-            project.id.as_str(),
-            project.slug.as_str(),
-            project.name.as_str(),
-            project.status.as_str(),
-            project.priority.as_str(),
-            project.goal.as_str(),
-        ]);
+        let mut row: Vec<String> = Vec::new();
+        if show_short_id {
+            let friendly = project
+                .short_id
+                .map(|n| format!("#{n}"))
+                .unwrap_or_default();
+            row.push(friendly);
+        }
+        if !show_short_id || with_primary_id {
+            row.push(project.id.clone());
+        }
+        row.push(project.slug.clone());
+        row.push(project.name.clone());
+        row.push(project.status.clone());
+        row.push(project.priority.clone());
+        row.push(project.goal.clone());
+        table.add_row(row);
     }
     println!("{table}");
 }
 
-fn print_tasks_table(tasks: &[Task]) {
+fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // Only render the EFFORT column when at least one row in the
     // view carries a level — keeps the common case (legacy rows)
     // narrow but surfaces the new field as soon as it lands on
     // anything. JSON output always carries the field; this is a
     // human-readability nicety only.
     let show_effort = tasks.iter().any(|t| t.effort_level.is_some());
+    let show_short_id = tasks.iter().any(|t| t.short_id.is_some());
     let mut table = Table::new();
-    let mut header = vec!["ID", "NAME", "STATUS", "PRIORITY"];
+    let mut header: Vec<&str> = Vec::new();
+    if show_short_id {
+        header.push("#");
+    }
+    if !show_short_id || with_primary_id {
+        header.push("ID");
+    }
+    header.extend_from_slice(&["NAME", "STATUS", "PRIORITY"]);
     if show_effort {
         header.push("EFFORT");
     }
@@ -3929,19 +4119,24 @@ fn print_tasks_table(tasks: &[Task]) {
             .ordinal
             .map(|value| value.to_string())
             .unwrap_or_default();
-        let mut row: Vec<&str> = vec![
-            task.id.as_str(),
-            task.name.as_str(),
-            task.status.as_str(),
-            task.priority.as_str(),
-        ];
-        let effort_cell = task.effort_level.map(|l| l.as_str()).unwrap_or("");
-        if show_effort {
-            row.push(effort_cell);
+        let friendly = task.short_id.map(|n| format!("#{n}")).unwrap_or_default();
+        let effort_str = task.effort_level.map(|l| l.as_str().to_owned()).unwrap_or_default();
+        let mut row: Vec<String> = Vec::new();
+        if show_short_id {
+            row.push(friendly);
         }
-        row.push(task.project_id.as_deref().unwrap_or(""));
-        row.push(ordinal.as_str());
-        row.push(task.pr_url.as_deref().unwrap_or(""));
+        if !show_short_id || with_primary_id {
+            row.push(task.id.clone());
+        }
+        row.push(task.name.clone());
+        row.push(task.status.clone());
+        row.push(task.priority.clone());
+        if show_effort {
+            row.push(effort_str);
+        }
+        row.push(task.project_id.clone().unwrap_or_default());
+        row.push(ordinal);
+        row.push(task.pr_url.clone().unwrap_or_default());
         table.add_row(row);
     }
     println!("{table}");
@@ -3986,9 +4181,17 @@ fn format_repo_line(override_url: Option<&str>, product: &Product) -> String {
     "(none — work item cannot dispatch)".to_owned()
 }
 
-fn print_project_details(title: &str, project: &Project, parent_product: Option<&Product>) {
+fn print_project_details(title: &str, project: &Project, parent_product: Option<&Product>, with_primary_id: bool) {
     println!("{title}");
-    println!("ID: {}", project.id);
+    if let Some(n) = project.short_id {
+        if with_primary_id {
+            println!("#{n}  \x1b[2m{}\x1b[0m", project.id);
+        } else {
+            println!("#{n}");
+        }
+    } else {
+        println!("ID: {}", project.id);
+    }
     println!("Product ID: {}", project.product_id);
     println!("Name: {}", project.name);
     println!("Slug: {}", project.slug);
@@ -4156,9 +4359,17 @@ fn decide_open_design_action(
     }
 }
 
-fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>) {
+fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>, with_primary_id: bool) {
     println!("{title}");
-    println!("ID: {}", task.id);
+    if let Some(n) = task.short_id {
+        if with_primary_id {
+            println!("#{n}  \x1b[2m{}\x1b[0m", task.id);
+        } else {
+            println!("#{n}");
+        }
+    } else {
+        println!("ID: {}", task.id);
+    }
     println!("Product ID: {}", task.product_id);
     if let Some(project_id) = &task.project_id {
         println!("Project ID: {}", project_id);
@@ -4442,8 +4653,8 @@ mod tests {
             model_override: None,
             ci_attempt_budget: None,
             ci_attempts_used: 0,
+            blocked_signals: vec![],
             short_id: None,
-            blocked_signals: Vec::new(),
         }
     }
 

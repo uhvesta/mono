@@ -117,6 +117,29 @@ rust_test(
     ),
 )
 
+# End-to-end integration tests for the friendly-id selector semantics
+# (chore 3 of 5 — "Friendly numeric IDs"). Verifies that 42, #42,
+# boss/42, boss/#42, and primary-id forms all resolve correctly and
+# that wrong-kind errors name the corrective verb.
+rust_test(
+    name = "friendly_id_test",
+    srcs = ["tests/friendly_id.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
 # End-to-end coverage for the heuristic feedback-loop audit report
 # (design §Q4 follow-up, PR #370). Drives `boss product
 # audit-effort` against an in-process engine with synthetic

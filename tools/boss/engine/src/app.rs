@@ -2923,6 +2923,39 @@ async fn handle_frontend_connection(
                     );
                 }
             },
+            FrontendRequest::GetWorkItemByShortId {
+                product_id,
+                short_id,
+            } => match work_db.get_work_item_by_short_id(&product_id, short_id) {
+                Ok(Some(item)) => {
+                    send_response_with_revision(
+                        &sink,
+                        &request_id,
+                        server_state.current_work_revision(),
+                        FrontendEvent::WorkItemResult { item },
+                    );
+                }
+                Ok(None) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "no work item with id #{short_id} in product {product_id}"
+                            ),
+                        },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
             FrontendRequest::CreateProject { input } => match work_db.create_project(input) {
                 Ok(project) => {
                     let item = WorkItem::Project(project);

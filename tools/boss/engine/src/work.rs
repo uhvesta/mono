@@ -2052,6 +2052,48 @@ impl WorkDb {
         }
     }
 
+    /// Look up a work item by its per-product short_id. Searches both
+    /// the `tasks` table (returning `Task` or `Chore`) and the
+    /// `projects` table, returning the first match. Returns `None` if
+    /// no row with `(product_id, short_id)` exists.
+    ///
+    /// The per-product sequence is shared across tasks and projects
+    /// (design Q1), so each short_id belongs to at most one row across
+    /// both tables for a given product.
+    pub fn get_work_item_by_short_id(
+        &self,
+        product_id: &str,
+        short_id: i64,
+    ) -> Result<Option<WorkItem>> {
+        let conn = self.connect()?;
+        if let Some(task) = conn
+            .query_row(
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+                 FROM tasks
+                 WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
+                params![product_id, short_id],
+                map_task,
+            )
+            .optional()?
+        {
+            return Ok(Some(task_to_item(task)));
+        }
+        if let Some(project) = conn
+            .query_row(
+                "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
+                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id
+                 FROM projects
+                 WHERE product_id = ?1 AND short_id = ?2",
+                params![product_id, short_id],
+                map_project,
+            )
+            .optional()?
+        {
+            return Ok(Some(WorkItem::Project(project)));
+        }
+        Ok(None)
+    }
+
     pub fn list_tasks(
         &self,
         product_id: &str,
@@ -4462,6 +4504,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // always empty; consumers fall back to the scalar
         // `blocked_reason` / `blocked_attempt_id` cache above.
         blocked_signals: Vec::new(),
+        short_id: row.get(23)?,
     })
 }
 
