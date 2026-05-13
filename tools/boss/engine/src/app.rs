@@ -303,6 +303,18 @@ struct ServerState {
     /// run lacks the field. See [`TranscriptPathCache`] for why this
     /// is the structural fix for the 2026-05-12 incident.
     transcript_path_cache: Arc<crate::live_status_loop::TranscriptPathCache>,
+    /// Primary-path `execution_id → pr_url` staging cache. Populated
+    /// by [`dispatch_live_worker_state`] from `PostToolUse` Bash
+    /// hooks that surface a `gh pr create` (or `view` / `edit`)
+    /// URL in `tool_response.stdout`. Read by
+    /// [`WorkerCompletionHandler::on_stop`] (and `recheck_for_pr`)
+    /// on the matching Stop to skip the `jj log` + `gh api` PR
+    /// reconstruction entirely.
+    ///
+    /// Shared with the completion handler via
+    /// [`WorkerCompletionHandler::with_staged_pr_urls`] so writes
+    /// here and reads in `on_stop` see the same map.
+    staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
     /// Snapshot of the Anthropic API key captured at engine startup.
     /// Used by the live-status summarizer for the per-slot task; the
     /// pane-titlebar summarizer continues to resolve the key
@@ -528,14 +540,18 @@ impl ServerState {
         // `PaneSpawnRunner` below.
         let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
-        let completion_handler = Arc::new(WorkerCompletionHandler::new(
-            work_db.clone(),
-            pr_detector,
-            cube_client.clone(),
-            publisher.clone(),
-            pane_releaser.clone(),
-            probe_queuer.clone(),
-        ));
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        let completion_handler = Arc::new(
+            WorkerCompletionHandler::new(
+                work_db.clone(),
+                pr_detector,
+                cube_client.clone(),
+                publisher.clone(),
+                pane_releaser.clone(),
+                probe_queuer.clone(),
+            )
+            .with_staged_pr_urls(staged_pr_urls.clone()),
+        );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
         // pointer back via set_server_state once the Arc exists. The
@@ -598,6 +614,7 @@ impl ServerState {
                 transcript_path_cache: Arc::new(
                     crate::live_status_loop::TranscriptPathCache::new(),
                 ),
+                staged_pr_urls,
                 anthropic_api_key,
                 next_session_id: AtomicU64::new(1),
                 work_revision,
@@ -2362,10 +2379,52 @@ async fn dispatch_live_worker_state(
                 .live_status_manager
                 .notify(slot_id, Trigger::Stop);
         }
-        crate::protocol::WorkerEvent::PostToolUse { .. } => {
+        crate::protocol::WorkerEvent::PostToolUse {
+            tool_name,
+            tool_response,
+            ..
+        } => {
             server_state
                 .live_status_manager
                 .notify(slot_id, Trigger::PostToolUse);
+            // Primary-path PR URL capture. Every worker that opens a
+            // PR does it via a Bash `gh pr create` (and also
+            // `gh pr view` / `gh pr edit`); the PR URL is printed
+            // on stdout. Catch it here, stage against the
+            // execution_id, and the on-Stop handler picks it up
+            // without ever shelling out to `jj log` to reconstruct
+            // it. Cheap regex scan — runs only on Bash events.
+            if tool_name == "Bash" {
+                if let Some(pr_url) =
+                    crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response)
+                {
+                    let outcome = server_state
+                        .staged_pr_urls
+                        .record_if_unset(run_id, &pr_url);
+                    match outcome {
+                        crate::pr_url_capture::StagePrUrlOutcome::Staged => {
+                            tracing::info!(
+                                execution_id = run_id,
+                                pr_url = %pr_url,
+                                "pr_url_capture: staged PR URL from worker hook stream",
+                            );
+                        }
+                        crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
+                            // Worker emitted another PR URL after
+                            // already staging one — typically a
+                            // `gh pr view` follow-up referencing a
+                            // different PR. First-writer-wins so
+                            // the original (the worker's own
+                            // `gh pr create`) is kept.
+                            tracing::debug!(
+                                execution_id = run_id,
+                                pr_url = %pr_url,
+                                "pr_url_capture: ignoring later URL (already staged for this execution)",
+                            );
+                        }
+                    }
+                }
+            }
         }
         _ => {}
     }

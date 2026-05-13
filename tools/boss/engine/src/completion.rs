@@ -649,6 +649,20 @@ pub struct WorkerCompletionHandler {
     publisher: Arc<dyn ExecutionPublisher>,
     pane_releaser: Arc<dyn WorkerPaneReleaser>,
     probe_queuer: Arc<dyn ProbeQueuer>,
+    /// Primary-path PR URL staging. The events-socket dispatcher in
+    /// `app.rs` populates this from `PostToolUse` Bash hook events
+    /// whose `tool_response.stdout` carries a `gh pr create` (or
+    /// `gh pr view` / `gh pr edit`) URL. When `on_stop` /
+    /// `recheck_for_pr` fires, peek this cache first: if a URL is
+    /// staged we trust it verbatim (`PrStatus::Fresh`) and skip the
+    /// `jj log` + `gh api commits/{sha}/pulls` reconstruction
+    /// entirely. Reconstruction stays as the cold-path fallback for
+    /// engine-restart recovery (the cache lives in memory only).
+    ///
+    /// Defaults to an empty cache so test sites that don't exercise
+    /// the staging path get the same behaviour they always had —
+    /// nothing is staged → fall through to `pr_detector`.
+    staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
 }
 
 impl WorkerCompletionHandler {
@@ -667,7 +681,24 @@ impl WorkerCompletionHandler {
             publisher,
             pane_releaser,
             probe_queuer,
+            staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
         }
+    }
+
+    /// Wire an externally-owned [`StagedPrUrlCache`] into this
+    /// handler so the events-socket dispatcher and the on-Stop
+    /// resolver share the same map. `app.rs` calls this once after
+    /// construction; tests that want to exercise the staged-URL
+    /// path can call it with their own cache. Tests that don't
+    /// invoke it get the default empty cache from `new` and follow
+    /// the legacy detector path — preserving the pre-change
+    /// behaviour without a signature break.
+    pub fn with_staged_pr_urls(
+        mut self,
+        cache: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    ) -> Self {
+        self.staged_pr_urls = cache;
+        self
     }
 
     /// Handle a `Stop` event for `execution_id`. Returns the outcome
@@ -704,6 +735,34 @@ impl WorkerCompletionHandler {
         // Already completed/failed/cancelled — nothing more to do.
         if !matches!(execution.status.as_str(), "running" | "waiting_human") {
             return StopOutcome::AlreadyTerminal;
+        }
+
+        // Primary path: a PR URL was already captured from a
+        // `PostToolUse` Bash hook event (`gh pr create` /
+        // `gh pr view` / `gh pr edit` stdout) while the worker was
+        // still running. Trust it verbatim, synthesize
+        // `PrStatus::Fresh`, and proceed to the in-review transition
+        // without shelling out to `jj log` or `gh api commits/.../pulls`.
+        //
+        // The cold-path fallback below (workspace + detect_pr)
+        // remains for engine-restart recovery: if the engine was
+        // down when the worker ran `gh pr create`, the in-memory
+        // staging cache is empty here and we fall through to
+        // reconstruct the URL from local jj state + the GitHub API.
+        if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
+            tracing::info!(
+                execution_id,
+                pr_url = %staged_url,
+                "stop event: using PR URL captured from worker hook stream (primary path); skipping detector",
+            );
+            return self
+                .finalize_pr_transition(
+                    execution_id,
+                    staged_url,
+                    WorkerPrCompletionTarget::InReview,
+                    "stop_staged",
+                )
+                .await;
         }
 
         let workspace_path = match execution.workspace_path.as_deref() {
@@ -813,6 +872,28 @@ impl WorkerCompletionHandler {
         if !matches!(execution.status.as_str(), "running" | "waiting_human") {
             return StopOutcome::AlreadyTerminal;
         }
+        // Primary path mirror: if the PostToolUse dispatcher already
+        // captured this execution's PR URL from the worker's hook
+        // stream, finalize via that URL and skip the detector. This
+        // matches the on-Stop shortcut so the merge-poller sweep
+        // recovers any chore whose Stop hook fired after the engine
+        // restarted (cache empty at Stop) but the PostToolUse for
+        // `gh pr create` arrived between then and now.
+        if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
+            tracing::info!(
+                execution_id,
+                pr_url = %staged_url,
+                "pr-recheck: using PR URL captured from worker hook stream (primary path); skipping detector",
+            );
+            return self
+                .finalize_pr_transition(
+                    execution_id,
+                    staged_url,
+                    WorkerPrCompletionTarget::InReview,
+                    "pr_recheck_staged",
+                )
+                .await;
+        }
         let workspace_path = match execution.workspace_path.as_deref() {
             Some(path) => PathBuf::from(path),
             None => return StopOutcome::NoWorkspace,
@@ -885,6 +966,11 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
+        // Clear the staged URL now that the DB write succeeded.
+        // Deliberately ordered after `record_worker_pr_completion` so
+        // a failed DB write leaves the cache intact and the next
+        // merge-poller sweep can retry with the same staged URL.
+        self.staged_pr_urls.forget(execution_id);
         if let Some(lease_id) = completion.released_lease_id.as_deref() {
             if let Err(err) = self.cube_client.release_workspace(lease_id).await {
                 tracing::error!(
@@ -1215,6 +1301,7 @@ mod tests {
 
     struct StubPrDetector {
         result: Mutex<Result<PrStatus, String>>,
+        call_count: std::sync::atomic::AtomicUsize,
     }
 
     impl StubPrDetector {
@@ -1225,19 +1312,26 @@ mod tests {
             };
             Arc::new(Self {
                 result: Mutex::new(Ok(status)),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
         fn ok_status(status: PrStatus) -> Arc<Self> {
             Arc::new(Self {
                 result: Mutex::new(Ok(status)),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
         fn err(message: &str) -> Arc<Self> {
             Arc::new(Self {
                 result: Mutex::new(Err(message.to_owned())),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
             })
+        }
+
+        fn call_count(&self) -> usize {
+            self.call_count.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1249,6 +1343,8 @@ mod tests {
             _repo_remote_url: &str,
             _dispatch_started_at: Option<&str>,
         ) -> Result<PrStatus> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let guard = self.result.lock().await;
             match &*guard {
                 Ok(value) => Ok(value.clone()),
@@ -1517,6 +1613,196 @@ mod tests {
             probes.snapshot().is_empty(),
             "fresh-PR completion must NOT queue a probe — the worker is done",
         );
+    }
+
+    #[tokio::test]
+    async fn on_stop_uses_staged_pr_url_and_skips_detector() {
+        // Primary path: the worker ran `gh pr create` mid-run, the
+        // events-socket dispatcher captured the URL into the staging
+        // cache, the worker did more work, then stopped. On Stop the
+        // handler must:
+        //   1. read the staged URL,
+        //   2. NOT invoke the detector (jj+gh reconstruction),
+        //   3. transition the work item to `in_review` with the
+        //      staged URL bound,
+        //   4. release the lease + pane.
+        //
+        // The detector is wired with a deliberately-wrong URL so any
+        // accidental fall-through to the cold path would be visible
+        // as a wrong pr_url on the work item.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/458",
+        );
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_staged_pr_urls(staged_pr_urls.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+                if pr_url == "https://github.com/spinyfin/mono/pull/458"),
+            "expected PrDetected with staged URL, got {outcome:?}",
+        );
+        assert_eq!(
+            detector.call_count(),
+            0,
+            "the staged-URL short-circuit must skip the detector entirely (this is the whole point — no jj log, no gh api commits/{{sha}}/pulls)",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/spinyfin/mono/pull/458"),
+                    "the chore must bind to the STAGED URL, not the detector's wrong URL",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // Cache is cleared after a successful transition so a repeat
+        // Stop on the same execution wouldn't re-fire transition logic
+        // against a stale entry.
+        assert!(
+            staged_pr_urls.get(&execution_id).is_none(),
+            "staging cache must be cleared after the successful transition",
+        );
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "lease release must still fire on the primary path",
+        );
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "pane teardown must still fire on the primary path",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "fresh-PR completion must not queue a probe",
+        );
+    }
+
+    #[tokio::test]
+    async fn on_stop_with_no_staged_url_still_falls_back_to_detector() {
+        // Regression test for the cold path. After this PR ships,
+        // the staged-URL shortcut handles 99% of cases, but the
+        // detector path remains as engine-restart recovery (if the
+        // engine restarted between `gh pr create` and Stop, the
+        // staging cache is empty here and we must still find the
+        // PR through the legacy jj+gh path).
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector =
+            StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        // No `with_staged_pr_urls` call — handler uses the default
+        // empty cache. The detector must be invoked.
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        assert_eq!(
+            detector.call_count(),
+            1,
+            "with no staged URL, the detector is the only way to bind — it must be called",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/12"));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_uses_staged_pr_url_and_skips_detector() {
+        // Merge-poller mirror: if the on-Stop path missed staging
+        // (e.g. PostToolUse arrived after Stop in the wrong order
+        // because of socket reordering, or the engine restarted),
+        // the merge poller's `recheck_for_pr` sweep is the second
+        // chance to find the URL. Same shortcut applies — if the
+        // dispatcher staged a URL between Stop and now, recheck
+        // uses it without the detector.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::err("jj broken");
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/458",
+        );
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_staged_pr_urls(staged_pr_urls.clone());
+
+        // Detector intentionally returns Err — if recheck called it,
+        // recheck would surface `DetectorFailed`. With the staged
+        // shortcut, recheck must succeed without ever touching the
+        // detector.
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+                if pr_url == "https://github.com/spinyfin/mono/pull/458"),
+            "expected PrDetected from recheck via staged URL, got {outcome:?}",
+        );
+        assert_eq!(
+            detector.call_count(),
+            0,
+            "recheck must skip the detector when a staged URL is present",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/spinyfin/mono/pull/458"),
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 
     #[tokio::test]

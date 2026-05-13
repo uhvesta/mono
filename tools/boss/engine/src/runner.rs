@@ -841,7 +841,6 @@ mod conflict_resolution_prompt_tests {
             ci_attempts_used: 0,
             short_id: None,
             blocked_signals: Vec::new(),
-            short_id: None,
         })
     }
 
@@ -1167,7 +1166,6 @@ mod pane_spawn_tests {
             ci_attempts_used: 0,
             short_id: None,
             blocked_signals: Vec::new(),
-            short_id: None,
         })
     }
 

@@ -28,6 +28,7 @@ rust_library(
         "src/merge_poller.rs",
         "src/orphan_sweep.rs",
         "src/pane_summary.rs",
+        "src/pr_url_capture.rs",
         "src/protocol.rs",
         "src/run_reconcile.rs",
         "src/runner.rs",

@@ -20,6 +20,7 @@ pub mod live_worker_state;
 pub mod merge_poller;
 pub mod orphan_sweep;
 pub mod pane_summary;
+pub mod pr_url_capture;
 pub mod protocol;
 pub mod run_reconcile;
 pub mod runner;
