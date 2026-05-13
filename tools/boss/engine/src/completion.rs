@@ -630,6 +630,7 @@ impl WorkerCompletionHandler {
             PrStatus::Stale { url, reason } => {
                 return StopOutcome::StalePr { pr_url: url, reason }
             }
+            PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };

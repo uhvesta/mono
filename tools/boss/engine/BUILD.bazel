@@ -26,6 +26,7 @@ rust_library(
         "src/live_status_redact.rs",
         "src/live_worker_state.rs",
         "src/merge_poller.rs",
+        "src/orphan_sweep.rs",
         "src/pane_summary.rs",
         "src/protocol.rs",
         "src/run_reconcile.rs",

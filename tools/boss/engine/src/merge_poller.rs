@@ -734,6 +734,7 @@ async fn sweep_pending_pr(
         StopOutcome::AwaitingInput
         | StopOutcome::DetectorFailed
         | StopOutcome::StalePr { .. }
+        | StopOutcome::EmptyDiffPr { .. }
         | StopOutcome::AlreadyTerminal
         | StopOutcome::UnknownExecution
         | StopOutcome::NoWorkspace
