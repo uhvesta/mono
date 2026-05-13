@@ -1455,14 +1455,21 @@ impl ExecutionCoordinator {
 
     /// Lease a cube workspace for `execution`, emitting a structured
     /// attempt/failure event for every try and falling back to "any
-    /// free workspace" when a `--prefer` request fails.
+    /// free workspace" when an unprefixed lease fails.
     ///
     /// Behaviour matrix:
     ///
-    /// | preferred set? | first attempt    | on first failure                 |
-    /// |----------------|------------------|----------------------------------|
-    /// | yes            | with `--prefer`  | retry once without `--prefer`    |
-    /// | no             | without `--prefer` | terminal failure              |
+    /// | preferred set? | first attempt      | on first failure                          |
+    /// |----------------|--------------------|-------------------------------------------|
+    /// | no             | without `--prefer` | retry once without `--prefer` (`any_free`) |
+    /// | yes            | with `--prefer`    | terminal failure (preserves continuity)   |
+    ///
+    /// When `preferred_workspace_id` is set the caller needs a specific
+    /// workspace (e.g. resuming a prior run). Silently landing elsewhere
+    /// would lose state continuity, so we fail fast and let the scheduler
+    /// retry the dispatch later. When no preference is set any free
+    /// workspace is acceptable, so a single bad workspace cannot block
+    /// the entire dispatch.
     ///
     /// Each subprocess invocation is bounded by [`CUBE_LEASE_TIMEOUT`]
     /// so the engine cannot wedge indefinitely waiting on cube — the
@@ -1476,8 +1483,8 @@ impl ExecutionCoordinator {
         task: &str,
     ) -> Result<CubeWorkspaceLease> {
         let prefer = execution.preferred_workspace_id.as_deref();
-        let fallback_policy = if prefer.is_some() {
-            "retry_any_on_failure"
+        let fallback_policy = if prefer.is_none() {
+            "any_free"
         } else {
             "none"
         };
@@ -1544,11 +1551,11 @@ impl ExecutionCoordinator {
             }
         };
 
-        // Fallback only kicks in when the first attempt asked for a
-        // specific workspace. With `prefer = None` the first attempt
-        // already let cube pick from anywhere and there's nothing
-        // left to try.
-        if prefer.is_none() {
+        // Fallback only kicks in when the first attempt had no workspace
+        // preference. With `prefer = Some(id)` the caller needs that
+        // specific workspace (resuming prior state); silently landing on
+        // a different workspace would lose continuity.
+        if prefer.is_some() {
             return Err(first_err);
         }
 
@@ -2269,10 +2276,14 @@ mod tests {
         fail_lease: bool,
         /// Simulate cube refusing a `--prefer` request because the
         /// preferred workspace is held: `lease_workspace` errors when
-        /// `prefer_workspace_id` is `Some(_)` and succeeds when the
-        /// engine retries without it. Models the fallback path that
-        /// the 2026-05-12 incident never triggered.
+        /// `prefer_workspace_id` is `Some(_)`. Models the "prefer set,
+        /// no fallback" path — the engine should fail fast rather than
+        /// silently landing on a different workspace.
         fail_lease_when_prefer_set: bool,
+        /// Fail the first N lease calls (0-indexed), then succeed. Used
+        /// to model a single bad workspace being skipped via `any_free`
+        /// retry when `preferred_workspace_id=null`.
+        fail_first_n_leases: usize,
         fail_create: bool,
         next_workspace_id: Mutex<Option<String>>,
     }
@@ -2307,17 +2318,25 @@ mod tests {
             task: &str,
             prefer_workspace_id: Option<&str>,
         ) -> Result<CubeWorkspaceLease> {
-            self.lease_calls.lock().await.push((
+            let mut calls = self.lease_calls.lock().await;
+            let call_index = calls.len();
+            calls.push((
                 repo_id.to_owned(),
                 task.to_owned(),
                 prefer_workspace_id.map(str::to_owned),
             ));
+            drop(calls);
             if self.fail_lease {
                 return Err(anyhow!("cube workspace lease failed"));
             }
             if self.fail_lease_when_prefer_set && prefer_workspace_id.is_some() {
                 return Err(anyhow!(
                     "cube workspace lease failed: preferred workspace held by another worker"
+                ));
+            }
+            if call_index < self.fail_first_n_leases {
+                return Err(anyhow!(
+                    "cube workspace lease failed: workspace has uncommitted work"
                 ));
             }
             let workspace_id = self
@@ -3651,14 +3670,13 @@ mod tests {
         assert!(!stages.contains(&"pane_spawned"));
     }
 
-    /// When the engine asks cube for a specific workspace via
-    /// `--prefer X` and cube refuses (because X is held), the engine
-    /// must retry once without `--prefer` so the execution lands on
-    /// any free workspace instead of failing terminally. The 2026-05-12
-    /// incident wedged in `worker_claimed` for ~46s with abundant
-    /// pool capacity precisely because this fallback wasn't wired up.
+    /// When `preferred_workspace_id` is set and cube refuses that workspace,
+    /// the engine must NOT fall back to any other workspace — doing so would
+    /// silently lose state continuity (the resuming worker needs that specific
+    /// workspace). The dispatch must fail so the scheduler can retry with
+    /// the correct workspace later.
     #[tokio::test]
-    async fn lease_falls_back_to_any_workspace_when_prefer_refused() {
+    async fn lease_with_prefer_set_does_not_fall_back_when_refused() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = db
@@ -3706,35 +3724,31 @@ mod tests {
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
-        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
 
-        // Two cube lease invocations: first with --prefer (refused),
-        // second without (succeeds).
+        // Exactly one cube lease invocation: the engine must not retry
+        // with a different workspace when a preferred workspace is set.
         let calls = cube.lease_calls.lock().await;
         assert_eq!(
             calls.len(),
-            2,
-            "engine must retry without --prefer when cube refuses; got {:?}",
+            1,
+            "engine must not retry when prefer is set; got {:?}",
             calls
         );
         assert_eq!(calls[0].2.as_deref(), Some("mono-agent-003"));
-        assert_eq!(calls[1].2, None);
         drop(calls);
 
         let events = recording.events_for(&execution_id).await;
         let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
 
-        // Timeline shape: attempted #1 → failed #1 → attempted #2 →
-        // leased (success). A single attempted-then-failed-then-leased
-        // pattern wouldn't pin the fallback decision.
         let attempt_events: Vec<&crate::dispatch_events::DispatchEvent> = events
             .iter()
             .filter(|e| e.stage == "cube_workspace_lease_attempted")
             .collect();
         assert_eq!(
             attempt_events.len(),
-            2,
-            "expected two lease_attempted events (initial + fallback); got stages {stages:?}"
+            1,
+            "expected exactly one lease_attempted event; got stages {stages:?}"
         );
         assert_eq!(
             attempt_events[0]
@@ -3748,16 +3762,126 @@ mod tests {
                 .details
                 .get("fallback_policy")
                 .and_then(|v| v.as_str()),
-            Some("retry_any_on_failure"),
+            Some("none"),
+            "policy must be none when prefer is set — no silent workspace swap",
+        );
+
+        // Execution must fail, not succeed on a different workspace.
+        assert!(
+            !stages.contains(&"cube_workspace_leased"),
+            "cube_workspace_leased must not appear; engine must not land on a different workspace; got {stages:?}",
+        );
+
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            attention_items.len(),
+            1,
+            "terminal lease failure must raise exactly one attention item",
+        );
+        assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
+    }
+
+    /// When `preferred_workspace_id=null` and cube fails the first workspace
+    /// (e.g. because it has uncommitted work from a prior crashed lease),
+    /// the engine must retry with `any_free` policy and land on the second
+    /// workspace. This pins the fix for the 2026-05-12 dispatch failure
+    /// where a single bad workspace blocked dispatch despite 12+ free ones.
+    #[tokio::test]
+    async fn lease_falls_back_when_no_prefer_and_first_workspace_refused() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Cleanup".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        db.request_execution(RequestExecutionInput {
+            work_item_id: chore.id.clone(),
+            priority: None,
+            preferred_workspace_id: None,
+            force: false,
+        })
+        .unwrap();
+
+        // First lease call fails (simulating a workspace with uncommitted
+        // work refusing the reset); second call succeeds on a different
+        // workspace.
+        let cube = Arc::new(FakeCubeClient {
+            fail_first_n_leases: 1,
+            ..FakeCubeClient::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_dispatch_events(recording.clone()),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &execution_id, "waiting_human").await;
+
+        // Two cube lease invocations: first fails, second succeeds.
+        let calls = cube.lease_calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            2,
+            "engine must retry on any_free when no prefer set; got {:?}",
+            calls
+        );
+        // Both calls have no --prefer (engine retries with same strategy).
+        assert_eq!(calls[0].2, None);
+        assert_eq!(calls[1].2, None);
+        drop(calls);
+
+        let events = recording.events_for(&execution_id).await;
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+
+        // Timeline: attempted #1 → failed #1 → attempted #2 → leased.
+        let attempt_events: Vec<&crate::dispatch_events::DispatchEvent> = events
+            .iter()
+            .filter(|e| e.stage == "cube_workspace_lease_attempted")
+            .collect();
+        assert_eq!(
+            attempt_events.len(),
+            2,
+            "expected two lease_attempted events (initial + any_free retry); got stages {stages:?}"
+        );
+        assert_eq!(
+            attempt_events[0]
+                .details
+                .get("fallback_policy")
+                .and_then(|v| v.as_str()),
+            Some("any_free"),
+            "first attempt must carry any_free policy when no prefer set",
         );
         assert!(
-            attempt_events[1]
+            attempt_events[0]
                 .details
                 .get("prefer_workspace_id")
                 .map(|v| v.is_null())
                 .unwrap_or(false),
-            "fallback attempt must have prefer_workspace_id=null; got {:?}",
-            attempt_events[1].details,
+            "first attempt must have prefer_workspace_id=null; got {:?}",
+            attempt_events[0].details,
         );
         assert_eq!(
             attempt_events[1]
@@ -3765,6 +3889,7 @@ mod tests {
                 .get("fallback_policy")
                 .and_then(|v| v.as_str()),
             Some("none"),
+            "retry attempt has no further fallback",
         );
 
         let failed_events: Vec<&crate::dispatch_events::DispatchEvent> = events
@@ -3777,26 +3902,24 @@ mod tests {
             "exactly one lease_failed event for the first attempt; got stages {stages:?}"
         );
 
-        // Final state: a successful `cube_workspace_leased` event and
-        // the execution proceeded past the lease step.
+        // Final state: a successful `cube_workspace_leased` event.
         let leased = events
             .iter()
             .find(|e| e.stage == "cube_workspace_leased")
-            .expect("cube_workspace_leased event missing after fallback");
+            .expect("cube_workspace_leased event missing after any_free retry");
         assert_eq!(leased.outcome, "ok");
 
-        // No attention item should be raised — the fallback succeeded
-        // and the execution didn't fail.
+        // No attention item — the fallback succeeded.
         let attention_items = db.list_attention_items(&execution_id).unwrap();
         assert!(
             attention_items.iter().all(|a| a.kind != "cube_workspace_lease_failed"),
-            "fallback success must not raise a lease-failure attention item; got {attention_items:?}",
+            "any_free success must not raise a lease-failure attention item; got {attention_items:?}",
         );
     }
 
-    /// When the fallback also fails the execution must transition to
-    /// `failed` with both `cube_workspace_lease_failed` events visible
-    /// — silent indefinite wait is not acceptable.
+    /// When `preferred_workspace_id=null` and both lease attempts fail, the
+    /// execution must transition to `failed` with both
+    /// `cube_workspace_lease_failed` events visible — silent wait is not OK.
     #[tokio::test]
     async fn lease_fallback_failure_transitions_execution_to_failed() {
         let dir = tempdir().unwrap();
@@ -3825,7 +3948,7 @@ mod tests {
         db.request_execution(RequestExecutionInput {
             work_item_id: chore.id.clone(),
             priority: None,
-            preferred_workspace_id: Some("mono-agent-003".to_owned()),
+            preferred_workspace_id: None,
             force: false,
         })
         .unwrap();
@@ -3859,7 +3982,7 @@ mod tests {
             .count();
         assert_eq!(
             attempt_count, 2,
-            "expected initial + fallback attempt events; got {events:?}"
+            "expected initial + any_free retry attempt events; got {events:?}"
         );
         assert_eq!(
             failed_count, 2,
