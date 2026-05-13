@@ -1409,6 +1409,8 @@ private struct WorkCardPopoverView: View {
     @ObservedObject var model: ChatViewModel
     let task: WorkTask
 
+    @Environment(\.openWindow) private var openWindow
+
     /// Drives presentation of the Repo Change… picker sheet. Bound to
     /// the popover so the sheet inherits the popover's window context;
     /// closing the sheet returns focus to the popover the user came
@@ -1570,9 +1572,9 @@ private struct WorkCardPopoverView: View {
 
             if shouldOfferFullDescription {
                 Button {
-                    MarkdownViewerWindowController.shared.present(
-                        title: task.name,
-                        markdown: task.description
+                    openWindow(
+                        id: "markdown-viewer",
+                        value: MarkdownViewerContent(title: task.name, markdown: task.description)
                     )
                 } label: {
                     Label("Read full description", systemImage: "doc.text.magnifyingglass")

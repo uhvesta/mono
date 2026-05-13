@@ -20,6 +20,13 @@ struct BossMacApp: App {
                 .keyboardShortcut("d", modifiers: [.command, .shift])
             }
         }
+
+        WindowGroup("Description", id: "markdown-viewer", for: MarkdownViewerContent.self) { $content in
+            if let content {
+                MarkdownViewerView(title: content.title, source: content.markdown)
+            }
+        }
+        .defaultSize(width: 760, height: 640)
     }
 }
 
