@@ -44,6 +44,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+/// Format the canonical `--version` string for a bundled Boss binary.
+///
+/// Output: `<name> 0+<sha> built <time>`, e.g.
+/// `boss-engine 0+abc1234 built 2026-05-12T11:14:02Z`.
+///
+/// The leading `0` is a placeholder major version per the design doc Q7:
+/// "until we cut a real v1.0 release with a versioning policy, every
+/// artifact is '0+<sha>'."
+///
+/// TODO(chore-1): switch sha/time to the genrule-linked constants once
+/// the workspace-status.sh + `build_info_rs` genrule from chore 1 lands.
+/// Until then, the values are "unknown" unless the build environment
+/// stamps BOSS_ENGINE_GIT_SHA / BOSS_ENGINE_BUILD_TIME.
+pub fn version_string(binary_name: &str) -> String {
+    format!("{binary_name} 0+{} built {}", git_sha(), build_time())
+}
+
 /// Short git SHA the engine binary was built from, baked at compile
 /// time. Returns `"unknown"` when the build environment did not
 /// stamp `BOSS_ENGINE_GIT_SHA`.

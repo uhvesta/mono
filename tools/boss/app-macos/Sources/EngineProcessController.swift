@@ -38,16 +38,40 @@ final class EngineProcessController: @unchecked Sendable {
                 return
             }
 
-            let command = ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"]
-                ?? "bazel run //tools/boss/engine:engine -- --socket-path \(socketPath)"
+            let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
 
-            try launchDetached(command: command)
+            try launchDetached(command: command, bossBinDir: bossBinDir)
             if let pid = waitForEnginePID(timeoutSeconds: 5.0) {
                 emit("[engine launch] detached pid=\(pid) \(command)")
             } else {
                 emit("[engine launch] started but pid file not observed yet: \(pidFilePath)")
             }
         }
+    }
+
+    /// Resolve the engine command and the BOSS_BIN_DIR to export.
+    ///
+    /// Resolution order (per design doc Q3):
+    ///   1. BOSS_ENGINE_CMD env override — wins unconditionally so a dev
+    ///      running `bazel run //tools/boss/app-macos:Boss` against a custom
+    ///      engine still works.
+    ///   2. Bundle-relative path: `<Bundle.main.resourcePath>/bin/engine` —
+    ///      the installed app path; BOSS_BIN_DIR is set to the bin/ dir so
+    ///      the engine can resolve its sibling CLIs.
+    ///   3. `bazel run` fallback — dev mode for when the bundle lacks the
+    ///      pre-built engine (e.g. iterating on just the Swift side).
+    private func resolveEngineCommand(socketPath: String) -> (command: String, bossBinDir: String?) {
+        if let override = ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] {
+            return (override, nil)
+        }
+        if let resourcePath = Bundle.main.resourcePath {
+            let enginePath = "\(resourcePath)/bin/engine"
+            if FileManager.default.fileExists(atPath: enginePath) {
+                let bossBinDir = "\(resourcePath)/bin"
+                return ("\(enginePath) --socket-path \(socketPath)", bossBinDir)
+            }
+        }
+        return ("bazel run //tools/boss/engine:engine -- --socket-path \(socketPath)", nil)
     }
 
     func stop() {
@@ -64,7 +88,7 @@ final class EngineProcessController: @unchecked Sendable {
         emit("[engine stop] terminated pid=\(pid)")
     }
 
-    private func launchDetached(command: String) throws {
+    private func launchDetached(command: String, bossBinDir: String? = nil) throws {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         proc.arguments = ["-c", "nohup \(command) >/dev/null 2>&1 &"]
@@ -76,6 +100,13 @@ final class EngineProcessController: @unchecked Sendable {
         // BOSS_APP_PID to set its trust root for `RegisterAppSession`.
         var env = ProcessInfo.processInfo.environment
         env["BOSS_APP_PID"] = String(getpid())
+        // BOSS_BIN_DIR tells the engine where its sibling CLIs live
+        // (boss, bossctl, boss-event) in installed mode. The engine
+        // propagates this to workers so they resolve the bundled copies
+        // rather than any PATH match. Unset in dev mode (no bundle bin/).
+        if let dir = bossBinDir {
+            env["BOSS_BIN_DIR"] = dir
+        }
         proc.environment = env
         proc.standardOutput = Pipe()
         proc.standardError = Pipe()
@@ -153,6 +184,7 @@ final class EngineProcessController: @unchecked Sendable {
 
         return command.contains("/tools/boss/engine/engine")
             || command.contains("bazel run //tools/boss/engine:engine")
+            || command.contains("Contents/Resources/bin/engine")
     }
 
     private func commandLine(for pid: pid_t) -> String? {
