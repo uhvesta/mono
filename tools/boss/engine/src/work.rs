@@ -141,11 +141,12 @@ impl WorkDb {
         let slug = unique_project_slug(&tx, &input.product_id, &slugify(&input.name))?;
         let description = input.description.unwrap_or_default();
         let goal = input.goal.unwrap_or_default();
+        let short_id = allocate_short_id(&tx, &input.product_id)?;
 
         tx.execute(
-            "INSERT INTO projects (id, product_id, name, slug, description, goal, status, priority, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planned', 'medium', ?7, ?7)",
-            params![id, input.product_id, input.name, slug, description, goal, now],
+            "INSERT INTO projects (id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planned', 'medium', ?7, ?7, ?8)",
+            params![id, input.product_id, input.name, slug, description, goal, now, short_id],
         )?;
 
         // Auto-create the project's design task. The design phase is
@@ -2577,6 +2578,10 @@ impl WorkDb {
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
         migrate_null_redundant_task_repo_remote_urls(&conn)?;
+        // Runs last so the per-product `(created_at, id)` backfill
+        // sees every task/project row that earlier migrations may
+        // have inserted (notably `migrate_backfill_project_design_tasks`).
+        migrate_short_id_columns(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '9')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -4704,11 +4709,12 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
+    let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, short_id)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, short_id],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
@@ -4728,11 +4734,12 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
+    let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override)
-         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, short_id)
+         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, short_id],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
@@ -4771,10 +4778,11 @@ fn insert_design_task_for_project_in_tx(
     let now = now_string();
     let autostart_value: i64 = if autostart { 1 } else { 0 };
     let name = format!("Design {project_name}");
+    let short_id = allocate_short_id(conn, product_id)?;
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
-         VALUES (?1, ?2, ?3, 'design', ?7, '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6)",
-        params![id, product_id, project_id, now, autostart_value, CREATED_VIA_ENGINE_AUTO, name],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
+         VALUES (?1, ?2, ?3, 'design', ?7, '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8)",
+        params![id, product_id, project_id, now, autostart_value, CREATED_VIA_ENGINE_AUTO, name, short_id],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))
 }
@@ -5746,6 +5754,154 @@ fn migrate_null_redundant_task_repo_remote_urls(conn: &Connection) -> Result<()>
         [],
     )?;
     Ok(())
+}
+
+/// Add `short_id` columns to `tasks` and `projects`, the
+/// `short_id_sequences` counter table, the per-product unique partial
+/// indexes, and backfill existing rows per the design's Q4 rules
+/// (`tools/boss/docs/designs/friendly-numeric-ids-for-work-items.md`).
+///
+/// Per-product across all kinds: for each product, the existing
+/// `tasks` rows (every `kind`, including soft-deleted) and the
+/// existing `projects` rows are merged into one stream, sorted by
+/// `(created_at ASC, id ASC)`, and assigned `1..N`. The counter is
+/// stamped at `N + 1` so the runtime allocator picks up where the
+/// backfill stopped. The migration is idempotent — rows that already
+/// have a `short_id` (e.g. a partial prior run, or a row inserted by
+/// the runtime allocator before this migration somehow ran) are
+/// skipped, and the counter is always advanced past the current
+/// `MAX(short_id)` to keep the unique index happy.
+fn migrate_short_id_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "short_id")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN short_id INTEGER", [])?;
+    }
+    if !table_has_column(conn, "projects", "short_id")? {
+        conn.execute("ALTER TABLE projects ADD COLUMN short_id INTEGER", [])?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS short_id_sequences (
+             product_id  TEXT PRIMARY KEY REFERENCES products(id),
+             next_value  INTEGER NOT NULL DEFAULT 1
+         );",
+    )?;
+
+    // Collect product ids first to keep the prepared statement out of
+    // the way of subsequent writes.
+    let product_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM products")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for product_id in &product_ids {
+        // Merged stream of unnumbered tasks + projects for this
+        // product, sorted by epoch-seconds `created_at` then `id`.
+        // `CAST(... AS INTEGER)` makes the migration robust to any
+        // residual ISO-shaped timestamp that `migrate_timestamps_to_epoch`
+        // didn't normalise (CAST yields 0 for non-numeric strings;
+        // the `id` tiebreaker still produces a deterministic order
+        // in that pathological case).
+        let merged: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT kind_label, id FROM (
+                     SELECT 'tasks'    AS kind_label, id, CAST(created_at AS INTEGER) AS ts
+                     FROM tasks
+                     WHERE product_id = ?1 AND short_id IS NULL
+                     UNION ALL
+                     SELECT 'projects' AS kind_label, id, CAST(created_at AS INTEGER) AS ts
+                     FROM projects
+                     WHERE product_id = ?1 AND short_id IS NULL
+                 )
+                 ORDER BY ts ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([product_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        // Start past both the prior `next_value` (if some earlier
+        // partial backfill stamped one) and `MAX(short_id)` (if any
+        // rows were already numbered). This keeps the partial unique
+        // index from rejecting the writes below.
+        let prior_next: i64 = conn
+            .query_row(
+                "SELECT next_value FROM short_id_sequences WHERE product_id = ?1",
+                [product_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(1);
+        let max_existing: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(short_id), 0) FROM (
+                 SELECT short_id FROM tasks
+                 WHERE product_id = ?1 AND short_id IS NOT NULL
+                 UNION ALL
+                 SELECT short_id FROM projects
+                 WHERE product_id = ?1 AND short_id IS NOT NULL
+             )",
+            [product_id],
+            |row| row.get(0),
+        )?;
+        let mut next = prior_next.max(max_existing + 1);
+
+        for (table, row_id) in &merged {
+            let update_sql = match table.as_str() {
+                "tasks" => "UPDATE tasks SET short_id = ?1 WHERE id = ?2",
+                "projects" => "UPDATE projects SET short_id = ?1 WHERE id = ?2",
+                other => bail!("unexpected short_id backfill table: {other}"),
+            };
+            conn.execute(update_sql, params![next, row_id])?;
+            next += 1;
+        }
+
+        conn.execute(
+            "INSERT INTO short_id_sequences(product_id, next_value) VALUES(?1, ?2)
+             ON CONFLICT(product_id) DO UPDATE SET next_value = excluded.next_value",
+            params![product_id, next],
+        )?;
+    }
+
+    // Create indexes after the backfill so the unique-partial check
+    // doesn't fail mid-migration on a transient duplicate (it would
+    // not fail given the above logic, but ordering it this way also
+    // matches the design's safety stance).
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS tasks_product_short_id_idx
+             ON tasks(product_id, short_id) WHERE short_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS projects_product_short_id_idx
+             ON projects(product_id, short_id) WHERE short_id IS NOT NULL;",
+    )?;
+
+    Ok(())
+}
+
+/// Allocate the next per-product `short_id` for a new `tasks` or
+/// `projects` row. Reads the current `next_value` from
+/// `short_id_sequences` for `product_id`, defaulting to 1 if no row
+/// exists yet, writes back `next_value + 1`, and returns the value
+/// just claimed. Must be called inside the same SQLite transaction as
+/// the row insert; SQLite serialises writers in WAL mode, so two
+/// concurrent inserts against the same product receive distinct ids.
+///
+/// See `tools/boss/docs/designs/friendly-numeric-ids-for-work-items.md`
+/// (Q3) for the reasoning behind the per-product scope and the
+/// in-transaction read-modify-write pattern.
+fn allocate_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    let current: i64 = conn
+        .query_row(
+            "SELECT next_value FROM short_id_sequences WHERE product_id = ?1",
+            [product_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1);
+    conn.execute(
+        "INSERT INTO short_id_sequences(product_id, next_value) VALUES(?1, ?2)
+         ON CONFLICT(product_id) DO UPDATE SET next_value = excluded.next_value",
+        params![product_id, current + 1],
+    )?;
+    Ok(current)
 }
 
 /// Validate the `(execution_id, work_item_id)` discriminant on a
@@ -14344,6 +14500,362 @@ mod tests {
         );
 
         drop(conn2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two threads creating chores against the same `WorkDb` (and the
+    /// same product) must each get a distinct `short_id`. The
+    /// allocator is wrapped in SQLite's per-write serialisation
+    /// (`BEGIN IMMEDIATE` + `busy_timeout`), so the test asserts the
+    /// emergent property: N parallel inserts produce N distinct,
+    /// gap-free ids starting at 1.
+    #[test]
+    fn allocator_concurrent_inserts_produce_distinct_short_ids() {
+        let path = temp_db_path("short-id-concurrent");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:concurrent.git".into()),
+            })
+            .unwrap();
+
+        const N: usize = 16;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let db = db.clone();
+            let product_id = product.id.clone();
+            handles.push(std::thread::spawn(move || {
+                db.create_chore(CreateChoreInput {
+                    product_id,
+                    name: format!("c{i}"),
+                    description: None,
+                    autostart: false,
+                    priority: None,
+                    created_via: None,
+                    repo_remote_url: None,
+                    effort_level: None,
+                    model_override: None,
+                })
+                .unwrap()
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let conn = db.connect().unwrap();
+        // Collect every `short_id` for this product across both tables
+        // (the per-product sequence is shared by `tasks` and
+        // `projects`; the single `projects` row from `create_product`
+        // doesn't create one, but the product itself does not — only
+        // the design task for a project would, and we created no
+        // project here). The N chores should occupy a contiguous run
+        // starting at 1.
+        let mut ids: Vec<i64> = conn
+            .prepare(
+                "SELECT short_id FROM tasks WHERE product_id = ?1 AND short_id IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([&product.id], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        ids.sort();
+        assert_eq!(ids, (1..=N as i64).collect::<Vec<_>>(), "ids: {ids:?}");
+
+        // The counter has advanced past every id we just observed.
+        let next: i64 = conn
+            .query_row(
+                "SELECT next_value FROM short_id_sequences WHERE product_id = ?1",
+                [&product.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, N as i64 + 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two products run independent sequences: each starts at 1, and
+    /// the per-product counter increments only on inserts against
+    /// that product.
+    #[test]
+    fn allocator_per_product_sequences_are_independent() {
+        let path = temp_db_path("short-id-per-product");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let boss = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".into()),
+            })
+            .unwrap();
+        let flunge = db
+            .create_product(CreateProductInput {
+                name: "Flunge".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:flunge.git".into()),
+            })
+            .unwrap();
+
+        let mk_chore = |product_id: &str, name: &str| {
+            db.create_chore(CreateChoreInput {
+                product_id: product_id.to_owned(),
+                name: name.to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap()
+        };
+
+        let b1 = mk_chore(&boss.id, "b1");
+        let f1 = mk_chore(&flunge.id, "f1");
+        let b2 = mk_chore(&boss.id, "b2");
+        let f2 = mk_chore(&flunge.id, "f2");
+
+        let conn = db.connect().unwrap();
+        let short = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT short_id FROM tasks WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(short(&b1.id), 1);
+        assert_eq!(short(&b2.id), 2);
+        assert_eq!(short(&f1.id), 1);
+        assert_eq!(short(&f2.id), 2);
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Backfill is deterministic: given the same set of (product,
+    /// created_at, id) tuples, two independent migration runs assign
+    /// the same `short_id` to every row.
+    ///
+    /// Setup plants rows via raw SQL with NULL `short_id` and
+    /// hand-controlled `created_at` values, then invokes the
+    /// migration directly (the column / table already exist from
+    /// `WorkDb::open`, but the rows are unnumbered). The merged
+    /// `(created_at ASC, id ASC)` stream is the contract.
+    #[test]
+    fn migrate_short_id_backfill_is_deterministic_and_merges_tasks_and_projects() {
+        fn seed_and_backfill(path: &Path) -> Vec<(String, i64)> {
+            let db = WorkDb::open(path.to_path_buf()).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model)
+                 VALUES ('prod_a', 'A', 'a', '', NULL, 'active', '0', '0', NULL)",
+                [],
+            )
+            .unwrap();
+            // Plant 3 tasks + 2 projects with hand-chosen created_at
+            // values so the merged ordering is unambiguous. The
+            // expected sequence by (created_at, id):
+            //   100  task_a   -> 1
+            //   100  task_b   -> 2  (created_at tie, id tiebreaker)
+            //   200  proj_a   -> 3
+            //   300  task_c   -> 4
+            //   400  proj_b   -> 5
+            let rows: &[(&str, &str, &str, i64)] = &[
+                ("tasks",    "task_a", "chore", 100),
+                ("tasks",    "task_b", "chore", 100),
+                ("projects", "proj_a", "",     200),
+                ("tasks",    "task_c", "chore", 300),
+                ("projects", "proj_b", "",     400),
+            ];
+            for (table, id, kind, ts) in rows {
+                if *table == "tasks" {
+                    conn.execute(
+                        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
+                         VALUES (?1, 'prod_a', NULL, ?2, ?1, '', 'todo', NULL, NULL, NULL, ?3, ?3, 0, 'medium', 'test', NULL)",
+                        params![id, kind, ts.to_string()],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute(
+                        "INSERT INTO projects (id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, short_id)
+                         VALUES (?1, 'prod_a', ?1, ?1, '', '', 'planned', 'medium', ?2, ?2, NULL)",
+                        params![id, ts.to_string()],
+                    )
+                    .unwrap();
+                }
+            }
+
+            // Wipe the prior counter so the backfill replays from 1.
+            conn.execute("DELETE FROM short_id_sequences WHERE product_id = 'prod_a'", []).unwrap();
+            migrate_short_id_columns(&conn).unwrap();
+
+            let mut pairs: Vec<(String, i64)> = Vec::new();
+            for table in &["tasks", "projects"] {
+                let sql = format!("SELECT id, short_id FROM {table} WHERE product_id = 'prod_a'");
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .unwrap();
+                for r in rows {
+                    pairs.push(r.unwrap());
+                }
+            }
+            pairs.sort();
+            pairs
+        }
+
+        let path_a = temp_db_path("short-id-backfill-a");
+        let path_b = temp_db_path("short-id-backfill-b");
+        let run_a = seed_and_backfill(&path_a);
+        let run_b = seed_and_backfill(&path_b);
+        assert_eq!(run_a, run_b, "two independent runs must produce identical short_ids");
+
+        let expected: Vec<(String, i64)> = vec![
+            ("proj_a".into(), 3),
+            ("proj_b".into(), 5),
+            ("task_a".into(), 1),
+            ("task_b".into(), 2),
+            ("task_c".into(), 4),
+        ];
+        assert_eq!(run_a, expected);
+
+        let _ = std::fs::remove_file(path_a);
+        let _ = std::fs::remove_file(path_b);
+    }
+
+    /// The partial unique index `(product_id, short_id) WHERE
+    /// short_id IS NOT NULL` is the belt-and-braces guard from design
+    /// Q3 / Q8: a manual SQL insert that collides with an existing
+    /// per-product `short_id` must be rejected.
+    #[test]
+    fn unique_short_id_index_rejects_manual_duplicate() {
+        let path = temp_db_path("short-id-index-conflict");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c1".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let existing_short: i64 = {
+            let conn = db.connect().unwrap();
+            conn.query_row(
+                "SELECT short_id FROM tasks WHERE id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // Try to hand-roll a second `tasks` row with the same
+        // (product_id, short_id) — the partial unique index must
+        // refuse it.
+        let conn = db.connect().unwrap();
+        let now = now_string();
+        let manual_id = next_id("task");
+        let err = conn
+            .execute(
+                "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
+                 VALUES (?1, ?2, NULL, 'chore', 'dupe', '', 'todo', NULL, NULL, NULL, ?3, ?3, 0, 'medium', 'test', ?4)",
+                params![manual_id, product.id, now, existing_short],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("UNIQUE constraint failed"),
+            "expected UNIQUE constraint failure, got: {err}",
+        );
+
+        // Same `short_id` on a DIFFERENT product is allowed — the
+        // uniqueness invariant is `(product_id, short_id)`, not
+        // global.
+        let other = db
+            .create_product(CreateProductInput {
+                name: "Flunge".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let other_manual_id = next_id("task");
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
+             VALUES (?1, ?2, NULL, 'chore', 'cross-product', '', 'todo', NULL, NULL, NULL, ?3, ?3, 0, 'medium', 'test', ?4)",
+            params![other_manual_id, other.id, now, existing_short],
+        )
+        .expect("same short_id on a different product must be permitted");
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `create_project` allocates a `short_id` for the project row
+    /// AND for the auto-spawned design task, both drawn from the
+    /// per-product sequence (Q1: tasks and projects share a counter).
+    #[test]
+    fn create_project_assigns_short_ids_to_project_and_design_task() {
+        let path = temp_db_path("short-id-project-design");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "P".into(),
+                description: None,
+                goal: None,
+                autostart: false,
+            })
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        let project_short: i64 = conn
+            .query_row(
+                "SELECT short_id FROM projects WHERE id = ?1",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let design_short: i64 = conn
+            .query_row(
+                "SELECT short_id FROM tasks WHERE project_id = ?1 AND kind = 'design'",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The project row is inserted before its design task, so it
+        // gets the lower number.
+        assert_eq!(project_short, 1);
+        assert_eq!(design_short, 2);
+
+        drop(conn);
         let _ = std::fs::remove_file(path);
     }
 }
