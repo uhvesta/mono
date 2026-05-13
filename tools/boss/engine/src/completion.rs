@@ -575,8 +575,84 @@ impl WorkerCompletionHandler {
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
-        let merged = matches!(target, WorkerPrCompletionTarget::Done);
+        self.finalize_pr_transition(execution_id, pr_url, target, "stop")
+            .await
+    }
 
+    /// Periodic fallback for the merge poller. Re-runs PR detection
+    /// against `execution_id` and transitions the work item on a
+    /// `Fresh` / `Merged` result, but stays QUIET on the no-PR /
+    /// stale-PR / detector-failure branches — the on-Stop probe
+    /// queueing and `worker_awaiting_pr` publish only make sense as a
+    /// one-shot response to a Stop event. A 60s poller calling
+    /// `on_stop` would (a) spam the worker's probe FIFO with
+    /// duplicate "push your branch" messages every minute and
+    /// (b) publish a steady stream of `worker_awaiting_pr` events
+    /// while the worker sat idle. `recheck_for_pr` exists so the
+    /// poller can drive the success path without the side effects.
+    ///
+    /// Closes the missed-PR-open window: if the on-Stop hook fired
+    /// before GitHub's `commits/{sha}/pulls` index caught up with a
+    /// freshly-created PR (the typical 7-second window observed in
+    /// PR #415), this sweep picks the chore up on the next pass and
+    /// completes the `active → in_review` transition.
+    pub async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {
+        let execution = match self.work_db.get_execution(execution_id) {
+            Ok(execution) => execution,
+            Err(_) => return StopOutcome::UnknownExecution,
+        };
+        if !matches!(execution.status.as_str(), "running" | "waiting_human") {
+            return StopOutcome::AlreadyTerminal;
+        }
+        let workspace_path = match execution.workspace_path.as_deref() {
+            Some(path) => PathBuf::from(path),
+            None => return StopOutcome::NoWorkspace,
+        };
+        let pr_status = match self
+            .pr_detector
+            .detect_pr(&workspace_path, &execution.repo_remote_url)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    workspace = %workspace_path.display(),
+                    ?err,
+                    "pr-recheck: detector failed; will retry next sweep"
+                );
+                return StopOutcome::DetectorFailed;
+            }
+        };
+        let (pr_url, target) = match pr_status {
+            // Quiet returns — no probes, no awaiting-input publish.
+            PrStatus::None | PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
+            PrStatus::Stale { url, reason } => {
+                return StopOutcome::StalePr { pr_url: url, reason }
+            }
+            PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
+            PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
+        };
+        self.finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
+            .await
+    }
+
+    /// Common Fresh/Merged transition path shared by `on_stop_inner`
+    /// and `recheck_for_pr`. Records the completion, releases the
+    /// cube lease + pane, publishes invalidation events, and returns
+    /// the matching [`StopOutcome`]. `source` distinguishes call
+    /// sites in the publish reason and tracing — `"stop"` for the
+    /// Stop hook path, `"pr_recheck"` for the merge-poller's
+    /// fallback sweep — so operators can see which path closed a
+    /// given chore.
+    async fn finalize_pr_transition(
+        &self,
+        execution_id: &str,
+        pr_url: String,
+        target: WorkerPrCompletionTarget,
+        source: &'static str,
+    ) -> StopOutcome {
+        let merged = matches!(target, WorkerPrCompletionTarget::Done);
         let completion = match self.work_db.record_worker_pr_completion(
             execution_id,
             &pr_url,
@@ -584,43 +660,36 @@ impl WorkerCompletionHandler {
             target,
         ) {
             Ok(Some(completion)) => completion,
-            Ok(None) => {
-                // Race: another Stop event finalised the execution
-                // between our status check and the DB update.
-                return StopOutcome::AlreadyTerminal;
-            }
+            Ok(None) => return StopOutcome::AlreadyTerminal,
             Err(err) => {
                 tracing::error!(
                     execution_id,
+                    source,
                     ?err,
-                    "stop event: failed to record PR completion"
+                    "pr completion: failed to record"
                 );
                 return StopOutcome::DbError;
             }
         };
-
         if let Some(lease_id) = completion.released_lease_id.as_deref() {
             if let Err(err) = self.cube_client.release_workspace(lease_id).await {
                 tracing::error!(
                     execution_id,
+                    source,
                     lease_id,
                     ?err,
-                    "stop event: PR completion recorded but cube release failed"
+                    "pr completion: cube release failed"
                 );
             }
         }
-
-        // Tear down the libghostty pane that was hosting the worker.
-        // Idempotent on the registry side, so a later manual stop /
-        // chore-done update for the same run is a no-op.
         self.pane_releaser.release_pane(execution_id).await;
-
         let product_id = work_item_product_id(&completion.work_item);
         let work_item_id = work_item_id(&completion.work_item);
-        let publish_reason = if merged {
-            "worker_pr_merged"
-        } else {
-            "worker_pr_completed"
+        let publish_reason = match (merged, source) {
+            (true, "pr_recheck") => "worker_pr_merged_recheck",
+            (false, "pr_recheck") => "worker_pr_completed_recheck",
+            (true, _) => "worker_pr_merged",
+            (false, _) => "worker_pr_completed",
         };
         self.publisher
             .publish(
@@ -638,7 +707,8 @@ impl WorkerCompletionHandler {
                 execution_id,
                 work_item_id = %work_item_id,
                 pr_url = %pr_url,
-                "stop event: worker PR already merged; moved work item to done"
+                source,
+                "pr completion: PR already merged; moved work item to done"
             );
             StopOutcome::PrMerged { pr_url }
         } else {
@@ -646,7 +716,8 @@ impl WorkerCompletionHandler {
                 execution_id,
                 work_item_id = %work_item_id,
                 pr_url = %pr_url,
-                "stop event: worker PR detected; moved work item to in_review"
+                source,
+                "pr completion: PR detected; moved work item to in_review"
             );
             StopOutcome::PrDetected { pr_url }
         }
@@ -2388,6 +2459,209 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             }
             other => panic!("expected chore, got {other:?}"),
         }
+    }
+
+    /// Regression for the missed PR-open detection that left chore
+    /// `task_18aefd1f955e5348_e` (PR #415) stuck in `active` with
+    /// `pr_url=NULL`. The on-Stop hook can miss a freshly-opened PR
+    /// when GitHub's `commits/{sha}/pulls` index hasn't caught up yet
+    /// (PR #415 was created 7s before the Stop fired). When that
+    /// happens the chore stays `active`, the merge poller's primary
+    /// query (`list_chores_pending_merge_check`) never picks it up
+    /// (that query gates on `status='in_review'`), and the chore is
+    /// stuck. The fix routes `waiting_human` executions with no
+    /// `pr_url` through `WorkerCompletionHandler::recheck_for_pr` on
+    /// every merge-poller pass, so a delayed GitHub-side propagation
+    /// recovers on the next 60s sweep.
+    #[tokio::test]
+    async fn merge_poller_recovers_missed_pr_open_for_waiting_human_execution() {
+        use crate::merge_poller::{
+            MergeProbe, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState,
+        };
+
+        // Fixture leaves the chore in `active` and the execution in
+        // `waiting_human` with a workspace_path — exactly the state
+        // PR #415 was in after its on-Stop hook missed.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+
+        // Simulate "on-Stop already ran and saw no PR" by leaving
+        // the chore's pr_url unset. The recheck path is what we're
+        // testing — it must see PrStatus::Fresh on this pass and
+        // promote the chore.
+        let workers_pr = "https://github.com/foo/bar/pull/415";
+        let detector = StubPrDetector::ok(Some(workers_pr));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = Arc::new(WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        ));
+
+        // Wire a no-op MergeProbe — the test exercises only the
+        // pending-PR-detection arm of the sweep, not the in-review
+        // merge path.
+        struct NoOpProbe;
+        #[async_trait]
+        impl MergeProbe for NoOpProbe {
+            async fn probe(&self, _: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe {
+                    url: String::new(),
+                    state: PrLifecycleState::Open(OpenPrMergeability::Clean),
+                    base_ref_oid: None,
+                    labels: Vec::new(),
+                })
+            }
+        }
+        let probe = NoOpProbe;
+
+        let outcome = crate::merge_poller::run_one_pass(
+            db.as_ref(),
+            &probe,
+            publisher.as_ref(),
+            None,
+            Some(handler.as_ref()),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.pr_recheck_recovered, 1,
+            "the sweep must recover exactly one missed PR-open transition, got {outcome:?}",
+        );
+
+        // Chore advanced to in_review with the PR url stamped.
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(t.pr_url.as_deref(), Some(workers_pr));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // Execution finalised — lease released, pane torn down.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "completed");
+        assert!(execution.cube_lease_id.is_none());
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "the recovery must release the cube lease just like the on-Stop path does",
+        );
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "the recovery must tear down the pane just like the on-Stop path does",
+        );
+        // Crucially: NO probe was queued. Periodic polling must not
+        // spam the worker's probe FIFO.
+        assert!(
+            probes.snapshot().is_empty(),
+            "merge-poller recovery must NOT queue a probe — that's a Stop-event side effect only",
+        );
+        // Publish reason distinguishes recheck from on-Stop so
+        // operators can see which path closed the chore.
+        let work_events = publisher.work_events.lock().await.clone();
+        assert!(
+            work_events
+                .iter()
+                .any(|(_, _, r)| r == "worker_pr_completed_recheck"),
+            "expected worker_pr_completed_recheck publish reason, got {work_events:?}",
+        );
+    }
+
+    /// Periodic polling must NOT queue probes when the detector
+    /// still sees no PR — that's the side effect that makes the
+    /// no-PR branch of `on_stop` correct but the no-PR branch of a
+    /// 60s poll wrong (a Stop event happens once; a poll happens
+    /// every minute).
+    #[tokio::test]
+    async fn recheck_for_pr_is_quiet_when_detector_still_reports_no_pr() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+
+        // Chore stays where it was.
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "active");
+                assert!(t.pr_url.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // No probe queued, no awaiting-input event published, no
+        // lease released, no pane torn down.
+        assert!(
+            probes.snapshot().is_empty(),
+            "recheck must NOT queue probes on the no-PR branch",
+        );
+        assert!(
+            publisher.events.lock().await.is_empty(),
+            "recheck must NOT publish awaiting-input events on the no-PR branch",
+        );
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
+    }
+
+    /// Sibling regression: when the detector returns PrStatus::Stale
+    /// (PR exists but local commits are ahead), the recheck must
+    /// also stay silent — the worker has stopped, so probing it
+    /// every 60s with PROBE_STALE_PR would spam its input FIFO.
+    #[tokio::test]
+    async fn recheck_for_pr_is_quiet_on_stale_pr() {
+        let workspace = tempdir().unwrap();
+        let (db, _, _, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok_status(PrStatus::Stale {
+            url: "https://github.com/foo/bar/pull/42".into(),
+            reason: "local HEAD ahead of PR head".into(),
+        });
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db,
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+        match outcome {
+            StopOutcome::StalePr { .. } => {}
+            other => panic!("expected StalePr, got {other:?}"),
+        }
+        assert!(
+            probes.snapshot().is_empty(),
+            "recheck must NOT queue probes on the stale-PR branch",
+        );
+        assert!(publisher.events.lock().await.is_empty());
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
     }
 
     #[test]

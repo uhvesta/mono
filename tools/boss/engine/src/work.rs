@@ -2825,6 +2825,42 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Executions whose bound chore is still `active` with no `pr_url`,
+    /// whose execution row is `waiting_human` (i.e., the worker spawned,
+    /// hit a Stop boundary, and is now idle), and that have a recorded
+    /// `workspace_path` for PR detection.
+    ///
+    /// This is the fallback set for the merge poller's PR-open recheck:
+    /// the on-Stop hook is the primary detection path but it can miss
+    /// (transient `gh api` failure, GitHub's
+    /// `commits/{sha}/pulls` index lagging a fresh `gh pr create`, or
+    /// a Stop event that never reached the engine). Without this list
+    /// the chore is stuck in `active` forever because the merge poller's
+    /// other query (`list_chores_pending_merge_check`) only sees rows
+    /// already in `in_review`.
+    ///
+    /// `kind IN ('chore', 'project_task', 'design')` matches the same
+    /// kinds the in-review poller watches — `task` is excluded for the
+    /// same reason (non-project tasks don't share the PR lifecycle).
+    pub fn list_executions_pending_pr_detection(&self) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT we.id
+             FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status = 'waiting_human'
+               AND we.workspace_path IS NOT NULL
+               AND we.workspace_path != ''
+               AND t.deleted_at IS NULL
+               AND t.kind IN ('chore', 'project_task', 'design')
+               AND t.status = 'active'
+               AND (t.pr_url IS NULL OR t.pr_url = '')
+             ORDER BY we.created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)
+    }
+
     /// Move the chore or project_task identified by `work_item_id`
     /// from `in_review` to `done`, recording `pr_url` (no-op if it
     /// was already set to the same value). Returns the updated task

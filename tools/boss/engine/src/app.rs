@@ -1854,6 +1854,7 @@ pub async fn serve(
         merge_probe,
         server_state.publisher.clone(),
         server_state.cube_client.clone(),
+        server_state.completion_handler.clone(),
         Duration::from_secs(60),
     );
 
