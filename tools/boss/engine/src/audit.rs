@@ -397,7 +397,7 @@ mod tests {
         record_via_direct_path(&path, "start", {
             let mut m = Map::new();
             m.insert("pid".into(), json!(42));
-            m.insert("argv".into(), json!(["engine", "--mode=server"]));
+            m.insert("argv".into(), json!(["engine"]));
             m.insert(
                 "socket_paths".into(),
                 json!(["/tmp/boss-engine.sock", "/tmp/events.sock"]),
@@ -526,7 +526,7 @@ mod tests {
         }
 
         record_start(StartContext {
-            argv: vec!["engine".into(), "--mode=server".into()],
+            argv: vec!["engine".into()],
             engine_version: Some("test".into()),
             socket_paths: vec![PathBuf::from("/tmp/x.sock")],
             state_db_path: Some(PathBuf::from("/tmp/state.db")),
