@@ -118,7 +118,7 @@ impl WorkDb {
 
         let mut stmt = conn.prepare(
             "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                    design_doc_repo_remote_url, design_doc_branch, design_doc_path
+                    design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id
              FROM projects
              WHERE product_id = ?1
              ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -1953,7 +1953,7 @@ impl WorkDb {
         let projects = {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                        design_doc_repo_remote_url, design_doc_branch, design_doc_path
+                        design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id
                  FROM projects
                  WHERE product_id = ?1
                  ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -1970,7 +1970,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1981,7 +1981,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -2064,7 +2064,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -2073,7 +2073,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -2172,7 +2172,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -4407,6 +4407,7 @@ fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         design_doc_repo_remote_url: row.get(11)?,
         design_doc_branch: row.get(12)?,
         design_doc_path: row.get(13)?,
+        short_id: row.get(14)?,
     })
 }
 
@@ -4453,6 +4454,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         model_override: row.get::<_, Option<String>>(20)?.filter(|s| !s.is_empty()),
         ci_attempt_budget: row.get(21)?,
         ci_attempts_used: row.get(22)?,
+        short_id: row.get(23)?,
         // The multi-signal projection is built from the
         // `task_blocked_signals` side table by the engine's signal-
         // aggregation path (`merge-conflict-handling-in-review.md` §Q2),
@@ -4893,7 +4895,7 @@ fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
 fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
     conn.query_row(
         "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                design_doc_repo_remote_url, design_doc_branch, design_doc_path
+                design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id
          FROM projects
          WHERE id = ?1",
         [id],
@@ -4905,7 +4907,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -4957,7 +4959,7 @@ fn query_attention_item(conn: &Connection, id: &str) -> Result<Option<WorkAttent
 fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare(
         "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
-                design_doc_repo_remote_url, design_doc_branch, design_doc_path
+                design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id
          FROM projects
          WHERE product_id = ?1
          ORDER BY created_at ASC, name COLLATE NOCASE ASC",
@@ -4968,7 +4970,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -14856,6 +14858,125 @@ mod tests {
         assert_eq!(design_short, 2);
 
         drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `create_chore` returns a `Task` struct with `short_id` populated.
+    /// This is the end-to-end wire test: the protocol struct carries the
+    /// field through the full engine → protocol round-trip.
+    #[test]
+    fn create_chore_protocol_struct_carries_short_id() {
+        let path = temp_db_path("short-id-wire-task");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "wire-test".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        assert_eq!(chore.short_id, Some(1), "first chore in product gets short_id 1");
+
+        // A second chore in the same product gets the next number.
+        let chore2 = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "wire-test-2".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        assert_eq!(chore2.short_id, Some(2));
+
+        // `list_chores` also surfaces the field (exercises the SELECT path).
+        let fetched = db.list_chores(&product.id, None).unwrap();
+        assert_eq!(fetched[0].short_id, Some(1));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `create_project` returns a `Project` struct with `short_id` populated.
+    #[test]
+    fn create_project_protocol_struct_carries_short_id() {
+        let path = temp_db_path("short-id-wire-project");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Wire Project".into(),
+                description: None,
+                goal: None,
+                autostart: false,
+            })
+            .unwrap();
+        // Project gets short_id = 1; its auto-spawned design task gets 2.
+        assert_eq!(project.short_id, Some(1));
+
+        // `get_project` also surfaces the field.
+        let fetched = db.get_project(&project.id).unwrap();
+        assert_eq!(fetched.short_id, Some(1));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `list_tasks_for_product` (used by WorkTree / Subscribe) carries
+    /// `short_id` in every returned `Task`.
+    #[test]
+    fn work_tree_tasks_carry_short_id() {
+        let path = temp_db_path("short-id-wire-worktree");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+
+        db.create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "c1".into(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+        })
+        .unwrap();
+
+        let tree = db.get_work_tree(&product.id).unwrap();
+        let chore = &tree.chores[0];
+        assert_eq!(chore.short_id, Some(1), "WorkTree chore carries short_id");
+
         let _ = std::fs::remove_file(path);
     }
 }

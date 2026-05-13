@@ -52,6 +52,10 @@ struct WorkProject: Identifiable, Hashable {
     /// Repo-relative path to the design doc. `nil` → no pointer set,
     /// UI affordance hidden. Mirrors `Project.design_doc_path`.
     var designDocPath: String? = nil
+    /// Per-product short id. `nil` only on rows predating the migration
+    /// (the engine backfills these at startup, so `nil` is transient).
+    /// Mirrors `Project.short_id` on the wire.
+    var shortID: Int? = nil
 }
 
 /// Swift mirror of `boss_protocol::SetProjectDesignDocInput`.
@@ -260,6 +264,10 @@ struct WorkTask: Identifiable, Hashable {
     /// Discriminated by `blockedReason`; `nil` for blocks without an
     /// engine-managed attempt.
     var blockedAttemptID: String? = nil
+    /// Per-product short id. `nil` only on rows predating the migration
+    /// (the engine backfills these at startup, so `nil` is transient).
+    /// Mirrors `Task.short_id` on the wire.
+    var shortID: Int? = nil
 
     var isChore: Bool {
         kind == "chore"

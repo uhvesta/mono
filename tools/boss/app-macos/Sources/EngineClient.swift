@@ -885,7 +885,8 @@ final class EngineClient: @unchecked Sendable {
             lastStatusActor: (payload["last_status_actor"] as? String) ?? "human",
             designDocRepoRemoteURL: payload["design_doc_repo_remote_url"] as? String,
             designDocBranch: payload["design_doc_branch"] as? String,
-            designDocPath: payload["design_doc_path"] as? String
+            designDocPath: payload["design_doc_path"] as? String,
+            shortID: (payload["short_id"] as? NSNumber)?.intValue
         )
     }
 
@@ -926,7 +927,8 @@ final class EngineClient: @unchecked Sendable {
             createdVia: (payload["created_via"] as? String) ?? "unknown",
             repoRemoteURL: payload["repo_remote_url"] as? String,
             blockedReason: payload["blocked_reason"] as? String,
-            blockedAttemptID: payload["blocked_attempt_id"] as? String
+            blockedAttemptID: payload["blocked_attempt_id"] as? String,
+            shortID: (payload["short_id"] as? NSNumber)?.intValue
         )
     }
 

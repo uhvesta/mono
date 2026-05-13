@@ -4442,6 +4442,7 @@ mod tests {
             model_override: None,
             ci_attempt_budget: None,
             ci_attempts_used: 0,
+            short_id: None,
             blocked_signals: Vec::new(),
         }
     }
@@ -4489,6 +4490,7 @@ mod tests {
             design_doc_repo_remote_url: None,
             design_doc_branch: None,
             design_doc_path: None,
+            short_id: None,
         };
         assert!(expect_leaf_work_item(WorkItem::Project(project)).is_err());
     }

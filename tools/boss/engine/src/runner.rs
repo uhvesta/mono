@@ -839,6 +839,7 @@ mod conflict_resolution_prompt_tests {
             model_override: None,
             ci_attempt_budget: None,
             ci_attempts_used: 0,
+            short_id: None,
             blocked_signals: Vec::new(),
         })
     }
@@ -1163,6 +1164,7 @@ mod pane_spawn_tests {
             model_override: None,
             ci_attempt_budget: None,
             ci_attempts_used: 0,
+            short_id: None,
             blocked_signals: Vec::new(),
         })
     }

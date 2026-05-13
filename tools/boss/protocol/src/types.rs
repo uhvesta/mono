@@ -84,6 +84,11 @@ impl std::str::FromStr for EffortLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
+    /// Per-product short id allocated at insert time. Always `Some` after the
+    /// schema migration runs; `None` only on rows predating it (which the
+    /// migration backfills, so in practice this is never `None` at runtime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<i64>,
     pub product_id: String,
     pub name: String,
     pub slug: String,
@@ -121,6 +126,11 @@ pub struct Project {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
+    /// Per-product short id allocated at insert time. Always `Some` after the
+    /// schema migration runs; `None` only on rows predating it (which the
+    /// migration backfills, so in practice this is never `None` at runtime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<i64>,
     pub product_id: String,
     pub project_id: Option<String>,
     pub kind: String,
@@ -1122,6 +1132,31 @@ mod tests {
     }
 
     #[test]
+    fn project_decodes_without_short_id() {
+        let raw = sample_project_json(json!({}));
+        let project: Project = serde_json::from_value(raw).unwrap();
+        assert!(project.short_id.is_none());
+    }
+
+    #[test]
+    fn project_skips_none_short_id_on_encode() {
+        let project: Project = serde_json::from_value(sample_project_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&project).unwrap();
+        assert!(!encoded.as_object().unwrap().contains_key("short_id"));
+    }
+
+    #[test]
+    fn project_roundtrips_with_short_id() {
+        let raw = sample_project_json(json!({"short_id": 42}));
+        let project: Project = serde_json::from_value(raw).unwrap();
+        assert_eq!(project.short_id, Some(42));
+        let reencoded = serde_json::to_value(&project).unwrap();
+        assert_eq!(reencoded["short_id"], Value::from(42_i64));
+        let project2: Project = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(project.short_id, project2.short_id);
+    }
+
+    #[test]
     fn project_decodes_without_design_doc_fields() {
         let raw = sample_project_json(json!({}));
         let project: Project = serde_json::from_value(raw).unwrap();
@@ -1288,6 +1323,31 @@ mod tests {
             }
         }
         base
+    }
+
+    #[test]
+    fn task_decodes_without_short_id() {
+        let raw = sample_task_json(json!({}));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert!(task.short_id.is_none());
+    }
+
+    #[test]
+    fn task_skips_none_short_id_on_encode() {
+        let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(!encoded.as_object().unwrap().contains_key("short_id"));
+    }
+
+    #[test]
+    fn task_roundtrips_with_short_id() {
+        let raw = sample_task_json(json!({"short_id": 99}));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert_eq!(task.short_id, Some(99));
+        let reencoded = serde_json::to_value(&task).unwrap();
+        assert_eq!(reencoded["short_id"], Value::from(99_i64));
+        let task2: Task = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(task.short_id, task2.short_id);
     }
 
     #[test]
