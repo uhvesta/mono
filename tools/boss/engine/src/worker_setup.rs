@@ -91,6 +91,10 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          - Before ending the run, print the PR URL on its own line as\n\
            the final thing in your final response so the engine can\n\
            pick it up automatically.\n\
+         - Before pushing, verify your changes are real with\n\
+           `jj diff -r @`. If the diff is empty, you have made no\n\
+           changes — do NOT commit, push, or open a PR. Stop and\n\
+           explain what went wrong instead.\n\
          \n\
          ## Your workspace\n\
          \n\
@@ -730,6 +734,12 @@ mod tests {
         assert!(rendered.contains("gh pr list --head"));
         assert!(rendered.contains("not complete until a PR exists"));
         assert!(rendered.contains("PR URL on its own line"));
+        // Empty-diff guard: the worker must verify the diff is non-empty
+        // before pushing so the engine's empty-diff probe is never needed.
+        assert!(
+            rendered.contains("jj diff -r @"),
+            "CLAUDE.md must remind workers to verify the diff before pushing",
+        );
     }
 
     #[test]
