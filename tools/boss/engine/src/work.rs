@@ -2672,7 +2672,7 @@ impl WorkDb {
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &project.status)?;
         }
-        let actor = if status_changed { "human" } else { "" };
+        let actor = if status_changed && previous_status != project.status { "human" } else { "" };
 
         tx.execute(
             "UPDATE projects
@@ -2764,7 +2764,7 @@ impl WorkDb {
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &task.status)?;
         }
-        let actor = if status_changed { "human" } else { "" };
+        let actor = if status_changed && previous_status != task.status { "human" } else { "" };
 
         let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
 
@@ -15139,6 +15139,193 @@ mod tests {
         let tree = db.get_work_tree(&product.id).unwrap();
         let chore = &tree.chores[0];
         assert_eq!(chore.short_id, Some(1), "WorkTree chore carries short_id");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A no-op status patch (patch.status == current status) must NOT flip
+    /// `last_status_actor` to 'human'. Regression test for the bug where
+    /// `status_changed = patch.status.is_some()` caused any patch that
+    /// carried a status field to overwrite the actor, silently disabling
+    /// the engine's auto-unblock cascade.
+    #[test]
+    fn noop_status_patch_preserves_last_status_actor_for_task() {
+        let path = temp_db_path("noop-status-actor-task");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:example/repo.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "C".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+
+        // Simulate the engine having set the status by writing directly.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET last_status_actor = 'engine' WHERE id = ?1",
+                rusqlite::params![chore.id],
+            )
+            .unwrap();
+        }
+
+        // No-op status patch: same value the row already has ('todo').
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("todo".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let conn = db.connect().unwrap();
+        let actor: String = conn
+            .query_row(
+                "SELECT last_status_actor FROM tasks WHERE id = ?1",
+                rusqlite::params![chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            actor, "engine",
+            "no-op status patch must not flip last_status_actor from 'engine' to 'human'"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Same invariant as `noop_status_patch_preserves_last_status_actor_for_task`
+    /// but exercised on the project path.
+    #[test]
+    fn noop_status_patch_preserves_last_status_actor_for_project() {
+        let path = temp_db_path("noop-status-actor-project");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Prod".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Proj".into(),
+                description: None,
+                goal: None,
+                autostart: false,
+            })
+            .unwrap();
+
+        // Pre-seed last_status_actor = 'engine' directly.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE projects SET last_status_actor = 'engine' WHERE id = ?1",
+                rusqlite::params![project.id],
+            )
+            .unwrap();
+        }
+
+        // No-op status patch: project default status is 'planned'.
+        let current_status = project.status.clone();
+        db.update_work_item(
+            &project.id,
+            WorkItemPatch {
+                status: Some(current_status),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let conn = db.connect().unwrap();
+        let actor: String = conn
+            .query_row(
+                "SELECT last_status_actor FROM projects WHERE id = ?1",
+                rusqlite::params![project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            actor, "engine",
+            "no-op status patch must not flip last_status_actor from 'engine' to 'human'"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A genuine status change must still flip `last_status_actor` to 'human'.
+    #[test]
+    fn real_status_change_sets_last_status_actor_human_for_task() {
+        let path = temp_db_path("real-status-actor-task");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:example/repo.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "C".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET last_status_actor = 'engine' WHERE id = ?1",
+                rusqlite::params![chore.id],
+            )
+            .unwrap();
+        }
+
+        // Genuine status change: todo → doing.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("doing".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let conn = db.connect().unwrap();
+        let actor: String = conn
+            .query_row(
+                "SELECT last_status_actor FROM tasks WHERE id = ?1",
+                rusqlite::params![chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            actor, "human",
+            "genuine status change must flip last_status_actor to 'human'"
+        );
 
         let _ = std::fs::remove_file(path);
     }
