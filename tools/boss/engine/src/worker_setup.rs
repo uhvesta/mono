@@ -127,6 +127,53 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          command that falls through to one will fail fast — fix it by\n\
          re-running with `-m`, not by changing the editor.\n\
          \n\
+         ## Creating a PR from a jj workspace\n\
+         \n\
+         This workspace uses jj, not plain git. There is **no `.git/` at the\n\
+         workspace root** — the backing git store lives at `.jj/repo/store/git`.\n\
+         Raw `gh` invocations that rely on git-directory discovery will fail\n\
+         with `fatal: not a git repository` unless you point them at it.\n\
+         \n\
+         **Rule: prefix every `gh` call with `GIT_DIR=.jj/repo/store/git`.**\n\
+         This applies to `gh pr create`, `gh pr view`, `gh pr checks`,\n\
+         `gh pr list`, `gh api`, and any other `gh` verb that touches git\n\
+         state. Exporting it once at the top of a sequence of commands is fine.\n\
+         \n\
+         **Rule: pass `--head <bookmark> --base main` to `gh pr create`.**\n\
+         `gh` cannot infer HEAD from a jj checkout, so the bookmark name must\n\
+         be given explicitly. Same for any `gh` verb that needs HEAD context.\n\
+         \n\
+         **Rule: `jj git push -b <bookmark>` requires `--allow-new` the first\n\
+         time the bookmark is pushed.** Subsequent pushes of the same bookmark\n\
+         do not need the flag.\n\
+         \n\
+         ### Canonical PR creation recipe\n\
+         \n\
+         Copy-paste this block; substitute `my-feature` with your bookmark name:\n\
+         \n\
+         ```sh\n\
+         # Describe the commit (inline -m is required — no editor)\n\
+         jj describe -m \"your commit message\"\n\
+         \n\
+         # Create a named bookmark pointing at the current commit\n\
+         jj bookmark create my-feature -r @\n\
+         \n\
+         # Push — first push of a new bookmark requires --allow-new\n\
+         GIT_DIR=.jj/repo/store/git jj git push -b my-feature --allow-new\n\
+         \n\
+         # Open the PR\n\
+         GIT_DIR=.jj/repo/store/git gh pr create \\\\\n\
+           --head my-feature --base main \\\\\n\
+           --title \"Your PR title\" \\\\\n\
+           --body \"PR description\"\n\
+         ```\n\
+         \n\
+         To update an existing PR after new commits:\n\
+         \n\
+         ```sh\n\
+         jj git push -b my-feature   # no --allow-new needed\n\
+         ```\n\
+         \n\
          ## Boundaries\n\
          \n\
          - Do not modify files outside this workspace. Sibling workspaces\n\
@@ -710,5 +757,47 @@ mod tests {
     fn claude_dir_for_appends_dot_claude() {
         let dir = claude_dir_for(Path::new("/some/workspace"));
         assert_eq!(dir, PathBuf::from("/some/workspace/.claude"));
+    }
+
+    #[test]
+    fn claude_md_has_pr_creation_section_with_git_dir_prefix() {
+        let input = sample_input();
+        let rendered = render_claude_md(&input);
+        assert!(
+            rendered.contains("Creating a PR from a jj workspace"),
+            "expected a 'Creating a PR from a jj workspace' section",
+        );
+        assert!(
+            rendered.contains("GIT_DIR=.jj/repo/store/git"),
+            "expected GIT_DIR=.jj/repo/store/git prefix to be documented",
+        );
+        assert!(
+            rendered.contains("--head"),
+            "expected --head <bookmark> guidance",
+        );
+        assert!(
+            rendered.contains("--allow-new"),
+            "expected --allow-new guidance for first-time bookmark push",
+        );
+        assert!(
+            rendered.contains("jj bookmark create"),
+            "expected canonical bookmark creation command",
+        );
+    }
+
+    #[test]
+    fn claude_md_explains_no_git_at_workspace_root() {
+        // Workers must know why bare `gh` fails before reaching for the fix.
+        let input = sample_input();
+        let rendered = render_claude_md(&input);
+        assert!(
+            rendered.contains(".jj/repo/store/git"),
+            "expected the backing git-store path to be documented",
+        );
+        assert!(
+            rendered.contains("fatal: not a git repository")
+                || rendered.contains("no `.git/`"),
+            "expected an explanation of why bare gh fails in a jj workspace",
+        );
     }
 }
