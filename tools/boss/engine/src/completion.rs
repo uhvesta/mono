@@ -182,7 +182,41 @@ impl PrDetector for CommandPrDetector {
         let mut last_err: Option<anyhow::Error> = None;
         for sha in &candidates {
             match query_pr_for_commit(&repo_slug, sha).await {
-                Ok(Some(api_pr)) => return Ok(classify_pr(api_pr, &candidates)),
+                Ok(Some(api_pr)) => {
+                    let status = classify_pr(api_pr, &candidates);
+                    // When all three diff-stat fields are zero the PR is
+                    // *tentatively* empty, but GitHub computes those stats
+                    // asynchronously.  Run a secondary check against the
+                    // full PR endpoint before surfacing EmptyDiff — a false
+                    // positive here would loop the worker pane with bogus
+                    // "your diff is empty" directives on every Stop event.
+                    if let PrStatus::EmptyDiff { ref url } = status {
+                        tracing::debug!(
+                            pr_url = %url,
+                            repo = %repo_slug,
+                            "all diff stats zero on initial check; verifying via PR endpoint",
+                        );
+                        match verify_pr_diff_nonempty(&repo_slug, url).await {
+                            Ok(true) => {
+                                tracing::debug!(
+                                    pr_url = %url,
+                                    "secondary check confirms non-empty diff; classifying as Fresh",
+                                );
+                                return Ok(PrStatus::Fresh { url: url.clone() });
+                            }
+                            Ok(false) => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    pr_url = %url,
+                                    ?err,
+                                    "secondary diff-stat check failed; surfacing as detector failure",
+                                );
+                                return Err(err);
+                            }
+                        }
+                    }
+                    return Ok(status);
+                }
                 Ok(None) => continue,
                 Err(err) => {
                     tracing::debug!(
@@ -210,8 +244,15 @@ struct ApiPr {
     state: String,
     merged_at: Option<String>,
     head_sha: String,
-    /// Number of files changed in the PR. Zero means the PR has an empty diff.
+    /// Number of files changed in the PR.
+    /// May be 0 when GitHub hasn't finished computing diff stats yet (race
+    /// condition on a freshly-pushed branch); check `additions`/`deletions`
+    /// before treating zero as "genuinely empty".
     changed_files: i64,
+    /// Lines added in the PR.  0 means absent or not-yet-computed.
+    additions: i64,
+    /// Lines deleted in the PR.  0 means absent or not-yet-computed.
+    deletions: i64,
 }
 
 fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
@@ -251,17 +292,21 @@ fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
         return PrStatus::None;
     }
     if head_match {
-        // Use file-count rather than tree-SHA equality: `changed_files`
-        // is available on the PR object without an extra API round-trip
-        // (the `commits/{sha}/pulls` endpoint returns full PR objects),
-        // whereas tree-equality would require a separate `commits/{sha}`
-        // call to get the tree sha. Zero files means the worker pushed
-        // an empty commit — surface it so the worker is asked to fix or
-        // close the PR rather than letting it advance to review.
-        if pr.changed_files == 0 {
-            PrStatus::EmptyDiff { url: pr.url }
-        } else {
+        // A PR has real changes if ANY of the three diff-stat fields is
+        // positive.  `changed_files` alone is unreliable: GitHub computes
+        // it asynchronously and the `commits/{sha}/pulls` endpoint can
+        // return 0 for a freshly-pushed branch before the computation
+        // finishes.  `additions` and `deletions` are populated by the same
+        // pipeline but are often available sooner.  If ALL three are zero
+        // the PR is tentatively empty; `detect_pr` runs a secondary
+        // verification call against the full PR endpoint before surfacing
+        // `EmptyDiff` to callers.
+        let has_changes =
+            pr.changed_files > 0 || pr.additions > 0 || pr.deletions > 0;
+        if has_changes {
             PrStatus::Fresh { url: pr.url }
+        } else {
+            PrStatus::EmptyDiff { url: pr.url }
         }
     } else {
         PrStatus::Stale {
@@ -333,7 +378,7 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
             "-H",
             "Accept: application/vnd.github+json",
             "--jq",
-            r#"first | select(.) | [(.html_url // ""), (.state // ""), (.merged_at // ""), (.head.sha // ""), ((.changed_files // 0) | tostring)] | @tsv"#,
+            r#"first | select(.) | [(.html_url // ""), (.state // ""), (.merged_at // ""), (.head.sha // ""), ((.changed_files // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -370,6 +415,8 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
     let merged_at_raw = parts.next().unwrap_or("").trim();
     let head_sha = parts.next().unwrap_or("").trim().to_owned();
     let changed_files_raw = parts.next().unwrap_or("0").trim();
+    let additions_raw = parts.next().unwrap_or("0").trim();
+    let deletions_raw = parts.next().unwrap_or("0").trim();
     if url.is_empty() {
         return Ok(None);
     }
@@ -379,13 +426,65 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
         Some(merged_at_raw.to_owned())
     };
     let changed_files = changed_files_raw.parse::<i64>().unwrap_or(0);
+    let additions = additions_raw.parse::<i64>().unwrap_or(0);
+    let deletions = deletions_raw.parse::<i64>().unwrap_or(0);
     Ok(Some(ApiPr {
         url,
         state,
         merged_at,
         head_sha,
         changed_files,
+        additions,
+        deletions,
     }))
+}
+
+/// Secondary diff-stat verification via the full PR endpoint.
+///
+/// The `commits/{sha}/pulls` response can report `changed_files == 0`
+/// (and likewise `additions`/`deletions`) before GitHub finishes its
+/// async diff computation on a freshly pushed branch.  This function
+/// queries the authoritative per-PR endpoint and returns `true` when
+/// the PR has at least one added or deleted line, so callers can
+/// override an ambiguous `EmptyDiff` classification with `Fresh`.
+///
+/// An `Err` here means the secondary check itself failed (network blip,
+/// `gh` auth issue, etc.). Callers must propagate this as a detector
+/// failure rather than treating it as confirmation of an empty diff.
+async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> {
+    let pr_number = pr_url
+        .split('/')
+        .last()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
+    let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "--jq",
+            "((.additions // 0) + (.deletions // 0))",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `gh api {endpoint}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`gh api {endpoint}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let total: i64 = stdout.trim().parse().with_context(|| {
+        format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim())
+    })?;
+    Ok(total > 0)
 }
 
 /// Pull `owner/repo` out of a remote URL. Handles both SSH
@@ -522,15 +621,18 @@ impl WorkerCompletionHandler {
         {
             Ok(value) => value,
             Err(err) => {
+                // Do NOT probe the worker on a detector failure.  The failure
+                // is usually a transient `gh`/network issue; probing here
+                // creates a re-entrancy loop: worker receives the probe,
+                // responds, stops, detection fails again, probe again…
+                // The merge-poller's recheck sweep will recover the
+                // transition once the failure clears.
                 tracing::warn!(
                     execution_id,
                     workspace = %workspace_path.display(),
                     ?err,
-                    "stop event: PR detection failed; surfacing as awaiting input"
+                    "stop event: PR detection failed; will retry on next merge-poller sweep"
                 );
-                self.publish_awaiting_input(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_DETECTOR_FAILURE);
                 return StopOutcome::DetectorFailed;
             }
         };
@@ -893,21 +995,6 @@ impl WorkerCompletionHandler {
         }
     }
 
-    async fn publish_awaiting_input(&self, execution: &crate::work::WorkExecution) {
-        // Status string mirrors what the execution actually is in DB,
-        // but the reason is what carries the "awaiting input" signal
-        // — frontends can surface that as the idle/awaiting indicator
-        // on the worker pane.
-        self.publisher
-            .publish(
-                &execution.id,
-                &execution.work_item_id,
-                &execution.status,
-                "worker_awaiting_input",
-            )
-            .await;
-    }
-
     /// Publish the more specific "stopped without a PR" signal so the
     /// frontend can paint a distinct activity icon (the live-state
     /// chore picks this up). Falls back to the same status string as
@@ -938,13 +1025,6 @@ pub const PROBE_STALE_PR: &str = "A PR exists for this branch, but your local co
 are ahead of the PR's head. Push the new commits (`jj git push -b <bookmark>`) \
 so the PR reflects your latest work, or explain why the local commits should not \
 be pushed.";
-
-/// Probe text dispatched when the PR detector itself errored. We don't
-/// know whether a PR exists, so ask the worker to confirm.
-pub const PROBE_DETECTOR_FAILURE: &str = "I couldn't determine whether you've opened \
-a PR for this branch (the `gh` query failed). If a PR exists, paste its URL on its \
-own line. If not, push your branch and open one with `gh pr create`. If you're \
-blocked, explain what you need.";
 
 /// Probe text dispatched when a PR exists and head_match is satisfied,
 /// but the PR contains no file changes (`changed_files == 0`). The
@@ -1443,7 +1523,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detector_failure_is_treated_as_awaiting_input() {
+    async fn detector_failure_does_not_probe_worker() {
+        // A transient `gh`/network failure must NOT inject a probe into the
+        // worker pane.  Probing on detector failure creates a re-entrancy
+        // loop: worker responds → stops → detection fails again → probe
+        // again → …  The merge-poller recheck recovers the transition once
+        // the failure clears.
         let workspace = tempdir().unwrap();
         let (db, _, _, execution_id) = fixture(workspace.path());
         let detector = StubPrDetector::err("gh broken");
@@ -1464,14 +1549,11 @@ mod tests {
         assert_eq!(outcome, StopOutcome::DetectorFailed);
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
-        let events = publisher.events.lock().await.clone();
-        assert!(
-            events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_input"),
-            "detector errors must surface as awaiting_input, got {events:?}",
-        );
         let queued = probes.snapshot();
-        assert_eq!(queued.len(), 1, "detector failures must still probe the worker");
-        assert_eq!(queued[0].1, PROBE_DETECTOR_FAILURE);
+        assert!(
+            queued.is_empty(),
+            "detector failure must NOT probe the worker, got {queued:?}",
+        );
     }
 
     #[tokio::test]
@@ -2027,6 +2109,8 @@ mod tests {
             merged_at: Some("2026-05-12T03:51:00Z".into()),
             head_sha: "branch_head_sha_aaaaaaaaaaaaaaaaaa".into(),
             changed_files: 3,
+            additions: 0,
+            deletions: 0,
         };
         let local_shas = vec![
             "worker_at_sha_111111111111111111111".into(),
@@ -2051,6 +2135,8 @@ mod tests {
             merged_at: None,
             head_sha: "branch_head_sha_bbbbbbbbbbbbbbbbbb".into(),
             changed_files: 2,
+            additions: 0,
+            deletions: 0,
         };
         let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
         assert_eq!(classify_pr(pr, &local_shas), PrStatus::None);
@@ -2069,6 +2155,8 @@ mod tests {
             merged_at: Some("2026-05-12T04:00:00Z".into()),
             head_sha: "worker_at_sha_111111111111111111111".into(),
             changed_files: 5,
+            additions: 0,
+            deletions: 0,
         };
         let local_shas = vec![
             "worker_at_sha_111111111111111111111".into(),
@@ -2082,18 +2170,20 @@ mod tests {
         );
     }
 
-    /// Guard: a head-matched PR with `changed_files == 0` classifies
-    /// as `EmptyDiff`, not `Fresh`. The head-sha match confirms the
-    /// worker pushed something, but zero files changed means the diff
-    /// is empty — the work item must not advance to `in_review`.
+    /// Guard: a head-matched PR with all diff-stat fields zero classifies
+    /// as `EmptyDiff`, not `Fresh`. The head-sha match confirms the worker
+    /// pushed something, but zero files/additions/deletions means the diff
+    /// is empty (pending secondary verification in `detect_pr`).
     #[test]
-    fn classify_pr_returns_empty_diff_when_head_matches_but_changed_files_is_zero() {
+    fn classify_pr_returns_empty_diff_when_all_diff_stats_are_zero() {
         let pr = ApiPr {
             url: "https://github.com/foo/bar/pull/55".into(),
             state: "open".into(),
             merged_at: None,
             head_sha: "worker_at_sha_111111111111111111111".into(),
             changed_files: 0,
+            additions: 0,
+            deletions: 0,
         };
         let local_shas = vec![
             "worker_at_sha_111111111111111111111".into(),
@@ -2107,8 +2197,35 @@ mod tests {
         );
     }
 
+    /// Regression: `changed_files == 0` must NOT produce `EmptyDiff` when
+    /// `additions` or `deletions` are non-zero.  This is the false-positive
+    /// scenario observed with PR #446: GitHub's `commits/{sha}/pulls`
+    /// endpoint returned `changed_files: 0` (async diff-stat lag) while
+    /// `additions: 1, deletions: 1` were already computed.  Before this
+    /// fix the engine injected a bogus "your diff is empty" directive into
+    /// the worker pane on every Stop event.
+    #[test]
+    fn classify_pr_returns_fresh_when_changed_files_zero_but_additions_nonzero() {
+        let pr = ApiPr {
+            url: "https://github.com/foo/bar/pull/446".into(),
+            state: "open".into(),
+            merged_at: None,
+            head_sha: "worker_at_sha_111111111111111111111".into(),
+            changed_files: 0,
+            additions: 1,
+            deletions: 1,
+        };
+        let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
+        assert_eq!(
+            classify_pr(pr, &local_shas),
+            PrStatus::Fresh {
+                url: "https://github.com/foo/bar/pull/446".into(),
+            },
+        );
+    }
+
     /// Confirm that a head-matched PR with `changed_files > 0` still
-    /// classifies as `Fresh` — the empty-diff guard only fires on zero.
+    /// classifies as `Fresh`.
     #[test]
     fn classify_pr_returns_fresh_when_head_matches_and_changed_files_nonzero() {
         let pr = ApiPr {
@@ -2117,6 +2234,8 @@ mod tests {
             merged_at: None,
             head_sha: "worker_at_sha_111111111111111111111".into(),
             changed_files: 1,
+            additions: 0,
+            deletions: 0,
         };
         let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
         assert_eq!(
