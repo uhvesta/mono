@@ -125,10 +125,20 @@ pub trait PrDetector: Send + Sync {
     /// "no PR" as `Ok(PrStatus::None)` to keep the caller's
     /// idle-vs-completed logic clean. Errors are reserved for tool
     /// failures (jj missing, `gh` auth broken, etc.).
+    ///
+    /// `dispatch_started_at` is the execution row's `started_at` (RFC
+    /// 3339, e.g. `2026-05-13T22:30:00Z`) and gates the candidate
+    /// expansion against stale bookmarks accumulated from prior tasks
+    /// in this cube workspace. `None` keeps the legacy `@ | @-`-only
+    /// behaviour for executions that have not yet started — those
+    /// shouldn't reach a Stop hook in practice, but the parameter is
+    /// optional rather than required so callers handle the missing
+    /// case explicitly instead of trusting the row.
     async fn detect_pr(
         &self,
         workspace_path: &Path,
         repo_remote_url: &str,
+        dispatch_started_at: Option<&str>,
     ) -> Result<PrStatus>;
 }
 
@@ -162,11 +172,13 @@ impl PrDetector for CommandPrDetector {
         &self,
         workspace_path: &Path,
         repo_remote_url: &str,
+        dispatch_started_at: Option<&str>,
     ) -> Result<PrStatus> {
         let repo_slug = parse_repo_slug(repo_remote_url).with_context(|| {
             format!("failed to parse repo slug from `{repo_remote_url}`")
         })?;
-        let mut candidates = jj_candidate_commit_shas(workspace_path).await?;
+        let mut candidates =
+            jj_candidate_commit_shas(workspace_path, dispatch_started_at).await?;
         // `@` and `@-` resolve to the same commit on a fresh,
         // single-commit workspace; skip the duplicate API call.
         candidates.dedup();
@@ -183,6 +195,8 @@ impl PrDetector for CommandPrDetector {
         for sha in &candidates {
             match query_pr_for_commit(&repo_slug, sha).await {
                 Ok(Some(api_pr)) => {
+                    let api_pr_url = api_pr.url.clone();
+                    let api_pr_head = api_pr.head_sha.clone();
                     let status = classify_pr(api_pr, &candidates);
                     // When all three diff-stat fields are zero the PR is
                     // *tentatively* empty, but GitHub computes those stats
@@ -215,6 +229,29 @@ impl PrDetector for CommandPrDetector {
                             }
                         }
                     }
+                    // Diagnostic surface for the "worker pushed a real PR
+                    // but the engine can't bind it" failure mode: when we
+                    // got a PR back from `gh api` but `classify_pr`
+                    // rejected `head_match`, log the SHAs side-by-side so
+                    // operators can see whether the worker's `@`/`@-`
+                    // drifted from the PR's head (e.g., they did `jj new
+                    // main` after `jj git push`). Without this, a worker
+                    // stuck in `active`/`waiting_human` is invisible to
+                    // log inspection — the existing `info!` in
+                    // `on_stop_inner` says "PR exists but local commits
+                    // are unpushed" without showing which SHAs failed.
+                    if matches!(status, PrStatus::Stale { .. }) {
+                        tracing::info!(
+                            workspace = %workspace_path.display(),
+                            repo = %repo_slug,
+                            pr_url = %api_pr_url,
+                            pr_head_sha = %api_pr_head,
+                            local_shas = ?candidates,
+                            queried_sha = %sha,
+                            "pr_detect: PR found but head_sha does not match any local commit — \
+                             worker's working copy likely moved after push (e.g., `jj new main`)",
+                        );
+                    }
                     return Ok(status);
                 }
                 Ok(None) => continue,
@@ -233,6 +270,16 @@ impl PrDetector for CommandPrDetector {
         if let Some(err) = last_err {
             return Err(err);
         }
+        // No candidate resolved to a PR. Log at debug so the next
+        // recheck-loop pass leaves a breadcrumb; the merge poller calls
+        // `recheck_for_pr` every 60s, and the steady-state "no PR" case
+        // is normal noise.
+        tracing::debug!(
+            workspace = %workspace_path.display(),
+            repo = %repo_slug,
+            candidate_count = candidates.len(),
+            "pr_detect: no PR found for any local commit; returning None",
+        );
         Ok(PrStatus::None)
     }
 }
@@ -319,21 +366,46 @@ fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
     }
 }
 
-/// `jj log -r '@ | @-' --no-graph -T 'commit_id ++ "\n"'` — read the
-/// worker's working-copy commit and its parent. The two-rev fallback
-/// covers the two normal end-states for a worker run:
+/// Read candidate commit shas for PR detection.
+///
+/// Always includes `@ | @-` — the worker's working-copy commit and its
+/// parent. The two-rev fallback covers the two normal end-states for
+/// a worker run:
 ///   - they did `jj squash` and the work lives on `@-` (with `@`
 ///     left as an empty change), or
 ///   - they edited `@` directly so the work lives there.
-/// Either way, querying both shas catches the PR.
-async fn jj_candidate_commit_shas(workspace_path: &Path) -> Result<Vec<String>> {
+///
+/// When `dispatch_started_at` is `Some`, the candidate set is extended
+/// with the tip of every bookmark whose tip commit was committed after
+/// that timestamp. This closes the bug that left Worf / Crusher / Troi
+/// (2026-05-13 dispatch wave, five-worker repro) stuck in `active` /
+/// `waiting_human`: those workers had pushed a real PR with a bookmark
+/// pointing at their work, then done `jj new main` afterwards, so
+/// `@` / `@-` no longer reached the pushed commit and the GitHub API
+/// query returned an unrelated already-merged PR off `main`'s tip
+/// which `classify_pr` correctly rejected as `Stale`. With the
+/// bookmark's tip in the candidate set, the worker's pushed sha is
+/// queried and `classify_pr` accepts it as `Fresh`.
+///
+/// The `committer_date(after:)` gate scopes the bookmark expansion to
+/// this dispatch's run window. Cube workspaces accumulate 50+ stale
+/// bookmarks from prior tasks (each was pushed at some point, so they
+/// have remote-tracking entries too), and including them naively
+/// would misbind the chore to whichever prior PR happened to be
+/// queried first. Filtering by `started_at` keeps only bookmarks the
+/// current worker actually moved.
+async fn jj_candidate_commit_shas(
+    workspace_path: &Path,
+    dispatch_started_at: Option<&str>,
+) -> Result<Vec<String>> {
+    let revset = build_candidate_revset(dispatch_started_at);
     let output = Command::new("jj")
         .args([
             "log",
             "--no-graph",
             "--ignore-working-copy",
             "-r",
-            "@ | @-",
+            &revset,
             "-T",
             r#"commit_id ++ "\n""#,
         ])
@@ -358,12 +430,43 @@ async fn jj_candidate_commit_shas(workspace_path: &Path) -> Result<Vec<String>> 
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
+    let mut shas: Vec<String> = stdout
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .collect())
+        .collect();
+    // De-duplicate while preserving newest-first order: `@` always
+    // appears before `@-`, and any bookmark tip that coincides with
+    // either should not be queried twice. A small `seen` set is
+    // cheaper than a sort for the typical candidate count (< 10).
+    let mut seen = std::collections::HashSet::new();
+    shas.retain(|sha| seen.insert(sha.clone()));
+    Ok(shas)
+}
+
+/// Compose the revset for `jj_candidate_commit_shas`. Split out so the
+/// committer-date gate is tested independently of the `jj log`
+/// invocation.
+fn build_candidate_revset(dispatch_started_at: Option<&str>) -> String {
+    match dispatch_started_at.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(started) => {
+            // jj revset string literals do not support backslash
+            // escaping inside double quotes, so any timestamp shape we
+            // pass must be safe to embed verbatim. RFC 3339 / SQLite's
+            // ISO 8601 output ([0-9T:.+-]Z) is safe by construction.
+            // If the value somehow contains a `"`, drop the bookmark
+            // gate rather than producing an invalid revset that would
+            // fail the whole detection pass.
+            if started.contains('"') {
+                return "@ | @-".to_owned();
+            }
+            format!(
+                r#"@ | @- | (bookmarks() & committer_date(after:"{started}"))"#,
+            )
+        }
+        None => "@ | @-".to_owned(),
+    }
 }
 
 /// `gh api repos/{owner}/{repo}/commits/{sha}/pulls` — return the
@@ -616,7 +719,11 @@ impl WorkerCompletionHandler {
 
         let pr_status = match self
             .pr_detector
-            .detect_pr(&workspace_path, &execution.repo_remote_url)
+            .detect_pr(
+                &workspace_path,
+                &execution.repo_remote_url,
+                execution.started_at.as_deref(),
+            )
             .await
         {
             Ok(value) => value,
@@ -712,7 +819,11 @@ impl WorkerCompletionHandler {
         };
         let pr_status = match self
             .pr_detector
-            .detect_pr(&workspace_path, &execution.repo_remote_url)
+            .detect_pr(
+                &workspace_path,
+                &execution.repo_remote_url,
+                execution.started_at.as_deref(),
+            )
             .await
         {
             Ok(value) => value,
@@ -1136,6 +1247,7 @@ mod tests {
             &self,
             _workspace_path: &Path,
             _repo_remote_url: &str,
+            _dispatch_started_at: Option<&str>,
         ) -> Result<PrStatus> {
             let guard = self.result.lock().await;
             match &*guard {
@@ -2785,6 +2897,474 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert!(publisher.events.lock().await.is_empty());
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
+    }
+
+    /// Regression for the 2026-05-13 five-concurrent-workers failure
+    /// (Worf/Crusher/Troi in the first wave at 21:01-21:04Z, then
+    /// Yar/Riker in the second wave at 22:13-22:15Z). All five pushed
+    /// real PRs but `pr_url` was never bound and their chores stayed
+    /// in `active` indefinitely. The failure was invisible in engine
+    /// logs because `merge_poller::sweep_pending_pr` silently returned
+    /// from the `StalePr`/`AwaitingInput`/`DetectorFailed`/`EmptyDiffPr`
+    /// arms.
+    ///
+    /// This test pins TWO contracts:
+    ///
+    /// 1. **Observability:** when the detector still returns Stale
+    ///    (e.g. an execution without `started_at`, or some other
+    ///    candidate-set failure the bookmark expansion doesn't catch),
+    ///    the recheck path counts unresolved candidates on
+    ///    `SweepOutcome.pr_recheck_unresolved` so a stuck worker leaves
+    ///    a breadcrumb on every 60s sweep instead of failing silently.
+    ///
+    /// 2. **Behavioural fix:** when the detector returns `Fresh` on a
+    ///    subsequent pass — the production path for this is
+    ///    `jj_candidate_commit_shas` finding the worker's pushed
+    ///    bookmark tip via `committer_date(after:"<started_at>")` — the
+    ///    recheck binds `pr_url` and transitions the chore to
+    ///    `in_review`. Without this leg, the diagnostic-only fix from
+    ///    the previous dispatch left the bug live and demanded
+    ///    coordinator backfill on every dispatch wave.
+    #[tokio::test]
+    async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers() {
+        use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
+
+        // Three independent workspaces / chores / executions in
+        // `waiting_human` with `pr_url=null`. Mirrors the 3-worker
+        // dispatch wave (Worf/Crusher/Troi).
+        let ws1 = tempdir().unwrap();
+        let ws2 = tempdir().unwrap();
+        let ws3 = tempdir().unwrap();
+        let (db, _p1, c1, e1) = fixture(ws1.path());
+        // Reuse the same DB for the next two so a single merge-poller
+        // pass sees all three executions.
+        let chore2 = db
+            .create_chore(crate::work::CreateChoreInput {
+                product_id: {
+                    let item = db.get_work_item(&c1).unwrap();
+                    work_item_product_id(&item)
+                },
+                name: "Crusher".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let exec2 = db
+            .create_execution(crate::work::CreateExecutionInput {
+                work_item_id: chore2.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (exec2, run2) = db
+            .start_execution_run(
+                &exec2.id,
+                "worker-2",
+                "mono",
+                "lease-2",
+                "mono-agent-002",
+                ws2.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &exec2.id,
+                &run2.id,
+                "waiting_human",
+                "completed",
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        let chore3 = db
+            .create_chore(crate::work::CreateChoreInput {
+                product_id: {
+                    let item = db.get_work_item(&c1).unwrap();
+                    work_item_product_id(&item)
+                },
+                name: "Troi".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let exec3 = db
+            .create_execution(crate::work::CreateExecutionInput {
+                work_item_id: chore3.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (exec3, run3) = db
+            .start_execution_run(
+                &exec3.id,
+                "worker-3",
+                "mono",
+                "lease-3",
+                "mono-agent-003",
+                ws3.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &exec3.id,
+                &run3.id,
+                "waiting_human",
+                "completed",
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        // Detector that returns Stale for every candidate — simulates
+        // the failure mode where the worker's `@`/`@-` drifted from
+        // the PR's head after push (`jj new main` after `jj git push`).
+        // Keep a handle on the concrete stub so pass 2 can swap the
+        // result without rebuilding the handler.
+        let detector = StubPrDetector::ok_status(PrStatus::Stale {
+            url: "https://github.com/spinyfin/mono/pull/433".into(),
+            reason: "local commits do not match PR head abc1234".into(),
+        });
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        struct NoOpProbe;
+        #[async_trait]
+        impl MergeProbe for NoOpProbe {
+            async fn probe(&self, _: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe {
+                    url: String::new(),
+                    state: PrLifecycleState::Open(
+                        crate::merge_poller::OpenPrStatus::clean(),
+                    ),
+                    base_ref_oid: None,
+                    head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
+                    labels: Vec::new(),
+                })
+            }
+        }
+        let probe = NoOpProbe;
+
+        let outcome = crate::merge_poller::run_one_pass(
+            db.as_ref(),
+            &probe,
+            publisher.as_ref(),
+            None,
+            Some(&handler),
+        )
+        .await;
+
+        // Pass 1 — pre-fix behaviour: the recheck reaches all three
+        // candidates but the detector still returns Stale on each. The
+        // observability counter fires so the failure leaves a
+        // breadcrumb on every sweep, but nothing transitions — exactly
+        // the 2026-05-13 stuck-worker shape.
+        assert_eq!(
+            outcome.pr_recheck_unresolved, 3,
+            "the sweep must count three unresolved recheck candidates, got {outcome:?}",
+        );
+        assert_eq!(
+            outcome.pr_recheck_recovered, 0,
+            "no transitions happen on the StalePr branch",
+        );
+        for chore_id in [c1.as_str(), chore2.id.as_str(), chore3.id.as_str()] {
+            let item = db.get_work_item(chore_id).unwrap();
+            match item {
+                WorkItem::Chore(t) => {
+                    assert_eq!(t.status, "active");
+                    assert!(t.pr_url.is_none());
+                }
+                other => panic!("expected chore, got {other:?}"),
+            }
+        }
+        for execution_id in [e1.as_str(), exec2.id.as_str(), exec3.id.as_str()] {
+            let execution = db.get_execution(execution_id).unwrap();
+            assert_eq!(
+                execution.status, "waiting_human",
+                "execution must stay in waiting_human after a Stale recheck",
+            );
+            assert!(
+                execution.cube_lease_id.is_some(),
+                "cube lease must NOT be released on the Stale branch — the worker is still alive",
+            );
+        }
+        assert!(
+            probes.snapshot().is_empty(),
+            "recheck path stays quiet on Stale — no probes queued",
+        );
+
+        // Pass 2 — fix engaged: simulate the production path where
+        // `jj_candidate_commit_shas`'s `committer_date(after:"<started_at>")`
+        // gate has now expanded the candidate set with the worker's
+        // pushed bookmark tip, so `gh api commits/{sha}/pulls` returns
+        // a PR whose `head.sha` matches a local sha and `classify_pr`
+        // accepts it as `Fresh`. The stub detector swaps to mirror
+        // that real-world transition. All three stuck chores must
+        // bind their `pr_url` and transition to `in_review` on this
+        // pass — without coordinator backfill.
+        *detector.result.lock().await = Ok(PrStatus::Fresh {
+            url: "https://github.com/spinyfin/mono/pull/433".into(),
+        });
+        let outcome2 = crate::merge_poller::run_one_pass(
+            db.as_ref(),
+            &probe,
+            publisher.as_ref(),
+            None,
+            Some(&handler),
+        )
+        .await;
+        assert_eq!(
+            outcome2.pr_recheck_recovered, 3,
+            "all three stuck workers must transition on the recovery pass, got {outcome2:?}",
+        );
+        assert_eq!(
+            outcome2.pr_recheck_unresolved, 0,
+            "no candidates should remain unresolved after the recovery pass",
+        );
+        for chore_id in [c1.as_str(), chore2.id.as_str(), chore3.id.as_str()] {
+            let item = db.get_work_item(chore_id).unwrap();
+            match item {
+                WorkItem::Chore(t) => {
+                    assert_eq!(
+                        t.status, "in_review",
+                        "chore {chore_id} must transition to in_review on the recovery pass",
+                    );
+                    assert_eq!(
+                        t.pr_url.as_deref(),
+                        Some("https://github.com/spinyfin/mono/pull/433"),
+                        "chore {chore_id} must have pr_url bound on the recovery pass",
+                    );
+                }
+                other => panic!("expected chore, got {other:?}"),
+            }
+        }
+        for execution_id in [e1.as_str(), exec2.id.as_str(), exec3.id.as_str()] {
+            let execution = db.get_execution(execution_id).unwrap();
+            assert_eq!(
+                execution.status, "completed",
+                "execution {execution_id} must finalise on the recovery pass",
+            );
+            assert!(
+                execution.cube_lease_id.is_none(),
+                "cube lease must be released on the recovery pass — worker has stopped",
+            );
+        }
+        // Three leases released, three panes torn down: one per worker.
+        assert_eq!(cube.release_calls.lock().await.len(), 3);
+        assert_eq!(pane.calls.lock().await.len(), 3);
+        // No probes queued even on the success path — recheck never
+        // probes (that's a Stop-event-only side effect).
+        assert!(probes.snapshot().is_empty());
+    }
+
+    /// The bookmark expansion in `jj_candidate_commit_shas` is gated
+    /// on `dispatch_started_at` being present and well-formed. Pin the
+    /// revset string shape directly so the production query stays
+    /// surgical: legacy callers without a timestamp keep the
+    /// pre-fix `@ | @-`-only behaviour; callers with a timestamp get
+    /// the bookmark tip expansion; pathological inputs (embedded
+    /// double quotes) fail closed by dropping the expansion rather
+    /// than producing an invalid revset that would fail the whole
+    /// detection pass.
+    #[test]
+    fn build_candidate_revset_with_no_timestamp_keeps_legacy_revset() {
+        assert_eq!(build_candidate_revset(None), "@ | @-");
+        assert_eq!(build_candidate_revset(Some("")), "@ | @-");
+        assert_eq!(build_candidate_revset(Some("   ")), "@ | @-");
+    }
+
+    #[test]
+    fn build_candidate_revset_with_timestamp_expands_to_recent_bookmarks() {
+        assert_eq!(
+            build_candidate_revset(Some("2026-05-13T21:00:00Z")),
+            r#"@ | @- | (bookmarks() & committer_date(after:"2026-05-13T21:00:00Z"))"#,
+        );
+    }
+
+    #[test]
+    fn build_candidate_revset_drops_expansion_when_timestamp_contains_quote() {
+        // A double-quote in the timestamp would close jj's string
+        // literal and allow the rest of the value to be parsed as
+        // revset syntax — fail closed by reverting to the legacy
+        // revset rather than producing an invalid query.
+        assert_eq!(
+            build_candidate_revset(Some(r#"2026-05-13" or true"#)),
+            "@ | @-",
+        );
+    }
+
+    /// Real-jj regression for the bookmark-tip candidate expansion.
+    /// Initialises a colocated jj workspace, commits on a named
+    /// bookmark, then moves `@` to the root commit (mirroring a
+    /// worker that pushed and then did `jj new main`). With the
+    /// dispatch timestamp set, `jj_candidate_commit_shas` must return
+    /// the bookmark tip so the downstream detector can find the PR
+    /// the worker actually opened. Without the timestamp, the legacy
+    /// `@ | @-`-only revset must still apply — preserving behaviour
+    /// for callers that have not opted into the expansion.
+    #[tokio::test]
+    async fn jj_candidate_commit_shas_includes_recent_bookmark_tip() {
+        // Skip when `jj` is unavailable on $PATH (e.g. minimal CI
+        // images). The cube-workspace assumption — jj is installed on
+        // the host — holds in our dispatch environment.
+        let jj_available = std::process::Command::new("jj")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !jj_available {
+            eprintln!("jj not available on PATH — skipping");
+            return;
+        }
+
+        let workspace = tempdir().unwrap();
+        let ws_path = workspace.path();
+        let run_jj = |args: &[&str]| {
+            std::process::Command::new("jj")
+                .args(args)
+                .current_dir(ws_path)
+                .env("JJ_USER", "test")
+                .env("JJ_EMAIL", "test@example.com")
+                .output()
+                .expect("jj command failed to spawn")
+        };
+
+        // Bootstrap: jj-only repo (no .git colocate needed).
+        let init = run_jj(&["git", "init"]);
+        assert!(
+            init.status.success(),
+            "jj git init failed: {}",
+            String::from_utf8_lossy(&init.stderr),
+        );
+
+        // Commit the worker's "fix" on a named bookmark, then push `@`
+        // past it. Mirrors: `jj describe -m worker-fix && jj bookmark
+        // create my-fix -r @ && jj git push -b my-fix && jj new root()`.
+        // We can't run an actual push here (no remote), but the
+        // candidate-shas function reads local refs, not remote-tracking
+        // state — the bookmark existing locally is sufficient.
+        let describe = run_jj(&["describe", "-m", "worker-fix-commit"]);
+        assert!(
+            describe.status.success(),
+            "jj describe failed: {}",
+            String::from_utf8_lossy(&describe.stderr),
+        );
+        let create_bookmark = run_jj(&["bookmark", "create", "my-fix", "-r", "@"]);
+        assert!(
+            create_bookmark.status.success(),
+            "jj bookmark create failed: {}",
+            String::from_utf8_lossy(&create_bookmark.stderr),
+        );
+        // Capture the bookmark tip sha.
+        let bookmark_tip = run_jj(&[
+            "log",
+            "--no-graph",
+            "-r",
+            "my-fix",
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ]);
+        assert!(bookmark_tip.status.success());
+        let bookmark_tip_sha = String::from_utf8_lossy(&bookmark_tip.stdout)
+            .trim()
+            .to_owned();
+        assert_eq!(
+            bookmark_tip_sha.len(),
+            40,
+            "expected a 40-char commit id, got {:?}",
+            bookmark_tip_sha,
+        );
+
+        // Now move `@` to a fresh commit off `root()` — mirrors the
+        // worker doing `jj new main` after `jj git push`. The
+        // bookmark stays where it is, but `@` and `@-` no longer
+        // reach the bookmark tip.
+        let new_off_root = run_jj(&["new", "root()"]);
+        assert!(
+            new_off_root.status.success(),
+            "jj new root() failed: {}",
+            String::from_utf8_lossy(&new_off_root.stderr),
+        );
+
+        // With no timestamp — legacy revset — the bookmark tip must
+        // NOT appear. This is the pre-fix bug: `@ | @-` doesn't
+        // reach the worker's pushed commit.
+        let legacy = jj_candidate_commit_shas(ws_path, None)
+            .await
+            .expect("legacy candidate query failed");
+        assert!(
+            !legacy.contains(&bookmark_tip_sha),
+            "legacy revset must NOT include the bookmark tip (the bug): got {legacy:?}",
+        );
+
+        // With a past timestamp — fix engaged — the bookmark tip MUST
+        // appear in the candidate set. This is what allows
+        // `classify_pr` to accept the pushed PR as `Fresh` instead of
+        // rejecting it as `Stale`.
+        let with_since = jj_candidate_commit_shas(ws_path, Some("2000-01-01T00:00:00Z"))
+            .await
+            .expect("with-since candidate query failed");
+        assert!(
+            with_since.contains(&bookmark_tip_sha),
+            "started_at-gated revset must include the bookmark tip: got {with_since:?}",
+        );
+
+        // With a future timestamp — bookmark tip is older than the
+        // dispatch window — the bookmark tip must NOT appear. This
+        // is the safeguard that keeps stale bookmarks from prior
+        // tasks out of the candidate set.
+        let with_future = jj_candidate_commit_shas(ws_path, Some("2999-01-01T00:00:00Z"))
+            .await
+            .expect("future-since candidate query failed");
+        assert!(
+            !with_future.contains(&bookmark_tip_sha),
+            "future-dated started_at must exclude older bookmark tips: got {with_future:?}",
+        );
     }
 
     #[test]

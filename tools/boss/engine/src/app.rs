@@ -2669,7 +2669,12 @@ async fn dispatch_completion_on_stop(
         return;
     };
     let outcome = server_state.completion_handler.on_stop(run_id).await;
-    tracing::debug!(run_id, ?outcome, "completion handler stop result");
+    // Info-level so non-success outcomes (DetectorFailed, AwaitingInput,
+    // StalePr, EmptyDiffPr) appear in the engine log without enabling
+    // debug. The 2026-05-13 three-concurrent-workers regression had
+    // zero log evidence because this was at debug — operators saw
+    // `activity=idle` workers but no record of what `on_stop` returned.
+    tracing::info!(run_id, ?outcome, "completion handler stop result");
 }
 
 async fn handle_frontend_connection(
