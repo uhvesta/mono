@@ -28,12 +28,13 @@ pub const CHURN_GUARD_THRESHOLD: i64 = 3;
 pub const CHURN_GUARD_REASON: &str = "churn_threshold_exceeded";
 
 pub use boss_protocol::{
-    AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, ConflictResolution,
-    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateManyChoresInput,
-    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput,
-    DependencyDirection, DependencyEdge, DependencyFilter, EffortLevel, ExecutionReconcileResult,
-    ListDependenciesInput, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
+    AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, CiRemediation,
+    ConflictResolution, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
+    EffortLevel, ExecutionReconcileResult, ListDependenciesInput, Product, Project,
+    ProjectDesignDocState, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
     SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
     WorkTree, is_known_created_via,
@@ -2901,6 +2902,42 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Chores and project_tasks the engine has flagged with either
+    /// `blocked: ci_failure` or `blocked: ci_failure_exhausted`. The
+    /// merge poller iterates this list alongside the in_review and
+    /// merge-conflict-blocked lists so that:
+    ///   - a still-`ci_failure` row can be observed for the symmetric
+    ///     "CI went green again" transition, and
+    ///   - a `ci_failure_exhausted` row is *also* probed, because the
+    ///     user (or the provider) can clear the failure out from under
+    ///     the engine and we want the parent to snap back to
+    ///     `in_review` without manual intervention. Re-probing an
+    ///     exhausted row does *not* re-fire the auto-fix flow (the
+    ///     engine has given up); it only watches for the clear signal
+    ///     (design §Q1 "Probe-pool extension").
+    pub fn list_chores_blocked_on_ci_failure(&self) -> Result<Vec<PendingMergeCheck>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, pr_url
+             FROM tasks
+             WHERE kind IN ('chore', 'project_task', 'design')
+               AND status = 'blocked'
+               AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+               AND pr_url IS NOT NULL
+               AND pr_url != ''
+               AND deleted_at IS NULL
+             ORDER BY updated_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingMergeCheck {
+                work_item_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// WHERE-guarded flip of a chore/project_task from `in_review`
     /// to `blocked: merge_conflict`. Idempotent — a second call for
     /// a row already in this state updates zero rows and returns
@@ -3020,6 +3057,384 @@ impl WorkDb {
         })?;
         tx.commit()?;
         Ok(Some(updated))
+    }
+
+    /// WHERE-guarded flip of a chore/project_task from `in_review` to
+    /// `blocked: ci_failure`. Mirrors
+    /// [`Self::mark_chore_blocked_merge_conflict`] but for the CI
+    /// signal — idempotent against second probes, gated on the row
+    /// still being `in_review` for the same `pr_url`. Returns the
+    /// updated task on transition; `Ok(None)` when the guard misses
+    /// (row already blocked or moved by a human).
+    ///
+    /// `task_blocked_signals` is upserted with the matching
+    /// `('ci_failure', attempt_id)` row so the multi-signal view
+    /// stays in sync. The scalar `blocked_reason` cache is set to
+    /// `'ci_failure'` only when no higher-priority signal already
+    /// occupies the slot — the design's §Q2 priority order is
+    /// (dependency > review_feedback > merge_conflict >
+    /// ci_failure_exhausted > ci_failure).
+    pub fn mark_chore_blocked_ci_failure(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<Option<Task>> {
+        self.mark_chore_blocked_ci_signal(work_item_id, pr_url, attempt_id, "ci_failure")
+    }
+
+    /// Variant of [`Self::mark_chore_blocked_ci_failure`] for the
+    /// budget-exhausted exit. Same WHERE guard but the
+    /// `blocked_reason` scalar lands as `'ci_failure_exhausted'` (the
+    /// UI surface for "engine has given up; please intervene"). The
+    /// side-table row carries `reason='ci_failure_exhausted'` too so
+    /// the multi-signal projection stays consistent.
+    ///
+    /// Idempotent for both the in_review → exhausted and the
+    /// ci_failure → exhausted transitions — the WHERE clause matches
+    /// either as long as the parent isn't already exhausted, the row
+    /// hasn't been deleted, and the PR url still matches.
+    pub fn mark_chore_blocked_ci_failure_exhausted(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        // Match either `in_review` (first failure, budget already 0) or
+        // an active `ci_failure` row whose budget has now exhausted.
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET status            = 'blocked',
+                    blocked_reason    = 'ci_failure_exhausted',
+                    last_status_actor = 'engine',
+                    updated_at        = ?3
+              WHERE id = ?1
+                AND pr_url = ?2
+                AND deleted_at IS NULL
+                AND (
+                       status = 'in_review'
+                    OR (status = 'blocked' AND blocked_reason = 'ci_failure')
+                )",
+            params![work_item_id, pr_url, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        upsert_task_blocked_signal(&tx, work_item_id, "ci_failure_exhausted", None, &now)?;
+        let updated = query_task(&tx, work_item_id)?.with_context(|| {
+            format!("unknown task after ci_failure_exhausted flip: {work_item_id}")
+        })?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
+    fn mark_chore_blocked_ci_signal(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        attempt_id: Option<&str>,
+        reason: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET status             = 'blocked',
+                    blocked_reason     = ?4,
+                    blocked_attempt_id = COALESCE(?3, blocked_attempt_id),
+                    last_status_actor  = 'engine',
+                    updated_at         = ?5
+              WHERE id = ?1
+                AND status = 'in_review'
+                AND pr_url = ?2
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, attempt_id, reason, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        upsert_task_blocked_signal(&tx, work_item_id, reason, attempt_id, &now)?;
+        let updated = query_task(&tx, work_item_id)?
+            .with_context(|| format!("unknown task after {reason} flip: {work_item_id}"))?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
+    /// Symmetric CI retire path: flip a chore/project_task currently
+    /// `blocked: ci_failure` (or `ci_failure_exhausted`) back to
+    /// `in_review`, clear the reason / attempt-id columns, and stamp
+    /// the matching `task_blocked_signals` rows as `cleared_at`.
+    /// Idempotent — returns `Ok(None)` on WHERE-guard miss.
+    pub fn clear_chore_blocked_ci_failure(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET status             = 'in_review',
+                    blocked_reason     = NULL,
+                    blocked_attempt_id = NULL,
+                    last_status_actor  = 'engine',
+                    updated_at         = ?3
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND pr_url = ?2
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason IN ('ci_failure', 'ci_failure_exhausted')
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        let updated = query_task(&tx, work_item_id)?.with_context(|| {
+            format!("unknown task after ci_failure clear: {work_item_id}")
+        })?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
+    /// Effective CI attempt budget for `work_item_id`: per-PR override
+    /// when set, falling back to the parent product's default (and
+    /// finally the documented default of 3 if neither row carries a
+    /// value). Capped at the documented hard limit of 10 to prevent a
+    /// misconfigured product from spinning forever (design §Q3).
+    pub fn effective_ci_budget(&self, work_item_id: &str) -> Result<i64> {
+        let conn = self.connect()?;
+        let raw: Option<(Option<i64>, i64)> = conn
+            .query_row(
+                "SELECT t.ci_attempt_budget,
+                        COALESCE(p.ci_attempt_budget, 3) AS product_budget
+                 FROM tasks t
+                 JOIN products p ON p.id = t.product_id
+                 WHERE t.id = ?1",
+                params![work_item_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((per_pr, product_default)) = raw else {
+            return Ok(3);
+        };
+        let effective = per_pr.unwrap_or(product_default);
+        Ok(effective.clamp(0, 10))
+    }
+
+    /// Read the current `ci_attempts_used` counter for a work item.
+    /// Defaults to 0 when the row or column is missing (the budget
+    /// kicks in only when the parent first enters the CI-failure
+    /// flow, so legacy in-flight rows return 0 here).
+    pub fn get_ci_attempts_used(&self, work_item_id: &str) -> Result<i64> {
+        let conn = self.connect()?;
+        let used: Option<i64> = conn
+            .query_row(
+                "SELECT ci_attempts_used FROM tasks WHERE id = ?1",
+                params![work_item_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(used.unwrap_or(0))
+    }
+
+    /// Increment the `ci_attempts_used` counter for `work_item_id` by
+    /// one. Used by the CI-watch detect path when a fix attempt
+    /// progresses past the worker's go/no-go (design §Q3 "what counts
+    /// as one attempt"). Idempotent only insofar as the unique key on
+    /// `ci_remediations` prevents the same `(work_item, head_sha, kind)`
+    /// from incrementing twice — callers are expected to bump only
+    /// when an insert actually produced a fresh row.
+    pub fn increment_ci_attempts_used(&self, work_item_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks
+                SET ci_attempts_used = ci_attempts_used + 1
+              WHERE id = ?1
+                AND deleted_at IS NULL",
+            params![work_item_id],
+        )?;
+        Ok(())
+    }
+
+    /// Reset `ci_attempts_used` to 0 for `work_item_id`. Called by
+    /// the CI-watch retire path on a successful cycle (design §Q3
+    /// "Budget reset rules"). Idempotent.
+    pub fn reset_ci_attempts_used(&self, work_item_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks
+                SET ci_attempts_used = 0
+              WHERE id = ?1
+                AND deleted_at IS NULL",
+            params![work_item_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a `ci_remediations` row with `status='pending'`.
+    /// Mirrors [`Self::insert_conflict_resolution`] but for the CI
+    /// signal: the unique key is `(work_item_id, head_sha_at_trigger,
+    /// attempt_kind)` and the engine uses `INSERT OR IGNORE` so a
+    /// second probe for the same triplet is a no-op (caller reads the
+    /// existing row separately). `failed_checks` is the JSON-encoded
+    /// snapshot the engine captured at trigger time; `consumes_budget`
+    /// must be `1` for `attempt_kind='fix'` and `0` for `'retrigger'`.
+    /// Phase 9 ships the worker-spawn wiring; this method is the
+    /// Phase 8 detection-side seam used by `ci_watch`.
+    pub fn insert_ci_remediation(
+        &self,
+        input: CiRemediationInsertInput,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let id = next_id("cir");
+        let now = now_string();
+        let rows = tx.execute(
+            "INSERT OR IGNORE INTO ci_remediations
+                (id, product_id, work_item_id, pr_url, pr_number,
+                 head_branch, head_sha_at_trigger, attempt_kind,
+                 consumes_budget, failed_checks, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
+            params![
+                id,
+                input.product_id,
+                input.work_item_id,
+                input.pr_url,
+                input.pr_number,
+                input.head_branch,
+                input.head_sha_at_trigger,
+                input.attempt_kind,
+                input.consumes_budget,
+                input.failed_checks,
+                now,
+            ],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let inserted = query_ci_remediation(&tx, &id)?
+            .with_context(|| format!("unknown ci_remediation after insert: {id}"))?;
+        tx.commit()?;
+        Ok(Some(inserted))
+    }
+
+    /// Latest non-terminal `ci_remediations` row for `work_item_id`,
+    /// or `None`. Used by `ci_watch` to detect "an attempt is already
+    /// in flight" and by the retire path to find the row to flip to
+    /// `succeeded` when the next probe reports CI back at clean.
+    pub fn active_ci_remediation_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, work_item_id, pr_url, pr_number,
+                    head_branch, head_sha_at_trigger, head_sha_after,
+                    attempt_kind, consumes_budget, failed_checks,
+                    triage_class, log_excerpt, status, failure_reason,
+                    cube_lease_id, cube_workspace_id, worker_id,
+                    created_at, started_at, finished_at
+             FROM ci_remediations
+             WHERE work_item_id = ?1
+               AND status IN ('pending', 'running')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([work_item_id], map_ci_remediation)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Does the work item have a `ci_failure_suppressions` row for
+    /// `head_sha`? Set by manual moves out of `blocked: ci_failure`
+    /// to keep the next probe from immediately re-flipping the row
+    /// (design §Q5 manual-override behaviour). The suppression is
+    /// scoped to one head sha — a fresh push invalidates it.
+    pub fn is_ci_failure_suppressed(&self, work_item_id: &str, head_sha: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ci_failure_suppressions
+              WHERE work_item_id = ?1 AND head_sha = ?2",
+            params![work_item_id, head_sha],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Flip a pending `ci_remediations` attempt to `succeeded` and
+    /// stamp `head_sha_after` if known. Idempotent — a row already
+    /// terminal returns `Ok(None)` and writes nothing.
+    pub fn mark_ci_remediation_succeeded(
+        &self,
+        attempt_id: &str,
+        head_sha_after: Option<&str>,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET status         = 'succeeded',
+                    head_sha_after = COALESCE(?2, head_sha_after),
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, head_sha_after, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Engine-side abandon for a `ci_remediations` attempt. Used for
+    /// the budget-exhausted / opt-out / suppression paths — the
+    /// engine declined to spawn, so the attempt row never ran.
+    pub fn mark_ci_remediation_abandoned(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET status         = 'abandoned',
+                    failure_reason = ?2,
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, reason, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Read the unified auto-maintenance opt-out flag for a product.
@@ -3935,6 +4350,96 @@ pub struct ConflictResolutionInsertInput {
     pub base_branch: String,
     pub base_sha_at_trigger: Option<String>,
     pub head_sha_before: Option<String>,
+}
+
+/// Pre-insert payload for [`WorkDb::insert_ci_remediation`]. Mirrors
+/// the `ci_remediations` schema for the engine-known fields at
+/// detection time. `consumes_budget` is `1` for `attempt_kind='fix'`
+/// and `0` for `'retrigger'` per design §Q3.
+#[derive(Debug, Clone)]
+pub struct CiRemediationInsertInput {
+    pub product_id: String,
+    pub work_item_id: String,
+    pub pr_url: String,
+    pub pr_number: i64,
+    pub head_branch: String,
+    pub head_sha_at_trigger: String,
+    pub attempt_kind: String,
+    pub consumes_budget: i64,
+    /// JSON-encoded list of failing-check snapshots captured at
+    /// trigger time. The engine writes this on detection; the worker
+    /// reads it via the spawned prompt.
+    pub failed_checks: String,
+}
+
+fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediation> {
+    Ok(CiRemediation {
+        id: row.get(0)?,
+        product_id: row.get(1)?,
+        work_item_id: row.get(2)?,
+        pr_url: row.get(3)?,
+        pr_number: row.get(4)?,
+        head_branch: row.get(5)?,
+        head_sha_at_trigger: row.get(6)?,
+        head_sha_after: row.get(7)?,
+        attempt_kind: row.get(8)?,
+        consumes_budget: row.get(9)?,
+        failed_checks: row.get(10)?,
+        triage_class: row.get(11)?,
+        log_excerpt: row.get(12)?,
+        status: row.get(13)?,
+        failure_reason: row.get(14)?,
+        cube_lease_id: row.get(15)?,
+        cube_workspace_id: row.get(16)?,
+        worker_id: row.get(17)?,
+        created_at: row.get(18)?,
+        started_at: row.get(19)?,
+        finished_at: row.get(20)?,
+    })
+}
+
+fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option<CiRemediation>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, product_id, work_item_id, pr_url, pr_number,
+                head_branch, head_sha_at_trigger, head_sha_after,
+                attempt_kind, consumes_budget, failed_checks,
+                triage_class, log_excerpt, status, failure_reason,
+                cube_lease_id, cube_workspace_id, worker_id,
+                created_at, started_at, finished_at
+         FROM ci_remediations
+         WHERE id = ?1",
+    )?;
+    let row = stmt.query_row([id], map_ci_remediation).optional()?;
+    Ok(row)
+}
+
+/// Upsert the multi-signal side table for a `(work_item_id, reason)`
+/// pair. The PK collapses repeat observations to one row; we reset
+/// `cleared_at` to NULL on re-observation so the same signal flapping
+/// in and out lands as one row with the latest `created_at`.
+///
+/// `attempt_id` is the soft FK that the design's §Q2 stores so the UI
+/// can navigate from a signal back to its attempt row; `None` for
+/// `'dependency'` (which has no attempt table) and for the
+/// `'ci_failure_exhausted'` signal (which is the *absence* of an
+/// engine-managed attempt — the engine has stopped trying).
+fn upsert_task_blocked_signal(
+    conn: &Connection,
+    work_item_id: &str,
+    reason: &str,
+    attempt_id: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO task_blocked_signals
+             (work_item_id, reason, attempt_id, created_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(work_item_id, reason) DO UPDATE SET
+             attempt_id = COALESCE(excluded.attempt_id, task_blocked_signals.attempt_id),
+             cleared_at = NULL",
+        params![work_item_id, reason, attempt_id, now],
+    )?;
+    Ok(())
 }
 
 fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> {

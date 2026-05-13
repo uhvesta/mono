@@ -2,6 +2,7 @@ pub mod app;
 pub mod audit;
 pub mod audit_effort;
 pub mod build_info;
+pub mod ci_watch;
 pub mod cli;
 pub mod completion;
 pub mod config;

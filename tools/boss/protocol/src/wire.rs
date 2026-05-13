@@ -824,6 +824,59 @@ pub enum FrontendEvent {
         pr_url: String,
         failure_reason: String,
     },
+    /// Activity-feed push: a fresh CI-remediation attempt has been
+    /// created for an in-review PR (design §"CI worker spawn",
+    /// Phase 8 #22). `attempt_kind` is `"fix"` or `"retrigger"` —
+    /// the engine's pre-spawn triage decision.
+    CiRemediationStarted {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+        attempt_kind: String,
+    },
+    /// Activity-feed push: the engine observed the parent PR back at
+    /// CI clean and retired the remediation attempt. The parent has
+    /// been flipped from `blocked: ci_failure` back to `in_review`;
+    /// the attempt row is `succeeded`.
+    CiRemediationSucceeded {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+    },
+    /// Activity-feed push: a CI-remediation attempt terminated in
+    /// `failed`. Emitted when the worker calls
+    /// `boss engine ci mark-failed` or when the completion path's
+    /// catch-all fires. The parent remains `blocked: ci_failure`.
+    CiRemediationFailed {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+        failure_reason: String,
+    },
+    /// Activity-feed push: a CI-remediation attempt was abandoned
+    /// (engine declined to spawn — opt-out, suppression, or
+    /// budget-related path).
+    CiRemediationAbandoned {
+        product_id: String,
+        work_item_id: String,
+        attempt_id: String,
+        pr_url: String,
+        failure_reason: String,
+    },
+    /// Activity-feed push: the engine has given up auto-fixing this
+    /// PR's CI. The parent is now `blocked: ci_failure_exhausted` and
+    /// the user is the next actor — typically via
+    /// `boss engine ci retry <work-item-id>`.
+    CiRemediationExhausted {
+        product_id: String,
+        work_item_id: String,
+        pr_url: String,
+        attempts_used: i64,
+        budget: i64,
+    },
     /// Response to [`FrontendRequest::AuditProductEffort`]. Carries
     /// the per-marker under-classification analysis for one
     /// product. Read-only snapshot; the engine recomputes from

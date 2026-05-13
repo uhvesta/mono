@@ -344,7 +344,7 @@ mod tests {
 
     use super::*;
     use crate::coordinator::ExecutionPublisher;
-    use crate::merge_poller::{OpenPrMergeability, PrLifecycleProbe, PrLifecycleState};
+    use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
     use crate::work::{
         CreateChoreInput, CreateProductInput, WorkDb, WorkItem, WorkItemPatch,
     };
@@ -435,6 +435,7 @@ mod tests {
             url: pr_url.to_owned(),
             state,
             base_ref_oid: Some("abc123".into()),
+            head_ref_oid: None,
             labels: Vec::new(),
         }
     }
@@ -448,6 +449,7 @@ mod tests {
             url: pr_url.to_owned(),
             state,
             base_ref_oid: Some("abc123".into()),
+            head_ref_oid: None,
             labels: labels.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
@@ -464,7 +466,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         assert!(transitioned, "first detection must flip the row");
@@ -493,14 +495,14 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         let second = on_conflict_detected(
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         assert!(first);
@@ -521,7 +523,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
@@ -556,7 +558,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         let r2 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
@@ -580,7 +582,7 @@ mod tests {
                 &db,
                 pub_.as_ref(),
                 &candidate(&product, &chore, pr),
-                &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+                &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
             )
             .await
         );
@@ -590,7 +592,7 @@ mod tests {
                 &db,
                 pub_.as_ref(),
                 &candidate(&product, &chore, pr),
-                &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+                &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
             )
             .await
         );
@@ -637,7 +639,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         assert!(!transitioned, "WHERE guard protects manual moves");
@@ -658,7 +660,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         // Human dropped the row from `blocked` back to `active` (e.g.
@@ -793,7 +795,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-42");
@@ -902,7 +904,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         let cube = Arc::new(RecordingCubeClient::default());
@@ -956,7 +958,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         install_running_attempt(&db, &product, &chore, pr, "lease-99");
@@ -1014,7 +1016,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-zz");
@@ -1079,7 +1081,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         assert!(transitioned);
@@ -1110,7 +1112,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
 
@@ -1154,7 +1156,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         assert!(!r, "rebase-active path must defer");
@@ -1192,7 +1194,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         assert!(!r, "opted-out product must not flip to blocked");
@@ -1219,7 +1221,7 @@ mod tests {
             &candidate(&product, &chore, pr),
             &probe_with_labels(
                 pr,
-                PrLifecycleState::Open(OpenPrMergeability::Conflict),
+                PrLifecycleState::Open(OpenPrStatus::conflict_only()),
                 &["boss/no-auto-rebase"],
             ),
         )
@@ -1247,7 +1249,7 @@ mod tests {
             &candidate(&product, &chore, pr),
             &probe_with_labels(
                 pr,
-                PrLifecycleState::Open(OpenPrMergeability::Conflict),
+                PrLifecycleState::Open(OpenPrStatus::conflict_only()),
                 &["Boss/No-Auto-Rebase"],
             ),
         )
@@ -1274,7 +1276,7 @@ mod tests {
             &db,
             pub_.as_ref(),
             &candidate(&product, &chore, pr),
-            &probe(pr, PrLifecycleState::Open(OpenPrMergeability::Conflict)),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
         let before = pub_.events.lock().await.len();

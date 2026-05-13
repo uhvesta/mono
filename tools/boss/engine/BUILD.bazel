@@ -9,6 +9,7 @@ rust_library(
         "src/audit.rs",
         "src/audit_effort.rs",
         "src/build_info.rs",
+        "src/ci_watch.rs",
         "src/cli.rs",
         "src/completion.rs",
         "src/config.rs",
