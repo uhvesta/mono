@@ -2047,6 +2047,21 @@ fn is_descendant_of_any(pid: libc::pid_t, trust_roots: &[libc::pid_t]) -> bool {
     false
 }
 
+/// Resolve the `last_status_actor` string for an RPC-driven status change.
+///
+/// Returns `"boss"` when the caller's process ancestry matches the registered
+/// Boss-coordinator session pid; `"human"` otherwise. Engine-internal writers
+/// stamp `"engine"` directly in SQL and never call this function.
+fn resolve_status_actor(server_state: &ServerState, peer_pid: Option<libc::pid_t>) -> &'static str {
+    let boss_pid = server_state.current_boss_pid();
+    if let (Some(boss_pid), Some(peer_pid)) = (boss_pid, peer_pid) {
+        if is_descendant_of_any(peer_pid, &[boss_pid]) {
+            return boss_protocol::LAST_STATUS_ACTOR_BOSS;
+        }
+    }
+    boss_protocol::LAST_STATUS_ACTOR_HUMAN
+}
+
 fn current_parent_pid() -> Option<libc::pid_t> {
     // BOSS_APP_PID is the only signal we trust to identify the app
     // tier. The macOS app sets it to its own pid before spawning the
@@ -3366,7 +3381,8 @@ async fn handle_frontend_connection(
                 // applies. We only care about task/chore — products and
                 // projects have no execution lifecycle.
                 let previous_task_status = task_status_for_id(&work_db, &id);
-                match work_db.update_work_item(&id, patch) {
+                let actor = resolve_status_actor(&server_state, peer_pid);
+                match work_db.update_work_item_as_actor(&id, patch, actor) {
                     Ok(item) => {
                         let product_id = work_item_product_id(&item);
                         let mut topics = vec![work_product_topic(&product_id)];
@@ -8559,5 +8575,64 @@ mod tests {
         server_state
             .shutdown_workers(Duration::from_millis(50), Duration::from_millis(0))
             .await;
+    }
+
+    // --- resolve_status_actor regression suite ---
+    //
+    // Pins the three-direction contract:
+    //   1. Boss-session ancestry → "boss"
+    //   2. No boss_pid registered → "human"
+    //   3. Unrelated peer (not in boss subtree) → "human"
+    //
+    // We use the current process pid as a stand-in for the "registered
+    // boss pid" because `is_descendant_of_any` treats a pid as a
+    // descendant of itself (first iteration of the trust-root check).
+
+    #[test]
+    fn resolve_status_actor_returns_boss_when_peer_is_boss_descendant() {
+        let server_state = test_server_state();
+        let our_pid = std::process::id() as libc::pid_t;
+        server_state.set_boss_pid(our_pid);
+        // Our own pid is in the boss subtree (pid is descendant of itself).
+        assert_eq!(
+            resolve_status_actor(&server_state, Some(our_pid)),
+            boss_protocol::LAST_STATUS_ACTOR_BOSS,
+        );
+    }
+
+    #[test]
+    fn resolve_status_actor_returns_human_when_no_boss_pid_registered() {
+        let server_state = test_server_state();
+        let our_pid = std::process::id() as libc::pid_t;
+        // No call to set_boss_pid — boss trust root is absent.
+        assert_eq!(
+            resolve_status_actor(&server_state, Some(our_pid)),
+            boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+        );
+    }
+
+    #[test]
+    fn resolve_status_actor_returns_human_when_peer_is_not_boss_descendant() {
+        let server_state = test_server_state();
+        // Register a non-existent pid as the boss root — our process is
+        // not a descendant of it.
+        server_state.set_boss_pid(99_999_999);
+        let our_pid = std::process::id() as libc::pid_t;
+        assert_eq!(
+            resolve_status_actor(&server_state, Some(our_pid)),
+            boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+        );
+    }
+
+    #[test]
+    fn resolve_status_actor_returns_human_when_peer_pid_is_none() {
+        let server_state = test_server_state();
+        let our_pid = std::process::id() as libc::pid_t;
+        server_state.set_boss_pid(our_pid);
+        // peer_pid is None — falls through to human (no pid to match against).
+        assert_eq!(
+            resolve_status_actor(&server_state, None),
+            boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+        );
     }
 }

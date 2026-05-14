@@ -98,11 +98,16 @@ pub struct Project {
     pub priority: String,
     pub created_at: String,
     pub updated_at: String,
-    /// `'human'` (default) when the most recent status change came
-    /// from a CLI / app caller; `'engine'` when the engine flipped
-    /// the status itself (e.g. dependency auto-block / unblock). The
-    /// dependencies auto-unblock path only flips a `blocked` row
-    /// back to `todo` when this is `'engine'` — manual blocks stick.
+    /// Who made the most recent status change. Three values:
+    /// - `'human'` (default) — a CLI / app caller with no registered
+    ///   Boss-session ancestry, or a drag-drop gesture in the macOS app.
+    /// - `'boss'` — the caller's process ancestry traces back to the
+    ///   registered Boss-coordinator session pid (the libghostty pane
+    ///   where Claude Code runs as coordinator).
+    /// - `'engine'` — the engine wrote the status itself (dependency
+    ///   auto-block/unblock, merge poller, CI watch, etc.).
+    /// The auto-unblock path only flips a `blocked` row back to `todo`
+    /// when this is `'engine'` — manual and Boss-driven blocks stick.
     #[serde(default = "default_human_actor")]
     pub last_status_actor: String,
     /// Repo URL the project's design doc lives in. `None` → inherit
@@ -148,6 +153,8 @@ pub struct Task {
     /// to `true` so legacy callers keep their old auto-start behavior.
     #[serde(default = "default_true")]
     pub autostart: bool,
+    /// Who made the most recent status change — `'human'`, `'boss'`,
+    /// or `'engine'`. See `Project.last_status_actor` for full semantics.
     #[serde(default = "default_human_actor")]
     pub last_status_actor: String,
     /// One of `low` / `medium` / `high`. Mirrors `Project.priority`
@@ -237,6 +244,17 @@ pub fn default_priority() -> String {
 pub fn default_human_actor() -> String {
     "human".to_owned()
 }
+
+/// A status change made by a human operator through the CLI or macOS app,
+/// or by any peer whose process ancestry doesn't match the Boss-session pid.
+pub const LAST_STATUS_ACTOR_HUMAN: &str = "human";
+/// A status change whose caller's process ancestry traces back to the
+/// registered Boss-coordinator session (the libghostty pane where the
+/// Boss Claude Code instance runs as coordinator).
+pub const LAST_STATUS_ACTOR_BOSS: &str = "boss";
+/// A status change made directly by the engine (auto-block, dep-unblock,
+/// merge poller, CI watch, etc.) — never comes from a peer RPC call.
+pub const LAST_STATUS_ACTOR_ENGINE: &str = "engine";
 
 /// Canonical "I don't know where this came from" stamp. Applied by
 /// the migration to existing rows and by the engine's last-resort

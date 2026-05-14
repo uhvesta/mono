@@ -1986,10 +1986,24 @@ impl WorkDb {
     }
 
     pub fn update_work_item(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
+        self.update_work_item_as_actor(id, patch, "human")
+    }
+
+    /// Like `update_work_item` but stamps `last_status_actor` with `actor`
+    /// when the status actually changes. Engine-internal writers use direct
+    /// SQL with `last_status_actor = 'engine'`; this path is for peer RPCs
+    /// where the caller tier has already been resolved to `"human"` or
+    /// `"boss"`.
+    pub fn update_work_item_as_actor(
+        &self,
+        id: &str,
+        patch: WorkItemPatch,
+        actor: &str,
+    ) -> Result<WorkItem> {
         match classify_id(id)? {
             ItemKind::Product => self.update_product(id, patch),
-            ItemKind::Project => self.update_project(id, patch),
-            ItemKind::Task => self.update_task(id, patch),
+            ItemKind::Project => self.update_project(id, patch, actor),
+            ItemKind::Task => self.update_task(id, patch, actor),
         }
     }
 
@@ -2837,7 +2851,7 @@ impl WorkDb {
         Ok(WorkItem::Product(updated))
     }
 
-    fn update_project(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
+    fn update_project(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut project =
@@ -2857,7 +2871,7 @@ impl WorkDb {
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &project.status)?;
         }
-        let actor = if status_changed && previous_status != project.status { "human" } else { "" };
+        let actor_stamp = if status_changed && previous_status != project.status { actor } else { "" };
 
         tx.execute(
             "UPDATE projects
@@ -2873,7 +2887,7 @@ impl WorkDb {
                 project.status,
                 project.priority,
                 project.updated_at,
-                actor,
+                actor_stamp,
             ],
         )?;
 
@@ -2891,7 +2905,7 @@ impl WorkDb {
         Ok(WorkItem::Project(updated))
     }
 
-    fn update_task(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
+    fn update_task(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut task = query_task(&tx, id)?.with_context(|| format!("unknown task: {id}"))?;
@@ -2953,7 +2967,7 @@ impl WorkDb {
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &task.status)?;
         }
-        let actor = if status_changed && previous_status != task.status { "human" } else { "" };
+        let actor_stamp = if status_changed && previous_status != task.status { actor } else { "" };
 
         let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
 
@@ -2973,7 +2987,7 @@ impl WorkDb {
                 task.ordinal,
                 task.pr_url,
                 task.updated_at,
-                actor,
+                actor_stamp,
                 task.priority,
                 task.repo_remote_url,
                 effort_level_value,
@@ -14490,7 +14504,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".into(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
             })
             .unwrap();
         let chore = db
@@ -14556,7 +14570,7 @@ mod tests {
             .create_product(CreateProductInput {
                 name: "Boss".into(),
                 description: None,
-                repo_remote_url: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
             })
             .unwrap();
         let chore = db
