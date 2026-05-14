@@ -22,7 +22,7 @@ use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
     FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState,
-    RequestExecutionInput, ROSTER, WorkExecution, WorkRun, WorkspacePoolEntry,
+    RequestExecutionInput, ROSTER, WorkExecution, WorkItem, WorkRun, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -674,6 +674,81 @@ fn looks_like_name_or_slot(reference: &str) -> bool {
         .any(|name| name.eq_ignore_ascii_case(reference))
 }
 
+/// If `selector` looks like a friendly work-item id (`T42`, `t42`, `P7`,
+/// `p7`), resolve it to the primary id via the engine and search `states`
+/// for a live worker running that work item. Returns the matching state,
+/// or `None` when the selector isn't a friendly-id form or no live worker
+/// is found for the resolved item.
+async fn resolve_tnnn_to_live_worker<'a>(
+    client: &mut BossClient,
+    selector: &str,
+    states: &'a [LiveWorkerState],
+) -> Result<Option<&'a LiveWorkerState>> {
+    if selector.len() < 2 {
+        return Ok(None);
+    }
+    let first = selector.as_bytes()[0];
+    if first != b'T' && first != b't' && first != b'P' && first != b'p' {
+        return Ok(None);
+    }
+    let n: i64 = match selector[1..].parse() {
+        Ok(n) if n > 0 => n,
+        _ => return Ok(None),
+    };
+    let products = match client
+        .send_request(&FrontendRequest::ListProducts)
+        .await
+        .context("listing products for friendly-id resolution")?
+    {
+        FrontendEvent::ProductsList { products } => products,
+        _ => return Ok(None),
+    };
+    for product in &products {
+        let item = match client
+            .send_request(&FrontendRequest::GetWorkItemByShortId {
+                product_id: product.id.clone(),
+                short_id: n,
+            })
+            .await
+            .context("resolving friendly id")?
+        {
+            FrontendEvent::WorkItemResult { item } => item,
+            _ => continue,
+        };
+        let primary_id = match &item {
+            WorkItem::Product(p) => p.id.as_str(),
+            WorkItem::Project(p) => p.id.as_str(),
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.id.as_str(),
+        };
+        if let Some(state) = states
+            .iter()
+            .find(|s| s.work_item_id.as_deref() == Some(primary_id))
+        {
+            return Ok(Some(state));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve `reference` to a live worker's run id, accepting run ids,
+/// slot ids, crew names, and friendly work-item ids (T42, P7). Falls
+/// back to the original `resolve_agent_ref` error when no match is found.
+async fn resolve_agent_ref_or_work_item(
+    client: &mut BossClient,
+    reference: &str,
+    states: &[LiveWorkerState],
+) -> Result<String> {
+    match resolve_agent_ref(reference, states) {
+        Ok(state) => return Ok(state.run_id.clone()),
+        Err(agent_err) => {
+            if let Some(state) = resolve_tnnn_to_live_worker(client, reference, states).await? {
+                return Ok(state.run_id.clone());
+            }
+            return Err(agent_err);
+        }
+    }
+}
+
 async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<LiveWorkerState>> {
     match client
         .send_request(&FrontendRequest::ListWorkerLiveStates)
@@ -803,7 +878,7 @@ async fn agents_list_live(socket_path: &Option<String>, json: bool) -> Result<()
 async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
-    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
     let response = client
         .send_request(&FrontendRequest::StopRun {
             run_id: run_id.clone(),
@@ -835,7 +910,7 @@ async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) ->
 async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
-    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
     let response = client
         .send_request(&FrontendRequest::FocusWorkerPane {
             run_id: run_id.clone(),
@@ -885,7 +960,7 @@ async fn agents_send(
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
-    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
     let response = client
         .send_request(&FrontendRequest::SendInputToWorker {
             run_id: run_id.clone(),
@@ -929,7 +1004,7 @@ async fn agents_interrupt(
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
-    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+    let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
     let response = client
         .send_request(&FrontendRequest::InterruptWorkerPane {
             run_id: run_id.clone(),
@@ -1082,10 +1157,19 @@ async fn agents_transcript(
     // the engine query work_runs.transcript_path from the DB. The
     // engine's resolve_transcript_for_tail handles both the exec_* and
     // run_* namespaces, so passing the raw ref works for either id form.
+    // Friendly ids (T42) are tried as live-worker references first.
     let run_id = match resolve_agent_ref(&agent, &states) {
         Ok(state) => state.run_id.clone(),
         Err(err) if looks_like_name_or_slot(&agent) => return Err(err),
-        Err(_) => agent.clone(),
+        Err(_) => {
+            if let Some(state) =
+                resolve_tnnn_to_live_worker(&mut client, &agent, &states).await?
+            {
+                state.run_id.clone()
+            } else {
+                agent.clone()
+            }
+        }
     };
 
     let response = client
