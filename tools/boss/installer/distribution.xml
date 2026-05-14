@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Distribution descriptor for Boss.pkg (productbuild).
+
+  Key settings:
+    domains: per-user install only (~/Applications) — no admin password required.
+    The component package identifier must match what pkgbuild uses
+    (dev.spinyfin.boss.installer) and the <pkg-ref> filename must match the
+    BossComponent.pkg produced by release.sh.
+-->
+<installer-gui-script minSpecVersion="1">
+    <title>Boss</title>
+
+    <!--
+      enable_currentUserHome="true"  — Installer.app offers "Install for me only"
+      enable_localSystem="false"     — prevents system-wide install (requires admin)
+      This pair ensures the package installs to ~/Applications without sudo,
+      even on managed work laptops where the user is not a local admin.
+    -->
+    <domains enable_currentUserHome="true" enable_localSystem="false"/>
+
+    <options customize="never" require-scripts="false" rootVolumeOnly="false"/>
+
+    <pkg-ref id="dev.spinyfin.boss.installer"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="dev.spinyfin.boss.installer"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+    <choice id="dev.spinyfin.boss.installer" visible="false">
+        <pkg-ref id="dev.spinyfin.boss.installer"/>
+    </choice>
+
+    <!--
+      BossComponent.pkg is the component package produced by pkgbuild inside
+      release.sh.  productbuild resolves it from the --package-path directory
+      passed on the command line.
+    -->
+    <pkg-ref id="dev.spinyfin.boss.installer" onConclusion="none">BossComponent.pkg</pkg-ref>
+</installer-gui-script>
