@@ -107,6 +107,16 @@ final class EngineProcessController: @unchecked Sendable {
         if let dir = bossBinDir {
             env["BOSS_BIN_DIR"] = dir
         }
+        // When launched from Finder/Dock/launchctl, the app inherits a minimal
+        // launchd GUI session PATH (/usr/bin:/bin:/usr/sbin:/sbin) that omits
+        // developer tool directories. The engine and its cube subprocesses need
+        // jj, mint, and other tools that live outside that minimal set.
+        //
+        // We prepend well-known locations rather than shelling out to read the
+        // user's login-shell PATH (which would be more accurate but brittle — a
+        // misbehaving shell init could hang the app or print garbage). Extra
+        // segments that don't exist on a given machine are ignored by the kernel.
+        env["PATH"] = augmentedPATH(current: env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
         proc.environment = env
         proc.standardOutput = Pipe()
         proc.standardError = Pipe()
@@ -120,6 +130,32 @@ final class EngineProcessController: @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "failed to launch detached engine process"]
             )
         }
+    }
+
+    /// Prepend standard developer-tool directories to PATH so the engine and its
+    /// subprocesses (cube, jj, mint, cargo binaries) can be found when the app is
+    /// launched from Finder/Dock/launchctl with a minimal launchd PATH.
+    ///
+    /// Order matches typical shell precedence: Apple Silicon Homebrew, Intel/manual
+    /// Homebrew, LinkedIn corporate tools, Rust/Cargo, then user-local directories.
+    /// Segments that don't exist on the current machine are harmless — the kernel
+    /// skips non-existent PATH entries. The original launchd PATH is preserved at the
+    /// end so system tools continue to resolve normally.
+    private func augmentedPATH(current: String) -> String {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let extra = [
+            "/opt/homebrew/bin",        // Apple Silicon Homebrew (jj, etc.)
+            "/usr/local/bin",           // Intel Homebrew, manual installs
+            "/usr/local/linkedin/bin",  // LinkedIn corporate tools (mint, etc.)
+            "\(home)/.cargo/bin",       // Rust binaries (jj commonly installed here)
+            "\(home)/bin",              // user-local binaries
+            "\(home)/.local/bin",       // XDG-style user-local binaries
+        ]
+        // Deduplicate: keep the first occurrence of each segment.
+        var seen = Set(current.split(separator: ":").map(String.init))
+        let unique = extra.filter { seen.insert($0).inserted }
+        let prefix = unique.joined(separator: ":")
+        return prefix.isEmpty ? current : "\(prefix):\(current)"
     }
 
     private func waitForEnginePID(timeoutSeconds: TimeInterval) -> pid_t? {
