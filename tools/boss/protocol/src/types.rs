@@ -761,6 +761,12 @@ pub struct CreateTaskInput {
     /// resolves per design §Q3 precedence. Stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// Bypass the recent-duplicate guard. When `true`, the engine skips
+    /// the 60-second same-name/same-product duplicate check and inserts
+    /// a second row unconditionally. Intended as a CLI escape hatch for
+    /// operators who explicitly want a second task with the same name.
+    #[serde(default)]
+    pub force_duplicate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -794,6 +800,9 @@ pub struct CreateChoreInput {
     /// See [`CreateTaskInput::model_override`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// See [`CreateTaskInput::force_duplicate`].
+    #[serde(default)]
+    pub force_duplicate: bool,
 }
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved

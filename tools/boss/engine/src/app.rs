@@ -31,7 +31,7 @@ use crate::protocol::{
     ReleaseWorkerPaneInput, RequestExecutionInput, SendToPaneInput, TOPIC_WORK_PRODUCTS,
     TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic, work_product_topic,
 };
-use crate::work::{SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
+use crate::work::{DuplicateTaskError, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
@@ -3376,9 +3376,7 @@ async fn handle_frontend_connection(
                     send_response(
                         &sink,
                         &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
+                        duplicate_or_work_error(err),
                     );
                 }
             }
@@ -3413,9 +3411,7 @@ async fn handle_frontend_connection(
                     send_response(
                         &sink,
                         &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
+                        duplicate_or_work_error(err),
                     );
                 }
             }
@@ -5413,6 +5409,25 @@ fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
         .collect()
 }
 
+/// Downcast `err` to `DuplicateTaskError` and return a structured
+/// `WorkItemDuplicateBlocked` event; fall back to `WorkError` for any
+/// other error kind. Keeps the `CreateTask` / `CreateChore` error arms
+/// DRY.
+fn duplicate_or_work_error(err: anyhow::Error) -> FrontendEvent {
+    if let Some(dup) = err.downcast_ref::<DuplicateTaskError>() {
+        FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id: dup.existing_id.clone(),
+            existing_short_id: dup.existing_short_id,
+            name: dup.name.clone(),
+            age_secs: dup.age_secs,
+        }
+    } else {
+        FrontendEvent::WorkError {
+            message: err.to_string(),
+        }
+    }
+}
+
 fn send_response(sink: &SessionSink, request_id: &str, payload: FrontendEvent) {
     sink.enqueue(FrontendEventEnvelope::response(
         request_id.to_owned(),
@@ -5620,13 +5635,7 @@ async fn handle_create_many(
             );
         }
         Err(err) => {
-            send_response(
-                sink,
-                request_id,
-                FrontendEvent::WorkError {
-                    message: format!("{err:#}"),
-                },
-            );
+            send_response(sink, request_id, duplicate_or_work_error(err));
         }
     }
 }
@@ -7127,6 +7136,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -7321,6 +7331,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -7444,6 +7455,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -7564,6 +7576,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -7677,6 +7690,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -7799,6 +7813,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -7893,6 +7908,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -8071,6 +8087,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -8219,6 +8236,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -8344,6 +8362,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -8466,6 +8485,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -8549,6 +8569,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = server_state
@@ -8848,6 +8869,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         (db, product.id, chore.id)

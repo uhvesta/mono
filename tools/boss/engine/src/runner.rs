@@ -1424,6 +1424,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
             .await
@@ -1475,6 +1476,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Trivial),
             model_override: None,
+            force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
             .await
@@ -1533,6 +1535,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Medium),
             model_override: Some("opus".to_owned()),
+            force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
             .await
@@ -1585,6 +1588,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Large),
             model_override: None,
+            force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
             .await
@@ -1640,6 +1644,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         };
         let (spawner, _chore) =
             run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
@@ -1708,6 +1713,7 @@ mod pane_spawn_tests {
                 repo_remote_url: None,
                 effort_level: Some(EffortLevel::Trivial),
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -1756,6 +1762,7 @@ mod pane_spawn_tests {
             repo_remote_url: None,
             effort_level: Some(EffortLevel::Large),
             model_override: None,
+            force_duplicate: false,
         };
         let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
             .await
@@ -1958,6 +1965,7 @@ mod pane_spawn_tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 

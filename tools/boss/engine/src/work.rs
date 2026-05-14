@@ -37,6 +37,12 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
 /// go live; the 4th trips the guard.
 pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 
+/// Sliding window for the duplicate-create guard: a non-deleted task/chore
+/// in the same product with the same name created within this many seconds
+/// of the attempted insert causes a `DuplicateTaskError` unless
+/// `force_duplicate` is set on the input.
+pub const DUPLICATE_GUARD_WINDOW_SECS: i64 = 60;
+
 pub use boss_protocol::{
     AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, CiRemediation,
     ConflictResolution, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
@@ -49,6 +55,30 @@ pub use boss_protocol::{
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
     WorkTree, is_known_created_via,
 };
+
+/// Returned by `insert_task_in_tx` / `insert_chore_in_tx` when the
+/// duplicate guard fires. Carried as an `anyhow::Error` so `app.rs` can
+/// downcast and send a structured `WorkItemDuplicateBlocked` event.
+#[derive(Debug)]
+pub struct DuplicateTaskError {
+    pub existing_id: String,
+    pub existing_short_id: i64,
+    pub name: String,
+    pub age_secs: i64,
+}
+
+impl std::fmt::Display for DuplicateTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "A task/chore named {:?} was created {} seconds ago (id: {}, short_id: T{}); \
+             pass --force-duplicate to create another",
+            self.name, self.age_secs, self.existing_id, self.existing_short_id,
+        )
+    }
+}
+
+impl std::error::Error for DuplicateTaskError {}
 
 use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
 
@@ -4923,9 +4953,53 @@ fn upsert_task_blocked_signal(
     Ok(())
 }
 
+/// Check whether a non-deleted task/chore with the same trimmed name
+/// exists in the same product and was created within `DUPLICATE_GUARD_WINDOW_SECS`.
+/// Returns `Some(DuplicateTaskError)` when the guard fires, `None` otherwise.
+fn check_recent_duplicate(
+    conn: &Connection,
+    product_id: &str,
+    name: &str,
+) -> Result<Option<DuplicateTaskError>> {
+    let trimmed = name.trim();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let cutoff = now_secs - DUPLICATE_GUARD_WINDOW_SECS;
+
+    let row: Option<(String, Option<i64>, i64)> = conn
+        .query_row(
+            "SELECT id, short_id, CAST(created_at AS INTEGER)
+             FROM tasks
+             WHERE product_id = ?1
+               AND trim(name) = ?2
+               AND deleted_at IS NULL
+               AND CAST(created_at AS INTEGER) >= ?3
+             ORDER BY CAST(created_at AS INTEGER) DESC
+             LIMIT 1",
+            params![product_id, trimmed, cutoff],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+
+    Ok(row.map(|(existing_id, existing_short_id, created_at)| DuplicateTaskError {
+        existing_id,
+        existing_short_id: existing_short_id.unwrap_or(0),
+        name: trimmed.to_owned(),
+        age_secs: now_secs - created_at,
+    }))
+}
+
 fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
     ensure_project_belongs_to_product(conn, &input.project_id, &input.product_id)?;
+
+    if !input.force_duplicate {
+        if let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
+            return Err(anyhow::Error::new(dup));
+        }
+    }
 
     let product = query_product(conn, &input.product_id)?
         .with_context(|| format!("missing product after existence check: {}", input.product_id))?;
@@ -4952,6 +5026,12 @@ fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> 
 
 fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
+
+    if !input.force_duplicate {
+        if let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
+            return Err(anyhow::Error::new(dup));
+        }
+    }
 
     let product = query_product(conn, &input.product_id)?
         .with_context(|| format!("missing product after existence check: {}", input.product_id))?;
@@ -7585,6 +7665,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let chore = db
@@ -7598,6 +7679,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -7654,6 +7736,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -7719,6 +7802,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
             CreateTaskInput {
                 product_id: product.id.clone(),
@@ -7731,6 +7815,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         ];
         let err = db
@@ -7780,6 +7865,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .collect::<Vec<_>>();
         let created = db
@@ -7822,6 +7908,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let chore_running = db
@@ -7835,6 +7922,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -7904,6 +7992,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let dependent = db
@@ -7917,6 +8006,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -7946,6 +8036,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let other_dependent = db
@@ -7959,6 +8050,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -8077,6 +8169,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let second = db
@@ -8091,6 +8184,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8143,6 +8237,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8309,6 +8404,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let second_task = db
@@ -8323,6 +8419,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let chore = db
@@ -8336,6 +8433,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8409,6 +8507,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let second_task = db
@@ -8423,6 +8522,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8489,6 +8589,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8552,6 +8653,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8605,6 +8707,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8676,6 +8779,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8739,6 +8843,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -8796,6 +8901,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -8985,6 +9091,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -9055,6 +9162,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -9133,6 +9241,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Manually mark the chore as done before starting execution.
@@ -9209,6 +9318,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Manually flip to active, mimicking a kanban drag that
@@ -9258,6 +9368,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -9316,6 +9427,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -9373,6 +9485,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -9442,6 +9555,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let exec_a = db
@@ -9477,6 +9591,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -9499,6 +9614,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -9557,6 +9673,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let exec_live = db
@@ -9588,6 +9705,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let exec_dead = db
@@ -9619,6 +9737,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let exec_unknown = db
@@ -9706,6 +9825,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let stale = db
@@ -9769,6 +9889,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -9839,6 +9960,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -9891,6 +10013,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Drive the chore into `active` so reconcile considers it.
@@ -9977,6 +10100,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -10052,6 +10176,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let live = db
@@ -10111,6 +10236,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let done_chore = db
@@ -10124,6 +10250,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -10167,6 +10294,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         assert!(
@@ -10198,6 +10326,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let result = db.reconcile_product_executions(&product.id).unwrap();
@@ -10247,6 +10376,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -10300,6 +10430,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -10344,6 +10475,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -10608,6 +10740,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -10662,6 +10795,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         assert!(chore.autostart, "newly created chore should have autostart=true");
@@ -10840,6 +10974,7 @@ mod tests {
                     repo_remote_url: None,
                     effort_level: None,
                     model_override: None,
+                    force_duplicate: false,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -10900,6 +11035,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let dependent = db
@@ -10913,6 +11049,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Add the blocks edge BEFORE flipping dependent to active so
@@ -10972,6 +11109,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -11037,6 +11175,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -11132,6 +11271,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -11237,6 +11377,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -11291,6 +11432,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -11304,6 +11446,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -11419,6 +11562,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -11432,6 +11576,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let err = db
@@ -11473,6 +11618,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -11486,6 +11632,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -11535,6 +11682,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -11548,6 +11696,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Sanity: A starts as `todo` (default).
@@ -11605,6 +11754,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -11618,6 +11768,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -11675,6 +11826,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let prereq_b = db
@@ -11688,6 +11840,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let prereq_c = db
@@ -11701,6 +11854,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -11788,6 +11942,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let prereq = db
@@ -11801,6 +11956,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -11885,6 +12041,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -11898,6 +12055,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -11954,6 +12112,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Human moves A to `blocked` (no edges yet).
@@ -11984,6 +12143,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -12040,6 +12200,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -12053,6 +12214,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -12100,6 +12262,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -12113,6 +12276,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -12168,6 +12332,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let b = db
@@ -12181,6 +12346,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.add_dependency(AddDependencyInput {
@@ -12233,6 +12399,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let dependent = db
@@ -12246,6 +12413,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Add the edge: dependent is gated by prereq.
@@ -12459,6 +12627,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         assert_eq!(cli_chore.created_via, boss_protocol::CREATED_VIA_CLI);
@@ -12474,6 +12643,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         assert_eq!(unknown_chore.created_via, CREATED_VIA_UNKNOWN);
@@ -12827,6 +12997,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Flip the chore into `blocked: merge_conflict` so the
@@ -13264,6 +13435,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let chore_id = chore.id.clone();
@@ -14318,6 +14490,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.create_execution(CreateExecutionInput {
@@ -14473,6 +14646,7 @@ mod tests {
                     repo_remote_url: None,
                     effort_level: None,
                     model_override: None,
+                    force_duplicate: false,
                 })
                 .unwrap()
                 .id
@@ -14594,6 +14768,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap()
             .id
@@ -14737,6 +14912,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         assert!(chore.effort_level.is_none());
@@ -14769,6 +14945,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: Some(EffortLevel::Large),
                 model_override: Some("claude-opus-4-7".into()),
+                force_duplicate: false,
             })
             .unwrap();
         assert_eq!(chore.effort_level, Some(EffortLevel::Large));
@@ -14801,6 +14978,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -14867,6 +15045,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -14973,6 +15152,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -15036,6 +15216,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: Some(EffortLevel::Trivial),
                 model_override: Some("haiku".into()),
+                force_duplicate: false,
             })
             .unwrap();
         assert_eq!(after_chore.effort_level, Some(EffortLevel::Trivial));
@@ -15076,6 +15257,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Simulate the pre-migration state by NULL-ing whatever the
@@ -15245,6 +15427,7 @@ mod tests {
                     repo_remote_url: None,
                     effort_level: None,
                     model_override: None,
+                    force_duplicate: false,
                 })
                 .unwrap()
             }));
@@ -15320,6 +15503,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap()
         };
@@ -15466,6 +15650,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let existing_short: i64 = {
@@ -15594,6 +15779,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         assert_eq!(chore.short_id, Some(1), "first chore in product gets short_id 1");
@@ -15610,6 +15796,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         assert_eq!(chore2.short_id, Some(2));
@@ -15678,6 +15865,7 @@ mod tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         })
         .unwrap();
 
@@ -15715,6 +15903,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 
@@ -15838,6 +16027,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
 

@@ -167,6 +167,7 @@ mod tests {
             model_override: None,
             created_via: None,
             autostart: true,
+            force_duplicate: false,
         })
         .unwrap()
         .id

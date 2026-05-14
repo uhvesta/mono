@@ -328,6 +328,7 @@ mod tests {
                 model_override: None,
                 created_via: None,
                 autostart: true,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(

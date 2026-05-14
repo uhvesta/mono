@@ -618,6 +618,22 @@ pub enum FrontendEvent {
     WorkError {
         message: String,
     },
+    /// Returned instead of `WorkError` when a create is rejected because
+    /// a non-deleted task/chore in the same product has an identical name
+    /// and was created within the last 60 seconds. Carries enough info for
+    /// the CLI to display a helpful message and for `--json` consumers to
+    /// act on the existing row. Pass `force_duplicate: true` in the input
+    /// to bypass the guard and insert unconditionally.
+    WorkItemDuplicateBlocked {
+        /// Primary id of the existing row that triggered the guard.
+        existing_id: String,
+        /// Friendly short id of the existing row (e.g. `439`).
+        existing_short_id: i64,
+        /// The name that triggered the match.
+        name: String,
+        /// Seconds elapsed since the existing row was created.
+        age_secs: i64,
+    },
     Error {
         message: String,
     },

@@ -2810,6 +2810,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -2898,6 +2899,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let chore_b = db
@@ -2911,6 +2913,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3011,6 +3014,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3116,6 +3120,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3175,6 +3180,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3271,6 +3277,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3314,6 +3321,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3362,6 +3370,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3428,6 +3437,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3612,6 +3622,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3749,6 +3760,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: Some(crate::work::EffortLevel::Trivial),
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3821,6 +3833,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -3930,6 +3943,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4041,6 +4055,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4175,6 +4190,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4253,6 +4269,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4393,6 +4410,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let late = db
@@ -4406,6 +4424,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4485,6 +4504,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4551,6 +4571,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4625,6 +4646,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4715,6 +4737,7 @@ mod tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         })
         .unwrap();
         db.create_task(CreateTaskInput {
@@ -4728,6 +4751,7 @@ mod tests {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         })
         .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -4825,6 +4849,7 @@ mod tests {
                     repo_remote_url: None,
                     effort_level: None,
                     model_override: None,
+                    force_duplicate: false,
                 })
                 .unwrap();
             chore_ids.push(chore.id);
@@ -4935,6 +4960,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -4960,6 +4986,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -4992,6 +5019,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let real_exec = db
@@ -5089,6 +5117,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         }
@@ -5162,6 +5191,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // A second chore that will sit in `ready` because the
@@ -5177,6 +5207,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -5294,6 +5325,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -5313,6 +5345,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -5397,6 +5430,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -5412,6 +5446,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.update_work_item(
@@ -5562,6 +5597,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
@@ -5702,6 +5738,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         // Inserts a `ready` execution row but does NOT call `kick()`.
@@ -5766,6 +5803,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();

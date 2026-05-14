@@ -700,6 +700,14 @@ struct TaskCreateArgs {
     /// source of truth on slugs.
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
+
+    /// Bypass the duplicate guard. When a task with the same name
+    /// already exists in this product and was created within the last
+    /// 60 seconds, the engine rejects the create to catch fat-finger
+    /// retries. Pass this flag to override and insert a second row
+    /// unconditionally.
+    #[arg(long = "force-duplicate", default_value_t = false)]
+    force_duplicate: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -780,6 +788,11 @@ struct ChoreCreateArgs {
     /// source of truth on slugs.
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
+
+    /// Bypass the duplicate guard. See `boss task create --help` for
+    /// the full description.
+    #[arg(long = "force-duplicate", default_value_t = false)]
+    force_duplicate: bool,
 }
 
 /// Args for `boss task create-many`. The CLI reads a JSON array of
@@ -1913,6 +1926,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                     repo_remote_url: resolved_repo,
                     effort_level: args.effort.map(EffortLevel::from),
                     model_override: normalize_non_empty(args.model),
+                    force_duplicate: args.force_duplicate,
                 },
             )
             .await?;
@@ -2027,6 +2041,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                     repo_remote_url: resolved_repo,
                     effort_level: args.effort.map(EffortLevel::from),
                     model_override: normalize_non_empty(args.model),
+                    force_duplicate: args.force_duplicate,
                 },
             )
             .await?;
@@ -2763,6 +2778,15 @@ async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<
         .map_err(CliError::internal)?
     {
         FrontendEvent::WorkItemCreated { item } => expect_task(item),
+        FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id,
+            existing_short_id,
+            name,
+            age_secs,
+        } => Err(CliError::conflict(format!(
+            "A task named {name:?} was created {age_secs}s ago as T{existing_short_id} \
+             ({existing_id}); pass --force-duplicate to create another."
+        ))),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -2777,6 +2801,15 @@ async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Resul
         .map_err(CliError::internal)?
     {
         FrontendEvent::WorkItemCreated { item } => expect_chore(item),
+        FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id,
+            existing_short_id,
+            name,
+            age_secs,
+        } => Err(CliError::conflict(format!(
+            "A chore named {name:?} was created {age_secs}s ago as T{existing_short_id} \
+             ({existing_id}); pass --force-duplicate to create another."
+        ))),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -3008,6 +3041,7 @@ async fn run_task_create_many(
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         });
     }
 
@@ -3054,6 +3088,7 @@ async fn run_chore_create_many(
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         });
     }
 
@@ -3120,6 +3155,15 @@ where
 {
     match event {
         FrontendEvent::WorkItemsCreated { items } => items.into_iter().map(extract).collect(),
+        FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id,
+            existing_short_id,
+            name,
+            age_secs,
+        } => Err(CliError::conflict(format!(
+            "Batch rejected: an item named {name:?} was created {age_secs}s ago as \
+             T{existing_short_id} ({existing_id}); pass --force-duplicate to bypass."
+        ))),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }

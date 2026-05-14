@@ -117,6 +117,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -136,6 +137,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -257,6 +259,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -274,6 +277,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -340,6 +344,7 @@ async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
             repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -503,6 +508,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -591,6 +597,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -640,6 +647,7 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1060,6 +1068,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1075,6 +1084,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1203,6 +1213,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1219,6 +1230,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1235,6 +1247,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1250,6 +1263,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1446,6 +1460,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         })
         .collect();
     let created_tasks = match client
@@ -1483,6 +1498,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         })
         .collect();
     let created_chores = match client
@@ -1517,6 +1533,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
         CreateTaskInput {
             product_id: product.id.clone(),
@@ -1529,6 +1546,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     ];
     match client
@@ -1848,6 +1866,7 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1869,6 +1888,7 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
             repo_remote_url: None,
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -1925,6 +1945,7 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
                 repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         })
         .await?
@@ -1955,6 +1976,7 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
                 repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         })
         .await?
@@ -2015,6 +2037,7 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         })
         .await?
@@ -2041,6 +2064,7 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         })
         .await?
@@ -2099,6 +2123,7 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
             repo_remote_url: Some("git@github.com:foo/service.git".to_owned()),
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -2120,6 +2145,7 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
             repo_remote_url: Some("git@github.com:foo/other.git".to_owned()),
             effort_level: None,
             model_override: None,
+            force_duplicate: false,
         },
     )
     .await?;
@@ -2202,6 +2228,253 @@ async fn product_dispatch_preamble_round_trip() -> Result<()> {
     assert!(
         cleared.dispatch_preamble.is_none(),
         "empty string clears the preamble",
+    );
+
+    Ok(())
+}
+
+/// Helper: create a chore, expecting a `WorkItemDuplicateBlocked` response.
+async fn create_chore_expect_duplicate(
+    client: &mut BossClient,
+    input: CreateChoreInput,
+) -> Result<(String, i64, String, i64)> {
+    match client
+        .send_request(&FrontendRequest::CreateChore { input })
+        .await?
+    {
+        FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id,
+            existing_short_id,
+            name,
+            age_secs,
+        } => Ok((existing_id, existing_short_id, name, age_secs)),
+        other => Err(anyhow!("expected WorkItemDuplicateBlocked, got {:?}", other)),
+    }
+}
+
+/// Duplicate guard: a second chore with the same name in the same product within 60 s
+/// is rejected, but `force_duplicate` bypasses the check, and a deleted row is
+/// excluded from the match.
+#[tokio::test]
+async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "dup-test".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:foo/dup-test.git".to_owned()),
+        },
+    )
+    .await?;
+
+    // First create succeeds.
+    let first = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "  Dedup Me  ".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
+
+    // Immediate retry (within 60 s) is rejected with structured info.
+    let (existing_id, existing_short_id, blocked_name, age_secs) =
+        create_chore_expect_duplicate(
+            &mut client,
+            CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Dedup Me".to_owned(), // trimmed match
+                description: Some("different description".to_owned()),
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            },
+        )
+        .await?;
+
+    assert_eq!(existing_id, first.id, "existing_id must reference the first row");
+    assert_eq!(
+        existing_short_id,
+        first.short_id.unwrap_or(0),
+        "existing_short_id must match the first row's short_id",
+    );
+    assert_eq!(blocked_name, "Dedup Me", "blocked_name is the trimmed input");
+    assert!(age_secs >= 0, "age_secs must be non-negative");
+
+    // force_duplicate bypasses the guard.
+    let forced = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Dedup Me".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: true,
+        },
+    )
+    .await?;
+    assert_ne!(forced.id, first.id, "forced create must produce a new row");
+
+    // Soft-deleted row is excluded from the guard.
+    delete_work_item(&mut client, &first.id).await?;
+    // After deleting `first`, a retry with the same name should succeed
+    // (only `forced` remains, and the guard also blocks on that one — so
+    // let's delete forced too, then confirm a fresh create works).
+    delete_work_item(&mut client, &forced.id).await?;
+    let after_delete = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Dedup Me".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
+    assert_ne!(after_delete.id, first.id, "post-delete create must be a fresh row");
+
+    Ok(())
+}
+
+/// Duplicate guard for tasks: same name + same product within 60 s is rejected.
+#[tokio::test]
+async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "task-dup-test".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:foo/task-dup-test.git".to_owned()),
+        },
+    )
+    .await?;
+    let project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Phase 1".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+        },
+    )
+    .await?;
+
+    let first = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: product.id.clone(),
+            project_id: project.id.clone(),
+            name: "Unique Task".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
+
+    // Retry blocked.
+    match client
+        .send_request(&FrontendRequest::CreateTask {
+            input: CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "Unique Task".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemDuplicateBlocked { existing_id, .. } => {
+            assert_eq!(existing_id, first.id, "blocked must reference first task");
+        }
+        other => return Err(anyhow!("expected WorkItemDuplicateBlocked, got {:?}", other)),
+    }
+
+    // Cross-product: same name in a different product is allowed.
+    let other_product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "other-product".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:foo/other.git".to_owned()),
+        },
+    )
+    .await?;
+    let other_project = create_project(
+        &mut client,
+        CreateProjectInput {
+            product_id: other_product.id.clone(),
+            name: "Other Phase".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+        },
+    )
+    .await?;
+    let cross = create_task(
+        &mut client,
+        CreateTaskInput {
+            product_id: other_product.id.clone(),
+            project_id: other_project.id.clone(),
+            name: "Unique Task".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
+    assert_ne!(
+        cross.id, first.id,
+        "same name in different product must be allowed",
     );
 
     Ok(())
