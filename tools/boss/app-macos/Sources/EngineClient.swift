@@ -142,6 +142,13 @@ enum EngineEvent {
     /// will see it immediately. The debug pane uses this as the
     /// "reload confirmed" signal to render the toggle as committed.
     case featureFlagSet(name: String, enabled: Bool)
+    /// Response to `get_settings` — snapshot of every per-installation
+    /// setting and its current value. Drives the Settings window.
+    case settingsList(settings: [EngineSetting])
+    /// Echoed result of a `set_setting` toggle: the engine has
+    /// persisted the new value. The Settings window uses this as the
+    /// "saved" signal.
+    case settingSet(key: String, enabled: Bool)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -233,6 +240,24 @@ final class EngineClient: @unchecked Sendable {
         sendLine([
             "type": "set_live_status_enabled",
             "slot_id": slotId,
+            "enabled": enabled,
+        ])
+    }
+
+    /// Ask the engine for the per-installation settings snapshot.
+    /// Used by the Settings window on appear so the rendered state
+    /// reflects what the engine has persisted.
+    func sendGetSettings() {
+        sendLine(["type": "get_settings"])
+    }
+
+    /// Set one per-installation setting. Engine persists to
+    /// `settings.toml` and replies with `setting_set` once the
+    /// in-memory store is updated.
+    func sendSetSetting(key: String, enabled: Bool) {
+        sendLine([
+            "type": "set_setting",
+            "key": key,
             "enabled": enabled,
         ])
     }
@@ -865,6 +890,16 @@ final class EngineClient: @unchecked Sendable {
                 if !name.isEmpty {
                     emit(.featureFlagSet(name: name, enabled: enabled))
                 }
+            case "settings_list":
+                let raw = payload["settings"] as? [[String: Any]] ?? []
+                let settings = raw.compactMap(parseEngineSetting)
+                emit(.settingsList(settings: settings))
+            case "setting_set":
+                let key = payload["key"] as? String ?? ""
+                let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
+                if !key.isEmpty {
+                    emit(.settingSet(key: key, enabled: enabled))
+                }
             default:
                 break
             }
@@ -1117,6 +1152,24 @@ final class EngineClient: @unchecked Sendable {
             name: name,
             description: description,
             category: category,
+            defaultEnabled: defaultEnabled,
+            enabled: enabled
+        )
+    }
+
+    private func parseEngineSetting(_ payload: [String: Any]) -> EngineSetting? {
+        guard
+            let key = payload["key"] as? String,
+            !key.isEmpty,
+            let description = payload["description"] as? String,
+            let defaultEnabled = (payload["default_enabled"] as? NSNumber)?.boolValue,
+            let enabled = (payload["enabled"] as? NSNumber)?.boolValue
+        else {
+            return nil
+        }
+        return EngineSetting(
+            key: key,
+            description: description,
             defaultEnabled: defaultEnabled,
             enabled: enabled
         )

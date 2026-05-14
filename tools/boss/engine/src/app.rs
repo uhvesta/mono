@@ -140,6 +140,10 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
             resolver,
         );
     }
+
+    fn draft_pr_mode(&self) -> bool {
+        self.settings.is_enabled("default_pr_draft_mode")
+    }
 }
 
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
@@ -380,6 +384,11 @@ struct ServerState {
     /// boot, mutated by `SetFeatureFlag` RPC, consulted by callers
     /// via `is_enabled(...)`. See `crate::feature_flags`.
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    /// Per-installation settings (e.g. default_pr_draft_mode). Loaded
+    /// from `~/Library/Application Support/Boss/settings.toml` at boot,
+    /// mutated by `SetSetting` RPC, consulted by the spawn flow to
+    /// inject worker directives. See `crate::settings`.
+    settings: Arc<crate::settings::SettingsStore>,
     /// Engine-wide counter / gauge registry. Plumbed as an
     /// `Arc<Registry>` per the framework design's recommendation
     /// against globals (see
@@ -601,6 +610,32 @@ impl ServerState {
         let feature_flags_for_handler = feature_flags.clone();
         let feature_flags_for_state = feature_flags.clone();
 
+        // Load per-installation settings. Same boot contract as feature
+        // flags: a missing or unreadable file falls back to registry
+        // defaults; parse failures are logged but don't block startup.
+        let settings = Arc::new(crate::settings::SettingsStore::new(
+            crate::settings::SettingsStore::default_path(&state_root),
+        ));
+        if let Err(err) = settings.load() {
+            tracing::warn!(
+                ?err,
+                path = %settings.path().display(),
+                "settings: load failed; falling back to registry defaults",
+            );
+        }
+        // Log active (non-default) settings at startup so the operator
+        // can diagnose unexpected worker behaviour (e.g. draft PRs).
+        for snap in settings.snapshot_all() {
+            if snap.enabled != snap.default_enabled {
+                tracing::info!(
+                    key = %snap.key,
+                    enabled = snap.enabled,
+                    "settings: active non-default setting at startup",
+                );
+            }
+        }
+        let settings_for_state = settings.clone();
+
         // Engine counter-metrics registry. Built up front so it can
         // be cloned into ServerState; the registry is plumbed
         // explicitly rather than stashed in a global per the
@@ -688,6 +723,7 @@ impl ServerState {
                 ipc_logger,
                 _self_weak: weak_self.clone(),
                 feature_flags: feature_flags_for_state,
+                settings: settings_for_state,
                 metrics: metrics_for_state,
             }
         });
@@ -4874,6 +4910,47 @@ async fn handle_frontend_connection(
                             &sink,
                             &request_id,
                             FrontendEvent::FeatureFlagSet { name, enabled },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::GetSettings => {
+                let settings = server_state
+                    .settings
+                    .snapshot_all()
+                    .into_iter()
+                    .map(|snap| boss_protocol::SettingSnapshot {
+                        key: snap.key,
+                        description: snap.description,
+                        default_enabled: snap.default_enabled,
+                        enabled: snap.enabled,
+                    })
+                    .collect();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::SettingsList { settings },
+                );
+            }
+            FrontendRequest::SetSetting { key, enabled } => {
+                match server_state.settings.set(&key, enabled) {
+                    Ok(()) => {
+                        tracing::info!(
+                            %key,
+                            enabled,
+                            "settings: toggled via macOS Settings window",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::SettingSet { key, enabled },
                         );
                     }
                     Err(err) => send_response(

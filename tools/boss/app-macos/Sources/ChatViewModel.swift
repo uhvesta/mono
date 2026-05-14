@@ -88,6 +88,12 @@ final class ChatViewModel: ObservableObject {
     /// the engine side so this is purely a UI mirror.
     @Published var liveStatusDisabledSlotIDs: Set<Int> = []
 
+    /// Per-installation settings snapshot, sourced from `get_settings`
+    /// on Settings window open and kept in sync via `setting_set`
+    /// echoes after every toggle. Empty until the Settings window is
+    /// first opened in this session.
+    @Published var engineSettings: [EngineSetting] = []
+
     /// Engine feature-flag snapshot, sourced from `list_feature_flags`
     /// on debug-pane open and kept in sync via `feature_flag_set`
     /// echoes after every toggle. Backs the Feature Flags window
@@ -202,6 +208,29 @@ final class ChatViewModel: ObservableObject {
     /// minority case.
     func isLiveStatusEnabled(slotId: Int) -> Bool {
         !liveStatusDisabledSlotIDs.contains(slotId)
+    }
+
+    /// Ask the engine for the current per-installation settings
+    /// snapshot. Called by the Settings window on appear.
+    func refreshSettings() {
+        engine.sendGetSettings()
+    }
+
+    /// Toggle one per-installation setting. Optimistically patches the
+    /// cached snapshot so the UI feels instantaneous; the engine's
+    /// `setting_set` echo reconciles state once the on-disk write
+    /// returns.
+    func setEngineSetting(key: String, enabled: Bool) {
+        if let idx = engineSettings.firstIndex(where: { $0.key == key }) {
+            let prior = engineSettings[idx]
+            engineSettings[idx] = EngineSetting(
+                key: prior.key,
+                description: prior.description,
+                defaultEnabled: prior.defaultEnabled,
+                enabled: enabled
+            )
+        }
+        engine.sendSetSetting(key: key, enabled: enabled)
     }
 
     /// Ask the engine for the current feature-flag snapshot. Called by
@@ -1166,6 +1195,18 @@ final class ChatViewModel: ObservableObject {
                     name: prior.name,
                     description: prior.description,
                     category: prior.category,
+                    defaultEnabled: prior.defaultEnabled,
+                    enabled: enabled
+                )
+            }
+        case .settingsList(let settings):
+            engineSettings = settings
+        case .settingSet(let key, let enabled):
+            if let idx = engineSettings.firstIndex(where: { $0.key == key }) {
+                let prior = engineSettings[idx]
+                engineSettings[idx] = EngineSetting(
+                    key: prior.key,
+                    description: prior.description,
                     defaultEnabled: prior.defaultEnabled,
                     enabled: enabled
                 )

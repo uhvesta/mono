@@ -25,6 +25,11 @@ struct BossMacApp: App {
             }
         }
 
+        Settings {
+            SettingsView()
+                .environmentObject(chatModel)
+        }
+
         WindowGroup("Description", id: "markdown-viewer", for: MarkdownViewerContent.self) { $content in
             if let content {
                 MarkdownViewerView(title: content.title, source: content.markdown)

@@ -39,6 +39,7 @@ rust_library(
         "src/protocol.rs",
         "src/run_reconcile.rs",
         "src/runner.rs",
+        "src/settings.rs",
         "src/spawn_flow.rs",
         "src/transcript_tail.rs",
         "src/work.rs",

@@ -1156,6 +1156,16 @@ enum EngineAttemptRow: Identifiable, Hashable {
     }
 }
 
+/// Snapshot of one per-installation setting, decoded from a
+/// `settings_list` response. Mirrors `boss_protocol::SettingSnapshot`.
+struct EngineSetting: Identifiable, Hashable {
+    var id: String { key }
+    let key: String
+    let description: String
+    let defaultEnabled: Bool
+    let enabled: Bool
+}
+
 /// Snapshot of one engine feature flag, decoded from a
 /// `feature_flags_list` response. Mirrors the engine's
 /// `boss_protocol::FeatureFlagSnapshot` one-for-one.
