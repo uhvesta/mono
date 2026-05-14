@@ -9,6 +9,7 @@ pub mod config;
 pub mod conflict_diagnosis;
 pub mod conflict_watch;
 pub mod coordinator;
+pub mod dep_unblock_sweep;
 pub mod dispatch_events;
 pub mod dispatch_reader;
 pub mod effort;

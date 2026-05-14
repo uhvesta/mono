@@ -1851,6 +1851,35 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Mark a task `done` without running `cascade_dependents_after_prereq_status_change`.
+    /// Used in tests that need to simulate the engine being offline when a
+    /// prereq transitions, so the sweeper can be exercised as the recovery path.
+    #[cfg(test)]
+    pub fn mark_task_done_for_test_no_cascade(&self, task_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_string();
+        conn.execute(
+            "UPDATE tasks
+             SET status = 'done', last_status_actor = 'engine', updated_at = ?2
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![task_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Overwrite `last_status_actor` for a task without touching any other
+    /// column. Used in tests to simulate a concurrent update that reset the
+    /// actor (the scenario that previously caused the cascade to skip an item).
+    #[cfg(test)]
+    pub fn force_last_status_actor_for_test(&self, task_id: &str, actor: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks SET last_status_actor = ?2 WHERE id = ?1",
+            params![task_id, actor],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn clear_run_transcript_path_for_test(&self, run_id: &str) -> Result<()> {
         let conn = self.connect()?;
@@ -2368,13 +2397,66 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let removed = deps::delete_edge(&tx, dependent_id, prerequisite_id, relation)?;
         // Auto-unblock (Q4): when the only remaining gating reason is
-        // gone and the engine itself put this row in `blocked`, flip
-        // it back to `todo`. Manual blocks (last_status_actor =
-        // 'human') stick — the user still has to clear them.
+        // gone and the engine itself put this row in `blocked` (identified
+        // by blocked_reason='dependency'), flip it back to `todo`.
+        // Human-placed blocks (other blocked_reason / NULL + human actor)
+        // stick — the user must clear them.
         let now = now_string();
         maybe_engine_unblock_dependent(&tx, dependent_id, &now)?;
         tx.commit()?;
         Ok(removed)
+    }
+
+    /// All task ids that are currently in `blocked` status because of
+    /// a dependency edge the engine set — i.e. rows that the periodic
+    /// dependency-unblock sweeper should evaluate. Returns
+    /// `(task_id, updated_at_epoch_secs)` so the sweeper can compute
+    /// how long each row has been stuck.
+    ///
+    /// The candidate set is:
+    ///   - `blocked_reason = 'dependency'`  — set by `maybe_engine_block_dependent`
+    ///   - `blocked_reason IS NULL AND last_status_actor = 'engine'`  — pre-backfill rows
+    pub fn list_dependency_blocked_candidates(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, CAST(updated_at AS INTEGER)
+             FROM tasks
+             WHERE status = 'blocked'
+               AND deleted_at IS NULL
+               AND (
+                   blocked_reason = 'dependency'
+                   OR (blocked_reason IS NULL AND last_status_actor = 'engine')
+               )
+             ORDER BY updated_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Check whether `work_item_id` is still gated by unsatisfied
+    /// prerequisites. If not — all prereqs are done and the block was
+    /// engine-owned — flip the item to `todo` and return `true`.
+    /// Returns `false` without modifying the DB when the item is not
+    /// blocked, is human-blocked, or still has gating prereqs.
+    ///
+    /// Used by the periodic dependency-unblock sweeper as a per-item
+    /// fallback for the case where the event-driven cascade
+    /// ([`cascade_dependents_after_prereq_status_change`]) silently
+    /// skipped this row (e.g. `last_status_actor` mismatch from a
+    /// concurrent update, or engine was offline when the prereq landed).
+    pub fn try_unblock_dependency_if_resolved(&self, work_item_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let unblocked = maybe_engine_unblock_dependent(&tx, work_item_id, &now)?;
+        tx.commit()?;
+        Ok(unblocked)
     }
 
     /// Return the prerequisites and/or dependents of a single work
@@ -7135,10 +7217,17 @@ fn maybe_engine_block_dependent(
 }
 
 /// Flip a dependent off `blocked` if (a) its current status is
-/// `blocked`, (b) `last_status_actor = 'engine'` (the engine put it
-/// there), and (c) no gating prereqs remain. The unblocked status
-/// is `todo` — the design's recommendation in Q4. Items that were
-/// manually blocked by a human are left alone.
+/// `blocked`, (b) the block was engine-owned — either
+/// `blocked_reason = 'dependency'` (the authoritative signal set by
+/// [`maybe_engine_block_dependent`]) or, for items that pre-date that
+/// column, `blocked_reason IS NULL AND last_status_actor = 'engine'`
+/// — and (c) no gating prereqs remain. Items blocked for other reasons
+/// (merge_conflict, ci_failure) or manually by a human are left alone.
+///
+/// Returns `true` when an unblock was written, `false` when the item
+/// was skipped (not blocked, not engine-owned, or still gated). This
+/// lets callers (and the periodic dep-unblock sweep) distinguish a
+/// real action from a no-op without scanning the DB a second time.
 ///
 /// Emits a `tracing::info!` line on each successful unblock so the
 /// chain `prereq → done → dependent unblocked` is visible after the
@@ -7149,21 +7238,37 @@ fn maybe_engine_unblock_dependent(
     conn: &Connection,
     dependent_id: &str,
     now_epoch: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let current = match deps::lookup_work_item_status(conn, dependent_id)? {
         Some(s) => s,
-        None => return Ok(()),
+        None => return Ok(false),
     };
     if current != "blocked" {
-        return Ok(());
+        return Ok(false);
     }
+    // Guard: only auto-unblock if the engine was responsible for the block.
+    // For tasks, `blocked_reason = 'dependency'` is the canonical signal —
+    // it is set atomically by `maybe_engine_block_dependent` and never set
+    // by any human-facing update path.  Accept `blocked_reason IS NULL AND
+    // last_status_actor = 'engine'` as a fallback for rows that were
+    // auto-blocked before the blocked_reason column existed.
+    // For projects (no blocked_reason column), fall back to the actor check.
     let actor = lookup_last_status_actor(conn, dependent_id)?;
-    if actor.as_deref() != Some("engine") {
-        return Ok(());
+    let eligible = if dependent_id.starts_with("task_") {
+        match lookup_blocked_reason(conn, dependent_id)?.as_deref() {
+            Some("dependency") => true,
+            None => actor.as_deref() == Some("engine"),
+            _ => false, // merge_conflict, ci_failure, etc. — different cascade owners
+        }
+    } else {
+        actor.as_deref() == Some("engine")
+    };
+    if !eligible {
+        return Ok(false);
     }
     let gating = deps::gating_prereqs_for(conn, dependent_id)?;
     if !gating.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     write_engine_status(conn, dependent_id, "todo", now_epoch)?;
     // Clear blocked_reason so it doesn't linger on a todo row.
@@ -7178,7 +7283,7 @@ fn maybe_engine_unblock_dependent(
         dependent_id,
         "engine: auto-unblocked dependent — all gating prereqs satisfied",
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Walk every `blocks` dependent of `prereq_id` and run the
@@ -7259,6 +7364,21 @@ fn refuse_manual_move_off_blocked_while_gated(
     bail!(
         "cannot move {work_item_id} to {new_status}: gated by [{names}] (use `boss <kind> depend rm` to remove)"
     );
+}
+
+fn lookup_blocked_reason(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+    if work_item_id.starts_with("task_") {
+        return conn
+            .query_row(
+                "SELECT blocked_reason FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+            .map(|opt| opt.flatten());
+    }
+    Ok(None)
 }
 
 fn lookup_last_status_actor(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {

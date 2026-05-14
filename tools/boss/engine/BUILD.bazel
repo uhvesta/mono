@@ -16,6 +16,7 @@ rust_library(
         "src/conflict_diagnosis.rs",
         "src/conflict_watch.rs",
         "src/coordinator.rs",
+        "src/dep_unblock_sweep.rs",
         "src/dispatch_events.rs",
         "src/dispatch_reader.rs",
         "src/effort.rs",

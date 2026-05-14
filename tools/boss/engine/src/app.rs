@@ -1933,6 +1933,20 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Dependency-unblock safety-net sweeper: periodically re-evaluates
+    // every dependency-blocked work item and unblocks any whose gating
+    // prerequisites have all reached a satisfied status. The primary
+    // unblock path is event-driven (cascade inside the prereq-done
+    // transaction), but that path can silently skip a row if the item's
+    // last_status_actor was reset between the auto-block and the prereq
+    // landing, or if the engine was offline at transition time. The
+    // sweeper recovers those cases within one interval (≤30 s).
+    // See dep_unblock_sweep.rs for the full incident trace.
+    let _dep_unblock_handle = crate::dep_unblock_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        Duration::from_secs(crate::dep_unblock_sweep::DEP_UNBLOCK_SWEEP_INTERVAL_SECS),
+    );
+
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
     // by a dropped wakeup (the `status_transition` → `request_recorded`
     // stall class — see `exec_18af3ba5259d32a8_12`, 2026-05-13) is
