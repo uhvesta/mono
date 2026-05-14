@@ -28,11 +28,12 @@ struct ContentView: View {
             } detail: {
                 detail
             }
-            // Agents has no sidebar, so the NavigationSplitView-injected toggle
-            // would be an orphan. The removal modifier must sit directly on the
+            // Only show this NavigationSplitView's sidebar toggle when Work is the
+            // active tab. The toggle would be an orphan on Agents, Engine, and
+            // Designs tabs. The removal modifier must sit directly on the
             // NavigationSplitView that contributes the default item — applied
             // at the outer ZStack level it does not reach the injected toggle.
-            .toolbar(removing: model.navigationMode == .agents ? .sidebarToggle : nil)
+            .toolbar(removing: model.navigationMode != .work ? .sidebarToggle : nil)
             .opacity(model.navigationMode == .work ? 1 : 0)
             .allowsHitTesting(model.navigationMode == .work)
 
