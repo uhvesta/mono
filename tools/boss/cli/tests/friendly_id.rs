@@ -121,6 +121,7 @@ async fn create_task(
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         })
         .await?
@@ -143,6 +144,7 @@ async fn create_chore(client: &mut BossClient, product_id: &str, name: &str) -> 
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         })
         .await?

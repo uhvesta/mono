@@ -108,6 +108,7 @@ async fn create_chore(
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             },
         })
         .await?

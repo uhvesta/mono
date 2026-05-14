@@ -1466,6 +1466,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -2189,6 +2190,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/77";
@@ -2690,6 +2692,7 @@ mod tests {
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -2918,6 +2921,7 @@ PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -3052,6 +3056,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let execution = db
@@ -3401,6 +3406,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let exec2 = db
@@ -3455,6 +3461,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: None,
                 effort_level: None,
                 model_override: None,
+                force_duplicate: false,
             })
             .unwrap();
         let exec3 = db
