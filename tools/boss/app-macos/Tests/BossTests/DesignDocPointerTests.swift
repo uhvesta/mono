@@ -100,7 +100,8 @@ final class DesignDocPointerCodableTests: XCTestCase {
                 kind: .sameProduct(productID: "prod_1")
             ),
             workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
-            webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
+            webURL: "https://github.com/foo/bar/blob/main/docs/x.md",
+            rawContentURL: "https://raw.githubusercontent.com/foo/bar/main/docs/x.md"
         )
         let back = try roundtrip(state)
         XCTAssertEqual(back, state)
@@ -125,7 +126,7 @@ final class DesignDocPointerCodableTests: XCTestCase {
         }
         """
         let state = try decoder.decode(ProjectDesignDocState.self, from: Data(wire.utf8))
-        if case let .resolved(_, workspacePath, _) = state {
+        if case let .resolved(_, workspacePath, _, _) = state {
             XCTAssertNil(workspacePath)
         } else {
             XCTFail("expected .resolved, got \(state)")
@@ -149,10 +150,62 @@ final class DesignDocPointerCodableTests: XCTestCase {
                     kind: .external
                 ),
                 workspacePath: nil,
-                webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
+                webURL: "https://github.com/foo/bar/blob/main/docs/x.md",
+                rawContentURL: "https://raw.githubusercontent.com/foo/bar/main/docs/x.md"
             )
         )
         let back = try roundtrip(output)
         XCTAssertEqual(back, output)
+    }
+
+    /// Engine sends `resolved` state without `raw_content_url` (older
+    /// engine or non-GitHub repo). The Swift decoder must accept the
+    /// shape and produce `rawContentURL == nil`.
+    func testProjectDesignDocStateResolvedDecodesWithoutRawContentURL() throws {
+        let wire = """
+        {
+          "type": "resolved",
+          "resolved": {
+            "repo_remote_url": "https://github.com/foo/bar.git",
+            "branch": "main",
+            "path": "docs/x.md",
+            "kind": {"type": "external"}
+          },
+          "web_url": "https://github.com/foo/bar/blob/main/docs/x.md"
+        }
+        """
+        let state = try decoder.decode(ProjectDesignDocState.self, from: Data(wire.utf8))
+        if case let .resolved(_, _, _, rawContentURL) = state {
+            XCTAssertNil(rawContentURL)
+        } else {
+            XCTFail("expected .resolved, got \(state)")
+        }
+    }
+
+    /// Engine sends `resolved` state with `raw_content_url` (GitHub
+    /// repo, branch set). The Swift decoder must surface the URL.
+    func testProjectDesignDocStateResolvedDecodesRawContentURL() throws {
+        let wire = """
+        {
+          "type": "resolved",
+          "resolved": {
+            "repo_remote_url": "https://github.com/foo/bar.git",
+            "branch": "boss/design-pr",
+            "path": "tools/boss/docs/designs/foo.md",
+            "kind": {"type": "same_product", "product_id": "prod_1"}
+          },
+          "web_url": "https://github.com/foo/bar/blob/boss/design-pr/tools/boss/docs/designs/foo.md",
+          "raw_content_url": "https://raw.githubusercontent.com/foo/bar/boss/design-pr/tools/boss/docs/designs/foo.md"
+        }
+        """
+        let state = try decoder.decode(ProjectDesignDocState.self, from: Data(wire.utf8))
+        if case let .resolved(_, _, _, rawContentURL) = state {
+            XCTAssertEqual(
+                rawContentURL,
+                "https://raw.githubusercontent.com/foo/bar/boss/design-pr/tools/boss/docs/designs/foo.md"
+            )
+        } else {
+            XCTFail("expected .resolved, got \(state)")
+        }
     }
 }

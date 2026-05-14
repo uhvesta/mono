@@ -4374,6 +4374,7 @@ fn decide_open_design_action(
             resolved,
             workspace_path,
             web_url,
+            ..
         } => {
             if force_web {
                 return Ok(OpenDesignAction::Web {
@@ -5235,6 +5236,10 @@ mod tests {
                 .then(|| "/tmp/mono-agent-007".to_owned()),
             web_url: "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/foo.md"
                 .to_owned(),
+            raw_content_url: Some(
+                "https://raw.githubusercontent.com/spinyfin/mono/main/tools/boss/docs/designs/foo.md"
+                    .to_owned(),
+            ),
         }
     }
 

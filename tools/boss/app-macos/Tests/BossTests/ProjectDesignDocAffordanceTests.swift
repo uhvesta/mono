@@ -32,7 +32,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .sameProduct(productID: "prod_1")
             ),
             workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
-            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md",
+            rawContentURL: nil
         )
         let presentation = ProjectDesignDocAffordancePresentation.from(state: state)
         XCTAssertEqual(presentation?.systemImage, "doc.text")
@@ -55,7 +56,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .external
             ),
             workspacePath: nil,
-            webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
+            webURL: "https://github.com/foo/bar/blob/main/docs/x.md",
+            rawContentURL: nil
         )
         XCTAssertEqual(
             ProjectDesignDocAffordancePresentation.from(state: state)?.tooltip,
@@ -117,7 +119,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .sameProduct(productID: project.productID)
             ),
             workspacePath: workspacePath,
-            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md",
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertNil(model.workErrorMessage)
@@ -153,7 +156,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .sameProduct(productID: project.productID)
             ),
             workspacePath: workspacePath,
-            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md",
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertNil(model.workErrorMessage)
@@ -191,7 +195,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .otherProduct(productID: "prod_wiki")
             ),
             workspacePath: workspacePath,
-            webURL: "https://github.com/myorg/wiki/blob/main/designs/x.md"
+            webURL: "https://github.com/myorg/wiki/blob/main/designs/x.md",
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertEqual(renderedContents.count, 1)
@@ -221,7 +226,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .external
             ),
             workspacePath: nil,
-            webURL: "https://github.com/foo/bar/blob/main/x.md"
+            webURL: "https://github.com/foo/bar/blob/main/x.md",
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertTrue(renderedContents.isEmpty)
@@ -249,7 +255,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .otherProduct(productID: "prod_wiki")
             ),
             workspacePath: workspacePath,
-            webURL: "https://github.com/myorg/wiki/blob/main/designs/x.md"
+            webURL: "https://github.com/myorg/wiki/blob/main/designs/x.md",
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertEqual(openedURLs.count, 1)
@@ -277,7 +284,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .sameProduct(productID: project.productID)
             ),
             workspacePath: nil,
-            webURL: webURL
+            webURL: webURL,
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertNil(model.workErrorMessage)
@@ -305,7 +313,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .external
             ),
             workspacePath: "/tmp/should-be-ignored",
-            webURL: webURL
+            webURL: webURL,
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertEqual(openedURLs.map(\.absoluteString), [webURL])
@@ -325,7 +334,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                 kind: .external
             ),
             workspacePath: nil,
-            webURL: ""
+            webURL: "",
+            rawContentURL: nil
         )
         model.openProjectDesignDoc(project)
         XCTAssertNotNil(model.workErrorMessage)
@@ -364,7 +374,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
                     kind: .sameProduct(productID: project.productID)
                 ),
                 workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
-                webURL: "https://github.com/foo/bar/blob/main/docs/x.md"
+                webURL: "https://github.com/foo/bar/blob/main/docs/x.md",
+                rawContentURL: nil
             )
         )
         model.handleForTest(event: .projectDesignDocResolved(output: output))
@@ -549,7 +560,8 @@ final class DesignTaskCardDesignDocAffordanceTests: XCTestCase {
                 kind: .sameProduct(productID: "prod_test")
             ),
             workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
-            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md"
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md",
+            rawContentURL: nil
         )
         model.designDocStateByProjectID[projectID] = resolvedState
         let state = model.designDocStateByProjectID[projectID] ?? .notSet
@@ -599,7 +611,8 @@ final class DesignTaskCardDesignDocAffordanceTests: XCTestCase {
                 kind: .external
             ),
             workspacePath: nil,
-            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md"
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md",
+            rawContentURL: nil
         )
         model.designDocStateByProjectID[project.id] = resolvedState
         model.openProjectDesignDoc(project)
