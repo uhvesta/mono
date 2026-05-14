@@ -18,10 +18,15 @@ struct ContentView: View {
     #endif
 
     var body: some View {
-        // Both modes are rendered simultaneously and toggled via opacity +
-        // hit-testing. SwiftUI's structural `if`/`else` would tear down the
-        // libghostty NSViews on every Agents↔Work switch, which would force
-        // `ghostty_surface_new` and restart every claude session.
+        // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
+        // doesn't tear down the libghostty NSViews on tab switches (teardown
+        // would force ghostty_surface_new and restart every claude session).
+        // DesignsView is structurally conditional because it contains its own
+        // NavigationSplitView: two NSVs mounted concurrently share the same
+        // NSWindow toolbar namespace and AppKit deduplicates their toggle
+        // items, causing position thrash and a missing Designs sidebar. Only
+        // one NSV may live in the tree at a time. Designs remounts cheaply
+        // (filesystem reads only) so structural conditional is safe here.
         ZStack {
             NavigationSplitView {
                 sidebar
@@ -29,10 +34,10 @@ struct ContentView: View {
                 detail
             }
             // Only show this NavigationSplitView's sidebar toggle when Work is the
-            // active tab. The toggle would be an orphan on Agents, Engine, and
-            // Designs tabs. The removal modifier must sit directly on the
-            // NavigationSplitView that contributes the default item — applied
-            // at the outer ZStack level it does not reach the injected toggle.
+            // active tab. The toggle would be an orphan on Agents and Engine tabs.
+            // The removal modifier must sit directly on the NavigationSplitView
+            // that contributes the default item — applied at the outer ZStack level
+            // it does not reach the injected toggle.
             .toolbar(removing: model.navigationMode != .work ? .sidebarToggle : nil)
             .opacity(model.navigationMode == .work ? 1 : 0)
             .allowsHitTesting(model.navigationMode == .work)
@@ -41,9 +46,9 @@ struct ContentView: View {
                 .opacity(model.navigationMode == .agents ? 1 : 0)
                 .allowsHitTesting(model.navigationMode == .agents)
 
-            DesignsView(chat: model)
-                .opacity(model.navigationMode == .designs ? 1 : 0)
-                .allowsHitTesting(model.navigationMode == .designs)
+            if model.navigationMode == .designs {
+                DesignsView(chat: model)
+            }
 
         }
         #if canImport(GhosttyKit)
