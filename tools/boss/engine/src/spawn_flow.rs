@@ -96,6 +96,10 @@ pub struct StartWorkerInput {
     /// Stamped onto `LiveWorkerState` at spawn so `bossctl agents list`
     /// reports the real dispatched model instead of a hardcoded default.
     pub model: String,
+    /// When `true`, the engine-injected CLAUDE.md includes a directive
+    /// to pass `--draft` to `gh pr create` by default. Sourced from
+    /// the `default_pr_draft_mode` per-installation setting.
+    pub draft_pr_mode: bool,
 }
 
 #[derive(Debug)]
@@ -151,6 +155,13 @@ pub trait WorkerSpawner: Send + Sync {
     /// `LiveStatusManager`. The task tears itself down when
     /// `release_worker_pane` runs.
     fn start_live_status_slot(&self, _slot_id: u8, _run_id: &str) {}
+
+    /// Whether the `default_pr_draft_mode` setting is enabled. When
+    /// `true`, the worker's CLAUDE.md gets a directive to pass
+    /// `--draft` to `gh pr create`. Default `false` for tests.
+    fn draft_pr_mode(&self) -> bool {
+        false
+    }
 }
 
 /// Render the worker-config files, ask the app to spawn a pane,
@@ -168,6 +179,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         workspace_path: input.workspace_path.clone(),
         events_socket_path: input.events_socket_path.clone(),
         boss_event_path: input.boss_event_path.clone(),
+        draft_pr_mode: input.draft_pr_mode,
     };
     let written = write_workspace_files(&setup).map_err(StartWorkerError::WriteFiles)?;
 
@@ -412,6 +424,7 @@ mod tests {
             title_summary: None,
             work_item_binding: None,
             model: "claude-opus-4-7".into(),
+            draft_pr_mode: false,
         }
     }
 

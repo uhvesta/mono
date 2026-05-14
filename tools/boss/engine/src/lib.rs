@@ -29,6 +29,7 @@ pub mod pr_url_capture;
 pub mod protocol;
 pub mod run_reconcile;
 pub mod runner;
+pub mod settings;
 pub mod spawn_flow;
 pub mod transcript_tail;
 pub mod work;

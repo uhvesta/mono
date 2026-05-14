@@ -57,12 +57,24 @@ pub struct WorkerSetupInput {
     /// references the shim by absolute path so a hook fires even if
     /// the user's PATH is unusual.
     pub boss_event_path: PathBuf,
+    /// When `true`, the CLAUDE.md includes a directive to use
+    /// `--draft` when running `gh pr create`. Omitted when `false`
+    /// so workers on default installs see no behaviour change.
+    pub draft_pr_mode: bool,
 }
 
 /// Render the worker-facing CLAUDE.md.
 pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
+    let draft_directive = if input.draft_pr_mode {
+        "\n## PR creation mode\n\
+         \n\
+         Default PR creation mode: when running `gh pr create`, pass `--draft`\n\
+         unless the chore description explicitly says to create a non-draft PR.\n"
+    } else {
+        ""
+    };
     format!(
         "# Boss worker rules\n\
          \n\
@@ -198,7 +210,8 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          \n\
          The engine's coordinator (`bossctl`) may probe this session\n\
          between turns. Treat probes as you would a question from a\n\
-         human reviewer — short, specific answers.\n"
+         human reviewer — short, specific answers.\n\
+         {draft_directive}"
     )
 }
 
@@ -397,6 +410,7 @@ mod tests {
             boss_event_path: PathBuf::from(
                 "/Users/brianduff/Library/Application Support/Boss/bin/boss-event",
             ),
+            draft_pr_mode: false,
         }
     }
 
@@ -670,6 +684,7 @@ mod tests {
             workspace_path: dir.path().to_path_buf(),
             events_socket_path: PathBuf::from("/tmp/events.sock"),
             boss_event_path: PathBuf::from("/tmp/boss-event"),
+            draft_pr_mode: false,
         };
 
         let written = write_workspace_files(&input).unwrap();
@@ -755,6 +770,7 @@ mod tests {
             workspace_path: dir.path().to_path_buf(),
             events_socket_path: PathBuf::from("/tmp/events.sock"),
             boss_event_path: PathBuf::from("/tmp/boss-event"),
+            draft_pr_mode: false,
         };
 
         write_workspace_files(&input).unwrap();
@@ -808,6 +824,31 @@ mod tests {
             rendered.contains("fatal: not a git repository")
                 || rendered.contains("no `.git/`"),
             "expected an explanation of why bare gh fails in a jj workspace",
+        );
+    }
+
+    #[test]
+    fn claude_md_draft_directive_present_when_enabled() {
+        let mut input = sample_input();
+        input.draft_pr_mode = true;
+        let rendered = render_claude_md(&input);
+        assert!(
+            rendered.contains("--draft"),
+            "CLAUDE.md must include --draft directive when draft_pr_mode is true",
+        );
+        assert!(
+            rendered.contains("gh pr create"),
+            "draft directive must reference gh pr create",
+        );
+    }
+
+    #[test]
+    fn claude_md_draft_directive_absent_when_disabled() {
+        let input = sample_input(); // draft_pr_mode: false
+        let rendered = render_claude_md(&input);
+        assert!(
+            !rendered.contains("--draft"),
+            "CLAUDE.md must NOT include --draft directive when draft_pr_mode is false",
         );
     }
 }

@@ -413,6 +413,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 title_summary,
                 work_item_binding,
                 model: spawn_config.model.clone(),
+                draft_pr_mode: spawner.draft_pr_mode(),
             },
             StdDuration::from_secs(30),
         )
@@ -1446,7 +1447,7 @@ mod pane_spawn_tests {
         assert_eq!(
             input.initial_input,
             format!(
-                "claude --model {} --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+                "unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
                 crate::effort::ENGINE_DEFAULT_MODEL
             ),
             "untagged row should spawn with the engine default model, --permission-mode auto (Opus), and no --effort",

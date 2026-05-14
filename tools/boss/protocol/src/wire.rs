@@ -517,6 +517,16 @@ pub enum FrontendRequest {
     /// from the bundle, ensuring the user always gets the version that
     /// shipped with the app they launched.
     GetEngineVersion,
+    /// Snapshot of every registered per-installation setting and its
+    /// current value. Used by the macOS Settings window to render the
+    /// current state on open. Replies with
+    /// [`FrontendEvent::SettingsList`]. Read-only; no side effects.
+    GetSettings,
+    /// Set one per-installation setting. The engine persists to
+    /// `settings.toml` atomically; consumer-side reads see the new
+    /// value the moment this returns. The reply
+    /// ([`FrontendEvent::SettingSet`]) confirms the persisted value.
+    SetSetting { key: String, enabled: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -984,6 +994,13 @@ pub enum FrontendEvent {
         build_time: String,
         binary_fingerprint: String,
     },
+    /// Response to [`FrontendRequest::GetSettings`]: a snapshot of every
+    /// registered per-installation setting and its current value.
+    SettingsList { settings: Vec<SettingSnapshot> },
+    /// Response to [`FrontendRequest::SetSetting`]: the engine has
+    /// persisted the new value. The macOS Settings window uses this as
+    /// the "saved" signal to commit the toggle state.
+    SettingSet { key: String, enabled: bool },
 }
 
 /// Snapshot of one feature flag's static metadata + current value.
@@ -1007,6 +1024,21 @@ pub struct FeatureFlagSnapshot {
     pub default_enabled: bool,
     /// Current effective value — what `is_enabled(name)` returns
     /// right now. Equals `default_enabled` when no override exists.
+    pub enabled: bool,
+}
+
+/// Snapshot of one per-installation setting's static metadata + current
+/// value. Wire type for [`FrontendEvent::SettingsList`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SettingSnapshot {
+    /// Stable key (lowercase snake_case). The toggle send path uses
+    /// this verbatim as the `key` in `SetSetting`.
+    pub key: String,
+    /// One-sentence description rendered in the Settings window.
+    pub description: String,
+    /// Registry default — rendered as a "default: ON/OFF" hint.
+    pub default_enabled: bool,
+    /// Current effective value.
     pub enabled: bool,
 }
 
