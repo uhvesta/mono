@@ -836,21 +836,8 @@ private struct BossTitleView: View {
     @ObservedObject var model: ChatViewModel
 
     var body: some View {
-        HStack(spacing: 4) {
-            Text("Boss")
-                .font(.subheadline.weight(.semibold))
-            if let product = model.selectedProduct,
-               let repoURL = product.repoRemoteURL,
-               !repoURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let slug = shortRepoName(for: repoURL)
-                Text("·")
-                    .foregroundStyle(.secondary)
-                    .font(.subheadline)
-                Text(slug)
-                    .foregroundStyle(.secondary)
-                    .font(.subheadline)
-            }
-        }
+        Text(model.selectedProduct?.name ?? "Boss")
+            .font(.headline)
     }
 }
 
