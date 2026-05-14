@@ -2020,7 +2020,7 @@ pub async fn serve(
     let stage_thresholds =
         crate::dispatch_reader::StageThresholds::new(Duration::from_secs(120))
             .with_override("worker_claimed", Duration::from_secs(30))
-            .with_override("cube_repo_ensured", Duration::from_secs(30))
+            .with_override("cube_repo_ensured", Duration::from_secs(60))
             .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
     let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
         server_state.dispatch_event_root.clone(),

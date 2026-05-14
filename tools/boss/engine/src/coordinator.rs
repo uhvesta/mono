@@ -38,7 +38,7 @@ const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Same upper bound for `cube repo ensure`. `ensure_repo` is normally
 /// fast (it's an idempotent record lookup), but the same hang class
 /// applies if cube wedges, so we time-bound it too.
-const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(30);
+const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
 /// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` is 30 minutes, so a
