@@ -790,13 +790,16 @@ async fn sweep_pending_pr(
                  the underlying detector classification)",
             );
         }
-        // These four are genuinely silent — the execution moved on
+        // These five are genuinely silent — the execution moved on
         // between `list` and `recheck` (raced with on-Stop / manual
-        // intervention) or hit a transient DB error. No log on these:
-        // they're not stuck-worker indicators.
+        // intervention), hit a transient DB error, or the running-
+        // status gate (AI #6) skipped the fallback because the worker
+        // is still alive. No log on these: they're not stuck-worker
+        // indicators.
         StopOutcome::AlreadyTerminal
         | StopOutcome::UnknownExecution
         | StopOutcome::NoWorkspace
+        | StopOutcome::RunningNoStagedPr
         | StopOutcome::DbError => {}
     }
 }

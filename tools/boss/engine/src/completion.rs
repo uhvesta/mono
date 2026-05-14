@@ -8,28 +8,38 @@
 //! else driving the lifecycle, completed work just sits in Doing
 //! forever — that is the bug this module exists to close.
 //!
-//! The completion signal we listen for is the worker's `Stop` hook
-//! event. On every Stop, we resolve the worker's local commit shas
-//! via `jj log` (cube workspaces are non-colocated, so a top-level
-//! `git` invocation has no repo to point at — we cannot rely on
-//! `gh pr view` to figure out the branch), then ask the GitHub API
-//! `repos/{owner}/{repo}/commits/{sha}/pulls` whether any PR
-//! contains those commits. If a fresh open PR exists, the work item
-//! moves to `in_review`, the execution finalises (status `completed`,
-//! lease cleared, finished_at stamped), and the cube workspace is
-//! released so the next dispatch can take it over. If the PR is
-//! already merged by the time the Stop fires, the work item moves
-//! straight to `done`. If there is no PR, we surface an
-//! "awaiting input" signal on the execution topic so the coordinator
-//! / pane indicator can show the worker is idle without moving the
-//! work item to review.
+//! ## Detection
+//!
+//! The primary signal is the in-memory PR-URL staging cache populated
+//! by the `PostToolUse` hook for `gh pr create` / `gh pr view` /
+//! `gh pr edit`: when the worker's hook stream carries a PR URL we
+//! finalize the work item against it without touching git or
+//! GitHub at all.
+//!
+//! The cold-path fallback (incident 001, AI #6) handles the case where
+//! staging is empty (engine restart, hook miss, etc.) by querying
+//! `gh pr list --head <branch>` for the PR whose head matches the
+//! engine-supplied per-execution branch name. The branch name is
+//! derived deterministically from `execution_id` (see
+//! [`expected_branch_name`]) and is injected into the worker prompt,
+//! so workers push to the name the engine gave them — sibling workers
+//! in other cube workspaces have different execution IDs and therefore
+//! cannot collide.
+//!
+//! The branch-keyed query replaces the previous SHA-keyed
+//! `jj_candidate_commit_shas` + `gh api commits/{sha}/pulls` recipe,
+//! which was structurally unsafe under cube's shared
+//! `.jj/repo/store/git`: bookmarks pushed by ANY concurrent worker
+//! were visible from EVERY workspace's `jj log`, so the detector
+//! routinely matched a sibling's bookmark and bound the wrong PR.
+//! See `tools/boss/docs/postmortems/incident-001-pr-fan-out.md` for
+//! the full incident write-up.
 //!
 //! Merges that happen *after* the worker exited are detected by a
 //! periodic poller wired in `app.rs`, which calls
 //! [`WorkDb::mark_chore_pr_merged`] for any chore in `in_review`
 //! whose `pr_url` is now in a merged GitHub state.
 
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -109,54 +119,54 @@ impl PrStatus {
     }
 }
 
-/// Probes a workspace for any PR associated with its local commits
-/// and reports whether the PR is open / merged / stale / absent.
+/// Engine-supplied branch name a worker must push to when opening
+/// the PR for an execution. Derived deterministically from
+/// `execution_id` so the detector can reconstruct the expected name
+/// from `state.db` alone — no local jj reads, no shared-store
+/// contamination.
+///
+/// See `tools/boss/docs/postmortems/incident-001-pr-fan-out.md` §5 for
+/// the rationale: a per-execution branch name gives the detector a
+/// signal that is unique by construction. Sibling workers in other
+/// cube workspaces have different execution IDs and therefore push
+/// to different branches, so a branch-keyed `gh pr list --head <name>`
+/// query cannot misattribute their PRs to this execution.
+pub fn expected_branch_name(execution_id: &str) -> String {
+    format!("boss/{execution_id}")
+}
+
+/// Probes GitHub for the PR opened against an engine-supplied branch
+/// name and reports whether the PR is open / merged / closed / absent.
 ///
 /// `repo_remote_url` is the product's `git@github.com:owner/repo.git`
 /// (or `https://...`) URL — the detector parses it into an
-/// `owner/repo` slug to query the GitHub API directly. Cube
-/// workspaces are non-colocated, so passing a workspace path to
-/// `gh pr view` doesn't work (no top-level `.git`); the detector
-/// must reach the API some other way, and the slug is the most
-/// reliable signal we have.
+/// `owner/repo` slug used to scope the `gh pr list` query.
+/// `expected_branch` is the engine-supplied head branch (see
+/// [`expected_branch_name`]).
 #[async_trait]
 pub trait PrDetector: Send + Sync {
-    /// Returns the workspace's PR status. Implementations must treat
-    /// "no PR" as `Ok(PrStatus::None)` to keep the caller's
-    /// idle-vs-completed logic clean. Errors are reserved for tool
-    /// failures (jj missing, `gh` auth broken, etc.).
-    ///
-    /// `dispatch_started_at` is the execution row's `started_at` — a unix
-    /// epoch seconds string (the engine's `now_string()` format, e.g.
-    /// `"1778714114"`) — and gates the candidate expansion against stale
-    /// bookmarks accumulated from prior tasks in this cube workspace.
-    /// `None` keeps the legacy `@ | @-`-only behaviour for executions
-    /// that have not yet started — those shouldn't reach a Stop hook in
-    /// practice, but the parameter is optional rather than required so
-    /// callers handle the missing case explicitly instead of trusting the row.
+    /// Returns the PR status for `expected_branch` in `repo_remote_url`.
+    /// Implementations must treat "no PR with this head" as
+    /// `Ok(PrStatus::None)` to keep the caller's idle-vs-completed
+    /// logic clean. Errors are reserved for tool failures (`gh` auth
+    /// broken, network blips, etc.).
     async fn detect_pr(
         &self,
-        workspace_path: &Path,
         repo_remote_url: &str,
-        dispatch_started_at: Option<&str>,
+        expected_branch: &str,
     ) -> Result<PrStatus>;
 }
 
-/// `PrDetector` that shells out to `jj log` plus `gh api`. We can't
-/// use `gh pr view` from the workspace because cube workspaces are
-/// non-colocated jj checkouts (no `.git` at the workspace root, so
-/// `gh`'s implicit `git rev-parse --abbrev-ref HEAD` fails). Instead:
+/// `PrDetector` that shells out to `gh pr list --head <branch>`. The
+/// branch name is engine-supplied and execution-unique
+/// (see [`expected_branch_name`]), so GitHub returns at most one PR
+/// per query — there is no cross-execution overlap to exploit.
 ///
-/// 1. Ask `jj log` for the worker's working-copy commit and its
-///    parent (covers both "@ has the work" and "squashed into @-,
-///    @ is empty" patterns).
-/// 2. Parse `repo_remote_url` into an `owner/repo` slug.
-/// 3. Hit `repos/{owner}/{repo}/commits/{sha}/pulls` for each
-///    candidate sha — GitHub returns the PR that contains the
-///    commit (open PRs while the branch lives, merged PRs when the
-///    commit landed in `main`).
-/// 4. Map the response (state, merged_at, head_sha) onto
-///    [`PrStatus`].
+/// Replaces the pre-incident-001 SHA-keyed recipe
+/// (`jj_candidate_commit_shas` + `gh api commits/{sha}/pulls`), which
+/// was structurally unsafe under cube's shared `.jj/repo/store/git`:
+/// any concurrent worker's bookmark passed the revset's
+/// `committer_date(after:…)` gate and the detector misattributed PRs.
 #[derive(Debug, Default)]
 pub struct CommandPrDetector;
 
@@ -170,127 +180,66 @@ impl CommandPrDetector {
 impl PrDetector for CommandPrDetector {
     async fn detect_pr(
         &self,
-        workspace_path: &Path,
         repo_remote_url: &str,
-        dispatch_started_at: Option<&str>,
+        expected_branch: &str,
     ) -> Result<PrStatus> {
         let repo_slug = parse_repo_slug(repo_remote_url).with_context(|| {
             format!("failed to parse repo slug from `{repo_remote_url}`")
         })?;
-        let mut candidates =
-            jj_candidate_commit_shas(workspace_path, dispatch_started_at).await?;
-        // `@` and `@-` resolve to the same commit on a fresh,
-        // single-commit workspace; skip the duplicate API call.
-        candidates.dedup();
-        if candidates.is_empty() {
-            // No commits to search — workspace is empty / brand new.
-            return Ok(PrStatus::None);
-        }
-
-        // Walk the candidates newest-first (`@` before `@-`). The
-        // first sha that resolves to a PR wins. We hold onto the
-        // most recent transient `gh` error so detector failures still
-        // surface if every candidate failed.
-        let mut last_err: Option<anyhow::Error> = None;
-        for sha in &candidates {
-            match query_pr_for_commit(&repo_slug, sha).await {
-                Ok(Some(api_pr)) => {
-                    let api_pr_url = api_pr.url.clone();
-                    let api_pr_head = api_pr.head_sha.clone();
-                    let status = classify_pr(api_pr, &candidates);
-                    // When all three diff-stat fields are zero the PR is
-                    // *tentatively* empty, but GitHub computes those stats
-                    // asynchronously.  Run a secondary check against the
-                    // full PR endpoint before surfacing EmptyDiff — a false
-                    // positive here would loop the worker pane with bogus
-                    // "your diff is empty" directives on every Stop event.
-                    if let PrStatus::EmptyDiff { ref url } = status {
-                        tracing::debug!(
-                            pr_url = %url,
-                            repo = %repo_slug,
-                            "all diff stats zero on initial check; verifying via PR endpoint",
-                        );
-                        match verify_pr_diff_nonempty(&repo_slug, url).await {
-                            Ok(true) => {
-                                tracing::debug!(
-                                    pr_url = %url,
-                                    "secondary check confirms non-empty diff; classifying as Fresh",
-                                );
-                                return Ok(PrStatus::Fresh { url: url.clone() });
-                            }
-                            Ok(false) => {}
-                            Err(err) => {
-                                tracing::warn!(
-                                    pr_url = %url,
-                                    ?err,
-                                    "secondary diff-stat check failed; surfacing as detector failure",
-                                );
-                                return Err(err);
-                            }
-                        }
-                    }
-                    // Diagnostic surface for the "worker pushed a real PR
-                    // but the engine can't bind it" failure mode: when we
-                    // got a PR back from `gh api` but `classify_pr`
-                    // rejected `head_match`, log the SHAs side-by-side so
-                    // operators can see whether the worker's `@`/`@-`
-                    // drifted from the PR's head (e.g., they did `jj new
-                    // main` after `jj git push`). Without this, a worker
-                    // stuck in `active`/`waiting_human` is invisible to
-                    // log inspection — the existing `info!` in
-                    // `on_stop_inner` says "PR exists but local commits
-                    // are unpushed" without showing which SHAs failed.
-                    if matches!(status, PrStatus::Stale { .. }) {
-                        tracing::info!(
-                            workspace = %workspace_path.display(),
-                            repo = %repo_slug,
-                            pr_url = %api_pr_url,
-                            pr_head_sha = %api_pr_head,
-                            local_shas = ?candidates,
-                            queried_sha = %sha,
-                            "pr_detect: PR found but head_sha does not match any local commit — \
-                             worker's working copy likely moved after push (e.g., `jj new main`)",
-                        );
-                    }
-                    return Ok(status);
-                }
-                Ok(None) => continue,
-                Err(err) => {
+        let api_pr = match query_pr_for_branch(&repo_slug, expected_branch).await? {
+            Some(pr) => pr,
+            None => {
+                tracing::debug!(
+                    repo = %repo_slug,
+                    branch = %expected_branch,
+                    "pr_detect: no PR found for expected branch; returning None",
+                );
+                return Ok(PrStatus::None);
+            }
+        };
+        let status = classify_pr(api_pr);
+        // EmptyDiff is tentative: GitHub computes diff stats
+        // asynchronously, so a freshly-pushed branch can report all
+        // three stat fields as 0 before the computation finishes. Run
+        // a secondary check against the full PR endpoint before
+        // surfacing EmptyDiff — a false positive here would loop the
+        // worker pane with bogus "your diff is empty" directives on
+        // every Stop event.
+        if let PrStatus::EmptyDiff { ref url } = status {
+            tracing::debug!(
+                pr_url = %url,
+                repo = %repo_slug,
+                "all diff stats zero on initial check; verifying via PR endpoint",
+            );
+            match verify_pr_diff_nonempty(&repo_slug, url).await {
+                Ok(true) => {
                     tracing::debug!(
-                        sha,
-                        repo = %repo_slug,
-                        ?err,
-                        "gh api commits/{sha}/pulls failed; trying next candidate",
+                        pr_url = %url,
+                        "secondary check confirms non-empty diff; classifying as Fresh",
                     );
-                    last_err = Some(err);
+                    return Ok(PrStatus::Fresh { url: url.clone() });
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        pr_url = %url,
+                        ?err,
+                        "secondary diff-stat check failed; surfacing as detector failure",
+                    );
+                    return Err(err);
                 }
             }
         }
-
-        if let Some(err) = last_err {
-            return Err(err);
-        }
-        // No candidate resolved to a PR. Log at debug so the next
-        // recheck-loop pass leaves a breadcrumb; the merge poller calls
-        // `recheck_for_pr` every 60s, and the steady-state "no PR" case
-        // is normal noise.
-        tracing::debug!(
-            workspace = %workspace_path.display(),
-            repo = %repo_slug,
-            candidate_count = candidates.len(),
-            "pr_detect: no PR found for any local commit; returning None",
-        );
-        Ok(PrStatus::None)
+        Ok(status)
     }
 }
 
-/// Single PR row returned from `gh api repos/{owner}/{repo}/commits/{sha}/pulls`.
+/// Single PR row returned from `gh pr list --head <branch> --json …`.
 #[derive(Debug, Clone)]
 struct ApiPr {
     url: String,
     state: String,
     merged_at: Option<String>,
-    head_sha: String,
     /// Number of files changed in the PR.
     /// May be 0 when GitHub hasn't finished computing diff stats yet (race
     /// condition on a freshly-pushed branch); check `additions`/`deletions`
@@ -302,114 +251,64 @@ struct ApiPr {
     deletions: i64,
 }
 
-fn classify_pr(pr: ApiPr, local_shas: &[String]) -> PrStatus {
-    // Structural safety belt against the "worker's `@-` is a recent
-    // squash-merge commit on `main`" misbind. `jj_candidate_commit_shas`
-    // returns both `@` and `@-`; when the worker did `jj new main` and
-    // committed on `@` without pushing, `@-` is the tip of `main` —
-    // which is the merge commit of whatever PR landed most recently.
-    // The GitHub `commits/{sha}/pulls` endpoint then happily returns
-    // that unrelated, already-merged PR. Without this gate the
-    // completion handler stamps the chore's `pr_url` with it and
-    // transitions to `done`, so the kanban Review column is skipped
-    // and the audit trail points at an unrelated PR.
-    //
-    // The legitimate worker-attribution path is: the worker pushed
-    // their branch (or it was pushed previously) and at least one
-    // local commit sha matches the PR's `head.sha`. For unmerged PRs
-    // we already required `head_match` to classify as `Fresh`; require
-    // it for `Merged` and `Closed` too so a commit that the worker
-    // didn't actually create the PR for can't get bound. Failing the
-    // gate returns `None`, which the on-Stop handler treats as
-    // "awaiting input" — the worker is probed to push and open a PR.
-    let head_match = local_shas
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(&pr.head_sha));
-
+fn classify_pr(pr: ApiPr) -> PrStatus {
+    // Branch-keyed query already guarantees the PR was opened against
+    // this execution's engine-supplied head branch — no SHA matching
+    // needed. (Pre-incident-001 the detector ran a SHA-keyed query and
+    // had to gate on `head.sha` matching a local commit to reject the
+    // squash-merge-on-`main` misbind; branch-keyed detection makes that
+    // gate structurally unnecessary because a sibling worker's
+    // bookmark cannot share this execution's branch name.)
     if pr.merged_at.is_some() {
-        if head_match {
-            return PrStatus::Merged { url: pr.url };
-        }
-        return PrStatus::None;
+        return PrStatus::Merged { url: pr.url };
     }
     if pr.state.eq_ignore_ascii_case("closed") {
-        if head_match {
-            return PrStatus::Closed { url: pr.url };
-        }
-        return PrStatus::None;
+        return PrStatus::Closed { url: pr.url };
     }
-    if head_match {
-        // A PR has real changes if ANY of the three diff-stat fields is
-        // positive.  `changed_files` alone is unreliable: GitHub computes
-        // it asynchronously and the `commits/{sha}/pulls` endpoint can
-        // return 0 for a freshly-pushed branch before the computation
-        // finishes.  `additions` and `deletions` are populated by the same
-        // pipeline but are often available sooner.  If ALL three are zero
-        // the PR is tentatively empty; `detect_pr` runs a secondary
-        // verification call against the full PR endpoint before surfacing
-        // `EmptyDiff` to callers.
-        let has_changes =
-            pr.changed_files > 0 || pr.additions > 0 || pr.deletions > 0;
-        if has_changes {
-            PrStatus::Fresh { url: pr.url }
-        } else {
-            PrStatus::EmptyDiff { url: pr.url }
-        }
+    // OPEN. A PR has real changes if ANY of the three diff-stat fields
+    // is positive.  `changed_files` alone is unreliable: GitHub computes
+    // it asynchronously and `gh pr list` can return 0 for a freshly-pushed
+    // branch before the computation finishes.  `additions` and `deletions`
+    // are populated by the same pipeline but are often available sooner.
+    // If ALL three are zero the PR is tentatively empty; `detect_pr` runs
+    // a secondary verification call against the full PR endpoint before
+    // surfacing `EmptyDiff` to callers.
+    let has_changes = pr.changed_files > 0 || pr.additions > 0 || pr.deletions > 0;
+    if has_changes {
+        PrStatus::Fresh { url: pr.url }
     } else {
-        PrStatus::Stale {
-            url: pr.url,
-            reason: format!(
-                "local commits do not match PR head {pr_head}",
-                pr_head = short_sha(&pr.head_sha),
-            ),
-        }
+        PrStatus::EmptyDiff { url: pr.url }
     }
 }
 
-/// Read candidate commit shas for PR detection.
+/// `gh pr list -R <slug> --head <branch> --state all` — return the
+/// single PR for `branch`, or `Ok(None)` if no PR exists with that
+/// head in `repo_slug`. `Err(_)` is reserved for tool / network failures.
 ///
-/// Always includes `@ | @-` — the worker's working-copy commit and its
-/// parent. The two-rev fallback covers the two normal end-states for
-/// a worker run:
-///   - they did `jj squash` and the work lives on `@-` (with `@`
-///     left as an empty change), or
-///   - they edited `@` directly so the work lives there.
-///
-/// When `dispatch_started_at` is `Some`, the candidate set is extended
-/// with the tip of every bookmark whose tip commit was committed after
-/// that timestamp. This closes the bug that left Worf / Crusher / Troi
-/// (2026-05-13 dispatch wave, five-worker repro) stuck in `active` /
-/// `waiting_human`: those workers had pushed a real PR with a bookmark
-/// pointing at their work, then done `jj new main` afterwards, so
-/// `@` / `@-` no longer reached the pushed commit and the GitHub API
-/// query returned an unrelated already-merged PR off `main`'s tip
-/// which `classify_pr` correctly rejected as `Stale`. With the
-/// bookmark's tip in the candidate set, the worker's pushed sha is
-/// queried and `classify_pr` accepts it as `Fresh`.
-///
-/// The `committer_date(after:)` gate scopes the bookmark expansion to
-/// this dispatch's run window. Cube workspaces accumulate 50+ stale
-/// bookmarks from prior tasks (each was pushed at some point, so they
-/// have remote-tracking entries too), and including them naively
-/// would misbind the chore to whichever prior PR happened to be
-/// queried first. Filtering by `started_at` keeps only bookmarks the
-/// current worker actually moved.
-async fn jj_candidate_commit_shas(
-    workspace_path: &Path,
-    dispatch_started_at: Option<&str>,
-) -> Result<Vec<String>> {
-    let revset = build_candidate_revset(dispatch_started_at);
-    let output = Command::new("jj")
+/// `gh pr list --head` returns at most one open PR (GitHub enforces a
+/// unique open PR per head branch), and historical closed/merged PRs
+/// for the same head are extremely unlikely in practice because each
+/// execution gets a unique branch name. We pass `--limit 1` defensively
+/// — if multiple historical rows happen to exist, we want the most
+/// recent (which `gh pr list` returns first).
+async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<ApiPr>> {
+    let output = Command::new("gh")
         .args([
-            "log",
-            "--no-graph",
-            "--ignore-working-copy",
-            "-r",
-            &revset,
-            "-T",
-            r#"commit_id ++ "\n""#,
+            "pr",
+            "list",
+            "-R",
+            repo_slug,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "1",
+            "--json",
+            "url,state,mergedAt,changedFiles,additions,deletions",
+            "--jq",
+            r#".[0] | select(.) | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
         ])
-        .current_dir(workspace_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -417,124 +316,11 @@ async fn jj_candidate_commit_shas(
         .output()
         .await
         .with_context(|| {
-            format!(
-                "failed to spawn `jj log` in {}",
-                workspace_path.display()
-            )
+            format!("failed to spawn `gh pr list -R {repo_slug} --head {branch}`")
         })?;
     if !output.status.success() {
         return Err(anyhow!(
-            "`jj log` failed in {}: {}",
-            workspace_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut shas: Vec<String> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-    // De-duplicate while preserving newest-first order: `@` always
-    // appears before `@-`, and any bookmark tip that coincides with
-    // either should not be queried twice. A small `seen` set is
-    // cheaper than a sort for the typical candidate count (< 10).
-    let mut seen = std::collections::HashSet::new();
-    shas.retain(|sha| seen.insert(sha.clone()));
-    Ok(shas)
-}
-
-/// Convert a unix epoch seconds string (the engine's `now_string()` format)
-/// to an ISO 8601 / RFC 3339 string jj can parse. Returns `None` if the
-/// input is not a valid non-negative integer or is out of range.
-fn epoch_seconds_to_iso8601(s: &str) -> Option<String> {
-    let secs: i64 = s.trim().parse().ok()?;
-    if secs < 0 {
-        return None;
-    }
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let hh = rem / 3600;
-    let mm = (rem % 3600) / 60;
-    let ss = rem % 60;
-    // Civil-from-days: Howard Hinnant's algorithm (public domain).
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    Some(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m, d, hh, mm, ss
-    ))
-}
-
-/// Compose the revset for `jj_candidate_commit_shas`. Split out so the
-/// committer-date gate is tested independently of the `jj log`
-/// invocation.
-///
-/// `dispatch_started_at` is the execution row's `started_at` — a unix
-/// epoch seconds string (the engine's `now_string()` format). It is
-/// converted to ISO 8601 before embedding in the revset so that jj can
-/// parse it. If the value cannot be converted (non-numeric or negative),
-/// the function fails closed by returning the legacy `@ | @-` revset
-/// rather than producing an invalid query that would fail the whole
-/// detection pass.
-fn build_candidate_revset(dispatch_started_at: Option<&str>) -> String {
-    match dispatch_started_at.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(started) => {
-            let Some(iso) = epoch_seconds_to_iso8601(started) else {
-                return "@ | @-".to_owned();
-            };
-            format!(
-                r#"@ | @- | (bookmarks() & committer_date(after:"{iso}"))"#,
-            )
-        }
-        None => "@ | @-".to_owned(),
-    }
-}
-
-/// `gh api repos/{owner}/{repo}/commits/{sha}/pulls` — return the
-/// first PR associated with `sha`, or `Ok(None)` if there isn't one.
-/// `Err(_)` is reserved for tool / network failures.
-async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>> {
-    let endpoint = format!("repos/{repo_slug}/commits/{sha}/pulls");
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &endpoint,
-            "-H",
-            "Accept: application/vnd.github+json",
-            "--jq",
-            r#"first | select(.) | [(.html_url // ""), (.state // ""), (.merged_at // ""), (.head.sha // ""), ((.changed_files // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn `gh api {endpoint}`"))?;
-    if !output.status.success() {
-        let stderr_lower = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        // 422 is what GitHub returns for "no commit found" on this
-        // endpoint when the sha isn't in the repo (e.g. the worker
-        // never pushed). Treat as "no PR" rather than an error so
-        // the caller's idle-vs-completed branch stays clean.
-        if stderr_lower.contains("404")
-            || stderr_lower.contains("422")
-            || stderr_lower.contains("not found")
-        {
-            return Ok(None);
-        }
-        return Err(anyhow!(
-            "`gh api {endpoint}` failed: {}",
+            "`gh pr list -R {repo_slug} --head {branch}` failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -547,7 +333,6 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
     let url = parts.next().unwrap_or("").trim().to_owned();
     let state = parts.next().unwrap_or("").trim().to_owned();
     let merged_at_raw = parts.next().unwrap_or("").trim();
-    let head_sha = parts.next().unwrap_or("").trim().to_owned();
     let changed_files_raw = parts.next().unwrap_or("0").trim();
     let additions_raw = parts.next().unwrap_or("0").trim();
     let deletions_raw = parts.next().unwrap_or("0").trim();
@@ -566,7 +351,6 @@ async fn query_pr_for_commit(repo_slug: &str, sha: &str) -> Result<Option<ApiPr>
         url,
         state,
         merged_at,
-        head_sha,
         changed_files,
         additions,
         deletions,
@@ -641,10 +425,6 @@ pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("missing repo segment: {remote_url}"))?;
     Ok(format!("{owner}/{repo}"))
-}
-
-fn short_sha(sha: &str) -> String {
-    sha.chars().take(8).collect()
 }
 
 /// Queues an automatic probe for `run_id`. The shape mirrors
@@ -773,13 +553,15 @@ impl WorkerCompletionHandler {
         // `gh pr view` / `gh pr edit` stdout) while the worker was
         // still running. Trust it verbatim, synthesize
         // `PrStatus::Fresh`, and proceed to the in-review transition
-        // without shelling out to `jj log` or `gh api commits/.../pulls`.
+        // without shelling out to GitHub. Applies regardless of
+        // `running` vs `waiting_human` — the staged URL itself is the
+        // attribution signal.
         //
-        // The cold-path fallback below (workspace + detect_pr)
-        // remains for engine-restart recovery: if the engine was
-        // down when the worker ran `gh pr create`, the in-memory
-        // staging cache is empty here and we fall through to
-        // reconstruct the URL from local jj state + the GitHub API.
+        // The cold-path fallback below remains for engine-restart
+        // recovery: if the engine was down when the worker ran
+        // `gh pr create`, the in-memory staging cache is empty here
+        // and we fall through to `detect_pr` to reconstruct the URL
+        // via the GitHub API.
         if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
             tracing::info!(
                 execution_id,
@@ -796,24 +578,28 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        let workspace_path = match execution.workspace_path.as_deref() {
-            Some(path) => PathBuf::from(path),
-            None => {
-                tracing::warn!(
-                    execution_id,
-                    "stop event: execution has no workspace_path — cannot detect PR"
-                );
-                return StopOutcome::NoWorkspace;
-            }
-        };
+        // AI #6 running-status gate (incident 001 §5): in Claude Code
+        // the `Stop` hook fires after every assistant turn, not just
+        // at worker exit. With no staged URL on a still-`running`
+        // execution we MUST NOT fall through to `detect_pr` — the
+        // worker is alive and any positive result would race against
+        // its own in-flight push. Reserve the fallback for
+        // genuinely-terminal worker sessions, which in the engine's
+        // execution lifecycle are stamped `waiting_human` (set by
+        // `finish_execution_run` after `PaneSpawnRunner` returns).
+        if execution.status != "waiting_human" {
+            tracing::debug!(
+                execution_id,
+                status = %execution.status,
+                "stop event: no staged URL and execution is not waiting_human — skipping fallback (running-status gate)",
+            );
+            return StopOutcome::RunningNoStagedPr;
+        }
 
+        let expected_branch = expected_branch_name(&execution.id);
         let pr_status = match self
             .pr_detector
-            .detect_pr(
-                &workspace_path,
-                &execution.repo_remote_url,
-                execution.started_at.as_deref(),
-            )
+            .detect_pr(&execution.repo_remote_url, &expected_branch)
             .await
         {
             Ok(value) => value,
@@ -826,7 +612,7 @@ impl WorkerCompletionHandler {
                 // transition once the failure clears.
                 tracing::warn!(
                     execution_id,
-                    workspace = %workspace_path.display(),
+                    expected_branch = %expected_branch,
                     ?err,
                     "stop event: PR detection failed; will retry on next merge-poller sweep"
                 );
@@ -838,7 +624,7 @@ impl WorkerCompletionHandler {
             PrStatus::None | PrStatus::Closed { .. } => {
                 tracing::info!(
                     execution_id,
-                    workspace = %workspace_path.display(),
+                    expected_branch = %expected_branch,
                     "stop event: worker idle without an active PR — probing to push and open one"
                 );
                 self.publish_awaiting_pr(&execution).await;
@@ -849,7 +635,7 @@ impl WorkerCompletionHandler {
             PrStatus::Stale { url, reason } => {
                 tracing::info!(
                     execution_id,
-                    workspace = %workspace_path.display(),
+                    expected_branch = %expected_branch,
                     pr_url = %url,
                     %reason,
                     "stop event: PR exists but local commits are unpushed — probing to push"
@@ -862,7 +648,7 @@ impl WorkerCompletionHandler {
             PrStatus::EmptyDiff { url } => {
                 tracing::warn!(
                     execution_id,
-                    workspace = %workspace_path.display(),
+                    expected_branch = %expected_branch,
                     pr_url = %url,
                     "stop event: PR has an empty diff — worker pushed a no-op change; probing to fix or close"
                 );
@@ -925,24 +711,32 @@ impl WorkerCompletionHandler {
                 )
                 .await;
         }
-        let workspace_path = match execution.workspace_path.as_deref() {
-            Some(path) => PathBuf::from(path),
-            None => return StopOutcome::NoWorkspace,
-        };
+
+        // Running-status gate mirror (AI #6): the merge-poller's
+        // recheck sweep is intended for `waiting_human` workers whose
+        // staged URL was missed. Skipping for `running` keeps the
+        // fallback off in-flight workers even when the poller's
+        // candidate query picks them up by race.
+        if execution.status != "waiting_human" {
+            tracing::debug!(
+                execution_id,
+                status = %execution.status,
+                "pr-recheck: skipping fallback — execution is not waiting_human (running-status gate)",
+            );
+            return StopOutcome::RunningNoStagedPr;
+        }
+
+        let expected_branch = expected_branch_name(&execution.id);
         let pr_status = match self
             .pr_detector
-            .detect_pr(
-                &workspace_path,
-                &execution.repo_remote_url,
-                execution.started_at.as_deref(),
-            )
+            .detect_pr(&execution.repo_remote_url, &expected_branch)
             .await
         {
             Ok(value) => value,
             Err(err) => {
                 tracing::debug!(
                     execution_id,
-                    workspace = %workspace_path.display(),
+                    expected_branch = %expected_branch,
                     ?err,
                     "pr-recheck: detector failed; will retry next sweep"
                 );
@@ -1126,6 +920,11 @@ impl WorkerCompletionHandler {
             // Race with an already-finalized execution (a second Stop
             // for the same worker, or finalize_run racing). Skip.
             StopOutcome::AlreadyTerminal | StopOutcome::UnknownExecution => false,
+            // AI #6 (incident 001): the Stop hook fired on a still-`running`
+            // worker with an empty staged-URL cache. The fallback didn't
+            // fire by design; the worker is alive and may still push. Do
+            // not pre-empt with a `failed` mark.
+            StopOutcome::RunningNoStagedPr => false,
             // Catch-all branches: the worker exited and we have no
             // evidence of a push.
             StopOutcome::AwaitingInput
@@ -1278,6 +1077,12 @@ pub enum StopOutcome {
     DetectorFailed,
     /// No PR yet — worker is idle awaiting input.
     AwaitingInput,
+    /// AI #6 / incident 001: the Stop hook fired for an execution in
+    /// `running` status with an empty staged-URL cache. The fallback
+    /// is reserved for `waiting_human`; the worker is still alive and
+    /// any positive result would race against its own in-flight push.
+    /// Quiet outcome — no probe, no publish, no transition.
+    RunningNoStagedPr,
     /// PR detected; work item moved to `in_review` and execution finalised.
     PrDetected { pr_url: String },
     /// PR detected and already merged at Stop time; work item moved
@@ -1286,6 +1091,10 @@ pub enum StopOutcome {
     /// PR exists but local commits are ahead of its head sha. The
     /// worker is probed to push the missing commits; the work item
     /// stays in its current state until the next Stop reports a fresh PR.
+    ///
+    /// Post-incident-001 the branch-keyed detector cannot produce this
+    /// classification (there is no SHA matching to fail). The variant
+    /// is kept for callers that already pattern-match on it.
     StalePr { pr_url: String, reason: String },
     /// PR exists and head_match, but has zero file changes. The worker
     /// is probed to make real edits or close the PR; the work item
@@ -1330,9 +1139,20 @@ mod tests {
         CreateChoreInput, CreateExecutionInput, CreateProductInput, WorkDb, WorkItem,
     };
 
+    /// Captured arguments from one `detect_pr` call. Tests assert on
+    /// these to confirm the branch name passed in is execution-unique
+    /// (the AI #6 regression guard: sibling workers in other cube
+    /// workspaces must derive different branch names from their own
+    /// execution IDs).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DetectCall {
+        repo_remote_url: String,
+        expected_branch: String,
+    }
+
     struct StubPrDetector {
         result: Mutex<Result<PrStatus, String>>,
-        call_count: std::sync::atomic::AtomicUsize,
+        calls: std::sync::Mutex<Vec<DetectCall>>,
     }
 
     impl StubPrDetector {
@@ -1343,26 +1163,36 @@ mod tests {
             };
             Arc::new(Self {
                 result: Mutex::new(Ok(status)),
-                call_count: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
         fn ok_status(status: PrStatus) -> Arc<Self> {
             Arc::new(Self {
                 result: Mutex::new(Ok(status)),
-                call_count: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
         fn err(message: &str) -> Arc<Self> {
             Arc::new(Self {
                 result: Mutex::new(Err(message.to_owned())),
-                call_count: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
         fn call_count(&self) -> usize {
-            self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+            self.calls
+                .lock()
+                .expect("StubPrDetector calls mutex poisoned")
+                .len()
+        }
+
+        fn calls_snapshot(&self) -> Vec<DetectCall> {
+            self.calls
+                .lock()
+                .expect("StubPrDetector calls mutex poisoned")
+                .clone()
         }
     }
 
@@ -1370,12 +1200,16 @@ mod tests {
     impl PrDetector for StubPrDetector {
         async fn detect_pr(
             &self,
-            _workspace_path: &Path,
-            _repo_remote_url: &str,
-            _dispatch_started_at: Option<&str>,
+            repo_remote_url: &str,
+            expected_branch: &str,
         ) -> Result<PrStatus> {
-            self.call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls
+                .lock()
+                .expect("StubPrDetector calls mutex poisoned")
+                .push(DetectCall {
+                    repo_remote_url: repo_remote_url.to_owned(),
+                    expected_branch: expected_branch.to_owned(),
+                });
             let guard = self.result.lock().await;
             match &*guard {
                 Ok(value) => Ok(value.clone()),
@@ -2510,168 +2344,369 @@ mod tests {
         );
     }
 
-    /// Regression for the "worker's `@-` is a recent squash-merge
-    /// commit on `main`" misbind (the engine PR-auto-bind regression
-    /// where chores were getting stamped with PRs referenced as prior
-    /// art in their description text). When the worker did
-    /// `jj new main` and committed locally without pushing, `@-`
-    /// resolves to the tip of `main` — which is the merge commit of
-    /// whatever PR landed most recently. The GitHub
-    /// `commits/{sha}/pulls` endpoint then returns that unrelated,
-    /// already-merged PR. Without the head-sha gate, the on-Stop
-    /// handler would stamp the chore's `pr_url` with that PR and
-    /// transition it to `done`.
-    ///
-    /// The gate: `classify_pr` only returns `Merged`/`Closed` if at
-    /// least one local sha matches the PR's `head.sha`. The squash
-    /// case keeps `head.sha` = the original PR branch head, which is
-    /// a different sha from `@-` on main, so a mismatched merged PR
-    /// is correctly rejected as `None`.
+    /// Branch-keyed detection (AI #6, incident 001): the detector
+    /// queries `gh pr list --head <branch>` and trusts the branch as
+    /// the unique attribution signal. The squash-merge-on-`main`
+    /// misbind from PR #379 (where `@-` resolved to the merge commit
+    /// of an unrelated PR) is now structurally impossible: a sibling
+    /// worker's bookmark cannot share this execution's branch name
+    /// because the engine derives it from `execution_id`. The
+    /// classifier therefore needs no head_sha gate.
     #[test]
-    fn classify_pr_rejects_merged_pr_when_head_sha_not_in_local_shas() {
-        // Worker's @ is unpushed; @- is the squash-merge commit on
-        // main. The merged PR returned by GitHub has `head.sha` =
-        // the original branch head, which is neither @ nor @-.
-        let pr = ApiPr {
-            url: "https://github.com/foo/bar/pull/99".into(),
-            state: "closed".into(),
-            merged_at: Some("2026-05-12T03:51:00Z".into()),
-            head_sha: "branch_head_sha_aaaaaaaaaaaaaaaaaa".into(),
-            changed_files: 3,
-            additions: 0,
-            deletions: 0,
-        };
-        let local_shas = vec![
-            "worker_at_sha_111111111111111111111".into(),
-            "main_tip_sha_222222222222222222222".into(),
-        ];
-        assert_eq!(classify_pr(pr, &local_shas), PrStatus::None);
-    }
-
-    /// Sibling regression: a closed-but-not-merged PR whose `head.sha`
-    /// doesn't appear in the worker's local shas is also rejected.
-    /// The on-Stop handler treats `None` and `Closed` identically
-    /// (publish_awaiting_pr + queue PROBE_NO_PR), so the user-visible
-    /// behavior is unchanged for the legitimate "worker pushed, PR got
-    /// closed" case — but a phantom closed PR found via `@-` on main
-    /// can no longer leak a url onto the chore via downstream code
-    /// that reads `PrStatus::url()`.
-    #[test]
-    fn classify_pr_rejects_closed_pr_when_head_sha_not_in_local_shas() {
-        let pr = ApiPr {
-            url: "https://github.com/foo/bar/pull/100".into(),
-            state: "closed".into(),
-            merged_at: None,
-            head_sha: "branch_head_sha_bbbbbbbbbbbbbbbbbb".into(),
-            changed_files: 2,
-            additions: 0,
-            deletions: 0,
-        };
-        let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
-        assert_eq!(classify_pr(pr, &local_shas), PrStatus::None);
-    }
-
-    /// Positive case: a merged PR whose `head.sha` matches a local sha
-    /// (the worker pushed and then their PR got merged before Stop
-    /// fired) still classifies as `Merged`. This keeps the
-    /// `merged_pr_skips_in_review_and_moves_chore_to_done` flow alive
-    /// for the legitimate fast-merge case.
-    #[test]
-    fn classify_pr_accepts_merged_pr_when_head_sha_matches_local() {
+    fn classify_pr_merged_is_merged() {
         let pr = ApiPr {
             url: "https://github.com/foo/bar/pull/42".into(),
-            state: "closed".into(),
+            state: "MERGED".into(),
             merged_at: Some("2026-05-12T04:00:00Z".into()),
-            head_sha: "worker_at_sha_111111111111111111111".into(),
             changed_files: 5,
-            additions: 0,
-            deletions: 0,
+            additions: 12,
+            deletions: 4,
         };
-        let local_shas = vec![
-            "worker_at_sha_111111111111111111111".into(),
-            "worker_parent_sha_222222222222222222222".into(),
-        ];
         assert_eq!(
-            classify_pr(pr, &local_shas),
+            classify_pr(pr),
             PrStatus::Merged {
                 url: "https://github.com/foo/bar/pull/42".into(),
             },
         );
     }
 
-    /// Guard: a head-matched PR with all diff-stat fields zero classifies
-    /// as `EmptyDiff`, not `Fresh`. The head-sha match confirms the worker
-    /// pushed something, but zero files/additions/deletions means the diff
-    /// is empty (pending secondary verification in `detect_pr`).
+    #[test]
+    fn classify_pr_closed_unmerged_is_closed() {
+        let pr = ApiPr {
+            url: "https://github.com/foo/bar/pull/100".into(),
+            state: "CLOSED".into(),
+            merged_at: None,
+            changed_files: 2,
+            additions: 1,
+            deletions: 1,
+        };
+        assert_eq!(
+            classify_pr(pr),
+            PrStatus::Closed {
+                url: "https://github.com/foo/bar/pull/100".into(),
+            },
+        );
+    }
+
+    /// All three diff-stat fields zero — tentative EmptyDiff. The
+    /// secondary verification call in `detect_pr` confirms before
+    /// surfacing this to callers.
     #[test]
     fn classify_pr_returns_empty_diff_when_all_diff_stats_are_zero() {
         let pr = ApiPr {
             url: "https://github.com/foo/bar/pull/55".into(),
-            state: "open".into(),
+            state: "OPEN".into(),
             merged_at: None,
-            head_sha: "worker_at_sha_111111111111111111111".into(),
             changed_files: 0,
             additions: 0,
             deletions: 0,
         };
-        let local_shas = vec![
-            "worker_at_sha_111111111111111111111".into(),
-            "worker_parent_sha_222222222222222222222".into(),
-        ];
         assert_eq!(
-            classify_pr(pr, &local_shas),
+            classify_pr(pr),
             PrStatus::EmptyDiff {
                 url: "https://github.com/foo/bar/pull/55".into(),
             },
         );
     }
 
-    /// Regression: `changed_files == 0` must NOT produce `EmptyDiff` when
-    /// `additions` or `deletions` are non-zero.  This is the false-positive
-    /// scenario observed with PR #446: GitHub's `commits/{sha}/pulls`
-    /// endpoint returned `changed_files: 0` (async diff-stat lag) while
-    /// `additions: 1, deletions: 1` were already computed.  Before this
-    /// fix the engine injected a bogus "your diff is empty" directive into
-    /// the worker pane on every Stop event.
+    /// Regression: `changed_files == 0` must NOT produce `EmptyDiff`
+    /// when `additions` or `deletions` are non-zero. GitHub computes
+    /// `changed_files` asynchronously and can return 0 for a
+    /// freshly-pushed branch while `additions` / `deletions` are
+    /// already populated. Before PR #446 the engine injected a bogus
+    /// "your diff is empty" directive into the worker pane on every
+    /// Stop event in this case.
     #[test]
     fn classify_pr_returns_fresh_when_changed_files_zero_but_additions_nonzero() {
         let pr = ApiPr {
             url: "https://github.com/foo/bar/pull/446".into(),
-            state: "open".into(),
+            state: "OPEN".into(),
             merged_at: None,
-            head_sha: "worker_at_sha_111111111111111111111".into(),
             changed_files: 0,
             additions: 1,
             deletions: 1,
         };
-        let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
         assert_eq!(
-            classify_pr(pr, &local_shas),
+            classify_pr(pr),
             PrStatus::Fresh {
                 url: "https://github.com/foo/bar/pull/446".into(),
             },
         );
     }
 
-    /// Confirm that a head-matched PR with `changed_files > 0` still
-    /// classifies as `Fresh`.
     #[test]
-    fn classify_pr_returns_fresh_when_head_matches_and_changed_files_nonzero() {
+    fn classify_pr_returns_fresh_when_changed_files_nonzero() {
         let pr = ApiPr {
             url: "https://github.com/foo/bar/pull/56".into(),
-            state: "open".into(),
+            state: "OPEN".into(),
             merged_at: None,
-            head_sha: "worker_at_sha_111111111111111111111".into(),
             changed_files: 1,
             additions: 0,
             deletions: 0,
         };
-        let local_shas = vec!["worker_at_sha_111111111111111111111".into()];
         assert_eq!(
-            classify_pr(pr, &local_shas),
+            classify_pr(pr),
             PrStatus::Fresh {
                 url: "https://github.com/foo/bar/pull/56".into(),
             },
+        );
+    }
+
+    /// AI #6 regression: the branch name passed to `detect_pr` must be
+    /// derived deterministically from `execution_id` — and two
+    /// different executions must derive two different branches. This
+    /// is the structural property that makes the cross-workspace
+    /// fan-out from incident 001 impossible: a sibling worker in
+    /// another cube workspace has a different execution ID, therefore
+    /// pushes to a different branch, therefore cannot be matched by
+    /// this execution's `gh pr list --head <branch>` query.
+    #[test]
+    fn expected_branch_name_is_deterministic_and_unique_per_execution() {
+        let a = expected_branch_name("exec_18af6057fe1514f8_3");
+        let b = expected_branch_name("exec_18af6057fe1514f8_3");
+        assert_eq!(a, b, "branch name must be deterministic for a given execution id");
+        let other = expected_branch_name("exec_999999999999_4");
+        assert_ne!(
+            a, other,
+            "two distinct execution ids must produce distinct branch names — \
+             this is the load-bearing structural property of AI #6",
+        );
+        // The execution id must be recoverable from the branch (the
+        // engine derives the name; the detector re-derives it from
+        // state.db). Easiest property to assert: the id is embedded.
+        assert!(
+            a.contains("exec_18af6057fe1514f8_3"),
+            "branch name must contain the execution id so the detector can re-derive it: {a}",
+        );
+    }
+
+    /// AI #6 cross-workspace regression: two concurrent workers in
+    /// different cube workspaces — Alice with one execution id, Bob
+    /// with another — each fire `on_stop` with an empty staged-URL
+    /// cache. Each handler must call `detect_pr` with its OWN
+    /// execution's branch name. Pre-fix the detector used a workspace-
+    /// scoped jj revset and would routinely return Bob's PR for
+    /// Alice's Stop event, fan-binding the wrong URL onto the wrong
+    /// chore (the 2026-05-14 fan-out).
+    #[tokio::test]
+    async fn cross_execution_attribution_uses_per_execution_branch_name() {
+        let alice_ws = tempdir().unwrap();
+        let bob_ws = tempdir().unwrap();
+        let (db, _alice_product, _alice_chore, alice_exec) = fixture(alice_ws.path());
+        // Fresh DB for Bob so the two executions are independent —
+        // we're modelling them as living in different cube
+        // workspaces, not contending for the same chore.
+        let (bob_db, _bob_product, _bob_chore, bob_exec) = fixture(bob_ws.path());
+
+        // Detector returns Fresh URLs unique per branch — the
+        // production behaviour of `gh pr list --head <branch>` once
+        // each worker has pushed.
+        struct PerBranchDetector;
+        #[async_trait]
+        impl PrDetector for PerBranchDetector {
+            async fn detect_pr(
+                &self,
+                _repo_remote_url: &str,
+                expected_branch: &str,
+            ) -> Result<PrStatus> {
+                Ok(PrStatus::Fresh {
+                    url: format!("https://github.com/spinyfin/mono/pull/PR-for-{expected_branch}"),
+                })
+            }
+        }
+        let detector = Arc::new(PerBranchDetector);
+
+        let alice_handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        );
+        let bob_handler = WorkerCompletionHandler::new(
+            bob_db.clone(),
+            detector,
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        );
+
+        let alice_outcome = alice_handler.on_stop(&alice_exec).await;
+        let bob_outcome = bob_handler.on_stop(&bob_exec).await;
+
+        let alice_url = match alice_outcome {
+            StopOutcome::PrDetected { pr_url } => pr_url,
+            other => panic!("alice expected PrDetected, got {other:?}"),
+        };
+        let bob_url = match bob_outcome {
+            StopOutcome::PrDetected { pr_url } => pr_url,
+            other => panic!("bob expected PrDetected, got {other:?}"),
+        };
+        assert_ne!(
+            alice_url, bob_url,
+            "two concurrent workers in different workspaces must bind to different PRs — \
+             the fan-out bug from incident 001 was exactly the case where they got the same one",
+        );
+        assert!(
+            alice_url.contains(&expected_branch_name(&alice_exec)),
+            "alice's bound URL must derive from her own execution id, got {alice_url}",
+        );
+        assert!(
+            bob_url.contains(&expected_branch_name(&bob_exec)),
+            "bob's bound URL must derive from his own execution id, got {bob_url}",
+        );
+    }
+
+    /// AI #6 running-status gate: if the Stop hook fires on an
+    /// execution that's still in `running` status (i.e. the worker is
+    /// alive and racing through turns) and there's no staged URL, the
+    /// fallback MUST NOT fire. Pre-incident-001 it did, and the
+    /// per-turn firing rate against cube's shared `.jj/repo/store/git`
+    /// is what produced the May 14 fan-out.
+    /// Build a fixture left in `running` status — i.e. `start_execution_run`
+    /// has fired but `finish_execution_run` has not yet been called. The
+    /// in-cube worker pane is alive, and a `Stop` hook fires for the
+    /// first assistant turn before the upper layer has had a chance to
+    /// stamp `waiting_human`.
+    fn fixture_running(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Running execution".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        // `start_execution_run` flips the row to `running`. Do not
+        // follow up with `finish_execution_run` — we want the row to
+        // stay in `running` to exercise the AI #6 gate.
+        let (execution, _run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(execution.status, "running");
+        (db, product.id, chore.id, execution.id)
+    }
+
+    #[tokio::test]
+    async fn running_status_short_circuits_without_calling_detector() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture_running(workspace.path());
+
+        let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::RunningNoStagedPr,
+            "running execution with no staged URL must short-circuit, not invoke the detector",
+        );
+        assert_eq!(
+            detector.call_count(),
+            0,
+            "running-status gate must not call detect_pr",
+        );
+        // Chore stays put, no probe queued, no publish.
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "active");
+                assert!(t.pr_url.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
+        assert!(probes.snapshot().is_empty());
+        assert!(publisher.events.lock().await.is_empty());
+    }
+
+    /// Companion to the running-status gate test: when the execution
+    /// IS in `waiting_human` (worker has paused and is awaiting human
+    /// review), the fallback fires. This is the only state in which
+    /// the cold path is allowed to run, per the incident-001 fix.
+    #[tokio::test]
+    async fn waiting_human_status_invokes_detector_with_expected_branch() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        // Fixture leaves the execution in `waiting_human`; the on-Stop
+        // handler should fall through to the detector.
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/501"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        assert_eq!(detector.call_count(), 1);
+        let calls = detector.calls_snapshot();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].expected_branch,
+            expected_branch_name(&execution_id),
+            "detect_pr must be invoked with the execution's deterministic branch name",
         );
     }
 
@@ -3515,180 +3550,6 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // No probes queued even on the success path — recheck never
         // probes (that's a Stop-event-only side effect).
         assert!(probes.snapshot().is_empty());
-    }
-
-    /// The bookmark expansion in `jj_candidate_commit_shas` is gated
-    /// on `dispatch_started_at` being present and well-formed. Pin the
-    /// revset string shape directly so the production query stays
-    /// surgical: legacy callers without a timestamp keep the
-    /// pre-fix `@ | @-`-only behaviour; callers with a timestamp get
-    /// the bookmark tip expansion; pathological inputs (embedded
-    /// double quotes) fail closed by dropping the expansion rather
-    /// than producing an invalid revset that would fail the whole
-    /// detection pass.
-    #[test]
-    fn build_candidate_revset_with_no_timestamp_keeps_legacy_revset() {
-        assert_eq!(build_candidate_revset(None), "@ | @-");
-        assert_eq!(build_candidate_revset(Some("")), "@ | @-");
-        assert_eq!(build_candidate_revset(Some("   ")), "@ | @-");
-    }
-
-    #[test]
-    fn build_candidate_revset_with_timestamp_expands_to_recent_bookmarks() {
-        // Engine writes started_at as unix epoch seconds (now_string()).
-        // 0 == 1970-01-01T00:00:00Z (Unix epoch origin).
-        assert_eq!(
-            build_candidate_revset(Some("0")),
-            r#"@ | @- | (bookmarks() & committer_date(after:"1970-01-01T00:00:00Z"))"#,
-        );
-        // 946684800 == 2000-01-01T00:00:00Z.
-        assert_eq!(
-            build_candidate_revset(Some("946684800")),
-            r#"@ | @- | (bookmarks() & committer_date(after:"2000-01-01T00:00:00Z"))"#,
-        );
-    }
-
-    #[test]
-    fn build_candidate_revset_drops_expansion_when_timestamp_is_non_numeric() {
-        // Non-numeric input (e.g. an old RFC 3339 string or junk) cannot be
-        // converted; fail closed to the legacy revset rather than producing
-        // an invalid jj query that would fail the whole detection pass.
-        assert_eq!(
-            build_candidate_revset(Some("2026-05-13T21:00:00Z")),
-            "@ | @-",
-        );
-        assert_eq!(build_candidate_revset(Some("not-a-number")), "@ | @-");
-    }
-
-    /// Real-jj regression for the bookmark-tip candidate expansion.
-    /// Initialises a colocated jj workspace, commits on a named
-    /// bookmark, then moves `@` to the root commit (mirroring a
-    /// worker that pushed and then did `jj new main`). With the
-    /// dispatch timestamp set, `jj_candidate_commit_shas` must return
-    /// the bookmark tip so the downstream detector can find the PR
-    /// the worker actually opened. Without the timestamp, the legacy
-    /// `@ | @-`-only revset must still apply — preserving behaviour
-    /// for callers that have not opted into the expansion.
-    #[tokio::test]
-    async fn jj_candidate_commit_shas_includes_recent_bookmark_tip() {
-        // Skip when `jj` is unavailable on $PATH (e.g. minimal CI
-        // images). The cube-workspace assumption — jj is installed on
-        // the host — holds in our dispatch environment.
-        let jj_available = std::process::Command::new("jj")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !jj_available {
-            eprintln!("jj not available on PATH — skipping");
-            return;
-        }
-
-        let workspace = tempdir().unwrap();
-        let ws_path = workspace.path();
-        let run_jj = |args: &[&str]| {
-            std::process::Command::new("jj")
-                .args(args)
-                .current_dir(ws_path)
-                .env("JJ_USER", "test")
-                .env("JJ_EMAIL", "test@example.com")
-                .output()
-                .expect("jj command failed to spawn")
-        };
-
-        // Bootstrap: jj-only repo (no .git colocate needed).
-        let init = run_jj(&["git", "init"]);
-        assert!(
-            init.status.success(),
-            "jj git init failed: {}",
-            String::from_utf8_lossy(&init.stderr),
-        );
-
-        // Commit the worker's "fix" on a named bookmark, then push `@`
-        // past it. Mirrors: `jj describe -m worker-fix && jj bookmark
-        // create my-fix -r @ && jj git push -b my-fix && jj new root()`.
-        // We can't run an actual push here (no remote), but the
-        // candidate-shas function reads local refs, not remote-tracking
-        // state — the bookmark existing locally is sufficient.
-        let describe = run_jj(&["describe", "-m", "worker-fix-commit"]);
-        assert!(
-            describe.status.success(),
-            "jj describe failed: {}",
-            String::from_utf8_lossy(&describe.stderr),
-        );
-        let create_bookmark = run_jj(&["bookmark", "create", "my-fix", "-r", "@"]);
-        assert!(
-            create_bookmark.status.success(),
-            "jj bookmark create failed: {}",
-            String::from_utf8_lossy(&create_bookmark.stderr),
-        );
-        // Capture the bookmark tip sha.
-        let bookmark_tip = run_jj(&[
-            "log",
-            "--no-graph",
-            "-r",
-            "my-fix",
-            "-T",
-            r#"commit_id ++ "\n""#,
-        ]);
-        assert!(bookmark_tip.status.success());
-        let bookmark_tip_sha = String::from_utf8_lossy(&bookmark_tip.stdout)
-            .trim()
-            .to_owned();
-        assert_eq!(
-            bookmark_tip_sha.len(),
-            40,
-            "expected a 40-char commit id, got {:?}",
-            bookmark_tip_sha,
-        );
-
-        // Now move `@` to a fresh commit off `root()` — mirrors the
-        // worker doing `jj new main` after `jj git push`. The
-        // bookmark stays where it is, but `@` and `@-` no longer
-        // reach the bookmark tip.
-        let new_off_root = run_jj(&["new", "root()"]);
-        assert!(
-            new_off_root.status.success(),
-            "jj new root() failed: {}",
-            String::from_utf8_lossy(&new_off_root.stderr),
-        );
-
-        // With no timestamp — legacy revset — the bookmark tip must
-        // NOT appear. This is the pre-fix bug: `@ | @-` doesn't
-        // reach the worker's pushed commit.
-        let legacy = jj_candidate_commit_shas(ws_path, None)
-            .await
-            .expect("legacy candidate query failed");
-        assert!(
-            !legacy.contains(&bookmark_tip_sha),
-            "legacy revset must NOT include the bookmark tip (the bug): got {legacy:?}",
-        );
-
-        // With a past timestamp (unix epoch seconds, matching the engine's
-        // now_string() format) — fix engaged — the bookmark tip MUST appear
-        // in the candidate set. Using 946684800 == 2000-01-01T00:00:00Z.
-        // This is the format the engine actually writes; the prior test used
-        // ISO 8601 which masked the production bug.
-        let with_since = jj_candidate_commit_shas(ws_path, Some("946684800"))
-            .await
-            .expect("with-since candidate query failed");
-        assert!(
-            with_since.contains(&bookmark_tip_sha),
-            "started_at-gated revset must include the bookmark tip: got {with_since:?}",
-        );
-
-        // With a future timestamp (unix epoch seconds far in the future) —
-        // bookmark tip is older than the dispatch window — the bookmark tip
-        // must NOT appear. Using 32503680000 == 3000-01-01T00:00:00Z.
-        let with_future = jj_candidate_commit_shas(ws_path, Some("32503680000"))
-            .await
-            .expect("future-since candidate query failed");
-        assert!(
-            !with_future.contains(&bookmark_tip_sha),
-            "future-dated started_at must exclude older bookmark tips: got {with_future:?}",
-        );
     }
 
     #[test]
