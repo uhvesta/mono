@@ -33,12 +33,16 @@ macos_application(
     # Bundle the engine and the Boss CLIs into Contents/Resources/bin/ so that
     # a single `bazel build //tools/boss/app-macos:Boss` produces a fully
     # self-contained .app (design doc Q3 on-disk layout, Q4 Phase 1).
-    # cube is intentionally absent — assumed pre-installed on target machine.
+    # cube is bundled so the engine can find it even when the macOS GUI launchd
+    # PATH excludes the user's shell PATH (see config.rs resolve_cube_command).
+    # Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
+    # so they continue to resolve cube (and jj, gh, claude, etc.) from PATH.
     additional_contents = {
         "//tools/boss/engine:engine": "Resources/bin",
         "//tools/boss/cli:boss": "Resources/bin",
         "//tools/boss/bossctl:bossctl": "Resources/bin",
         "//tools/boss/event-shim:boss-event": "Resources/bin",
+        "//tools/cube:cube": "Resources/bin",
         "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons": "Resources/TrekIcons",
     },
     visibility = ["//tools/boss/installer:__pkg__"],

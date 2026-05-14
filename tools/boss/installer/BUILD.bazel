@@ -4,8 +4,11 @@ load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "build_info_rs")
 package(default_visibility = ["//visibility:private"])
 
 # The set of binaries bundled inside Boss.app/Contents/Resources/bin/.
-# Note: cube is intentionally absent — it is assumed pre-installed on the
-# target machine and resolved by workers from PATH (design doc Q3).
+# cube is bundled here so that the engine can find it even when the macOS GUI
+# launchd PATH excludes the user's shell PATH (~/bin, /opt/homebrew/bin, etc.).
+# Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
+# so they continue to resolve cube (and jj, gh, claude, etc.) from PATH — only
+# the engine needs the bundled copy.
 filegroup(
     name = "bundled_binaries",
     srcs = [
@@ -13,6 +16,7 @@ filegroup(
         "//tools/boss/cli:boss",
         "//tools/boss/bossctl:bossctl",
         "//tools/boss/event-shim:boss-event",
+        "//tools/cube:cube",
     ],
 )
 

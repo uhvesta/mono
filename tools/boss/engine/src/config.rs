@@ -5,9 +5,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::coordinator::MAX_WORKER_POOL_SIZE;
 
-// `cube` is intentionally NOT bundled inside Boss.app — it is assumed pre-installed
-// on the target machine and resolved from PATH. Use BOSS_CUBE_CMD to override
-// (e.g. `BOSS_CUBE_CMD='bazel run //tools/cube:cube --'` on a dev machine).
+// Bare name used as the PATH fallback. In installed Boss.app the engine
+// resolves cube from the bundle first (see resolve_cube_command); this
+// constant is only reached in dev mode or when the bundle copy is absent.
 const DEFAULT_CUBE_COMMAND: &str = "cube";
 
 #[derive(Debug, Clone)]
@@ -64,10 +64,10 @@ impl AgentConfig {
 
         let (cube_command, cube_args) = parse_command_line(
             "BOSS_CUBE_CMD",
-            std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| DEFAULT_CUBE_COMMAND.to_owned()),
+            std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| resolve_cube_command()),
         )?;
 
-        warn_if_cube_not_on_path(&cube_command);
+        log_cube_resolution(&cube_command);
 
         Ok(Self {
             anthropic_api_key,
@@ -122,17 +122,40 @@ impl RuntimeConfig {
     }
 }
 
-/// Emits a warning if `command` looks like a bare executable name (no path separator)
-/// and cannot be found in any PATH directory. Helps catch misconfigured installs
-/// before the first dispatch attempt surfaces an unhelpful ENOENT.
-fn warn_if_cube_not_on_path(command: &str) {
+/// Returns the cube command to use, preferring a bundle-relative binary when
+/// the engine itself was launched from a bundle (installed Boss.app).
+///
+/// Resolution order:
+///   1. `<engine_exe_dir>/cube` — present in the bundle; used by installed
+///      Boss.app so the engine never depends on the GUI launchd PATH.
+///   2. `"cube"` — bare name resolved from PATH at exec time; used in dev
+///      mode where the engine runs via `bazel run` outside a bundle.
+///
+/// Workers run inside Ghostty terminal panes which inherit the user's shell
+/// PATH, so they continue to resolve cube (and jj, gh, claude, etc.) from
+/// PATH naturally. This bundle-relative lookup is engine-only.
+fn resolve_cube_command() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(DEFAULT_CUBE_COMMAND);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    DEFAULT_CUBE_COMMAND.to_owned()
+}
+
+/// Logs how cube was resolved and warns if the bare name cannot be found on PATH.
+fn log_cube_resolution(command: &str) {
     if command.contains('/') {
+        tracing::info!(command, "cube resolved from bundle");
         return;
     }
     let path_env = std::env::var("PATH").unwrap_or_default();
     let found = std::env::split_paths(&path_env).any(|dir| dir.join(command).is_file());
     if found {
-        tracing::debug!(command, "cube executable found on PATH");
+        tracing::info!(command, "cube resolved from PATH");
     } else {
         tracing::warn!(
             command,
