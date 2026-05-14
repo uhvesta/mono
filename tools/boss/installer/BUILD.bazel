@@ -50,3 +50,34 @@ build_info_rs(
     out = "build_info_generated.rs",
     visibility = ["//tools/boss:__subpackages__"],
 )
+
+# Human-facing release driver (design doc Q4 Phase 3).
+# Signs, notarizes, and staples the Boss installer .pkg.
+#
+# Full release:
+#   bazel run //tools/boss/installer:release --config=release
+#
+# CI / sign-only (no notarization):
+#   bazel run //tools/boss/installer:release --config=release -- --skip-notary
+#
+# Required env vars: BOSS_DEVELOPER_ID_APPLICATION, BOSS_DEVELOPER_ID_INSTALLER
+# See release.sh header for notarization credentials documentation.
+sh_binary(
+    name = "release",
+    srcs = ["release.sh"],
+    data = [
+        # boss_pkg_unsigned provides the SHA-stamped .pkg filename.
+        ":boss_pkg_unsigned",
+        # boss_pkg_payload provides the staged Boss.app tree (with bundled
+        # binaries) that release.sh signs before rebuilding the .pkg.
+        ":boss_pkg_payload",
+        # Pre/postinstall scripts for pkgbuild --scripts.
+        ":installer_scripts",
+        # Entitlements files for codesign invocations.
+        "entitlements/app.entitlements",
+        "entitlements/engine.entitlements",
+        # Distribution XML for productbuild (per-user domain configuration).
+        "distribution.xml",
+    ],
+    visibility = ["//visibility:public"],
+)
