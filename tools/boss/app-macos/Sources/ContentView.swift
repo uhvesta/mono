@@ -17,6 +17,7 @@ struct ContentView: View {
     @StateObject private var bossPane = BossPaneModel()
     #endif
     @State private var isSearchExpanded: Bool = false
+    @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -30,17 +31,16 @@ struct ContentView: View {
         // one NSV may live in the tree at a time. Designs remounts cheaply
         // (filesystem reads only) so structural conditional is safe here.
         ZStack {
-            NavigationSplitView {
+            NavigationSplitView(columnVisibility: $workColumnVisibility) {
                 sidebar
             } detail: {
                 detail
             }
-            // Only show this NavigationSplitView's sidebar toggle when Work is the
-            // active tab. The toggle would be an orphan on Agents and Engine tabs.
-            // The removal modifier must sit directly on the NavigationSplitView
-            // that contributes the default item — applied at the outer ZStack level
-            // it does not reach the injected toggle.
-            .toolbar(removing: model.navigationMode != .work ? .sidebarToggle : nil)
+            // Always remove the default sidebarToggle so it never appears on
+            // non-Work tabs. A custom toggle button in the .toolbar block below
+            // shows only when navigationMode == .work, giving Work its toggle
+            // back without the conditional-removal dynamic that proved unreliable.
+            .toolbar(removing: .sidebarToggle)
             .opacity(model.navigationMode == .work ? 1 : 0)
             .allowsHitTesting(model.navigationMode == .work)
 
@@ -94,6 +94,19 @@ struct ContentView: View {
             model.startIfNeeded()
         }
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                if model.navigationMode == .work {
+                    Button {
+                        withAnimation {
+                            workColumnVisibility = workColumnVisibility == .detailOnly ? .all : .detailOnly
+                        }
+                    } label: {
+                        Image(systemName: "sidebar.left")
+                    }
+                    .help("Toggle Sidebar")
+                }
+            }
+
             ToolbarItem(placement: .navigation) {
                 Picker("Mode", selection: Binding(
                     get: { model.navigationMode },
