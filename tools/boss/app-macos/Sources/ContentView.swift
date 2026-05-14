@@ -16,6 +16,8 @@ struct ContentView: View {
     @StateObject private var workersWorkspace = WorkersWorkspaceModel()
     @StateObject private var bossPane = BossPaneModel()
     #endif
+    @State private var isSearchExpanded: Bool = false
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
@@ -120,6 +122,26 @@ struct ContentView: View {
                     }
                 }
             }
+
+            ToolbarItem(placement: .principal) {
+                BossTitleView(model: model)
+            }
+
+            ToolbarItemGroup(placement: .primaryAction) {
+                if model.navigationMode == .work {
+                    WorkProjectFilterToolbarButton(model: model)
+                    WorkGroupToolbarMenu(model: model)
+                    WorkSearchToolbarItem(
+                        model: model,
+                        isExpanded: $isSearchExpanded,
+                        isFocused: $searchFocused
+                    )
+                }
+            }
+        }
+        .onChange(of: model.navigationMode) { _, _ in
+            isSearchExpanded = false
+            searchFocused = false
         }
         .alert(
             "Work Error",
@@ -348,7 +370,6 @@ struct ContentView: View {
             }
         }
         .listStyle(.sidebar)
-        .searchable(text: $model.workSearchText, placement: .sidebar, prompt: "Filter board")
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Button {
@@ -403,8 +424,8 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .padding(24)
-            } else if let product = model.selectedProduct {
-                workBoard(product: product)
+            } else if model.selectedProduct != nil {
+                workBoard()
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Select a product")
@@ -572,62 +593,18 @@ struct ContentView: View {
         }
     }
 
-    private func workBoard(product: WorkProduct) -> some View {
-        let titleRow = HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(product.name)
-                .font(.title2.weight(.semibold))
-                .fixedSize(horizontal: true, vertical: false)
-            if case .singleRepo(let url) = model.workBoardRepoMode {
-                RepoChipView(
-                    presentation: RepoChipPresentation.forProductHeader(
-                        productRepoURL: url
-                    )
-                )
-            }
-            ProjectFilterButton(model: model)
-        }
-
-        let groupPicker = Picker(
-            "Group",
-            selection: Binding(
-                get: { model.workBoardGrouping },
-                set: { model.setWorkBoardGrouping($0) }
-            )
-        ) {
-            ForEach(WorkBoardGrouping.allCases) { grouping in
-                Text(grouping.title).tag(grouping)
-            }
-        }
-        .pickerStyle(.segmented)
-        .frame(width: 220)
-
-        return VStack(alignment: .leading, spacing: 16) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top) {
-                    titleRow
-                    Spacer(minLength: 16)
-                    groupPicker
-                }
-                VStack(alignment: .leading, spacing: 10) {
-                    titleRow
-                    groupPicker
+    private func workBoard() -> some View {
+        ScrollView(.horizontal) {
+            HStack(alignment: .top, spacing: workBoardColumnSpacing) {
+                ForEach(WorkBoardColumnKey.allCases) { column in
+                    workColumn(column)
                 }
             }
             .padding(.horizontal, workBoardHorizontalPadding)
-            .padding(.top, 20)
-
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: workBoardColumnSpacing) {
-                    ForEach(WorkBoardColumnKey.allCases) { column in
-                        workColumn(column)
-                    }
-                }
-                .padding(.horizontal, workBoardHorizontalPadding)
-                .frame(maxHeight: .infinity, alignment: .top)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.top, workBoardHorizontalPadding)
+            .frame(maxHeight: .infinity, alignment: .top)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func workColumn(_ column: WorkBoardColumnKey) -> some View {
@@ -855,7 +832,29 @@ private struct WorkSidebarFilterRow: View {
     }
 }
 
-private struct ProjectFilterButton: View {
+private struct BossTitleView: View {
+    @ObservedObject var model: ChatViewModel
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("Boss")
+                .font(.subheadline.weight(.semibold))
+            if let product = model.selectedProduct,
+               let repoURL = product.repoRemoteURL,
+               !repoURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let slug = shortRepoName(for: repoURL)
+                Text("·")
+                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                Text(slug)
+                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+            }
+        }
+    }
+}
+
+private struct WorkProjectFilterToolbarButton: View {
     @ObservedObject var model: ChatViewModel
     @State private var isShowingPopover = false
 
@@ -863,19 +862,74 @@ private struct ProjectFilterButton: View {
         Button {
             isShowingPopover.toggle()
         } label: {
-            HStack(spacing: 3) {
-                Text(model.projectFilterDescription)
-                    .font(.subheadline)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-            }
-            .foregroundStyle(.secondary)
+            Image(systemName: "square.stack.3d.up")
+                .overlay(alignment: .topTrailing) {
+                    if model.hasProjectFilters {
+                        Circle()
+                            .fill(Color.accentColor)
+                            .frame(width: 6, height: 6)
+                            .offset(x: 3, y: -3)
+                    }
+                }
         }
-        .buttonStyle(.plain)
+        .help("Project filter")
         .popover(isPresented: $isShowingPopover, arrowEdge: .bottom) {
             ProjectFilterPopover(model: model)
+        }
+    }
+}
+
+private struct WorkGroupToolbarMenu: View {
+    @ObservedObject var model: ChatViewModel
+
+    var body: some View {
+        Menu {
+            ForEach(WorkBoardGrouping.allCases) { grouping in
+                Button {
+                    model.setWorkBoardGrouping(grouping)
+                } label: {
+                    if model.workBoardGrouping == grouping {
+                        Label(grouping.title, systemImage: "checkmark")
+                    } else {
+                        Text(grouping.title)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "rectangle.3.group")
+        }
+        .help("Group by")
+    }
+}
+
+private struct WorkSearchToolbarItem: View {
+    @ObservedObject var model: ChatViewModel
+    @Binding var isExpanded: Bool
+    @FocusState.Binding var isFocused: Bool
+
+    var body: some View {
+        if isExpanded {
+            TextField("Search", text: $model.workSearchText)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 160)
+                .focused($isFocused)
+                .onKeyPress(.escape) {
+                    isExpanded = false
+                    model.workSearchText = ""
+                    return .handled
+                }
+                .onChange(of: isFocused) { _, focused in
+                    if !focused { isExpanded = false }
+                }
+                .onAppear { isFocused = true }
+        } else {
+            Button {
+                isExpanded = true
+            } label: {
+                Image(systemName: "magnifyingglass")
+            }
+            .help("Search (⌘F)")
+            .keyboardShortcut("f", modifiers: .command)
         }
     }
 }
