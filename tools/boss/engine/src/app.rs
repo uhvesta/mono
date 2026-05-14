@@ -3890,20 +3890,37 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::GetRun { id } => match work_db.get_run(&id) {
-                Ok(run) => {
-                    send_response(&sink, &request_id, FrontendEvent::RunResult { run });
+            FrontendRequest::GetRun { id } => {
+                // Try the run_* namespace first, then fall back to the
+                // exec_* namespace. Callers such as `bossctl agents
+                // status` pass whatever id they have in hand — often an
+                // execution id (exec_*) — but `get_run` joins against
+                // `work_runs.id` (run_*), so the lookup silently fails
+                // with "unknown run". `list_runs(exec_id)` finds the
+                // run via `work_runs.execution_id` and returns the most
+                // recent one (the active or last-completed run for that
+                // execution).
+                let result = work_db.get_run(&id).ok().or_else(|| {
+                    work_db
+                        .list_runs(&id)
+                        .ok()
+                        .and_then(|mut runs| runs.pop())
+                });
+                match result {
+                    Some(run) => {
+                        send_response(&sink, &request_id, FrontendEvent::RunResult { run });
+                    }
+                    None => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("unknown run: {id}"),
+                            },
+                        );
+                    }
                 }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
+            }
             FrontendRequest::CreateAttentionItem { input } => {
                 match work_db.create_attention_item(input) {
                     Ok(item) => {

@@ -204,8 +204,15 @@ enum AgentsAction {
         agent: String,
     },
     /// Print the most recent transcript chunk from a worker.
+    ///
+    /// Works for both live workers and terminal/completed executions.
+    /// For a completed execution, pass the execution id (`exec_*`) or
+    /// run id (`run_*`) — the engine resolves the transcript path from
+    /// the persistent `work_runs.transcript_path` record.
     Transcript {
-        /// Worker reference: run id, slot id, or crew name.
+        /// Worker reference: run id (`run_*`), execution id (`exec_*`),
+        /// slot id, or crew name. For completed executions, pass the
+        /// execution id shown by `bossctl agents status <exec_id>`.
         agent: String,
         #[arg(long, default_value_t = 100)]
         lines: usize,
@@ -1069,7 +1076,18 @@ async fn agents_transcript(
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
-    let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
+
+    // For live workers resolve via the registry. For completed/terminal
+    // executions the live registry has no entry — fall through and let
+    // the engine query work_runs.transcript_path from the DB. The
+    // engine's resolve_transcript_for_tail handles both the exec_* and
+    // run_* namespaces, so passing the raw ref works for either id form.
+    let run_id = match resolve_agent_ref(&agent, &states) {
+        Ok(state) => state.run_id.clone(),
+        Err(err) if looks_like_name_or_slot(&agent) => return Err(err),
+        Err(_) => agent.clone(),
+    };
+
     let response = client
         .send_request(&FrontendRequest::TailRunTranscript {
             run_id: run_id.clone(),
