@@ -403,6 +403,7 @@ private struct MarkdownDocumentView: View {
                         baseURL: fileURL.deletingLastPathComponent()
                     )
                     .bossMarkdown()
+                    .textual.textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
@@ -464,6 +465,7 @@ struct MarkdownViewerView: View {
                 Divider()
                 StructuredText(markdown: source)
                     .bossMarkdown()
+                    .textual.textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.horizontal, 24)
