@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -34,8 +35,32 @@ final class EngineProcessController: @unchecked Sendable {
             }
 
             if let pid = currentEnginePID() {
-                emit("[engine attach] using existing engine pid=\(pid)")
-                return
+                // An engine is already running. Check if its binary matches
+                // the app's bundled engine. If not, replace it so the user
+                // always gets the version that shipped with this app launch.
+                // Skip the check when BOSS_ENGINE_CMD is set — the developer
+                // is explicitly pointing at a custom engine binary.
+                let skipCheck = ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] != nil
+                if !skipCheck,
+                   let bundledPath = bundledEnginePath(),
+                   let bundledFP = computeBinaryFingerprint(path: bundledPath),
+                   let runningFP = queryRunningEngineFingerprint(
+                       socketPath: socketPath, timeoutSeconds: 3.0
+                   ),
+                   bundledFP != runningFP
+                {
+                    emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing engine pid=\(pid)")
+                    terminateProcess(pid: pid)
+                    clearPIDFileIfOwned(pid: pid)
+                    let closed = waitForSocketClose(socketPath: socketPath, timeoutSeconds: 8.0)
+                    if !closed {
+                        emit("[engine upgrade] socket did not close within 8s after SIGTERM; SIGKILL should have fired already")
+                    }
+                    emit("[engine upgrade] old engine stopped — launching new engine from bundle")
+                } else {
+                    emit("[engine attach] using existing engine pid=\(pid)")
+                    return
+                }
             }
 
             let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
@@ -47,6 +72,154 @@ final class EngineProcessController: @unchecked Sendable {
                 emit("[engine launch] started but pid file not observed yet: \(pidFilePath)")
             }
         }
+    }
+
+    // MARK: - Version-check helpers
+
+    /// Path to the engine binary shipped inside the current app bundle.
+    /// Returns `nil` in dev/bazel-run mode where no bundle engine exists.
+    private func bundledEnginePath() -> String? {
+        guard let resourcePath = Bundle.main.resourcePath else { return nil }
+        let path = "\(resourcePath)/bin/engine"
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        return path
+    }
+
+    /// Compute a binary fingerprint of `path` using the same algorithm
+    /// as `boss_engine::build_info::binary_fingerprint`:
+    ///   SHA-256 of up to 64 MiB of file content → first 6 bytes as
+    ///   12 lowercase hex digits, optionally suffixed "-truncated".
+    private func computeBinaryFingerprint(path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+
+        let cap: Int = 64 * 1024 * 1024
+        var hasher = SHA256()
+        var readTotal = 0
+        var truncated = false
+        let chunkSize = 64 * 1024
+
+        while true {
+            let remaining = cap - readTotal
+            guard remaining > 0 else {
+                // Probe for more bytes to set the truncated flag.
+                let probe = (try? fh.read(upToCount: 1)) ?? Data()
+                if !probe.isEmpty { truncated = true }
+                break
+            }
+            let toRead = min(chunkSize, remaining)
+            guard let chunk = try? fh.read(upToCount: toRead), !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+            readTotal += chunk.count
+            if chunk.count < toRead {
+                // EOF before cap.
+                break
+            }
+        }
+
+        let digest = hasher.finalize()
+        let firstSixBytes = digest.prefix(6)
+        let hex = firstSixBytes.map { String(format: "%02x", $0) }.joined()
+        return truncated ? "\(hex)-truncated" : hex
+    }
+
+    /// Open a synchronous Unix-domain connection to `socketPath`, send a
+    /// `get_engine_version` request, and return the `binary_fingerprint`
+    /// from the response. Returns `nil` on any error (timeout, parse
+    /// failure, socket unavailable).
+    private func queryRunningEngineFingerprint(
+        socketPath: String,
+        timeoutSeconds: Double
+    ) -> String? {
+        let sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard sock >= 0 else { return nil }
+        defer { Darwin.close(sock) }
+
+        // Apply send/recv timeouts so a hung engine doesn't block startup.
+        var tv = timeval(
+            tv_sec: Int(timeoutSeconds),
+            tv_usec: Int32((timeoutSeconds.truncatingRemainder(dividingBy: 1.0)) * 1_000_000)
+        )
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        // Capture the size of sun_path before the exclusive-access borrow.
+        let sunPathMax = MemoryLayout.size(ofValue: addr.sun_path)
+        _ = socketPath.withCString { cStr in
+            withUnsafeMutablePointer(to: &addr.sun_path) { dst in
+                memcpy(UnsafeMutableRawPointer(dst), cStr, min(strlen(cStr), sunPathMax - 1))
+            }
+        }
+        let connectResult: Int32 = withUnsafePointer(to: addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else { return nil }
+
+        let requestJSON = "{\"request_id\":\"version-check\",\"payload\":{\"type\":\"get_engine_version\"}}\n"
+        guard let requestData = requestJSON.data(using: .utf8) else { return nil }
+        let sent = requestData.withUnsafeBytes { buf in
+            Darwin.send(sock, buf.baseAddress!, buf.count, 0)
+        }
+        guard sent == requestData.count else { return nil }
+
+        // Read newline-delimited JSON until we see our response.
+        var responseBuffer = Data()
+        var readBuf = [UInt8](repeating: 0, count: 4096)
+        outer: while true {
+            let n = Darwin.recv(sock, &readBuf, readBuf.count, 0)
+            if n <= 0 { break }
+            responseBuffer.append(contentsOf: readBuf[..<n])
+            while let newlineIdx = responseBuffer.firstIndex(of: 0x0A) {
+                let lineData = Data(responseBuffer[..<newlineIdx])
+                responseBuffer.removeSubrange(...newlineIdx)
+                guard
+                    let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                    json["request_id"] as? String == "version-check",
+                    let payload = json["payload"] as? [String: Any],
+                    payload["type"] as? String == "engine_version_result",
+                    let fp = payload["binary_fingerprint"] as? String
+                else { continue }
+                return fp
+            }
+            // Safety: if we've buffered a lot without finding a match, stop.
+            if responseBuffer.count > 256 * 1024 { break outer }
+        }
+        return nil
+    }
+
+    /// Poll until `socketPath` is no longer connectable (the engine has
+    /// closed it) or `timeoutSeconds` elapses. Returns `true` if the
+    /// socket closed in time.
+    private func waitForSocketClose(socketPath: String, timeoutSeconds: Double) -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            let sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+            guard sock >= 0 else { return true }
+            var addr = sockaddr_un()
+            addr.sun_family = sa_family_t(AF_UNIX)
+            let sunPathMaxClose = MemoryLayout.size(ofValue: addr.sun_path)
+            _ = socketPath.withCString { cStr in
+                withUnsafeMutablePointer(to: &addr.sun_path) { dst in
+                    memcpy(UnsafeMutableRawPointer(dst), cStr,
+                           min(strlen(cStr), sunPathMaxClose - 1))
+                }
+            }
+            let result = withUnsafePointer(to: addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            Darwin.close(sock)
+            if result != 0 {
+                return true  // Connection refused — socket is closed.
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return false
     }
 
     /// Resolve the engine command and the BOSS_BIN_DIR to export.

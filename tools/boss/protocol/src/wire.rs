@@ -508,6 +508,15 @@ pub enum FrontendRequest {
     /// state and is the round-trip "the engine has reloaded" signal
     /// the debug pane uses to render the toggle as committed.
     SetFeatureFlag { name: String, enabled: bool },
+    /// Ask the engine to identify itself. Replies with
+    /// [`FrontendEvent::EngineVersionResult`] carrying the build SHA,
+    /// build time, and binary-content fingerprint of the running
+    /// engine binary. Used by the macOS app on attach to detect
+    /// whether the running engine matches the app's bundled engine; if
+    /// they differ the app stops the old engine and spawns the new one
+    /// from the bundle, ensuring the user always gets the version that
+    /// shipped with the app they launched.
+    GetEngineVersion,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -960,6 +969,21 @@ pub enum FrontendEvent {
     /// new value is in effect immediately for all subsequent
     /// consumer-side checks.
     FeatureFlagSet { name: String, enabled: bool },
+    /// Response to [`FrontendRequest::GetEngineVersion`]: identifies
+    /// the running engine binary. `binary_fingerprint` is the most
+    /// reliable signal — it is a truncated SHA-256 of the engine
+    /// binary's on-disk bytes (same algorithm as
+    /// `boss_engine::build_info::binary_fingerprint`). The macOS app
+    /// computes the same hash for its bundled engine file and compares;
+    /// a mismatch means the running engine pre-dates the current app
+    /// bundle and should be replaced. `git_sha` and `build_time` are
+    /// included for human-readable logging only; they may be "unknown"
+    /// in dev builds.
+    EngineVersionResult {
+        git_sha: String,
+        build_time: String,
+        binary_fingerprint: String,
+    },
 }
 
 /// Snapshot of one feature flag's static metadata + current value.

@@ -156,6 +156,30 @@ impl BossClient {
     }
 }
 
+impl BossClient {
+    /// Ask the running engine for its version identifiers. Returns
+    /// `(git_sha, build_time, binary_fingerprint)`. The
+    /// `binary_fingerprint` is the most reliable signal for detecting
+    /// whether the running engine matches an expected binary — see
+    /// `boss_engine::build_info::binary_fingerprint` for the algorithm.
+    pub async fn get_engine_version(&mut self) -> Result<(String, String, String)> {
+        let event = self
+            .send_request(&boss_protocol::FrontendRequest::GetEngineVersion)
+            .await?;
+        match event {
+            boss_protocol::FrontendEvent::EngineVersionResult {
+                git_sha,
+                build_time,
+                binary_fingerprint,
+            } => Ok((git_sha, build_time, binary_fingerprint)),
+            other => anyhow::bail!(
+                "unexpected response to GetEngineVersion: {:?}",
+                other
+            ),
+        }
+    }
+}
+
 pub async fn engine_socket_reachable(socket_path: &str) -> bool {
     UnixStream::connect(socket_path).await.is_ok()
 }

@@ -4832,6 +4832,17 @@ async fn handle_frontend_connection(
                     FrontendEvent::LiveStatusDebugReportEvent { report },
                 );
             }
+            FrontendRequest::GetEngineVersion => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::EngineVersionResult {
+                        git_sha: crate::build_info::git_sha().to_owned(),
+                        build_time: crate::build_info::build_time().to_owned(),
+                        binary_fingerprint: crate::build_info::binary_fingerprint().to_owned(),
+                    },
+                );
+            }
             FrontendRequest::ListFeatureFlags => {
                 let flags = server_state
                     .feature_flags
