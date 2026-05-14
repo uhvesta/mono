@@ -1606,3 +1606,66 @@ async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()
     }
     Ok(())
 }
+
+/// `RequestExecution` should accept friendly-id forms (T1, T2, …) in
+/// addition to the primary `task_*` ids. This covers the
+/// `bossctl work start T3` failure from 2026-05-14 where the engine
+/// rejected the bareword before even checking the work-item table.
+#[tokio::test]
+async fn request_execution_accepts_tnnn_friendly_id() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // Seed a product + chore. The first chore in a fresh DB gets short_id=1
+    // (or the next available sequence slot), making it addressable as T1.
+    let SeededExecution { work_item_id, .. } = seed_execution(&mut client).await?;
+
+    // Fetch the chore to learn its short_id.
+    let short_id = match client
+        .send_request(&FrontendRequest::GetWorkItem {
+            id: work_item_id.clone(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemResult {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemResult {
+            item: WorkItem::Task(t),
+        } => t.short_id.expect("chore must have a short_id after creation"),
+        other => return Err(anyhow!("unexpected GetWorkItem response: {other:?}")),
+    };
+
+    let friendly_id = format!("T{short_id}");
+
+    // Re-request execution using the friendly id — the engine must
+    // resolve it and return the same execution row (idempotent path).
+    let response = client
+        .send_request(&FrontendRequest::RequestExecution {
+            input: RequestExecutionInput {
+                work_item_id: friendly_id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            },
+        })
+        .await?;
+
+    match response {
+        FrontendEvent::ExecutionRequested { execution }
+        | FrontendEvent::ExecutionResult { execution }
+        | FrontendEvent::ExecutionCreated { execution } => {
+            assert_eq!(
+                execution.work_item_id, work_item_id,
+                "resolved work_item_id must match the primary id"
+            );
+        }
+        FrontendEvent::WorkError { message } => {
+            return Err(anyhow!(
+                "engine rejected RequestExecution with friendly id {friendly_id}: {message}"
+            ))
+        }
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}

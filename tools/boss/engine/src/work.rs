@@ -322,6 +322,9 @@ impl WorkDb {
     /// Returns or creates a ready execution for `work_item_id`, applying any
     /// priority / preferred-workspace overrides from the request.
     ///
+    /// Friendly ids (`T3`, `P7`) are resolved to primary ids before any other
+    /// processing, so callers do not need to pre-resolve them.
+    ///
     /// If the most recent execution for this work item is still in flight
     /// (`ready` / `running` / `waiting_*`) we update its priority and
     /// preferred_workspace_id rather than creating a duplicate. If it is
@@ -352,10 +355,16 @@ impl WorkDb {
     ///   existing `abandoned`, insert new `ready`.
     pub fn request_execution_with_live_check<F: FnOnce(&str) -> bool>(
         &self,
-        input: RequestExecutionInput,
+        mut input: RequestExecutionInput,
         is_live: F,
     ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
+        // Resolve T42 / P7 friendly ids to primary ids before any other check,
+        // so callers like `bossctl work start T3` work without client-side
+        // resolution. Primary ids (task_*, proj_*, prod_*) pass through unchanged.
+        if let Some(resolved) = resolve_friendly_work_item_id(&conn, &input.work_item_id)? {
+            input.work_item_id = resolved;
+        }
         // Pre-check the resolver outside the transaction. If the work
         // item has no repo resolution, write a sticky attention item
         // via a *separate* short-lived tx that commits before the
@@ -7468,6 +7477,45 @@ enum ItemKind {
     Product,
     Project,
     Task,
+}
+
+/// If `id` looks like a friendly work-item selector (`T42`, `t42`, `P7`,
+/// `p7`), query the DB by short_id and return the matching primary id.
+/// Returns `Ok(None)` when `id` is not a friendly-id form or when no row
+/// matches; callers should treat the original id as-is in that case.
+fn resolve_friendly_work_item_id(conn: &Connection, id: &str) -> Result<Option<String>> {
+    if id.len() < 2 {
+        return Ok(None);
+    }
+    let first = id.as_bytes()[0];
+    if first != b'T' && first != b't' && first != b'P' && first != b'p' {
+        return Ok(None);
+    }
+    let n: i64 = match id[1..].parse() {
+        Ok(n) if n > 0 => n,
+        _ => return Ok(None),
+    };
+    if let Some(primary_id) = conn
+        .query_row(
+            "SELECT id FROM tasks WHERE short_id = ?1 AND deleted_at IS NULL LIMIT 1",
+            params![n],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(primary_id));
+    }
+    if let Some(primary_id) = conn
+        .query_row(
+            "SELECT id FROM projects WHERE short_id = ?1 LIMIT 1",
+            params![n],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(primary_id));
+    }
+    Ok(None)
 }
 
 fn classify_id(id: &str) -> Result<ItemKind> {
