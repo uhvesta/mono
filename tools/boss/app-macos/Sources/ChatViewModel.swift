@@ -100,7 +100,9 @@ final class ChatViewModel: ObservableObject {
     /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
     /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
     /// button taps. Phase 5 #14 of the merge-conflict design.
-    @Published var conflictResolutions: [WorkConflictResolution] = []
+    @Published var conflictResolutions: [WorkConflictResolution] = [] {
+        didSet { invalidateWorkCache() }
+    }
 
     /// PR URLs whose most recent conflict-resolution attempt succeeded,
     /// with the wall-clock timestamp the engine reported (or the local
@@ -1275,12 +1277,38 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// The column that `task` renders into, overriding `task.boardColumn`
+    /// when a merge-resolution worker is actively running against it. A
+    /// `blocked: merge_conflict` task with a `pending` or `running`
+    /// conflict resolution routes to `.doing` so the kanban invariant
+    /// holds: Doing = a worker is touching this right now.
+    func effectiveBoardColumn(for task: WorkTask) -> WorkBoardColumnKey {
+        if task.status == "blocked",
+           task.blockedReason == "merge_conflict",
+           let attemptID = task.blockedAttemptID,
+           conflictResolutions.contains(where: {
+               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
+           }) {
+            return .doing
+        }
+        return task.boardColumn
+    }
+
+    /// The active conflict resolution for `taskID`, if any. A resolution
+    /// is "active" when its status is `pending` or `running`. Returns
+    /// `nil` when no such attempt exists.
+    func activeConflictResolution(for taskID: String) -> WorkConflictResolution? {
+        conflictResolutions.first {
+            $0.workItemID == taskID && ($0.status == "pending" || $0.status == "running")
+        }
+    }
+
     func workItems(in column: WorkBoardColumnKey) -> [WorkTask] {
         if let cached = cachedItemsByColumn[column] {
             return cached
         }
         let items = visibleWorkItems
-            .filter { $0.boardColumn == column }
+            .filter { effectiveBoardColumn(for: $0) == column }
             .sorted(by: boardTaskSort)
         cachedItemsByColumn[column] = items
         return items
@@ -1472,7 +1500,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func isTaskVisible(_ task: WorkTask) -> Bool {
-        workItems(in: task.boardColumn).contains(where: { $0.id == task.id })
+        workItems(in: effectiveBoardColumn(for: task)).contains(where: { $0.id == task.id })
     }
 
     private func mergeTaskRuntimes(

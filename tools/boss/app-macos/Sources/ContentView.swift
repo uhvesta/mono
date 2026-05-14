@@ -974,15 +974,26 @@ private struct WorkBoardCardItem: View {
         // "waiting for a slot" subtitle distinct from an active worker.
         let isDispatchPending = task.status == "todo" && task.autostart
 
+        // A conflict-resolution card is status=blocked+merge_conflict with
+        // an active resolution attempt. It routes to Doing for the duration
+        // of the worker run; we surface a distinct "resolving conflicts"
+        // indicator rather than the generic agent-activity dot.
+        let isResolvingConflicts = column == .doing
+            && task.status == "blocked"
+            && task.blockedReason == "merge_conflict"
+
         let activityState: AgentActivityState? = column == .doing
             ? (isDispatchPending
                 ? .dispatchPending
+                : isResolvingConflicts
+                ? .waiting(reason: "Resolving merge conflict")
                 : AgentActivityState(runtime: runtime, liveState: liveState))
             : nil
 
         let liveStatusForCard: String? = {
             guard column == .doing else { return nil }
             if isDispatchPending { return "Waiting for a slot" }
+            if isResolvingConflicts { return nil }
             return liveState?.liveStatus
         }()
 
@@ -1021,7 +1032,8 @@ private struct WorkBoardCardItem: View {
                     isAutoBlocked: isAutoBlocked,
                     gatingPrereqs: gatingPrereqs,
                     repoChip: repoChip,
-                    showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL)
+                    showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL),
+                    isResolvingConflicts: isResolvingConflicts
                 )
             }
             .buttonStyle(.plain)
@@ -1145,6 +1157,12 @@ struct WorkBoardCardView: View {
     /// `"🔧 conflict cleared"` chip in the footer; ages out after 24h
     /// via [[ChatViewModel.showsConflictClearedBadge(forPR:)]].
     var showsConflictClearedBadge: Bool = false
+    /// True when this card is in the Doing column because a merge-
+    /// resolution worker is actively running against it. Suppresses the
+    /// blocked-row orange chrome and renders the `"resolving conflicts"`
+    /// indicator instead so the user can tell at a glance what the
+    /// active work is.
+    var isResolvingConflicts: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1166,12 +1184,12 @@ struct WorkBoardCardView: View {
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        if task.status == "blocked" {
+                        if task.status == "blocked" && !isResolvingConflicts {
                             Image(systemName: "lock.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                                 .accessibilityLabel("Blocked")
-                        } else if task.blockedReason != nil {
+                        } else if task.blockedReason != nil && !isResolvingConflicts {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
@@ -1211,7 +1229,9 @@ struct WorkBoardCardView: View {
                     if let projectName, !projectName.isEmpty {
                         WorkStatusBadge(text: projectName)
                     }
-                    if task.status == "blocked" {
+                    if isResolvingConflicts {
+                        ResolvingConflictsBadge()
+                    } else if task.status == "blocked" {
                         WorkStatusBadge(text: "Blocked")
                     } else if let reason = task.blockedReason {
                         WorkStatusBadge(text: blockedReasonLabel(reason))
@@ -1319,7 +1339,7 @@ struct WorkBoardCardView: View {
         if isSelected {
             return Color.accentColor.opacity(0.08)
         }
-        if task.status == "blocked" || task.blockedReason != nil {
+        if !isResolvingConflicts && (task.status == "blocked" || task.blockedReason != nil) {
             return Color.orange.opacity(0.08)
         }
         return Color(nsColor: .windowBackgroundColor)
@@ -1329,7 +1349,7 @@ struct WorkBoardCardView: View {
         if isSelected {
             return .accentColor
         }
-        if task.status == "blocked" || task.blockedReason != nil {
+        if !isResolvingConflicts && (task.status == "blocked" || task.blockedReason != nil) {
             return .orange
         }
         return Color(nsColor: .separatorColor)
@@ -2485,6 +2505,28 @@ private struct ConflictClearedBadge: View {
         .clipShape(Capsule())
         .help("The engine cleared a merge conflict on this PR within the last 24 hours.")
         .accessibilityLabel("Conflict cleared by the engine")
+    }
+}
+
+/// "resolving conflicts" PR-card chip. Rendered on cards that have been
+/// routed to the Doing column because a merge-resolution worker is
+/// actively running against them. Signals to the user that the active
+/// work is conflict resolution rather than the original task scope.
+private struct ResolvingConflictsBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.caption2)
+            Text("resolving conflicts")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.orange)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(Capsule())
+        .help("A worker is actively resolving a merge conflict on this PR.")
+        .accessibilityLabel("Resolving merge conflict")
     }
 }
 
