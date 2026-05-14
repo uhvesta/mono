@@ -542,6 +542,20 @@ final class EngineClient: @unchecked Sendable {
     private func sendLine(_ payload: [String: Any]) {
         outboundRecorder?(payload)
 
+        // Log outbound engine_response messages so both sides of every
+        // IPC round-trip have a disk record.
+        if let type = payload["type"] as? String, type == "engine_response",
+           let requestId = payload["request_id"] as? String,
+           let response = payload["response"] as? [String: Any],
+           let kind = response["kind"] as? String {
+            IpcLog.shared.log(
+                requestId: requestId,
+                direction: "app→engine",
+                kind: kind,
+                body: response
+            )
+        }
+
         guard let connection else {
             emit(.error(message:"engine connection is not established"))
             return
@@ -697,6 +711,12 @@ final class EngineClient: @unchecked Sendable {
                     emit(.error(message:"engine_request missing required fields"))
                     break
                 }
+                IpcLog.shared.log(
+                    requestId: requestId,
+                    direction: "engine→app",
+                    kind: kind,
+                    body: request
+                )
                 switch kind {
                 case "spawn_worker_pane":
                     let runId = request["run_id"] as? String ?? ""

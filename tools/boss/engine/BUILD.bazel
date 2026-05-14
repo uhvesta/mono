@@ -21,6 +21,7 @@ rust_library(
         "src/dispatch_reader.rs",
         "src/effort.rs",
         "src/events_socket.rs",
+        "src/ipc_log.rs",
         "src/lib.rs",
         "src/live_status.rs",
         "src/live_status_loop.rs",

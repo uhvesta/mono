@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::audit_effort;
 use crate::cli::Cli;
+use crate::ipc_log::IpcLogger;
 use crate::completion::{
     CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
@@ -363,6 +364,12 @@ struct ServerState {
     /// only ever sees one pane allocation in flight at a time. See the
     /// `WorkerSpawner` impl for the why.
     spawn_pane_lock: Arc<Mutex<()>>,
+    /// Append-only JSONL log of every engine↔app IPC exchange. Each
+    /// `send_to_app` call appends an `engine→app` record; each
+    /// `deliver_app_response` call appends an `app→engine` record.
+    /// Backed by a background task so log writes never block the hot
+    /// path. Files rotate daily under `<state-root>/ipc/`.
+    ipc_logger: IpcLogger,
     /// Weak self-reference produced by `Arc::new_cyclic`. Kept so
     /// late-bound consumers (the pane-spawn runner) can resolve back
     /// to the live `Arc<ServerState>` without an outer allocation.
@@ -589,6 +596,7 @@ impl ServerState {
         );
         let dispatch_events_for_state = dispatch_events.clone();
         let dispatch_event_root_for_state = dispatch_event_root.clone();
+        let ipc_logger = IpcLogger::new(&dispatch_event_root);
 
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
@@ -628,6 +636,7 @@ impl ServerState {
                 next_probe_id: AtomicU64::new(1),
                 app_session: Arc::new(Mutex::new(None)),
                 spawn_pane_lock: Arc::new(Mutex::new(())),
+                ipc_logger,
                 _self_weak: weak_self.clone(),
             }
         });
@@ -683,6 +692,8 @@ impl ServerState {
                 }));
             request_id
         };
+
+        self.ipc_logger.log_request(&request_id, &request);
 
         match timeout(wait, rx).await {
             Ok(Ok(response)) => Ok(response),
@@ -1182,6 +1193,8 @@ impl ServerState {
         request_id: &str,
         response: EngineToAppResponse,
     ) {
+        self.ipc_logger.log_response(request_id, &response);
+
         let mut guard = self.app_session.lock().await;
         let Some(handle) = guard.as_mut() else {
             tracing::warn!(
