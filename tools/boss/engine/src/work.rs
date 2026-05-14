@@ -128,7 +128,7 @@ impl WorkDb {
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model
+            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble
              FROM products
              ORDER BY name COLLATE NOCASE ASC",
         )?;
@@ -2566,7 +2566,8 @@ impl WorkDb {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 default_model TEXT,
-                ci_attempt_budget INTEGER NOT NULL DEFAULT 3
+                ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
+                dispatch_preamble TEXT
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -2749,6 +2750,7 @@ impl WorkDb {
         migrate_ci_failure_suppressions_table(&conn)?;
         migrate_tasks_ci_attempt_columns(&conn)?;
         migrate_products_ci_attempt_budget(&conn)?;
+        migrate_products_dispatch_preamble(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
         migrate_null_redundant_task_repo_remote_urls(&conn)?;
@@ -2813,12 +2815,13 @@ impl WorkDb {
         apply_repo_remote_url_patch(&mut product.repo_remote_url, patch.repo_remote_url);
         apply_text_patch(&mut product.status, patch.status);
         apply_optional_string_patch(&mut product.default_model, patch.default_model);
+        apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
         product.slug = unique_product_slug_for_update(&tx, id, &slugify(&product.name))?;
         product.updated_at = now_string();
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9
              WHERE id = ?1",
             params![
                 product.id,
@@ -2829,6 +2832,7 @@ impl WorkDb {
                 product.status,
                 product.updated_at,
                 product.default_model,
+                product.dispatch_preamble,
             ],
         )?;
 
@@ -4580,6 +4584,7 @@ fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         default_model: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+        dispatch_preamble: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -5074,7 +5079,7 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
 
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
-        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model
+        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble
          FROM products
          WHERE id = ?1",
         [id],
@@ -5855,6 +5860,18 @@ fn migrate_products_ci_attempt_budget(conn: &Connection) -> Result<()> {
             "ALTER TABLE products ADD COLUMN ci_attempt_budget INTEGER NOT NULL DEFAULT 3",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// Add `products.dispatch_preamble` — an optional text string prepended
+/// (with a visible bracket marker) to every worker's initial context
+/// at spawn time. `NULL` / empty → no injection (existing behaviour).
+/// Lets a product owner set per-product runtime guidance (e.g. test-runner
+/// preferences) that workers see on every spawn.
+fn migrate_products_dispatch_preamble(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "dispatch_preamble")? {
+        conn.execute("ALTER TABLE products ADD COLUMN dispatch_preamble TEXT", [])?;
     }
     Ok(())
 }

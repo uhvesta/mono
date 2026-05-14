@@ -18,6 +18,14 @@ pub struct Product {
     /// migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Optional preamble prepended to every worker's initial context
+    /// at spawn time, visibly bracketed so humans reading transcripts
+    /// know what was injected and by whom. `None` / empty → today's
+    /// behaviour (no injection). Intended for per-product runtime
+    /// guidance such as test-runner preferences that workers should
+    /// see on every spawn rather than only when they read AGENTS.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_preamble: Option<String>,
 }
 
 /// Allowed values for `tasks.effort_level`. Per design §"Naming" /
@@ -873,6 +881,11 @@ pub struct WorkItemPatch {
     /// project. `None` → leave unchanged. `Some("")` → clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Product-level dispatch preamble. Only honoured on
+    /// product-targeted updates. `None` → leave unchanged.
+    /// `Some("")` → clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_preamble: Option<String>,
     /// Flip the `autostart` flag. `None` → leave unchanged.
     /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -2118,3 +2118,78 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
 
     Ok(())
 }
+
+/// `dispatch_preamble` round-trip: set, verify, update, clear.
+#[tokio::test]
+async fn product_dispatch_preamble_round_trip() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "preamble-test".to_owned(),
+            description: None,
+            repo_remote_url: None,
+        },
+    )
+    .await?;
+    assert!(
+        product.dispatch_preamble.is_none(),
+        "new product has no dispatch_preamble"
+    );
+
+    // Set a preamble via product update.
+    let updated = expect_product(
+        update_work_item(
+            &mut client,
+            &product.id,
+            WorkItemPatch {
+                dispatch_preamble: Some("Prefer bazel for tests.".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(
+        updated.dispatch_preamble.as_deref(),
+        Some("Prefer bazel for tests."),
+        "preamble should be stored verbatim",
+    );
+
+    // Update to a different value.
+    let updated2 = expect_product(
+        update_work_item(
+            &mut client,
+            &product.id,
+            WorkItemPatch {
+                dispatch_preamble: Some("Use bazel; cargo only on explicit fallback.".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert_eq!(
+        updated2.dispatch_preamble.as_deref(),
+        Some("Use bazel; cargo only on explicit fallback."),
+    );
+
+    // Clear via empty string.
+    let cleared = expect_product(
+        update_work_item(
+            &mut client,
+            &product.id,
+            WorkItemPatch {
+                dispatch_preamble: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .await?,
+    )?;
+    assert!(
+        cleared.dispatch_preamble.is_none(),
+        "empty string clears the preamble",
+    );
+
+    Ok(())
+}

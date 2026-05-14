@@ -307,18 +307,27 @@ impl ExecutionRunner for PaneSpawnRunner {
         // `--effort` value and the optional prompt addendum from the
         // row's `effort_level` (model_override never changes those —
         // design §Q3).
-        let (row_effort, row_model_override, product_default_model) = match work_item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => {
-                let product_default = self
-                    .work_db
-                    .get_product(&task.product_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|p| p.default_model);
-                (task.effort_level, task.model_override.clone(), product_default)
-            }
-            _ => (None, None, None),
-        };
+        let (row_effort, row_model_override, product_default_model, product_dispatch_preamble) =
+            match work_item {
+                WorkItem::Task(task) | WorkItem::Chore(task) => {
+                    let product = self
+                        .work_db
+                        .get_product(&task.product_id)
+                        .ok()
+                        .flatten();
+                    let product_default_model =
+                        product.as_ref().and_then(|p| p.default_model.clone());
+                    let dispatch_preamble =
+                        product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
+                    (
+                        task.effort_level,
+                        task.model_override.clone(),
+                        product_default_model,
+                        dispatch_preamble,
+                    )
+                }
+                _ => (None, None, None, None),
+            };
         let spawn_config = resolve_spawn_config(
             row_effort,
             row_model_override.as_deref(),
@@ -332,6 +341,17 @@ impl ExecutionRunner for PaneSpawnRunner {
         // when the addendum is `None`.
         let prompt_text = match spawn_config.prompt_addendum {
             Some(addendum) => format!("{}\n\n{}", addendum, prompt_text),
+            None => prompt_text,
+        };
+
+        // Product dispatch preamble is prepended before the effort
+        // addendum, with visible bracket markers so humans reading
+        // transcripts know what was injected by the engine.
+        // Empty / null preamble → today's behaviour, no change.
+        let prompt_text = match product_dispatch_preamble {
+            Some(preamble) => {
+                format!("[product-preamble]\n{}\n[/product-preamble]\n\n{}", preamble, prompt_text)
+            }
             None => prompt_text,
         };
 
