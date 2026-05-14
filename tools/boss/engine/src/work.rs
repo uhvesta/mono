@@ -2821,6 +2821,10 @@ impl WorkDb {
         // existing data too. Must run after `migrate_tasks_autostart`
         // so the column exists.
         migrate_backfill_autostart_consumed(&conn)?;
+        // Engine counter-metrics framework (phase 1). Independent of
+        // every other table — runs last because order doesn't matter
+        // for `CREATE TABLE IF NOT EXISTS`.
+        migrate_metrics_tables(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '10')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -6213,6 +6217,134 @@ fn migrate_backfill_autostart_consumed(conn: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+/// Create the `metrics_counter` / `metrics_gauge` tables for the
+/// engine counter-metrics framework (phase 1). Idempotent — the
+/// framework upserts on every flush, so re-running the migration is
+/// a no-op on tables that already exist. Schemas match design
+/// §"Persistence: state.db table".
+fn migrate_metrics_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS metrics_counter (
+             name           TEXT PRIMARY KEY,
+             value          INTEGER NOT NULL,
+             updated_at_ms  INTEGER NOT NULL,
+             description    TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS metrics_gauge (
+             name             TEXT PRIMARY KEY,
+             value            INTEGER NOT NULL,
+             observed_at_ms   INTEGER NOT NULL,
+             description      TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+/// One row pulled from `metrics_counter`. The framework rehydrates
+/// these into the in-memory registry on engine start so monotonic
+/// totals span restarts.
+#[derive(Debug, Clone)]
+pub struct MetricsCounterRow {
+    pub name: String,
+    pub value: u64,
+    pub updated_at_ms: i64,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricsGaugeRow {
+    pub name: String,
+    pub value: i64,
+    pub observed_at_ms: i64,
+    pub description: String,
+}
+
+impl WorkDb {
+    /// Load every persisted counter and gauge row for the
+    /// metrics-framework startup rehydrate. Order is unspecified
+    /// (the caller is `metrics::seed_from_db`, which doesn't care).
+    pub fn metrics_load_all(&self) -> Result<(Vec<MetricsCounterRow>, Vec<MetricsGaugeRow>)> {
+        let conn = self.connect()?;
+        let mut counter_stmt = conn.prepare(
+            "SELECT name, value, updated_at_ms, description FROM metrics_counter",
+        )?;
+        let counters: Vec<MetricsCounterRow> = counter_stmt
+            .query_map([], |row| {
+                let value_i64: i64 = row.get(1)?;
+                Ok(MetricsCounterRow {
+                    name: row.get(0)?,
+                    // Counters round-trip as raw bits so monotonic
+                    // u64 values above i64::MAX (theoretical only —
+                    // see design §"Bounded memory and disk cost")
+                    // survive the encode/decode.
+                    value: value_i64 as u64,
+                    updated_at_ms: row.get(2)?,
+                    description: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut gauge_stmt = conn.prepare(
+            "SELECT name, value, observed_at_ms, description FROM metrics_gauge",
+        )?;
+        let gauges: Vec<MetricsGaugeRow> = gauge_stmt
+            .query_map([], |row| {
+                Ok(MetricsGaugeRow {
+                    name: row.get(0)?,
+                    value: row.get(1)?,
+                    observed_at_ms: row.get(2)?,
+                    description: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok((counters, gauges))
+    }
+
+    /// UPSERT every counter and gauge snapshot in a single
+    /// transaction. The flush task calls this every 30s; the
+    /// graceful-shutdown path calls it once more before the engine
+    /// exits. Rehydrated "stale" rows (whose name no longer matches
+    /// any registered handle) are skipped — the existing row stays
+    /// in the table untouched so historical answers remain
+    /// queryable (design §"Risks / open questions" item 3).
+    pub fn metrics_flush(
+        &self,
+        counters: &[MetricsCounterRow],
+        gauges: &[MetricsGaugeRow],
+    ) -> Result<()> {
+        if counters.is_empty() && gauges.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        for c in counters {
+            tx.execute(
+                "INSERT INTO metrics_counter (name, value, updated_at_ms, description)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(name) DO UPDATE SET
+                     value = excluded.value,
+                     updated_at_ms = excluded.updated_at_ms,
+                     description = excluded.description",
+                params![c.name, c.value as i64, c.updated_at_ms, c.description],
+            )?;
+        }
+        for g in gauges {
+            tx.execute(
+                "INSERT INTO metrics_gauge (name, value, observed_at_ms, description)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(name) DO UPDATE SET
+                     value = excluded.value,
+                     observed_at_ms = excluded.observed_at_ms,
+                     description = excluded.description",
+                params![g.name, g.value, g.observed_at_ms, g.description],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 /// Allocate the next per-product `short_id` for a new `tasks` or
