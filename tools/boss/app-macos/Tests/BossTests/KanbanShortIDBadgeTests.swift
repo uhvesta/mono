@@ -4,7 +4,7 @@ import XCTest
 /// Covers the friendly-id badge on `WorkBoardCardView` and related
 /// surfaces (popover header, right-click copy). Per the design for
 /// "macOS kanban: short_id badge" (chore 4 of 5), every card that
-/// carries a `shortID` must surface it as a `#<n>` badge anchored
+/// carries a `shortID` must surface it as a `T<n>` badge anchored
 /// top-right; the popover header repeats it inline; and right-click
 /// offers "Copy Friendly ID". These tests pin the data layer that the
 /// views reflect so correctness is asserted without spinning up a
@@ -15,12 +15,12 @@ final class KanbanShortIDBadgeTests: XCTestCase {
     // MARK: - shortID on WorkTask
 
     /// A task with a `shortID` must carry the value through and format
-    /// it as `#<n>` at the call site. This is the minimal contract the
+    /// it as `T<n>` at the call site. This is the minimal contract the
     /// card view depends on.
-    func testShortIDFormatIsHashPrefixed() {
+    func testShortIDFormatIsTPrefixed() {
         let task = makeTask(status: "todo", shortID: 42)
         XCTAssertEqual(task.shortID, 42)
-        XCTAssertEqual("#\(task.shortID!)", "#42")
+        XCTAssertEqual("T\(task.shortID!)", "T42")
     }
 
     /// Tasks that predate the migration arrive with `shortID == nil`;
@@ -86,21 +86,21 @@ final class KanbanShortIDBadgeTests: XCTestCase {
 
     // MARK: - Friendly-id format contract
 
-    /// Friendly-id badge text is the `#` sigil followed by the decimal
-    /// integer with no padding — `#7`, not `#007`. This mirrors the CLI
-    /// output (`boss task show` renders `#7`) and the coordinator's
+    /// Friendly-id badge text is the `T` sigil followed by the decimal
+    /// integer with no padding — `T7`, not `T007`. This mirrors the CLI
+    /// output (`boss task show` renders `T7`) and the coordinator's
     /// preferred referral protocol.
     func testFriendlyIDHasNoZeroPadding() {
         let task = makeTask(status: "todo", shortID: 7)
-        XCTAssertEqual("#\(task.shortID!)", "#7")
+        XCTAssertEqual("T\(task.shortID!)", "T7")
     }
 
     /// Large numbers render without abbreviation so the reader can tell
-    /// `#1000` from `#1K` at a glance. Any abbreviation would be
+    /// `T1000` from `T1K` at a glance. Any abbreviation would be
     /// misleading when two items share the same abbreviation.
     func testFriendlyIDRendersFullDecimalForLargeIDs() {
         let task = makeTask(status: "todo", shortID: 1000)
-        XCTAssertEqual("#\(task.shortID!)", "#1000")
+        XCTAssertEqual("T\(task.shortID!)", "T1000")
     }
 
     // MARK: - ChatViewModel wiring

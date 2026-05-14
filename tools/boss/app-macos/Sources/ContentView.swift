@@ -1030,7 +1030,7 @@ private struct WorkBoardCardItem: View {
                     Button("Copy Friendly ID") {
                         let pb = NSPasteboard.general
                         pb.clearContents()
-                        pb.setString("#\(id)", forType: .string)
+                        pb.setString("T\(id)", forType: .string)
                     }
                 }
             }
@@ -1252,12 +1252,12 @@ struct WorkBoardCardView: View {
         .draggable(task.id)
         .overlay(alignment: .topTrailing) {
             if let id = task.shortID {
-                Text("#\(id)")
+                Text("T\(id)")
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .padding(.trailing, 10)
                     .padding(.top, 8)
-                    .accessibilityLabel("Friendly ID \(id)")
+                    .accessibilityLabel("T\(id)")
             }
         }
     }
@@ -1502,10 +1502,10 @@ private struct WorkCardPopoverView: View {
                         Text(task.name)
                             .font(.title3.weight(.semibold))
                         if let id = task.shortID {
-                            Text("#\(id)")
+                            Text("T\(id)")
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(.secondary)
-                                .accessibilityLabel("Friendly ID \(id)")
+                                .accessibilityLabel("T\(id)")
                         }
                     }
                     Text(task.isChore ? "Chore" : "Task")

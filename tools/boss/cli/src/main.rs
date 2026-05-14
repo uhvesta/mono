@@ -2093,11 +2093,11 @@ fn check_task_kind_for_verb(item: &WorkItem, short_id: i64, chore_only: bool) ->
     }
     match item {
         WorkItem::Task(t) => Err(CliError::application(format!(
-            "#{short_id} is a {} (kind={}), not a chore — use `boss task show {short_id}`",
+            "T{short_id} is a {} (kind={}), not a chore — use `boss task show {short_id}`",
             t.kind, t.kind
         ))),
         WorkItem::Project(_) => Err(CliError::application(format!(
-            "#{short_id} is a project, not a chore — use `boss project show {short_id}`"
+            "P{short_id} is a project, not a chore — use `boss project show {short_id}`"
         ))),
         WorkItem::Chore(_) | WorkItem::Product(_) => Ok(()),
     }
@@ -4073,7 +4073,7 @@ fn print_projects_table(projects: &[Project], with_primary_id: bool) {
         if show_short_id {
             let friendly = project
                 .short_id
-                .map(|n| format!("#{n}"))
+                .map(|n| format!("P{n}"))
                 .unwrap_or_default();
             row.push(friendly);
         }
@@ -4119,7 +4119,7 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
             .ordinal
             .map(|value| value.to_string())
             .unwrap_or_default();
-        let friendly = task.short_id.map(|n| format!("#{n}")).unwrap_or_default();
+        let friendly = task.short_id.map(|n| format!("T{n}")).unwrap_or_default();
         let effort_str = task.effort_level.map(|l| l.as_str().to_owned()).unwrap_or_default();
         let mut row: Vec<String> = Vec::new();
         if show_short_id {
@@ -4185,9 +4185,9 @@ fn print_project_details(title: &str, project: &Project, parent_product: Option<
     println!("{title}");
     if let Some(n) = project.short_id {
         if with_primary_id {
-            println!("#{n}  \x1b[2m{}\x1b[0m", project.id);
+            println!("P{n}  \x1b[2m{}\x1b[0m", project.id);
         } else {
-            println!("#{n}");
+            println!("P{n}");
         }
     } else {
         println!("ID: {}", project.id);
@@ -4363,9 +4363,9 @@ fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>
     println!("{title}");
     if let Some(n) = task.short_id {
         if with_primary_id {
-            println!("#{n}  \x1b[2m{}\x1b[0m", task.id);
+            println!("T{n}  \x1b[2m{}\x1b[0m", task.id);
         } else {
-            println!("#{n}");
+            println!("T{n}");
         }
     } else {
         println!("ID: {}", task.id);
