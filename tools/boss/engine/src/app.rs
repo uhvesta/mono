@@ -3440,6 +3440,21 @@ async fn handle_frontend_connection(
                                 handler.force_release(&execution_id).await;
                             });
                         }
+                        // If the patch moved a task/chore into
+                        // `in_review`, release pane + cube workspace
+                        // for the same reason — the worker is done
+                        // with the slot. The worker auto-transition
+                        // path (Stop hook → finalize_pr_transition)
+                        // handles its own release; this block covers
+                        // the human-drag path and any ghost panes left
+                        // behind by a failed or partial auto-release.
+                        // Idempotent for the same reasons as above.
+                        if let Some(execution_id) = in_review_chore_execution(&work_db, &item) {
+                            let handler = server_state.completion_handler.clone();
+                            tokio::spawn(async move {
+                                handler.force_release(&execution_id).await;
+                            });
+                        }
                         // Kanban drop-into-Doing (and any other human
                         // path that flips a task/chore to `active` via
                         // UpdateWorkItem) must dispatch a worker — see
@@ -5634,6 +5649,37 @@ fn terminal_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Option<String>
                 work_item_id = %task.id,
                 ?err,
                 "terminal_chore_execution: failed to look up latest execution",
+            );
+            None
+        }
+    }
+}
+
+/// If `item` is a task or chore that has just entered `in_review`
+/// status, return the id of its most recent execution so the caller
+/// can tear down its worker pane and cube workspace. Returns `None`
+/// for non-task work items, for non-`in_review` statuses, and when
+/// the work item has no executions.
+///
+/// Covers the human-drag kanban path. The worker auto-transition path
+/// (Stop hook → `finalize_pr_transition`) handles its own teardown
+/// inline; this function is the reconciliation safety net.
+fn in_review_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Option<String> {
+    let task = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        _ => return None,
+    };
+    if task.status != "in_review" {
+        return None;
+    }
+    match work_db.latest_execution_for_work_item(&task.id) {
+        Ok(Some(execution)) => Some(execution.id),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %task.id,
+                ?err,
+                "in_review_chore_execution: failed to look up latest execution",
             );
             None
         }
@@ -8670,6 +8716,131 @@ mod tests {
         assert_eq!(
             resolve_status_actor(&server_state, None),
             boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+        );
+    }
+
+    // ---- in_review_chore_execution ----
+
+    fn make_work_db_with_chore() -> (Arc<WorkDb>, String, String) {
+        use crate::work::{CreateChoreInput, CreateProductInput};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Test".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:test/test.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "In-review reap test".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+            })
+            .unwrap();
+        (db, product.id, chore.id)
+    }
+
+    #[test]
+    fn in_review_chore_execution_returns_none_for_non_in_review_status() {
+        use boss_protocol::WorkItemPatch;
+        let (db, _, chore_id) = make_work_db_with_chore();
+        // Default chore status is "todo" (autostart=true → "active" actually,
+        // but either way it is not "in_review").
+        let item = db.get_work_item(&chore_id).unwrap();
+        assert!(
+            in_review_chore_execution(&db, &item).is_none(),
+            "must return None when the chore is not in_review"
+        );
+        // Move to done — still not in_review.
+        let done_item = db
+            .update_work_item(&chore_id, WorkItemPatch { status: Some("done".into()), ..Default::default() })
+            .unwrap();
+        assert!(
+            in_review_chore_execution(&db, &done_item).is_none(),
+            "must return None for done (not in_review)"
+        );
+    }
+
+    #[test]
+    fn in_review_chore_execution_returns_none_when_no_execution() {
+        use boss_protocol::WorkItemPatch;
+        let (db, _, chore_id) = make_work_db_with_chore();
+        let item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch { status: Some("in_review".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert!(
+            in_review_chore_execution(&db, &item).is_none(),
+            "must return None when the chore has no executions"
+        );
+    }
+
+    #[test]
+    fn in_review_chore_execution_returns_execution_id_when_in_review() {
+        use boss_protocol::WorkItemPatch;
+        use crate::work::{CreateExecutionInput};
+        let (db, _, chore_id) = make_work_db_with_chore();
+        // Create an execution for the chore.
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore_id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch { status: Some("in_review".into()), ..Default::default() },
+            )
+            .unwrap();
+        let found = in_review_chore_execution(&db, &item);
+        assert_eq!(
+            found.as_deref(),
+            Some(execution.id.as_str()),
+            "must return the execution id when the chore is in_review and has an execution"
+        );
+    }
+
+    #[test]
+    fn in_review_chore_execution_returns_none_for_product() {
+        use crate::work::CreateProductInput;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product_item = db
+            .create_product(CreateProductInput {
+                name: "Prod".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let item = WorkItem::Product(product_item);
+        assert!(
+            in_review_chore_execution(&db, &item).is_none(),
+            "must return None for non-task work items"
         );
     }
 }
