@@ -381,6 +381,148 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
     }
 }
 
+// MARK: - Design task card affordance
+
+/// Verifies that the design-doc affordance wires correctly for `kind=design`
+/// task cards. The card derives its state from the same
+/// `model.designDocStateByProjectID` dict as the project-section header, so
+/// the same presentation rules apply — these tests exercise the path from
+/// task → projectID → state → presentation that `WorkBoardCardItem` computes.
+@MainActor
+final class DesignTaskCardDesignDocAffordanceTests: XCTestCase {
+    /// A `kind=design` task whose parent project has a resolved pointer
+    /// should produce a non-nil affordance presentation — the doc icon
+    /// must appear on the card so the worker can navigate to the design
+    /// without first hunting for the project card.
+    func testDesignTaskWithResolvedStateProducesPresentation() {
+        let model = makeModelWithDesignTask()
+        let projectID = model.projectsByProductID.values.first!.first!.id
+        let resolvedState = ProjectDesignDocState.resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "tools/boss/docs/designs/test.md",
+                kind: .sameProduct(productID: "prod_test")
+            ),
+            workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-001",
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md"
+        )
+        model.designDocStateByProjectID[projectID] = resolvedState
+        let state = model.designDocStateByProjectID[projectID] ?? .notSet
+        XCTAssertNotNil(ProjectDesignDocAffordancePresentation.from(state: state))
+        XCTAssertEqual(
+            ProjectDesignDocAffordancePresentation.from(state: state)?.systemImage,
+            "doc.text"
+        )
+    }
+
+    /// A `kind=design` task whose parent project has `.notSet` state
+    /// must produce a nil presentation — the card renders no affordance
+    /// rather than a broken / empty placeholder.
+    func testDesignTaskWithNotSetStateProducesNoPresentation() {
+        let model = makeModelWithDesignTask()
+        let projectID = model.projectsByProductID.values.first!.first!.id
+        model.designDocStateByProjectID[projectID] = .notSet
+        let state = model.designDocStateByProjectID[projectID] ?? .notSet
+        XCTAssertNil(ProjectDesignDocAffordancePresentation.from(state: state))
+    }
+
+    /// When the parent project's state has not been fetched yet
+    /// (no entry in `designDocStateByProjectID`) the affordance must
+    /// be hidden — the fallback to `.notSet` in `WorkBoardCardItem`
+    /// ensures no stale icon appears while a resolve RPC is in flight.
+    func testDesignTaskWithMissingStateDefaultsToHidden() {
+        let model = makeModelWithDesignTask()
+        let projectID = model.projectsByProductID.values.first!.first!.id
+        XCTAssertNil(model.designDocStateByProjectID[projectID])
+        let state = model.designDocStateByProjectID[projectID] ?? .notSet
+        XCTAssertNil(ProjectDesignDocAffordancePresentation.from(state: state))
+    }
+
+    /// `openProjectDesignDoc` is called with the correct project when
+    /// the design task's affordance is tapped. This mirrors the
+    /// existing click-handler tests for the project-section header.
+    func testOpenProjectDesignDocIsInvokedForDesignTask() {
+        let model = makeModelWithDesignTask()
+        let project = model.projectsByProductID.values.first!.first!
+        var openedURLs: [URL] = []
+        model.urlOpener = { url in openedURLs.append(url) }
+        let resolvedState = ProjectDesignDocState.resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "tools/boss/docs/designs/test.md",
+                kind: .external
+            ),
+            workspacePath: nil,
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md"
+        )
+        model.designDocStateByProjectID[project.id] = resolvedState
+        model.openProjectDesignDoc(project)
+        XCTAssertEqual(openedURLs.count, 1)
+        XCTAssertEqual(
+            openedURLs.first?.absoluteString,
+            "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/test.md"
+        )
+    }
+
+    // MARK: - Fixture
+
+    private func makeModelWithDesignTask() -> ChatViewModel {
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.urlOpener = { url in
+            XCTFail("urlOpener was invoked with \(url) — install a recording stub before exercising `.resolved`.")
+        }
+        let productID = "prod_test"
+        model.products = [
+            WorkProduct(
+                id: productID,
+                name: "Test Product",
+                slug: "test",
+                description: "",
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                status: "active",
+                createdAt: "2026-05-08T00:00:00Z",
+                updatedAt: "2026-05-08T00:00:00Z"
+            )
+        ]
+        model.selectedWorkProductID = productID
+        let projectID = "proj_test"
+        let project = WorkProject(
+            id: projectID,
+            productID: productID,
+            name: "Test Project",
+            slug: "test",
+            description: "",
+            goal: "",
+            status: "active",
+            priority: "medium",
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "human",
+            designDocPath: "tools/boss/docs/designs/test.md"
+        )
+        model.projectsByProductID = [productID: [project]]
+        let task = WorkTask(
+            id: "task_design",
+            productID: productID,
+            projectID: projectID,
+            kind: "design",
+            name: "Design the feature",
+            description: "",
+            status: "todo",
+            priority: "medium",
+            ordinal: 1,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z"
+        )
+        model.tasksByProjectID = [projectID: [task]]
+        return model
+    }
+}
+
 // MARK: - Test-only handler hook
 
 extension ChatViewModel {
