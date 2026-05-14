@@ -126,14 +126,14 @@ pub trait PrDetector: Send + Sync {
     /// idle-vs-completed logic clean. Errors are reserved for tool
     /// failures (jj missing, `gh` auth broken, etc.).
     ///
-    /// `dispatch_started_at` is the execution row's `started_at` (RFC
-    /// 3339, e.g. `2026-05-13T22:30:00Z`) and gates the candidate
-    /// expansion against stale bookmarks accumulated from prior tasks
-    /// in this cube workspace. `None` keeps the legacy `@ | @-`-only
-    /// behaviour for executions that have not yet started — those
-    /// shouldn't reach a Stop hook in practice, but the parameter is
-    /// optional rather than required so callers handle the missing
-    /// case explicitly instead of trusting the row.
+    /// `dispatch_started_at` is the execution row's `started_at` — a unix
+    /// epoch seconds string (the engine's `now_string()` format, e.g.
+    /// `"1778714114"`) — and gates the candidate expansion against stale
+    /// bookmarks accumulated from prior tasks in this cube workspace.
+    /// `None` keeps the legacy `@ | @-`-only behaviour for executions
+    /// that have not yet started — those shouldn't reach a Stop hook in
+    /// practice, but the parameter is optional rather than required so
+    /// callers handle the missing case explicitly instead of trusting the row.
     async fn detect_pr(
         &self,
         workspace_path: &Path,
@@ -445,24 +445,55 @@ async fn jj_candidate_commit_shas(
     Ok(shas)
 }
 
+/// Convert a unix epoch seconds string (the engine's `now_string()` format)
+/// to an ISO 8601 / RFC 3339 string jj can parse. Returns `None` if the
+/// input is not a valid non-negative integer or is out of range.
+fn epoch_seconds_to_iso8601(s: &str) -> Option<String> {
+    let secs: i64 = s.trim().parse().ok()?;
+    if secs < 0 {
+        return None;
+    }
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    // Civil-from-days: Howard Hinnant's algorithm (public domain).
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, hh, mm, ss
+    ))
+}
+
 /// Compose the revset for `jj_candidate_commit_shas`. Split out so the
 /// committer-date gate is tested independently of the `jj log`
 /// invocation.
+///
+/// `dispatch_started_at` is the execution row's `started_at` — a unix
+/// epoch seconds string (the engine's `now_string()` format). It is
+/// converted to ISO 8601 before embedding in the revset so that jj can
+/// parse it. If the value cannot be converted (non-numeric or negative),
+/// the function fails closed by returning the legacy `@ | @-` revset
+/// rather than producing an invalid query that would fail the whole
+/// detection pass.
 fn build_candidate_revset(dispatch_started_at: Option<&str>) -> String {
     match dispatch_started_at.map(str::trim).filter(|s| !s.is_empty()) {
         Some(started) => {
-            // jj revset string literals do not support backslash
-            // escaping inside double quotes, so any timestamp shape we
-            // pass must be safe to embed verbatim. RFC 3339 / SQLite's
-            // ISO 8601 output ([0-9T:.+-]Z) is safe by construction.
-            // If the value somehow contains a `"`, drop the bookmark
-            // gate rather than producing an invalid revset that would
-            // fail the whole detection pass.
-            if started.contains('"') {
+            let Some(iso) = epoch_seconds_to_iso8601(started) else {
                 return "@ | @-".to_owned();
-            }
+            };
             format!(
-                r#"@ | @- | (bookmarks() & committer_date(after:"{started}"))"#,
+                r#"@ | @- | (bookmarks() & committer_date(after:"{iso}"))"#,
             )
         }
         None => "@ | @-".to_owned(),
@@ -3504,22 +3535,29 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
     #[test]
     fn build_candidate_revset_with_timestamp_expands_to_recent_bookmarks() {
+        // Engine writes started_at as unix epoch seconds (now_string()).
+        // 0 == 1970-01-01T00:00:00Z (Unix epoch origin).
         assert_eq!(
-            build_candidate_revset(Some("2026-05-13T21:00:00Z")),
-            r#"@ | @- | (bookmarks() & committer_date(after:"2026-05-13T21:00:00Z"))"#,
+            build_candidate_revset(Some("0")),
+            r#"@ | @- | (bookmarks() & committer_date(after:"1970-01-01T00:00:00Z"))"#,
+        );
+        // 946684800 == 2000-01-01T00:00:00Z.
+        assert_eq!(
+            build_candidate_revset(Some("946684800")),
+            r#"@ | @- | (bookmarks() & committer_date(after:"2000-01-01T00:00:00Z"))"#,
         );
     }
 
     #[test]
-    fn build_candidate_revset_drops_expansion_when_timestamp_contains_quote() {
-        // A double-quote in the timestamp would close jj's string
-        // literal and allow the rest of the value to be parsed as
-        // revset syntax — fail closed by reverting to the legacy
-        // revset rather than producing an invalid query.
+    fn build_candidate_revset_drops_expansion_when_timestamp_is_non_numeric() {
+        // Non-numeric input (e.g. an old RFC 3339 string or junk) cannot be
+        // converted; fail closed to the legacy revset rather than producing
+        // an invalid jj query that would fail the whole detection pass.
         assert_eq!(
-            build_candidate_revset(Some(r#"2026-05-13" or true"#)),
+            build_candidate_revset(Some("2026-05-13T21:00:00Z")),
             "@ | @-",
         );
+        assert_eq!(build_candidate_revset(Some("not-a-number")), "@ | @-");
     }
 
     /// Real-jj regression for the bookmark-tip candidate expansion.
@@ -3628,11 +3666,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "legacy revset must NOT include the bookmark tip (the bug): got {legacy:?}",
         );
 
-        // With a past timestamp — fix engaged — the bookmark tip MUST
-        // appear in the candidate set. This is what allows
-        // `classify_pr` to accept the pushed PR as `Fresh` instead of
-        // rejecting it as `Stale`.
-        let with_since = jj_candidate_commit_shas(ws_path, Some("2000-01-01T00:00:00Z"))
+        // With a past timestamp (unix epoch seconds, matching the engine's
+        // now_string() format) — fix engaged — the bookmark tip MUST appear
+        // in the candidate set. Using 946684800 == 2000-01-01T00:00:00Z.
+        // This is the format the engine actually writes; the prior test used
+        // ISO 8601 which masked the production bug.
+        let with_since = jj_candidate_commit_shas(ws_path, Some("946684800"))
             .await
             .expect("with-since candidate query failed");
         assert!(
@@ -3640,11 +3679,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "started_at-gated revset must include the bookmark tip: got {with_since:?}",
         );
 
-        // With a future timestamp — bookmark tip is older than the
-        // dispatch window — the bookmark tip must NOT appear. This
-        // is the safeguard that keeps stale bookmarks from prior
-        // tasks out of the candidate set.
-        let with_future = jj_candidate_commit_shas(ws_path, Some("2999-01-01T00:00:00Z"))
+        // With a future timestamp (unix epoch seconds far in the future) —
+        // bookmark tip is older than the dispatch window — the bookmark tip
+        // must NOT appear. Using 32503680000 == 3000-01-01T00:00:00Z.
+        let with_future = jj_candidate_commit_shas(ws_path, Some("32503680000"))
             .await
             .expect("future-since candidate query failed");
         assert!(
