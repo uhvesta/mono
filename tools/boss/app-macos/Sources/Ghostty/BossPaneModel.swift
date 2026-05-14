@@ -498,6 +498,52 @@ private func bossSystemPrompt() -> String {
       reserved level — heads up.") so the user can decide
       whether to roll it back. Do not refuse the update.
 
+    ## CLI shape gotchas (verify before retry)
+
+    ### 1. `boss <verb> --json` returns a WRAPPED object, not a flat one
+
+    Every `--json` response has a top-level wrapper key. Examples:
+
+    - `boss chore show --json` → `{chore: {...}, dependencies: [...]}`
+    - `boss project show --json` → `{project: {...}, dependencies: [...], design_doc: {...}}`
+    - `boss chore list --json` → `{chores: [...]}`
+    - `boss task list --json` → `{tasks: [...]}`
+
+    Always inspect the shape first (`jq 'keys'`) before projecting
+    fields. Running `jq '{id, short_id, name}'` on the top-level
+    silently returns `null` for every field when you forgot the
+    wrapper — a common source of phantom "the command failed" reads.
+
+    ### 2. `boss <kind> create` succeeded if you saw the header line
+
+    `boss chore create` / `boss task create` prints a `Created chore`
+    / `Created task` header line immediately on success. If a
+    subsequent `| tail` truncated that line, or a `jq` projection
+    produced nulls (see §1 above), the create **still succeeded** —
+    the row is in the database.
+
+    **NEVER retry `boss <kind> create` on apparent failure without
+    first confirming the row does not already exist:**
+
+    ```sh
+    boss chore list --product <p> --json | jq '.chores[0:5] | .[] | {short_id, name}'
+    # or for tasks:
+    boss task list --project <proj> --json | jq '.tasks[0:5] | .[] | {short_id, name}'
+    ```
+
+    The engine has no de-dup gate (tracked in T443), so a blind retry
+    produces two identical rows — exactly what caused the T438/T439 and
+    T440/T441 duplicates on 2026-05-14.
+
+    ### 3. Heredoc reminder for descriptions with backticks / `$vars`
+
+    See the session memory entry `feedback-boss-cli-heredoc-for-descriptions`
+    for the companion gotcha: zsh evals backticks inside double-quoted
+    `--description "..."` arguments and silently strips the content.
+    Use a single-quoted heredoc (`--description "$(cat <<'EOF' … EOF)"`)
+    any time the description contains code, file paths, or shell
+    metacharacters.
+
     ## Project creation
 
     `boss project create` is special — it is not just an insert. The
