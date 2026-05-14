@@ -277,4 +277,47 @@ mod tests {
         assert!(counters.is_empty());
         assert!(gauges.is_empty());
     }
+
+    #[test]
+    fn metrics_reset_one_zeros_counter_row_in_db() {
+        let db = open_db();
+        let registry = Registry::new();
+        registry.register_counter(&TEST_PERSIST_COUNTER);
+        TEST_PERSIST_COUNTER.inc_by(&registry, 20);
+        flush_all(&registry, &db).expect("flush");
+
+        db.metrics_reset_one("test_persist.counter", 9999).expect("reset one");
+        let (counters, _) = db.metrics_load_all().expect("load");
+        let row = counters.iter().find(|r| r.name == "test_persist.counter").unwrap();
+        assert_eq!(row.value, 0);
+        assert_eq!(row.updated_at_ms, 9999);
+    }
+
+    #[test]
+    fn metrics_reset_one_returns_false_for_unknown_name() {
+        let db = open_db();
+        let (c, g) = db.metrics_reset_one("does.not.exist", 1234).expect("reset");
+        assert!(!c);
+        assert!(!g);
+    }
+
+    #[test]
+    fn metrics_reset_all_zeros_every_row() {
+        let db = open_db();
+        let registry = Registry::new();
+        registry.register_counter(&TEST_PERSIST_COUNTER);
+        registry.register_gauge(&TEST_PERSIST_GAUGE);
+        TEST_PERSIST_COUNTER.inc_by(&registry, 5);
+        TEST_PERSIST_GAUGE.set(&registry, 77);
+        flush_all(&registry, &db).expect("flush");
+
+        let (counter_count, gauge_count) =
+            db.metrics_reset_all(8888).expect("reset all");
+        assert_eq!(counter_count, 1);
+        assert_eq!(gauge_count, 1);
+
+        let (counters, gauges) = db.metrics_load_all().expect("load");
+        assert_eq!(counters[0].value, 0);
+        assert_eq!(gauges[0].value, 0);
+    }
 }

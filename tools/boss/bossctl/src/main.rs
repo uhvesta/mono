@@ -16,13 +16,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use boss_engine::work::WorkDb;
+
 use anyhow::{Context, Result, bail};
 use boss_client::{BossClient, Discovery};
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
     FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState,
-    RequestExecutionInput, ROSTER, WorkExecution, WorkItem, WorkRun, WorkspacePoolEntry,
+    MetricLiveEntry, RequestExecutionInput, ROSTER, WorkExecution, WorkItem, WorkRun,
+    WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -102,6 +105,18 @@ enum Command {
     Dispatch {
         #[command(subcommand)]
         action: DispatchAction,
+    },
+    /// Query and manage engine counter / gauge metrics.
+    ///
+    /// `list` and `show` read `state.db` directly — they work even
+    /// when the engine is wedged (values may be up to 30s stale due
+    /// to the flush window). `show --live` bypasses the stale window
+    /// by reading in-memory atomics via engine RPC. `reset` always
+    /// goes through engine RPC so the in-memory atomic and the
+    /// database row are cleared in lockstep.
+    Metrics {
+        #[command(subcommand)]
+        action: MetricsAction,
     },
 }
 
@@ -254,6 +269,53 @@ enum WorkspaceAction {
     Summary,
 }
 
+#[derive(Subcommand, Debug)]
+enum MetricsAction {
+    /// List all registered counters and gauges with current value and
+    /// last-update time. Reads `state.db` directly — works even when
+    /// the engine is wedged. Values may be up to 30s stale due to the
+    /// flush interval.
+    List {
+        /// Filter to metrics whose name starts with this prefix
+        /// (e.g. `pr_url_capture`).
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Override the Boss state-root directory (defaults to
+        /// `$HOME/Library/Application Support/Boss` or `$BOSS_DB_PATH`).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Show one metric with its description, current value, and
+    /// metadata. Reads `state.db` directly by default; pass `--live`
+    /// to read the in-memory atomic via engine RPC (bypasses the 30s
+    /// flush-staleness window).
+    Show {
+        /// The metric name (e.g.
+        /// `pr_url_capture.primary_path.hit`).
+        name: String,
+        /// Read the in-memory atomic directly via engine RPC,
+        /// bypassing flush-staleness. Requires a running engine.
+        #[arg(long)]
+        live: bool,
+        /// Override the Boss state-root directory (ignored when
+        /// `--live` is set).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Reset one or all metrics to zero (both in-memory and in
+    /// `state.db`) via engine RPC. Counters are truly monotonic
+    /// across the framework's lifetime unless reset explicitly; this
+    /// is the only way to restart accumulation.
+    Reset {
+        /// Name of the metric to reset. Mutually exclusive with
+        /// `--all`.
+        name: Option<String>,
+        /// Reset every registered counter and gauge to zero.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+    },
+}
+
 fn bossctl_version_string() -> String {
     let sha = option_env!("BOSS_GIT_SHA").unwrap_or("unknown");
     let time = option_env!("BOSS_BUILD_TIME").unwrap_or("unknown");
@@ -378,11 +440,24 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     include_stalled,
                 },
         } => dispatch_ghost_active(cli.json, state_root, stalled_after_secs, include_stalled),
-        // Any remaining verbs that need engine surfaces that don't
-        // exist yet print a structured "not_implemented" so the Boss
-        // session can call them and see exactly which ones are
-        // pending.
-        other => print_not_implemented(cli.json, &describe_verb(&other)),
+        Command::Metrics {
+            action: MetricsAction::List { prefix, state_root },
+        } => metrics_list(cli.json, state_root, prefix.as_deref()),
+        Command::Metrics {
+            action: MetricsAction::Show { name, live, state_root },
+        } => {
+            if live {
+                metrics_show_live(&cli.socket_path, cli.json, name).await
+            } else {
+                metrics_show(cli.json, state_root, &name)
+            }
+        }
+        Command::Metrics {
+            action: MetricsAction::Reset { name, all },
+        } => {
+            let target = if all { None } else { name };
+            metrics_reset(&cli.socket_path, cli.json, target).await
+        }
     }
 }
 
@@ -1404,50 +1479,291 @@ fn print_execution(json: bool, execution: &WorkExecution) {
     }
 }
 
-fn print_not_implemented(json: bool, verb: &str) -> Result<()> {
+/// Resolve the path to `state.db`. Checks `BOSS_DB_PATH` env var
+/// first (the same override the engine uses), then falls back to the
+/// default under `state_root` (which itself defaults to
+/// `$HOME/Library/Application Support/Boss`). The explicit
+/// `state_root` arg takes priority over `BOSS_DB_PATH`.
+fn resolve_db_path(state_root: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(root) = state_root {
+        return Ok(root.join("state.db"));
+    }
+    if let Some(path) = std::env::var_os("BOSS_DB_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve Boss state.db: HOME is unset; pass --state-root")
+    })?;
+    Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
+}
+
+/// Format a millisecond timestamp as a human-friendly relative age
+/// string ("3m ago", "2h ago", "never"). Shown next to each metric
+/// in the `list` / `show` output.
+fn format_age_ms(ts_ms: i64, now_ms: u128) -> String {
+    if ts_ms <= 0 {
+        return "(never)".into();
+    }
+    let now_i64 = now_ms as i64;
+    let diff_ms = now_i64.saturating_sub(ts_ms);
+    if diff_ms < 0 {
+        return "(just now)".into();
+    }
+    let diff_s = diff_ms / 1000;
+    if diff_s < 60 {
+        return format!("({}s ago)", diff_s);
+    }
+    let diff_m = diff_s / 60;
+    if diff_m < 60 {
+        return format!("({}m ago)", diff_m);
+    }
+    let diff_h = diff_m / 60;
+    if diff_h < 24 {
+        return format!("({}h ago)", diff_h);
+    }
+    let diff_d = diff_h / 24;
+    format!("({}d ago)", diff_d)
+}
+
+/// A unified metric row for rendering, covering both counters and
+/// gauges loaded from `state.db`.
+struct MetricRow {
+    name: String,
+    description: String,
+    kind: &'static str,
+    value: i64,
+    timestamp_ms: i64,
+    stale: bool,
+}
+
+fn load_metric_rows(db_path: PathBuf, prefix: Option<&str>) -> Result<Vec<MetricRow>> {
+    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let (counters, gauges) = db.metrics_load_all().context("reading metrics from state.db")?;
+
+    let mut rows: Vec<MetricRow> = counters
+        .into_iter()
+        .map(|c| MetricRow {
+            name: c.name,
+            description: c.description,
+            kind: "counter",
+            value: c.value as i64,
+            timestamp_ms: c.updated_at_ms,
+            stale: false,
+        })
+        .chain(gauges.into_iter().map(|g| MetricRow {
+            name: g.name,
+            description: g.description,
+            kind: "gauge",
+            value: g.value,
+            timestamp_ms: g.observed_at_ms,
+            stale: false,
+        }))
+        .collect();
+
+    if let Some(p) = prefix {
+        rows.retain(|r| r.name.starts_with(p));
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
+}
+
+fn print_metric_row_short(row: &MetricRow, now_ms: u128, name_width: usize) {
+    let age = format_age_ms(row.timestamp_ms, now_ms);
+    let stale_tag = if row.stale { " [stale]" } else { "" };
+    println!(
+        "{:<width$}  {:>12}  {:>10}  {}{}",
+        row.name,
+        row.value,
+        age,
+        row.kind,
+        stale_tag,
+        width = name_width,
+    );
+}
+
+fn metrics_list(json: bool, state_root: Option<PathBuf>, prefix: Option<&str>) -> Result<()> {
+    let db_path = resolve_db_path(state_root)?;
+    let rows = load_metric_rows(db_path, prefix)?;
+    let now = now_epoch_ms();
+
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "status": "not_implemented",
-                "verb": verb,
+        let entries: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name,
+                    "description": r.description,
+                    "kind": r.kind,
+                    "value": r.value,
+                    "timestamp_ms": r.timestamp_ms,
+                    "stale": r.stale,
+                })
             })
-        );
+            .collect();
+        println!("{}", serde_json::json!({ "metrics": entries }));
+    } else if rows.is_empty() {
+        println!("no metrics in state.db (engine may not have flushed yet)");
     } else {
-        println!("bossctl {verb}: not yet implemented");
+        let name_width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+        for row in &rows {
+            print_metric_row_short(row, now as u128, name_width);
+        }
     }
     Ok(())
 }
 
-fn describe_verb(command: &Command) -> String {
-    match command {
-        Command::Agents { action } => match action {
-            AgentsAction::List => "agents list".into(),
-            AgentsAction::Status { .. } => "agents status".into(),
-            AgentsAction::Focus { .. } => "agents focus".into(),
-            AgentsAction::Send { .. } => "agents send".into(),
-            AgentsAction::Interrupt { .. } => "agents interrupt".into(),
-            AgentsAction::Launch { .. } => "agents launch".into(),
-            AgentsAction::Stop { .. } => "agents stop".into(),
-            AgentsAction::Transcript { .. } => "agents transcript".into(),
-            AgentsAction::Reap { .. } => "agents reap".into(),
-        },
-        Command::Probe { .. } => "probe".into(),
-        Command::Work { action } => match action {
-            WorkAction::Start { .. } => "work start".into(),
-            WorkAction::Cancel { .. } => "work cancel".into(),
-        },
-        Command::Workspace { action } => match action {
-            WorkspaceAction::Summary => "workspace summary".into(),
-        },
-        Command::LiveStatus { action } => match action {
-            LiveStatusAction::Debug => "live-status debug".into(),
-        },
-        Command::Dispatch { action } => match action {
-            DispatchAction::Tail { .. } => "dispatch tail".into(),
-            DispatchAction::Diagnose { .. } => "dispatch diagnose".into(),
-            DispatchAction::GhostActive { .. } => "dispatch ghost-active".into(),
-        },
+fn metrics_show(json: bool, state_root: Option<PathBuf>, name: &str) -> Result<()> {
+    let db_path = resolve_db_path(state_root)?;
+    let rows = load_metric_rows(db_path, None)?;
+    let now = now_epoch_ms();
+
+    let row = rows.iter().find(|r| r.name == name);
+    match row {
+        None => {
+            if json {
+                println!("{}", serde_json::json!({ "entry": null, "name": name }));
+            } else {
+                println!("metric not found: {name}");
+                println!("  (engine may not have flushed yet; try --live to read in-memory value)");
+            }
+        }
+        Some(r) => {
+            let age = format_age_ms(r.timestamp_ms, now as u128);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "entry": {
+                            "name": r.name,
+                            "description": r.description,
+                            "kind": r.kind,
+                            "value": r.value,
+                            "timestamp_ms": r.timestamp_ms,
+                            "stale": r.stale,
+                        }
+                    })
+                );
+            } else {
+                let stale_tag = if r.stale { "  [stale: not registered by current engine]" } else { "" };
+                println!("{}{}", r.name, stale_tag);
+                println!("  description:   {}", r.description);
+                println!("  kind:          {}", r.kind);
+                println!("  value:         {}", r.value);
+                println!("  last_updated:  {age}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn metrics_show_live(
+    socket_path: &Option<String>,
+    json: bool,
+    name: String,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::MetricsShowLive { name: name.clone() })
+        .await
+        .context("sending MetricsShowLive")?;
+    match response {
+        FrontendEvent::MetricsShowLiveResult { entry } => {
+            print_metric_live_entry(json, &name, entry.as_ref());
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected metrics show --live: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+fn print_metric_live_entry(json: bool, name: &str, entry: Option<&MetricLiveEntry>) {
+    let now = now_epoch_ms() as u128;
+    match entry {
+        None => {
+            if json {
+                println!("{}", serde_json::json!({ "entry": null, "name": name }));
+            } else {
+                println!("metric not found: {name}");
+                println!("  (not registered in the current engine binary)");
+            }
+        }
+        Some(e) => {
+            let age = format_age_ms(e.timestamp_ms, now);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "entry": {
+                            "name": e.name,
+                            "description": e.description,
+                            "kind": e.kind,
+                            "value": e.value,
+                            "timestamp_ms": e.timestamp_ms,
+                            "stale": e.stale,
+                            "source": "live",
+                        }
+                    })
+                );
+            } else {
+                let stale_tag =
+                    if e.stale { "  [stale: not registered by current engine]" } else { "" };
+                println!("{}{}", e.name, stale_tag);
+                println!("  description:   {}", e.description);
+                println!("  kind:          {}  (live — read from in-memory atomic)", e.kind);
+                println!("  value:         {}", e.value);
+                println!("  last_updated:  {age}");
+            }
+        }
+    }
+}
+
+async fn metrics_reset(
+    socket_path: &Option<String>,
+    json: bool,
+    name: Option<String>,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::MetricsReset { name: name.clone() })
+        .await
+        .context("sending MetricsReset")?;
+    match response {
+        FrontendEvent::MetricsResetDone { name: returned_name, counters_reset, gauges_reset } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "reset",
+                        "name": returned_name,
+                        "counters_reset": counters_reset,
+                        "gauges_reset": gauges_reset,
+                    })
+                );
+            } else {
+                match &name {
+                    Some(n) => {
+                        if counters_reset == 0 && gauges_reset == 0 {
+                            println!("metric not found: {n}");
+                        } else {
+                            println!("reset {n} ({} counter(s), {} gauge(s))", counters_reset, gauges_reset);
+                        }
+                    }
+                    None => {
+                        println!(
+                            "reset all metrics ({} counter(s), {} gauge(s))",
+                            counters_reset, gauges_reset
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected metrics reset: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
     }
 }
 
@@ -1710,6 +2026,8 @@ mod tests {
             cube_repo_id: None,
             cube_lease_id: None,
             cube_workspace_id: None,
+            cube_command: None,
+            cube_cwd: None,
             error_message: None,
             details: serde_json::Value::Null,
         }

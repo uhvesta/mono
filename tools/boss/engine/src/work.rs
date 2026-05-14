@@ -6489,6 +6489,41 @@ impl WorkDb {
         tx.commit()?;
         Ok(())
     }
+
+    /// Zero one metric (counter or gauge) in `state.db`. Called from
+    /// the `MetricsReset` RPC handler after the in-memory atomic is
+    /// already cleared. Returns `(counter_cleared, gauge_cleared)` so
+    /// the caller can tell the operator which kind was found.
+    pub fn metrics_reset_one(&self, name: &str, now_ms: i64) -> Result<(bool, bool)> {
+        let conn = self.connect()?;
+        let counter_rows = conn.execute(
+            "UPDATE metrics_counter SET value = 0, updated_at_ms = ?2 WHERE name = ?1",
+            params![name, now_ms],
+        )?;
+        let gauge_rows = conn.execute(
+            "UPDATE metrics_gauge SET value = 0, observed_at_ms = ?2 WHERE name = ?1",
+            params![name, now_ms],
+        )?;
+        Ok((counter_rows > 0, gauge_rows > 0))
+    }
+
+    /// Zero every counter and gauge row in `state.db`. Called from
+    /// the `MetricsReset { name: None }` path (reset --all). Returns
+    /// `(counters_cleared, gauges_cleared)`.
+    pub fn metrics_reset_all(&self, now_ms: i64) -> Result<(usize, usize)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let counter_rows = tx.execute(
+            "UPDATE metrics_counter SET value = 0, updated_at_ms = ?1",
+            params![now_ms],
+        )?;
+        let gauge_rows = tx.execute(
+            "UPDATE metrics_gauge SET value = 0, observed_at_ms = ?1",
+            params![now_ms],
+        )?;
+        tx.commit()?;
+        Ok((counter_rows, gauge_rows))
+    }
 }
 
 /// Allocate the next per-product `short_id` for a new `tasks` or
