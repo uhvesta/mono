@@ -1,0 +1,7 @@
+package(default_visibility = ["//visibility:private"])
+
+filegroup(
+    name = "trek_icons",
+    srcs = glob(["**/*.png"]),
+    visibility = ["//tools/boss/app-macos:__pkg__"],
+)

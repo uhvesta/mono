@@ -39,6 +39,7 @@ macos_application(
         "//tools/boss/cli:boss": "Resources/bin",
         "//tools/boss/bossctl:bossctl": "Resources/bin",
         "//tools/boss/event-shim:boss-event": "Resources/bin",
+        "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons": "Resources/TrekIcons",
     },
     visibility = ["//tools/boss/installer:__pkg__"],
 )

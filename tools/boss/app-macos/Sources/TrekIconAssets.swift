@@ -55,9 +55,10 @@ enum TrekIconSize: String {
 }
 
 /// Loads bundled TNG portraits. Resources live under
-/// `Sources/Resources/TrekIcons/...` and are processed by SwiftPM
-/// (`Bundle.module`). The Bazel build path doesn't bundle them today
-/// — callers must tolerate `nil` (the UI keeps text-only fallback).
+/// `Sources/Resources/TrekIcons/...`. SwiftPM builds access them via
+/// `Bundle.module`; Bazel builds find them in `Bundle.main` because
+/// the Bazel `macos_application` places them at
+/// `Contents/Resources/TrekIcons/` via `additional_contents`.
 enum TrekIconAssets {
     private struct CacheKey: Hashable {
         let character: TrekCharacter
@@ -101,11 +102,14 @@ enum TrekIconAssets {
     private static func loadFromBundle(character: TrekCharacter, size: TrekIconSize) -> NSImage? {
         let resource = "TrekIcons/\(size.rawValue)/\(character.rawValue)"
         #if SWIFT_PACKAGE
-        if let url = Bundle.module.url(forResource: resource, withExtension: "png"),
+        let bundle = Bundle.module
+        #else
+        let bundle = Bundle.main
+        #endif
+        if let url = bundle.url(forResource: resource, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }
-        #endif
         return nil
     }
 }
