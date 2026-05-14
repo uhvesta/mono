@@ -472,11 +472,15 @@ fn compose_execution_prompt(
     prompt.push_str("The current session cwd is already set to that workspace.\n");
     prompt.push_str("Do the work directly in the repository checkout before ending this run.\n");
     prompt.push_str("Avoid asking the human for permission during this pass; when you need review or direction, stop and summarize it clearly.\n\n");
+    let expected_branch = crate::completion::expected_branch_name(&execution.id);
     prompt.push_str("Execution context:\n");
     prompt.push_str(&format!("- execution id: `{}`\n", execution.id));
     prompt.push_str(&format!("- execution kind: `{}`\n", execution.kind));
     prompt.push_str(&format!("- workspace: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("- work item: `{}`\n", work_item_name(work_item)));
+    prompt.push_str(&format!(
+        "- expected branch name: `{expected_branch}` — the engine reconstructs this from your execution id and uses it to find your PR. Push to this exact bookmark name.\n",
+    ));
     if let Some(cube_change_id) = cube_change_id {
         prompt.push_str(&format!("- local change: `{}`\n", cube_change_id));
     }
@@ -526,13 +530,21 @@ fn compose_execution_prompt(
         // this up front avoids the probe round-trip when the worker
         // would otherwise have stopped at "I made the changes" with
         // nothing pushed.
-        prompt.push_str(
+        //
+        // AI #6 (incident 001): the branch name is engine-supplied —
+        // `expected branch name` above. Workers MUST push to that
+        // bookmark name, because the cold-path detector now reads
+        // `gh pr list --head <expected-branch>` (a unique-by-construction
+        // signal) instead of the structurally-unsafe shared-store jj
+        // bookmark scan that produced the May 14 PR fan-out.
+        prompt.push_str(&format!(
             "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
-             - Push your branch (`jj git push -b <bookmark>`) and open a PR with `gh pr create` if one does not already exist for this branch.\n\
+             - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark and pushing — do NOT invent a different name.\n\
+             - Push your branch (`jj bookmark create {expected_branch} -r @ && jj git push -b {expected_branch} --allow-new`) and open a PR with `gh pr create --head {expected_branch} --base main` if one does not already exist.\n\
              - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
              - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
              - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
-        );
+        ));
     }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -1281,6 +1293,33 @@ mod pane_spawn_tests {
         assert!(
             prompt.contains("jj diff -r @"),
             "implementation prompt must tell the worker to verify the diff before pushing: {prompt}",
+        );
+    }
+
+    /// AI #6 (incident 001): the prompt must name the engine-supplied
+    /// branch the worker is expected to push to. The detector reads
+    /// this same name back out of `state.db` (via
+    /// `completion::expected_branch_name`) and queries
+    /// `gh pr list --head <branch>` against it. If a worker pushes to
+    /// a different bookmark, the fallback returns `None` instead of
+    /// misbinding — but the happy path requires the worker to follow
+    /// the engine's name, so the prompt must state it.
+    #[tokio::test]
+    async fn implementation_prompt_dictates_engine_supplied_branch_name() {
+        let workspace = TempDir::new().unwrap();
+        let _spawner = run_once(&workspace).await.unwrap();
+        let prompt = std::fs::read_to_string(
+            workspace.path().join(".claude").join("initial-prompt.txt"),
+        )
+        .unwrap();
+        let expected_branch = crate::completion::expected_branch_name("exec-test-1");
+        assert!(
+            prompt.contains(&expected_branch),
+            "prompt must name the engine-supplied branch `{expected_branch}`, got: {prompt}",
+        );
+        assert!(
+            prompt.contains("expected branch name"),
+            "prompt must include the `expected branch name` context line, got: {prompt}",
         );
     }
 
