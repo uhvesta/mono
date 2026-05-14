@@ -4,17 +4,20 @@ import SwiftUI
 @main
 struct BossMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var chatModel = ChatViewModel()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
+        .environmentObject(chatModel)
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1060, height: 680)
         .commands {
             TextEditingCommands()
             CommandMenu("Debug") {
                 DispatchEventsCommand()
+                EngineCommand()
             }
         }
 
@@ -28,6 +31,12 @@ struct BossMacApp: App {
         Window("Dispatch Events", id: "dispatch-events") {
             DispatchEventsViewer()
         }
+        .defaultSize(width: 1040, height: 620)
+
+        Window("Engine", id: "engine") {
+            EngineView()
+        }
+        .environmentObject(chatModel)
         .defaultSize(width: 1040, height: 620)
     }
 }
@@ -48,6 +57,25 @@ private struct DispatchEventsCommand: View {
             }
         }
         .keyboardShortcut("d", modifiers: [.command, .shift])
+    }
+}
+
+private struct EngineCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.engineViewer.visible") private var isOpen = false
+
+    var body: some View {
+        Button("Engine") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "engine")
+            } else {
+                isOpen = true
+                openWindow(id: "engine")
+            }
+        }
+        .keyboardShortcut("e", modifiers: [.command, .shift])
     }
 }
 

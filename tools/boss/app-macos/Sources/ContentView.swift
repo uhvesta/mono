@@ -11,7 +11,7 @@ private let workBossPanelCollapsedWidth: CGFloat = 88
 private let workBossPanelDividerHitWidth: CGFloat = 12
 
 struct ContentView: View {
-    @StateObject private var model = ChatViewModel()
+    @EnvironmentObject private var model: ChatViewModel
     #if canImport(GhosttyKit)
     @StateObject private var workersWorkspace = WorkersWorkspaceModel()
     @StateObject private var bossPane = BossPaneModel()
@@ -45,9 +45,6 @@ struct ContentView: View {
                 .opacity(model.navigationMode == .designs ? 1 : 0)
                 .allowsHitTesting(model.navigationMode == .designs)
 
-            EngineView(chat: model)
-                .opacity(model.navigationMode == .engine ? 1 : 0)
-                .allowsHitTesting(model.navigationMode == .engine)
         }
         #if canImport(GhosttyKit)
         .task {
@@ -88,7 +85,7 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 260)
+                .frame(width: 200)
             }
 
             ToolbarItem {

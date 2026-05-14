@@ -361,8 +361,6 @@ final class ChatViewModel: ObservableObject {
         defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
         if mode == .work {
             refreshWork()
-        } else if mode == .engine, isConnected {
-            refreshConflictResolutions()
         }
     }
 

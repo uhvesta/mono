@@ -15,7 +15,7 @@ import SwiftUI
 /// The Refresh button is a one-shot escape hatch for the "did I miss
 /// a push?" case.
 struct EngineView: View {
-    @ObservedObject var chat: ChatViewModel
+    @EnvironmentObject private var chat: ChatViewModel
 
     @State private var sortColumn: SortColumn = .createdAt
     @State private var sortDirection: SortDirection = .descending

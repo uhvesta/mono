@@ -4,11 +4,6 @@ enum NavigationMode: String, CaseIterable, Identifiable {
     case agents = "Agents"
     case work = "Work"
     case designs = "Designs"
-    /// Engine-tab: lists `conflict_resolutions` (and, when the auto-
-    /// rebase-stacked-prs flow lands, `rebase_attempts`) — the engine's
-    /// attempt-shaped remediation feed. Phase 5 #14 of the merge-
-    /// conflict design.
-    case engine = "Engine"
 
     var id: String { rawValue }
 }
