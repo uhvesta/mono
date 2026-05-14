@@ -132,6 +132,28 @@ pub fn local_fallback(name: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
+/// Returns a fixed gerund phrase for conflict-resolution workers, overriding
+/// the original task's pane summary so the pane titlebar reads
+/// `"<Name> is resolving merge conflicts for <task-name>"` rather than
+/// `"<Name> is implementing …"` (the original task's gerund).
+///
+/// The task name is truncated to 3 words so the combined phrase stays within
+/// the 7-word UI guidance. If the task name is empty the shorter
+/// `"resolving merge conflicts"` is returned instead.
+pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
+    let short: Vec<String> = task_name
+        .trim()
+        .split_whitespace()
+        .take(3)
+        .map(|w| w.to_lowercase())
+        .collect();
+    if short.is_empty() {
+        Some("resolving merge conflicts".to_owned())
+    } else {
+        Some(format!("resolving merge conflicts for {}", short.join(" ")))
+    }
+}
+
 /// Resolve a summary for a work item, hitting the cache first and
 /// falling through to Claude only on a miss or basis change. Errors
 /// are swallowed — this function never blocks worker spawn — and a
@@ -471,6 +493,42 @@ mod tests {
     fn local_fallback_handles_empty() {
         assert_eq!(local_fallback("").as_deref(), None);
         assert_eq!(local_fallback("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn conflict_resolution_summary_uses_first_three_words_of_task_name() {
+        assert_eq!(
+            conflict_resolution_summary("Implementing app + engine resolution path").as_deref(),
+            Some("resolving merge conflicts for implementing app +"),
+        );
+    }
+
+    #[test]
+    fn conflict_resolution_summary_lowercases_task_name_fragment() {
+        assert_eq!(
+            conflict_resolution_summary("Fix The Fencer Scraper").as_deref(),
+            Some("resolving merge conflicts for fix the fencer"),
+        );
+    }
+
+    #[test]
+    fn conflict_resolution_summary_handles_short_task_name() {
+        assert_eq!(
+            conflict_resolution_summary("Fix it").as_deref(),
+            Some("resolving merge conflicts for fix it"),
+        );
+    }
+
+    #[test]
+    fn conflict_resolution_summary_handles_empty_task_name() {
+        assert_eq!(
+            conflict_resolution_summary("").as_deref(),
+            Some("resolving merge conflicts"),
+        );
+        assert_eq!(
+            conflict_resolution_summary("   ").as_deref(),
+            Some("resolving merge conflicts"),
+        );
     }
 
     #[test]
