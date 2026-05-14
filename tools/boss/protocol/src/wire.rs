@@ -495,6 +495,19 @@ pub enum FrontendRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule_id: Option<String>,
     },
+    /// Snapshot of every registered engine feature flag and its current
+    /// value. Backs the macOS app's Feature Flags debug pane (incident
+    /// 001 AI #5). Replies with [`FrontendEvent::FeatureFlagsList`].
+    /// Read-only; no side effects.
+    ListFeatureFlags,
+    /// Toggle one feature flag on or off. The engine updates the
+    /// in-memory map and rewrites the on-disk file atomically; the
+    /// new value is visible to consumer-side `is_enabled` calls the
+    /// moment this request returns. The reply
+    /// ([`FrontendEvent::FeatureFlagSet`]) confirms the persisted
+    /// state and is the round-trip "the engine has reloaded" signal
+    /// the debug pane uses to render the toggle as committed.
+    SetFeatureFlag { name: String, enabled: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -920,6 +933,41 @@ pub enum FrontendEvent {
     EffortEscalationRecorded {
         event: crate::EffortEscalation,
     },
+    /// Response to [`FrontendRequest::ListFeatureFlags`]: a snapshot
+    /// of every registered engine feature flag plus its current
+    /// effective value. Order is registry order so the debug pane
+    /// renders flags in a stable, predictable sequence.
+    FeatureFlagsList { flags: Vec<FeatureFlagSnapshot> },
+    /// Response to [`FrontendRequest::SetFeatureFlag`]: the engine has
+    /// updated and persisted the named flag to `enabled`. Receiving
+    /// this event is the debug pane's "reload confirmed" signal — the
+    /// new value is in effect immediately for all subsequent
+    /// consumer-side checks.
+    FeatureFlagSet { name: String, enabled: bool },
+}
+
+/// Snapshot of one feature flag's static metadata + current value.
+/// Mirrors `boss_engine::feature_flags::FeatureFlagSnapshot` so the
+/// engine can ship its in-memory snapshot over the wire without
+/// translating field-by-field at the call site.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeatureFlagSnapshot {
+    /// Stable flag identifier (lowercase snake_case). Also the key
+    /// the consumer passes to `is_enabled`.
+    pub name: String,
+    /// Human-readable one-sentence description rendered in the
+    /// debug pane.
+    pub description: String,
+    /// Free-form grouping label used as a section header in the
+    /// debug pane (e.g. `"completion"`).
+    pub category: String,
+    /// What the flag is when the on-disk file has no entry for it.
+    /// Rendered as a "default: ON / OFF" hint next to the toggle so
+    /// the human can tell what they would revert to.
+    pub default_enabled: bool,
+    /// Current effective value — what `is_enabled(name)` returns
+    /// right now. Equals `default_enabled` when no override exists.
+    pub enabled: bool,
 }
 
 /// One row of the cube workspace pool, as exposed via
@@ -963,4 +1011,78 @@ pub enum TopicEventPayload {
         work_item_id: String,
         status: String,
     },
+}
+
+#[cfg(test)]
+mod feature_flags_wire_tests {
+    use super::*;
+
+    #[test]
+    fn list_feature_flags_request_round_trips() {
+        let original = FrontendRequest::ListFeatureFlags;
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("list_feature_flags"));
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, FrontendRequest::ListFeatureFlags));
+    }
+
+    #[test]
+    fn set_feature_flag_request_round_trips() {
+        let original = FrontendRequest::SetFeatureFlag {
+            name: "detect_pr_cold_fallback".into(),
+            enabled: false,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("set_feature_flag"));
+        assert!(json.contains("detect_pr_cold_fallback"));
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::SetFeatureFlag { name, enabled } => {
+                assert_eq!(name, "detect_pr_cold_fallback");
+                assert!(!enabled);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_flags_list_event_round_trips() {
+        let snap = FeatureFlagSnapshot {
+            name: "detect_pr_cold_fallback".into(),
+            description: "test description".into(),
+            category: "completion".into(),
+            default_enabled: true,
+            enabled: false,
+        };
+        let original = FrontendEvent::FeatureFlagsList {
+            flags: vec![snap.clone()],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("feature_flags_list"));
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::FeatureFlagsList { flags } => {
+                assert_eq!(flags, vec![snap]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_flag_set_event_round_trips() {
+        let original = FrontendEvent::FeatureFlagSet {
+            name: "detect_pr_cold_fallback".into(),
+            enabled: true,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("feature_flag_set"));
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::FeatureFlagSet { name, enabled } => {
+                assert_eq!(name, "detect_pr_cold_fallback");
+                assert!(enabled);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
 }

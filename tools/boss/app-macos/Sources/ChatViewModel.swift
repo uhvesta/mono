@@ -88,6 +88,13 @@ final class ChatViewModel: ObservableObject {
     /// the engine side so this is purely a UI mirror.
     @Published var liveStatusDisabledSlotIDs: Set<Int> = []
 
+    /// Engine feature-flag snapshot, sourced from `list_feature_flags`
+    /// on debug-pane open and kept in sync via `feature_flag_set`
+    /// echoes after every toggle. Backs the Feature Flags window
+    /// (incident 001 AI #5). Empty when the pane has never been opened
+    /// in this session.
+    @Published var featureFlags: [FeatureFlag] = []
+
     /// Resolved design-doc pointer state per project. Populated lazily
     /// when a project surface (kanban project header, future detail
     /// view) calls `resolveProjectDesignDoc(_:)`; refreshed whenever
@@ -174,6 +181,35 @@ final class ChatViewModel: ObservableObject {
     /// minority case.
     func isLiveStatusEnabled(slotId: Int) -> Bool {
         !liveStatusDisabledSlotIDs.contains(slotId)
+    }
+
+    /// Ask the engine for the current feature-flag snapshot. Called by
+    /// the Feature Flags debug pane on appear so the rendered state
+    /// reflects whatever the engine has persisted (which may differ
+    /// from what an earlier session in this app saw).
+    func refreshFeatureFlags() {
+        engine.sendListFeatureFlags()
+    }
+
+    /// Toggle a feature flag. Optimistically patches the cached
+    /// snapshot so the UI feels instantaneous; the engine's
+    /// `feature_flag_set` echo reconciles state once the on-disk
+    /// write returns. If the engine rejects the call (unknown flag,
+    /// IO error), the echo never arrives and the `work_error` path
+    /// surfaces the failure — the next `refreshFeatureFlags()` corrects
+    /// the optimistic UI state.
+    func setFeatureFlag(name: String, enabled: Bool) {
+        if let idx = featureFlags.firstIndex(where: { $0.name == name }) {
+            let prior = featureFlags[idx]
+            featureFlags[idx] = FeatureFlag(
+                name: prior.name,
+                description: prior.description,
+                category: prior.category,
+                defaultEnabled: prior.defaultEnabled,
+                enabled: enabled
+            )
+        }
+        engine.sendSetFeatureFlag(name: name, enabled: enabled)
     }
 
     var selectedProduct: WorkProduct? {
@@ -1045,6 +1081,22 @@ final class ChatViewModel: ObservableObject {
                 liveStatusDisabledSlotIDs.remove(slotId)
             } else {
                 liveStatusDisabledSlotIDs.insert(slotId)
+            }
+        case .featureFlagsList(let flags):
+            featureFlags = flags
+        case .featureFlagSet(let name, let enabled):
+            // Patch the cached snapshot so the toggle commits without
+            // a second round-trip. The engine has already persisted
+            // the value at this point — the patch is a UI mirror.
+            if let idx = featureFlags.firstIndex(where: { $0.name == name }) {
+                let prior = featureFlags[idx]
+                featureFlags[idx] = FeatureFlag(
+                    name: prior.name,
+                    description: prior.description,
+                    category: prior.category,
+                    defaultEnabled: prior.defaultEnabled,
+                    enabled: enabled
+                )
             }
         case .projectDesignDocResolved(let output):
             designDocStateByProjectID[output.projectID] = output.state

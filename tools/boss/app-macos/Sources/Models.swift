@@ -1107,3 +1107,17 @@ enum EngineAttemptRow: Identifiable, Hashable {
         }
     }
 }
+
+/// Snapshot of one engine feature flag, decoded from a
+/// `feature_flags_list` response. Mirrors the engine's
+/// `boss_protocol::FeatureFlagSnapshot` one-for-one.
+struct FeatureFlag: Identifiable, Hashable {
+    /// Stable flag identifier (lowercase snake_case). The toggle send
+    /// path uses this verbatim; identifier for `Identifiable`.
+    var id: String { name }
+    let name: String
+    let description: String
+    let category: String
+    let defaultEnabled: Bool
+    let enabled: Bool
+}

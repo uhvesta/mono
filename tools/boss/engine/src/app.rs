@@ -374,6 +374,12 @@ struct ServerState {
     /// late-bound consumers (the pane-spawn runner) can resolve back
     /// to the live `Arc<ServerState>` without an outer allocation.
     _self_weak: Weak<ServerState>,
+    /// Toggleable feature flags for optional/risk-bearing engine
+    /// behaviours (incident 001 AI #5). Loaded from
+    /// `~/Library/Application Support/Boss/feature-flags.toml` at
+    /// boot, mutated by `SetFeatureFlag` RPC, consulted by callers
+    /// via `is_enabled(...)`. See `crate::feature_flags`.
+    feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
 }
 
 /// Authorization tier for a frontend RPC.
@@ -552,6 +558,40 @@ impl ServerState {
         let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+
+        // Resolve the Boss state root early — both the feature-flags
+        // store (loaded below, before the completion handler is
+        // built) and the dispatch-event sink (set up further down)
+        // land next to `state.db` under the same root. Empty parent
+        // (test configs with `:memory:` for the DB path) falls back
+        // to `cwd` so test artifacts stay co-located.
+        let state_root: PathBuf = cfg
+            .work
+            .db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cfg.work.cwd.clone());
+
+        // Load the feature-flags store from the on-disk file. A
+        // missing or unreadable file is logged but does not block
+        // startup: the in-memory store falls back to registry defaults
+        // for every flag, which is the same behaviour as a fresh
+        // install. Persisting failures inside `set` are caught by
+        // the RPC handler.
+        let feature_flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            crate::feature_flags::FeatureFlagsStore::default_path(&state_root),
+        ));
+        if let Err(err) = feature_flags.load() {
+            tracing::warn!(
+                ?err,
+                path = %feature_flags.path().display(),
+                "feature-flags: load failed; falling back to registry defaults",
+            );
+        }
+        let feature_flags_for_handler = feature_flags.clone();
+        let feature_flags_for_state = feature_flags.clone();
+
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -561,7 +601,8 @@ impl ServerState {
                 pane_releaser.clone(),
                 probe_queuer.clone(),
             )
-            .with_staged_pr_urls(staged_pr_urls.clone()),
+            .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_feature_flags(feature_flags_for_handler),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -577,20 +618,9 @@ impl ServerState {
         let cube_client_for_state = cube_client.clone();
         let publisher_for_state = publisher.clone();
 
-        // Resolve the Boss state root from the db path's parent so the
-        // dispatch-event JSONL stream lands next to state.db /
-        // events.sock under the same root. Falls back to the user's
-        // `~/Library/Application Support/Boss/` if the db path has no
-        // parent (only possible in degenerate test configs). When the db
-        // path is `:memory:`, its parent is an empty string; fall back to
-        // `cwd` so dispatch events land next to the other test artifacts.
-        let dispatch_event_root: PathBuf = cfg
-            .work
-            .db_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cfg.work.cwd.clone());
+        // Dispatch-event JSONL stream lands next to state.db /
+        // events.sock under the same `state_root` resolved above.
+        let dispatch_event_root: PathBuf = state_root.clone();
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> = Arc::new(
             crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()),
         );
@@ -638,6 +668,7 @@ impl ServerState {
                 spawn_pane_lock: Arc::new(Mutex::new(())),
                 ipc_logger,
                 _self_weak: weak_self.clone(),
+                feature_flags: feature_flags_for_state,
             }
         });
 
@@ -4740,6 +4771,48 @@ async fn handle_frontend_connection(
                     &request_id,
                     FrontendEvent::LiveStatusDebugReportEvent { report },
                 );
+            }
+            FrontendRequest::ListFeatureFlags => {
+                let flags = server_state
+                    .feature_flags
+                    .snapshot_all()
+                    .into_iter()
+                    .map(|snap| boss_protocol::FeatureFlagSnapshot {
+                        name: snap.name,
+                        description: snap.description,
+                        category: snap.category,
+                        default_enabled: snap.default_enabled,
+                        enabled: snap.enabled,
+                    })
+                    .collect();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::FeatureFlagsList { flags },
+                );
+            }
+            FrontendRequest::SetFeatureFlag { name, enabled } => {
+                match server_state.feature_flags.set(&name, enabled) {
+                    Ok(()) => {
+                        tracing::info!(
+                            flag = %name,
+                            enabled,
+                            "feature-flags: toggled via macOS debug pane",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::FeatureFlagSet { name, enabled },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
             }
             FrontendRequest::SetProjectDesignDoc { input } => {
                 match work_db.set_project_design_doc(input) {

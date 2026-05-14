@@ -21,6 +21,7 @@ struct BossMacApp: App {
             CommandMenu("Debug") {
                 DispatchEventsCommand()
                 EngineCommand()
+                FeatureFlagsCommand()
             }
         }
 
@@ -54,6 +55,12 @@ struct BossMacApp: App {
         }
         .environmentObject(chatModel)
         .defaultSize(width: 1040, height: 620)
+
+        Window("Feature Flags", id: "feature-flags") {
+            FeatureFlagsViewer()
+        }
+        .environmentObject(chatModel)
+        .defaultSize(width: 600, height: 420)
     }
 }
 
@@ -92,6 +99,25 @@ private struct EngineCommand: View {
             }
         }
         .keyboardShortcut("e", modifiers: [.command, .shift])
+    }
+}
+
+private struct FeatureFlagsCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.featureFlagsViewer.visible") private var isOpen = false
+
+    var body: some View {
+        Button("Feature Flags") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "feature-flags")
+            } else {
+                isOpen = true
+                openWindow(id: "feature-flags")
+            }
+        }
+        .keyboardShortcut("f", modifiers: [.command, .shift])
     }
 }
 

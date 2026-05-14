@@ -474,6 +474,13 @@ pub struct WorkerCompletionHandler {
     /// the staging path get the same behaviour they always had —
     /// nothing is staged → fall through to `pr_detector`.
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// Toggleable feature flags (incident 001 AI #5). Consulted by
+    /// `on_stop_inner` and `recheck_for_pr` to decide whether the
+    /// cold-path PR fallback is permitted to run. Defaults to a
+    /// store whose only state is the registry defaults — tests that
+    /// don't wire one in get the historical behaviour
+    /// (`detect_pr_cold_fallback` defaults ON).
+    feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
 }
 
 impl WorkerCompletionHandler {
@@ -493,6 +500,9 @@ impl WorkerCompletionHandler {
             pane_releaser,
             probe_queuer,
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
+            feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+                std::path::PathBuf::new(),
+            )),
         }
     }
 
@@ -509,6 +519,20 @@ impl WorkerCompletionHandler {
         cache: Arc<crate::pr_url_capture::StagedPrUrlCache>,
     ) -> Self {
         self.staged_pr_urls = cache;
+        self
+    }
+
+    /// Wire an externally-owned [`FeatureFlagsStore`] into this
+    /// handler so engine-wide flag toggles are observed by the
+    /// completion path. `app.rs` calls this once at startup with the
+    /// store loaded from `~/Library/Application Support/Boss/feature-flags.toml`.
+    /// Tests that don't invoke it get the default store (every flag
+    /// at its registry default), preserving the pre-change behaviour.
+    pub fn with_feature_flags(
+        mut self,
+        flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    ) -> Self {
+        self.feature_flags = flags;
         self
     }
 
@@ -594,6 +618,21 @@ impl WorkerCompletionHandler {
                 "stop event: no staged URL and execution is not waiting_human — skipping fallback (running-status gate)",
             );
             return StopOutcome::RunningNoStagedPr;
+        }
+
+        // AI #5 feature-flag gate (incident 001 §5): the cold-path
+        // fallback is the path that produced the mis-binds in the
+        // incident. The human can flip this off in the macOS app
+        // debug pane to immediately suppress the path without a
+        // rebuild. When OFF, empty staging falls through to "no PR
+        // pushed" — the chore stays in `waiting_human` until the
+        // human resolves it by hand.
+        if !self.feature_flags.is_enabled("detect_pr_cold_fallback") {
+            tracing::info!(
+                execution_id,
+                "stop event: detect_pr_cold_fallback flag is OFF — skipping fallback",
+            );
+            return StopOutcome::FallbackDisabledByFlag;
         }
 
         let expected_branch = expected_branch_name(&execution.id);
@@ -724,6 +763,17 @@ impl WorkerCompletionHandler {
                 "pr-recheck: skipping fallback — execution is not waiting_human (running-status gate)",
             );
             return StopOutcome::RunningNoStagedPr;
+        }
+
+        // Feature-flag gate mirror (AI #5): the merge-poller's sweep
+        // runs on the same cold-path fallback `on_stop_inner` does,
+        // so the human's debug-pane toggle must take effect here too.
+        if !self.feature_flags.is_enabled("detect_pr_cold_fallback") {
+            tracing::debug!(
+                execution_id,
+                "pr-recheck: detect_pr_cold_fallback flag is OFF — skipping fallback",
+            );
+            return StopOutcome::FallbackDisabledByFlag;
         }
 
         let expected_branch = expected_branch_name(&execution.id);
@@ -925,6 +975,12 @@ impl WorkerCompletionHandler {
             // fire by design; the worker is alive and may still push. Do
             // not pre-empt with a `failed` mark.
             StopOutcome::RunningNoStagedPr => false,
+            // AI #5 (incident 001): the human flipped the
+            // `detect_pr_cold_fallback` flag OFF — the fallback was
+            // intentionally suppressed. The chore stays in
+            // `waiting_human` for the human to resolve; do not
+            // pre-empt with a `failed` mark either.
+            StopOutcome::FallbackDisabledByFlag => false,
             // Catch-all branches: the worker exited and we have no
             // evidence of a push.
             StopOutcome::AwaitingInput
@@ -1083,6 +1139,13 @@ pub enum StopOutcome {
     /// any positive result would race against its own in-flight push.
     /// Quiet outcome — no probe, no publish, no transition.
     RunningNoStagedPr,
+    /// AI #5 / incident 001: the human has flipped the
+    /// `detect_pr_cold_fallback` feature flag OFF via the debug pane,
+    /// so the cold-path fallback is suppressed. With no staged URL
+    /// the engine treats the empty staging as "no PR pushed" — the
+    /// chore stays in `waiting_human` for the human to resolve by
+    /// hand. Quiet outcome — no probe, no publish, no transition.
+    FallbackDisabledByFlag,
     /// PR detected; work item moved to `in_review` and execution finalised.
     PrDetected { pr_url: String },
     /// PR detected and already merged at Stop time; work item moved
@@ -3575,5 +3638,164 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // surfacing an explicit error keeps the failure mode obvious.
         assert!(parse_repo_slug("git@gitlab.com:foo/bar.git").is_err());
         assert!(parse_repo_slug("https://github.com/spinyfin").is_err());
+    }
+
+    /// AI #5 (incident 001): when the `detect_pr_cold_fallback` feature
+    /// flag is OFF the cold-path fallback must not call the detector
+    /// even for a `waiting_human` execution with an empty staged-URL
+    /// cache. The outcome is the new quiet `FallbackDisabledByFlag`,
+    /// no probe gets queued, the work item stays at its pre-Stop
+    /// state, and the lease/pane are NOT torn down — the human is
+    /// the next actor.
+    #[tokio::test]
+    async fn on_stop_skips_detector_when_feature_flag_is_off() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // Detector wired with a deliberately-wrong URL so any
+        // accidental fall-through would surface as a wrong pr_url on
+        // the chore.
+        let detector =
+            StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("detect_pr_cold_fallback", false).unwrap();
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_feature_flags(flags.clone());
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(outcome, StopOutcome::FallbackDisabledByFlag);
+        assert_eq!(
+            detector.call_count(),
+            0,
+            "feature-flag gate must short-circuit before the detector is consulted",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                // Chore stays put — no transition to `in_review` or anything else.
+                assert_eq!(t.status, "active");
+                assert!(t.pr_url.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status, "waiting_human",
+            "execution must remain `waiting_human` for the human to resolve",
+        );
+        assert!(
+            execution.cube_lease_id.is_some(),
+            "cube lease must be retained — the human may want to re-enter the workspace",
+        );
+        assert!(
+            pane.calls.lock().await.is_empty(),
+            "pane teardown must NOT fire when the fallback is suppressed by flag",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "no probe must be queued — the human is the next actor",
+        );
+    }
+
+    /// AI #5 mirror: the merge-poller's `recheck_for_pr` sweep must
+    /// honour the same flag. The poller fires every ~60s, so a stuck
+    /// `detect_pr_cold_fallback=false` setting must keep the
+    /// fallback off on every sweep, not just the on-Stop path.
+    #[tokio::test]
+    async fn recheck_for_pr_skips_detector_when_feature_flag_is_off() {
+        let workspace = tempdir().unwrap();
+        let (_db_product_id, execution_id, detector, cube, publisher, pane, probes, db) = {
+            let (db, product_id, _chore_id, execution_id) = fixture(workspace.path());
+            let detector =
+                StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+            let cube = Arc::new(StubCubeClient::default());
+            let publisher = Arc::new(RecordingPublisher::default());
+            let pane = Arc::new(RecordingPaneReleaser::default());
+            let probes = Arc::new(RecordingProbeQueuer::default());
+            (
+                product_id, execution_id, detector, cube, publisher, pane, probes, db,
+            )
+        };
+
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap();
+        flags.set("detect_pr_cold_fallback", false).unwrap();
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_feature_flags(flags.clone());
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+        assert_eq!(outcome, StopOutcome::FallbackDisabledByFlag);
+        assert_eq!(detector.call_count(), 0);
+    }
+
+    /// Default-ON safety contract: with NO override file and no
+    /// explicit wiring (the typical test path), `detect_pr` MUST still
+    /// fire. This guards against a future regression where the flag's
+    /// default flips off by accident — the change would show up here
+    /// as the test going green on the wrong branch.
+    #[tokio::test]
+    async fn on_stop_calls_detector_when_feature_flag_defaults_on() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags.load().unwrap(); // missing file → registry default (true)
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_feature_flags(flags);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { .. }),
+            "default-ON must still let `detect_pr` fire; got {outcome:?}",
+        );
+        assert_eq!(detector.call_count(), 1);
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 }

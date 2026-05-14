@@ -133,6 +133,15 @@ enum EngineEvent {
     case conflictResolutionFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
     /// Activity-feed push: an attempt was abandoned on purpose.
     case conflictResolutionAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    /// Response to `list_feature_flags` — a snapshot of every
+    /// registered engine feature flag and its current value. Drives
+    /// the Feature Flags debug pane.
+    case featureFlagsList(flags: [FeatureFlag])
+    /// Echoed result of a `set_feature_flag` toggle: the engine has
+    /// persisted the new value and consumer-side `is_enabled` checks
+    /// will see it immediately. The debug pane uses this as the
+    /// "reload confirmed" signal to render the toggle as committed.
+    case featureFlagSet(name: String, enabled: Bool)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -224,6 +233,25 @@ final class EngineClient: @unchecked Sendable {
         sendLine([
             "type": "set_live_status_enabled",
             "slot_id": slotId,
+            "enabled": enabled,
+        ])
+    }
+
+    /// Ask the engine for the registered feature-flag set. Used by
+    /// the Feature Flags debug pane on appear and after every toggle
+    /// so the rendered state matches what the engine persisted.
+    func sendListFeatureFlags() {
+        sendLine(["type": "list_feature_flags"])
+    }
+
+    /// Toggle one feature flag. Engine persists to
+    /// `feature-flags.toml`, updates the in-memory store, and replies
+    /// with `feature_flag_set` once consumer-side `is_enabled` calls
+    /// see the new value.
+    func sendSetFeatureFlag(name: String, enabled: Bool) {
+        sendLine([
+            "type": "set_feature_flag",
+            "name": name,
             "enabled": enabled,
         ])
     }
@@ -827,6 +855,16 @@ final class EngineClient: @unchecked Sendable {
                     prURL: payload["pr_url"] as? String ?? "",
                     failureReason: payload["failure_reason"] as? String ?? ""
                 ))
+            case "feature_flags_list":
+                let raw = payload["flags"] as? [[String: Any]] ?? []
+                let flags = raw.compactMap(parseFeatureFlag)
+                emit(.featureFlagsList(flags: flags))
+            case "feature_flag_set":
+                let name = payload["name"] as? String ?? ""
+                let enabled = (payload["enabled"] as? NSNumber)?.boolValue ?? false
+                if !name.isEmpty {
+                    emit(.featureFlagSet(name: name, enabled: enabled))
+                }
             default:
                 break
             }
@@ -1061,6 +1099,26 @@ final class EngineClient: @unchecked Sendable {
             activity: activity,
             liveStatus: payload["live_status"] as? String,
             liveStatusAt: payload["live_status_at"] as? String
+        )
+    }
+
+    private func parseFeatureFlag(_ payload: [String: Any]) -> FeatureFlag? {
+        guard
+            let name = payload["name"] as? String,
+            !name.isEmpty,
+            let description = payload["description"] as? String,
+            let category = payload["category"] as? String,
+            let defaultEnabled = (payload["default_enabled"] as? NSNumber)?.boolValue,
+            let enabled = (payload["enabled"] as? NSNumber)?.boolValue
+        else {
+            return nil
+        }
+        return FeatureFlag(
+            name: name,
+            description: description,
+            category: category,
+            defaultEnabled: defaultEnabled,
+            enabled: enabled
         )
     }
 }
