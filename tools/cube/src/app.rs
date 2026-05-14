@@ -144,6 +144,12 @@ pub enum CubeError {
 /// `tools/jj/` — the wording has been stable across releases.
 const JJ_STALE_SIGNATURE: &str = "working copy is stale";
 
+/// Stable substring jj prints when the repo was loaded at an operation
+/// that is a sibling of the working copy's operation (op-log divergence).
+/// Both the stale-working-copy and op-log-diverged cases are fixed by
+/// `jj workspace update-stale`. The wording has been stable across releases.
+const JJ_OP_DIVERGED_SIGNATURE: &str = "seems to be a sibling";
+
 impl CubeError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -1796,9 +1802,10 @@ fn read_head_status(
 }
 
 /// Run a `jj` command against a workspace, transparently recovering
-/// from a stale working copy. If the underlying command fails with the
-/// `working copy is stale` signature, runs `jj workspace update-stale`
-/// once and retries. Non-stale failures and non-`jj` invocations pass
+/// from a stale working copy or op-log divergence. If the underlying
+/// command fails with either the `working copy is stale` or
+/// `seems to be a sibling` signature, runs `jj workspace update-stale`
+/// once and retries. Other failures and non-`jj` invocations pass
 /// through untouched.
 fn run_jj(
     runner: &dyn CommandRunner,
@@ -1808,8 +1815,14 @@ fn run_jj(
     match runner.run(invocation) {
         Ok(out) => Ok(out),
         Err(err) => {
-            if !is_stale_working_copy_error(&err) {
+            let Some(recovery_kind) = jj_update_stale_recovery_kind(&err) else {
                 return Err(err);
+            };
+            if recovery_kind == "workspace.op_diverged_recovered" {
+                eprintln!(
+                    "cube: jj op-log diverged on {}; running `jj workspace update-stale` to recover",
+                    invocation.cwd.display()
+                );
             }
             let update_stale = RealCommandRunner::invocation(
                 &invocation.cwd,
@@ -1824,7 +1837,7 @@ fn run_jj(
             }
             audit!(
                 database_path,
-                "workspace.stale_recovered",
+                recovery_kind,
                 workspace_path = invocation.cwd.display().to_string(),
                 program = invocation.program,
                 args = invocation.args,
@@ -1840,13 +1853,25 @@ fn run_jj(
     }
 }
 
-fn is_stale_working_copy_error(err: &CubeError) -> bool {
-    matches!(
-        err,
-        CubeError::CommandFailed { program, stderr, .. }
-            if program == "jj" && stderr.to_lowercase().contains(JJ_STALE_SIGNATURE)
-    )
+/// Returns the audit event name if the error is one that `jj workspace
+/// update-stale` can fix, or `None` if the error is unrelated.
+fn jj_update_stale_recovery_kind(err: &CubeError) -> Option<&'static str> {
+    let CubeError::CommandFailed { program, stderr, .. } = err else {
+        return None;
+    };
+    if program != "jj" {
+        return None;
+    }
+    let lower = stderr.to_lowercase();
+    if lower.contains(JJ_STALE_SIGNATURE) {
+        return Some("workspace.stale_recovered");
+    }
+    if lower.contains(JJ_OP_DIVERGED_SIGNATURE) {
+        return Some("workspace.op_diverged_recovered");
+    }
+    None
 }
+
 
 fn current_workspace_commit(
     runner: &dyn CommandRunner,
@@ -6509,6 +6534,130 @@ steps:
         }
     }
 
+    #[test]
+    fn workspace_lease_recovers_from_op_log_divergence() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // `jj status` returns the op-log divergence error (exit 255,
+        // "seems to be a sibling"). The wrapper should run
+        // `jj workspace update-stale` once, then retry `jj status`. The
+        // remainder of the lease then proceeds normally.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::op_diverged(workspace_path.clone(), "jj", &["status", "--no-pager"]),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["workspace", "update-stale"],
+                "Working copy now at: abc1234",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "op-diverged demo"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease should auto-recover from op-log divergence");
+        runner.assert_exhausted();
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-004"
+        );
+        assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
+
+        let audit_dir = database_path.parent().unwrap().join("audit");
+        let logs = std::fs::read_dir(&audit_dir)
+            .expect("audit dir")
+            .filter_map(|e| e.ok())
+            .map(|e| std::fs::read_to_string(e.path()).expect("audit log"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            logs.contains("\"event\":\"workspace.op_diverged_recovered\""),
+            "expected op_diverged_recovered audit event, got: {logs}"
+        );
+        assert!(
+            logs.contains(workspace_path.display().to_string().as_str()),
+            "audit event should record the workspace path"
+        );
+    }
+
+    #[test]
+    fn workspace_lease_surfaces_op_diverged_recovery_failure() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // `jj status` reports op-log divergence; `jj workspace update-stale`
+        // itself fails. The lease must surface a StaleRecoveryFailed error
+        // with the original error preserved.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::op_diverged(workspace_path.clone(), "jj", &["status", "--no-pager"]),
+            ExpectedCommand {
+                cwd: workspace_path.clone(),
+                program: "jj".to_string(),
+                args: vec!["workspace".to_string(), "update-stale".to_string()],
+                result: Err(CubeError::CommandFailed {
+                    program: "jj".to_string(),
+                    args: vec!["workspace".to_string(), "update-stale".to_string()],
+                    status: Some(1),
+                    stderr: "Error: workspace operation failed".to_string(),
+                }),
+                creates_dir: None,
+            },
+        ]);
+
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "op-diverged fail"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("lease should fail when op-diverged recovery itself fails");
+        runner.assert_exhausted();
+
+        match error {
+            CubeError::StaleRecoveryFailed {
+                workspace_path: path,
+                cause,
+            } => {
+                assert_eq!(path, workspace_path);
+                assert!(
+                    cause.contains("update-stale"),
+                    "cause should mention update-stale: {cause}"
+                );
+            }
+            other => panic!("expected StaleRecoveryFailed, got {other:?}"),
+        }
+    }
+
     /// Sets `lease_expires_at_epoch_s` directly in the SQLite store.
     /// Used by reconcile tests to age a lease past its TTL without having
     /// to wait wall-clock seconds.
@@ -7311,6 +7460,28 @@ steps:
                     status: Some(1),
                     stderr: "Error: The working copy is stale (not updated since operation \
                              0123456789ab). Run `jj workspace update-stale` to update it."
+                        .to_string(),
+                }),
+                creates_dir: None,
+            }
+        }
+
+        /// Build an expectation that simulates jj's op-log divergence
+        /// failure. The wording matches `JJ_OP_DIVERGED_SIGNATURE` and
+        /// is recovered by `jj workspace update-stale`, same as `stale`.
+        fn op_diverged(cwd: PathBuf, program: &str, args: &[&str]) -> Self {
+            let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            Self {
+                cwd,
+                program: program.to_string(),
+                args: args_owned.clone(),
+                result: Err(CubeError::CommandFailed {
+                    program: program.to_string(),
+                    args: args_owned,
+                    status: Some(255),
+                    stderr: "Internal error: The repo was loaded at operation a44a2f689f46, \
+                             which seems to be a sibling of the working copy's operation \
+                             17fb914fb03f"
                         .to_string(),
                 }),
                 creates_dir: None,
