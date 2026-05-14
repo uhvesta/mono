@@ -145,8 +145,8 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         self.settings.is_enabled("default_pr_draft_mode")
     }
 
-    fn always_use_opus(&self) -> bool {
-        self.settings.is_enabled("workers.always_use_opus")
+    fn non_opus_auto_mode(&self) -> bool {
+        self.settings.is_enabled("workers.non_opus_permission_mode")
     }
 }
 

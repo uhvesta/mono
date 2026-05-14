@@ -101,21 +101,26 @@ impl SpawnConfig {
     /// level (per design §Q2: omit and let `claude` fall through to
     /// `high` for untagged rows).
     ///
-    /// Permission mode is model-dependent: Opus supports
-    /// `--permission-mode auto`; all other models (Haiku, Sonnet, …)
-    /// use `--dangerously-skip-permissions` because `--permission-mode
-    /// auto` is Opus-only and falls back to interactive mode on
-    /// non-Opus, making the worker unusable.
+    /// Permission mode rules (corp env vs personal laptop observations,
+    /// 2026-05-14):
+    /// - Opus: always `--permission-mode auto`. Corp env does not default to
+    ///   it, so it must be explicit.
+    /// - Sonnet/Haiku: controlled by `non_opus_auto_mode` (the
+    ///   `workers.non_opus_permission_mode` setting). `false` (default, personal
+    ///   laptop) → `--dangerously-skip-permissions`. `true` (corp laptop, where
+    ///   dangerously-skip is forbidden) → `--permission-mode auto`.
     ///
     /// The trailing newline is what the pane treats as the user
     /// hitting return — match today's behaviour byte-for-byte.
-    pub fn claude_invocation(&self) -> String {
+    pub fn claude_invocation(&self, non_opus_auto_mode: bool) -> String {
         let mut cmd = format!("claude --model {}", self.model);
         if let Some(effort) = self.claude_effort {
             cmd.push_str(" --effort ");
             cmd.push_str(effort);
         }
         if model_is_opus(&self.model) {
+            cmd.push_str(" --permission-mode auto");
+        } else if non_opus_auto_mode {
             cmd.push_str(" --permission-mode auto");
         } else {
             cmd.push_str(" --dangerously-skip-permissions");
@@ -169,36 +174,6 @@ pub fn resolve_spawn_config(
         claude_effort: effort_level.map(claude_effort_for_level),
         model,
         prompt_addendum: effort_level.and_then(prompt_addendum_for_level),
-    }
-}
-
-/// Opus model slug used when the `workers.always_use_opus` setting overrides
-/// the effort-level default.
-pub const ALWAYS_OPUS_MODEL: &str = "claude-opus-4-7";
-
-/// `--effort` value for each level when `workers.always_use_opus` is active.
-/// Large/max match the §Q2 table exactly (those rows already use Opus).
-/// Trivial/small use `low` and medium uses `medium` — sensible budgets for
-/// Opus on lighter tasks without wasting the model's full reasoning depth.
-fn claude_effort_for_level_with_opus(level: EffortLevel) -> &'static str {
-    match level {
-        EffortLevel::Trivial | EffortLevel::Small => "low",
-        EffortLevel::Medium => "medium",
-        EffortLevel::Large => "xhigh",
-        EffortLevel::Max => "max",
-    }
-}
-
-/// Apply the `workers.always_use_opus` override to a resolved `SpawnConfig`.
-/// Forces the model to Opus and remaps `--effort` to Opus-appropriate values.
-/// `effort_level` and `prompt_addendum` are preserved — the override changes
-/// the model, not the scope classification (design §Q3 precedence rationale).
-pub fn apply_always_opus_override(config: SpawnConfig) -> SpawnConfig {
-    SpawnConfig {
-        effort_level: config.effort_level,
-        claude_effort: config.effort_level.map(claude_effort_for_level_with_opus),
-        model: ALWAYS_OPUS_MODEL.to_owned(),
-        prompt_addendum: config.prompt_addendum,
     }
 }
 
@@ -466,17 +441,17 @@ mod tests {
         // carry --permission-mode auto (Opus) and no --effort.
         let cfg = resolve_spawn_config(None, None, None);
         assert_eq!(
-            cfg.claude_invocation(),
+            cfg.claude_invocation(false),
             "claude --model claude-opus-4-7 --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 
     #[test]
     fn trivial_invocation_includes_both_flags() {
-        // Haiku is non-Opus → --dangerously-skip-permissions.
+        // Haiku is non-Opus → --dangerously-skip-permissions (default/personal laptop).
         let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
         assert_eq!(
-            cfg.claude_invocation(),
+            cfg.claude_invocation(false),
             "claude --model claude-haiku-4-5-20251001 --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
@@ -486,7 +461,7 @@ mod tests {
         // model_override = "opus" → Opus family → --permission-mode auto.
         let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None);
         assert_eq!(
-            cfg.claude_invocation(),
+            cfg.claude_invocation(false),
             "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
@@ -494,28 +469,32 @@ mod tests {
     // --- permission-mode branching ---
 
     #[test]
-    fn opus_model_gets_permission_mode_auto() {
+    fn opus_model_always_gets_permission_mode_auto() {
+        // Opus gets --permission-mode auto regardless of non_opus_auto_mode.
         for model in ["claude-opus-4-7", "claude-opus-4-5", "opus"] {
-            let cfg = SpawnConfig {
-                effort_level: None,
-                claude_effort: None,
-                model: model.to_owned(),
-                prompt_addendum: None,
-            };
-            let inv = cfg.claude_invocation();
-            assert!(
-                inv.contains("--permission-mode auto"),
-                "Opus model {model:?} must carry --permission-mode auto, got: {inv:?}",
-            );
-            assert!(
-                !inv.contains("--dangerously-skip-permissions"),
-                "Opus model {model:?} must NOT carry --dangerously-skip-permissions, got: {inv:?}",
-            );
+            for non_opus_auto_mode in [false, true] {
+                let cfg = SpawnConfig {
+                    effort_level: None,
+                    claude_effort: None,
+                    model: model.to_owned(),
+                    prompt_addendum: None,
+                };
+                let inv = cfg.claude_invocation(non_opus_auto_mode);
+                assert!(
+                    inv.contains("--permission-mode auto"),
+                    "Opus model {model:?} must carry --permission-mode auto, got: {inv:?}",
+                );
+                assert!(
+                    !inv.contains("--dangerously-skip-permissions"),
+                    "Opus model {model:?} must NOT carry --dangerously-skip-permissions, got: {inv:?}",
+                );
+            }
         }
     }
 
     #[test]
-    fn non_opus_model_gets_dangerously_skip_permissions() {
+    fn non_opus_model_skip_mode_gets_dangerously_skip_permissions() {
+        // non_opus_auto_mode=false (default/personal laptop): --dangerously-skip-permissions.
         for model in [
             "claude-haiku-4-5-20251001",
             "claude-sonnet-4-6",
@@ -527,14 +506,40 @@ mod tests {
                 model: model.to_owned(),
                 prompt_addendum: None,
             };
-            let inv = cfg.claude_invocation();
+            let inv = cfg.claude_invocation(false);
             assert!(
                 inv.contains("--dangerously-skip-permissions"),
-                "Non-Opus model {model:?} must carry --dangerously-skip-permissions, got: {inv:?}",
+                "Non-Opus model {model:?} with skip mode must carry --dangerously-skip-permissions, got: {inv:?}",
             );
             assert!(
                 !inv.contains("--permission-mode"),
-                "Non-Opus model {model:?} must NOT carry --permission-mode, got: {inv:?}",
+                "Non-Opus model {model:?} with skip mode must NOT carry --permission-mode, got: {inv:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn non_opus_model_auto_mode_gets_permission_mode_auto() {
+        // non_opus_auto_mode=true (corp laptop): --permission-mode auto for Sonnet/Haiku too.
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+        ] {
+            let cfg = SpawnConfig {
+                effort_level: None,
+                claude_effort: None,
+                model: model.to_owned(),
+                prompt_addendum: None,
+            };
+            let inv = cfg.claude_invocation(true);
+            assert!(
+                inv.contains("--permission-mode auto"),
+                "Non-Opus model {model:?} with auto mode must carry --permission-mode auto, got: {inv:?}",
+            );
+            assert!(
+                !inv.contains("--dangerously-skip-permissions"),
+                "Non-Opus model {model:?} with auto mode must NOT carry --dangerously-skip-permissions, got: {inv:?}",
             );
         }
     }
@@ -607,77 +612,4 @@ mod tests {
         assert_eq!(all_markers().count(), total);
     }
 
-    // --- always-opus override ---
-
-    #[test]
-    fn always_opus_override_forces_model_to_opus_for_all_levels() {
-        for level in [
-            EffortLevel::Trivial,
-            EffortLevel::Small,
-            EffortLevel::Medium,
-            EffortLevel::Large,
-            EffortLevel::Max,
-        ] {
-            let base = resolve_spawn_config(Some(level), None, None);
-            let overridden = apply_always_opus_override(base.clone());
-            assert_eq!(
-                overridden.model, ALWAYS_OPUS_MODEL,
-                "level {:?} must resolve to opus",
-                level,
-            );
-            // effort_level and prompt_addendum are preserved
-            assert_eq!(overridden.effort_level, base.effort_level);
-            assert_eq!(overridden.prompt_addendum, base.prompt_addendum);
-        }
-    }
-
-    #[test]
-    fn always_opus_override_effort_mapping() {
-        let check = |level, expected_effort| {
-            let base = resolve_spawn_config(Some(level), None, None);
-            let overridden = apply_always_opus_override(base);
-            assert_eq!(
-                overridden.claude_effort,
-                Some(expected_effort),
-                "level {:?} should map to --effort {} in always-opus mode",
-                level,
-                expected_effort,
-            );
-        };
-        check(EffortLevel::Trivial, "low");
-        check(EffortLevel::Small, "low");
-        check(EffortLevel::Medium, "medium");
-        // large/max match the §Q2 Opus rows exactly
-        check(EffortLevel::Large, "xhigh");
-        check(EffortLevel::Max, "max");
-    }
-
-    #[test]
-    fn always_opus_override_invocation_uses_permission_mode_auto() {
-        // Opus model → --permission-mode auto, not --dangerously-skip-permissions.
-        let base = resolve_spawn_config(Some(EffortLevel::Small), None, None);
-        assert!(
-            base.claude_invocation().contains("--dangerously-skip-permissions"),
-            "small without override should use --dangerously-skip-permissions (Sonnet)",
-        );
-        let overridden = apply_always_opus_override(base);
-        let inv = overridden.claude_invocation();
-        assert!(
-            inv.contains("--permission-mode auto"),
-            "always-opus override on small must use --permission-mode auto, got: {inv:?}",
-        );
-        assert!(
-            !inv.contains("--dangerously-skip-permissions"),
-            "always-opus override must NOT use --dangerously-skip-permissions, got: {inv:?}",
-        );
-    }
-
-    #[test]
-    fn always_opus_override_preserves_null_effort_on_untagged_row() {
-        // A row with no effort_level still resolves to opus but loses --effort.
-        let base = resolve_spawn_config(None, None, None);
-        let overridden = apply_always_opus_override(base);
-        assert_eq!(overridden.model, ALWAYS_OPUS_MODEL);
-        assert_eq!(overridden.claude_effort, None);
-    }
 }

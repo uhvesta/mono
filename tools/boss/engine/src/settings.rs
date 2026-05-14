@@ -35,8 +35,13 @@ pub const REGISTRY: &[SettingSpec] = &[
         default_enabled: false,
     },
     SettingSpec {
-        key: "workers.always_use_opus",
-        description: "Forces every dispatched worker to run on Opus regardless of effort level. Useful where --dangerously-skip-permissions is forbidden (auto-mode only works on Opus).",
+        key: "workers.non_opus_permission_mode",
+        // false = --dangerously-skip-permissions (personal laptop default).
+        // true  = --permission-mode auto (corp laptop: dangerously-skip is
+        // forbidden, but auto mode works for Sonnet/Haiku too).
+        // Opus workers always get --permission-mode auto regardless of this
+        // setting (corp env does not default to auto for Opus either).
+        description: "Permission mode for Sonnet/Haiku workers. Disabled (default): --dangerously-skip-permissions. Enabled: --permission-mode auto.",
         default_enabled: false,
     },
 ];
@@ -101,6 +106,17 @@ impl SettingsStore {
         let mut guard = self.state.lock().expect("settings lock poisoned");
         guard.clear();
         for (key, value) in parsed.settings {
+            // workers.always_use_opus was superseded by workers.non_opus_permission_mode
+            // (T462 → this chore). If the old key is still in the file it is a no-op;
+            // log once so operators know to clean it up.
+            if key == "workers.always_use_opus" {
+                tracing::warn!(
+                    "settings: ignoring obsolete key 'workers.always_use_opus' \
+                     (superseded by 'workers.non_opus_permission_mode'); \
+                     you can remove it from settings.toml"
+                );
+                continue;
+            }
             if REGISTRY.iter().any(|spec| spec.key == key) {
                 guard.insert(key, value);
             }
@@ -250,6 +266,31 @@ mod tests {
         store.load().unwrap();
         assert!(store.is_enabled("default_pr_draft_mode"));
         assert!(store.get("stale_setting").is_none());
+    }
+
+    #[test]
+    fn non_opus_permission_mode_defaults_to_false() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(!store.is_enabled("workers.non_opus_permission_mode"));
+    }
+
+    #[test]
+    fn obsolete_always_use_opus_key_is_ignored_on_load() {
+        // The old workers.always_use_opus key from T462 must not cause an error;
+        // it is silently skipped (and a tracing warning is emitted, not tested here).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "\"workers.always_use_opus\" = true\ndefault_pr_draft_mode = true\n",
+        )
+        .unwrap();
+        let store = SettingsStore::new(path);
+        store.load().unwrap();
+        assert!(store.is_enabled("default_pr_draft_mode"));
+        assert!(store.get("workers.always_use_opus").is_none());
     }
 
     #[test]

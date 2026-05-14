@@ -32,8 +32,8 @@ private struct WorkerSettingsPane: View {
         chatModel.engineSettings.filter { $0.key == "default_pr_draft_mode" }
     }
 
-    private var modelSettings: [EngineSetting] {
-        chatModel.engineSettings.filter { $0.key == "workers.always_use_opus" }
+    private var permissionModeSetting: EngineSetting? {
+        chatModel.engineSettings.first { $0.key == "workers.non_opus_permission_mode" }
     }
 
     var body: some View {
@@ -54,14 +54,14 @@ private struct WorkerSettingsPane: View {
                 } header: {
                     Text("PR Conventions")
                 }
-                Section {
-                    ForEach(modelSettings) { setting in
-                        SettingToggleRow(setting: setting) { enabled in
+                if let setting = permissionModeSetting {
+                    Section {
+                        PermissionModePickerRow(setting: setting) { enabled in
                             chatModel.setEngineSetting(key: setting.key, enabled: enabled)
                         }
+                    } header: {
+                        Text("Workers")
                     }
-                } header: {
-                    Text("Model")
                 }
             }
         }
@@ -95,10 +95,36 @@ private struct SettingToggleRow: View {
         switch key {
         case "default_pr_draft_mode":
             return "Default new PRs to draft mode"
-        case "workers.always_use_opus":
-            return "Always use Opus for workers"
         default:
             return key
         }
+    }
+}
+
+/// Segmented picker for the two-value `workers.non_opus_permission_mode` setting.
+/// `false` (default) = --dangerously-skip-permissions (personal laptop).
+/// `true` = --permission-mode auto (corp laptop).
+private struct PermissionModePickerRow: View {
+    let setting: EngineSetting
+    let onChange: (Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Permission mode for Sonnet/Haiku workers")
+                .font(.body)
+            Text(setting.description)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("", selection: Binding(
+                get: { setting.enabled },
+                set: { onChange($0) }
+            )) {
+                Text("Skip permissions (default)").tag(false)
+                Text("Auto mode").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+        .padding(.vertical, 2)
     }
 }
