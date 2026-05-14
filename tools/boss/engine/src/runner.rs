@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis::ConflictDiagnosis;
 use crate::coordinator::slot_id_from_worker_id;
-use crate::effort::{SpawnConfig, apply_always_opus_override, resolve_spawn_config};
+use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
@@ -333,22 +333,6 @@ impl ExecutionRunner for PaneSpawnRunner {
             row_model_override.as_deref(),
             product_default_model.as_deref(),
         );
-        let spawn_config = if spawner.always_use_opus() {
-            let overridden = apply_always_opus_override(spawn_config);
-            tracing::info!(
-                execution_id = %execution.id,
-                effort_level = row_effort.map(|l| l.as_str()).unwrap_or("none"),
-                claude_effort = overridden.claude_effort.unwrap_or("default"),
-                "always-opus override: resolved {} (effort={}) to opus/{}",
-                execution.id,
-                row_effort.map(|l| l.as_str()).unwrap_or("none"),
-                overridden.claude_effort.unwrap_or("default"),
-            );
-            overridden
-        } else {
-            spawn_config
-        };
-
         // Per-level prompt addendum lands at the very top of the file
         // (design §Q2: "concatenated to .claude/initial-prompt.txt
         // BEFORE the existing prompt body"). The existing task /
@@ -385,7 +369,10 @@ impl ExecutionRunner for PaneSpawnRunner {
         // shell profile (or via `launchctl setenv`) causes every worker
         // spawn to show: "Auth conflict: Using ANTHROPIC_API_KEY instead of
         // Anthropic Console key."
-        let initial_input = format!("unset ANTHROPIC_API_KEY; {}", spawn_config.claude_invocation());
+        let initial_input = format!(
+            "unset ANTHROPIC_API_KEY; {}",
+            spawn_config.claude_invocation(spawner.non_opus_auto_mode()),
+        );
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for
         // this work item. The full run id is still used for logs and

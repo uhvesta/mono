@@ -163,10 +163,11 @@ pub trait WorkerSpawner: Send + Sync {
         false
     }
 
-    /// Whether the `workers.always_use_opus` setting is enabled. When
-    /// `true`, the effort→model resolver is overridden to Opus for every
-    /// spawned worker. Default `false` for tests.
-    fn always_use_opus(&self) -> bool {
+    /// Whether Sonnet/Haiku workers should use `--permission-mode auto`
+    /// instead of `--dangerously-skip-permissions`. Controlled by the
+    /// `workers.non_opus_permission_mode` setting. Default `false` (skip
+    /// permissions) for tests; corp users set it to `true`.
+    fn non_opus_auto_mode(&self) -> bool {
         false
     }
 }
