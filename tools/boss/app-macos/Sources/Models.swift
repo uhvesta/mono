@@ -281,6 +281,50 @@ struct WorkTask: Identifiable, Hashable {
     }
 }
 
+/// Derivation helpers for the kanban card's "blocked" badge — the
+/// orange chip in the card footer that reads e.g. `Merge Conflict` /
+/// `Blocked`. Centralised so the View and unit tests share one rule.
+///
+/// **Rule:** the badge MUST only render when `task.status == "blocked"`.
+/// Per the engine spec (`Task::blocked_reason` doc), the scalar
+/// `blocked_reason` field is `NULL` on rows whose `status` is not
+/// `'blocked'`. A non-blocked row carrying a non-nil `blockedReason`
+/// is, by definition, locally stale (the engine has cleared the
+/// scalar but the macOS reducer hasn't reconverged yet — typically
+/// because an `events.sock` envelope was dropped or the work-tree
+/// refresh hasn't landed). The badge must NOT mirror that stale
+/// signal: the lane is the source of truth, and the lane comes from
+/// `status`. So the badge derivation gates on `status` rather than
+/// trusting `blockedReason` in isolation. See the chore card
+/// `Kanban chore card shows stale "Merge Conflict" badge` regression.
+enum WorkBlockedBadge {
+    /// Footer chip text for `task`, or `nil` when no chip should
+    /// appear. Callers pass the chip text straight into `WorkStatusBadge`;
+    /// the `nil` path collapses the chip entirely.
+    static func badgeText(for task: WorkTask) -> String? {
+        guard task.status == "blocked" else { return nil }
+        guard let reason = task.blockedReason else { return "Blocked" }
+        return label(forReason: reason)
+    }
+
+    /// Human-readable label for a raw `blocked_reason` string. Used by
+    /// [[badgeText(for:)]] and by any future surface (e.g. detail
+    /// metadata row) that needs the same vocabulary. Falls back to a
+    /// title-cased version of the raw value so unknown / future reason
+    /// codes degrade gracefully rather than rendering as the empty
+    /// string.
+    static func label(forReason reason: String) -> String {
+        switch reason {
+        case "dependency": return "Dependency"
+        case "merge_conflict": return "Merge Conflict"
+        case "ci_failure": return "CI Failure"
+        case "ci_failure_exhausted": return "CI Failed"
+        case "review_feedback": return "Review"
+        default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+}
+
 /// Canonical priority vocabulary shared by tasks, chores, and
 /// projects. Lives in one place so kanban chips, edit pickers, and
 /// any future filter UI all speak the same dialect.

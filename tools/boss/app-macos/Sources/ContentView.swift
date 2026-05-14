@@ -1316,11 +1316,6 @@ struct WorkBoardCardView: View {
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                                 .accessibilityLabel("Blocked")
-                        } else if task.blockedReason != nil && !isResolvingConflicts {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .accessibilityLabel("Blocked: \(task.blockedReason ?? "")")
                         }
                         Text(task.name)
                             .font(.body.weight(.medium))
@@ -1358,10 +1353,8 @@ struct WorkBoardCardView: View {
                     }
                     if isResolvingConflicts {
                         ResolvingConflictsBadge()
-                    } else if task.status == "blocked" {
-                        WorkStatusBadge(text: "Blocked")
-                    } else if let reason = task.blockedReason {
-                        WorkStatusBadge(text: blockedReasonLabel(reason))
+                    } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
+                        WorkStatusBadge(text: blockedText)
                     }
                     if isAutoBlocked {
                         Image(systemName: "link")
@@ -1462,25 +1455,11 @@ struct WorkBoardCardView: View {
         }
     }
 
-    /// Human-readable badge label for a `blocked_reason` value on a
-    /// non-blocked-status card. Falls back to a title-cased version of
-    /// the raw string so future reason values degrade gracefully.
-    private func blockedReasonLabel(_ reason: String) -> String {
-        switch reason {
-        case "dependency": return "Dependency"
-        case "merge_conflict": return "Merge Conflict"
-        case "ci_failure": return "CI Failure"
-        case "ci_failure_exhausted": return "CI Failed"
-        case "review_feedback": return "Review"
-        default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
-        }
-    }
-
     private var cardBackground: Color {
         if isSelected {
             return Color.accentColor.opacity(0.08)
         }
-        if !isResolvingConflicts && (task.status == "blocked" || task.blockedReason != nil) {
+        if !isResolvingConflicts && task.status == "blocked" {
             return Color.orange.opacity(0.08)
         }
         return Color(nsColor: .windowBackgroundColor)
@@ -1490,7 +1469,7 @@ struct WorkBoardCardView: View {
         if isSelected {
             return .accentColor
         }
-        if !isResolvingConflicts && (task.status == "blocked" || task.blockedReason != nil) {
+        if !isResolvingConflicts && task.status == "blocked" {
             return .orange
         }
         return Color(nsColor: .separatorColor)
@@ -1692,7 +1671,7 @@ private struct WorkCardPopoverView: View {
                     "Status",
                     value: task.status.replacingOccurrences(of: "_", with: " ").capitalized
                 )
-                if let reason = task.blockedReason {
+                if task.status == "blocked", let reason = task.blockedReason {
                     metadataRow(
                         "Blocked reason",
                         value: reason.replacingOccurrences(of: "_", with: " ").capitalized
