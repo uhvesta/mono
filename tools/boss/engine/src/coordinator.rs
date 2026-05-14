@@ -18,7 +18,9 @@ use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
 use crate::runner::{ExecutionRunner, RunOutcome};
-use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution, WorkItem, WorkRun};
+use crate::work::{
+    CreateAttentionItemInput, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun,
+};
 
 /// Hard cap on the worker pool. The runtime config can request a smaller
 /// pool, but values above this are clamped (with a warning). The V2
@@ -39,6 +41,16 @@ const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// fast (it's an idempotent record lookup), but the same hang class
 /// applies if cube wedges, so we time-bound it too.
 const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Backoff delays between successive pre-start retry attempts. Element N
+/// is the sleep before attempt N+2 (the first retry, the second retry, …).
+/// Three entries → up to 3 retries (4 total attempts) before a pre-start
+/// failure surfaces to the operator.
+const PRE_START_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+];
 
 /// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
 /// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` is 30 minutes, so a
@@ -814,6 +826,10 @@ pub struct ExecutionCoordinator {
     /// this; per `multi-repo-work-modeling.md` R4 the deduplication
     /// scope is engine-lifetime, not durable.
     repo_cold_probe_seen: Mutex<HashSet<String>>,
+    /// Backoff delays between successive pre-start retry attempts.
+    /// Defaults to [`PRE_START_RETRY_DELAYS`]. Tests may override via
+    /// [`Self::with_pre_start_retry_delays`] to avoid real sleeps.
+    pre_start_retry_delays: Vec<Duration>,
 }
 
 impl ExecutionCoordinator {
@@ -849,7 +865,16 @@ impl ExecutionCoordinator {
             scheduling_active: AtomicBool::new(false),
             scheduling_pending: AtomicBool::new(false),
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
+            pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
         }
+    }
+
+    /// Override the pre-start retry delay schedule. Pass an empty vec
+    /// to disable retries entirely (immediate permanent failure); pass
+    /// short durations in tests to avoid real sleeps.
+    pub fn with_pre_start_retry_delays(mut self, delays: Vec<Duration>) -> Self {
+        self.pre_start_retry_delays = delays;
+        self
     }
 
     /// Install a dispatch-event sink. The production engine threads
@@ -1258,6 +1283,7 @@ impl ExecutionCoordinator {
                     )
                     .await;
                 self.record_start_failure(
+                    Arc::clone(self),
                     execution,
                     worker_id,
                     None,
@@ -1289,6 +1315,7 @@ impl ExecutionCoordinator {
                     )
                     .await;
                 self.record_start_failure(
+                    Arc::clone(self),
                     execution,
                     worker_id,
                     None,
@@ -1321,6 +1348,7 @@ impl ExecutionCoordinator {
                 // execution row flips to `failed` cleanly instead of
                 // wedging in `worker_claimed`.
                 self.record_start_failure(
+                    Arc::clone(self),
                     execution,
                     worker_id,
                     Some(repo.repo_id.as_str()),
@@ -1377,6 +1405,7 @@ impl ExecutionCoordinator {
                     )
                     .await;
                 self.record_start_failure(
+                    Arc::clone(self),
                     execution,
                     worker_id,
                     Some(repo.repo_id.as_str()),
@@ -1490,6 +1519,7 @@ impl ExecutionCoordinator {
                     )
                     .await;
                 self.record_start_failure(
+                    Arc::clone(self),
                     execution,
                     worker_id,
                     Some(repo.repo_id.as_str()),
@@ -1779,8 +1809,18 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Record a pre-start failure and either schedule an automatic retry
+    /// or surface a permanent failure to the operator.
+    ///
+    /// Safe-to-retry stages (no worker side effects yet):
+    /// `cube_repo_ensure`, `workspace_lease`, `change_create`,
+    /// `run_start` (DB-only failure, transaction rolled back).
+    ///
+    /// Do NOT call this for post-`run_started` failures — those require
+    /// `finish_execution_run`.
     fn record_start_failure(
         &self,
+        coordinator: Arc<ExecutionCoordinator>,
         execution: &WorkExecution,
         worker_id: &str,
         cube_repo_id: Option<&str>,
@@ -1788,78 +1828,111 @@ impl ExecutionCoordinator {
         attention_title: &str,
         error: &anyhow::Error,
     ) -> Result<()> {
-        let (execution, run) = self.work_db.fail_execution_start(
+        let (execution, run, outcome) = self.work_db.record_pre_start_failure(
             &execution.id,
             worker_id,
             cube_repo_id,
             &error.to_string(),
+            &self.pre_start_retry_delays,
         )?;
-        tracing::warn!(
-            execution_id = %execution.id,
-            run_id = %run.id,
-            worker_id,
-            error = %error,
-            "recorded execution start failure"
-        );
 
-        // The historical silent-release path: the execution row
-        // flipped to `failed` and the operator had nothing in
-        // `bossctl agents list` to chase. Surface every dispatch
-        // start failure as a `WorkAttentionItem` so the next failure
-        // is diagnosable in one bossctl call instead of needing a
-        // tracing-log tail.
-        let attention_body = format!(
-            "Execution `{execution_id}` could not start on worker `{worker_id}`.\n\n\
-             **Error:** {err}\n\n\
-             Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` for the full stage timeline.",
-            execution_id = execution.id,
-            err = format!("{error:#}"),
-        );
-        if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
-            execution_id: Some(execution.id.clone()),
-            work_item_id: None,
-            kind: attention_kind.to_owned(),
-            status: None,
-            title: attention_title.to_owned(),
-            body_markdown: attention_body,
-            resolved_at: None,
-        }) {
-            // Attention-item insertion shouldn't fail the dispatch
-            // record path; if it does, just log it. The execution
-            // row is still marked `failed`, so the gap is at worst
-            // back to where we started.
-            tracing::error!(
-                ?attention_err,
-                execution_id = %execution.id,
-                "failed to record attention item for execution start failure",
-            );
+        match outcome {
+            PreStartFailureOutcome::Retry { delay } => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id,
+                    pre_start_failure_count = execution.pre_start_failure_count,
+                    max_retries = self.pre_start_retry_delays.len(),
+                    delay_secs = delay.as_secs(),
+                    "pre-start failure will retry after backoff"
+                );
+                // After the backoff window expires, promote the execution
+                // back into the ready queue and wake the scheduler. Until
+                // then `dispatch_not_before` keeps it invisible to
+                // `list_ready_executions`.
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    coordinator.kick();
+                });
+            }
+            PreStartFailureOutcome::PermanentFail => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    run_id = %run.id,
+                    worker_id,
+                    pre_start_failure_count = execution.pre_start_failure_count,
+                    error = %error,
+                    "recorded execution start failure"
+                );
+
+                // Surface every permanent pre-start failure as a
+                // `WorkAttentionItem` so the failure is diagnosable in one
+                // bossctl call instead of needing a tracing-log tail.
+                let attention_body = format!(
+                    "Execution `{execution_id}` could not start on worker `{worker_id}` \
+                     after {attempts} attempt(s).\n\n\
+                     **Error:** {err}\n\n\
+                     Inspect `dispatch-events/executions/{execution_id}/dispatch.jsonl` \
+                     for the full stage timeline.",
+                    execution_id = execution.id,
+                    attempts = execution.pre_start_failure_count,
+                    err = format!("{error:#}"),
+                );
+                if let Err(attention_err) =
+                    self.work_db.create_attention_item(CreateAttentionItemInput {
+                        execution_id: Some(execution.id.clone()),
+                        work_item_id: None,
+                        kind: attention_kind.to_owned(),
+                        status: None,
+                        title: attention_title.to_owned(),
+                        body_markdown: attention_body,
+                        resolved_at: None,
+                    })
+                {
+                    tracing::error!(
+                        ?attention_err,
+                        execution_id = %execution.id,
+                        "failed to record attention item for execution start failure",
+                    );
+                }
+
+                let publisher = self.publisher.clone();
+                let execution_id = execution.id.clone();
+                let work_item_id = execution.work_item_id.clone();
+                let status = execution.status.clone();
+                let product_id = match self.work_db.get_work_item(&work_item_id) {
+                    Ok(item) => Some(work_item_product_id(&item)),
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            %work_item_id,
+                            "failed to resolve product for runtime broadcast"
+                        );
+                        None
+                    }
+                };
+                tokio::spawn(async move {
+                    publisher
+                        .publish(
+                            &execution_id,
+                            &work_item_id,
+                            &status,
+                            "execution_start_failed",
+                        )
+                        .await;
+                    if let Some(product_id) = product_id {
+                        publisher
+                            .publish_work_item_changed(
+                                &product_id,
+                                &work_item_id,
+                                "execution_start_failed",
+                            )
+                            .await;
+                    }
+                });
+            }
         }
-
-        let publisher = self.publisher.clone();
-        let execution_id = execution.id.clone();
-        let work_item_id = execution.work_item_id.clone();
-        let status = execution.status.clone();
-        let product_id = match self.work_db.get_work_item(&work_item_id) {
-            Ok(item) => Some(work_item_product_id(&item)),
-            Err(err) => {
-                tracing::warn!(?err, %work_item_id, "failed to resolve product for runtime broadcast");
-                None
-            }
-        };
-        tokio::spawn(async move {
-            publisher
-                .publish(&execution_id, &work_item_id, &status, "execution_start_failed")
-                .await;
-            if let Some(product_id) = product_id {
-                publisher
-                    .publish_work_item_changed(
-                        &product_id,
-                        &work_item_id,
-                        "execution_start_failed",
-                    )
-                    .await;
-            }
-        });
         Ok(())
     }
 
@@ -3379,12 +3452,15 @@ mod tests {
             fail_lease: true,
             ..FakeCubeClient::default()
         });
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            Arc::new(FakeExecutionRunner::default()),
-        ));
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_pre_start_retry_delays(vec![]),
+        );
         coordinator.kick();
         wait_for_execution_status(
             db.as_ref(),
@@ -3446,12 +3522,17 @@ mod tests {
             fail_lease: true,
             ..FakeCubeClient::default()
         });
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            Arc::new(FakeExecutionRunner::default()),
-        ));
+        // No retries: go straight to permanent failure so the test does
+        // not have to wait through exponential backoff delays.
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_pre_start_retry_delays(vec![]),
+        );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
         coordinator.kick();
         wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
@@ -3843,6 +3924,8 @@ mod tests {
             ..FakeCubeClient::default()
         });
         let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        // No retries: go straight to permanent failure so the test does
+        // not have to wait through exponential backoff delays.
         let coordinator = Arc::new(
             ExecutionCoordinator::new(
                 db.clone(),
@@ -3850,6 +3933,7 @@ mod tests {
                 cube.clone(),
                 Arc::new(FakeExecutionRunner::default()),
             )
+            .with_pre_start_retry_delays(vec![])
             .with_dispatch_events(recording.clone()),
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
@@ -3916,6 +4000,186 @@ mod tests {
         assert!(!stages.contains(&"pane_spawned"));
     }
 
+    /// Pre-start failures (cube lease error, cube ensure error, etc.) should
+    /// be retried automatically before surfacing to the operator.
+    ///
+    /// This test uses zero-length backoff delays and a single retry slot so
+    /// it runs quickly. It verifies:
+    /// 1. A single pre-start failure resets the execution to `ready` (not
+    ///    `failed`) and `pre_start_failure_count` is incremented.
+    /// 2. A second failure (after retry) permanently marks the execution
+    ///    `failed` and surfaces an attention item.
+    /// 3. Only one execution row exists (no sibling rows).
+    #[tokio::test]
+    async fn pre_start_failure_retries_then_permanently_fails() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Retry Chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease: true,
+            ..FakeCubeClient::default()
+        });
+        // One retry (two attempts total), immediate backoff.
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_pre_start_retry_delays(vec![Duration::ZERO]),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        coordinator.kick();
+        // Wait for permanent failure — after 1 retry (2 total attempts)
+        wait_for_execution_status(db.as_ref(), &execution_id, "failed").await;
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "failed");
+        assert_eq!(
+            execution.pre_start_failure_count, 2,
+            "expected 2 pre-start failures (initial + 1 retry); got {}",
+            execution.pre_start_failure_count
+        );
+
+        let runs = db.list_runs(&execution_id).unwrap();
+        assert_eq!(
+            runs.len(),
+            2,
+            "expected 2 run rows (one per attempt); got {}",
+            runs.len()
+        );
+        assert!(runs.iter().all(|r| r.status == "failed"));
+
+        // Exactly one execution row — retries reuse the same row.
+        let all_executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(
+            all_executions.len(),
+            1,
+            "retries must not create sibling execution rows; got {}",
+            all_executions.len()
+        );
+
+        // Permanent failure surfaces exactly one attention item.
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            attention_items.len(),
+            1,
+            "permanent pre-start failure must raise exactly one attention item"
+        );
+        assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
+    }
+
+    /// Pre-start retry: when the FIRST attempt fails but a second succeeds,
+    /// the execution reaches `running` and only one execution row is created.
+    #[tokio::test]
+    async fn pre_start_failure_retries_and_succeeds_on_second_attempt() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Retry Then Succeed".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // `lease_workspace_with_fallback` makes two `lease_workspace`
+        // calls per dispatch attempt (primary + `any_free` fallback).
+        // Fail both calls in the first attempt so the retry path
+        // actually triggers; calls 3+ succeed.
+        let cube = Arc::new(FakeCubeClient {
+            fail_first_n_leases: 2,
+            ..FakeCubeClient::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                // pending=true keeps the execution in `running` so we can
+                // assert on it without racing against the WaitingHuman
+                // transition.
+                Arc::new(FakeExecutionRunner {
+                    pending: true,
+                    ..FakeExecutionRunner::default()
+                }),
+            )
+            .with_pre_start_retry_delays(vec![Duration::ZERO]),
+        );
+        let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+
+        coordinator.kick();
+        // On the retry the lease succeeds → execution reaches `running`.
+        wait_for_execution_status(db.as_ref(), &execution_id, "running").await;
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "running");
+        assert_eq!(
+            execution.pre_start_failure_count, 1,
+            "expected exactly 1 pre-start failure before the successful attempt; got {}",
+            execution.pre_start_failure_count
+        );
+
+        // Only the one failed run row (from the initial attempt) + the active run.
+        let runs = db.list_runs(&execution_id).unwrap();
+        assert_eq!(
+            runs.len(),
+            2,
+            "expected 1 failed run + 1 active run; got {}",
+            runs.len()
+        );
+
+        // No attention items — the retry succeeded.
+        let attention_items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            attention_items.is_empty(),
+            "successful retry must not surface an attention item"
+        );
+
+        // Exactly one execution row.
+        let all_executions = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(all_executions.len(), 1);
+    }
+
     /// When `preferred_workspace_id` is set and cube refuses that workspace,
     /// the engine must NOT fall back to any other workspace — doing so would
     /// silently lose state continuity (the resuming worker needs that specific
@@ -3960,6 +4224,8 @@ mod tests {
             ..FakeCubeClient::default()
         });
         let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        // No retries: go straight to permanent failure to avoid backoff
+        // delays and to keep the lease-call assertion at exactly 1.
         let coordinator = Arc::new(
             ExecutionCoordinator::new(
                 db.clone(),
@@ -3967,6 +4233,7 @@ mod tests {
                 cube.clone(),
                 Arc::new(FakeExecutionRunner::default()),
             )
+            .with_pre_start_retry_delays(vec![])
             .with_dispatch_events(recording.clone()),
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
@@ -4207,6 +4474,8 @@ mod tests {
             ..FakeCubeClient::default()
         });
         let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        // No retries: go straight to permanent failure to keep the event
+        // count assertions (2 attempts, 2 failures) unambiguous.
         let coordinator = Arc::new(
             ExecutionCoordinator::new(
                 db.clone(),
@@ -4214,6 +4483,7 @@ mod tests {
                 cube.clone(),
                 Arc::new(FakeExecutionRunner::default()),
             )
+            .with_pre_start_retry_delays(vec![])
             .with_dispatch_events(recording.clone()),
         );
         let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
@@ -4278,12 +4548,17 @@ mod tests {
             fail_create: true,
             ..FakeCubeClient::default()
         });
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            Arc::new(FakeExecutionRunner::default()),
-        ));
+        // No retries: go straight to permanent failure to keep the
+        // release_calls assertion (exactly "lease-1") unambiguous.
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(1),
+                cube.clone(),
+                Arc::new(FakeExecutionRunner::default()),
+            )
+            .with_pre_start_retry_delays(vec![]),
+        );
         coordinator.kick();
         wait_for_execution_status(
             db.as_ref(),

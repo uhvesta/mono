@@ -56,6 +56,19 @@ pub use boss_protocol::{
     WorkTree, is_known_created_via,
 };
 
+/// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
+/// this to decide whether to schedule a delayed kick (retry) or surface
+/// a permanent failure to the operator.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreStartFailureOutcome {
+    /// The execution has been reset to `ready` with a `dispatch_not_before`
+    /// delay. The coordinator should kick the scheduler after `delay`.
+    Retry { delay: Duration },
+    /// All retry attempts exhausted. The execution is now `failed`.
+    /// The coordinator should surface an attention item.
+    PermanentFail,
+}
+
 /// Returned by `insert_task_in_tx` / `insert_chore_in_tx` when the
 /// duplicate guard fires. Carried as an `anyhow::Error` so `app.rs` can
 /// downcast and send a structured `WorkItemDuplicateBlocked` event.
@@ -696,7 +709,8 @@ impl WorkDb {
             let mut stmt = conn.prepare(
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                        created_at, started_at, finished_at
+                        created_at, started_at, finished_at,
+                        pre_start_failure_count, dispatch_not_before
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -708,7 +722,8 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -1303,9 +1318,12 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before
              FROM work_executions
              WHERE status = 'ready'
+               AND (dispatch_not_before IS NULL
+                    OR CAST(dispatch_not_before AS INTEGER) <= CAST(strftime('%s', 'now') AS INTEGER))
              ORDER BY priority DESC, created_at ASC, id ASC",
         )?;
         let rows = stmt.query_map([], map_execution)?;
@@ -1326,7 +1344,8 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -1555,6 +1574,99 @@ impl WorkDb {
             .with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
         Ok((execution, run))
+    }
+
+    /// Record a pre-start failure for `execution_id`, inserting a failed
+    /// `work_run` and either resetting the execution to `ready` with a
+    /// backoff delay (retry) or marking it permanently `failed`.
+    ///
+    /// `retry_delays` controls how many retries are allowed and the delay
+    /// between each. An empty slice means "no retries; fail immediately."
+    /// The Nth element is the backoff before the (N+1)th attempt.
+    ///
+    /// This is the safe-to-retry alternative to `fail_execution_start`:
+    /// call it for failures at `cube_repo_ensure`, `workspace_lease`,
+    /// `change_create`, and `run_start` (before the worker has any
+    /// side effects). Do NOT call it for failures at or after
+    /// `run_started` — those require `finish_execution_run`.
+    pub fn record_pre_start_failure(
+        &self,
+        execution_id: &str,
+        agent_id: &str,
+        cube_repo_id: Option<&str>,
+        error_text: &str,
+        retry_delays: &[Duration],
+    ) -> Result<(WorkExecution, WorkRun, PreStartFailureOutcome)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        if execution.status != "ready" {
+            bail!(
+                "execution {execution_id} is not ready and cannot record pre-start failure \
+                 from status `{}`",
+                execution.status
+            );
+        }
+
+        let now = now_string();
+        let new_count = execution.pre_start_failure_count + 1;
+        let max_retries = retry_delays.len() as i64;
+
+        let run_id = next_id("run");
+        tx.execute(
+            "INSERT INTO work_runs (
+                id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                artifacts_path, created_at, started_at, finished_at
+             ) VALUES (?1, ?2, ?3, 'failed', ?4, NULL, NULL, NULL, ?5, ?5, ?5)",
+            params![run_id, execution_id, agent_id, error_text, now],
+        )?;
+
+        let outcome = if new_count <= max_retries {
+            let delay = retry_delays[(new_count - 1) as usize];
+            let dispatch_not_before = (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + delay.as_secs())
+            .to_string();
+            tx.execute(
+                "UPDATE work_executions
+                 SET pre_start_failure_count = ?2,
+                     cube_repo_id = COALESCE(?3, cube_repo_id),
+                     cube_lease_id = NULL,
+                     cube_workspace_id = NULL,
+                     workspace_path = NULL,
+                     started_at = NULL,
+                     finished_at = NULL,
+                     dispatch_not_before = ?4
+                 WHERE id = ?1",
+                params![execution_id, new_count, cube_repo_id, dispatch_not_before],
+            )?;
+            PreStartFailureOutcome::Retry { delay }
+        } else {
+            tx.execute(
+                "UPDATE work_executions
+                 SET status = 'failed',
+                     pre_start_failure_count = ?2,
+                     cube_repo_id = COALESCE(?3, cube_repo_id),
+                     cube_lease_id = NULL,
+                     cube_workspace_id = NULL,
+                     workspace_path = NULL,
+                     started_at = COALESCE(started_at, ?4),
+                     finished_at = ?4
+                 WHERE id = ?1",
+                params![execution_id, new_count, cube_repo_id, now],
+            )?;
+            PreStartFailureOutcome::PermanentFail
+        };
+
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let run = query_run(&tx, &run_id)?
+            .with_context(|| format!("missing run after insert: {run_id}"))?;
+        tx.commit()?;
+        Ok((execution, run, outcome))
     }
 
     pub fn finish_execution_run(
@@ -2825,6 +2937,7 @@ impl WorkDb {
         // every other table — runs last because order doesn't matter
         // for `CREATE TABLE IF NOT EXISTS`.
         migrate_metrics_tables(&conn)?;
+        migrate_work_executions_pre_start_retry(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '10')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -4556,7 +4669,8 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -4745,6 +4859,8 @@ fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         created_at: row.get(11)?,
         started_at: row.get(12)?,
         finished_at: row.get(13)?,
+        pre_start_failure_count: row.get(14)?,
+        dispatch_not_before: row.get(15)?,
     })
 }
 
@@ -5235,7 +5351,8 @@ fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>>
     conn.query_row(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                created_at, started_at, finished_at
+                created_at, started_at, finished_at,
+                pre_start_failure_count, dispatch_not_before
          FROM work_executions
          WHERE id = ?1",
         [id],
@@ -5346,6 +5463,24 @@ fn migrate_work_executions_v3(conn: &Connection) -> Result<()> {
         (
             "preferred_workspace_id",
             "ALTER TABLE work_executions ADD COLUMN preferred_workspace_id TEXT",
+        ),
+    ] {
+        if !work_executions_has_column(conn, column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_work_executions_pre_start_retry(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "pre_start_failure_count",
+            "ALTER TABLE work_executions ADD COLUMN pre_start_failure_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "dispatch_not_before",
+            "ALTER TABLE work_executions ADD COLUMN dispatch_not_before TEXT",
         ),
     ] {
         if !work_executions_has_column(conn, column)? {
@@ -6562,7 +6697,8 @@ fn query_latest_execution_for_work_item(
     conn.query_row(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-                created_at, started_at, finished_at
+                created_at, started_at, finished_at,
+                pre_start_failure_count, dispatch_not_before
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
