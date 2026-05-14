@@ -285,15 +285,94 @@ fn ensure_repo(
 
     let record = infer_repo_record_from_origin(origin, defaults)?;
     if let Some(existing) = store.get_repo(&record.repo)? {
-        return Err(CubeError::InvalidArgument(format!(
-            "repo `{}` is already configured for origin `{}`; cannot ensure `{origin}`",
-            existing.repo, existing.origin
-        )));
+        // Treat two URLs as equivalent when they differ only in auth-identity
+        // prefix (e.g. `org-X@github.com:` vs `git@github.com:`). Corporate
+        // git configs rewrite remote URLs with an org-specific user prefix, so
+        // the stored origin and the incoming origin may not match exactly even
+        // when they point at the same repo.
+        if !origin_urls_equivalent(&existing.origin, origin) {
+            return Err(CubeError::InvalidArgument(format!(
+                "repo `{}` is already configured for origin `{}`; cannot ensure `{origin}`",
+                existing.repo, existing.origin
+            )));
+        }
+        fs::create_dir_all(&existing.workspace_root)?;
+        materialize_repo_source_if_missing(runner, &existing, &cfg)?;
+        return Ok(existing);
     }
 
     fs::create_dir_all(&record.workspace_root)?;
     materialize_repo_source_if_missing(runner, &record, &cfg)?;
     store.upsert_repo(&record)
+}
+
+/// Parsed representation of a git remote URL, normalised for equivalence checks.
+#[derive(Debug, PartialEq)]
+struct ParsedOrigin {
+    /// Lower-cased host (e.g. `github.com`).
+    host: String,
+    /// Repo path without leading slash and without trailing `.git`
+    /// (e.g. `linkedin-sandbox/bduff`). Case-sensitive.
+    path: String,
+}
+
+/// Parse an SSH-style (`[user@]host:path`) or HTTPS-style (`https://[user@]host/path`) URL
+/// into a `ParsedOrigin`. Returns `None` if the URL is not in a recognised format.
+fn parse_origin(url: &str) -> Option<ParsedOrigin> {
+    let url = url.trim();
+
+    // HTTPS: https://[user@]host/path
+    if let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+        // Drop optional `user@`
+        let rest = if let Some(at) = rest.find('@') {
+            &rest[at + 1..]
+        } else {
+            rest
+        };
+        let (host, path) = rest.split_once('/')?;
+        let path = path.trim_end_matches('/').trim_end_matches(".git");
+        return Some(ParsedOrigin {
+            host: host.to_ascii_lowercase(),
+            path: path.to_string(),
+        });
+    }
+
+    // SSH SCP-like: [user@]host:path
+    // Must contain `:` but must NOT look like a Windows absolute path (`C:\`).
+    if let Some(colon_pos) = url.find(':') {
+        let before_colon = &url[..colon_pos];
+        let after_colon = &url[colon_pos + 1..];
+        // Reject Windows paths (single letter before colon) and paths starting with `//` (git+ssh://)
+        if before_colon.len() > 1 && !after_colon.starts_with('/') {
+            // Strip optional `user@` from the host part
+            let host = if let Some(at) = before_colon.rfind('@') {
+                &before_colon[at + 1..]
+            } else {
+                before_colon
+            };
+            let path = after_colon
+                .trim_end_matches('/')
+                .trim_end_matches(".git");
+            return Some(ParsedOrigin {
+                host: host.to_ascii_lowercase(),
+                path: path.to_string(),
+            });
+        }
+    }
+
+    None
+}
+
+/// Returns `true` when two origin URL strings refer to the same repository,
+/// ignoring auth-identity prefixes (e.g. `org-X@` vs `git@`) and trailing
+/// `.git` suffixes. Host comparison is case-insensitive; path is case-sensitive.
+fn origin_urls_equivalent(a: &str, b: &str) -> bool {
+    match (parse_origin(a), parse_origin(b)) {
+        (Some(pa), Some(pb)) => pa == pb,
+        // If either URL is unparseable fall back to exact-string equality so
+        // we never accidentally allow a mismatch.
+        _ => a == b,
+    }
 }
 
 fn normalize_origin(origin: &str) -> Result<String> {
@@ -2298,8 +2377,8 @@ mod tests {
     use crate::command_runner::{CommandInvocation, CommandRunner};
 
     use super::{
-        CubeError, RepoEnsureDefaults, Result, current_epoch_s, run_with_context,
-        run_with_dependencies,
+        CubeError, RepoEnsureDefaults, Result, current_epoch_s, origin_urls_equivalent,
+        parse_origin, run_with_context, run_with_dependencies,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -2753,6 +2832,208 @@ mod tests {
             msg.contains("multiproduct"),
             "error should reference multiproduct config: {msg}"
         );
+    }
+
+    // --- parse_origin / origin_urls_equivalent unit tests ---
+
+    #[test]
+    fn parse_origin_plain_ssh() {
+        let p = parse_origin("git@github.com:foo/bar.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "foo/bar");
+    }
+
+    #[test]
+    fn parse_origin_auth_prefixed_ssh() {
+        let p = parse_origin("org-132020694@github.com:linkedin-sandbox/bduff.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "linkedin-sandbox/bduff");
+    }
+
+    #[test]
+    fn parse_origin_ssh_no_dot_git() {
+        let p = parse_origin("git@github.com:foo/bar").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "foo/bar");
+    }
+
+    #[test]
+    fn parse_origin_https() {
+        let p = parse_origin("https://github.com/foo/bar.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "foo/bar");
+    }
+
+    #[test]
+    fn parse_origin_https_with_user() {
+        let p = parse_origin("https://myuser@github.com/foo/bar.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "foo/bar");
+    }
+
+    #[test]
+    fn origin_urls_equivalent_plain_vs_auth_prefixed() {
+        assert!(origin_urls_equivalent(
+            "git@github.com:linkedin-sandbox/bduff.git",
+            "org-132020694@github.com:linkedin-sandbox/bduff.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_equivalent_auth_prefixed_vs_plain() {
+        assert!(origin_urls_equivalent(
+            "org-132020694@github.com:linkedin-sandbox/bduff.git",
+            "git@github.com:linkedin-sandbox/bduff.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_equivalent_dot_git_vs_no_dot_git() {
+        assert!(origin_urls_equivalent(
+            "git@github.com:foo/bar.git",
+            "git@github.com:foo/bar"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_not_equivalent_different_path() {
+        assert!(!origin_urls_equivalent(
+            "git@github.com:linkedin-sandbox/bduff.git",
+            "git@github.com:linkedin-eng/bduff.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_not_equivalent_different_host() {
+        assert!(!origin_urls_equivalent(
+            "git@github.com:foo/bar.git",
+            "git@gitlab.com:foo/bar.git"
+        ));
+    }
+
+    #[test]
+    fn repo_ensure_accepts_auth_prefixed_url_when_plain_stored() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("bduff")).expect("source dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "bduff",
+            "--origin",
+            "git@github.com:linkedin-sandbox/bduff.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "bduff-agent-",
+            "--source",
+            &defaults.repo_root.join("bduff").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "org-132020694@github.com:linkedin-sandbox/bduff.git",
+        ]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            None,
+        )
+        .expect("ensure with auth-prefixed URL should succeed");
+
+        assert_eq!(result.payload["repo_id"], "bduff");
+    }
+
+    #[test]
+    fn repo_ensure_accepts_plain_url_when_auth_prefixed_stored() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("bduff")).expect("source dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "bduff",
+            "--origin",
+            "org-132020694@github.com:linkedin-sandbox/bduff.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "bduff-agent-",
+            "--source",
+            &defaults.repo_root.join("bduff").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:linkedin-sandbox/bduff.git",
+        ]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            None,
+        )
+        .expect("ensure with plain URL should succeed when auth-prefixed is stored");
+
+        assert_eq!(result.payload["repo_id"], "bduff");
+    }
+
+    #[test]
+    fn repo_ensure_still_rejects_different_path() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("bduff")).expect("source dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "bduff",
+            "--origin",
+            "git@github.com:linkedin-sandbox/bduff.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "bduff-agent-",
+            "--source",
+            &defaults.repo_root.join("bduff").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:linkedin-eng/bduff.git",
+        ]);
+        let err = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            None,
+        )
+        .expect_err("ensure with different path should fail");
+
+        assert!(matches!(err, CubeError::InvalidArgument(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("cannot ensure"), "error: {msg}");
     }
 
     #[test]
