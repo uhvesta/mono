@@ -1,0 +1,47 @@
+//! Engine counter / gauge metrics framework (phase 1).
+//!
+//! Declaring a new metric is a one- or two-line change at the call
+//! site via [`register_counter!`] / [`register_gauge!`]. Values are
+//! held in in-memory atomics for the hot path and flushed to
+//! `state.db` every 30 seconds (and on graceful shutdown). On engine
+//! startup the framework reads the persisted rows back so monotonic
+//! counter totals are continuous across restarts.
+//!
+//! Per the framework design (see
+//! `tools/boss/docs/designs/engine-counter-metrics-framework.md`,
+//! §"Risks / open questions" item 7) the [`Registry`] is plumbed
+//! explicitly as `Arc<Registry>` rather than stashed in a global —
+//! every call site takes a `&Registry` so unit tests can construct a
+//! local registry without leaking state across tests.
+//!
+//! Phase 1 ships the registry, the primitives, the `state.db`
+//! tables, the flush task and the startup-rehydrate path. The
+//! `bossctl metrics` surfacing verbs and the actual counters at call
+//! sites land in subsequent phases.
+
+pub mod persistence;
+pub mod registry;
+
+pub use persistence::{flush_all, seed_from_db, spawn_flush_task};
+pub use registry::{CounterHandle, GaugeHandle, Registry};
+
+/// Force registration of every counter / gauge handle the engine
+/// declares.
+///
+/// `LazyLock`-style registration would let a counter living in a
+/// rarely-loaded module miss its first flush window (and would push
+/// the duplicate-name panic from boot into the middle of a busy
+/// sweep — see design §"Risks / open questions" item 6, which is
+/// load-bearing for item 2). The cure is this single function that
+/// touches every handle so registration happens once, deterministically,
+/// at engine startup.
+///
+/// Phase 1 ships zero production counters — the concrete counters
+/// (`pr_url_capture.*`, `dependency_unblock.*`, the
+/// `DispatcherStats` / `SweepOutcome` migrations) are filed as
+/// phases 3–5. As each new counter module lands, add one line here
+/// to register its handles.
+pub fn init_all(_registry: &Registry) {
+    // Intentionally empty in phase 1. Subsequent phases append one
+    // `<module>::init(registry)` call per new counter module.
+}

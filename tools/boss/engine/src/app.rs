@@ -380,6 +380,15 @@ struct ServerState {
     /// boot, mutated by `SetFeatureFlag` RPC, consulted by callers
     /// via `is_enabled(...)`. See `crate::feature_flags`.
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    /// Engine-wide counter / gauge registry. Plumbed as an
+    /// `Arc<Registry>` per the framework design's recommendation
+    /// against globals (see
+    /// `tools/boss/docs/designs/engine-counter-metrics-framework.md`
+    /// §"Risks / open questions" item 7) — every call site that
+    /// increments a counter takes a `&Registry`, which keeps
+    /// counter state isolated per `ServerState` instance and
+    /// makes unit tests cheap.
+    metrics: Arc<crate::metrics::Registry>,
 }
 
 /// Authorization tier for a frontend RPC.
@@ -592,6 +601,16 @@ impl ServerState {
         let feature_flags_for_handler = feature_flags.clone();
         let feature_flags_for_state = feature_flags.clone();
 
+        // Engine counter-metrics registry. Built up front so it can
+        // be cloned into ServerState; the registry is plumbed
+        // explicitly rather than stashed in a global per the
+        // framework design. `init_all` runs further down once the
+        // Arc<ServerState> is in hand so a duplicate registration
+        // panics during this boot path instead of inside the first
+        // increment.
+        let metrics_registry = Arc::new(crate::metrics::Registry::new());
+        let metrics_for_state = metrics_registry.clone();
+
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -669,8 +688,30 @@ impl ServerState {
                 ipc_logger,
                 _self_weak: weak_self.clone(),
                 feature_flags: feature_flags_for_state,
+                metrics: metrics_for_state,
             }
         });
+
+        // Register every binary-known counter / gauge handle before
+        // any rehydrate or increment runs. `init_all` is empty in
+        // phase 1; subsequent phases append one line per new
+        // counter module so duplicate-name panics trip during this
+        // boot path rather than at runtime (design §"Risks / open
+        // questions" item 6).
+        crate::metrics::init_all(&server_state.metrics);
+
+        // Seed the in-memory registry from `state.db` so monotonic
+        // counter totals span engine restarts. Failures are logged
+        // and the registry is left at zero — better than refusing to
+        // start because the metrics table is corrupted.
+        if let Err(err) =
+            crate::metrics::seed_from_db(&server_state.metrics, &server_state.work_db)
+        {
+            tracing::warn!(
+                ?err,
+                "metrics: seed_from_db failed; starting from zeroed counters",
+            );
+        }
 
         // Late-bind the runner to the Arc<ServerState>. Going through
         // the WorkerSpawner trait keeps the runner unaware of
@@ -2029,6 +2070,18 @@ pub async fn serve(
         Duration::from_secs(15),
     );
 
+    // Periodic metrics flush — snapshots the in-memory counter /
+    // gauge registry into `state.db` every 30s so monotonic totals
+    // survive engine restarts (see
+    // `tools/boss/docs/designs/engine-counter-metrics-framework.md`
+    // §"Persistence: state.db table"). The graceful-shutdown branch
+    // below runs one final flush before returning so the last 0–30s
+    // window of increments isn't lost on a normal exit.
+    let _metrics_flush_handle = crate::metrics::spawn_flush_task(
+        server_state.metrics.clone(),
+        server_state.work_db.clone(),
+    );
+
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
@@ -2049,6 +2102,17 @@ pub async fn serve(
                 server_state
                     .shutdown_workers(Duration::from_secs(5), Duration::from_secs(1))
                     .await;
+                // One final metrics flush so the 0–30s window of
+                // increments between the last periodic flush and the
+                // shutdown signal isn't dropped on a clean exit.
+                // Crash-loss is acceptable for monotonic counts; a
+                // clean exit can afford to do better.
+                if let Err(err) = crate::metrics::flush_all(
+                    &server_state.metrics,
+                    &server_state.work_db,
+                ) {
+                    tracing::warn!(?err, "metrics: final flush on shutdown failed");
+                }
                 tracing::info!("engine shutdown complete");
                 return Ok(());
             }
