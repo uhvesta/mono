@@ -20,6 +20,8 @@ struct DispatchEvent: Identifiable, Hashable {
     let cubeLeaseId: String?
     let cubeWorkspaceId: String?
     let errorMessage: String?
+    let cubeCommand: String?
+    let cubeCwd: String?
     let detailsJSON: String?
 
     var timestamp: Date {
@@ -87,6 +89,8 @@ enum DispatchEventDecoder {
             cubeLeaseId: dict["cube_lease_id"] as? String,
             cubeWorkspaceId: dict["cube_workspace_id"] as? String,
             errorMessage: dict["error_message"] as? String,
+            cubeCommand: dict["cube_command"] as? String,
+            cubeCwd: dict["cube_cwd"] as? String,
             detailsJSON: detailsJSON
         )
     }
@@ -739,6 +743,30 @@ private struct DispatchTimelineRow: View {
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
+            if let cmd = event.cubeCommand {
+                HStack(spacing: 4) {
+                    Text(cmd)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .textSelection(.enabled)
+                    Button(action: {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        pb.setString(cmd, forType: .string)
+                    }) {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                    .help("Copy command to clipboard")
+                }
+            }
+            if let cwd = event.cubeCwd {
+                Text("cwd: \(cwd)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
             if let details = event.detailsJSON, details != "null" {
                 Text(details)
                     .font(.system(.caption2, design: .monospaced))
@@ -775,6 +803,8 @@ private struct DispatchTimelineRow: View {
         if let v = event.cubeLeaseId { dict["cube_lease_id"] = v }
         if let v = event.cubeWorkspaceId { dict["cube_workspace_id"] = v }
         if let v = event.errorMessage { dict["error_message"] = v }
+        if let v = event.cubeCommand { dict["cube_command"] = v }
+        if let v = event.cubeCwd { dict["cube_cwd"] = v }
         guard let data = try? JSONSerialization.data(
             withJSONObject: dict,
             options: [.prettyPrinted, .sortedKeys]

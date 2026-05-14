@@ -167,6 +167,14 @@ pub struct DispatchEvent {
     /// Skip when the outcome is `ok` / `skipped`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Full shell-quoted argv string of the cube subprocess invocation,
+    /// e.g. `cube workspace lease ci-infra --task "fix the bug"`.
+    /// Copy-pastes into a terminal to reproduce the failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube_command: Option<String>,
+    /// Absolute working directory passed to the cube subprocess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube_cwd: Option<String>,
     /// Per-stage open object; readers `jq` into this when they care.
     #[serde(default)]
     pub details: serde_json::Value,
@@ -189,6 +197,8 @@ impl DispatchEvent {
             cube_lease_id: None,
             cube_workspace_id: None,
             error_message: None,
+            cube_command: None,
+            cube_cwd: None,
             details: serde_json::Value::Null,
         }
     }
@@ -220,6 +230,17 @@ impl DispatchEvent {
 
     pub fn with_error(mut self, error: &anyhow::Error) -> Self {
         self.error_message = Some(format!("{error:#}"));
+        self
+    }
+
+    /// Attach `cube_command` and `cube_cwd` from a `(command, cwd)` pair.
+    /// Accepts `Option` so callers can pass the result of
+    /// `CubeClient::command_repr` directly without an extra `if let`.
+    pub fn with_cube_invocation(mut self, info: Option<(String, String)>) -> Self {
+        if let Some((cmd, cwd)) = info {
+            self.cube_command = Some(cmd);
+            self.cube_cwd = Some(cwd);
+        }
         self
     }
 

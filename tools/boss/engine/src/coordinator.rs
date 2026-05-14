@@ -224,11 +224,26 @@ pub trait CubeClient: Send + Sync {
     /// callers use it to inspect pool config for advisory checks like
     /// the cold-repo probe.
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>>;
+    /// Returns `(command_string, cwd)` for the subprocess that would be
+    /// spawned with `args`. Used to populate `cube_command`/`cube_cwd`
+    /// in dispatch events so failures are reproducible from the terminal.
+    /// Returns `None` for test doubles that don't use real subprocesses.
+    fn command_repr(&self, _args: &[&str]) -> Option<(String, String)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct CommandCubeClient {
     cfg: Arc<RuntimeConfig>,
+}
+
+fn shell_quote(arg: &str) -> String {
+    if arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'') {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_owned()
+    }
 }
 
 impl CommandCubeClient {
@@ -493,6 +508,18 @@ impl CubeClient for CommandCubeClient {
                 source: r.source,
             })
             .collect())
+    }
+
+    fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
+        let Ok(agent) = self.cfg.agent() else { return None };
+        let cmd = std::iter::once(agent.cube.command.as_str())
+            .chain(agent.cube.args.iter().map(String::as_str))
+            .chain(args.iter().copied())
+            .map(shell_quote)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cwd = self.cfg.work.cwd.display().to_string();
+        Some((cmd, cwd))
     }
 }
 
@@ -1270,6 +1297,9 @@ impl ExecutionCoordinator {
         {
             Ok(Ok(repo)) => repo,
             Ok(Err(err)) => {
+                let ensure_repr = self.cube_client.command_repr(&[
+                    "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
+                ]);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -1279,7 +1309,8 @@ impl ExecutionCoordinator {
                         )
                         .with_work_item(&execution.work_item_id)
                         .with_worker(worker_id)
-                        .with_error(&err),
+                        .with_error(&err)
+                        .with_cube_invocation(ensure_repr),
                     )
                     .await;
                 self.record_start_failure(
@@ -1298,6 +1329,9 @@ impl ExecutionCoordinator {
                     "cube `repo ensure` timed out after {}s",
                     CUBE_REPO_ENSURE_TIMEOUT.as_secs()
                 );
+                let ensure_repr = self.cube_client.command_repr(&[
+                    "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
+                ]);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -1308,6 +1342,7 @@ impl ExecutionCoordinator {
                         .with_work_item(&execution.work_item_id)
                         .with_worker(worker_id)
                         .with_error(&err)
+                        .with_cube_invocation(ensure_repr)
                         .with_details(serde_json::json!({
                             "reason": "timeout",
                             "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
@@ -1332,7 +1367,10 @@ impl ExecutionCoordinator {
                 DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Ok, &execution.id)
                     .with_work_item(&execution.work_item_id)
                     .with_worker(worker_id)
-                    .with_cube_repo(&repo.repo_id),
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_invocation(self.cube_client.command_repr(&[
+                        "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
+                    ])),
             )
             .await;
 
@@ -1359,21 +1397,40 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
-        self.dispatch_events
-            .emit(
-                DispatchEvent::new(
-                    Stage::CubeWorkspaceLeased,
-                    DispatchOutcome::Ok,
-                    &execution.id,
+        {
+            let mut lease_args = vec![
+                "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task.as_str(),
+            ];
+            if let Some(p) = execution.preferred_workspace_id.as_deref() {
+                lease_args.extend_from_slice(&["--prefer", p]);
+            }
+            self.dispatch_events
+                .emit(
+                    DispatchEvent::new(
+                        Stage::CubeWorkspaceLeased,
+                        DispatchOutcome::Ok,
+                        &execution.id,
+                    )
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_lease(&lease.lease_id)
+                    .with_cube_workspace(&lease.workspace_id)
+                    .with_cube_invocation(self.cube_client.command_repr(&lease_args)),
                 )
-                .with_work_item(&execution.work_item_id)
-                .with_worker(worker_id)
-                .with_cube_repo(&repo.repo_id)
-                .with_cube_lease(&lease.lease_id)
-                .with_cube_workspace(&lease.workspace_id),
-            )
-            .await;
+                .await;
+        }
         let change_title = execution_change_title(execution, &work_item);
+        let workspace_path_str = lease.workspace_path.display().to_string();
+        let change_repr: Option<(String, String)> = self.cube_client.command_repr(&[
+            "--json",
+            "change",
+            "create",
+            "--workspace",
+            &workspace_path_str,
+            "--title",
+            &change_title,
+        ]);
         let change = match self
             .cube_client
             .create_change(&lease.workspace_path, &change_title)
@@ -1401,7 +1458,8 @@ impl ExecutionCoordinator {
                         .with_cube_repo(&repo.repo_id)
                         .with_cube_lease(&lease.lease_id)
                         .with_cube_workspace(&lease.workspace_id)
-                        .with_error(&err),
+                        .with_error(&err)
+                        .with_cube_invocation(change_repr.clone()),
                     )
                     .await;
                 self.record_start_failure(
@@ -1424,6 +1482,7 @@ impl ExecutionCoordinator {
                     .with_cube_repo(&repo.repo_id)
                     .with_cube_lease(&lease.lease_id)
                     .with_cube_workspace(&lease.workspace_id)
+                    .with_cube_invocation(change_repr)
                     .with_details(serde_json::json!({
                         "change_id": change.change_id,
                         "change_title": change_title,
@@ -1652,6 +1711,16 @@ impl ExecutionCoordinator {
             "none"
         };
 
+        // Build the lease args for attempt 1 so we can attach the
+        // exact command to both the attempted and failed events.
+        let mut attempt1_args = vec![
+            "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task,
+        ];
+        if let Some(p) = prefer {
+            attempt1_args.extend_from_slice(&["--prefer", p]);
+        }
+        let attempt1_repr = self.cube_client.command_repr(&attempt1_args);
+
         // First attempt: use the preferred workspace if the caller
         // pinned one. Emit `cube_workspace_lease_attempted` *before*
         // the subprocess so the timeline shows what we tried even
@@ -1666,6 +1735,7 @@ impl ExecutionCoordinator {
                 .with_work_item(&execution.work_item_id)
                 .with_worker(worker_id)
                 .with_cube_repo(&repo.repo_id)
+                .with_cube_invocation(attempt1_repr.clone())
                 .with_details(serde_json::json!({
                     "attempt": 1,
                     "prefer_workspace_id": prefer,
@@ -1702,6 +1772,7 @@ impl ExecutionCoordinator {
                         .with_worker(worker_id)
                         .with_cube_repo(&repo.repo_id)
                         .with_error(&err)
+                        .with_cube_invocation(attempt1_repr)
                         .with_details(serde_json::json!({
                             "attempt": 1,
                             "prefer_workspace_id": prefer,
@@ -1722,6 +1793,11 @@ impl ExecutionCoordinator {
             return Err(first_err);
         }
 
+        let attempt2_args = vec![
+            "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task,
+        ];
+        let attempt2_repr = self.cube_client.command_repr(&attempt2_args);
+
         self.dispatch_events
             .emit(
                 DispatchEvent::new(
@@ -1732,6 +1808,7 @@ impl ExecutionCoordinator {
                 .with_work_item(&execution.work_item_id)
                 .with_worker(worker_id)
                 .with_cube_repo(&repo.repo_id)
+                .with_cube_invocation(attempt2_repr.clone())
                 .with_details(serde_json::json!({
                     "attempt": 2,
                     "prefer_workspace_id": serde_json::Value::Null,
@@ -1768,6 +1845,7 @@ impl ExecutionCoordinator {
                         .with_worker(worker_id)
                         .with_cube_repo(&repo.repo_id)
                         .with_error(&err)
+                        .with_cube_invocation(attempt2_repr)
                         .with_details(serde_json::json!({
                             "attempt": 2,
                             "prefer_workspace_id": serde_json::Value::Null,
