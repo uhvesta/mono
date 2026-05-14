@@ -321,7 +321,10 @@ fn ensure_repo(
                 existing.repo, existing.origin
             )));
         }
-        fs::create_dir_all(&existing.workspace_root)?;
+        fs::create_dir_all(&existing.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
+            path: existing.workspace_root.clone(),
+            source: e,
+        })?;
         materialize_repo_source_if_missing(runner, &existing, &cfg)?;
         return Ok(existing);
     }
