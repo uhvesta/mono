@@ -7,5 +7,15 @@ apple_static_xcframework_import(
         ["GhosttyKit.xcframework/**"],
         exclude = ["GhosttyKit.xcframework/**/._*"],
     ),
-    visibility = ["//visibility:public"],
+    # System frameworks required by GhosttyKit's prebuilt static libraries:
+    #   Carbon     — KeymapDarwin (TISCopyCurrentKeyboardLayoutInputSource et al.)
+    #   GameController — imgui_impl_osx.o (OBJC_CLASS_ references)
+    # libc++ is listed explicitly because GhosttyKit ships prebuilt object files;
+    # Bazel cannot infer C++ linkage from a binary-only target.
+    sdk_frameworks = [
+        "Carbon",
+        "GameController",
+    ],
+    sdk_dylibs = ["c++"],
+    visibility = ["@@//tools/boss/app-macos:__pkg__"],
 )
