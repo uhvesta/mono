@@ -962,6 +962,12 @@ struct TaskUpdateArgs {
     /// through per design §Q3 precedence.
     #[arg(long = "unset-model")]
     unset_model: bool,
+
+    /// Enable or disable auto-dispatch for this item. `--autostart true`
+    /// lets the engine auto-dispatch the item when a worker slot is free;
+    /// `--autostart false` parks it in the backlog until you re-enable it.
+    #[arg(long, value_name = "BOOL")]
+    autostart: Option<bool>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2132,11 +2138,12 @@ async fn run_update_leaf(
         repo_remote_url: args.repo_remote_url,
         effort_level,
         model_override,
+        autostart: args.autostart,
         ..WorkItemPatch::default()
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, or --model",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, or --autostart",
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
@@ -3799,7 +3806,8 @@ fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Result<(), CliE
         || patch.ordinal.is_some()
         || patch.effort_level.is_some()
         || patch.model_override.is_some()
-        || patch.default_model.is_some();
+        || patch.default_model.is_some()
+        || patch.autostart.is_some();
 
     if has_fields {
         Ok(())

@@ -873,6 +873,10 @@ pub struct WorkItemPatch {
     /// project. `None` → leave unchanged. `Some("")` → clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Flip the `autostart` flag. `None` → leave unchanged.
+    /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart: Option<bool>,
 }
 
 /// One row of the `work_item_dependencies` table — an edge from a
