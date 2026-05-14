@@ -23,7 +23,7 @@
 //! worker prompt can still render something sensible — better than
 //! aborting the spawn entirely.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -84,6 +84,34 @@ impl ConflictDiagnosis {
     }
 }
 
+/// Resolve the git directory for `workspace_path`.
+///
+/// For jj-only cube workspaces (no top-level `.git`), the real git
+/// store is recorded in `.jj/repo/store/git_target` as a relative path
+/// from `.jj/repo/store/`. This function reads that file and returns the
+/// canonicalised absolute path so callers can pass it as `GIT_DIR`.
+///
+/// Falls back to `<workspace_path>/.git` when `git_target` is absent,
+/// which covers colocated jj+git workspaces (test fixtures, dev-mode).
+fn resolve_git_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
+    let git_target_file = workspace_path
+        .join(".jj")
+        .join("repo")
+        .join("store")
+        .join("git_target");
+
+    if git_target_file.exists() {
+        let raw = std::fs::read_to_string(&git_target_file)?;
+        let relative = raw.trim();
+        let base = workspace_path.join(".jj").join("repo").join("store");
+        let resolved = base.join(relative).canonicalize()?;
+        Ok(resolved)
+    } else {
+        // Colocated jj+git workspace — the `.git` directory is at the root.
+        Ok(workspace_path.join(".git"))
+    }
+}
+
 /// Run `git merge-tree --write-tree <base> <head>` in `workspace_path`
 /// and parse the result into a structured diagnosis.
 ///
@@ -102,6 +130,20 @@ pub async fn collect(
     base_sha: &str,
     head_sha: &str,
 ) -> std::io::Result<ConflictDiagnosis> {
+    // Cube workspaces are jj-only (no top-level `.git`); git must be
+    // told where the store is via GIT_DIR, otherwise it fails with
+    // "not a git repository" during directory discovery.
+    let git_dir = match resolve_git_dir(workspace_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ConflictDiagnosis::errored(
+                base_sha,
+                head_sha,
+                format!("could not resolve git dir: {e}"),
+            ));
+        }
+    };
+
     let output = Command::new("git")
         .args([
             "merge-tree",
@@ -112,6 +154,7 @@ pub async fn collect(
             head_sha,
         ])
         .current_dir(workspace_path)
+        .env("GIT_DIR", &git_dir)
         .output()
         .await?;
 
@@ -259,6 +302,69 @@ mod tests {
         let diag = collect(repo, "main", "feature").await.unwrap();
         assert!(diag.error.is_none(), "diagnosis errored: {:?}", diag.error);
         assert_eq!(diag.files.len(), 1, "expected one conflicted file");
+        assert_eq!(diag.files[0].path, "a.txt");
+    }
+
+    /// Regression test: `collect` must succeed when the workspace is
+    /// jj-only (no top-level `.git`). We simulate a cube workspace by
+    /// building a normal git repo, then creating a separate jj-style
+    /// workspace dir that has `.jj/repo/store/git_target` pointing at
+    /// the repo's `.git`. There is intentionally no `.git` at the
+    /// workspace root — that's the shape that was producing the
+    /// "not a git repository" error.
+    #[tokio::test]
+    async fn collect_against_jj_only_workspace_resolves_git_dir() {
+        if which_git().is_none() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+
+        // --- Build a normal git repo with a conflict between main/feature --
+        let git_dir = tempfile::tempdir().unwrap();
+        let git_repo = git_dir.path();
+        run_git(git_repo, &["init", "-q", "--initial-branch=main"]).await;
+        run_git(git_repo, &["config", "user.email", "test@example.invalid"]).await;
+        run_git(git_repo, &["config", "user.name", "Test"]).await;
+
+        std::fs::write(git_repo.join("a.txt"), "alpha\n").unwrap();
+        run_git(git_repo, &["add", "a.txt"]).await;
+        run_git(git_repo, &["commit", "-q", "-m", "init"]).await;
+
+        run_git(git_repo, &["checkout", "-q", "-b", "feature"]).await;
+        std::fs::write(git_repo.join("a.txt"), "feature side\n").unwrap();
+        run_git(git_repo, &["commit", "-q", "-am", "feature"]).await;
+
+        run_git(git_repo, &["checkout", "-q", "main"]).await;
+        std::fs::write(git_repo.join("a.txt"), "main side\n").unwrap();
+        run_git(git_repo, &["commit", "-q", "-am", "main"]).await;
+
+        // --- Build a jj-style workspace (no .git at root) -----------------
+        // git_target is an absolute path here; jj itself uses relative paths
+        // but our resolver just joins and canonicalises, so absolute is fine
+        // for the test.
+        let jj_ws = tempfile::tempdir().unwrap();
+        let ws = jj_ws.path();
+        let store_path = ws.join(".jj").join("repo").join("store");
+        std::fs::create_dir_all(&store_path).unwrap();
+        std::fs::write(
+            store_path.join("git_target"),
+            git_repo.join(".git").to_str().unwrap(),
+        )
+        .unwrap();
+        // Intentionally no .git at ws root — this is the jj-only shape.
+
+        let diag = collect(ws, "main", "feature").await.unwrap();
+        assert!(
+            diag.error.is_none(),
+            "jj-only workspace: diagnosis errored: {:?}",
+            diag.error
+        );
+        assert_eq!(
+            diag.files.len(),
+            1,
+            "jj-only workspace: expected one conflicted file, got: {:?}",
+            diag.files
+        );
         assert_eq!(diag.files[0].path, "a.txt");
     }
 
