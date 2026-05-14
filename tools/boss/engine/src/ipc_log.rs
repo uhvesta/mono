@@ -44,11 +44,15 @@ pub struct IpcLogger {
 
 impl IpcLogger {
     /// Create a new logger that writes under `<root>/ipc/`.
-    /// Spawns a Tokio background task; must be called from within a
-    /// Tokio runtime context.
+    /// Spawns a Tokio background task when a runtime is available.
+    /// When called outside a Tokio runtime (e.g. synchronous unit tests),
+    /// the channel is created but the writer task is not spawned — log
+    /// entries queue up and are silently dropped when the sender is dropped.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(writer_task(root.into(), rx));
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(writer_task(root.into(), rx));
+        }
         Self { tx }
     }
 
