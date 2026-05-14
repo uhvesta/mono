@@ -354,6 +354,17 @@ final class ChatViewModel: ObservableObject {
     private var subscribedWorkTopics: Set<String> = []
     private let defaults = UserDefaults.standard
 
+    /// Notification manager for Review-lane transitions. Fires a system
+    /// banner when a task reaches `in_review` while the app is backgrounded.
+    private let reviewNotifier = ReviewNotificationCenter()
+
+    /// Task IDs currently known to be in `in_review`. Populated from
+    /// work-tree snapshots (without firing) on load/reconnect, and
+    /// updated incrementally on `workItemUpdated` events. Guards against
+    /// re-notifying for a task that was already in Review when the app
+    /// launched or re-subscribed.
+    var knownReviewTaskIDs: Set<String> = []
+
     private let navigationModeDefaultsKey = "boss.navigationMode"
     private let selectedWorkProductDefaultsKey = "boss.work.selectedProductID"
     private let selectedProjectFilterIDsDefaultsKey = "boss.work.projectFilterIDs"
@@ -402,6 +413,12 @@ final class ChatViewModel: ObservableObject {
 
         engine.onEvent = { [weak self] event in
             self?.handle(event)
+        }
+
+        reviewNotifier.configure()
+        reviewNotifier.onSelectWorkItem = { [weak self] taskID in
+            self?.setNavigationMode(.work)
+            self?.selectWorkCard(taskID)
         }
 
         // In the AppKit-hosted macOS shell, the root SwiftUI `.task` can be
@@ -1101,6 +1118,7 @@ final class ChatViewModel: ObservableObject {
             choresByProductID[product.id] = chores.sorted(by: taskSort)
             mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
             dependenciesByProductID[product.id] = dependencies
+            seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
             reconcileWorkSelection()
             refreshWorkSubscriptions()
             refreshDesignDocStates(for: projects)
@@ -1917,10 +1935,38 @@ final class ChatViewModel: ObservableObject {
             }
         case .project(let project):
             engine.sendGetWorkTree(productId: project.productID)
-        case .task(let task), .chore(let task):
-            engine.sendGetWorkTree(productId: task.productID)
+        case .task(let updatedTask), .chore(let updatedTask):
+            maybeFireReviewNotification(for: updatedTask)
+            engine.sendGetWorkTree(productId: updatedTask.productID)
         }
         workErrorMessage = nil
+    }
+
+    /// Fire a review notification when `updatedTask` enters `in_review`
+    /// for the first time (not already in [[knownReviewTaskIDs]]).
+    /// Clears the task from the set when it leaves `in_review` so a
+    /// subsequent re-entry (e.g. worker re-opens a revised PR) fires again.
+    private func maybeFireReviewNotification(for updatedTask: WorkTask) {
+        if updatedTask.status == "in_review" {
+            guard !knownReviewTaskIDs.contains(updatedTask.id) else { return }
+            knownReviewTaskIDs.insert(updatedTask.id)
+            reviewNotifier.notifyReadyForReview(task: updatedTask)
+        } else {
+            knownReviewTaskIDs.remove(updatedTask.id)
+        }
+    }
+
+    /// Sync [[knownReviewTaskIDs]] from a full product work-tree snapshot
+    /// without firing notifications. Called on initial load and reconnect
+    /// so tasks already in Review at startup don't trigger spurious banners.
+    private func seedReviewTaskIDs(tasks: [WorkTask], chores: [WorkTask], productID: String) {
+        // Remove all IDs belonging to this product, then re-add the current in-review ones.
+        // Avoids stale entries when a task leaves review between two tree snapshots.
+        let productItemIDs = Set(tasks.map(\.id) + chores.map(\.id))
+        knownReviewTaskIDs.subtract(productItemIDs)
+        for item in tasks + chores where item.status == "in_review" {
+            knownReviewTaskIDs.insert(item.id)
+        }
     }
 
     private func reconcileWorkSelection() {
