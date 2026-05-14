@@ -16,10 +16,10 @@ use crate::cli::{
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::lock::RepoLock;
-use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceRecord, WorkspaceState};
+use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::paths;
 use crate::setup::{self, SetupReport, StepStatus, run_setup_engine};
-use crate::store::{Store, WorkspaceListFilter};
+use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 
 type Result<T> = std::result::Result<T, CubeError>;
 
@@ -453,33 +453,170 @@ fn run_workspace(
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
             let lease_expires_at = Some(leased_at_epoch_s + DEFAULT_LEASE_TTL_SECS);
-            let (mut workspace, was_auto_created) = match store.claim_workspace(
-                &repo,
-                &holder,
-                &task,
-                &lease_id,
-                leased_at_epoch_s,
-                lease_expires_at,
-                prefer.as_deref(),
-            )? {
-                Some(ws) => (ws, false),
-                None => {
-                    let new_candidate = auto_create_workspace(runner, &repo_record, &candidates)?;
-                    candidates.push(new_candidate);
-                    store.sync_workspaces(&repo, &candidates)?;
-                    let ws = store
-                        .claim_workspace(
-                            &repo,
-                            &holder,
-                            &task,
-                            &lease_id,
-                            leased_at_epoch_s,
-                            lease_expires_at,
-                            prefer.as_deref(),
-                        )?
-                        .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
-                    (ws, true)
+
+            // ── Health-check phase ──────────────────────────────────────────
+            // Before claiming any workspace, inspect each free candidate:
+            //   - Clean → use immediately
+            //   - ConflictedBookmarks → save as first repairable candidate
+            //     (keep looking for a clean one; repair before claim)
+            //   - DirtyWorkingCopy → skip and mark in the store so
+            //     `cube workspace list` surfaces it
+            //
+            // The repo lock is held throughout, so no concurrent lease can
+            // steal a workspace between the health check and the claim.
+
+            let free_workspaces = store.list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some(&repo),
+                effective_state: Some(EffectiveState::Free),
+                ..Default::default()
+            })?;
+
+            // Ordering: try the --prefer workspace first, then others by id.
+            let ordered_ids: Vec<String> = {
+                let mut v = Vec::new();
+                if let Some(pref) = prefer.as_deref() {
+                    if free_workspaces.iter().any(|w| w.workspace_id == pref) {
+                        v.push(pref.to_string());
+                    }
                 }
+                for w in &free_workspaces {
+                    if !v.contains(&w.workspace_id) {
+                        v.push(w.workspace_id.clone());
+                    }
+                }
+                v
+            };
+
+            let mut health_checks: Vec<serde_json::Value> = Vec::new();
+            // first clean workspace found
+            let mut clean_candidate: Option<String> = None;
+            // first conflicted-but-repairable workspace found
+            let mut conflicted_candidate: Option<(String, Vec<String>)> = None;
+            let mut dirty_count = 0usize;
+
+            for ws_id in &ordered_ids {
+                let ws = free_workspaces
+                    .iter()
+                    .find(|w| w.workspace_id == *ws_id)
+                    .expect("ordered_ids came from free_workspaces");
+
+                if !workspace_path_exists(ws) {
+                    // Will be reconciled; skip for health-check purposes.
+                    health_checks.push(json!({
+                        "workspace_id": ws_id,
+                        "skipped": true,
+                        "reason": "directory_missing",
+                    }));
+                    continue;
+                }
+
+                let outcome = check_workspace_health(runner, database_path, &ws.workspace_path)?;
+                match outcome {
+                    WorkspaceHealthOutcome::Clean => {
+                        health_checks.push(json!({
+                            "workspace_id": ws_id,
+                            "health": "clean",
+                            "skipped": false,
+                        }));
+                        clean_candidate = Some(ws_id.clone());
+                        break;
+                    }
+                    WorkspaceHealthOutcome::ConflictedBookmarks(ref bookmarks) => {
+                        health_checks.push(json!({
+                            "workspace_id": ws_id,
+                            "health": "conflicted",
+                            "bookmarks": bookmarks,
+                            "skipped": conflicted_candidate.is_some(),
+                        }));
+                        store.update_workspace_health(
+                            &repo,
+                            ws_id,
+                            WorkspaceHealth::Conflicted,
+                        )?;
+                        if conflicted_candidate.is_none() {
+                            conflicted_candidate =
+                                Some((ws_id.clone(), bookmarks.clone()));
+                        }
+                        // Keep looking for a clean one before falling back
+                        // to repairing the conflicted one.
+                    }
+                    WorkspaceHealthOutcome::DirtyWorkingCopy => {
+                        health_checks.push(json!({
+                            "workspace_id": ws_id,
+                            "health": "dirty",
+                            "skipped": true,
+                            "reason": "dirty_working_copy",
+                        }));
+                        store.update_workspace_health(
+                            &repo,
+                            ws_id,
+                            WorkspaceHealth::Dirty,
+                        )?;
+                        dirty_count += 1;
+                        audit!(
+                            database_path,
+                            "workspace.health_check_skipped",
+                            repo = repo,
+                            workspace_id = ws_id,
+                            reason = "dirty_working_copy",
+                        );
+                    }
+                }
+            }
+
+            // Decide which workspace to use: prefer clean, fall back to
+            // first repairable conflicted workspace, otherwise auto-create
+            // (pool empty) or error (pool all-dirty).
+            let chosen_id = clean_candidate.or_else(|| {
+                conflicted_candidate.as_ref().map(|(id, _)| id.clone())
+            });
+
+            let (mut workspace, was_auto_created, repair_bookmarks) = if let Some(ws_id) =
+                chosen_id
+            {
+                // Claim the specific workspace we health-checked.
+                let ws = store
+                    .claim_specific_workspace(
+                        &repo,
+                        &ws_id,
+                        &holder,
+                        &task,
+                        &lease_id,
+                        leased_at_epoch_s,
+                        lease_expires_at,
+                    )?
+                    .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
+                let bookmarks = conflicted_candidate
+                    .filter(|(id, _)| *id == ws_id)
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                (ws, false, bookmarks)
+            } else if !ordered_ids.is_empty() && dirty_count == ordered_ids.len() {
+                // Every free workspace has a dirty working copy. Do NOT
+                // auto-create — the operator needs to clean those up. Return
+                // a structured error so Boss can surface this as `blocked`.
+                return Err(CubeError::NoAvailableWorkspace(format!(
+                    "{repo} (all {dirty_count} free workspace(s) have dirty working copies; \
+                     run `cube workspace list --repo {repo}` to inspect, then \
+                     `cube workspace force-release --reason crash` to reclaim them)"
+                )));
+            } else {
+                // Pool has no free workspaces (empty or all leased): auto-create.
+                let new_candidate = auto_create_workspace(runner, &repo_record, &candidates)?;
+                candidates.push(new_candidate);
+                store.sync_workspaces(&repo, &candidates)?;
+                let ws = store
+                    .claim_workspace(
+                        &repo,
+                        &holder,
+                        &task,
+                        &lease_id,
+                        leased_at_epoch_s,
+                        lease_expires_at,
+                        prefer.as_deref(),
+                    )?
+                    .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
+                (ws, true, vec![])
             };
 
             if !workspace_path_exists(&workspace) {
@@ -505,6 +642,23 @@ fn run_workspace(
                 );
                 store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
                 return Err(CubeError::NoAvailableWorkspace(repo));
+            }
+
+            // If the workspace had conflicted bookmarks, repair them before
+            // the reset. `jj new main` would succeed with conflicts present,
+            // but the conflicts would still appear in `jj status` for the
+            // new worker — better to clean them up now so the workspace is
+            // truly pristine.
+            if !repair_bookmarks.is_empty() {
+                if let Err(error) = repair_conflicted_bookmarks(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repair_bookmarks,
+                ) {
+                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                    return Err(error);
+                }
             }
 
             // If the workspace we just claimed was reclaimed-from-expired
@@ -578,6 +732,7 @@ fn run_workspace(
                 json!({
                     "workspace": workspace,
                     "setup": setup_report,
+                    "health_check": health_checks,
                 }),
             )
         }
@@ -749,10 +904,10 @@ fn run_workspace(
             state,
             holder,
         } => {
-            let parsed_state = match state.as_deref() {
-                Some(raw) => Some(WorkspaceState::from_str(raw).ok_or_else(|| {
+            let parsed_effective_state = match state.as_deref() {
+                Some(raw) => Some(EffectiveState::from_str(raw).ok_or_else(|| {
                     CubeError::InvalidArgument(format!(
-                        "invalid --state `{raw}`; expected `free` or `leased`"
+                        "invalid --state `{raw}`; expected `free`, `free-dirty`, `free-conflicted`, or `leased`"
                     ))
                 })?),
                 None => None,
@@ -769,7 +924,7 @@ fn run_workspace(
             )?;
             let filter = WorkspaceListFilter {
                 repo: repo.as_deref(),
-                state: parsed_state,
+                effective_state: parsed_effective_state,
                 holder_pattern: holder.as_deref(),
                 ..Default::default()
             };
@@ -1212,6 +1367,119 @@ fn reset_workspace_guarded(
     Ok(())
 }
 
+/// Outcome of a pre-lease health check on a free workspace.
+#[derive(Debug, Clone)]
+enum WorkspaceHealthOutcome {
+    /// Working copy is clean and no bookmarks are conflicted. Ready to use as-is.
+    Clean,
+    /// Working copy is clean, but one or more bookmarks are conflicted.
+    /// Auto-repairable: forget the named bookmarks before resetting.
+    ConflictedBookmarks(Vec<String>),
+    /// Working copy has uncommitted changes from a prior worker session.
+    /// Not safe to auto-repair — skip this workspace.
+    DirtyWorkingCopy,
+}
+
+/// Check the health of a free workspace by running `jj status`. Returns
+/// [`WorkspaceHealthOutcome`] so the lease handler can decide whether to
+/// skip, repair, or immediately use the workspace. Does not modify the
+/// workspace.
+fn check_workspace_health(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+) -> Result<WorkspaceHealthOutcome> {
+    let output = run_jj(
+        runner,
+        database_path,
+        &CommandInvocation {
+            cwd: workspace_path.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec!["status".to_string(), "--no-pager".to_string()],
+        },
+    )?;
+
+    // "Working copy changes:" appears when jj has file-level changes staged
+    // or present in the working copy. Its absence means the working copy
+    // itself is clean (though bookmarks may still be conflicted).
+    if output
+        .lines()
+        .any(|l| l.trim_start().starts_with("Working copy changes:"))
+    {
+        return Ok(WorkspaceHealthOutcome::DirtyWorkingCopy);
+    }
+
+    let conflicted = parse_conflicted_bookmarks_from_status(&output);
+    if !conflicted.is_empty() {
+        return Ok(WorkspaceHealthOutcome::ConflictedBookmarks(conflicted));
+    }
+
+    Ok(WorkspaceHealthOutcome::Clean)
+}
+
+/// Extract conflicted bookmark names from `jj status` output.
+///
+/// `jj status` includes a section like:
+/// ```text
+/// These bookmarks have conflicts:
+///   fix-spawn-worker-pane-burst-crash
+///   Use `jj bookmark list` to see details. ...
+/// ```
+/// The bookmark names are the indented lines before the "Use …" hint.
+fn parse_conflicted_bookmarks_from_status(status: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut bookmarks = Vec::new();
+    for line in status.lines() {
+        if line.contains("These bookmarks have conflicts:") {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || !line.starts_with(' ') {
+                break; // end of section
+            }
+            // Skip the advisory "Use `jj bookmark list`…" line.
+            if trimmed.starts_with("Use `jj bookmark") {
+                continue;
+            }
+            bookmarks.push(trimmed.to_string());
+        }
+    }
+    bookmarks
+}
+
+/// Forget each conflicted bookmark so the workspace no longer reports
+/// bookmark conflicts. Called at lease time when the health check finds
+/// `ConflictedBookmarks` and the workspace is otherwise clean (working
+/// copy empty). `jj bookmark forget` removes the local tracking state
+/// without touching remote refs.
+fn repair_conflicted_bookmarks(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    bookmarks: &[String],
+) -> Result<()> {
+    for bookmark in bookmarks {
+        audit!(
+            database_path,
+            "workspace.bookmark_forgotten",
+            workspace_path = workspace_path.display().to_string(),
+            bookmark = bookmark,
+        );
+        run_jj(
+            runner,
+            database_path,
+            &CommandInvocation {
+                cwd: workspace_path.to_path_buf(),
+                program: "jj".to_string(),
+                args: vec!["bookmark".to_string(), "forget".to_string(), bookmark.clone()],
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Audit one of cube's own `jj` invocations against a leased
 /// workspace. Pair-reads of this with the cube audit log let an
 /// investigator answer "did cube move my `@`?" without guesswork —
@@ -1609,6 +1877,22 @@ fn reconcile_missing_workspaces(
     Ok(report)
 }
 
+/// Returns the human-readable effective status string for a workspace,
+/// combining the lease state with the last-known health status. Free
+/// workspaces with a recorded health issue show `free-dirty` or
+/// `free-conflicted` so operators can see at a glance which slots are
+/// usable without `cd`-ing into each one.
+fn effective_state_display(record: &WorkspaceRecord) -> String {
+    match record.state {
+        WorkspaceState::Leased => "leased".to_string(),
+        WorkspaceState::Free => match record.health_status {
+            Some(WorkspaceHealth::Dirty) => "free-dirty".to_string(),
+            Some(WorkspaceHealth::Conflicted) => "free-conflicted".to_string(),
+            _ => "free".to_string(),
+        },
+    }
+}
+
 fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
     if records.is_empty() {
         return "No workspaces match.".to_string();
@@ -1622,19 +1906,22 @@ fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
         .iter()
         .map(|r| abbreviate_path(&r.workspace_path))
         .collect();
+    let effective_states: Vec<String> = records.iter().map(effective_state_display).collect();
     let name_w = names.iter().map(|s| s.len()).max().unwrap_or(0);
-    let state_w = records
+    let state_w = effective_states
         .iter()
-        .map(|r| r.state.as_str().len())
+        .map(|s| s.len())
         .max()
         .unwrap_or(0);
 
     let label_w = "holder".len();
     let dim = Style::new().dim();
     let mut lines = Vec::with_capacity(records.len());
-    for ((record, name), path) in records.iter().zip(&names).zip(&paths) {
+    for (((record, name), path), eff_state) in
+        records.iter().zip(&names).zip(&paths).zip(&effective_states)
+    {
         let name_pad = format!("{name:<name_w$}");
-        let state_pad = format!("{:<state_w$}", record.state.as_str());
+        let state_pad = format!("{eff_state:<state_w$}");
         let state_styled = match record.state {
             WorkspaceState::Free => style(state_pad).green(),
             WorkspaceState::Leased => style(state_pad).yellow(),
@@ -2182,6 +2469,7 @@ mod tests {
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2306,6 +2594,7 @@ mod tests {
             (workspace_root.join("mono-agent-007"), "second"),
         ] {
             let runner = FakeRunner::new(vec![
+                ExpectedCommand::ok(path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
                 ExpectedCommand::ok(path.clone(), "jj", &["git", "fetch"], ""),
                 ExpectedCommand::ok(path.clone(), "jj", &["new", "main"], ""),
                 ExpectedCommand::ok(
@@ -2412,6 +2701,7 @@ mod tests {
 
         let preferred_path = workspace_root.join("mono-agent-005");
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2469,6 +2759,7 @@ mod tests {
         // First lease takes mono-agent-005 (the preferred one).
         let preferred_path = workspace_root.join("mono-agent-005");
         let first_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(preferred_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2495,6 +2786,7 @@ mod tests {
         // Second lease prefers mono-agent-005 (leased), should fall back to mono-agent-004.
         let fallback_path = workspace_root.join("mono-agent-004");
         let second_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(fallback_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2547,6 +2839,7 @@ mod tests {
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2576,6 +2869,543 @@ mod tests {
         runner.assert_exhausted();
     }
 
+    // ── Health-check tests ───────────────────────────────────────────────
+
+    fn jj_status_clean() -> &'static str {
+        "The working copy is clean\nWorking copy : abc1234 (empty) main"
+    }
+
+    fn jj_status_dirty() -> &'static str {
+        "Working copy changes:\nM tools/cube/src/app.rs\n\nWorking copy : abc1234 some change"
+    }
+
+    fn jj_status_conflicted(bookmark: &str) -> String {
+        format!(
+            "The working copy is clean\nWorking copy : abc1234 (empty) main\nThese bookmarks have conflicts:\n  {bookmark}\n  Use `jj bookmark list` to see details."
+        )
+    }
+
+    #[test]
+    fn workspace_lease_clean_pool_returns_lowest_workspace() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-003")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-007")).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let first = workspace_root.join("mono-agent-003");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(first.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(first.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(first.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                first.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "clean pool"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-003");
+        // health_check array should be present
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        assert_eq!(hc.len(), 1);
+        assert_eq!(hc[0]["workspace_id"], "mono-agent-003");
+        assert_eq!(hc[0]["health"], "clean");
+        assert_eq!(hc[0]["skipped"], false);
+    }
+
+    #[test]
+    fn workspace_lease_skips_dirty_picks_clean() {
+        // Pool: dirty(003), clean(007) → should skip 003, lease 007.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let dirty_path = workspace_root.join("mono-agent-003");
+        let clean_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&dirty_path).expect("dirty dir");
+        std::fs::create_dir_all(&clean_path).expect("clean dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let runner = FakeRunner::new(vec![
+            // health-check 003 → dirty → skip
+            ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+            // health-check 007 → clean → use
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "skip dirty"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-007");
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        assert_eq!(hc.len(), 2);
+        assert_eq!(hc[0]["workspace_id"], "mono-agent-003");
+        assert_eq!(hc[0]["health"], "dirty");
+        assert_eq!(hc[0]["skipped"], true);
+        assert_eq!(hc[1]["workspace_id"], "mono-agent-007");
+        assert_eq!(hc[1]["health"], "clean");
+        assert_eq!(hc[1]["skipped"], false);
+
+        // mono-agent-003 must be marked dirty in the store
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ws = store
+            .get_workspace_by_path(&dirty_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
+    }
+
+    #[test]
+    fn workspace_lease_one_clean_n_conflicted_uses_clean() {
+        // Pool: conflicted(003), clean(007) → should skip conflicted, use clean.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let conflicted_path = workspace_root.join("mono-agent-003");
+        let clean_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&conflicted_path).expect("conflicted dir");
+        std::fs::create_dir_all(&clean_path).expect("clean dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let runner = FakeRunner::new(vec![
+            // health-check 003 → conflicted (save as fallback, keep looking)
+            ExpectedCommand::ok(
+                conflicted_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                &jj_status_conflicted("fix-burst"),
+            ),
+            // health-check 007 → clean → use
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "prefer clean"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        runner.assert_exhausted();
+
+        // 007 was used; 003 (conflicted) was not repaired because 007 was clean.
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-007");
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        assert_eq!(hc.len(), 2);
+        assert_eq!(hc[0]["workspace_id"], "mono-agent-003");
+        assert_eq!(hc[0]["health"], "conflicted");
+        assert_eq!(hc[1]["workspace_id"], "mono-agent-007");
+        assert_eq!(hc[1]["health"], "clean");
+    }
+
+    #[test]
+    fn workspace_lease_all_conflicted_repairs_lowest_and_returns_it() {
+        // Pool: conflicted(003), conflicted(007) → repair 003 (lowest) and use it.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let path_003 = workspace_root.join("mono-agent-003");
+        let path_007 = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&path_003).expect("003 dir");
+        std::fs::create_dir_all(&path_007).expect("007 dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let runner = FakeRunner::new(vec![
+            // health-check 003 → conflicted (save as first fallback)
+            ExpectedCommand::ok(
+                path_003.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                &jj_status_conflicted("fix-burst"),
+            ),
+            // health-check 007 → conflicted (already have a fallback, don't replace)
+            ExpectedCommand::ok(
+                path_007.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                &jj_status_conflicted("fix-burst"),
+            ),
+            // repair 003: forget the conflicted bookmark
+            ExpectedCommand::ok(
+                path_003.clone(),
+                "jj",
+                &["bookmark", "forget", "fix-burst"],
+                "",
+            ),
+            // reset 003
+            ExpectedCommand::ok(path_003.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(path_003.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                path_003.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "all conflicted"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-003");
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        // Both conflicted workspaces appear in health_check
+        assert_eq!(hc.len(), 2);
+        assert_eq!(hc[0]["workspace_id"], "mono-agent-003");
+        assert_eq!(hc[0]["health"], "conflicted");
+        // 003 was chosen (not skipped), 007 was skipped (already have a candidate)
+        assert_eq!(hc[0]["skipped"], false);
+        assert_eq!(hc[1]["workspace_id"], "mono-agent-007");
+        assert_eq!(hc[1]["skipped"], true);
+    }
+
+    #[test]
+    fn workspace_lease_all_dirty_returns_structured_error() {
+        // Pool: dirty(003), dirty(007) → no usable workspace → structured error.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let path_003 = workspace_root.join("mono-agent-003");
+        let path_007 = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&path_003).expect("003 dir");
+        std::fs::create_dir_all(&path_007).expect("007 dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(path_003.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+            ExpectedCommand::ok(path_007.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+        ]);
+
+        let err = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "all dirty"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("should fail when all workspaces are dirty");
+        runner.assert_exhausted();
+
+        match err {
+            CubeError::NoAvailableWorkspace(msg) => {
+                assert!(
+                    msg.contains("dirty working copies"),
+                    "error should mention dirty: {msg}"
+                );
+                assert!(
+                    msg.contains("mono"),
+                    "error should mention repo: {msg}"
+                );
+            }
+            other => panic!("expected NoAvailableWorkspace, got: {other:?}"),
+        }
+
+        // Both workspaces should be marked dirty in the store.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        for path in [&path_003, &path_007] {
+            let ws = store.get_workspace_by_path(path).unwrap().unwrap();
+            assert_eq!(
+                ws.health_status,
+                Some(crate::metadata::WorkspaceHealth::Dirty),
+                "expected dirty health for {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_list_shows_health_status_in_effective_state() {
+        // After a lease attempt that skips dirty workspaces, workspace list
+        // should show `free-dirty` for the skipped ones.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let dirty_path = workspace_root.join("mono-agent-003");
+        let clean_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&dirty_path).expect("dirty dir");
+        std::fs::create_dir_all(&clean_path).expect("clean dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Trigger a lease so health checks run and health_status is persisted.
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        // Now list workspaces and check the JSON output.
+        let list_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list", "--json"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list");
+
+        let workspaces = list_result.payload["workspaces"]
+            .as_array()
+            .expect("workspaces array");
+        // 003 is free-dirty, 007 is leased
+        let ws_003 = workspaces
+            .iter()
+            .find(|w| w["workspace_id"] == "mono-agent-003")
+            .expect("003");
+        let ws_007 = workspaces
+            .iter()
+            .find(|w| w["workspace_id"] == "mono-agent-007")
+            .expect("007");
+        assert_eq!(ws_003["health_status"], "dirty");
+        assert_eq!(ws_003["state"], "free");
+        assert_eq!(ws_007["state"], "leased");
+    }
+
+    #[test]
+    fn workspace_list_state_filter_accepts_free_dirty() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let dirty_path = workspace_root.join("mono-agent-003");
+        let clean_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&dirty_path).expect("dirty dir");
+        std::fs::create_dir_all(&clean_path).expect("clean dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Trigger a lease to run health checks and persist health_status.
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+
+        // --state free-dirty should return only mono-agent-003
+        let dirty_list = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list", "--state", "free-dirty"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list dirty");
+
+        let workspaces = dirty_list.payload["workspaces"]
+            .as_array()
+            .expect("workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0]["workspace_id"], "mono-agent-003");
+
+        // --state free should return zero (003 is free-dirty, 007 is leased)
+        let free_list = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list", "--state", "free"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list free");
+        assert_eq!(
+            free_list.payload["workspaces"].as_array().unwrap().len(),
+            0,
+            "no purely-free workspaces should remain after leasing the only clean one"
+        );
+    }
+
+    #[test]
+    fn workspace_release_clears_health_status() {
+        // After a workspace is released, its health_status should be NULL
+        // so it gets re-checked at next lease time.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws_path = workspace_root.join("mono-agent-003");
+        std::fs::create_dir_all(&ws_path).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_for(&ws_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main"], ""),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(ws.health_status, None, "health_status should be cleared on release");
+    }
+
+    #[test]
+    fn workspace_lease_release_list_workspace_list_shows_effective_state() {
+        // `cube workspace list` output message should show `free-conflicted`
+        // for a workspace whose health_status is `conflicted`.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let conflicted_path = workspace_root.join("mono-agent-003");
+        let clean_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(&conflicted_path).expect("conflicted dir");
+        std::fs::create_dir_all(&clean_path).expect("clean dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Run a lease that skips the conflicted workspace and picks the clean one.
+        let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                conflicted_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                &jj_status_conflicted("fix-burst"),
+            ),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        let list = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "list"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("list");
+
+        // The human-readable message should contain "free-conflicted" for 003.
+        assert!(
+            list.message.contains("free-conflicted"),
+            "expected free-conflicted in list message: {}",
+            list.message
+        );
+    }
+
     #[test]
     fn workspace_release_resets_and_frees_the_workspace() {
         let (tempdir, database_path) = with_database_path();
@@ -2598,6 +3428,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2661,6 +3492,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2777,6 +3609,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2861,6 +3694,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -2929,6 +3763,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3059,6 +3894,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3131,6 +3967,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3683,6 +4520,7 @@ mod tests {
         // Without --expunge the dir is still there, so the next lease
         // discovers it and re-syncs the row.
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3728,6 +4566,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3823,6 +4662,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3889,6 +4729,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3947,6 +4788,7 @@ mod tests {
 
         let first_path = workspace_root.join("mono-agent-001");
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -4009,6 +4851,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -4095,6 +4938,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -4216,6 +5060,7 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -4290,6 +5135,7 @@ mod tests {
 
     fn lease_runner_for(workspace_path: &std::path::Path, head: &str) -> FakeRunner {
         FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -4307,6 +5153,7 @@ mod tests {
         setup_steps: Vec<ExpectedCommand>,
     ) -> FakeRunner {
         let mut commands = vec![
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -4697,6 +5544,7 @@ steps:
         // retry the original command. The remainder of the lease then
         // proceeds normally.
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::stale(workspace_path.clone(), "jj", &["git", "fetch"]),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -4764,6 +5612,7 @@ steps:
         // itself fails. The lease must not pretend success — surface a
         // distinct StaleRecoveryFailed error.
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::stale(workspace_path.clone(), "jj", &["git", "fetch"]),
             ExpectedCommand {
                 cwd: workspace_path.clone(),
@@ -5345,12 +6194,13 @@ steps:
         // on the next lease call.
         force_lease_expiry(&database_path, &prior_lease_id, 1);
 
-        // The second lease's reset path should run `jj git fetch` then
-        // the head-status probe and stop. Stub the probe to return a
-        // non-empty `@` whose parent isn't `main` — exactly the
-        // shape a still-active worker's WIP looks like.
+        // The second lease's reset path should run `jj status --no-pager`
+        // (health check), then `jj git fetch`, then the head-status probe
+        // and stop. Stub the probe to return a non-empty `@` whose parent
+        // isn't `main` — exactly the shape a still-active worker's WIP looks like.
         let probe_output = "abcd1234\tfalse\tfeature-bookmark";
         let second_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -5460,6 +6310,7 @@ steps:
         // Clean @: empty, parent on main → safe to reset.
         let probe_output = "abcd1234\ttrue\tmain";
         let second_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
