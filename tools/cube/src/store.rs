@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::app::CubeError;
 use crate::metadata::{
-    ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState,
+    ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceHealth, WorkspaceRecord, WorkspaceState,
 };
 use crate::paths::database_path;
 
@@ -13,11 +13,49 @@ pub struct Store {
     connection: Connection,
 }
 
+/// Effective display state of a workspace: combines lease state with health.
+/// Used by `cube workspace list --state` to filter on composite status strings
+/// that include health info (e.g. `free-dirty`, `free-conflicted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveState {
+    /// state=free, health_status IS NULL or 'clean'
+    Free,
+    /// state=free, health_status='dirty'
+    FreeDirty,
+    /// state=free, health_status='conflicted'
+    FreeConflicted,
+    /// state=leased
+    Leased,
+}
+
+impl EffectiveState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::FreeDirty => "free-dirty",
+            Self::FreeConflicted => "free-conflicted",
+            Self::Leased => "leased",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "free" => Some(Self::Free),
+            "free-dirty" => Some(Self::FreeDirty),
+            "free-conflicted" => Some(Self::FreeConflicted),
+            "leased" => Some(Self::Leased),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct WorkspaceListFilter<'a> {
     pub repo: Option<&'a str>,
     pub workspace_id: Option<&'a str>,
-    pub state: Option<WorkspaceState>,
+    /// Filter by effective state (combines lease state + health). When set,
+    /// `state` is ignored.
+    pub effective_state: Option<EffectiveState>,
     pub holder_pattern: Option<&'a str>,
 }
 
@@ -156,7 +194,8 @@ impl Store {
                 leased_at_epoch_s,
                 lease_expires_at_epoch_s,
                 head_commit,
-                last_release_reason
+                last_release_reason,
+                health_status
             FROM workspaces
             WHERE 1=1
             "#,
@@ -170,9 +209,27 @@ impl Store {
             sql.push_str(" AND workspace_id = ?");
             bound.push(workspace_id.to_string());
         }
-        if let Some(state) = filter.state {
-            sql.push_str(" AND state = ?");
-            bound.push(state.as_str().to_string());
+        if let Some(effective) = filter.effective_state {
+            match effective {
+                EffectiveState::Free => {
+                    sql.push_str(
+                        " AND state = ? AND (health_status IS NULL OR health_status = 'clean')",
+                    );
+                    bound.push(WorkspaceState::Free.as_str().to_string());
+                }
+                EffectiveState::FreeDirty => {
+                    sql.push_str(" AND state = ? AND health_status = 'dirty'");
+                    bound.push(WorkspaceState::Free.as_str().to_string());
+                }
+                EffectiveState::FreeConflicted => {
+                    sql.push_str(" AND state = ? AND health_status = 'conflicted'");
+                    bound.push(WorkspaceState::Free.as_str().to_string());
+                }
+                EffectiveState::Leased => {
+                    sql.push_str(" AND state = ?");
+                    bound.push(WorkspaceState::Leased.as_str().to_string());
+                }
+            }
         }
         if let Some(holder_pattern) = filter.holder_pattern {
             sql.push_str(" AND holder GLOB ?");
@@ -207,7 +264,8 @@ impl Store {
                     leased_at_epoch_s,
                     lease_expires_at_epoch_s,
                     head_commit,
-                    last_release_reason
+                    last_release_reason,
+                    health_status
                 FROM workspaces
                 WHERE repo = ?1
                 ORDER BY workspace_id
@@ -400,7 +458,8 @@ impl Store {
                     leased_at_epoch_s,
                     lease_expires_at_epoch_s,
                     head_commit,
-                    last_release_reason
+                    last_release_reason,
+                    health_status
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -432,6 +491,113 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the health status of a free workspace so `cube workspace list`
+    /// can surface it without re-running `jj status` on every workspace.
+    /// Only updates free workspaces (leased workspaces have no meaningful
+    /// health status until they are released).
+    pub fn update_workspace_health(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+        health: WorkspaceHealth,
+    ) -> Result<(), CubeError> {
+        self.connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET health_status = ?3
+                WHERE repo = ?1 AND workspace_id = ?2 AND state = ?4
+                "#,
+                params![
+                    repo,
+                    workspace_id,
+                    health.as_str(),
+                    WorkspaceState::Free.as_str(),
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
+    /// Claim a specific workspace by `workspace_id`, atomically transitioning
+    /// it from `free` to `leased`. Returns `None` if the workspace is not
+    /// currently free (e.g., already leased or doesn't exist). Unlike
+    /// `claim_workspace`, there is no fallback — the named workspace must be
+    /// free or the call returns `None`.
+    pub fn claim_specific_workspace(
+        &mut self,
+        repo: &str,
+        workspace_id: &str,
+        holder: &str,
+        task: &str,
+        lease_id: &str,
+        leased_at_epoch_s: i64,
+        lease_expires_at_epoch_s: Option<i64>,
+    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+        let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
+
+        let rows_updated = transaction
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    state = ?1,
+                    lease_id = ?2,
+                    holder = ?3,
+                    task = ?4,
+                    leased_at_epoch_s = ?5,
+                    lease_expires_at_epoch_s = ?6,
+                    head_commit = NULL,
+                    last_release_reason = NULL,
+                    health_status = NULL
+                WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
+                "#,
+                params![
+                    WorkspaceState::Leased.as_str(),
+                    lease_id,
+                    holder,
+                    task,
+                    leased_at_epoch_s,
+                    lease_expires_at_epoch_s,
+                    repo,
+                    workspace_id,
+                    WorkspaceState::Free.as_str(),
+                ],
+            )
+            .map_err(CubeError::Storage)?;
+
+        if rows_updated == 0 {
+            transaction.rollback().map_err(CubeError::Storage)?;
+            return Ok(None);
+        }
+
+        let claimed = transaction
+            .query_row(
+                r#"
+                SELECT
+                    repo,
+                    workspace_id,
+                    workspace_path,
+                    state,
+                    lease_id,
+                    holder,
+                    task,
+                    leased_at_epoch_s,
+                    lease_expires_at_epoch_s,
+                    head_commit,
+                    last_release_reason,
+                    health_status
+                FROM workspaces
+                WHERE repo = ?1 AND workspace_id = ?2
+                "#,
+                params![repo, workspace_id],
+                row_to_workspace_record,
+            )
+            .map_err(CubeError::Storage)?;
+        transaction.commit().map_err(CubeError::Storage)?;
+        Ok(Some(claimed))
+    }
+
     pub fn get_workspace_by_path(
         &self,
         workspace_path: &Path,
@@ -450,7 +616,8 @@ impl Store {
                     leased_at_epoch_s,
                     lease_expires_at_epoch_s,
                     head_commit,
-                    last_release_reason
+                    last_release_reason,
+                    health_status
                 FROM workspaces
                 WHERE workspace_path = ?1
                 "#,
@@ -479,7 +646,8 @@ impl Store {
                     leased_at_epoch_s,
                     lease_expires_at_epoch_s,
                     head_commit,
-                    last_release_reason
+                    last_release_reason,
+                    health_status
                 FROM workspaces
                 WHERE lease_id = ?1
                 "#,
@@ -525,7 +693,8 @@ impl Store {
                     leased_at_epoch_s = NULL,
                     lease_expires_at_epoch_s = NULL,
                     head_commit = NULL,
-                    last_release_reason = ?3
+                    last_release_reason = ?3,
+                    health_status = NULL
                 WHERE lease_id = ?1
                 "#,
                 params![lease_id, WorkspaceState::Free.as_str(), reason],
@@ -541,6 +710,7 @@ impl Store {
             lease_expires_at_epoch_s: None,
             head_commit: None,
             last_release_reason: reason.map(str::to_string),
+            health_status: None,
             ..record
         }))
     }
@@ -825,6 +995,7 @@ impl Store {
                     lease_expires_at_epoch_s INTEGER,
                     head_commit TEXT,
                     last_release_reason TEXT,
+                    health_status TEXT,
                     PRIMARY KEY(repo, workspace_id),
                     FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE
                 );
@@ -873,6 +1044,10 @@ impl Store {
         try_add_column(
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN last_release_reason TEXT",
+        )?;
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN health_status TEXT",
         )?;
 
         Ok(())
@@ -929,6 +1104,7 @@ fn row_to_repo_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoRecord> {
 
 fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     let state_raw: String = row.get(3)?;
+    let health_raw: Option<String> = row.get(11)?;
     Ok(WorkspaceRecord {
         repo: row.get(0)?,
         workspace_id: row.get(1)?,
@@ -949,6 +1125,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         lease_expires_at_epoch_s: row.get(8)?,
         head_commit: row.get(9)?,
         last_release_reason: row.get(10)?,
+        health_status: health_raw.as_deref().and_then(WorkspaceHealth::from_str),
     })
 }
 
@@ -973,7 +1150,7 @@ mod tests {
         ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState,
     };
 
-    use super::{Store, WorkspaceListFilter};
+    use super::{EffectiveState, Store, WorkspaceListFilter};
 
     fn open_store() -> (TempDir, Store) {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1129,7 +1306,7 @@ mod tests {
         // state filter
         let leased = store
             .list_workspaces_filtered(&WorkspaceListFilter {
-                state: Some(WorkspaceState::Leased),
+                effective_state: Some(EffectiveState::Leased),
                 ..Default::default()
             })
             .expect("list leased");
@@ -1150,7 +1327,7 @@ mod tests {
         let mono_free = store
             .list_workspaces_filtered(&WorkspaceListFilter {
                 repo: Some("mono"),
-                state: Some(WorkspaceState::Free),
+                effective_state: Some(EffectiveState::Free),
                 ..Default::default()
             })
             .expect("list mono free");
