@@ -37,6 +37,35 @@ The user-visible symptoms clustered into three:
 
 The earlier 02:04 batch was a 4-way fan-out across T404a/b, T407a, T409, T410 — five rows, all reading PR #478. That is the most extreme fan-out we have evidence for; the 06:22 and 06:38 events were 1-way and 2-way respectively. The mechanism is the same; the fan-out factor depends on how many investigation-only workers happen to be active at the moment of a sibling merge.
 
+### Per-execution timing
+
+The kill-after-merge correlation is tight enough to be the smoking gun. Reading `work_executions.started_at` and `finished_at` out of `state.db` for each affected execution and lining them up against the GitHub merge timestamps:
+
+| Execution | Started (UTC) | Finished (UTC) | Wrong-PR merged at (UTC) | Gap from merge → kill |
+|---|---|---|---|---|
+| T407a (`exec_18af4bc13c377510_1f`) | 01:54:45 | 02:05:12 | #478 — 02:04:02 | 70s |
+| T404b (`exec_18af4c03a1f30350_22`) | 01:59:22 | 02:05:15 | #478 — 02:04:02 | 73s |
+| T415 (`exec_18af5a98696c2860_2b`) | 06:26:31 | 06:39:38 | #483 — 06:22:43 | started 4 min after merge; killed on next fallback sweep |
+| T407b (`exec_18af5aeb58f73a58_2d`) | 06:32:27 | 06:39:40 | #486 — 06:38:10 | 90s |
+| T404c (`exec_18af5aeb59b21260_2f`) | 06:32:32 | 06:39:43 | #486 — 06:38:10 | 93s |
+
+The 02:05 cluster (T407a finishing 3 seconds before T404b, on two different workspaces) and the 06:39 cluster (three executions across three workspaces all finishing within 5 seconds of each other) are the engine-wide fire of the fallback against multiple in-flight workers in the same sweep window. The T415 row is the slightly different shape that confirms the mechanism: T415 started *after* #483 was already merged, ran for 13 minutes doing its own investigation, and was killed when its next Stop hook fired the fallback and matched #483's still-recent bookmark.
+
+### Per-execution worker output
+
+The transcripts of the killed workers confirm that none of them ever produced a PR of their own. Counting tool-use messages from the on-disk `.jsonl` session files for each execution:
+
+| Execution | `Bash` calls | `Read` calls | `Edit` calls | `gh pr create` / `jj git push` |
+|---|---|---|---|---|
+| T404a (mono-006) | 5 | 5 | 0 | 0 |
+| T404b (mono-005) | 14 | 8 | 0 | 0 |
+| T404c (mono-004) | 27 | 12 | 0 | 0 |
+| T407a (mono-004) | 22 | 24 | 0 | 0 |
+| T407b (mono-002) | 29 | 16 | 0 | 0 |
+| T415 (mono-001) | 40 | 25 | 9 | 0 |
+
+Every affected worker terminated mid-thought — the last assistant message in each transcript is investigatory, not a summary or hand-off. Five of the six executions never reached an edit phase; T415 had reached editing (9 `Edit` calls, adding regression tests to engine source) but had not run `gh pr create` or `jj git push` yet when killed. That is why the staging cache was empty for each of these executions: not because the engine missed a staging event, but because there was no staging event to miss. The fallback then ran as the only path the engine had, and ran it against jj state that, under cube's shared store, included sibling workers' just-pushed bookmarks.
+
 ## 4. Investigation and root cause
 
 ### The intended cold path
