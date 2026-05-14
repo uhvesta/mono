@@ -144,6 +144,10 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
     fn draft_pr_mode(&self) -> bool {
         self.settings.is_enabled("default_pr_draft_mode")
     }
+
+    fn always_use_opus(&self) -> bool {
+        self.settings.is_enabled("workers.always_use_opus")
+    }
 }
 
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
