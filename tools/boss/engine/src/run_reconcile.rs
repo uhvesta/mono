@@ -336,6 +336,8 @@ mod tests {
             created_at: "2026-05-07T00:00:00Z".to_owned(),
             started_at: Some("2026-05-07T00:00:00Z".to_owned()),
             finished_at: None,
+            pre_start_failure_count: 0,
+            dispatch_not_before: None,
         }
     }
 

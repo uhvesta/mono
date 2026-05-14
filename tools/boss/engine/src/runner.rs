@@ -850,6 +850,8 @@ mod conflict_resolution_prompt_tests {
             created_at: "1700000000".into(),
             started_at: Some("1700000010".into()),
             finished_at: None,
+            pre_start_failure_count: 0,
+            dispatch_not_before: None,
         }
     }
 
@@ -1175,6 +1177,8 @@ mod pane_spawn_tests {
             created_at: "2026-05-06T20:00:00Z".into(),
             started_at: Some("2026-05-06T20:00:00Z".into()),
             finished_at: None,
+            pre_start_failure_count: 0,
+            dispatch_not_before: None,
         }
     }
 
