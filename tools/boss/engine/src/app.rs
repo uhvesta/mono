@@ -2435,29 +2435,66 @@ async fn dispatch_live_worker_state(
                 if let Some(pr_url) =
                     crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response)
                 {
-                    let outcome = server_state
-                        .staged_pr_urls
-                        .record_if_unset(run_id, &pr_url);
-                    match outcome {
-                        crate::pr_url_capture::StagePrUrlOutcome::Staged => {
-                            tracing::info!(
-                                execution_id = run_id,
-                                pr_url = %pr_url,
-                                "pr_url_capture: staged PR URL from worker hook stream",
-                            );
+                    // Gate the URL against the product's repo before
+                    // staging. Workers running tests can emit fixture
+                    // URLs (e.g. `https://github.com/foo/bar/pull/42`)
+                    // in tool_response.stdout; without this gate those
+                    // bind to the work_item as if they were real PRs.
+                    let execution_id = run_id;
+                    let repo_url_result = server_state
+                        .work_db
+                        .get_execution(execution_id)
+                        .map(|e| e.repo_remote_url);
+                    let valid = match repo_url_result {
+                        Ok(ref repo_url) => {
+                            match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
+                                Ok(()) => true,
+                                Err(reason) => {
+                                    tracing::info!(
+                                        execution_id,
+                                        rejected_url = %pr_url,
+                                        %reason,
+                                        "pr_url_capture: dropping URL — failed product-repo gate",
+                                    );
+                                    false
+                                }
+                            }
                         }
-                        crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
-                            // Worker emitted another PR URL after
-                            // already staging one — typically a
-                            // `gh pr view` follow-up referencing a
-                            // different PR. First-writer-wins so
-                            // the original (the worker's own
-                            // `gh pr create`) is kept.
-                            tracing::debug!(
-                                execution_id = run_id,
-                                pr_url = %pr_url,
-                                "pr_url_capture: ignoring later URL (already staged for this execution)",
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id,
+                                rejected_url = %pr_url,
+                                ?err,
+                                "pr_url_capture: could not load execution to validate URL; dropping for safety",
                             );
+                            false
+                        }
+                    };
+                    if valid {
+                        let outcome = server_state
+                            .staged_pr_urls
+                            .record_if_unset(run_id, &pr_url);
+                        match outcome {
+                            crate::pr_url_capture::StagePrUrlOutcome::Staged => {
+                                tracing::info!(
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    "pr_url_capture: staged PR URL from worker hook stream",
+                                );
+                            }
+                            crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
+                                // Worker emitted another PR URL after
+                                // already staging one — typically a
+                                // `gh pr view` follow-up referencing a
+                                // different PR. First-writer-wins so
+                                // the original (the worker's own
+                                // `gh pr create`) is kept.
+                                tracing::debug!(
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    "pr_url_capture: ignoring later URL (already staged for this execution)",
+                                );
+                            }
                         }
                     }
                 }
