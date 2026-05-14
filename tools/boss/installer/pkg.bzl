@@ -45,11 +45,16 @@ the bundled binaries in Contents/Resources/bin/.
 # ── boss_pkg_unsigned ─────────────────────────────────────────────────────────
 
 def _boss_pkg_unsigned_impl(ctx):
-    """Runs pkgbuild to produce an unsigned Boss-<sha>.pkg."""
+    """Runs pkgbuild + productbuild to produce an unsigned Boss-<sha>.pkg."""
     output_dir = ctx.actions.declare_directory(ctx.label.name)
 
     # Payload directory (the extracted Boss.app tree)
     payload = ctx.file.payload
+
+    # Distribution XML — enables currentUserHomeDirectory domain so Installer
+    # uses the runtime user's ~/Applications rather than a build-time-expanded
+    # absolute path.
+    distribution = ctx.file.distribution
 
     # Pre/postinstall scripts directory — all scripts live in the same dir
     scripts = ctx.files.scripts
@@ -64,27 +69,42 @@ def _boss_pkg_unsigned_impl(ctx):
 
     # Build the shell command.  We avoid .format() to sidestep brace-escaping
     # issues with awk; string concatenation is clearer here.
+    #
+    # Two-step build mirrors release.sh:
+    #   1. pkgbuild → BossComponent.pkg  (component package, --install-location /Applications)
+    #   2. productbuild --distribution   → Boss-<sha>.pkg  (distribution package)
+    #
+    # Using /Applications (not ~/Applications) avoids baking the builder's $HOME
+    # into the component metadata.  productbuild + distribution.xml with
+    # enable_currentUserHome="true" remaps /Applications → ~/Applications at
+    # install time on the target machine.
     command = (
         "set -euo pipefail\n" +
         "SHA=$(grep STABLE_BOSS_GIT_SHA " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
+        # Step 1: component package (intermediate; named to match distribution.xml pkg-ref)
         "/usr/bin/pkgbuild \\\n" +
         "    --root " + payload.path + " \\\n" +
         "    --identifier dev.spinyfin.boss.installer \\\n" +
-        "    --install-location ~/Applications \\\n" +
+        "    --install-location /Applications \\\n" +
         "    --scripts " + scripts_dir + " \\\n" +
         "    --version \"0+${SHA}\" \\\n" +
+        "    " + output_dir.path + "/BossComponent.pkg\n" +
+        # Step 2: distribution package wrapping the component with domain metadata
+        "/usr/bin/productbuild \\\n" +
+        "    --distribution " + distribution.path + " \\\n" +
+        "    --package-path " + output_dir.path + " \\\n" +
         "    " + output_dir.path + "/Boss-${SHA}.pkg\n"
     )
 
     ctx.actions.run_shell(
-        inputs = [payload, info_file] + scripts,
+        inputs = [payload, distribution, info_file] + scripts,
         outputs = [output_dir],
         command = command,
         mnemonic = "BossPkgBuild",
         progress_message = "Building unsigned Boss installer .pkg",
-        # pkgbuild is macOS-only and must run locally (not in a remote executor)
+        # pkgbuild/productbuild are macOS-only and must run locally
         execution_requirements = {"local": "1"},
     )
 
@@ -103,12 +123,23 @@ boss_pkg_unsigned = rule(
             allow_files = True,
             doc = "Filegroup of pre/postinstall scripts for pkgbuild --scripts.",
         ),
+        "distribution": attr.label(
+            mandatory = True,
+            allow_single_file = True,
+            doc = "distribution.xml for productbuild — sets currentUserHomeDirectory domain.",
+        ),
     },
     doc = """
 Builds an unsigned .pkg installer from the staged payload directory.
 
 Output: a directory boss_pkg_unsigned/ containing Boss-<sha>.pkg where <sha>
 is STABLE_BOSS_GIT_SHA from the stable workspace status file (ctx.info_file).
+Also contains BossComponent.pkg (intermediate component package).
+
+Two-step build: pkgbuild produces BossComponent.pkg with --install-location
+/Applications; productbuild wraps it with distribution.xml which sets
+enable_currentUserHome="true" so Installer.app resolves /Applications relative
+to the runtime user's home, not the builder's $HOME.
 
 The .pkg installs Boss.app to ~/Applications (currentUserHomeDirectory domain,
 no admin rights required).  It is unsigned; run release.sh (chore 2) to sign,

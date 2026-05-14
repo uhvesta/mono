@@ -35,9 +35,9 @@
     </choice>
 
     <!--
-      BossComponent.pkg is the component package produced by pkgbuild inside
-      release.sh.  productbuild resolves it from the --package-path directory
-      passed on the command line.
+      BossComponent.pkg is the component package produced by pkgbuild.
+      productbuild resolves it from the package-path directory passed on
+      the command line.
     -->
     <pkg-ref id="dev.spinyfin.boss.installer" onConclusion="none">BossComponent.pkg</pkg-ref>
 </installer-gui-script>

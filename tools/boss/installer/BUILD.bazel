@@ -38,6 +38,7 @@ boss_pkg_payload(
 #   Phase 2 — workspace-status.sh threads the git SHA into the filename
 boss_pkg_unsigned(
     name = "boss_pkg_unsigned",
+    distribution = "distribution.xml",
     payload = ":boss_pkg_payload",
     scripts = ":installer_scripts",
 )
