@@ -24,26 +24,45 @@ struct SettingsView: View {
     }
 }
 
-/// "Workers" pane — PR-related worker defaults.
+/// "Workers" pane — worker defaults grouped by concern.
 private struct WorkerSettingsPane: View {
     @EnvironmentObject private var chatModel: ChatViewModel
 
+    private var prSettings: [EngineSetting] {
+        chatModel.engineSettings.filter { $0.key == "default_pr_draft_mode" }
+    }
+
+    private var modelSettings: [EngineSetting] {
+        chatModel.engineSettings.filter { $0.key == "workers.always_use_opus" }
+    }
+
     var body: some View {
         Form {
-            Section {
-                if chatModel.engineSettings.isEmpty {
+            if chatModel.engineSettings.isEmpty {
+                Section {
                     ProgressView("Loading…")
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding()
-                } else {
-                    ForEach(chatModel.engineSettings) { setting in
+                }
+            } else {
+                Section {
+                    ForEach(prSettings) { setting in
                         SettingToggleRow(setting: setting) { enabled in
                             chatModel.setEngineSetting(key: setting.key, enabled: enabled)
                         }
                     }
+                } header: {
+                    Text("PR Conventions")
                 }
-            } header: {
-                Text("PR Conventions")
+                Section {
+                    ForEach(modelSettings) { setting in
+                        SettingToggleRow(setting: setting) { enabled in
+                            chatModel.setEngineSetting(key: setting.key, enabled: enabled)
+                        }
+                    }
+                } header: {
+                    Text("Model")
+                }
             }
         }
         .formStyle(.grouped)
@@ -76,6 +95,8 @@ private struct SettingToggleRow: View {
         switch key {
         case "default_pr_draft_mode":
             return "Default new PRs to draft mode"
+        case "workers.always_use_opus":
+            return "Always use Opus for workers"
         default:
             return key
         }

@@ -34,6 +34,11 @@ pub const REGISTRY: &[SettingSpec] = &[
         description: "Workers will pass --draft to gh pr create unless the chore description overrides.",
         default_enabled: false,
     },
+    SettingSpec {
+        key: "workers.always_use_opus",
+        description: "Forces every dispatched worker to run on Opus regardless of effort level. Useful where --dangerously-skip-permissions is forbidden (auto-mode only works on Opus).",
+        default_enabled: false,
+    },
 ];
 
 /// Wire/display snapshot of one setting's current state.

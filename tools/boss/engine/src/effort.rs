@@ -172,6 +172,36 @@ pub fn resolve_spawn_config(
     }
 }
 
+/// Opus model slug used when the `workers.always_use_opus` setting overrides
+/// the effort-level default.
+pub const ALWAYS_OPUS_MODEL: &str = "claude-opus-4-7";
+
+/// `--effort` value for each level when `workers.always_use_opus` is active.
+/// Large/max match the §Q2 table exactly (those rows already use Opus).
+/// Trivial/small use `low` and medium uses `medium` — sensible budgets for
+/// Opus on lighter tasks without wasting the model's full reasoning depth.
+fn claude_effort_for_level_with_opus(level: EffortLevel) -> &'static str {
+    match level {
+        EffortLevel::Trivial | EffortLevel::Small => "low",
+        EffortLevel::Medium => "medium",
+        EffortLevel::Large => "xhigh",
+        EffortLevel::Max => "max",
+    }
+}
+
+/// Apply the `workers.always_use_opus` override to a resolved `SpawnConfig`.
+/// Forces the model to Opus and remaps `--effort` to Opus-appropriate values.
+/// `effort_level` and `prompt_addendum` are preserved — the override changes
+/// the model, not the scope classification (design §Q3 precedence rationale).
+pub fn apply_always_opus_override(config: SpawnConfig) -> SpawnConfig {
+    SpawnConfig {
+        effort_level: config.effort_level,
+        claude_effort: config.effort_level.map(claude_effort_for_level_with_opus),
+        model: ALWAYS_OPUS_MODEL.to_owned(),
+        prompt_addendum: config.prompt_addendum,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Marker corpus + audit thresholds — design §Q4 + Q4 follow-up
 // ---------------------------------------------------------------------------
@@ -575,5 +605,79 @@ mod tests {
             + MULTI_SUBSYSTEM_HINTS.len()
             + MECHANICAL_EDIT_MARKERS.len();
         assert_eq!(all_markers().count(), total);
+    }
+
+    // --- always-opus override ---
+
+    #[test]
+    fn always_opus_override_forces_model_to_opus_for_all_levels() {
+        for level in [
+            EffortLevel::Trivial,
+            EffortLevel::Small,
+            EffortLevel::Medium,
+            EffortLevel::Large,
+            EffortLevel::Max,
+        ] {
+            let base = resolve_spawn_config(Some(level), None, None);
+            let overridden = apply_always_opus_override(base.clone());
+            assert_eq!(
+                overridden.model, ALWAYS_OPUS_MODEL,
+                "level {:?} must resolve to opus",
+                level,
+            );
+            // effort_level and prompt_addendum are preserved
+            assert_eq!(overridden.effort_level, base.effort_level);
+            assert_eq!(overridden.prompt_addendum, base.prompt_addendum);
+        }
+    }
+
+    #[test]
+    fn always_opus_override_effort_mapping() {
+        let check = |level, expected_effort| {
+            let base = resolve_spawn_config(Some(level), None, None);
+            let overridden = apply_always_opus_override(base);
+            assert_eq!(
+                overridden.claude_effort,
+                Some(expected_effort),
+                "level {:?} should map to --effort {} in always-opus mode",
+                level,
+                expected_effort,
+            );
+        };
+        check(EffortLevel::Trivial, "low");
+        check(EffortLevel::Small, "low");
+        check(EffortLevel::Medium, "medium");
+        // large/max match the §Q2 Opus rows exactly
+        check(EffortLevel::Large, "xhigh");
+        check(EffortLevel::Max, "max");
+    }
+
+    #[test]
+    fn always_opus_override_invocation_uses_permission_mode_auto() {
+        // Opus model → --permission-mode auto, not --dangerously-skip-permissions.
+        let base = resolve_spawn_config(Some(EffortLevel::Small), None, None);
+        assert!(
+            base.claude_invocation().contains("--dangerously-skip-permissions"),
+            "small without override should use --dangerously-skip-permissions (Sonnet)",
+        );
+        let overridden = apply_always_opus_override(base);
+        let inv = overridden.claude_invocation();
+        assert!(
+            inv.contains("--permission-mode auto"),
+            "always-opus override on small must use --permission-mode auto, got: {inv:?}",
+        );
+        assert!(
+            !inv.contains("--dangerously-skip-permissions"),
+            "always-opus override must NOT use --dangerously-skip-permissions, got: {inv:?}",
+        );
+    }
+
+    #[test]
+    fn always_opus_override_preserves_null_effort_on_untagged_row() {
+        // A row with no effort_level still resolves to opus but loses --effort.
+        let base = resolve_spawn_config(None, None, None);
+        let overridden = apply_always_opus_override(base);
+        assert_eq!(overridden.model, ALWAYS_OPUS_MODEL);
+        assert_eq!(overridden.claude_effort, None);
     }
 }

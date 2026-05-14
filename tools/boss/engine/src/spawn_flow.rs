@@ -162,6 +162,13 @@ pub trait WorkerSpawner: Send + Sync {
     fn draft_pr_mode(&self) -> bool {
         false
     }
+
+    /// Whether the `workers.always_use_opus` setting is enabled. When
+    /// `true`, the effort→model resolver is overridden to Opus for every
+    /// spawned worker. Default `false` for tests.
+    fn always_use_opus(&self) -> bool {
+        false
+    }
 }
 
 /// Render the worker-config files, ask the app to spawn a pane,
