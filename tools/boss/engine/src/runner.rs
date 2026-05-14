@@ -1943,6 +1943,7 @@ mod pane_spawn_tests {
                         .to_owned(),
                 ),
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
         let task = work_db
@@ -2039,6 +2040,7 @@ mod pane_spawn_tests {
                         .to_owned(),
                 ),
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
 
@@ -2166,6 +2168,7 @@ mod pane_spawn_tests {
                 description: Some("Pick the right merge-poller cadence.".to_owned()),
                 goal: Some("Reduce GitHub API spend without lagging merges.".to_owned()),
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
 

@@ -1149,6 +1149,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         let task = db

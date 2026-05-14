@@ -92,6 +92,7 @@ async fn create_project(client: &mut BossClient, product_id: &str, name: &str) -
                 description: None,
                 goal: None,
                 autostart: false,
+                no_design_task: false,
             },
         })
         .await?

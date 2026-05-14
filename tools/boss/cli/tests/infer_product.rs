@@ -163,6 +163,7 @@ async fn project_show_infers_product_from_typed_id() -> Result<()> {
             description: None,
             goal: None,
             autostart: false,
+            no_design_task: false,
         },
     )
     .await?;
@@ -208,6 +209,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
             description: None,
             goal: None,
             autostart: false,
+            no_design_task: false,
         },
     )
     .await?;
@@ -282,6 +284,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
             description: None,
             goal: None,
             autostart: false,
+            no_design_task: false,
         },
     )
     .await?;

@@ -524,6 +524,13 @@ struct ProjectCreateArgs {
 
     #[arg(long)]
     goal: Option<String>,
+
+    /// Skip the auto-generated `kind=design` seed task. Pass this for
+    /// non-design-shaped projects (postmortems, checklists, milestone
+    /// aggregators) where the seed task would be dead weight.
+    /// Defaults to false (preserves existing behaviour).
+    #[arg(long = "no-design-task", default_value_t = false)]
+    no_design_task: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1401,7 +1408,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "If the work fits an existing project, create a task in that project.",
             "If it does not fit an existing project and is small and self-contained, create a chore.",
             "If it does not fit an existing project and is broad, ambiguous, investigative, or multi-stage, create a project.",
-            "`boss project create` auto-spawns a `kind=design` seed task under the new project (surfaced as `design_task` in the --json response). Do NOT follow up by filing a parallel \"Design\" task; populate the brief by running `boss task update <design_task.id> --description ...` on the seed task. Use `--no-autostart` on `project create` if you want to author the brief before the engine dispatches a worker against the seed task.",
+            "`boss project create` auto-spawns a `kind=design` seed task under the new project (surfaced as `design_task` in the --json response). Do NOT follow up by filing a parallel \"Design\" task; populate the brief by running `boss task update <design_task.id> --description ...` on the seed task. Use `--no-autostart` on `project create` if you want to author the brief before the engine dispatches a worker against the seed task. Use `--no-design-task` for non-design-shaped projects (postmortems, checklists, milestone aggregators) where no seed task is needed; the project is filed with zero child tasks.",
         ],
         commands,
     })
@@ -1643,6 +1650,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                     // design task so a single mental model covers
                     // every work-item kind.
                     autostart: !ctx.no_autostart,
+                    no_design_task: args.no_design_task,
                 },
             )
             .await?;

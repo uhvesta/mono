@@ -716,6 +716,13 @@ pub struct CreateProjectInput {
     /// applied at the moment the design task is born.
     #[serde(default = "default_true")]
     pub autostart: bool,
+    /// When `true`, skip creation of the auto-generated `kind=design`
+    /// seed task entirely. The project is filed alone with zero child
+    /// tasks. Useful for non-design-shaped projects (postmortems,
+    /// milestone aggregators, checklists) where the seed task is dead
+    /// weight. Defaults to `false` to preserve existing behaviour.
+    #[serde(default)]
+    pub no_design_task: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

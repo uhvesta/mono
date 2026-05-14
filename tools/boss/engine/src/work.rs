@@ -199,15 +199,21 @@ impl WorkDb {
             params![id, input.product_id, input.name, slug, description, goal, now, short_id],
         )?;
 
-        // Auto-create the project's design task. The design phase is
-        // a unit of work just like any other task on the project, so
-        // we represent it as one — the kanban renders it through the
-        // existing task pipeline (drag/drop, popover, runtime dot,
-        // PR-on-merge round-trip). It sorts first via `ordinal = 0`
-        // so the dispatcher picks it up before the project's own
-        // tasks (which start at `ordinal = 1` per the
-        // task-creation default).
-        insert_design_task_for_project_in_tx(&tx, &input.product_id, &id, &input.name, input.autostart)?;
+        // Auto-create the project's design task unless the caller
+        // opted out with `no_design_task`. For design-shaped projects
+        // the task sorts first (ordinal = 0) so the dispatcher picks
+        // it up before the project's own tasks (ordinal ≥ 1).
+        // Non-design-shaped projects (postmortems, checklists, etc.)
+        // pass `no_design_task = true` and land here with zero tasks.
+        if !input.no_design_task {
+            insert_design_task_for_project_in_tx(
+                &tx,
+                &input.product_id,
+                &id,
+                &input.name,
+                input.autostart,
+            )?;
+        }
 
         let project = query_project(&tx, &id)?
             .with_context(|| format!("missing project after insert: {id}"))?;
@@ -7538,6 +7544,7 @@ mod tests {
                 description: None,
                 goal: Some("goal".to_owned()),
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         let task = db
@@ -7605,6 +7612,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
 
@@ -7667,6 +7675,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
 
@@ -8027,6 +8036,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         let first = db
@@ -8092,6 +8102,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         let task = db
@@ -8257,6 +8268,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         let first_task = db
@@ -8356,6 +8368,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         let first_task = db
@@ -8435,6 +8448,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         let task = db
@@ -10358,6 +10372,7 @@ mod tests {
                 description: None,
                 goal: Some("expose every dispatch event".to_owned()),
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
 
@@ -10420,6 +10435,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
 
@@ -10437,6 +10453,48 @@ mod tests {
         assert!(
             executions.is_empty(),
             "no_autostart design task must NOT spawn an execution, found: {executions:?}",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `--no-design-task` creates the project with zero child tasks —
+    /// the seed task is not inserted at all. Reconcile should find
+    /// nothing to dispatch.
+    #[test]
+    fn create_project_no_design_task_creates_project_alone() {
+        let path = temp_db_path("project-no-design-task");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Incident 001 postmortem".to_owned(),
+                description: None,
+                goal: None,
+                autostart: true,
+                no_design_task: true,
+            })
+            .unwrap();
+
+        let tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        assert!(
+            tasks.is_empty(),
+            "no_design_task project must have zero child tasks, found: {tasks:?}",
+        );
+
+        db.reconcile_product_executions(&product.id).unwrap();
+        let executions = db.list_executions(Some(&project.id)).unwrap();
+        assert!(
+            executions.is_empty(),
+            "no_design_task project must spawn no executions, found: {executions:?}",
         );
 
         let _ = std::fs::remove_file(path);
@@ -10468,6 +10526,7 @@ mod tests {
                     description: None,
                     goal: None,
                     autostart: true,
+                    no_design_task: false,
                 })
                 .unwrap();
             // Hard-delete the auto-created design task so the
@@ -12223,6 +12282,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
         let project_tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
@@ -13356,6 +13416,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
         (product, project)
@@ -13774,6 +13835,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: true,
+                no_design_task: false,
             })
             .unwrap();
 
@@ -14299,6 +14361,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
         // When the product has no repo, `create_task` now rejects a
@@ -14874,6 +14937,7 @@ mod tests {
             description: None,
             goal: None,
             autostart: false,
+            no_design_task: false,
         }).unwrap();
 
         // Seed 3 chores that mirror the product's repo (the legacy bug).
@@ -15273,6 +15337,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
 
@@ -15373,6 +15438,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
         // Project gets short_id = 1; its auto-spawned design task gets 2.
@@ -15505,6 +15571,7 @@ mod tests {
                 description: None,
                 goal: None,
                 autostart: false,
+                no_design_task: false,
             })
             .unwrap();
 
