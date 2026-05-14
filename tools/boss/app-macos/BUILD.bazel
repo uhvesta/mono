@@ -17,6 +17,11 @@ swift_library(
     # through SwiftPM. The Workers mode in ContentView is gated on
     # `canImport(GhosttyKit)` and shows a placeholder under Bazel.
     srcs = glob(["Sources/*.swift"]),
+    copts = [
+        # Mirror the swiftSettings define in Package.swift so @inlinable
+        # Textual APIs (e.g. .textual.textSelection) expand correctly here.
+        "-DTEXTUAL_ENABLE_TEXT_SELECTION",
+    ],
     deps = [
         "@swiftpkg_textual//:Textual",
     ],

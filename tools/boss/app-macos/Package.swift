@@ -25,6 +25,12 @@ let package = Package(
             resources: [
                 .copy("Resources/TrekIcons"),
             ],
+            swiftSettings: [
+                // Required so @inlinable code in the Textual library (e.g.
+                // .textual.textSelection) expands to the real implementation
+                // rather than the no-op #else branch.
+                .define("TEXTUAL_ENABLE_TEXT_SELECTION"),
+            ],
             linkerSettings: [
                 .linkedFramework("Carbon"),
                 .linkedLibrary("c++"),
