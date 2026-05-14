@@ -50,6 +50,7 @@ use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
+use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, WorkDb};
 
 /// Review-gating state of a PR at probe time. Derived from
@@ -88,6 +89,48 @@ impl PrReviewState {
             _ => &[],
         }
     }
+}
+
+crate::register_counter!(
+    MERGED,
+    "merge_poller.merged",
+    "PRs transitioned to merged in one sweep."
+);
+crate::register_counter!(
+    CONFLICT_FLAGGED,
+    "merge_poller.conflict_flagged",
+    "PRs flipped to blocked:merge_conflict in one sweep."
+);
+crate::register_counter!(
+    CONFLICT_CLEARED,
+    "merge_poller.conflict_cleared",
+    "PRs cleared from blocked:merge_conflict in one sweep."
+);
+crate::register_counter!(
+    PR_RECHECK_RECOVERED,
+    "merge_poller.pr_recheck_recovered",
+    "Missed PR-open transitions recovered by recheck in one sweep."
+);
+crate::register_counter!(
+    CONFLICT_REDISPATCHED,
+    "merge_poller.conflict_redispatched",
+    "Stranded conflict-resolution attempts re-dispatched in one sweep."
+);
+crate::register_counter!(
+    PR_RECHECK_UNRESOLVED,
+    "merge_poller.pr_recheck_unresolved",
+    "PR-detection rechecks that still found no bindable PR in one sweep."
+);
+
+/// Register all merge-poller counter handles with `registry`. Called
+/// from [`crate::metrics::init_all`] at engine startup.
+pub fn init(registry: &Registry) {
+    registry.register_counter(&MERGED);
+    registry.register_counter(&CONFLICT_FLAGGED);
+    registry.register_counter(&CONFLICT_CLEARED);
+    registry.register_counter(&PR_RECHECK_RECOVERED);
+    registry.register_counter(&CONFLICT_REDISPATCHED);
+    registry.register_counter(&PR_RECHECK_UNRESOLVED);
 }
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -1220,6 +1263,7 @@ pub fn spawn_loop(
     cube_client: Arc<dyn CubeClient>,
     completion_handler: Arc<WorkerCompletionHandler>,
     interval: Duration,
+    metrics: Arc<Registry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1231,6 +1275,12 @@ pub fn spawn_loop(
                 Some(completion_handler.as_ref()),
             )
             .await;
+            MERGED.inc_by(&metrics, outcome.merged as u64);
+            CONFLICT_FLAGGED.inc_by(&metrics, outcome.conflict_flagged as u64);
+            CONFLICT_CLEARED.inc_by(&metrics, outcome.conflict_cleared as u64);
+            PR_RECHECK_RECOVERED.inc_by(&metrics, outcome.pr_recheck_recovered as u64);
+            CONFLICT_REDISPATCHED.inc_by(&metrics, outcome.conflict_redispatched as u64);
+            PR_RECHECK_UNRESOLVED.inc_by(&metrics, outcome.pr_recheck_unresolved as u64);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,

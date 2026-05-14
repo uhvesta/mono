@@ -2123,6 +2123,7 @@ pub async fn serve(
         server_state.cube_client.clone(),
         server_state.completion_handler.clone(),
         Duration::from_secs(60),
+        server_state.metrics.clone(),
     );
 
     // Periodic orphan-active reconciler: re-dispatches `active` work

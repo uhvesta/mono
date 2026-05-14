@@ -42,4 +42,6 @@ pub use registry::{CounterHandle, GaugeHandle, Registry};
 pub fn init_all(registry: &Registry) {
     // Phase 4: DispatcherStats counters migrated to the framework.
     crate::live_status_loop::register_metrics(registry);
+    // Phase 5: SweepOutcome / merge_poller counters.
+    crate::merge_poller::init(registry);
 }
