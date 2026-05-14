@@ -135,10 +135,6 @@ struct ContentView: View {
                 }
             }
 
-            ToolbarItem(placement: .principal) {
-                BossTitleView(model: model)
-            }
-
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.navigationMode == .work {
                     WorkProjectFilterToolbarButton(model: model)
@@ -842,15 +838,6 @@ private struct WorkSidebarFilterRow: View {
     }
 }
 
-private struct BossTitleView: View {
-    @ObservedObject var model: ChatViewModel
-
-    var body: some View {
-        Text(model.selectedProduct?.name ?? "Boss")
-            .font(.headline)
-    }
-}
-
 private struct WorkProjectFilterToolbarButton: View {
     @ObservedObject var model: ChatViewModel
     @State private var isShowingPopover = false
@@ -951,6 +938,11 @@ private struct NativeSearchField: NSViewRepresentable {
         if nsView.stringValue != text {
             nsView.stringValue = text
         }
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSSearchField, context: Context) -> CGSize? {
+        let intrinsic = nsView.intrinsicContentSize
+        return CGSize(width: proposal.width ?? intrinsic.width, height: intrinsic.height)
     }
 
     func makeCoordinator() -> Coordinator {
