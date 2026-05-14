@@ -7193,7 +7193,7 @@ mod tests {
         });
 
         // Queue the probe and call dispatch_probe_if_idle directly.
-        server_state.queue_probe(run.id.clone(), "coordinator nudge".into());
+        server_state.queue_probe(run.id.clone(), "coordinator nudge".into(), false);
         dispatch_probe_if_idle(&server_state, &run.id).await;
 
         // The app_responder task must have seen the SendToPane by now.
@@ -7274,7 +7274,7 @@ mod tests {
 
         // Queue a probe manually (simulating what the completion handler does)
         // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.
-        server_state.queue_probe(run.id.clone(), "push your PR".into());
+        server_state.queue_probe(run.id.clone(), "push your PR".into(), false);
 
         // Register a fake app session to capture the SendToPane.
         let app_sink = make_session_sink();
