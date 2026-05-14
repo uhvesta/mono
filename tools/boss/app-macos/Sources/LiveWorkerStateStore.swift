@@ -12,6 +12,15 @@ final class LiveWorkerStateStore: ObservableObject {
     @Published private(set) var byRunID: [String: WorkerLiveState] = [:]
     @Published private(set) var bySlot: [Int: WorkerLiveState] = [:]
 
+    /// Count of workers in an actively-doing-work state: `spawning` or
+    /// `working`. Used by the quit-confirmation guard to decide whether
+    /// to warn before exiting. Does not include `waitingForInput` or
+    /// error/terminal states — those are not "work in flight" for the
+    /// purposes of the dialog.
+    var activeAgentCount: Int {
+        bySlot.values.filter { $0.activity == .spawning || $0.activity == .working }.count
+    }
+
     /// Replace the snapshot with `states`. Skips the publish when the
     /// new snapshot is value-equal to the previous one — a hook event
     /// that nudged `lastEventAt` but left every per-slot field

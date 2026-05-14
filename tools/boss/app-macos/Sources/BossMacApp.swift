@@ -9,6 +9,9 @@ struct BossMacApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .task {
+                    appDelegate.liveWorkerStates = chatModel.liveWorkerStates
+                }
         }
         .environmentObject(chatModel)
         .windowToolbarStyle(.unified(showsTitle: false))
@@ -81,6 +84,11 @@ private struct EngineCommand: View {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Set by BossMacApp once the main window has appeared. Nil only in the
+    /// brief window between launch and first-render — treated as "no agents
+    /// working" so a very-early Cmd-Q is never held hostage.
+    var liveWorkerStates: LiveWorkerStateStore?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // When launched outside a regular .app bundle (e.g. `swift run`
         // for local dev), macOS does not auto-promote the process to a
@@ -90,6 +98,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // bringing back the manual NSWindow setup #417 removed.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let count = liveWorkerStates?.activeAgentCount ?? 0
+        guard count > 0 else { return .terminateNow }
+
+        let alert = NSAlert()
+        alert.messageText = "Quit Boss?"
+        let agentWord = count == 1 ? "agent is" : "agents are"
+        alert.informativeText =
+            "\(count) \(agentWord) currently working. Quitting will terminate them and discard any unsaved progress."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Quit Anyway")
+        alert.alertStyle = .warning
+
+        // Make Cancel (index 0) the default so a stray Cmd-Q doesn't
+        // accidentally confirm through the dialog.
+        alert.buttons[0].keyEquivalent = "\r"
+        alert.buttons[1].keyEquivalent = ""
+        alert.buttons[1].hasDestructiveAction = true
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            // Cancel — stay running.
+            return .terminateCancel
+        }
+        // Quit Anyway
+        return .terminateNow
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
