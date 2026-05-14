@@ -130,10 +130,111 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         )
     }
 
+    /// SameProduct + leased workspace with a `designRendererOpener`
+    /// wired (the production wiring `ContentView` installs) routes
+    /// the click to the in-app renderer window — chore #12 of
+    /// `project-design-doc-pointer.md`. The legacy `urlOpener` path
+    /// is bypassed so the OS-registered `.md` handler doesn't also
+    /// fire. The stub captures the payload so the test asserts (a)
+    /// the renderer was chosen, (b) the file path is composed from
+    /// `workspacePath + resolved.path`, and (c) the web URL is
+    /// threaded through for the "Open on GitHub" affordance.
+    func testOpenOnResolvedSameProductWithRendererOpensInRendererWindow() {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+        let workspacePath = "/Users/me/Documents/dev/workspaces/mono-agent-007"
+        var renderedContents: [DesignRendererContent] = []
+        model.designRendererOpener = { renderedContents.append($0) }
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "tools/boss/docs/designs/x.md",
+                kind: .sameProduct(productID: project.productID)
+            ),
+            workspacePath: workspacePath,
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+        )
+        model.openProjectDesignDoc(project)
+        XCTAssertNil(model.workErrorMessage)
+        XCTAssertEqual(renderedContents.count, 1)
+        let content = renderedContents.first!
+        XCTAssertEqual(
+            content.filePath,
+            "\(workspacePath)/tools/boss/docs/designs/x.md"
+        )
+        XCTAssertEqual(
+            content.webURL,
+            "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+        )
+        XCTAssertEqual(content.repoLabel, "foo/bar")
+        XCTAssertEqual(content.title, project.name)
+        XCTAssertEqual(content.projectID, project.id)
+    }
+
+    /// OtherProduct + leased workspace also flows through the renderer
+    /// — Q3's dispatch table treats SameProduct/OtherProduct
+    /// identically once a workspace is available, and chore #12's
+    /// "doc renders identically in both surfaces" acceptance means
+    /// the OtherProduct surface picks the same view.
+    func testOpenOnResolvedOtherProductWithRendererOpensInRendererWindow() {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+        let workspacePath = "/Users/me/Documents/dev/workspaces/wiki-agent-001"
+        var renderedContents: [DesignRendererContent] = []
+        model.designRendererOpener = { renderedContents.append($0) }
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "git@github.com:myorg/wiki.git",
+                branch: "main",
+                path: "designs/x.md",
+                kind: .otherProduct(productID: "prod_wiki")
+            ),
+            workspacePath: workspacePath,
+            webURL: "https://github.com/myorg/wiki/blob/main/designs/x.md"
+        )
+        model.openProjectDesignDoc(project)
+        XCTAssertEqual(renderedContents.count, 1)
+        let content = renderedContents.first!
+        XCTAssertEqual(content.filePath, "\(workspacePath)/designs/x.md")
+        XCTAssertEqual(content.repoLabel, "myorg/wiki")
+    }
+
+    /// External pointers must skip the renderer regardless of whether
+    /// an opener is wired — the renderer reads the file from disk and
+    /// there is no leased workspace for external repos. The
+    /// dispatcher hands the click to the web URL via `urlOpener`
+    /// (asserted in [[testOpenOnResolvedExternalAlwaysFallsBackToWebURL]]);
+    /// here we additionally assert the renderer opener is NOT called.
+    func testOpenOnResolvedExternalSkipsRenderer() {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+        var renderedContents: [DesignRendererContent] = []
+        model.designRendererOpener = { renderedContents.append($0) }
+        var openedURLs: [URL] = []
+        model.urlOpener = { openedURLs.append($0) }
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "x.md",
+                kind: .external
+            ),
+            workspacePath: nil,
+            webURL: "https://github.com/foo/bar/blob/main/x.md"
+        )
+        model.openProjectDesignDoc(project)
+        XCTAssertTrue(renderedContents.isEmpty)
+        XCTAssertEqual(openedURLs.count, 1)
+    }
+
     /// Other-product pointers with a leased workspace get the same
     /// fast path as same-product pointers — cube has the repo, the
     /// renderer / `$EDITOR` can read it directly. Design Q3's table
     /// row `OtherProduct + workspace available` mirrors `SameProduct`.
+    /// This test exercises the legacy `urlOpener` fallback path (no
+    /// renderer opener installed); the renderer-opener path is
+    /// covered by [[testOpenOnResolvedOtherProductWithRendererOpensInRendererWindow]].
     func testOpenOnResolvedOtherProductWithWorkspaceOpensLocalFile() {
         let model = makeModelWithProject()
         let project = model.projectsByProductID.values.first!.first!
@@ -316,6 +417,49 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             XCTFail("expected a Chores section"); return
         }
         XCTAssertNil(chores.projectID)
+    }
+
+    // MARK: - DesignRendererContent.from
+
+    /// External resolved kinds carry no workspace path the renderer
+    /// can read from, so the factory refuses to build content for
+    /// them. The dispatcher in [[ChatViewModel.openProjectDesignDoc(_:)]]
+    /// already short-circuits this case via the eligibility predicate,
+    /// but the factory has to hold the line itself so a misuse can't
+    /// hand a `.external` kind to the renderer window.
+    func testDesignRendererContentRefusesExternalKind() {
+        let content = DesignRendererContent.from(
+            projectID: "proj",
+            projectName: "Some Project",
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "x.md",
+                kind: .external
+            ),
+            workspacePath: "/tmp/ignored",
+            webURL: "https://github.com/foo/bar/blob/main/x.md"
+        )
+        XCTAssertNil(content)
+    }
+
+    /// Empty project names fall back to the doc path so the window
+    /// title is never blank — re-clicking a renderer window relies on
+    /// the title for disambiguation in the macOS Window menu.
+    func testDesignRendererContentFallsBackToPathWhenProjectNameEmpty() {
+        let content = DesignRendererContent.from(
+            projectID: "proj",
+            projectName: "",
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "https://github.com/foo/bar.git",
+                branch: "main",
+                path: "tools/boss/docs/designs/x.md",
+                kind: .sameProduct(productID: "prod_1")
+            ),
+            workspacePath: "/ws",
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md"
+        )
+        XCTAssertEqual(content?.title, "tools/boss/docs/designs/x.md")
     }
 
     // MARK: - Fixture

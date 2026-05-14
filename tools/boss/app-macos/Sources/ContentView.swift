@@ -17,6 +17,7 @@ struct ContentView: View {
     @StateObject private var bossPane = BossPaneModel()
     #endif
     @State private var isSearchExpanded: Bool = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
@@ -78,6 +79,15 @@ struct ContentView: View {
         #endif
         .frame(minWidth: 860, minHeight: 560)
         .task {
+            // Hand the SwiftUI `openWindow` action to the view model
+            // so its design-doc dispatch can open the in-app renderer
+            // window. The view model can't reach `@Environment` from
+            // its own scope; injecting via a closure is how all the
+            // other view-model boundaries (pane allocator above,
+            // urlOpener) cross the same line.
+            model.designRendererOpener = { [openWindow] content in
+                openWindow(id: "design-renderer", value: content)
+            }
             model.startIfNeeded()
         }
         .toolbar {

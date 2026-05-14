@@ -31,6 +31,19 @@ struct BossMacApp: App {
         }
         .defaultSize(width: 760, height: 640)
 
+        // In-app renderer for a project's design-doc pointer. Wired to
+        // the kanban project-card affordance via
+        // [[ChatViewModel.designRendererOpener]] so SameProduct /
+        // OtherProduct + workspace-available pointers render in this
+        // window instead of dispatching to the OS-registered `.md`
+        // handler — chore #12 of `project-design-doc-pointer.md`.
+        WindowGroup("Design Doc", id: "design-renderer", for: DesignRendererContent.self) { $content in
+            if let content {
+                DesignRendererView(content: content)
+            }
+        }
+        .defaultSize(width: 880, height: 700)
+
         Window("Dispatch Events", id: "dispatch-events") {
             DispatchEventsViewer()
         }

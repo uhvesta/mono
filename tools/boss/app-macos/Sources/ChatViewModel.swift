@@ -143,6 +143,20 @@ final class ChatViewModel: ObservableObject {
         #endif
     }
 
+    /// Indirection for opening the in-app `DesignRendererView` window.
+    /// Installed by [[ContentView]] using `@Environment(\.openWindow)`
+    /// — the view model can't reach the SwiftUI environment directly,
+    /// so the closure crosses the boundary. `nil` (the default for
+    /// tests and headless contexts) falls the dispatcher back to the
+    /// legacy `urlOpener(fileURL)` path that hands the file to the
+    /// OS-registered `.md` handler.
+    ///
+    /// Wiring this closure is what swaps the project-card click
+    /// affordance from `$EDITOR` to the in-app Textual renderer —
+    /// chore #12 of [[project-design-doc-pointer.md]] and Q9's
+    /// renderer-reuse acceptance.
+    var designRendererOpener: ((DesignRendererContent) -> Void)?
+
     /// Toggle the live-status summarizer for `slotId`. Sends the
     /// RPC and optimistically updates local state; the engine echo
     /// brings the two back in sync.
@@ -800,16 +814,18 @@ final class ChatViewModel: ObservableObject {
     ///
     /// - `.notSet` — affordance shouldn't have been clickable. No-op.
     /// - `.broken` — surface the engine's reason as a work error so
-    ///   the user can re-point. The renderer / re-point sheet are
-    ///   tracked separately (design Q5 / Q9).
+    ///   the user can re-point. The re-point sheet is tracked
+    ///   separately (design Q5).
     /// - `.resolved` — same/other-product pointers with a leased cube
-    ///   workspace open the file directly on disk (the design's
-    ///   `$EDITOR` fast path, routed through `NSWorkspace` so the
-    ///   user's registered `.md` handler wins — `Q9` reuse of the
-    ///   in-app renderer is a follow-up once `design-producing-tasks`
-    ///   ships its renderer). Everything else — external pointers, or
-    ///   same/other-product pointers without a leased workspace —
-    ///   falls through to the GitHub web URL.
+    ///   workspace render in the in-app [[DesignRendererView]] when
+    ///   [[designRendererOpener]] is wired (the production app does
+    ///   this in `ContentView`). With no renderer opener installed —
+    ///   tests, or a future headless surface — the dispatcher falls
+    ///   back to handing the file URL to [[urlOpener]] so the
+    ///   OS-registered `.md` handler still opens the doc. Everything
+    ///   else (external pointers, or same/other-product pointers
+    ///   without a leased workspace) falls through to the GitHub web
+    ///   URL via `urlOpener`.
     func openProjectDesignDoc(_ project: WorkProject) {
         let state = designDocStateByProjectID[project.id] ?? .notSet
         switch state {
@@ -819,6 +835,17 @@ final class ChatViewModel: ObservableObject {
             workErrorMessage = "Design doc pointer is broken: \(reason)"
         case .resolved(let resolved, let workspacePath, let webURL):
             if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind) {
+                if let opener = designRendererOpener,
+                   let content = DesignRendererContent.from(
+                       projectID: project.id,
+                       projectName: project.name,
+                       resolved: resolved,
+                       workspacePath: workspacePath,
+                       webURL: webURL
+                   ) {
+                    opener(content)
+                    return
+                }
                 let absolute = (workspacePath as NSString)
                     .appendingPathComponent(resolved.path)
                 urlOpener(URL(fileURLWithPath: absolute))
