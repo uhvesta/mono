@@ -79,112 +79,77 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
         "# Boss worker rules\n\
          \n\
          You are running inside a Boss-managed worker session. The engine\n\
-         spawned you in a leased cube workspace and is observing this\n\
-         session via claude hooks routed to its events socket.\n\
+         spawned you in a leased cube workspace and observes this session\n\
+         via claude hooks.\n\
          \n\
          ## Pull requests are the deliverable\n\
          \n\
-         **A task is not complete until a PR exists for it.** Local\n\
-         commits are NOT enough. Workers that stop with only local\n\
-         commits are treated as incomplete and the engine will probe\n\
-         you to push and open a PR before transitioning the work item\n\
-         to review.\n\
+         **A task is not complete until a PR exists.** Local commits are NOT enough.\n\
          \n\
          - Push your branch and open a PR with `gh pr create` once\n\
-           your branch has commits and tests pass.\n\
-         - **If a PR for this branch already exists** (e.g. you are\n\
-           resuming work via `--prefer`, or addressing review\n\
-           comments), push your new commits to update it; do NOT\n\
-           open a duplicate PR. Check first with\n\
+           commits exist and tests pass.\n\
+         - **If a PR already exists** (resuming or addressing review),\n\
+           push new commits to update it; do NOT open a duplicate. Check:\n\
            `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
-           or simply `gh pr view` from inside the workspace.\n\
-         - Do not hard-wrap PR bodies — GitHub renders single newlines\n\
-           inside paragraphs as visible breaks.\n\
-         - Before ending the run, print the PR URL on its own line as\n\
-           the final thing in your final response so the engine can\n\
-           pick it up automatically.\n\
-         - Before pushing, verify your changes are real with\n\
-           `jj diff -r @`. If the diff is empty, you have made no\n\
-           changes — do NOT commit, push, or open a PR. Stop and\n\
-           explain what went wrong instead.\n\
+           or `gh pr view`.\n\
+         - Do not hard-wrap PR bodies.\n\
+         - Print the PR URL on its own line as the last thing in your final response.\n\
+         - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
+           do NOT commit, push, or open a PR — stop and explain.\n\
          \n\
          ## Your workspace\n\
          \n\
          - Workspace path: `{workspace}`\n\
          - Cube lease id: `{lease}`\n\
          \n\
-         The lease is held for the lifetime of this run. Do not lease,\n\
-         release, or otherwise mutate cube state — the engine owns lease\n\
-         lifecycle.\n\
+         Lease held for the lifetime of this run. Do not lease, release,\n\
+         or mutate cube state.\n\
          \n\
          ## VCS\n\
          \n\
-         Use `jj` for all VCS operations. Do not invoke `git` directly\n\
-         except via `gh` for GitHub operations.\n\
+         Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.\n\
          \n\
-         - `jj git fetch` to sync with origin.\n\
-         - `jj new main` for a fresh task; `jj edit <bookmark>` to resume.\n\
-         - `jj describe -m '...'` to set commit messages; `jj git push\n\
-           -b <bookmark>` to publish.\n\
-         - Never run `jj git push --deleted` or `git push --delete`\n\
+         - `jj git fetch` to sync; `jj new main` for a fresh task;\n\
+           `jj edit <bookmark>` to resume.\n\
+         - `jj describe -m '...'` to set commit messages;\n\
+           `jj git push -b <bookmark>` to publish.\n\
+         - Never `jj git push --deleted` or `git push --delete`\n\
            without explicit user approval.\n\
-         - `.claude/` is gitignored by the engine on every spawn. Do\n\
-           not force-track or commit anything inside it (no\n\
-           `--force`, no `jj file track .claude/...`) — those files\n\
-           are per-worker plumbing, not part of the project.\n\
+         - `.claude/` is gitignored by the engine. Do not force-track\n\
+           or commit anything inside it (no `--force`,\n\
+           no `jj file track .claude/...`).\n\
          \n\
          ### Commit messages must be inline\n\
          \n\
-         Never invoke `git commit`, `git rebase`, `jj commit`, or\n\
-         `jj describe` without an explicit `-m \"…\"` message. The same\n\
-         rule applies to amend and squash flows (`git commit --amend`,\n\
-         `jj squash`, `jj split`): pass `-m` inline. The worker\n\
-         environment intentionally has no usable `$EDITOR`, so any\n\
-         command that falls through to one will fail fast — fix it by\n\
-         re-running with `-m`, not by changing the editor.\n\
+         Always pass `-m \"…\"` to `git commit`, `git rebase`, `jj commit`,\n\
+         `jj describe`, and amend/squash flows (`git commit --amend`,\n\
+         `jj squash`, `jj split`). The worker environment has no usable\n\
+         `$EDITOR` — commands that fall through to one fail. Fix by\n\
+         re-running with `-m`.\n\
          \n\
          ## Creating a PR from a jj workspace\n\
          \n\
-         This workspace uses jj, not plain git. There is **no `.git/` at the\n\
-         workspace root** — the backing git store lives at `.jj/repo/store/git`.\n\
-         Raw `gh` invocations that rely on git-directory discovery will fail\n\
-         with `fatal: not a git repository` unless you point them at it.\n\
+         There is no `.git/` at the workspace root — the backing git store\n\
+         lives at `.jj/repo/store/git`. Bare `gh` calls fail with\n\
+         `fatal: not a git repository`.\n\
          \n\
          **Rule: prefix every `gh` call with `GIT_DIR=.jj/repo/store/git`.**\n\
-         This applies to `gh pr create`, `gh pr view`, `gh pr checks`,\n\
-         `gh pr list`, `gh api`, and any other `gh` verb that touches git\n\
-         state. Exporting it once at the top of a sequence of commands is fine.\n\
-         \n\
          **Rule: pass `--head <bookmark> --base main` to `gh pr create`.**\n\
-         `gh` cannot infer HEAD from a jj checkout, so the bookmark name must\n\
-         be given explicitly. Same for any `gh` verb that needs HEAD context.\n\
-         \n\
-         **Rule: `jj git push -b <bookmark>` requires `--allow-new` the first\n\
-         time the bookmark is pushed.** Subsequent pushes of the same bookmark\n\
-         do not need the flag.\n\
+         **Rule: `jj git push -b <bookmark>` requires `--allow-new` the first time.**\n\
          \n\
          ### Canonical PR creation recipe\n\
          \n\
-         Copy-paste this block; substitute `my-feature` with your bookmark name:\n\
-         \n\
          ```sh\n\
-         # Describe the commit (inline -m is required — no editor)\n\
          jj describe -m \"your commit message\"\n\
-         \n\
-         # Create a named bookmark pointing at the current commit\n\
          jj bookmark create my-feature -r @\n\
-         \n\
-         # Push — first push of a new bookmark requires --allow-new\n\
          GIT_DIR=.jj/repo/store/git jj git push -b my-feature --allow-new\n\
-         \n\
-         # Open the PR\n\
          GIT_DIR=.jj/repo/store/git gh pr create \\\\\n\
            --head my-feature --base main \\\\\n\
            --title \"Your PR title\" \\\\\n\
            --body \"PR description\"\n\
          ```\n\
          \n\
-         To update an existing PR after new commits:\n\
+         To update an existing PR:\n\
          \n\
          ```sh\n\
          jj git push -b my-feature   # no --allow-new needed\n\
@@ -193,24 +158,17 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          ## Boundaries\n\
          \n\
          - Do not modify files outside this workspace. Sibling workspaces\n\
-           under `~/Documents/dev/workspaces/` belong to other workers\n\
-           and concurrent edits will corrupt their state.\n\
-         - Do not modify cube's database, lease state, or workspace\n\
-           registry. The engine reconciles state on its own.\n\
-         - The Boss runtime state under `~/Library/Application Support/Boss/`\n\
-           (state.db, dispatch-events, engine-audit.log, the events\n\
-           socket, executions/, …) is the coordinator's territory.\n\
-           Workers must never read, write, or otherwise touch it —\n\
-           the engine enforces this via permission deny rules and\n\
-           audits every attempt. If you need work-taxonomy context,\n\
-           ask the coordinator to inject it; do not query the DB\n\
-           yourself. `bossctl` is similarly coordinator-only.\n\
+           under `~/Documents/dev/workspaces/` belong to other workers.\n\
+         - Do not modify cube's database, lease state, or workspace registry.\n\
+         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
+           Never read, write, or touch it. Ask the coordinator for\n\
+           work-taxonomy context; do not query the DB yourself.\n\
+           `bossctl` is coordinator-only.\n\
          \n\
          ## Coordinator\n\
          \n\
-         The engine's coordinator (`bossctl`) may probe this session\n\
-         between turns. Treat probes as you would a question from a\n\
-         human reviewer — short, specific answers.\n\
+         The coordinator may probe this session between turns. Treat probes\n\
+         as questions from a human reviewer — short, specific answers.\n\
          {draft_directive}"
     )
 }
