@@ -50,6 +50,7 @@ use tokio::process::Command;
 use boss_protocol::FrontendEvent;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
+use crate::design_detector;
 use crate::work::{WorkDb, WorkItem, WorkerPrCompletionTarget};
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -877,6 +878,39 @@ impl WorkerCompletionHandler {
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, publish_reason)
             .await;
+        // Auto-populate the project's design-doc pointer when the
+        // completed work item is a `kind=design` task with a project.
+        // Errors are logged inside the detector — they must not surface
+        // here because they'd mask the successful PR transition.
+        if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item {
+            if task.kind == "design" {
+                if let Some(ref project_id) = task.project_id {
+                    if merged {
+                        // Worker merged directly during its session; update
+                        // the branch to main (base_ref_name unknown here,
+                        // so the detector will fetch it from the PR).
+                        design_detector::on_design_pr_merged(
+                            &self.work_db,
+                            &task.id,
+                            &task.product_id,
+                            project_id,
+                            &pr_url,
+                            None,
+                        )
+                        .await;
+                    } else {
+                        design_detector::on_design_pr_detected(
+                            &self.work_db,
+                            &task.id,
+                            &task.product_id,
+                            project_id,
+                            &pr_url,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
         if merged {
             tracing::info!(
                 execution_id,

@@ -48,6 +48,7 @@ use crate::ci_watch;
 use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
+use crate::design_detector;
 use crate::work::{PendingMergeCheck, WorkDb};
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -828,7 +829,7 @@ async fn sweep_one(
     };
     match &probe_result.state {
         PrLifecycleState::Merged => {
-            if mark_merged(work_db, publisher, candidate).await {
+            if mark_merged(work_db, publisher, candidate, &probe_result).await {
                 outcome.merged += 1;
             }
         }
@@ -925,6 +926,7 @@ async fn mark_merged(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
 ) -> bool {
     let updated = match work_db.mark_chore_pr_merged(&candidate.work_item_id, &candidate.pr_url) {
         Ok(Some(task)) => task,
@@ -948,6 +950,21 @@ async fn mark_merged(
         pr_url = %candidate.pr_url,
         "merge poller: PR merged; work item moved to done",
     );
+    // Auto-populate the project's design-doc pointer on merge for
+    // `kind=design` tasks. Errors are logged inside the detector.
+    if updated.kind == "design" {
+        if let Some(ref project_id) = updated.project_id {
+            design_detector::on_design_pr_merged(
+                work_db,
+                &updated.id,
+                &candidate.product_id,
+                project_id,
+                &candidate.pr_url,
+                probe.base_ref_name.as_deref(),
+            )
+            .await;
+        }
+    }
     true
 }
 
