@@ -56,13 +56,15 @@ enum Command {
         #[command(subcommand)]
         action: AgentsAction,
     },
-    /// Inject a probe prompt into a worker. By default the probe is
-    /// queued and delivered on the worker's next Stop boundary. With
+    /// Inject a probe prompt into a worker. If the worker is currently
+    /// idle (between turns) the text lands immediately; if the worker is
+    /// active it is queued and delivered at the next Stop boundary. With
     /// `--urgent`, the probe is delivered at the next tool-call
-    /// boundary (PostToolUse) so the coordinator can redirect a
-    /// mid-task worker without waiting for it to finish its current
-    /// turn. The engine always waits for any in-flight tool call to
-    /// return before injecting, so no work is discarded.
+    /// boundary (PostToolUse) instead of the next Stop boundary, so
+    /// the coordinator can redirect a mid-task worker without waiting
+    /// for it to finish its current turn. The engine always waits for
+    /// any in-flight tool call to return before injecting, so no work
+    /// is discarded.
     Probe {
         /// Worker reference: run id, slot id, or crew name (e.g.
         /// `Riker`). Crew names resolve only over currently-live
