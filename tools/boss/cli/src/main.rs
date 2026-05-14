@@ -968,6 +968,15 @@ struct TaskUpdateArgs {
     /// `--autostart false` parks it in the backlog until you re-enable it.
     #[arg(long, value_name = "BOOL")]
     autostart: Option<bool>,
+
+    /// Set or clear the blocked reason on this item. Accepts any engine
+    /// reason value (`merge_conflict`, `ci_failure`, `ci_failure_exhausted`,
+    /// `dependency`, `review_feedback`) or an empty string to clear.
+    /// Pass `--blocked-reason ""` to wipe a stale reason the automated
+    /// sweepers left behind. This is the manual escape hatch; automated
+    /// clearing happens when the engine transitions a row away from `blocked`.
+    #[arg(long = "blocked-reason", value_name = "REASON", allow_hyphen_values = true)]
+    blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2139,11 +2148,14 @@ async fn run_update_leaf(
         effort_level,
         model_override,
         autostart: args.autostart,
+        // Preserve the empty-string "clear" wire form: `--blocked-reason ""`
+        // maps to NULL in the engine (clears the field).
+        blocked_reason: args.blocked_reason,
         ..WorkItemPatch::default()
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, or --autostart",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --autostart, or --blocked-reason",
     )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
@@ -3807,7 +3819,8 @@ fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Result<(), CliE
         || patch.effort_level.is_some()
         || patch.model_override.is_some()
         || patch.default_model.is_some()
-        || patch.autostart.is_some();
+        || patch.autostart.is_some()
+        || patch.blocked_reason.is_some();
 
     if has_fields {
         Ok(())

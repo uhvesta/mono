@@ -877,6 +877,12 @@ pub struct WorkItemPatch {
     /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostart: Option<bool>,
+    /// Set or clear the `blocked_reason` field. `None` → leave unchanged.
+    /// `Some("")` → clear (write NULL). Any non-empty string is stored verbatim
+    /// (e.g. `"merge_conflict"`, `"ci_failure"`). Manual escape hatch for
+    /// clearing stale reasons the automated sweepers missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
 }
 
 /// One row of the `work_item_dependencies` table — an edge from a
