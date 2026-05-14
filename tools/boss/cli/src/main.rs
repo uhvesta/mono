@@ -909,7 +909,8 @@ impl DependencyFilterArgs {
 #[derive(Debug, Clone, Args)]
 struct TaskIdArg {
     /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
-    /// (`42` or `#42`), or cross-product form (`boss/42` or `boss/#42`).
+    /// (`T441`, `t441`, `42`, or `#42`), or cross-product form
+    /// (`boss/42` or `boss/#42`).
     id: String,
     /// Resolve a friendly short id (`42` or `#42`) against this product
     /// (slug or id). Ignored when the selector already embeds a product
@@ -1391,7 +1392,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
             "Project selectors accept a project id, slug, short id (#42 or 42), or 1-based interactive index within the selected product. For agent use, prefer slug, short id, or primary id; avoid numeric indexes.",
-            "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `42` or `#42` within the context product, `boss/42` or `boss/#42` for a specific product. For agent use, prefer the short id form (#42) when talking to a human, and the primary id when calling other engine RPCs.",
+            "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `T441` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `P7` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
             "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
@@ -2172,7 +2173,8 @@ async fn run_update_leaf(
         &patch,
         "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --autostart, or --blocked-reason",
     )?;
-    let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
+    let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Updated {label}"), &item, None, false);
     })
@@ -2184,11 +2186,12 @@ async fn run_move_leaf(
     ctx: &RunContext,
     args: TaskMoveArgs,
 ) -> Result<(), CliError> {
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
     let patch = WorkItemPatch {
         status: Some(args.target.as_status().to_owned()),
         ..WorkItemPatch::default()
     };
-    let (item, label) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
+    let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Moved {label}"), &item, None, false);
     })
@@ -2203,17 +2206,18 @@ async fn run_delete_leaf(
     ctx: &RunContext,
     args: TaskDeleteArgs,
 ) -> Result<(), CliError> {
-    let label = match get_work_item(client, &args.id).await {
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
+    let label = match get_work_item(client, &resolved_id).await {
         Ok(item) => expect_leaf_work_item(item).map(|(_, l)| l).unwrap_or("item"),
         Err(_) => "item",
     };
-    delete_work_item(client, &args.id).await?;
+    delete_work_item(client, &resolved_id).await?;
     print_entity(
         ctx,
-        &serde_json::json!({ "id": args.id, "deleted": true }),
+        &serde_json::json!({ "id": resolved_id, "deleted": true }),
         || {
             if !ctx.quiet {
-                println!("Deleted {label} {}", args.id);
+                println!("Deleted {label} {resolved_id}");
             }
         },
     )
@@ -2853,7 +2857,8 @@ async fn run_bind_pr(
 ) -> Result<(), CliError> {
     let new_url = validate_github_pr_url(&args.pr_url)?;
 
-    let (existing, label) = expect_leaf_work_item(get_work_item(client, &args.id).await?)?;
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
+    let (existing, label) = expect_leaf_work_item(get_work_item(client, &resolved_id).await?)?;
     let prior_url = existing.pr_url.clone();
 
     match classify_bind_pr(prior_url.as_deref(), new_url) {
@@ -2886,7 +2891,7 @@ async fn run_bind_pr(
         pr_url: Some(new_url.to_owned()),
         ..WorkItemPatch::default()
     };
-    let (updated, _) = expect_leaf_work_item(update_work_item(client, &args.id, patch).await?)?;
+    let (updated, _) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
 
     let title = format!("Bound PR to {label}");
     print_entity(
@@ -3175,11 +3180,13 @@ async fn run_depend_command(
 ) -> Result<(), CliError> {
     match command {
         DependCommand::Add(args) => {
+            let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, None).await?;
+            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, None).await?;
             let edge = add_dependency(
                 client,
                 AddDependencyInput {
-                    dependent: args.dependent,
-                    prerequisite: args.prerequisite,
+                    dependent,
+                    prerequisite,
                     relation: Some(args.relation),
                 },
             )
@@ -3194,11 +3201,13 @@ async fn run_depend_command(
             })
         }
         DependCommand::Rm(args) => {
+            let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, None).await?;
+            let prerequisite = resolve_selector_to_primary_id(client, ctx, &args.prerequisite, None).await?;
             let removed = remove_dependency(
                 client,
                 RemoveDependencyInput {
-                    dependent: args.dependent.clone(),
-                    prerequisite: args.prerequisite.clone(),
+                    dependent: dependent.clone(),
+                    prerequisite: prerequisite.clone(),
                     relation: Some(args.relation.clone()),
                 },
             )
@@ -3206,8 +3215,8 @@ async fn run_depend_command(
             print_entity(
                 ctx,
                 &serde_json::json!({
-                    "dependent_id": args.dependent,
-                    "prerequisite_id": args.prerequisite,
+                    "dependent_id": dependent,
+                    "prerequisite_id": prerequisite,
                     "relation": args.relation,
                     "removed": removed,
                 }),
@@ -3216,12 +3225,12 @@ async fn run_depend_command(
                         if removed {
                             println!(
                                 "Removed dependency: {} → {}",
-                                args.dependent, args.prerequisite,
+                                dependent, prerequisite,
                             );
                         } else {
                             println!(
                                 "No dependency {} → {} (no-op)",
-                                args.dependent, args.prerequisite,
+                                dependent, prerequisite,
                             );
                         }
                     }
@@ -3229,10 +3238,11 @@ async fn run_depend_command(
             )
         }
         DependCommand::List(args) => {
+            let selector = resolve_selector_to_primary_id(client, ctx, &args.selector, None).await?;
             let view = list_dependencies(
                 client,
                 ListDependenciesInput {
-                    work_item: args.selector.clone(),
+                    work_item: selector,
                     direction: Some(args.direction.into()),
                 },
             )
@@ -3461,8 +3471,8 @@ fn is_typed_work_item_id(s: &str) -> bool {
 
 /// Parsed form of a task/chore/project selector.
 ///
-/// Priority order per design Q5:
-/// 1. `#42` or `42` → short id
+/// Priority order per design Q5 (extended with friendly-id prefix forms):
+/// 1. `#42` or `42` or `T441`/`t441`/`P7`/`p7` → short id
 /// 2. `boss/42` or `boss/#42` → cross-product short id
 /// 3. `task_…` / `proj_…` / `prod_…` → primary id (typed)
 /// 4. anything else → slug / existing resolution
@@ -3504,6 +3514,18 @@ fn parse_work_item_selector(s: &str) -> WorkItemSelector {
             }
         }
     }
+    // `T441` / `t441` / `P12` / `p12` — friendly kanban id (T for tasks/chores, P for projects).
+    // Case-insensitive; the leading letter is just visual sugar for the short_id number.
+    if s.len() >= 2 {
+        let first = s.as_bytes()[0];
+        if first == b'T' || first == b't' || first == b'P' || first == b'p' {
+            if let Ok(n) = s[1..].parse::<i64>() {
+                if n > 0 {
+                    return WorkItemSelector::ShortId(n);
+                }
+            }
+        }
+    }
     // Plain integer → short id (Q5 step 2: `#` is optional)
     if let Ok(n) = s.parse::<i64>() {
         if n > 0 {
@@ -3536,6 +3558,39 @@ async fn get_work_item_by_short_id_rpc(
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("work item fetch by short id", &other)),
+    }
+}
+
+fn work_item_primary_id(item: &WorkItem) -> &str {
+    match item {
+        WorkItem::Product(p) => &p.id,
+        WorkItem::Project(p) => &p.id,
+        WorkItem::Task(t) | WorkItem::Chore(t) => &t.id,
+    }
+}
+
+/// Resolve any selector form (friendly `T441`, `#42`, plain `42`,
+/// cross-product `boss/42`, or primary `task_…` id) to a primary engine
+/// id. If the selector is already a primary id or an opaque slug, it is
+/// returned unchanged so the engine can reject it with its own error.
+async fn resolve_selector_to_primary_id(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    id: &str,
+    product: Option<String>,
+) -> Result<String, CliError> {
+    match parse_work_item_selector(id) {
+        WorkItemSelector::ShortId(n) => {
+            let product = resolve_product(client, product, ctx).await?;
+            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            Ok(work_item_primary_id(&item).to_owned())
+        }
+        WorkItemSelector::ProductShortId { product_slug, n } => {
+            let product = resolve_product(client, Some(product_slug), ctx).await?;
+            let item = get_work_item_by_short_id_rpc(client, &product.id, n).await?;
+            Ok(work_item_primary_id(&item).to_owned())
+        }
+        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
     }
 }
 
@@ -5668,6 +5723,26 @@ mod tests {
         // chore_ is not used at the engine row level — chores share
         // the task_ prefix.
         assert!(!is_typed_work_item_id("chore_18ae0000_1"));
+    }
+
+    #[test]
+    fn friendly_tnnn_form_parses_as_short_id() {
+        use super::{WorkItemSelector, parse_work_item_selector};
+        // uppercase T
+        assert!(matches!(parse_work_item_selector("T441"), WorkItemSelector::ShortId(441)));
+        // lowercase t
+        assert!(matches!(parse_work_item_selector("t441"), WorkItemSelector::ShortId(441)));
+        // leading whitespace is trimmed
+        assert!(matches!(parse_work_item_selector("  T12  "), WorkItemSelector::ShortId(12)));
+        // P-form (projects)
+        assert!(matches!(parse_work_item_selector("P7"), WorkItemSelector::ShortId(7)));
+        assert!(matches!(parse_work_item_selector("p100"), WorkItemSelector::ShortId(100)));
+        // zero is rejected (short_ids are positive)
+        assert!(matches!(parse_work_item_selector("T0"), WorkItemSelector::Other(_)));
+        // non-digit suffix is NOT a short id — falls through to Other
+        assert!(matches!(parse_work_item_selector("Tabc"), WorkItemSelector::Other(_)));
+        // plain primary id is still PrimaryId, not confused with T-form
+        assert!(matches!(parse_work_item_selector("task_18ae0000_1"), WorkItemSelector::PrimaryId(_)));
     }
 
     /// `boss project show proj_…` accepts a globally-unique typed id
