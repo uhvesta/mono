@@ -7089,10 +7089,11 @@ mod tests {
         // worker-pid exclusion is the only thing keeping
         // `tail_run_transcript` from leaking one worker's transcript
         // into another worker's hands. The test process registers
-        // itself as a worker so the ancestor walk hits on step zero;
-        // app_pid is set to a clearly bogus value (1) so the trust
-        // subtree check fails first.
-        let server_state = server_state_with_app_pid(1);
+        // itself as a worker so the ancestor walk hits on step zero.
+        // app_pid is set to i32::MAX (an impossible PID on any platform)
+        // so the fast-path trust-subtree check definitely fails — PID 1
+        // (launchd/init) would NOT work because all processes descend from it.
+        let server_state = server_state_with_app_pid(i32::MAX);
         let self_pid = std::process::id() as libc::pid_t;
         server_state
             .worker_registry
@@ -7219,7 +7220,10 @@ mod tests {
             "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
         )
         .unwrap();
-        let run = server_state
+        // Create the work_runs row so transcript_path_for_execution(execution.id)
+        // can resolve the path. The run.id is not used for hook correlation — in
+        // production BOSS_RUN_ID carries execution.id (exec_*), not run.id (run_*).
+        server_state
             .work_db
             .create_run(crate::protocol::CreateRunInput {
                 execution_id: execution.id.clone(),
@@ -7234,9 +7238,10 @@ mod tests {
             })
             .unwrap();
 
-        // Map the run to slot 1 so dispatch_probe_on_stop has a target
-        // for `SendToPane`.
-        server_state.worker_registry.register_run_slot(run.id.clone(), 1);
+        // Map the execution (via its exec_* id) to slot 1 so dispatch_probe_on_stop
+        // has a target for `SendToPane`. In production BOSS_RUN_ID carries
+        // execution.id (exec_*), not run.id (run_*).
+        server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
 
         // Subscribe a session to the per-run probe topic and pin the
         // ServerState so probe pushes have somewhere to land.
@@ -7248,7 +7253,7 @@ mod tests {
             .await;
         server_state
             .topic_broker
-            .subscribe(&session_id, &[probe_topic(&run.id)])
+            .subscribe(&session_id, &[probe_topic(&execution.id)])
             .await;
 
         // Register a fake "app session" to receive the SendToPane that
@@ -7283,13 +7288,15 @@ mod tests {
 
         // Queue a probe and pull the minted probe_id back out of the
         // queue head so we can assert it threads through to ProbeReplied.
-        let probe_id = server_state.queue_probe(run.id.clone(), "what now?".into(), false);
+        // In production BOSS_RUN_ID is execution.id (exec_*), so probe
+        // operations use execution.id, not run.id.
+        let probe_id = server_state.queue_probe(execution.id.clone(), "what now?".into(), false);
 
         // Fire the first Stop boundary. This dispatches the probe to
         // the (fake) app session and records the in-flight entry.
         let first_stop = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(execution.id.clone()),
             transcript_path: None,
             event: WorkerEvent::Stop {
                 session_id: "claude-sess-1".into(),
@@ -7321,7 +7328,7 @@ mod tests {
         // the per-run probe topic.
         let second_stop = crate::events_socket::IncomingHookEvent {
             peer_pid: None,
-            run_id: Some(run.id.clone()),
+            run_id: Some(execution.id.clone()),
             transcript_path: None,
             event: WorkerEvent::Stop {
                 session_id: "claude-sess-1".into(),
@@ -7341,7 +7348,7 @@ mod tests {
                 probe_id: emitted_probe,
                 text,
             } => {
-                assert_eq!(emitted_run, run.id);
+                assert_eq!(emitted_run, execution.id);
                 assert_eq!(emitted_probe, probe_id);
                 assert_eq!(text, "the answer");
             }

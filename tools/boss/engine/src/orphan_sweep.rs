@@ -322,7 +322,9 @@ mod tests {
                 product_id: product_id.to_owned(),
                 name: "test chore".to_owned(),
                 description: None,
-                repo_remote_url: Some("https://github.com/test/repo".to_owned()),
+                // repo_remote_url omitted: product already has one; the invariant
+                // disallows setting both.
+                repo_remote_url: None,
                 priority: None,
                 effort_level: None,
                 model_override: None,
