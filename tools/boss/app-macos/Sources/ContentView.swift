@@ -1114,6 +1114,11 @@ private struct WorkBoardCardItem: View {
             ? model.dragRefusalNotice?.message
             : nil
         let repoChip = model.repoChip(for: task)
+        let designDocProject: WorkProject? = task.kind == "design"
+            ? task.projectID.flatMap { model.project(withID: $0) }
+            : nil
+        let designDocState: ProjectDesignDocState? = designDocProject
+            .map { model.designDocStateByProjectID[$0.id] ?? .notSet }
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -1132,7 +1137,9 @@ private struct WorkBoardCardItem: View {
                     gatingPrereqs: gatingPrereqs,
                     repoChip: repoChip,
                     showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL),
-                    isResolvingConflicts: isResolvingConflicts
+                    isResolvingConflicts: isResolvingConflicts,
+                    designDocState: designDocState,
+                    onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } }
                 )
             }
             .buttonStyle(.plain)
@@ -1262,6 +1269,14 @@ struct WorkBoardCardView: View {
     /// indicator instead so the user can tell at a glance what the
     /// active work is.
     var isResolvingConflicts: Bool = false
+    /// Resolved design-doc state for the parent project. Non-nil only
+    /// for `kind=design` tasks whose parent project has populated
+    /// `design_doc_*` columns. `nil` hides the affordance entirely.
+    var designDocState: ProjectDesignDocState? = nil
+    /// Invoked when the user taps the design-doc affordance. Only
+    /// called when `designDocState` is non-nil and produces a
+    /// non-nil `ProjectDesignDocAffordancePresentation`.
+    var onOpenDesignDoc: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1350,6 +1365,20 @@ struct WorkBoardCardView: View {
                         RepoChipView(presentation: repoChip)
                     }
                     Spacer()
+                    if task.kind == "design",
+                       let state = designDocState,
+                       let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+                        Button {
+                            onOpenDesignDoc?()
+                        } label: {
+                            Image(systemName: presentation.systemImage)
+                                .font(.caption)
+                                .foregroundStyle(presentation.tint)
+                                .accessibilityLabel(presentation.accessibilityLabel)
+                        }
+                        .buttonStyle(.plain)
+                        .help(presentation.tooltip)
+                    }
                 }
             }
 
