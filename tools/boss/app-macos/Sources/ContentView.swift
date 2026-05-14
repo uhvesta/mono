@@ -1037,7 +1037,7 @@ private struct WorkBoardCardItem: View {
             .buttonStyle(.plain)
             .contextMenu {
                 if let id = task.shortID {
-                    Button("Copy Friendly ID") {
+                    Button("Copy ID") {
                         let pb = NSPasteboard.general
                         pb.clearContents()
                         pb.setString("T\(id)", forType: .string)
