@@ -19,6 +19,10 @@ Optional environment variables:
   BOSS_ENGINE_STOP_ON_EXIT    Set 1 to stop engine when app exits.
   BOSS_SHOW_SYSTEM_MESSAGES   Set 1 to show internal system status lines in UI.
   BOSS_ENGINE_CMD
+  BOSS_CUBE_CMD       How the engine invokes cube. Defaults to 'cube' (PATH-resolved).
+                      On a dev machine without cube installed, set this to use the
+                      bazel-built cube instead:
+                        export BOSS_CUBE_CMD='bazel run //tools/cube:cube --'
   RUST_LOG
 EOF
 }
