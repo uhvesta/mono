@@ -1649,6 +1649,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
             resolved,
             workspace_path,
             web_url,
+            raw_content_url,
         } => {
             assert_eq!(resolved.repo_remote_url, "git@github.com:spinyfin/mono.git");
             assert_eq!(resolved.branch, "main");
@@ -1670,6 +1671,13 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
             assert!(
                 web_url.contains("tools/boss/docs/designs/pointer.md"),
                 "web_url should embed the resolved path: {web_url}",
+            );
+            // raw_content_url must be present for github.com repos.
+            assert!(
+                raw_content_url
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with("https://raw.githubusercontent.com/spinyfin/mono/")),
+                "raw_content_url should be a raw.githubusercontent.com URL: {raw_content_url:?}",
             );
         }
         other => panic!("expected Resolved, got {other:?}"),

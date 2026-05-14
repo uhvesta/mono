@@ -88,6 +88,9 @@ struct ContentView: View {
             model.designRendererOpener = { [openWindow] content in
                 openWindow(id: "design-renderer", value: content)
             }
+            model.markdownViewerOpener = { [openWindow] content in
+                openWindow(id: "markdown-viewer", value: content)
+            }
             model.startIfNeeded()
         }
         .toolbar {
@@ -1555,7 +1558,7 @@ struct ProjectDesignDocAffordancePresentation: Equatable {
         switch state {
         case .notSet:
             return nil
-        case .resolved(let resolved, _, _):
+        case .resolved(let resolved, _, _, _):
             let repoBase = repoBasename(from: resolved.repoRemoteURL)
             let tooltip = "\(repoBase):\(resolved.path)"
             return ProjectDesignDocAffordancePresentation(

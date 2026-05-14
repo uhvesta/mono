@@ -164,6 +164,27 @@ final class ChatViewModel: ObservableObject {
     /// renderer-reuse acceptance.
     var designRendererOpener: ((DesignRendererContent) -> Void)?
 
+    /// Indirection for opening the markdown-viewer window with fetched
+    /// content. Installed by [[ContentView]] using
+    /// `@Environment(\.openWindow)` — same boundary-crossing pattern as
+    /// [[designRendererOpener]]. Used when the design doc lives on a PR
+    /// branch (not yet on `main`) and no leased workspace is available:
+    /// the dispatcher fetches the raw content via [[rawContentFetcher]]
+    /// and hands the rendered string to this opener. `nil` (tests and
+    /// headless contexts) falls back to `urlOpener`.
+    var markdownViewerOpener: ((MarkdownViewerContent) -> Void)?
+
+    /// Indirection for fetching raw markdown content from a URL.
+    /// Production default hits `URLSession.shared`; tests inject a stub
+    /// so the affordance tests never make live network calls.
+    var rawContentFetcher: (URL) async throws -> String = { url in
+        let (data, _) = try await URLSession.shared.data(from: url)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw URLError(.cannotDecodeContentData)
+        }
+        return text
+    }
+
     /// Toggle the live-status summarizer for `slotId`. Sends the
     /// RPC and optimistically updates local state; the engine echo
     /// brings the two back in sync.
@@ -854,14 +875,14 @@ final class ChatViewModel: ObservableObject {
     ///   separately (design Q5).
     /// - `.resolved` — same/other-product pointers with a leased cube
     ///   workspace render in the in-app [[DesignRendererView]] when
-    ///   [[designRendererOpener]] is wired (the production app does
-    ///   this in `ContentView`). With no renderer opener installed —
-    ///   tests, or a future headless surface — the dispatcher falls
-    ///   back to handing the file URL to [[urlOpener]] so the
-    ///   OS-registered `.md` handler still opens the doc. Everything
-    ///   else (external pointers, or same/other-product pointers
-    ///   without a leased workspace) falls through to the GitHub web
-    ///   URL via `urlOpener`.
+    ///   [[designRendererOpener]] is wired. Without a workspace, if
+    ///   `rawContentURL` is present (GitHub raw-content URL for the
+    ///   doc's branch, populated when the file is on a PR branch),
+    ///   the dispatcher fetches the markdown via [[rawContentFetcher]]
+    ///   and opens it in [[markdownViewerOpener]] — this is how the
+    ///   affordance works for `in_review` design tasks before the PR
+    ///   merges. Otherwise falls through to `urlOpener` with the web
+    ///   URL.
     func openProjectDesignDoc(_ project: WorkProject) {
         let state = designDocStateByProjectID[project.id] ?? .notSet
         switch state {
@@ -869,7 +890,7 @@ final class ChatViewModel: ObservableObject {
             return
         case .broken(let reason):
             workErrorMessage = "Design doc pointer is broken: \(reason)"
-        case .resolved(let resolved, let workspacePath, let webURL):
+        case .resolved(let resolved, let workspacePath, let webURL, let rawContentURL):
             if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind) {
                 if let opener = designRendererOpener,
                    let content = DesignRendererContent.from(
@@ -887,11 +908,44 @@ final class ChatViewModel: ObservableObject {
                 urlOpener(URL(fileURLWithPath: absolute))
                 return
             }
+            if let rawContentURL, let rawURL = URL(string: rawContentURL) {
+                let projectName = project.name
+                Task { @MainActor in
+                    await self.fetchAndOpenDesignDoc(
+                        projectName: projectName,
+                        rawURL: rawURL,
+                        webURL: webURL
+                    )
+                }
+                return
+            }
             guard let url = URL(string: webURL) else {
                 workErrorMessage = "Design doc URL could not be parsed: \(webURL)"
                 return
             }
             urlOpener(url)
+        }
+    }
+
+    /// Fetch raw markdown from `rawURL` and open it in the
+    /// [[markdownViewerOpener]] window. Falls back to `urlOpener(webURL)`
+    /// if the fetch fails or [[markdownViewerOpener]] is not wired.
+    @MainActor
+    private func fetchAndOpenDesignDoc(projectName: String, rawURL: URL, webURL: String) async {
+        do {
+            let markdown = try await rawContentFetcher(rawURL)
+            if let opener = markdownViewerOpener {
+                let title = projectName.isEmpty ? rawURL.lastPathComponent : projectName
+                opener(MarkdownViewerContent(title: title, markdown: markdown))
+            } else if let url = URL(string: webURL) {
+                urlOpener(url)
+            }
+        } catch {
+            if let url = URL(string: webURL) {
+                urlOpener(url)
+            } else {
+                workErrorMessage = "Failed to fetch design doc: \(error.localizedDescription)"
+            }
         }
     }
 

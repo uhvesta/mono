@@ -1132,13 +1132,21 @@ pub enum ProjectDesignDocState {
         /// open dispatcher can hand `<workspace_path>/<resolved.path>`
         /// to `$EDITOR` / the in-app renderer; `None` means no
         /// workspace is currently leased so the affordance falls back
-        /// to the GitHub web URL. Boolean form is `workspace_path.is_some()`.
+        /// to `raw_content_url` or the GitHub web URL.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_path: Option<String>,
         /// `https://github.com/<owner>/<repo>/blob/<branch>/<path>`,
         /// pre-built so consumers don't have to re-parse the repo
         /// URL.
         web_url: String,
+        /// `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>`,
+        /// present when `resolved.repo_remote_url` is a github.com URL.
+        /// Used by the macOS app to fetch and render the doc inline when
+        /// no workspace fast-path is available — in particular when the
+        /// design task is `in_review` and the file lives on the PR head
+        /// branch rather than `main`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_content_url: Option<String>,
     },
     /// The pointer is set but cannot be resolved (e.g. path with no
     /// repo to resolve against). The UI surfaces a warning glyph
@@ -1331,6 +1339,9 @@ mod tests {
             },
             workspace_path: Some("/Users/me/Documents/dev/workspaces/mono-agent-001".into()),
             web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
+            raw_content_url: Some(
+                "https://raw.githubusercontent.com/foo/bar/main/docs/x.md".into(),
+            ),
         };
         let raw = serde_json::to_value(&resolved).unwrap();
         assert_eq!(raw["type"], "resolved");
@@ -1499,6 +1510,9 @@ mod tests {
                 },
                 workspace_path: None,
                 web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
+                raw_content_url: Some(
+                    "https://raw.githubusercontent.com/foo/bar/main/docs/x.md".into(),
+                ),
             },
         };
         let raw = serde_json::to_value(&output).unwrap();

@@ -9,9 +9,11 @@
 //! Two entry points, called from their respective trigger modules:
 //!
 //! - [`on_design_pr_detected`] — fired when `tasks.pr_url` is set for
-//!   a `kind=design` task (the `in_review` transition). Uses
-//!   [`WorkDb::sync_project_design_doc_from_detector`], which is a
-//!   no-op when the project already has a design-doc pointer.
+//!   a `kind=design` task (the `in_review` transition). Populates the
+//!   project's design-doc pointer when it is unset. If it is already
+//!   set, updates only `design_doc_branch` to the PR head branch so the
+//!   resolved URL correctly points to the file on the PR branch rather
+//!   than `main` (where the file does not exist yet).
 //! - [`on_design_pr_merged`] — fired when `mark_chore_pr_merged`
 //!   transitions a `kind=design` task to `done`. If the project
 //!   already has a path, only the branch is updated to the PR's base
@@ -62,7 +64,8 @@ pub async fn on_design_pr_detected(
         return;
     };
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
-    let branch = scan.head_ref_name.as_deref();
+    let head_ref_name = scan.head_ref_name;
+    let branch = head_ref_name.as_deref();
     match work_db.sync_project_design_doc_from_detector(
         project_id,
         repo_remote_url.as_deref(),
@@ -80,12 +83,46 @@ pub async fn on_design_pr_detected(
             );
         }
         Ok(false) => {
-            tracing::debug!(
-                task_id,
-                project_id,
-                pr_url,
-                "design detector: project already has a design-doc pointer; skipping (in_review)"
-            );
+            // Path was already set — the pointer is preserved, but we
+            // still update `design_doc_branch` to the PR head branch so
+            // the resolved web URL and raw-content URL point at the file
+            // on the PR branch (not at `main` where it doesn't exist yet).
+            if let Some(head_branch) = head_ref_name {
+                let input = SetProjectDesignDocInput {
+                    project_id: project_id.to_owned(),
+                    design_doc_path: None,
+                    design_doc_branch: Some(head_branch.clone()),
+                    design_doc_repo_remote_url: None,
+                    unset: false,
+                };
+                match work_db.set_project_design_doc(input) {
+                    Ok(_) => {
+                        tracing::info!(
+                            task_id,
+                            project_id,
+                            pr_url,
+                            branch = head_branch,
+                            "design detector: updated design-doc branch to PR head branch (in_review)"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            task_id,
+                            project_id,
+                            pr_url,
+                            ?err,
+                            "design detector: failed to update design-doc branch to PR head branch"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    task_id,
+                    project_id,
+                    pr_url,
+                    "design detector: project already has a design-doc pointer, head branch unknown; skipping (in_review)"
+                );
+            }
         }
         Err(err) => {
             tracing::warn!(

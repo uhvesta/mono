@@ -149,10 +149,11 @@ struct ResolvedDesignDoc: Codable, Hashable {
 /// none is leased). The open dispatcher uses it to fast-path
 /// `$EDITOR` / the in-app renderer onto the workspace file system
 /// when the kind is same- or other-product; absence falls back to
-/// the GitHub web URL.
+/// the `rawContentURL` (GitHub raw-content fetch for in-app rendering)
+/// and then the GitHub web URL.
 enum ProjectDesignDocState: Hashable {
     case notSet
-    case resolved(resolved: ResolvedDesignDoc, workspacePath: String?, webURL: String)
+    case resolved(resolved: ResolvedDesignDoc, workspacePath: String?, webURL: String, rawContentURL: String?)
     case broken(reason: String)
 }
 
@@ -162,6 +163,7 @@ extension ProjectDesignDocState: Codable {
         case resolved
         case workspacePath = "workspace_path"
         case webURL = "web_url"
+        case rawContentURL = "raw_content_url"
         case reason
     }
 
@@ -175,7 +177,8 @@ extension ProjectDesignDocState: Codable {
             self = .resolved(
                 resolved: try container.decode(ResolvedDesignDoc.self, forKey: .resolved),
                 workspacePath: try container.decodeIfPresent(String.self, forKey: .workspacePath),
-                webURL: try container.decode(String.self, forKey: .webURL)
+                webURL: try container.decode(String.self, forKey: .webURL),
+                rawContentURL: try container.decodeIfPresent(String.self, forKey: .rawContentURL)
             )
         case "broken":
             self = .broken(reason: try container.decode(String.self, forKey: .reason))
@@ -193,11 +196,12 @@ extension ProjectDesignDocState: Codable {
         switch self {
         case .notSet:
             try container.encode("not_set", forKey: .type)
-        case .resolved(let resolved, let workspacePath, let webURL):
+        case .resolved(let resolved, let workspacePath, let webURL, let rawContentURL):
             try container.encode("resolved", forKey: .type)
             try container.encode(resolved, forKey: .resolved)
             try container.encodeIfPresent(workspacePath, forKey: .workspacePath)
             try container.encode(webURL, forKey: .webURL)
+            try container.encodeIfPresent(rawContentURL, forKey: .rawContentURL)
         case .broken(let reason):
             try container.encode("broken", forKey: .type)
             try container.encode(reason, forKey: .reason)

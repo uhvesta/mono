@@ -897,6 +897,7 @@ impl WorkDb {
         };
 
         let web_url = render_design_doc_web_url(&repo, &branch, &path);
+        let raw_content_url = render_design_doc_raw_content_url(&repo, &branch, &path);
         let workspace_path = lookup_repo_workspace_path(&repo);
 
         Ok(ResolveProjectDesignDocOutput {
@@ -910,6 +911,7 @@ impl WorkDb {
                 },
                 workspace_path,
                 web_url,
+                raw_content_url,
             },
         })
     }
@@ -7011,6 +7013,22 @@ fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, path: &str) ->
         Ok(slug) => format!("https://github.com/{slug}/blob/{branch}/{path}"),
         Err(_) => format!("{repo_remote_url}/blob/{branch}/{path}"),
     }
+}
+
+/// Build the GitHub raw-content URL for a design doc:
+/// `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>`.
+/// Returns `None` when the repo URL can't be parsed as a github.com URL
+/// (e.g. an enterprise mirror or non-GitHub host) so callers know the
+/// raw-content fast path is unavailable and should fall back to the
+/// web URL.
+fn render_design_doc_raw_content_url(
+    repo_remote_url: &str,
+    branch: &str,
+    path: &str,
+) -> Option<String> {
+    crate::completion::parse_repo_slug(repo_remote_url)
+        .ok()
+        .map(|slug| format!("https://raw.githubusercontent.com/{slug}/{branch}/{path}"))
 }
 
 /// Look up a product by `repo_remote_url`. Used by
@@ -13912,6 +13930,7 @@ mod tests {
             resolved,
             workspace_path,
             web_url,
+            raw_content_url,
         } = resolved.state
         else {
             panic!("expected Resolved state, got {:?}", resolved.state);
@@ -13931,6 +13950,10 @@ mod tests {
         assert_eq!(
             web_url,
             "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/foo.md",
+        );
+        assert_eq!(
+            raw_content_url.as_deref(),
+            Some("https://raw.githubusercontent.com/spinyfin/mono/main/tools/boss/docs/designs/foo.md"),
         );
 
         let _ = std::fs::remove_file(path);
@@ -13969,6 +13992,7 @@ mod tests {
             resolved,
             workspace_path,
             web_url,
+            raw_content_url,
         } = resolved.state
         else {
             panic!("expected Resolved state");
@@ -13984,6 +14008,10 @@ mod tests {
         assert_eq!(
             web_url,
             "https://github.com/myorg/wiki/blob/docs/designs/foo.md",
+        );
+        assert_eq!(
+            raw_content_url.as_deref(),
+            Some("https://raw.githubusercontent.com/myorg/wiki/docs/designs/foo.md"),
         );
 
         let _ = std::fs::remove_file(path);
