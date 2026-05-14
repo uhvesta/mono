@@ -380,6 +380,109 @@ async fn agents_transcript_errors_when_run_has_no_transcript_path() -> Result<()
 }
 
 #[tokio::test]
+async fn agents_transcript_via_execution_id_returns_tail_lines() -> Result<()> {
+    // Regression test for AI #1: `bossctl agents transcript <exec_id>`
+    // must work for completed/terminal executions. The engine resolves
+    // the transcript path via `work_runs.transcript_path` using the
+    // execution_id foreign key, not the run's own id. This test drives
+    // `TailRunTranscript` with an exec_* id to confirm the engine's
+    // `transcript_path_for_execution` fallback inside
+    // `resolve_transcript_for_tail` is reachable.
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
+    let transcript_dir = tempfile::tempdir()?;
+    let transcript_path = transcript_dir.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript_path,
+        "{\"event\":\"alpha\"}\n{\"event\":\"beta\"}\n{\"event\":\"gamma\"}\n",
+    )?;
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    work_db.create_run(CreateRunInput {
+        execution_id: execution_id.clone(),
+        agent_id: "test-agent".to_owned(),
+        status: Some("done".to_owned()),
+        transcript_path: Some(transcript_path.display().to_string()),
+        artifacts_path: None,
+        result_summary: None,
+        error_text: None,
+        started_at: None,
+        finished_at: None,
+    })?;
+
+    // Pass the execution id (exec_*) rather than the run id (run_*).
+    // This is the path that was broken before AI #1: the engine
+    // returned "unknown run: exec_..." because the hot-path cache was
+    // gone for a terminal execution and the DB was only queried by run id.
+    let response = client
+        .send_request(&FrontendRequest::TailRunTranscript {
+            run_id: execution_id.clone(),
+            lines: 2,
+        })
+        .await?;
+    match response {
+        FrontendEvent::RunTranscriptTail {
+            transcript_path: returned_path,
+            lines,
+            truncated,
+            ..
+        } => {
+            assert_eq!(returned_path, transcript_path.display().to_string());
+            assert_eq!(
+                lines,
+                vec![
+                    "{\"event\":\"beta\"}".to_owned(),
+                    "{\"event\":\"gamma\"}".to_owned()
+                ]
+            );
+            assert!(truncated, "asking for 2 of 3 lines must set truncated");
+        }
+        other => return Err(anyhow!("expected RunTranscriptTail, got: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_run_via_execution_id_returns_run_record() -> Result<()> {
+    // Regression test for AI #1: `bossctl agents status <exec_id>`
+    // must return the run record for a completed execution. Before this
+    // fix, `GetRun { id: exec_id }` returned "unknown run: exec_..."
+    // because the handler only queried `work_runs.id` (run_* ns).
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution { execution_id, .. } = seed_execution(&mut client).await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    let run = work_db.create_run(CreateRunInput {
+        execution_id: execution_id.clone(),
+        agent_id: "test-agent-history".to_owned(),
+        status: Some("done".to_owned()),
+        transcript_path: None,
+        artifacts_path: None,
+        result_summary: None,
+        error_text: None,
+        started_at: None,
+        finished_at: None,
+    })?;
+
+    // Pass execution id; the engine must resolve it to the run row.
+    let response = client
+        .send_request(&FrontendRequest::GetRun {
+            id: execution_id.clone(),
+        })
+        .await?;
+    match response {
+        FrontendEvent::RunResult { run: returned } => {
+            assert_eq!(returned.id, run.id);
+            assert_eq!(returned.execution_id, execution_id);
+        }
+        other => return Err(anyhow!("expected RunResult, got: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_summary_returns_pool_snapshot() -> Result<()> {
     // The in-process engine builds a `CommandCubeClient` which would
     // shell out to a real `cube` binary. That isn't available in
