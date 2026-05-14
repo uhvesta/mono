@@ -410,6 +410,7 @@ private struct MarkdownDocumentView: View {
             .padding(.vertical, 20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .textSelection(.enabled)
         .task(id: fileURL) {
             await load()
         }
@@ -469,6 +470,7 @@ struct MarkdownViewerView: View {
             .padding(.vertical, 20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .textSelection(.enabled)
     }
 }
 
