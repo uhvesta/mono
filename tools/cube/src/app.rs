@@ -347,8 +347,9 @@ struct ParsedOrigin {
     path: String,
 }
 
-/// Parse an SSH-style (`[user@]host:path`) or HTTPS-style (`https://[user@]host/path`) URL
-/// into a `ParsedOrigin`. Returns `None` if the URL is not in a recognised format.
+/// Parse an SSH-style (`[user@]host:path`), `ssh://` URL, or HTTPS-style
+/// (`https://[user@]host/path`) URL into a `ParsedOrigin`. Returns `None` if
+/// the URL is not in a recognised format.
 fn parse_origin(url: &str) -> Option<ParsedOrigin> {
     let url = url.trim();
 
@@ -361,6 +362,28 @@ fn parse_origin(url: &str) -> Option<ParsedOrigin> {
             rest
         };
         let (host, path) = rest.split_once('/')?;
+        let path = path.trim_end_matches('/').trim_end_matches(".git");
+        return Some(ParsedOrigin {
+            host: host.to_ascii_lowercase(),
+            path: path.to_string(),
+        });
+    }
+
+    // RFC-3986 SSH URL: ssh://[user@]host[:port]/path
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        // Drop optional `user@`
+        let rest = if let Some(at) = rest.find('@') {
+            &rest[at + 1..]
+        } else {
+            rest
+        };
+        // Drop optional `:port` from the host portion before the path `/`
+        let (host_maybe_port, path) = rest.split_once('/')?;
+        let host = if let Some((h, _port)) = host_maybe_port.split_once(':') {
+            h
+        } else {
+            host_maybe_port
+        };
         let path = path.trim_end_matches('/').trim_end_matches(".git");
         return Some(ParsedOrigin {
             host: host.to_ascii_lowercase(),
@@ -2962,6 +2985,104 @@ mod tests {
         ));
     }
 
+    // --- ssh:// URL form tests ---
+
+    #[test]
+    fn parse_origin_ssh_url_form() {
+        let p = parse_origin("ssh://git@github.com/foo/bar.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "foo/bar");
+    }
+
+    #[test]
+    fn parse_origin_ssh_url_auth_prefixed() {
+        let p = parse_origin("ssh://org-132020694@github.com/linkedin-eng/ci-infra.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "linkedin-eng/ci-infra");
+    }
+
+    #[test]
+    fn parse_origin_ssh_url_no_user() {
+        let p = parse_origin("ssh://github.com/foo/bar.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "foo/bar");
+    }
+
+    #[test]
+    fn parse_origin_ssh_url_with_port() {
+        let p = parse_origin("ssh://git@github.com:22/foo/bar.git").unwrap();
+        assert_eq!(p.host, "github.com");
+        assert_eq!(p.path, "foo/bar");
+    }
+
+    #[test]
+    fn origin_urls_equivalent_ssh_url_vs_scp() {
+        // ssh://git@github.com/foo/bar.git == git@github.com:foo/bar.git
+        assert!(origin_urls_equivalent(
+            "ssh://git@github.com/foo/bar.git",
+            "git@github.com:foo/bar.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_equivalent_scp_vs_ssh_url() {
+        assert!(origin_urls_equivalent(
+            "git@github.com:foo/bar.git",
+            "ssh://git@github.com/foo/bar.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_equivalent_ssh_url_auth_vs_scp_plain() {
+        // ssh://org-X@github.com/foo/bar.git == git@github.com:foo/bar.git
+        assert!(origin_urls_equivalent(
+            "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git",
+            "git@github.com:linkedin-eng/ci-infra.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_equivalent_scp_auth_vs_ssh_url_plain() {
+        assert!(origin_urls_equivalent(
+            "org-132020694@github.com:linkedin-eng/ci-infra.git",
+            "ssh://git@github.com/linkedin-eng/ci-infra.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_equivalent_all_four_cross_products() {
+        let variants = [
+            "ssh://git@github.com/foo/bar.git",
+            "ssh://org-132020694@github.com/foo/bar.git",
+            "git@github.com:foo/bar.git",
+            "org-132020694@github.com:foo/bar.git",
+        ];
+        for a in &variants {
+            for b in &variants {
+                assert!(
+                    origin_urls_equivalent(a, b),
+                    "{a} and {b} should be equivalent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn origin_urls_not_equivalent_ssh_url_different_path() {
+        assert!(!origin_urls_equivalent(
+            "ssh://git@github.com/foo/bar.git",
+            "git@github.com:foo/baz.git"
+        ));
+    }
+
+    #[test]
+    fn origin_urls_not_equivalent_ssh_url_different_host() {
+        assert!(!origin_urls_equivalent(
+            "ssh://git@github.com/foo/bar.git",
+            "git@gitlab.com:foo/bar.git"
+        ));
+    }
+
     #[test]
     fn repo_ensure_accepts_auth_prefixed_url_when_plain_stored() {
         let (tempdir, database_path) = with_database_path();
@@ -3042,6 +3163,90 @@ mod tests {
         .expect("ensure with plain URL should succeed when auth-prefixed is stored");
 
         assert_eq!(result.payload["repo_id"], "bduff");
+    }
+
+    #[test]
+    fn repo_ensure_accepts_scp_url_when_ssh_scheme_stored() {
+        // Reproduces the ci-infra user report: stored as ssh://, ensured as SCP-style.
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("ci-infra")).expect("source dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "ci-infra",
+            "--origin",
+            "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "ci-infra-agent-",
+            "--source",
+            &defaults.repo_root.join("ci-infra").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:linkedin-eng/ci-infra.git",
+        ]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            None,
+        )
+        .expect("ensure with SCP URL should succeed when ssh:// form is stored");
+
+        assert_eq!(result.payload["repo_id"], "ci-infra");
+    }
+
+    #[test]
+    fn repo_ensure_accepts_ssh_scheme_when_scp_stored() {
+        // Inverse direction: stored as SCP, ensured as ssh://.
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("ci-infra")).expect("source dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "ci-infra",
+            "--origin",
+            "git@github.com:linkedin-eng/ci-infra.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "ci-infra-agent-",
+            "--source",
+            &defaults.repo_root.join("ci-infra").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git",
+        ]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            None,
+        )
+        .expect("ensure with ssh:// URL should succeed when SCP form is stored");
+
+        assert_eq!(result.payload["repo_id"], "ci-infra");
     }
 
     #[test]
