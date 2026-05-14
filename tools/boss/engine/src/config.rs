@@ -5,7 +5,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::coordinator::MAX_WORKER_POOL_SIZE;
 
-const DEFAULT_CUBE_COMMAND: &str = "bazel run //tools/cube:cube --";
+// `cube` is intentionally NOT bundled inside Boss.app — it is assumed pre-installed
+// on the target machine and resolved from PATH. Use BOSS_CUBE_CMD to override
+// (e.g. `BOSS_CUBE_CMD='bazel run //tools/cube:cube --'` on a dev machine).
+const DEFAULT_CUBE_COMMAND: &str = "cube";
 
 #[derive(Debug, Clone)]
 pub struct CubeConfig {
@@ -64,6 +67,8 @@ impl AgentConfig {
             std::env::var("BOSS_CUBE_CMD").unwrap_or_else(|_| DEFAULT_CUBE_COMMAND.to_owned()),
         )?;
 
+        warn_if_cube_not_on_path(&cube_command);
+
         Ok(Self {
             anthropic_api_key,
             cube: CubeConfig {
@@ -114,6 +119,26 @@ impl RuntimeConfig {
                 .expect("OnceLock set after failed insert")
                 .clone()),
         }
+    }
+}
+
+/// Emits a warning if `command` looks like a bare executable name (no path separator)
+/// and cannot be found in any PATH directory. Helps catch misconfigured installs
+/// before the first dispatch attempt surfaces an unhelpful ENOENT.
+fn warn_if_cube_not_on_path(command: &str) {
+    if command.contains('/') {
+        return;
+    }
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path_env).any(|dir| dir.join(command).is_file());
+    if found {
+        tracing::debug!(command, "cube executable found on PATH");
+    } else {
+        tracing::warn!(
+            command,
+            "cube executable not found on PATH; worker dispatch will fail — \
+             install cube or set BOSS_CUBE_CMD to its full path"
+        );
     }
 }
 
