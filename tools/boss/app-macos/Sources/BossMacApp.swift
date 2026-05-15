@@ -22,6 +22,7 @@ struct BossMacApp: App {
                 DispatchEventsCommand()
                 EngineCommand()
                 FeatureFlagsCommand()
+                MetricsCommand()
                 Divider()
                 BossSessionInvocationCommand()
             }
@@ -70,6 +71,12 @@ struct BossMacApp: App {
         }
         .environmentObject(chatModel)
         .defaultSize(width: 600, height: 420)
+
+        Window("Metrics", id: "metrics") {
+            MetricsViewer()
+        }
+        .environmentObject(chatModel)
+        .defaultSize(width: 720, height: 520)
     }
 }
 
@@ -127,6 +134,25 @@ private struct FeatureFlagsCommand: View {
             }
         }
         .keyboardShortcut("f", modifiers: [.command, .shift])
+    }
+}
+
+private struct MetricsCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.metricsViewer.visible") private var isOpen = false
+
+    var body: some View {
+        Button("Metrics") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "metrics")
+            } else {
+                isOpen = true
+                openWindow(id: "metrics")
+            }
+        }
+        .keyboardShortcut("m", modifiers: [.command, .shift])
     }
 }
 

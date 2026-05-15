@@ -1200,3 +1200,20 @@ struct FeatureFlag: Identifiable, Hashable {
     let defaultEnabled: Bool
     let enabled: Bool
 }
+
+/// Snapshot of one engine metric (counter or gauge), decoded from a
+/// `metrics_list_live_result` response. Mirrors the engine's
+/// `boss_protocol::MetricLiveEntry` one-for-one.
+struct EngineMetric: Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let description: String
+    /// `"counter"` or `"gauge"`.
+    let kind: String
+    let value: Int64
+    /// Milliseconds since Unix epoch of the last update. 0 = never updated.
+    let timestampMs: Int64
+    /// True when this row was rehydrated from state.db but the current
+    /// engine binary has no matching handle.
+    let stale: Bool
+}
