@@ -477,6 +477,11 @@ mod tests {
             ci_attempt_budget: None,
             ci_attempts_used: 0,
             blocked_signals: vec![],
+            ci_required_state: None,
+            ci_required_detail: None,
+            review_required_state: None,
+            review_required_detail: None,
+            pr_state_polled_at: None,
             short_id: None,
         }
     }
