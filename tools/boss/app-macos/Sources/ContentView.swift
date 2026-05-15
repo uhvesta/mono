@@ -1144,7 +1144,11 @@ private struct WorkBoardCardItem: View {
                     showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL),
                     isResolvingConflicts: isResolvingConflicts,
                     designDocState: designDocState,
-                    onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } }
+                    onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } },
+                    ciRequiredState: column == .review ? task.ciRequiredState : nil,
+                    ciRequiredDetail: column == .review ? task.ciRequiredDetail : nil,
+                    reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
+                    reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil
                 )
             }
             .buttonStyle(.plain)
@@ -1282,6 +1286,18 @@ struct WorkBoardCardView: View {
     /// called when `designDocState` is non-nil and produces a
     /// non-nil `ProjectDesignDocAffordancePresentation`.
     var onOpenDesignDoc: (() -> Void)? = nil
+    /// Aggregate required-CI state for the PR indicator. Mirrors
+    /// `WorkTask.ciRequiredState`; supplied by the parent only when the
+    /// card is in the Review lane and `task.prURL` is non-nil.
+    var ciRequiredState: String? = nil
+    /// JSON-encoded failing check detail for the CI tooltip.
+    var ciRequiredDetail: String? = nil
+    /// Required-review state for the review indicator. Mirrors
+    /// `WorkTask.reviewRequiredState`; supplied by the parent under the
+    /// same conditions as `ciRequiredState`.
+    var reviewRequiredState: String? = nil
+    /// JSON-encoded reviewer list for the review tooltip.
+    var reviewRequiredDetail: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1382,6 +1398,18 @@ struct WorkBoardCardView: View {
 
             if let prURL = task.prURL, !prURL.isEmpty {
                 PRURLLink(urlString: prURL, font: .caption)
+            }
+
+            if task.prURL != nil, ciRequiredState != nil || reviewRequiredState != nil {
+                HStack(spacing: 6) {
+                    if let ciState = ciRequiredState {
+                        PrCiIndicator(state: ciState, detail: ciRequiredDetail)
+                    }
+                    if let reviewState = reviewRequiredState {
+                        PrReviewIndicator(state: reviewState, detail: reviewRequiredDetail)
+                    }
+                    Spacer(minLength: 0)
+                }
             }
         }
         .padding(.horizontal, 12)
@@ -2617,6 +2645,128 @@ private struct ConflictClearedBadge: View {
         .clipShape(Capsule())
         .help("The engine cleared a merge conflict on this PR within the last 24 hours.")
         .accessibilityLabel("Conflict cleared by the engine")
+    }
+}
+
+/// CI status indicator shown on Review-lane cards when the engine has polled
+/// GitHub for required check results. Three visual states: in-progress
+/// (yellow clock), success (green checkmark), fail (red X). The `"unknown"`
+/// state (no branch protection / first poll pending) hides the indicator
+/// entirely so a missing result doesn't look like an all-green pass.
+private struct PrCiIndicator: View {
+    let state: String
+    var detail: String? = nil
+
+    var body: some View {
+        if let icon = systemImage {
+            Image(systemName: icon)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(tint)
+                .help(tooltipText)
+                .accessibilityLabel(tooltipText)
+        }
+    }
+
+    private var systemImage: String? {
+        switch state {
+        case "in_progress": return "clock.fill"
+        case "success":     return "checkmark.circle.fill"
+        case "fail":        return "xmark.circle.fill"
+        default:            return nil
+        }
+    }
+
+    private var tint: Color {
+        switch state {
+        case "in_progress": return .yellow
+        case "success":     return .green
+        case "fail":        return .red
+        default:            return .secondary
+        }
+    }
+
+    private var tooltipText: String {
+        switch state {
+        case "in_progress":
+            return "Required CI checks in progress"
+        case "success":
+            return "All required CI checks passed"
+        case "fail":
+            if let detail, let checks = parseCheckNames(from: detail), !checks.isEmpty {
+                return "Required CI check(s) failed: \(checks.joined(separator: ", "))"
+            }
+            return "Required CI check(s) failed"
+        default:
+            return "CI check state unknown"
+        }
+    }
+
+    private func parseCheckNames(from json: String) -> [String]? {
+        guard let data = json.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return nil }
+        return arr.compactMap { $0["name"] as? String }
+    }
+}
+
+/// Review-gating indicator for Review-lane cards. Four states:
+/// required (empty checklist — awaiting review), approved (green
+/// checkmark — all required reviews in), changes_requested (exclamation
+/// — at least one reviewer requested changes), unknown (hidden).
+private struct PrReviewIndicator: View {
+    let state: String
+    var detail: String? = nil
+
+    var body: some View {
+        if let icon = systemImage {
+            Image(systemName: icon)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(tint)
+                .help(tooltipText)
+                .accessibilityLabel(tooltipText)
+        }
+    }
+
+    private var systemImage: String? {
+        switch state {
+        case "required":           return "checklist"
+        case "approved":           return "checkmark.seal.fill"
+        case "changes_requested":  return "exclamationmark.circle.fill"
+        default:                   return nil
+        }
+    }
+
+    private var tint: Color {
+        switch state {
+        case "required":           return .secondary
+        case "approved":           return .green
+        case "changes_requested":  return .orange
+        default:                   return .secondary
+        }
+    }
+
+    private var tooltipText: String {
+        let reviewers = reviewerNames(from: detail)
+        switch state {
+        case "required":
+            return "Awaiting required review"
+        case "approved":
+            if reviewers.isEmpty { return "Approved" }
+            return "Approved by \(reviewers.joined(separator: ", "))"
+        case "changes_requested":
+            if reviewers.isEmpty { return "Changes requested" }
+            return "Changes requested by \(reviewers.joined(separator: ", "))"
+        default:
+            return "Review state unknown"
+        }
+    }
+
+    private func reviewerNames(from json: String?) -> [String] {
+        guard let json,
+              let data = json.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [String]
+        else { return [] }
+        return arr
     }
 }
 

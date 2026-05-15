@@ -2228,7 +2228,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -2239,7 +2239,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -2326,7 +2326,7 @@ impl WorkDb {
         let conn = self.connect()?;
         if let Some(task) = conn
             .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
                  FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
                 params![product_id, short_id],
@@ -2364,7 +2364,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -2373,7 +2373,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -2472,7 +2472,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
              FROM tasks
              WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
              ORDER BY created_at ASC",
@@ -2947,6 +2947,8 @@ impl WorkDb {
         // for `CREATE TABLE IF NOT EXISTS`.
         migrate_metrics_tables(&conn)?;
         migrate_work_executions_pre_start_retry(&conn)?;
+        // PR poll state columns for CI + review indicators on Review-lane cards.
+        migrate_pr_poll_state_columns(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '10')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3412,6 +3414,57 @@ impl WorkDb {
             .with_context(|| format!("unknown task after update: {work_item_id}"))?;
         tx.commit()?;
         Ok(Some(updated))
+    }
+
+    /// Update the PR poll-state columns for a single task row after a
+    /// successful merge-poller probe. Stores the CI and review state strings
+    /// (and optional JSON-encoded detail blobs) plus the current timestamp.
+    ///
+    /// Returns `Ok(true)` when the CI or review state actually changed (so
+    /// the caller should emit a change event), `Ok(false)` when the probe
+    /// confirmed the same state as before (no event needed), and `Ok(false)`
+    /// when the row was deleted or not found. Errors propagate from
+    /// the underlying DB operations.
+    ///
+    /// The UPDATE is guarded by a `WHERE` clause that skips rows whose
+    /// `ci_required_state` AND `review_required_state` are already set to
+    /// the incoming values, so `changes() == 0` reliably means "nothing
+    /// changed" — the caller does not need to issue a separate read.
+    pub fn update_task_pr_poll_state(
+        &self,
+        work_item_id: &str,
+        ci_required_state: &str,
+        review_required_state: &str,
+        ci_required_detail: Option<&str>,
+        review_required_detail: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        // Only write (and count as changed) when the CI or review state
+        // differs from what's already stored. `COALESCE(col, '')` treats
+        // NULL as distinct from any non-empty string, so the first probe
+        // after migration always fires the event.
+        let changed = conn.execute(
+            "UPDATE tasks
+             SET ci_required_state      = ?2,
+                 review_required_state  = ?3,
+                 ci_required_detail     = ?4,
+                 review_required_detail = ?5,
+                 pr_state_polled_at     = ?6
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND (COALESCE(ci_required_state, '') != ?2
+                    OR COALESCE(review_required_state, '') != ?3)",
+            params![
+                work_item_id,
+                ci_required_state,
+                review_required_state,
+                ci_required_detail,
+                review_required_detail,
+                now,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Chores and project_tasks the engine previously flagged with
@@ -4849,6 +4902,11 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // always empty; consumers fall back to the scalar
         // `blocked_reason` / `blocked_attempt_id` cache above.
         blocked_signals: Vec::new(),
+        ci_required_state: row.get::<_, Option<String>>(24)?.filter(|s| !s.is_empty()),
+        review_required_state: row.get::<_, Option<String>>(25)?.filter(|s| !s.is_empty()),
+        ci_required_detail: row.get::<_, Option<String>>(26)?.filter(|s| !s.is_empty()),
+        review_required_detail: row.get::<_, Option<String>>(27)?.filter(|s| !s.is_empty()),
+        pr_state_polled_at: row.get::<_, Option<String>>(28)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -5346,7 +5404,7 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
          FROM tasks
          WHERE id = ?1",
         [id],
@@ -5410,7 +5468,7 @@ fn list_projects_for_product(conn: &Connection, product_id: &str) -> Result<Vec<
 
 fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at
          FROM tasks
          WHERE product_id = ?1 AND deleted_at IS NULL
          ORDER BY project_id ASC, ordinal ASC, created_at ASC, id ASC",
@@ -6360,6 +6418,41 @@ fn migrate_backfill_autostart_consumed(conn: &Connection) -> Result<()> {
         "UPDATE tasks SET autostart = 0 WHERE autostart = 1 AND status != 'todo'",
         [],
     )?;
+    Ok(())
+}
+
+/// Add `ci_required_state`, `review_required_state`, `ci_required_detail`,
+/// `review_required_detail`, and `pr_state_polled_at` columns to the `tasks`
+/// table. These are populated by the merge poller on every Review-lane sweep
+/// and surfaced to the macOS kanban as CI + review indicators with tooltips.
+/// Idempotent — guarded by `tasks_has_column`.
+fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "ci_required_state",
+            "ALTER TABLE tasks ADD COLUMN ci_required_state TEXT",
+        ),
+        (
+            "review_required_state",
+            "ALTER TABLE tasks ADD COLUMN review_required_state TEXT",
+        ),
+        (
+            "ci_required_detail",
+            "ALTER TABLE tasks ADD COLUMN ci_required_detail TEXT",
+        ),
+        (
+            "review_required_detail",
+            "ALTER TABLE tasks ADD COLUMN review_required_detail TEXT",
+        ),
+        (
+            "pr_state_polled_at",
+            "ALTER TABLE tasks ADD COLUMN pr_state_polled_at TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
     Ok(())
 }
 

@@ -275,6 +275,27 @@ struct WorkTask: Identifiable, Hashable {
     /// leaving them in Backlog. Defaults to `false` when absent from the
     /// wire so legacy rows without the field stay in Backlog (unchanged).
     var autostart: Bool = false
+    /// Aggregate required-CI state at last merge-poller probe. One of:
+    /// `"in_progress"`, `"success"`, `"fail"`, `"unknown"`. `nil` until the
+    /// first probe completes. Only rendered when `status == "in_review"` and
+    /// `prURL` is non-nil; hidden otherwise.
+    var ciRequiredState: String? = nil
+    /// JSON-encoded list of failing check objects for the CI tooltip.
+    /// Each object has `"name"` and `"conclusion"` keys. `nil` unless
+    /// `ciRequiredState == "fail"`.
+    var ciRequiredDetail: String? = nil
+    /// Review-gating state at last merge-poller probe. One of:
+    /// `"required"`, `"approved"`, `"changes_requested"`, `"unknown"`. `nil`
+    /// until the first probe completes. Only rendered when `status == "in_review"`
+    /// and `prURL` is non-nil; hidden otherwise.
+    var reviewRequiredState: String? = nil
+    /// JSON-encoded list of reviewer login strings for the review tooltip.
+    /// `nil` unless `reviewRequiredState` is `"approved"` or
+    /// `"changes_requested"`.
+    var reviewRequiredDetail: String? = nil
+    /// RFC 3339 timestamp of the most recent successful poll that wrote the
+    /// PR state fields above. `nil` until the first probe completes.
+    var prStatePolledAt: String? = nil
 
     var isChore: Bool {
         kind == "chore"

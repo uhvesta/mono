@@ -3206,6 +3206,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     head_ref_name: None,
                     base_ref_name: None,
                     labels: Vec::new(),
+                    review: crate::merge_poller::PrReviewState::Unknown,
                 })
             }
         }
@@ -3539,6 +3540,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                     head_ref_name: None,
                     base_ref_name: None,
                     labels: Vec::new(),
+                    review: crate::merge_poller::PrReviewState::Unknown,
                 })
             }
         }

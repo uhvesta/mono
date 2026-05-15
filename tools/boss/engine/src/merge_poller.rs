@@ -42,6 +42,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use serde_json;
 use tokio::process::Command;
 
 use crate::ci_watch;
@@ -50,6 +51,44 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::work::{PendingMergeCheck, WorkDb};
+
+/// Review-gating state of a PR at probe time. Derived from
+/// GitHub's `reviewDecision` field and the `reviews` array.
+///
+/// `Required` maps to `REVIEW_REQUIRED` — at least one approving
+/// review is still needed. `Approved` means all required reviewers
+/// have approved; the `reviewers` list carries their login names
+/// for the tooltip. `ChangesRequested` means at least one reviewer
+/// blocked the PR; `reviewers` lists who. `Unknown` is the
+/// fallback when GitHub omitted the field or returned an
+/// unrecognised value (e.g., no branch protection configured).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrReviewState {
+    Required,
+    Approved { reviewers: Vec<String> },
+    ChangesRequested { reviewers: Vec<String> },
+    Unknown,
+}
+
+impl PrReviewState {
+    /// Stable DB string for the `review_required_state` column.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            PrReviewState::Required => "required",
+            PrReviewState::Approved { .. } => "approved",
+            PrReviewState::ChangesRequested { .. } => "changes_requested",
+            PrReviewState::Unknown => "unknown",
+        }
+    }
+
+    /// Reviewer login names for the tooltip, if available.
+    pub fn reviewers(&self) -> &[String] {
+        match self {
+            PrReviewState::Approved { reviewers } | PrReviewState::ChangesRequested { reviewers } => reviewers,
+            _ => &[],
+        }
+    }
+}
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
 /// single `gh pr view` round-trip. Carries everything the poller's
@@ -86,6 +125,11 @@ pub struct PrLifecycleProbe {
     /// per-PR opt-out label (`boss/no-auto-rebase`, design Q7 /
     /// Phase 6 #18) without a second `gh` round trip.
     pub labels: Vec<String>,
+    /// Review-gating state derived from GitHub's `reviewDecision` and
+    /// `reviews` fields. Used by the merge poller to update the
+    /// `review_required_state` / `review_required_detail` columns on
+    /// the task row for display in the macOS kanban Review-lane card.
+    pub review: PrReviewState,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -311,7 +355,9 @@ impl MergeProbe for CommandMergeProbe {
                 // the same probe"); the previous TSV-via-jq shape
                 // can't carry it without escaping headaches, so we
                 // take the raw JSON document from gh instead.
-                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup",
+                // `reviewDecision` and `reviews` are added to capture
+                // the review-required state for UI indicators.
+                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -339,6 +385,7 @@ impl MergeProbe for CommandMergeProbe {
                     head_ref_name: None,
                     base_ref_name: None,
                     labels: Vec::new(),
+                    review: PrReviewState::Unknown,
                 });
             }
             return Err(anyhow!(
@@ -410,6 +457,16 @@ fn parse_probe_json(url: &str, body: &str) -> Result<PrLifecycleProbe> {
         .unwrap_or_default();
     let ci = classify_ci(&rollup);
     let state = classify_state(raw_state, merged_at, mergeable, merge_state_status, ci);
+    let review_decision = root
+        .get("reviewDecision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let reviews = root
+        .get("reviews")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let review = classify_review(review_decision, &reviews);
     Ok(PrLifecycleProbe {
         url: url.to_owned(),
         state,
@@ -418,7 +475,63 @@ fn parse_probe_json(url: &str, body: &str) -> Result<PrLifecycleProbe> {
         head_ref_name,
         base_ref_name,
         labels,
+        review,
     })
+}
+
+/// Derive the [`PrReviewState`] from GitHub's `reviewDecision` string
+/// and the `reviews` array. Rules:
+///
+///   - `REVIEW_REQUIRED` → `Required` (no reviewers needed yet).
+///   - `CHANGES_REQUESTED` → `ChangesRequested`; reviewers are the
+///     latest CHANGES_REQUESTED submitters per author (de-duped).
+///   - `APPROVED` → `Approved`; reviewers are the latest APPROVED
+///     submitters per author (de-duped).
+///   - Empty / `null` / unrecognised → `Unknown` (no branch
+///     protection or first poll hasn't run). The UI hides the
+///     indicator in this case rather than showing a misleading green.
+fn classify_review(review_decision: &str, reviews: &[serde_json::Value]) -> PrReviewState {
+    // Collect the most-recent review state per author from the
+    // `reviews` array. GitHub orders reviews oldest-to-newest so
+    // iterating forward and overwriting gives us the latest per author.
+    let mut by_author: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for review in reviews {
+        let login = review
+            .get("author")
+            .and_then(|a| a.get("login"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let state = review
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !login.is_empty() && !state.is_empty() {
+            by_author.insert(login, state);
+        }
+    }
+
+    match review_decision.to_ascii_uppercase().as_str() {
+        "REVIEW_REQUIRED" => PrReviewState::Required,
+        "CHANGES_REQUESTED" => {
+            let reviewers = by_author
+                .into_iter()
+                .filter(|(_, state)| state == "CHANGES_REQUESTED")
+                .map(|(login, _)| login)
+                .collect();
+            PrReviewState::ChangesRequested { reviewers }
+        }
+        "APPROVED" => {
+            let reviewers = by_author
+                .into_iter()
+                .filter(|(_, state)| state == "APPROVED")
+                .map(|(login, _)| login)
+                .collect();
+            PrReviewState::Approved { reviewers }
+        }
+        _ => PrReviewState::Unknown,
+    }
 }
 
 /// Collapse the `statusCheckRollup` array into one [`OpenPrCiStatus`]
@@ -920,6 +1033,109 @@ async fn sweep_one(
             );
         }
     }
+    // For every open (or just-probed) PR, persist the CI + review poll
+    // state so the macOS kanban can render indicators with tooltips.
+    // We do this unconditionally after the lifecycle routing above so
+    // the columns stay fresh even when no status transition fired.
+    // Merged / closed-unmerged probes are skipped — the row will
+    // transition away from `in_review` and the indicators become moot.
+    if matches!(probe_result.state, PrLifecycleState::Open(_)) {
+        update_pr_poll_state(work_db, publisher, candidate, &probe_result).await;
+    }
+}
+
+/// Derive the `ci_required_state` string from a probe's CI status.
+fn ci_state_str(ci: &OpenPrCiStatus) -> &'static str {
+    match ci {
+        OpenPrCiStatus::Clean => "success",
+        OpenPrCiStatus::InFlight => "in_progress",
+        OpenPrCiStatus::Failing { .. } => "fail",
+    }
+}
+
+/// Build a compact JSON detail blob for failing CI checks (list of
+/// `{"name": "...", "conclusion": "..."}` objects). Returns `None`
+/// when the check list is empty so we don't write `"[]"` to the DB.
+fn ci_detail_json(ci: &OpenPrCiStatus) -> Option<String> {
+    let OpenPrCiStatus::Failing { failures } = ci else {
+        return None;
+    };
+    if failures.is_empty() {
+        return None;
+    }
+    let items: Vec<serde_json::Value> = failures
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name,
+                "conclusion": f.conclusion,
+            })
+        })
+        .collect();
+    serde_json::to_string(&items).ok()
+}
+
+/// Build a compact JSON detail blob for reviewer logins. Returns `None`
+/// when the list is empty.
+fn review_detail_json(reviewers: &[String]) -> Option<String> {
+    if reviewers.is_empty() {
+        return None;
+    }
+    serde_json::to_string(reviewers).ok()
+}
+
+/// Persist CI + review poll state and emit a change event when either
+/// field flips value. Called from `sweep_one` for every open PR.
+async fn update_pr_poll_state(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+) {
+    let PrLifecycleState::Open(open) = &probe.state else {
+        return;
+    };
+
+    let ci_state = ci_state_str(&open.ci);
+    let review_state = probe.review.as_db_str();
+    let ci_detail = ci_detail_json(&open.ci);
+    let review_detail = review_detail_json(probe.review.reviewers());
+
+    match work_db.update_task_pr_poll_state(
+        &candidate.work_item_id,
+        ci_state,
+        review_state,
+        ci_detail.as_deref(),
+        review_detail.as_deref(),
+    ) {
+        Ok(true) => {
+            // State changed — emit event so the macOS kanban refreshes the
+            // card's CI / review indicators within the poll interval.
+            publisher
+                .publish_work_item_changed(
+                    &candidate.product_id,
+                    &candidate.work_item_id,
+                    "pr_poll_state_updated",
+                )
+                .await;
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                ci_state,
+                review_state,
+                "merge poller: PR poll state changed",
+            );
+        }
+        Ok(false) => {
+            // No state change (or row not found / deleted) — skip event.
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "merge poller: failed to update PR poll state",
+            );
+        }
+    }
 }
 
 async fn mark_merged(
@@ -1075,6 +1291,7 @@ mod tests {
                     head_ref_name: None,
                     base_ref_name: None,
                     labels: Vec::new(),
+                    review: PrReviewState::Unknown,
                 }),
             );
         }
@@ -1090,6 +1307,7 @@ mod tests {
                     head_ref_name: None,
                     base_ref_name: None,
                     labels: labels.iter().map(|s| (*s).to_owned()).collect(),
+                    review: PrReviewState::Unknown,
                 }),
             );
         }
@@ -1117,6 +1335,7 @@ mod tests {
                     head_ref_name: None,
                     base_ref_name: None,
                     labels: Vec::new(),
+                    review: PrReviewState::Unknown,
                 }),
             }
         }
@@ -1125,6 +1344,21 @@ mod tests {
     #[derive(Default)]
     struct RecordingPublisher {
         work_events: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl RecordingPublisher {
+        /// Events filtered to exclude poll-state housekeeping events
+        /// (`pr_poll_state_updated`) so lifecycle-focused assertions don't
+        /// have to account for the background sweep's bookkeeping writes.
+        async fn lifecycle_reasons(&self) -> Vec<String> {
+            self.work_events
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, _, reason)| reason != "pr_poll_state_updated")
+                .map(|(_, _, reason)| reason.clone())
+                .collect()
+        }
     }
 
     #[async_trait]
@@ -1286,7 +1520,8 @@ mod tests {
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
         }
-        assert!(publisher.work_events.lock().await.is_empty());
+        // Only poll-state housekeeping events are allowed; no lifecycle flip.
+        assert!(publisher.lifecycle_reasons().await.is_empty());
     }
 
     #[tokio::test]
@@ -1385,7 +1620,7 @@ mod tests {
             WorkItem::Task(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected project_task, got {other:?}"),
         }
-        assert!(publisher.work_events.lock().await.is_empty());
+        assert!(publisher.lifecycle_reasons().await.is_empty());
     }
 
     #[tokio::test]
@@ -1397,7 +1632,7 @@ mod tests {
         let publisher = Arc::new(RecordingPublisher::default());
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.total_transitions(), 0);
-        assert!(publisher.work_events.lock().await.is_empty());
+        assert!(publisher.lifecycle_reasons().await.is_empty());
     }
 
     #[tokio::test]
@@ -1453,13 +1688,13 @@ mod tests {
         assert_eq!(outcome4.total_transitions(), 0);
 
         // Event trail: blocked → resolved, plus the noop-passes
-        // emitted nothing.
+        // emitted nothing (poll-state events are excluded).
         let reasons: Vec<String> = publisher
             .work_events
             .lock()
             .await
             .iter()
-            .filter(|(p, w, _)| p == &product && w == &chore)
+            .filter(|(p, w, r)| p == &product && w == &chore && r != "pr_poll_state_updated")
             .map(|(_, _, r)| r.clone())
             .collect();
         assert_eq!(
@@ -1625,6 +1860,7 @@ mod tests {
             head_ref_name: None,
             base_ref_name: None,
             labels: Vec::new(),
+            review: PrReviewState::Unknown,
         }
     }
 
@@ -1637,6 +1873,7 @@ mod tests {
             head_ref_name: None,
             base_ref_name: None,
             labels: Vec::new(),
+            review: PrReviewState::Unknown,
         }
     }
 
@@ -1700,13 +1937,13 @@ mod tests {
         let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome4.total_transitions(), 0);
 
-        // Event trail: blocked → resolved.
+        // Event trail: blocked → resolved (poll-state events excluded).
         let reasons: Vec<String> = publisher
             .work_events
             .lock()
             .await
             .iter()
-            .filter(|(p, w, _)| p == &product && w == &chore)
+            .filter(|(p, w, r)| p == &product && w == &chore && r != "pr_poll_state_updated")
             .map(|(_, _, r)| r.clone())
             .collect();
         assert_eq!(
@@ -2375,7 +2612,7 @@ mod tests {
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
         }
-        assert!(publisher.work_events.lock().await.is_empty());
+        assert!(publisher.lifecycle_reasons().await.is_empty());
     }
 
     /// Helper: seed a chore into `blocked: merge_conflict` with a pending
