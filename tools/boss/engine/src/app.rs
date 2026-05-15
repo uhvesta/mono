@@ -402,6 +402,14 @@ struct ServerState {
     /// counter state isolated per `ServerState` instance and
     /// makes unit tests cheap.
     metrics: Arc<crate::metrics::Registry>,
+    /// Shared kick signal for the merge-poller loop. The macOS app
+    /// fires [`FrontendRequest::KickPrReconcilers`] on window
+    /// activation; the handler calls `notify_one()` here so the
+    /// poller's next wait arm resolves immediately (subject to the
+    /// 15 s engine-side quiesce window). `None` only between
+    /// `new_arc` return and the first `spawn_merge_poller` call in
+    /// `serve` — that window is < 1 ms in production.
+    pr_reconciler_kick: Arc<Notify>,
 }
 
 /// Authorization tier for a frontend RPC.
@@ -666,6 +674,8 @@ impl ServerState {
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();
         let metrics_for_coordinator = metrics_registry.clone();
+        let pr_reconciler_kick = Arc::new(Notify::new());
+        let pr_reconciler_kick_for_state = pr_reconciler_kick.clone();
 
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -750,6 +760,7 @@ impl ServerState {
                 feature_flags: feature_flags_for_state,
                 settings: settings_for_state,
                 metrics: metrics_for_state,
+                pr_reconciler_kick: pr_reconciler_kick_for_state,
             }
         });
 
@@ -2142,6 +2153,7 @@ pub async fn serve(
         server_state.completion_handler.clone(),
         Duration::from_secs(60),
         server_state.metrics.clone(),
+        server_state.pr_reconciler_kick.clone(),
     );
 
     // Periodic orphan-active reconciler: re-dispatches `active` work
@@ -5144,6 +5156,15 @@ async fn handle_frontend_connection(
                     &sink,
                     &request_id,
                     FrontendEvent::MetricsResetDone { name, counters_reset, gauges_reset },
+                );
+            }
+            FrontendRequest::KickPrReconcilers => {
+                server_state.pr_reconciler_kick.notify_one();
+                tracing::debug!("merge poller: activation kick received from app");
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::PrReconcilersKicked { kicked: true },
                 );
             }
             FrontendRequest::SetProjectDesignDoc { input } => {

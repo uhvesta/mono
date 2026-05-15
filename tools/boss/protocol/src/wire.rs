@@ -550,6 +550,14 @@ pub enum FrontendRequest {
     /// until the next flush. Replies with
     /// [`FrontendEvent::MetricsResetDone`].
     MetricsReset { name: Option<String> },
+    /// App sends this when its window becomes active (user switching back
+    /// from another app, e.g. after reviewing a PR on GitHub). The engine
+    /// schedules an immediate pass of every PR-state reconciler so the
+    /// kanban reflects upstream changes without waiting for the next
+    /// periodic tick. Engine-side quiescing (15 s window) prevents
+    /// repeated GitHub API calls on rapid focus-toggle events.
+    /// Replies with [`FrontendEvent::PrReconcilersKicked`].
+    KickPrReconcilers,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1045,6 +1053,12 @@ pub enum FrontendEvent {
         counters_reset: u64,
         gauges_reset: u64,
     },
+    /// Response to [`FrontendRequest::KickPrReconcilers`]. `kicked`
+    /// is `true` when the engine forwarded the signal to the merge
+    /// poller; `false` when the kick was dropped because the engine
+    /// has not yet started the poller (race at startup — treat as a
+    /// no-op).
+    PrReconcilersKicked { kicked: bool },
 }
 
 /// Snapshot of one feature flag's static metadata + current value.
