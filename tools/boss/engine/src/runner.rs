@@ -1223,6 +1223,7 @@ mod compose_prompt_tests {
             finished_at: None,
             pre_start_failure_count: 0,
             dispatch_not_before: None,
+            pr_url: None,
         }
     }
 
