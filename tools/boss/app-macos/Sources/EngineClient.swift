@@ -149,6 +149,10 @@ enum EngineEvent {
     /// persisted the new value. The Settings window uses this as the
     /// "saved" signal.
     case settingSet(key: String, enabled: Bool)
+    /// Response to `metrics_list_live` — bulk snapshot of every
+    /// registered engine counter and gauge, sorted by name. Drives the
+    /// Metrics debug pane's initial load and its polling timer.
+    case metricsListLiveResult(entries: [EngineMetric])
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -260,6 +264,13 @@ final class EngineClient: @unchecked Sendable {
             "key": key,
             "enabled": enabled,
         ])
+    }
+
+    /// Ask the engine for a live snapshot of every registered metric.
+    /// Used by the Metrics debug pane on appear and on its 5-second
+    /// polling timer so values refresh without a manual reload.
+    func sendMetricsListLive() {
+        sendLine(["type": "metrics_list_live"])
     }
 
     /// Ask the engine for the registered feature-flag set. Used by
@@ -900,6 +911,10 @@ final class EngineClient: @unchecked Sendable {
                 if !key.isEmpty {
                     emit(.settingSet(key: key, enabled: enabled))
                 }
+            case "metrics_list_live_result":
+                let raw = payload["entries"] as? [[String: Any]] ?? []
+                let entries = raw.compactMap(parseEngineMetric)
+                emit(.metricsListLiveResult(entries: entries))
             default:
                 break
             }
@@ -1177,6 +1192,28 @@ final class EngineClient: @unchecked Sendable {
             description: description,
             defaultEnabled: defaultEnabled,
             enabled: enabled
+        )
+    }
+
+    private func parseEngineMetric(_ payload: [String: Any]) -> EngineMetric? {
+        guard
+            let name = payload["name"] as? String,
+            !name.isEmpty,
+            let description = payload["description"] as? String,
+            let kind = payload["kind"] as? String,
+            let value = (payload["value"] as? NSNumber)?.int64Value,
+            let timestampMs = (payload["timestamp_ms"] as? NSNumber)?.int64Value
+        else {
+            return nil
+        }
+        let stale = (payload["stale"] as? NSNumber)?.boolValue ?? false
+        return EngineMetric(
+            name: name,
+            description: description,
+            kind: kind,
+            value: value,
+            timestampMs: timestampMs,
+            stale: stale
         )
     }
 }

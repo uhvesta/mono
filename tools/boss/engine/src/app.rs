@@ -5074,6 +5074,35 @@ async fn handle_frontend_connection(
                     FrontendEvent::MetricsShowLiveResult { entry },
                 );
             }
+            FrontendRequest::MetricsListLive => {
+                let mut entries: Vec<boss_protocol::MetricLiveEntry> = Vec::new();
+                for snap in server_state.metrics.counter_snapshots() {
+                    entries.push(boss_protocol::MetricLiveEntry {
+                        name: snap.name,
+                        description: snap.description,
+                        kind: "counter".into(),
+                        value: snap.value as i64,
+                        timestamp_ms: snap.updated_at_ms,
+                        stale: snap.stale,
+                    });
+                }
+                for snap in server_state.metrics.gauge_snapshots() {
+                    entries.push(boss_protocol::MetricLiveEntry {
+                        name: snap.name,
+                        description: snap.description,
+                        kind: "gauge".into(),
+                        value: snap.value,
+                        timestamp_ms: snap.observed_at_ms,
+                        stale: snap.stale,
+                    });
+                }
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::MetricsListLiveResult { entries },
+                );
+            }
             FrontendRequest::MetricsReset { name } => {
                 let now = crate::metrics::registry::now_ms();
                 let (counters_reset, gauges_reset) = match &name {

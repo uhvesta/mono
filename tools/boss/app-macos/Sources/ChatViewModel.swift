@@ -94,6 +94,12 @@ final class ChatViewModel: ObservableObject {
     /// first opened in this session.
     @Published var engineSettings: [EngineSetting] = []
 
+    /// Engine metrics snapshot — every registered counter and gauge —
+    /// sourced from `metrics_list_live` on Metrics pane open and
+    /// refreshed by the pane's 5-second polling timer. Empty until the
+    /// pane has been opened in this session.
+    @Published var engineMetrics: [EngineMetric] = []
+
     /// Engine feature-flag snapshot, sourced from `list_feature_flags`
     /// on debug-pane open and kept in sync via `feature_flag_set`
     /// echoes after every toggle. Backs the Feature Flags window
@@ -231,6 +237,13 @@ final class ChatViewModel: ObservableObject {
             )
         }
         engine.sendSetSetting(key: key, enabled: enabled)
+    }
+
+    /// Ask the engine for a fresh snapshot of every registered metric.
+    /// Called by the Metrics debug pane on appear and by its 5-second
+    /// polling timer so values refresh without a manual reload.
+    func refreshMetrics() {
+        engine.sendMetricsListLive()
     }
 
     /// Ask the engine for the current feature-flag snapshot. Called by
@@ -1218,6 +1231,8 @@ final class ChatViewModel: ObservableObject {
                     enabled: enabled
                 )
             }
+        case .metricsListLiveResult(let entries):
+            engineMetrics = entries
         case .projectDesignDocResolved(let output):
             designDocStateByProjectID[output.projectID] = output.state
         case .conflictResolutionsList(let attempts):

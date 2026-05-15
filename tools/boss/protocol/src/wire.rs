@@ -533,6 +533,15 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::MetricsShowLiveResult`]; `entry` is `None`
     /// when no counter or gauge with `name` is registered.
     MetricsShowLive { name: String },
+    /// Bulk snapshot of every registered counter and gauge, bypassing
+    /// the 30s flush-staleness window. Used by the macOS app's Metrics
+    /// debug pane to render a full listing in one round-trip instead of
+    /// one `MetricsShowLive` call per metric. Replies with
+    /// [`FrontendEvent::MetricsListLiveResult`]. Includes stale
+    /// (rehydrated from `state.db` but no current handle) entries so
+    /// the pane can surface historical counters that no longer exist in
+    /// the running binary.
+    MetricsListLive,
     /// Reset one or all counter / gauge values to zero — both
     /// in-memory and in `state.db` — in a single atomic step.
     /// `name = None` means "reset everything". Routes through engine
@@ -1020,6 +1029,13 @@ pub enum FrontendEvent {
     /// counter or gauge with that name is registered in the current
     /// engine binary.
     MetricsShowLiveResult { entry: Option<MetricLiveEntry> },
+    /// Response to [`FrontendRequest::MetricsListLive`]: every
+    /// registered counter and gauge as a flat list, sorted by name.
+    /// Stale entries (rehydrated from `state.db` but no matching
+    /// handle in the current binary) are included so the debug pane
+    /// can surface historical values. Counters and gauges are
+    /// interleaved in name order — the `kind` field distinguishes them.
+    MetricsListLiveResult { entries: Vec<MetricLiveEntry> },
     /// Response to [`FrontendRequest::MetricsReset`]. Reports how
     /// many counters and gauges were zeroed so the caller can print a
     /// meaningful confirmation. `name = None` means "all" was
@@ -1202,6 +1218,54 @@ mod feature_flags_wire_tests {
             FrontendEvent::FeatureFlagSet { name, enabled } => {
                 assert_eq!(name, "detect_pr_cold_fallback");
                 assert!(enabled);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_list_live_request_round_trips() {
+        let original = FrontendRequest::MetricsListLive;
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("metrics_list_live"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, FrontendRequest::MetricsListLive));
+    }
+
+    #[test]
+    fn metrics_list_live_result_event_round_trips() {
+        let entries = vec![
+            MetricLiveEntry {
+                name: "a.counter".into(),
+                description: "a counter".into(),
+                kind: "counter".into(),
+                value: 7,
+                timestamp_ms: 1_700_000_000_000,
+                stale: false,
+            },
+            MetricLiveEntry {
+                name: "b.gauge".into(),
+                description: "a gauge".into(),
+                kind: "gauge".into(),
+                value: -3,
+                timestamp_ms: 1_700_000_001_000,
+                stale: true,
+            },
+        ];
+        let original =
+            FrontendEvent::MetricsListLiveResult { entries: entries.clone() };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("metrics_list_live_result"), "serialized: {json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::MetricsListLiveResult { entries: parsed_entries } => {
+                assert_eq!(parsed_entries.len(), 2);
+                assert_eq!(parsed_entries[0].name, "a.counter");
+                assert_eq!(parsed_entries[0].value, 7);
+                assert!(!parsed_entries[0].stale);
+                assert_eq!(parsed_entries[1].name, "b.gauge");
+                assert_eq!(parsed_entries[1].value, -3);
+                assert!(parsed_entries[1].stale);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
