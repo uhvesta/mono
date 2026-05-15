@@ -1423,17 +1423,18 @@ struct WorkBoardCardView: View {
             }
 
             if let prURL = task.prURL, !prURL.isEmpty {
-                PRURLLink(urlString: prURL, font: .caption)
-            }
-
-            if task.prURL != nil, ciRequiredState != nil || reviewRequiredState != nil {
-                HStack(spacing: 6) {
+                HStack(alignment: .center, spacing: 6) {
                     if let ciState = ciRequiredState {
                         PrCiIndicator(state: ciState, detail: ciRequiredDetail)
                     }
-                    if let reviewState = reviewRequiredState {
-                        PrReviewIndicator(state: reviewState, detail: reviewRequiredDetail)
-                    }
+                    PRURLLink(urlString: prURL, font: .caption)
+                    Spacer(minLength: 0)
+                }
+            }
+
+            if task.prURL != nil, let reviewState = reviewRequiredState {
+                HStack(spacing: 6) {
+                    PrReviewIndicator(state: reviewState, detail: reviewRequiredDetail)
                     Spacer(minLength: 0)
                 }
             }
