@@ -365,6 +365,13 @@ struct ContentView: View {
                         .onTapGesture {
                             model.toggleProjectFilter(project.id)
                         }
+                        .contextMenu {
+                            if !isArchived {
+                                Button("Archive") {
+                                    model.archiveProject(id: project.id)
+                                }
+                            }
+                        }
                     }
                 } header: {
                     workSidebarSectionTitle("Projects")

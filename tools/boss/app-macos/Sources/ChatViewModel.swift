@@ -544,6 +544,10 @@ final class ChatViewModel: ObservableObject {
         persistProjectFilterIDs()
     }
 
+    func archiveProject(id: String) {
+        engine.sendUpdateWorkItem(id: id, patch: ["status": "archived"])
+    }
+
     func setIncludeChores(_ value: Bool) {
         guard includeChores != value else { return }
         includeChores = value
