@@ -2692,6 +2692,7 @@ async fn dispatch_live_worker_state(
         }
         crate::protocol::WorkerEvent::PostToolUse {
             tool_name,
+            tool_input,
             tool_response,
             ..
         } => {
@@ -2704,11 +2705,27 @@ async fn dispatch_live_worker_state(
             // on stdout. Catch it here, stage against the
             // execution_id, and the on-Stop handler picks it up
             // without ever shelling out to `jj log` to reconstruct
-            // it. Cheap regex scan — runs only on Bash events.
+            // it.
+            //
+            // Layer-1 gate: only capture URLs from deliberate `gh pr`
+            // invocations. Arbitrary Bash output (file reads, test
+            // runs, chore descriptions printed via shell) can contain
+            // PR URLs from unrelated executions; filtering by command
+            // prevents those from staging the wrong PR.
             if tool_name == "Bash" {
+                // Check for any PR URL first so we can log a rejection
+                // when the command isn't a gh pr invocation.
                 if let Some(pr_url) =
                     crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response)
                 {
+                    if !crate::pr_url_capture::is_gh_pr_command(tool_input) {
+                        tracing::info!(
+                            execution_id = run_id,
+                            rejected_url = %pr_url,
+                            reason = "not_a_gh_pr_command",
+                            "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
+                        );
+                    } else {
                     // Gate the URL against the product's repo before
                     // staging. Workers running tests can emit fixture
                     // URLs (e.g. `https://github.com/foo/bar/pull/42`)
@@ -2771,6 +2788,7 @@ async fn dispatch_live_worker_state(
                             }
                         }
                     }
+                    } // else (is_gh_pr_command)
                 }
             }
         }

@@ -668,6 +668,7 @@ mod tests {
             "pr_url_capture.primary_path.hit",
             "pr_url_capture.reconstruction_path.hit",
             "pr_url_capture.reconstruction_path.failed",
+            "pr_url_capture.recheck_staged.branch_mismatch",
         ] {
             assert!(
                 names.contains(&expected.to_owned()),
@@ -704,7 +705,7 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        assert_eq!(names.len(), 21, "expected 3 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 6 merge_poller counters");
+        assert_eq!(names.len(), 22, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 6 merge_poller counters");
         // Phase 3: dep_unblock gauge.
         let gauge_names: Vec<_> = registry
             .gauge_snapshots()

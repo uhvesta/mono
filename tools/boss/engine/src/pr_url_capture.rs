@@ -145,6 +145,34 @@ pub fn extract_pr_url_from_bash_response(tool_response: &serde_json::Value) -> O
     scan("stdout").or_else(|| scan("stderr"))
 }
 
+/// Check whether a Bash `tool_input` command is a deliberate `gh pr`
+/// invocation (create, view, list, or edit).
+///
+/// Returns `true` only when the Bash command string contains a
+/// `gh pr <subcommand>` pattern, where the subcommand is one of the
+/// forms that can legitimately surface a PR URL for the worker's own
+/// PR. Handles environment-variable prefixes such as
+/// `GIT_DIR=.jj/repo/store/git gh pr create ...` by scanning the
+/// full command string rather than just the first token.
+///
+/// Use this as the Layer-1 gate in the PostToolUse capture path:
+/// arbitrary Bash commands whose output happens to contain a PR URL
+/// (file reads, test runs, chore descriptions echoed via shell) must
+/// not stage a wrong PR against the running execution.
+pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
+    let command = match tool_input.get("command").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return false,
+    };
+    const GH_PR_SUBCOMMANDS: &[&str] = &[
+        "gh pr create",
+        "gh pr view",
+        "gh pr list",
+        "gh pr edit",
+    ];
+    GH_PR_SUBCOMMANDS.iter().any(|sub| command.contains(sub))
+}
+
 /// Outcome of [`StagedPrUrlCache::record_if_unset`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagePrUrlOutcome {
@@ -438,6 +466,78 @@ mod tests {
         cache.forget("never-staged");
         cache.forget("never-staged");
         assert_eq!(cache.get("never-staged"), None);
+    }
+
+    // ── is_gh_pr_command ──────────────────────────────────────────
+
+    #[test]
+    fn gh_pr_create_is_a_gh_pr_command() {
+        assert!(is_gh_pr_command(&json!({
+            "command": "gh pr create --head boss/exec_abc --base main --title 'fix: something'"
+        })));
+    }
+
+    #[test]
+    fn gh_pr_create_with_git_dir_prefix_is_a_gh_pr_command() {
+        // Workers use GIT_DIR=.jj/repo/store/git because jj-backed
+        // workspaces lack a top-level .git directory.
+        assert!(is_gh_pr_command(&json!({
+            "command": "GIT_DIR=.jj/repo/store/git gh pr create --head boss/exec_abc --base main"
+        })));
+    }
+
+    #[test]
+    fn gh_pr_view_is_a_gh_pr_command() {
+        assert!(is_gh_pr_command(&json!({
+            "command": "GIT_DIR=.jj/repo/store/git gh pr view"
+        })));
+    }
+
+    #[test]
+    fn gh_pr_list_is_a_gh_pr_command() {
+        assert!(is_gh_pr_command(&json!({ "command": "gh pr list --state open" })));
+    }
+
+    #[test]
+    fn gh_pr_edit_is_a_gh_pr_command() {
+        assert!(is_gh_pr_command(&json!({ "command": "gh pr edit 42 --add-label foo" })));
+    }
+
+    #[test]
+    fn non_gh_command_is_not_a_gh_pr_command() {
+        // Bash command that outputs PR URLs (e.g. reading a chore
+        // description that mentions a prior PR) must not trigger capture.
+        assert!(!is_gh_pr_command(&json!({
+            "command": "bossctl task show task_123"
+        })));
+    }
+
+    #[test]
+    fn cat_command_with_pr_url_content_is_not_a_gh_pr_command() {
+        assert!(!is_gh_pr_command(&json!({ "command": "cat chore.md" })));
+    }
+
+    #[test]
+    fn grep_command_is_not_a_gh_pr_command() {
+        assert!(!is_gh_pr_command(&json!({
+            "command": "grep -r 'pull/' . | head -5"
+        })));
+    }
+
+    #[test]
+    fn gh_issue_is_not_a_gh_pr_command() {
+        // `gh issue` is not a PR command.
+        assert!(!is_gh_pr_command(&json!({ "command": "gh issue list" })));
+    }
+
+    #[test]
+    fn missing_command_field_returns_false() {
+        assert!(!is_gh_pr_command(&json!({ "timeout": 30000 })));
+    }
+
+    #[test]
+    fn null_tool_input_returns_false() {
+        assert!(!is_gh_pr_command(&json!(null)));
     }
 
     // ── validate_pr_url ───────────────────────────────────────────
