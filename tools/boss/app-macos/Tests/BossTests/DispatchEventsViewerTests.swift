@@ -65,6 +65,8 @@ final class DispatchEventsViewerModelFilterTests: XCTestCase {
             cubeLeaseId: nil,
             cubeWorkspaceId: nil,
             errorMessage: error,
+            cubeCommand: nil,
+            cubeCwd: nil,
             detailsJSON: nil
         )
     }

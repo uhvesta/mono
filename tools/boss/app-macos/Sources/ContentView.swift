@@ -345,15 +345,19 @@ struct ContentView: View {
                     ForEach(model.projectsForSelectedProduct) { project in
                         let isOn = model.selectedProjectFilterIDs.contains(project.id)
                         let isArchived = project.status == "archived"
+                        let unblocked = model.unblockedTaskCount(forProjectID: project.id)
+                        let blocked = model.blockedTaskCount(forProjectID: project.id)
                         WorkSidebarFilterRow(
                             title: project.name,
                             subtitle: project.shortID.map { "P\($0)" },
                             systemImage: isArchived ? "archivebox" : "folder",
                             isSelected: isOn,
-                            trailing: project.status.capitalized,
+                            trailing: nil,
                             showsCheckbox: true,
                             isCheckboxOn: isOn,
-                            dimmed: isArchived
+                            dimmed: isArchived,
+                            unblockedCount: unblocked > 0 ? unblocked : nil,
+                            blockedCount: blocked > 0 ? blocked : nil
                         )
                         .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
                         .listRowBackground(Color.clear)
@@ -807,6 +811,12 @@ private struct WorkSidebarFilterRow: View {
     /// they're visibly distinct from active ones when the user opts in
     /// to seeing them.
     var dimmed: Bool = false
+    /// When non-nil, a green `▶ N` chip is shown for unblocked (todo)
+    /// task count. Suppressed when nil (no unblocked tasks).
+    var unblockedCount: Int? = nil
+    /// When non-nil, a red `⏸ N` chip is shown for dependency-blocked
+    /// task count. Suppressed when nil (no dependency-blocked tasks).
+    var blockedCount: Int? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -846,6 +856,18 @@ private struct WorkSidebarFilterRow: View {
 
                     if let trailing, !trailing.isEmpty {
                         WorkStatusBadge(text: trailing, emphasized: isSelected)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(2)
+                            .opacity(dimmed ? 0.65 : 1.0)
+                    }
+                    if let unblockedCount {
+                        ProjectTaskCountChip(count: unblockedCount, kind: .unblocked)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(2)
+                            .opacity(dimmed ? 0.65 : 1.0)
+                    }
+                    if let blockedCount {
+                        ProjectTaskCountChip(count: blockedCount, kind: .blocked)
                             .fixedSize(horizontal: true, vertical: false)
                             .layoutPriority(2)
                             .opacity(dimmed ? 0.65 : 1.0)
@@ -2823,6 +2845,61 @@ private struct WorkStatusBadge: View {
             return Color.white.opacity(0.96)
         }
         return Color(nsColor: .controlBackgroundColor)
+    }
+}
+
+/// Compact count chip for the navigator project row. Shows the number
+/// of unblocked (green `▶ N`) or dependency-blocked (red `⏸ N`) tasks
+/// for a project. Color + symbol ensures the chip is meaningful for
+/// color-blind users. Visual weight deliberately subordinate to the
+/// project name — matches the `T<n>` / `P<n>` chip treatment.
+private struct ProjectTaskCountChip: View {
+    enum Kind {
+        case unblocked
+        case blocked
+    }
+
+    let count: Int
+    let kind: Kind
+
+    var body: some View {
+        Text(label)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(foregroundColor)
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(backgroundColor)
+            .clipShape(Capsule())
+            .help(helpText)
+    }
+
+    private var label: String {
+        switch kind {
+        case .unblocked: return "▶ \(count)"
+        case .blocked: return "⏸ \(count)"
+        }
+    }
+
+    private var helpText: String {
+        switch kind {
+        case .unblocked: return "\(count) unblocked task\(count == 1 ? "" : "s") ready to dispatch"
+        case .blocked: return "\(count) task\(count == 1 ? "" : "s") gated by a dependency"
+        }
+    }
+
+    private var foregroundColor: Color {
+        switch kind {
+        case .unblocked: return Color(nsColor: .systemGreen)
+        case .blocked: return Color(nsColor: .systemRed)
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch kind {
+        case .unblocked: return Color(nsColor: .systemGreen).opacity(0.12)
+        case .blocked: return Color(nsColor: .systemRed).opacity(0.12)
+        }
     }
 }
 

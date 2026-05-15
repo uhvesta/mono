@@ -1436,6 +1436,22 @@ final class ChatViewModel: ObservableObject {
         return projectName(for: task.projectID)
     }
 
+    /// Count of `todo` tasks for `projectID`. A `todo` task has no
+    /// unsatisfied dependency gating it — if it did, the engine would
+    /// have set `status = "blocked"`. These are tasks ready to dispatch.
+    func unblockedTaskCount(forProjectID projectID: String) -> Int {
+        (tasksByProjectID[projectID] ?? []).filter { $0.status == "todo" }.count
+    }
+
+    /// Count of dependency-blocked tasks for `projectID`. The engine
+    /// sets `blocked_reason = "dependency"` when a task is gated by at
+    /// least one unsatisfied prerequisite edge.
+    func blockedTaskCount(forProjectID projectID: String) -> Int {
+        (tasksByProjectID[projectID] ?? []).filter {
+            $0.status == "blocked" && $0.blockedReason == "dependency"
+        }.count
+    }
+
     /// Repo-chip mode for the kanban under the currently selected
     /// product. Drives both the product-header chip (single-repo) and
     /// the per-card chip (multi-repo) per design Q7. Computed off the
