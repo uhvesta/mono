@@ -396,53 +396,62 @@ pub async fn on_resolved(
     // design (Q5) requires both to happen even if one of them has
     // already been moved by a concurrent path (manual override, on-Stop
     // completion, etc.).
+    //
+    // For a `pending` attempt (PR resolved before the worker started) we
+    // only call mark_conflict_resolution_succeeded when the parent task was
+    // also cleared in this call.  If task_transitioned is false the attempt
+    // is either stale (idempotent second probe) or the task was moved by a
+    // human — in both cases we leave the attempt alone.
     let mut attempt_transitioned = false;
     if let Some(attempt) = attempt.as_ref() {
-        match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
-            Ok(Some(succeeded)) => {
-                attempt_transitioned = true;
-                // Release the cube workspace lease the attempt owned.
-                // Idempotent on the cube side — the lease may already
-                // have been released by the worker's on-Stop completion
-                // path, in which case cube returns a benign error that
-                // we log at debug.
-                if let (Some(client), Some(lease_id)) =
-                    (cube_client, succeeded.cube_lease_id.as_deref())
-                {
-                    if let Err(err) = client.release_workspace(lease_id).await {
-                        tracing::debug!(
-                            attempt_id = %succeeded.id,
-                            lease_id,
-                            ?err,
-                            "conflict_watch: lease release on retire failed (likely already released)",
-                        );
+        let should_succeed = attempt.status == "running" || task_transitioned;
+        if should_succeed {
+            match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
+                Ok(Some(succeeded)) => {
+                    attempt_transitioned = true;
+                    // Release the cube workspace lease the attempt owned.
+                    // Idempotent on the cube side — the lease may already
+                    // have been released by the worker's on-Stop completion
+                    // path, in which case cube returns a benign error that
+                    // we log at debug.
+                    if let (Some(client), Some(lease_id)) =
+                        (cube_client, succeeded.cube_lease_id.as_deref())
+                    {
+                        if let Err(err) = client.release_workspace(lease_id).await {
+                            tracing::debug!(
+                                attempt_id = %succeeded.id,
+                                lease_id,
+                                ?err,
+                                "conflict_watch: lease release on retire failed (likely already released)",
+                            );
+                        }
                     }
+                    publisher
+                        .publish_frontend_event_on_product(
+                            &candidate.product_id,
+                            FrontendEvent::ConflictResolutionSucceeded {
+                                product_id: candidate.product_id.clone(),
+                                work_item_id: candidate.work_item_id.clone(),
+                                attempt_id: succeeded.id.clone(),
+                                pr_url: candidate.pr_url.clone(),
+                            },
+                        )
+                        .await;
                 }
-                publisher
-                    .publish_frontend_event_on_product(
-                        &candidate.product_id,
-                        FrontendEvent::ConflictResolutionSucceeded {
-                            product_id: candidate.product_id.clone(),
-                            work_item_id: candidate.work_item_id.clone(),
-                            attempt_id: succeeded.id.clone(),
-                            pr_url: candidate.pr_url.clone(),
-                        },
-                    )
-                    .await;
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    attempt_id = %attempt.id,
-                    work_item_id = %candidate.work_item_id,
-                    "conflict_watch: attempt row already terminal; skipping succeeded UPDATE",
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    ?err,
-                    "conflict_watch: failed to mark conflict_resolution succeeded",
-                );
+                Ok(None) => {
+                    tracing::debug!(
+                        attempt_id = %attempt.id,
+                        work_item_id = %candidate.work_item_id,
+                        "conflict_watch: attempt row already terminal; skipping succeeded UPDATE",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        ?err,
+                        "conflict_watch: failed to mark conflict_resolution succeeded",
+                    );
+                }
             }
         }
     }

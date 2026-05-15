@@ -4324,12 +4324,13 @@ impl WorkDb {
         Ok(updated)
     }
 
-    /// Auto-retire transition: flip an attempt from `running` to
-    /// `succeeded`, stamping `head_sha_after` if known and a fresh
+    /// Auto-retire transition: flip an attempt from `pending` or `running`
+    /// to `succeeded`, stamping `head_sha_after` if known and a fresh
     /// `finished_at`. Idempotent — a second call with the row already
     /// terminal returns `Ok(None)` and writes nothing. Phase 4 / design
     /// Q5: invoked by the merge poller's `on_resolved` path when
-    /// GitHub reports the PR mergeable again.
+    /// GitHub reports the PR mergeable again.  Accepting `pending` covers
+    /// the case where the PR becomes clean again before the worker starts.
     pub fn mark_conflict_resolution_succeeded(
         &self,
         attempt_id: &str,
@@ -4344,7 +4345,7 @@ impl WorkDb {
                     head_sha_after = COALESCE(?2, head_sha_after),
                     finished_at    = COALESCE(finished_at, ?3)
               WHERE id = ?1
-                AND status = 'running'",
+                AND status IN ('pending', 'running')",
             params![attempt_id, head_sha_after, now],
         )?;
         if rows == 0 {
@@ -14973,7 +14974,11 @@ mod tests {
     fn concurrent_writes_do_not_return_database_locked() {
         const WORKERS: usize = 8;
 
-        let path = temp_db_path("concurrent-writes");
+        // Must use an on-disk database: WAL mode (which serialises
+        // concurrent writers via busy_timeout) is incompatible with
+        // SQLite's shared-cache in-memory mode, causing
+        // SQLITE_LOCKED_SHAREDCACHE errors that busy_timeout cannot retry.
+        let path = disk_db_path("concurrent-writes");
         let db = std::sync::Arc::new(WorkDb::open(path.clone()).unwrap());
 
         let product = db
@@ -15757,7 +15762,10 @@ mod tests {
     /// gap-free ids starting at 1.
     #[test]
     fn allocator_concurrent_inserts_produce_distinct_short_ids() {
-        let path = temp_db_path("short-id-concurrent");
+        // Must use an on-disk database: WAL mode (which serialises
+        // concurrent writers via busy_timeout) is incompatible with
+        // SQLite's shared-cache in-memory mode.
+        let path = disk_db_path("short-id-concurrent");
         let db = WorkDb::open(path.clone()).unwrap();
         let product = db
             .create_product(CreateProductInput {
@@ -15823,7 +15831,9 @@ mod tests {
         assert_eq!(next, N as i64 + 1);
 
         drop(conn);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 
     /// Two products run independent sequences: each starts at 1, and

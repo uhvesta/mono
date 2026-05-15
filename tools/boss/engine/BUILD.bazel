@@ -88,6 +88,11 @@ rust_test(
     crate = ":engine_lib",
     edition = "2024",
     size = "small",
+    # HOME must be set so cube_default_workspace_root_for_test (and the
+    # production workspace_root_is_cube_default helper it mirrors) can
+    # compute the expected path.  Bazel's sandbox does not inherit HOME
+    # from the host environment, so we provide a stable sentinel value.
+    env = {"HOME": "/tmp"},
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
