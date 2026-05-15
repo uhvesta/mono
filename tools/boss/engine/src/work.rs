@@ -14671,6 +14671,49 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Regression for Bug A: SSH-form remote URLs (`git@github.com:owner/repo.git`)
+    /// must produce a non-null `raw_content_url`. The resolver inherits the
+    /// product's `repo_remote_url` when `design_doc_repo_remote_url` is unset;
+    /// if that URL is in SCP/SSH form the raw URL builder must still work.
+    /// The test uses a non-main `design_doc_branch` to simulate an in-review
+    /// design PR — the branch must appear in the raw URL, not "main".
+    #[test]
+    fn resolve_project_design_doc_raw_content_url_built_for_ssh_remote_on_pr_branch() {
+        let path = temp_db_path("resolve-raw-content-ssh-pr-branch");
+        let db = WorkDb::open(path.clone()).unwrap();
+        // seed_project_for_design_doc uses `git@github.com:spinyfin/mono.git` (SSH form).
+        let (_, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: None, // inherit SSH URL from product
+            design_doc_branch: Some("design-boss-ci-buildkite".to_owned()),
+            design_doc_path: Some("tools/boss/docs/designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+
+        let resolved = db
+            .resolve_project_design_doc(&project.id, |_| None)
+            .unwrap();
+        let ProjectDesignDocState::Resolved { raw_content_url, web_url, .. } = resolved.state
+        else {
+            panic!("expected Resolved, got {:?}", resolved.state);
+        };
+
+        assert_eq!(
+            raw_content_url.as_deref(),
+            Some("https://raw.githubusercontent.com/spinyfin/mono/design-boss-ci-buildkite/tools/boss/docs/designs/foo.md"),
+            "SSH remote URL must produce a raw_content_url on a non-main branch"
+        );
+        assert_eq!(
+            web_url,
+            "https://github.com/spinyfin/mono/blob/design-boss-ci-buildkite/tools/boss/docs/designs/foo.md",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn resolve_project_design_doc_surfaces_broken_when_no_repo() {
         let path = temp_db_path("resolve-broken");
