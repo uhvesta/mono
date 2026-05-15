@@ -663,6 +663,28 @@ mod tests {
             .into_iter()
             .map(|s| s.name)
             .collect();
+        // Phase 3: PR URL capture counters.
+        for expected in [
+            "pr_url_capture.primary_path.hit",
+            "pr_url_capture.reconstruction_path.hit",
+            "pr_url_capture.reconstruction_path.failed",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
+        // Phase 3: cube workspace lease counters.
+        for expected in [
+            "cube_workspace_lease.attempts",
+            "cube_workspace_lease.success",
+            "cube_workspace_lease.failure",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         // Phase 4: dispatcher counters.
         assert!(
             names.iter().any(|n| n == "dispatcher.hook_events.total"),
@@ -682,8 +704,18 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        assert_eq!(names.len(), 15, "expected 9 dispatcher + 6 merge_poller counters");
-        assert!(registry.gauge_snapshots().is_empty());
+        assert_eq!(names.len(), 21, "expected 3 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 6 merge_poller counters");
+        // Phase 3: dep_unblock gauge.
+        let gauge_names: Vec<_> = registry
+            .gauge_snapshots()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            gauge_names,
+            vec!["dependency_unblock.longest_stale_seconds"],
+            "init_all must register the dep_unblock gauge",
+        );
     }
 
     #[test]

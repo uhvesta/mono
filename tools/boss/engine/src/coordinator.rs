@@ -17,10 +17,36 @@ use crate::conflict_diagnosis;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
+use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{
     CreateAttentionItemInput, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun,
 };
+
+// Phase-3 counter handles for the cube workspace lease boundary.
+crate::register_counter!(
+    CUBE_WORKSPACE_LEASE_ATTEMPTS,
+    "cube_workspace_lease.attempts",
+    "Number of cube workspace lease invocations attempted (each fallback counts separately).",
+);
+crate::register_counter!(
+    CUBE_WORKSPACE_LEASE_SUCCESS,
+    "cube_workspace_lease.success",
+    "Number of cube workspace lease invocations that succeeded.",
+);
+crate::register_counter!(
+    CUBE_WORKSPACE_LEASE_FAILURE,
+    "cube_workspace_lease.failure",
+    "Number of cube workspace lease sequences that exhausted all attempts and failed.",
+);
+
+/// Register all cube-workspace-lease counter handles with `registry`. Called
+/// from [`crate::metrics::init_all`] at engine startup.
+pub fn register_metrics(registry: &Registry) {
+    registry.register_counter(&CUBE_WORKSPACE_LEASE_ATTEMPTS);
+    registry.register_counter(&CUBE_WORKSPACE_LEASE_SUCCESS);
+    registry.register_counter(&CUBE_WORKSPACE_LEASE_FAILURE);
+}
 
 /// Hard cap on the worker pool. The runtime config can request a smaller
 /// pool, but values above this are clamped (with a warning). The V2
@@ -857,6 +883,11 @@ pub struct ExecutionCoordinator {
     /// Defaults to [`PRE_START_RETRY_DELAYS`]. Tests may override via
     /// [`Self::with_pre_start_retry_delays`] to avoid real sleeps.
     pre_start_retry_delays: Vec<Duration>,
+    /// Engine-wide counter registry. Defaults to a fresh local registry
+    /// with the lease counters pre-registered so tests that do not call
+    /// `set_metrics` still get valid increments. Production wires in the
+    /// shared engine registry via `set_metrics` after construction.
+    metrics: Arc<Registry>,
 }
 
 impl ExecutionCoordinator {
@@ -882,6 +913,11 @@ impl ExecutionCoordinator {
         execution_runner: Arc<dyn ExecutionRunner>,
         publisher: Arc<dyn ExecutionPublisher>,
     ) -> Self {
+        // Build a local registry for tests that never call `set_metrics`.
+        // Pre-register the lease counter handles so `.inc()` never panics
+        // on "counter not registered" in a test context.
+        let local_metrics = Arc::new(Registry::new());
+        register_metrics(&local_metrics);
         Self {
             work_db,
             worker_pool,
@@ -893,7 +929,17 @@ impl ExecutionCoordinator {
             scheduling_pending: AtomicBool::new(false),
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
             pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
+            metrics: local_metrics,
         }
+    }
+
+    /// Wire the engine-global metrics registry into this coordinator.
+    /// `app.rs` calls this once after `init_all` has registered the
+    /// lease counter handles. Tests that omit this call use a pre-seeded
+    /// local registry (created in `with_publisher`) so counter increments
+    /// never panic.
+    pub fn set_metrics(&mut self, metrics: Arc<Registry>) {
+        self.metrics = metrics;
     }
 
     /// Override the pre-start retry delay schedule. Pass an empty vec
@@ -1745,11 +1791,15 @@ impl ExecutionCoordinator {
             )
             .await;
 
+        CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         let first_err = match self
             .invoke_lease(repo, task, prefer, CUBE_LEASE_TIMEOUT)
             .await
         {
-            Ok(lease) => return Ok(lease),
+            Ok(lease) => {
+                CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
+                return Ok(lease);
+            }
             Err((reason, err)) => {
                 tracing::error!(
                     execution_id = %execution.id,
@@ -1790,6 +1840,7 @@ impl ExecutionCoordinator {
         // specific workspace (resuming prior state); silently landing on
         // a different workspace would lose continuity.
         if prefer.is_some() {
+            CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
             return Err(first_err);
         }
 
@@ -1819,11 +1870,15 @@ impl ExecutionCoordinator {
             )
             .await;
 
+        CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
             .invoke_lease(repo, task, None, CUBE_LEASE_TIMEOUT)
             .await
         {
-            Ok(lease) => Ok(lease),
+            Ok(lease) => {
+                CUBE_WORKSPACE_LEASE_SUCCESS.inc(&self.metrics);
+                Ok(lease)
+            }
             Err((reason, err)) => {
                 tracing::error!(
                     execution_id = %execution.id,
@@ -1855,6 +1910,7 @@ impl ExecutionCoordinator {
                         })),
                     )
                     .await;
+                CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
                 Err(err)
             }
         }
