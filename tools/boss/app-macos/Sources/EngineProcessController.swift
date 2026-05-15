@@ -38,29 +38,62 @@ final class EngineProcessController: @unchecked Sendable {
                 // An engine is already running. Check if its binary matches
                 // the app's bundled engine. If not, replace it so the user
                 // always gets the version that shipped with this app launch.
-                // Skip the check when BOSS_ENGINE_CMD is set — the developer
-                // is explicitly pointing at a custom engine binary.
-                let skipCheck = ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] != nil
-                if !skipCheck,
-                   let bundledPath = bundledEnginePath(),
-                   let bundledFP = computeBinaryFingerprint(path: bundledPath),
-                   let runningFP = queryRunningEngineFingerprint(
-                       socketPath: socketPath, timeoutSeconds: 3.0
-                   ),
-                   bundledFP != runningFP
-                {
-                    emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing engine pid=\(pid)")
-                    terminateProcess(pid: pid)
-                    clearPIDFileIfOwned(pid: pid)
-                    let closed = waitForSocketClose(socketPath: socketPath, timeoutSeconds: 8.0)
-                    if !closed {
-                        emit("[engine upgrade] socket did not close within 8s after SIGTERM; SIGKILL should have fired already")
+                //
+                // Each branch emits a distinct log line so a user reporting
+                // "engine wasn't restarted after I updated Boss" can grep
+                // the system messages and tell exactly which path fired:
+                //   [engine version-check skipped: <reason>] — check didn't run
+                //   [engine version-check ok] — ran, fingerprints matched
+                //   [engine upgrade] — ran, fingerprints differed, restarting
+                let reasonToSkip: String? = {
+                    if ProcessInfo.processInfo.environment["BOSS_ENGINE_CMD"] != nil {
+                        return "BOSS_ENGINE_CMD is set (developer custom engine)"
                     }
-                    emit("[engine upgrade] old engine stopped — launching new engine from bundle")
-                } else {
-                    emit("[engine attach] using existing engine pid=\(pid)")
+                    if bundledEnginePath() == nil {
+                        return "no bundled engine in app resources (dev/bazel-run mode)"
+                    }
+                    return nil
+                }()
+
+                if let reason = reasonToSkip {
+                    emit("[engine version-check skipped: \(reason)] attaching to pid=\(pid)")
                     return
                 }
+
+                // We know bundledEnginePath() is non-nil from the guard above.
+                guard let bundledPath = bundledEnginePath(),
+                      let bundledFP = computeBinaryFingerprint(path: bundledPath)
+                else {
+                    emit("[engine version-check skipped: could not fingerprint bundled engine] attaching to pid=\(pid)")
+                    return
+                }
+
+                guard let runningFP = queryRunningEngineFingerprint(
+                    socketPath: socketPath, timeoutSeconds: 3.0
+                ) else {
+                    // Engine either pre-dates GetEngineVersion or didn't
+                    // answer in time. Safe fallback is to keep it rather
+                    // than restart blindly; flag the reason explicitly so
+                    // a user investigating "did the version check fire?"
+                    // can tell the query failed versus the check was a
+                    // no-op for some other reason.
+                    emit("[engine version-check skipped: running engine did not respond to get_engine_version within 3s; likely pre-T460 binary] attaching to pid=\(pid)")
+                    return
+                }
+
+                if bundledFP == runningFP {
+                    emit("[engine version-check ok] running=\(runningFP) matches bundled — attaching to pid=\(pid)")
+                    return
+                }
+
+                emit("[engine upgrade] running=\(runningFP) bundled=\(bundledFP) — replacing engine pid=\(pid)")
+                terminateProcess(pid: pid)
+                clearPIDFileIfOwned(pid: pid)
+                let closed = waitForSocketClose(socketPath: socketPath, timeoutSeconds: 8.0)
+                if !closed {
+                    emit("[engine upgrade] socket did not close within 8s after SIGTERM; SIGKILL should have fired already")
+                }
+                emit("[engine upgrade] old engine stopped — launching new engine from bundle")
             }
 
             let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)

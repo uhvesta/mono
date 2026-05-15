@@ -557,9 +557,23 @@ impl ServerState {
         }
         // Engine build identity, logged once at startup so the user
         // can grep `live_status:` and confirm which binary is live.
+        //
+        // `build_info::init()` here is load-bearing: it pins the
+        // binary fingerprint to the engine's on-disk bytes *as they
+        // exist right now*, before any installer can replace the file
+        // out from under us. Without it, the OnceLock would populate
+        // on the first GetEngineVersion query, hashing whatever bytes
+        // happen to be on disk at that moment — and if Boss.app was
+        // updated while the engine was still running, those are the
+        // *new* bytes. The macOS app would see "fingerprint matches
+        // bundled engine" and silently attach to the stale engine
+        // instead of triggering the version-mismatch restart from
+        // T460. See `build_info::binary_fingerprint` doc comment.
+        crate::build_info::init();
         tracing::info!(
             engine_build_sha = crate::build_info::git_sha(),
             engine_build_time = crate::build_info::build_time(),
+            engine_binary_fingerprint = crate::build_info::binary_fingerprint(),
             "live_status: engine starting (build identity)",
         );
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
@@ -6443,6 +6457,85 @@ mod tests {
     fn make_session_sink() -> Arc<SessionSink> {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         Arc::new(SessionSink::new(shutdown_tx))
+    }
+
+    /// Regression guard for the version-mismatch restart path (T460
+    /// + the chore that surfaced this gap): engine startup must
+    /// call `build_info::init()` so the binary-fingerprint OnceLock
+    /// is pinned to the bytes the engine launched from. Without
+    /// this, an in-place app upgrade could rewrite the engine's
+    /// own binary on disk before the first GetEngineVersion query,
+    /// causing the running (old) engine to report the *new*
+    /// fingerprint and the app to silently attach to the stale
+    /// engine instead of restarting it.
+    #[tokio::test]
+    async fn engine_startup_eagerly_initializes_binary_fingerprint() {
+        crate::build_info::reset_eager_init_for_test();
+        let _state = test_server_state();
+        assert!(
+            crate::build_info::eager_init_called_for_test(),
+            "build_info::init() must be called during ServerState construction; \
+             removing the call breaks the macOS app version-mismatch restart path"
+        );
+    }
+
+    /// Wire-shape regression for the GetEngineVersion handler: the
+    /// macOS app sends a raw `{"request_id":"version-check",
+    /// "payload":{"type":"get_engine_version"}}` frame (no session
+    /// registration) and parses the response by reading the
+    /// top-level `request_id`, `payload.type` == "engine_version_result",
+    /// and `payload.binary_fingerprint`. If serde tags or envelope
+    /// names ever change, the Swift parser silently returns nil and
+    /// the version check is skipped — which looks just like an old
+    /// engine that doesn't speak the verb. This test holds the
+    /// contract pinned to the bytes-on-the-wire the Swift code
+    /// expects.
+    #[tokio::test]
+    async fn get_engine_version_response_matches_swift_app_parser() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let server_state = test_server_state();
+        let (engine_side, app_side) = tokio::net::UnixStream::pair().unwrap();
+        let conn = tokio::spawn(handle_frontend_connection(
+            engine_side,
+            server_state,
+            None,
+        ));
+
+        let (read_half, mut write_half) = app_side.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        // Drain the initial Hello push the engine emits on connect.
+        let mut hello = String::new();
+        reader.read_line(&mut hello).await.unwrap();
+        let hello_json: serde_json::Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(hello_json["payload"]["type"], "hello");
+
+        // Send the exact byte sequence EngineProcessController.swift
+        // emits. Using a literal here (not a Rust struct) so a serde
+        // refactor that broke wire compatibility couldn't sneak past
+        // a round-trip test.
+        let request =
+            b"{\"request_id\":\"version-check\",\"payload\":{\"type\":\"get_engine_version\"}}\n";
+        write_half.write_all(request).await.unwrap();
+        write_half.flush().await.unwrap();
+
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["request_id"], "version-check");
+        assert_eq!(parsed["payload"]["type"], "engine_version_result");
+        let fp = parsed["payload"]["binary_fingerprint"]
+            .as_str()
+            .expect("binary_fingerprint must be a string");
+        assert!(!fp.is_empty());
+        assert!(parsed["payload"]["git_sha"].is_string());
+        assert!(parsed["payload"]["build_time"].is_string());
+
+        // Drop the writer so the engine-side reader unblocks and the
+        // task exits without us having to call any shutdown verb.
+        drop(write_half);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn).await;
     }
 
     #[tokio::test]

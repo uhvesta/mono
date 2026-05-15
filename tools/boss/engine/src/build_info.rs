@@ -39,6 +39,7 @@
 //! shipped?").
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -115,6 +116,17 @@ fn binary_mtime_iso8601() -> Option<String> {
 /// fingerprint string itself when it bites (`"…-truncated"` suffix)
 /// so a mismatch isn't mistaken for two different binaries when one
 /// of them was simply over the cap.
+///
+/// IMPORTANT: callers must ensure this function is invoked at engine
+/// startup (via [`init`]) *before* any chance of the on-disk binary
+/// being replaced by an installer. The macOS app's version-mismatch
+/// restart path (T460) depends on the running engine reporting the
+/// fingerprint of the bytes it was *launched from*, not the bytes
+/// that happen to be on disk at the moment of the first query —
+/// otherwise an in-place app update silently rewrites the very file
+/// this function would read on first call, the engine reports the
+/// post-update fingerprint, the app sees a "match", and the user
+/// stays attached to the stale engine instead of getting a restart.
 pub fn binary_fingerprint() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| match compute_binary_fingerprint() {
@@ -122,6 +134,39 @@ pub fn binary_fingerprint() -> &'static str {
         None => "unknown".to_owned(),
     })
     .as_str()
+}
+
+/// Eagerly populate the OnceLock-backed identity values so subsequent
+/// reads return the values captured at engine startup, not whatever
+/// the surrounding world looks like at the moment of the first query.
+///
+/// Specifically pins [`binary_fingerprint`] to the bytes that are on
+/// disk *now*, before an installer can come along and replace them
+/// out from under a long-running engine. See `binary_fingerprint`'s
+/// doc comment for why this matters for the macOS app's version-
+/// mismatch restart path.
+///
+/// Idempotent: subsequent calls are no-ops because the underlying
+/// OnceLocks are already populated.
+pub fn init() {
+    let _ = binary_fingerprint();
+    let _ = build_time();
+    let _ = process_started_at();
+    EAGER_INIT_CALLED.store(true, Ordering::SeqCst);
+}
+
+/// Test-only flag used by `app::tests` to assert that engine startup
+/// actually called [`init`]. Production code should not read this.
+static EAGER_INIT_CALLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub fn eager_init_called_for_test() -> bool {
+    EAGER_INIT_CALLED.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub fn reset_eager_init_for_test() {
+    EAGER_INIT_CALLED.store(false, Ordering::SeqCst);
 }
 
 /// Cap on the number of bytes the fingerprinter reads from the
@@ -271,5 +316,20 @@ mod tests {
             core.chars().all(|c| c.is_ascii_hexdigit()),
             "fingerprint must be hex digits only, got {s}"
         );
+    }
+
+    #[test]
+    fn init_populates_identity_values() {
+        // The whole point of `init()` is to pin the on-disk
+        // fingerprint at engine startup. Verify it returns a real
+        // value (not the uninitialized default) and sets the flag
+        // the engine-startup regression test reads.
+        init();
+        let fp = binary_fingerprint();
+        assert!(!fp.is_empty());
+        // build_time and process_started_at should also be set.
+        assert!(!build_time().is_empty());
+        assert_eq!(process_started_at().len(), 20);
+        assert!(eager_init_called_for_test());
     }
 }
