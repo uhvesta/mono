@@ -273,6 +273,16 @@ final class EngineClient: @unchecked Sendable {
         sendLine(["type": "metrics_list_live"])
     }
 
+    /// Signal the engine that the Boss app window just became active.
+    /// The engine schedules an immediate pass of every PR-state reconciler
+    /// so the kanban reflects upstream GitHub changes (merged PRs, new
+    /// review decisions, check-status updates) without waiting for the
+    /// next periodic tick. Engine-side quiescing (15 s window) prevents
+    /// repeated GitHub API calls on rapid focus-toggle events.
+    func sendKickPrReconcilers() {
+        sendLine(["type": "kick_pr_reconcilers"])
+    }
+
     /// Ask the engine for the registered feature-flag set. Used by
     /// the Feature Flags debug pane on appear and after every toggle
     /// so the rendered state matches what the engine persisted.

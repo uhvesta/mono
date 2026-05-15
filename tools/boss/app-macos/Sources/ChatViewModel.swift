@@ -414,6 +414,9 @@ final class ChatViewModel: ObservableObject {
     /// Notification manager for Review-lane transitions. Fires a system
     /// banner when a task reaches `in_review` while the app is backgrounded.
     private let reviewNotifier = ReviewNotificationCenter()
+    #if canImport(AppKit)
+    private var appActivationObserver: NSObjectProtocol?
+    #endif
 
     /// Task IDs currently known to be in `in_review`. Populated from
     /// work-tree snapshots (without firing) on load/reconnect, and
@@ -484,6 +487,27 @@ final class ChatViewModel: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.startIfNeeded()
         }
+
+        #if canImport(AppKit)
+        // Kick PR-state reconcilers immediately when the user returns to Boss
+        // from another app (e.g. after reviewing or merging a PR on GitHub).
+        // The engine quiesces repeated kicks within a 15 s window so rapid
+        // focus-toggle events don't hammer the GitHub API.
+        //
+        // `MainActor.assumeIsolated` is safe here because we pass `queue: .main`
+        // — the closure always runs on the main queue, which is the main actor's
+        // executor.
+        appActivationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isConnected else { return }
+                self.engine.sendKickPrReconcilers()
+            }
+        }
+        #endif
     }
 
     deinit {

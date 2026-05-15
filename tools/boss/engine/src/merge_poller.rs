@@ -38,12 +38,13 @@
 
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json;
 use tokio::process::Command;
+use tokio::sync::Notify;
 
 use crate::ci_watch;
 use crate::completion::{StopOutcome, WorkerCompletionHandler};
@@ -1341,6 +1342,13 @@ pub(crate) fn parse_pr_number(pr_url: &str) -> Option<i64> {
 /// reconciled on boot. The sweep runs inside the spawned task so
 /// engine startup isn't blocked on `gh`; subsequent passes are
 /// gated behind `interval`.
+///
+/// `kick` is a shared [`Notify`] the caller can fire (via
+/// [`Notify::notify_one`]) to request an immediate out-of-band pass.
+/// Kicks received within the 15 s quiesce window after the most
+/// recent pass are silently dropped — the periodic tick will pick up
+/// the change soon enough and rapid window-toggle events don't result
+/// in repeated GitHub API calls.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     probe: Arc<dyn MergeProbe>,
@@ -1349,8 +1357,10 @@ pub fn spawn_loop(
     completion_handler: Arc<WorkerCompletionHandler>,
     interval: Duration,
     metrics: Arc<Registry>,
+    kick: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let quiesce_window = Duration::from_secs(15);
         loop {
             let outcome = run_one_pass(
                 work_db.as_ref(),
@@ -1360,6 +1370,7 @@ pub fn spawn_loop(
                 Some(completion_handler.as_ref()),
             )
             .await;
+            let last_run_at = Instant::now();
             MERGED.inc_by(&metrics, outcome.merged as u64);
             CONFLICT_FLAGGED.inc_by(&metrics, outcome.conflict_flagged as u64);
             CONFLICT_CLEARED.inc_by(&metrics, outcome.conflict_cleared as u64);
@@ -1379,7 +1390,36 @@ pub fn spawn_loop(
                     "merge poller: sweep transitions",
                 );
             }
-            tokio::time::sleep(interval).await;
+
+            // Wait for either the periodic interval or an activation kick.
+            // Kicks received within the quiesce window are silently absorbed
+            // — the inner loop keeps listening so the first kick that arrives
+            // after the window has elapsed will trigger a pass immediately.
+            'wait: loop {
+                let elapsed = last_run_at.elapsed();
+                let remaining_interval = interval.saturating_sub(elapsed);
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining_interval) => {
+                        break 'wait;
+                    }
+                    _ = kick.notified() => {
+                        let since_last = last_run_at.elapsed();
+                        if since_last >= quiesce_window {
+                            tracing::debug!(
+                                since_last_ms = since_last.as_millis(),
+                                "merge poller: activation kick → immediate sweep",
+                            );
+                            break 'wait;
+                        }
+                        tracing::debug!(
+                            since_last_ms = since_last.as_millis(),
+                            quiesce_ms = quiesce_window.as_millis(),
+                            "merge poller: kick within quiesce window, absorbing",
+                        );
+                        // continue listening; periodic sleep arm will eventually fire
+                    }
+                }
+            }
         }
     })
 }
@@ -3021,6 +3061,103 @@ mod tests {
                 .filter(|e| e.work_item_id == chore && e.kind == "conflict_resolution")
                 .count(),
             1,
+        );
+    }
+
+    /// Acceptance test for the window-activation kick quiesce logic.
+    ///
+    /// Simulates the inner `'wait` loop from `spawn_loop` directly:
+    /// - a kick that arrives immediately after a run (within the 15 s
+    ///   quiesce window) must NOT cause a second run to start.
+    /// - a kick that arrives after the quiesce window has elapsed MUST
+    ///   break out of the wait loop (i.e. trigger a new pass).
+    ///
+    /// Tested at the `select!` level rather than through `spawn_loop`
+    /// to avoid the dependency on a fully-constructed
+    /// `WorkerCompletionHandler`.
+    #[tokio::test]
+    async fn activation_kick_quiesce_absorbs_rapid_repeats() {
+        use tokio::time::timeout;
+
+        let kick = Arc::new(Notify::new());
+        let quiesce_window = Duration::from_millis(200); // short for tests
+        let interval = Duration::from_secs(3600); // never fires
+
+        // Simulate: last run just finished.
+        let last_run_at = Instant::now();
+
+        // Fire a kick immediately (well within the quiesce window).
+        kick.notify_one();
+
+        // The 'wait loop should absorb the kick and NOT break out within
+        // a short window. We run one iteration of the select: if kick
+        // fires and elapsed < quiesce_window, the loop should continue
+        // (not break). We test this by trying to break out within 50 ms
+        // using only the kick arm; the timer is infinite so only the kick
+        // arm can fire.
+        let broke_out = timeout(Duration::from_millis(50), async {
+            loop {
+                let elapsed = last_run_at.elapsed();
+                let remaining = interval.saturating_sub(elapsed);
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => { return true; }
+                    _ = kick.notified() => {
+                        let since_last = last_run_at.elapsed();
+                        if since_last >= quiesce_window {
+                            return true;
+                        }
+                        // absorbed — continue waiting
+                    }
+                }
+            }
+        })
+        .await;
+
+        // The timeout must fire (broke_out = Err) because the kick was
+        // absorbed and the periodic timer (3600 s) never elapsed.
+        assert!(
+            broke_out.is_err(),
+            "kick within quiesce window must be absorbed, not break out of wait",
+        );
+    }
+
+    /// Acceptance test: a kick that arrives after the quiesce window
+    /// has elapsed triggers an immediate pass (breaks out of the wait).
+    #[tokio::test]
+    async fn activation_kick_after_quiesce_window_triggers_pass() {
+        use tokio::time::timeout;
+
+        let kick = Arc::new(Notify::new());
+        let quiesce_window = Duration::from_millis(1); // essentially instant
+        let interval = Duration::from_secs(3600);
+
+        // Simulate: last run finished a long time ago (100 ms > 1 ms quiesce).
+        let last_run_at = Instant::now() - Duration::from_millis(100);
+
+        // Fire a kick.
+        kick.notify_one();
+
+        // The 'wait loop should break out immediately because elapsed > quiesce.
+        let broke_out = timeout(Duration::from_millis(500), async {
+            loop {
+                let elapsed = last_run_at.elapsed();
+                let remaining = interval.saturating_sub(elapsed);
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => { return true; }
+                    _ = kick.notified() => {
+                        let since_last = last_run_at.elapsed();
+                        if since_last >= quiesce_window {
+                            return true; // break out — trigger pass
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            broke_out.is_ok(),
+            "kick after quiesce window must break out of wait loop",
         );
     }
 }
