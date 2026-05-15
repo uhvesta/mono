@@ -22,6 +22,8 @@ struct BossMacApp: App {
                 DispatchEventsCommand()
                 EngineCommand()
                 FeatureFlagsCommand()
+                Divider()
+                BossSessionInvocationCommand()
             }
         }
 
@@ -123,6 +125,21 @@ private struct FeatureFlagsCommand: View {
             }
         }
         .keyboardShortcut("f", modifiers: [.command, .shift])
+    }
+}
+
+/// Debug menu item: copies the Boss-session claude invocation to the
+/// clipboard. Provides an out-of-scrollback way to confirm which flags
+/// the Boss session was started with — mirrors the cube_command display
+/// in the dispatch events drawer (T468) for worker invocations.
+private struct BossSessionInvocationCommand: View {
+    var body: some View {
+        Button("Copy Boss Session Invocation") {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(bossPaneClaudeInvocation, forType: .string)
+        }
+        .help("Copies the claude invocation used for the Boss session pane to the clipboard")
     }
 }
 

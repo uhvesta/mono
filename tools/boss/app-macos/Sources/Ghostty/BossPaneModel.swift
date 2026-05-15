@@ -1,4 +1,12 @@
 import Foundation
+import os
+
+private let logger = Logger(subsystem: "com.boss.app", category: "BossPaneModel")
+
+/// The exact claude invocation typed into the Boss-session shell on startup.
+/// Stored here (not computed on the fly) so callers can surface it for
+/// diagnostics without parsing the TerminalLaunchSpec.
+let bossPaneClaudeInvocation = "claude --permission-mode auto"
 
 /// Owns the single libghostty pane that hosts the Boss session — a
 /// Claude Code session with a coordinator-flavoured system prompt
@@ -11,6 +19,10 @@ import Foundation
 final class BossPaneModel: ObservableObject {
     let runtime: GhosttyRuntime
     @Published var session: TerminalPaneSession
+    /// The resolved claude command line sent to the Boss-session shell.
+    /// Exposed so the UI and debug surfaces can display it without
+    /// inspecting pane scrollback.
+    let claudeInvocation: String = bossPaneClaudeInvocation
 
     init() {
         self.runtime = GhosttyRuntime.shared
@@ -22,10 +34,13 @@ final class BossPaneModel: ObservableObject {
         // summaries, etc.); the shell child must not inherit it or
         // Claude Code shows "Auth conflict: Using ANTHROPIC_API_KEY
         // instead of Anthropic Console key."
+        // --permission-mode auto is required so the coordinator session
+        // runs unattended (same policy as worker spawns from T465).
+        logger.info("Boss-session claude invocation: \(bossPaneClaudeInvocation, privacy: .public)")
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
             workingDirectory: workingDirectory,
-            initialInput: "unset ANTHROPIC_API_KEY; claude\n"
+            initialInput: "unset ANTHROPIC_API_KEY; \(bossPaneClaudeInvocation)\n"
         )
         self.session = TerminalPaneSession(
             id: "boss",
