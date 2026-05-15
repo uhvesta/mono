@@ -6,3 +6,7 @@ build --disk_cache=~/.cache/bazelcache
 # flow into the build (design doc Q4 Phase 2).
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
+
+# CI config: use a stable agent-local disk cache path shared across jobs.
+# Remote cache is a v2 optimisation; v1 uses disk only.
+build:ci --disk_cache=/var/cache/bazel-mono

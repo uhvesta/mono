@@ -99,4 +99,4 @@ The check names buildkite will report (once the pipeline is wired to the buildki
 
 ## Status
 
-This is the v1 skeleton (#2 in the project). All step scripts are placeholders (`echo` + `exit 0`). Real check invocations are wired in task #3 (static checks) and task #4 (test steps).
+Task #3 (static checks) is complete. `cargo-check.sh`, `bazel-build.sh`, `pnpm-typecheck.sh`, and `checks.sh` now run real invocations. `bazel-build.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`). `bazel-test.sh` and `pnpm-test.sh` remain placeholders; they are wired in task #4 (test steps).
