@@ -409,6 +409,84 @@ impl Registry {
         out
     }
 
+    /// Snapshot a single counter by name. Returns `None` if the name
+    /// is not registered (registered or stale).
+    pub fn counter_snapshot_one(&self, name: &str) -> Option<CounterSnapshot> {
+        let counters = self.counters.read().expect("metrics counters lock poisoned");
+        counters.get(name).map(|entry| CounterSnapshot {
+            name: entry.name.clone(),
+            description: entry.description.clone(),
+            value: entry.value.load(Ordering::Relaxed),
+            updated_at_ms: entry.updated_at_ms.load(Ordering::Relaxed),
+            stale: entry.stale.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Snapshot a single gauge by name. Returns `None` if the name
+    /// is not registered.
+    pub fn gauge_snapshot_one(&self, name: &str) -> Option<GaugeSnapshot> {
+        let gauges = self.gauges.read().expect("metrics gauges lock poisoned");
+        gauges.get(name).map(|entry| GaugeSnapshot {
+            name: entry.name.clone(),
+            description: entry.description.clone(),
+            value: entry.value.load(Ordering::Relaxed),
+            observed_at_ms: entry.observed_at_ms.load(Ordering::Relaxed),
+            stale: entry.stale.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Reset one metric to zero. Looks up `name` in counters first,
+    /// then gauges. Returns `(counter_reset, gauge_reset)`. Both can
+    /// be true if somehow the same name appears in both maps (which
+    /// would be a registration bug, but we don't panic here).
+    pub fn reset_one(&self, name: &str) -> (bool, bool) {
+        let now = now_ms();
+        let counter_reset = {
+            let counters = self.counters.read().expect("metrics counters lock poisoned");
+            if let Some(entry) = counters.get(name) {
+                entry.value.store(0, Ordering::Relaxed);
+                entry.updated_at_ms.store(now, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        let gauge_reset = {
+            let gauges = self.gauges.read().expect("metrics gauges lock poisoned");
+            if let Some(entry) = gauges.get(name) {
+                entry.value.store(0, Ordering::Relaxed);
+                entry.observed_at_ms.store(now, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        (counter_reset, gauge_reset)
+    }
+
+    /// Reset every counter and gauge to zero. Returns
+    /// `(counters_reset, gauges_reset)`.
+    pub fn reset_all(&self) -> (u64, u64) {
+        let now = now_ms();
+        let counters_reset = {
+            let counters = self.counters.read().expect("metrics counters lock poisoned");
+            for entry in counters.values() {
+                entry.value.store(0, Ordering::Relaxed);
+                entry.updated_at_ms.store(now, Ordering::Relaxed);
+            }
+            counters.len() as u64
+        };
+        let gauges_reset = {
+            let gauges = self.gauges.read().expect("metrics gauges lock poisoned");
+            for entry in gauges.values() {
+                entry.value.store(0, Ordering::Relaxed);
+                entry.observed_at_ms.store(now, Ordering::Relaxed);
+            }
+            gauges.len() as u64
+        };
+        (counters_reset, gauges_reset)
+    }
+
     /// Convenience for tests that only need to assert on a single
     /// counter's value.
     pub fn counter_value(&self, name: &str) -> Option<u64> {
@@ -582,5 +660,76 @@ mod tests {
         crate::metrics::init_all(&registry);
         assert!(registry.counter_snapshots().is_empty());
         assert!(registry.gauge_snapshots().is_empty());
+    }
+
+    #[test]
+    fn snapshot_one_returns_none_for_unknown_name() {
+        let registry = Registry::new();
+        registry.register_counter(&TEST_COUNTER_A);
+        assert!(registry.counter_snapshot_one("does.not.exist").is_none());
+        assert!(registry.gauge_snapshot_one("does.not.exist").is_none());
+    }
+
+    #[test]
+    fn snapshot_one_returns_correct_value() {
+        let registry = Registry::new();
+        registry.register_counter(&TEST_COUNTER_A);
+        TEST_COUNTER_A.inc_by(&registry, 5);
+        let snap = registry.counter_snapshot_one("test.counter_a").unwrap();
+        assert_eq!(snap.value, 5);
+        assert!(!snap.stale);
+        assert_eq!(snap.name, "test.counter_a");
+    }
+
+    #[test]
+    fn reset_one_zeros_counter_and_returns_true() {
+        let registry = Registry::new();
+        registry.register_counter(&TEST_COUNTER_A);
+        TEST_COUNTER_A.inc_by(&registry, 10);
+        assert_eq!(registry.counter_value("test.counter_a"), Some(10));
+
+        let (counter_reset, gauge_reset) = registry.reset_one("test.counter_a");
+        assert!(counter_reset);
+        assert!(!gauge_reset);
+        assert_eq!(registry.counter_value("test.counter_a"), Some(0));
+    }
+
+    #[test]
+    fn reset_one_zeros_gauge_and_returns_true() {
+        let registry = Registry::new();
+        registry.register_gauge(&TEST_GAUGE_A);
+        TEST_GAUGE_A.set(&registry, 99);
+        assert_eq!(registry.gauge_value("test.gauge_a"), Some(99));
+
+        let (counter_reset, gauge_reset) = registry.reset_one("test.gauge_a");
+        assert!(!counter_reset);
+        assert!(gauge_reset);
+        assert_eq!(registry.gauge_value("test.gauge_a"), Some(0));
+    }
+
+    #[test]
+    fn reset_one_returns_false_for_unknown_name() {
+        let registry = Registry::new();
+        let (c, g) = registry.reset_one("no.such.metric");
+        assert!(!c);
+        assert!(!g);
+    }
+
+    #[test]
+    fn reset_all_zeros_every_counter_and_gauge() {
+        let registry = Registry::new();
+        registry.register_counter(&TEST_COUNTER_A);
+        registry.register_counter(&TEST_COUNTER_B);
+        registry.register_gauge(&TEST_GAUGE_A);
+        TEST_COUNTER_A.inc_by(&registry, 3);
+        TEST_COUNTER_B.inc_by(&registry, 7);
+        TEST_GAUGE_A.set(&registry, -5);
+
+        let (counters_reset, gauges_reset) = registry.reset_all();
+        assert_eq!(counters_reset, 2);
+        assert_eq!(gauges_reset, 1);
+        assert_eq!(registry.counter_value("test.counter_a"), Some(0));
+        assert_eq!(registry.counter_value("test.counter_b"), Some(0));
+        assert_eq!(registry.gauge_value("test.gauge_a"), Some(0));
     }
 }

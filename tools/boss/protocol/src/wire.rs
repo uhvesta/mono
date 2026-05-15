@@ -527,6 +527,20 @@ pub enum FrontendRequest {
     /// value the moment this returns. The reply
     /// ([`FrontendEvent::SettingSet`]) confirms the persisted value.
     SetSetting { key: String, enabled: bool },
+    /// Read a single metric's current in-memory value, bypassing the
+    /// 30s flush-staleness window. Used by `bossctl metrics show
+    /// --live`. The engine replies with
+    /// [`FrontendEvent::MetricsShowLiveResult`]; `entry` is `None`
+    /// when no counter or gauge with `name` is registered.
+    MetricsShowLive { name: String },
+    /// Reset one or all counter / gauge values to zero — both
+    /// in-memory and in `state.db` — in a single atomic step.
+    /// `name = None` means "reset everything". Routes through engine
+    /// RPC so the in-memory atomic and the database row are cleared in
+    /// lockstep; a direct SQLite write would leave the atomic stale
+    /// until the next flush. Replies with
+    /// [`FrontendEvent::MetricsResetDone`].
+    MetricsReset { name: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1001,6 +1015,20 @@ pub enum FrontendEvent {
     /// persisted the new value. The macOS Settings window uses this as
     /// the "saved" signal to commit the toggle state.
     SettingSet { key: String, enabled: bool },
+    /// Response to [`FrontendRequest::MetricsShowLive`]: the
+    /// in-memory snapshot for `name`. `entry` is `None` when no
+    /// counter or gauge with that name is registered in the current
+    /// engine binary.
+    MetricsShowLiveResult { entry: Option<MetricLiveEntry> },
+    /// Response to [`FrontendRequest::MetricsReset`]. Reports how
+    /// many counters and gauges were zeroed so the caller can print a
+    /// meaningful confirmation. `name = None` means "all" was
+    /// requested.
+    MetricsResetDone {
+        name: Option<String>,
+        counters_reset: u64,
+        gauges_reset: u64,
+    },
 }
 
 /// Snapshot of one feature flag's static metadata + current value.
@@ -1085,6 +1113,27 @@ pub enum TopicEventPayload {
     },
 }
 
+/// In-memory snapshot of one metric (counter or gauge), returned by
+/// [`FrontendEvent::MetricsShowLiveResult`]. Values are read directly
+/// from the engine's atomics so they are not subject to the 30s
+/// flush-staleness window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricLiveEntry {
+    pub name: String,
+    pub description: String,
+    /// `"counter"` or `"gauge"`.
+    pub kind: String,
+    /// Counter value cast to `i64` (same bit pattern — values above
+    /// `i64::MAX` are theoretical). Gauge value is a signed `i64`.
+    pub value: i64,
+    /// Milliseconds since Unix epoch of the last increment (counter)
+    /// or set (gauge). 0 means "never updated since registration".
+    pub timestamp_ms: i64,
+    /// True when this entry was rehydrated from `state.db` but no
+    /// handle in the current binary matches its name.
+    pub stale: bool,
+}
+
 #[cfg(test)]
 mod feature_flags_wire_tests {
     use super::*;
@@ -1153,6 +1202,93 @@ mod feature_flags_wire_tests {
             FrontendEvent::FeatureFlagSet { name, enabled } => {
                 assert_eq!(name, "detect_pr_cold_fallback");
                 assert!(enabled);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_show_live_request_round_trips() {
+        let original = FrontendRequest::MetricsShowLive {
+            name: "pr_url_capture.primary_path.hit".into(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("metrics_show_live"), "serialized: {json}");
+        assert!(json.contains("pr_url_capture.primary_path.hit"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::MetricsShowLive { name } => {
+                assert_eq!(name, "pr_url_capture.primary_path.hit");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_reset_request_round_trips_with_name() {
+        let original = FrontendRequest::MetricsReset {
+            name: Some("pr_url_capture.primary_path.hit".into()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("metrics_reset"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::MetricsReset { name } => {
+                assert_eq!(name.as_deref(), Some("pr_url_capture.primary_path.hit"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_reset_request_round_trips_with_all() {
+        let original = FrontendRequest::MetricsReset { name: None };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("metrics_reset"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::MetricsReset { name } => assert!(name.is_none()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_show_live_result_event_round_trips() {
+        let entry = MetricLiveEntry {
+            name: "pr_url_capture.primary_path.hit".into(),
+            description: "test desc".into(),
+            kind: "counter".into(),
+            value: 42,
+            timestamp_ms: 1_700_000_000_000,
+            stale: false,
+        };
+        let original = FrontendEvent::MetricsShowLiveResult { entry: Some(entry.clone()) };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("metrics_show_live_result"), "serialized: {json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::MetricsShowLiveResult { entry: Some(e) } => {
+                assert_eq!(e, entry);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metrics_reset_done_event_round_trips() {
+        let original = FrontendEvent::MetricsResetDone {
+            name: Some("pr_url_capture.primary_path.hit".into()),
+            counters_reset: 1,
+            gauges_reset: 0,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("metrics_reset_done"), "serialized: {json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::MetricsResetDone { name, counters_reset, gauges_reset } => {
+                assert_eq!(name.as_deref(), Some("pr_url_capture.primary_path.hit"));
+                assert_eq!(counters_reset, 1);
+                assert_eq!(gauges_reset, 0);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
