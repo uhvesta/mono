@@ -533,15 +533,45 @@ fn compose_execution_prompt(
     prompt.push_str("The current session cwd is already set to that workspace.\n");
     prompt.push_str("Do the work directly in the repository checkout before ending this run.\n");
     prompt.push_str("Avoid asking the human for permission during this pass; when you need review or direction, stop and summarize it clearly.\n\n");
+
+    // If the chore already has a PR, inject a high-prominence resume
+    // directive BEFORE the execution context so it outweighs the
+    // workspace-rules default of `jj git fetch && jj new main`.
+    let existing_pr_url = work_item_pr_url(work_item);
+    if let Some(pr_url) = existing_pr_url {
+        let pr_number = extract_pr_number(pr_url).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+        prompt.push_str(&format!(
+            "## RESUME EXISTING PR\n\
+             \n\
+             This task has an existing open PR (#{pr_number}) at {pr_url}.\n\
+             You MUST add commits to that branch — do NOT start from `jj new main` and do NOT open a new PR.\n\
+             \n\
+             After leasing your workspace:\n\
+             ```\n\
+             jj git fetch\n\
+             GIT_DIR=.jj/repo/store/git gh pr checkout {pr_number}   # lands you on the PR branch\n\
+             ```\n\
+             Then make your changes on that branch and push:\n\
+             ```\n\
+             jj git push --bookmark <branch-name>   # or: GIT_DIR=.jj/repo/store/git git push\n\
+             ```\n\
+             \n\
+             If the branch cannot be resumed (deleted upstream, conflict you cannot resolve, etc.),\n\
+             STOP and surface the blocker — do NOT silently open a parallel PR.\n\n",
+        ));
+    }
+
     let expected_branch = crate::completion::expected_branch_name(&execution.id);
     prompt.push_str("Execution context:\n");
     prompt.push_str(&format!("- execution id: `{}`\n", execution.id));
     prompt.push_str(&format!("- execution kind: `{}`\n", execution.kind));
     prompt.push_str(&format!("- workspace: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("- work item: `{}`\n", work_item_name(work_item)));
-    prompt.push_str(&format!(
-        "- expected branch name: `{expected_branch}` — the engine reconstructs this from your execution id and uses it to find your PR. Push to this exact bookmark name.\n",
-    ));
+    if existing_pr_url.is_none() {
+        prompt.push_str(&format!(
+            "- expected branch name: `{expected_branch}` — the engine reconstructs this from your execution id and uses it to find your PR. Push to this exact bookmark name.\n",
+        ));
+    }
     if let Some(cube_change_id) = cube_change_id {
         prompt.push_str(&format!("- local change: `{}`\n", cube_change_id));
     }
@@ -598,14 +628,30 @@ fn compose_execution_prompt(
         // `gh pr list --head <expected-branch>` (a unique-by-construction
         // signal) instead of the structurally-unsafe shared-store jj
         // bookmark scan that produced the May 14 PR fan-out.
-        prompt.push_str(&format!(
-            "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
-             - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark and pushing — do NOT invent a different name.\n\
-             - Push your branch (`jj bookmark create {expected_branch} -r @ && jj git push -b {expected_branch} --allow-new`) and open a PR with `gh pr create --head {expected_branch} --base main` if one does not already exist.\n\
-             - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
-             - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
-             - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
-        ));
+        //
+        // When the chore already has a pr_url, the acceptance criterion
+        // changes: the worker pushes to the existing PR branch instead of
+        // creating a new one. The engine's staged-URL detector captures
+        // the URL from `gh pr view` output at the end of the run.
+        if let Some(pr_url) = existing_pr_url {
+            let pr_number = extract_pr_number(pr_url).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+            prompt.push_str(&format!(
+                "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
+                 - Push your commits to the existing PR branch (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
+                 - Confirm the PR is updated with `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`.\n\
+                 - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
+                 - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
+            ));
+        } else {
+            prompt.push_str(&format!(
+                "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
+                 - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark and pushing — do NOT invent a different name.\n\
+                 - Push your branch (`jj bookmark create {expected_branch} -r @ && jj git push -b {expected_branch} --allow-new`) and open a PR with `gh pr create --head {expected_branch} --base main` if one does not already exist.\n\
+                 - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
+                 - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
+                 - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
+            ));
+        }
     }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -844,6 +890,21 @@ fn work_item_id(work_item: &WorkItem) -> &str {
         WorkItem::Project(project) => &project.id,
         WorkItem::Task(task) | WorkItem::Chore(task) => &task.id,
     }
+}
+
+fn work_item_pr_url(work_item: &WorkItem) -> Option<&str> {
+    match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => {
+            task.pr_url.as_deref().filter(|u| !u.is_empty())
+        }
+        WorkItem::Product(_) | WorkItem::Project(_) => None,
+    }
+}
+
+fn extract_pr_number(pr_url: &str) -> Option<u64> {
+    let tail = pr_url.rsplit_once("/pull/")?.1;
+    let n = tail.split(|c: char| !c.is_ascii_digit()).next()?;
+    n.parse::<u64>().ok()
 }
 
 fn work_item_details(work_item: &WorkItem) -> Option<String> {
@@ -1135,6 +1196,265 @@ mod conflict_resolution_prompt_tests {
             prompt.contains("git not on PATH"),
             "prompt should include the probe error message:\n{prompt}",
         );
+    }
+}
+
+#[cfg(test)]
+mod compose_prompt_tests {
+    use super::*;
+    use crate::work::Task;
+
+    fn base_execution() -> WorkExecution {
+        WorkExecution {
+            id: "exec_abc123_01".into(),
+            work_item_id: "task-1".into(),
+            kind: "chore_implementation".into(),
+            status: "pending".into(),
+            repo_remote_url: "git@github.com:org/repo.git".into(),
+            cube_repo_id: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            workspace_path: Some("/tmp/workspace".into()),
+            priority: 0,
+            preferred_workspace_id: None,
+            created_at: "2026-05-15T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            pre_start_failure_count: 0,
+            dispatch_not_before: None,
+        }
+    }
+
+    fn chore_without_pr() -> WorkItem {
+        WorkItem::Chore(Task {
+            id: "task-1".into(),
+            product_id: "prod-1".into(),
+            project_id: None,
+            kind: "chore".into(),
+            name: "Fix the thing".into(),
+            description: "Description here.".into(),
+            status: "todo".into(),
+            ordinal: None,
+            pr_url: None,
+            deleted_at: None,
+            created_at: "2026-05-15T00:00:00Z".into(),
+            updated_at: "2026-05-15T00:00:00Z".into(),
+            autostart: false,
+            last_status_actor: "human".into(),
+            priority: "medium".into(),
+            created_via: "unknown".into(),
+            repo_remote_url: None,
+            blocked_reason: None,
+            blocked_attempt_id: None,
+            effort_level: None,
+            model_override: None,
+            ci_attempt_budget: None,
+            ci_attempts_used: 0,
+            short_id: None,
+            blocked_signals: Vec::new(),
+            ci_required_state: None,
+            ci_required_detail: None,
+            review_required_state: None,
+            review_required_detail: None,
+            pr_state_polled_at: None,
+        })
+    }
+
+    fn chore_with_pr(pr_url: &str) -> WorkItem {
+        match chore_without_pr() {
+            WorkItem::Chore(mut task) => {
+                task.pr_url = Some(pr_url.into());
+                WorkItem::Chore(task)
+            }
+            other => other,
+        }
+    }
+
+    #[test]
+    fn no_resume_directive_when_pr_url_is_absent() {
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("RESUME EXISTING PR"),
+            "should have no resume block when pr_url is None:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn no_resume_directive_when_pr_url_is_empty() {
+        let chore = chore_with_pr("");
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("RESUME EXISTING PR"),
+            "should have no resume block when pr_url is empty:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn resume_directive_present_when_pr_url_is_set() {
+        let chore = chore_with_pr("https://github.com/org/repo/pull/42");
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("## RESUME EXISTING PR"),
+            "missing resume block when pr_url is set:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("https://github.com/org/repo/pull/42"),
+            "resume block should include the PR URL:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("#42"),
+            "resume block should include the PR number:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn resume_directive_appears_before_execution_context() {
+        let chore = chore_with_pr("https://github.com/org/repo/pull/99");
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        let resume_pos = prompt.find("## RESUME EXISTING PR").expect("missing resume block");
+        let exec_pos = prompt.find("Execution context:").expect("missing execution context");
+        assert!(
+            resume_pos < exec_pos,
+            "resume block must appear before execution context:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn expected_branch_name_suppressed_when_pr_url_set() {
+        let chore = chore_with_pr("https://github.com/org/repo/pull/42");
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("expected branch name"),
+            "expected-branch-name line should be suppressed when resuming a PR:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn expected_branch_name_present_when_no_pr_url() {
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("expected branch name"),
+            "expected-branch-name line must be present for fresh dispatches:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn acceptance_criterion_references_existing_pr_when_pr_url_set() {
+        let chore = chore_with_pr("https://github.com/org/repo/pull/42");
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("Do NOT open a new PR"),
+            "acceptance criterion should prohibit opening a new PR:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("gh pr view 42"),
+            "acceptance criterion should reference gh pr view for the existing PR:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("jj bookmark create"),
+            "acceptance criterion should guide fresh branch creation:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("gh pr create"),
+            "acceptance criterion should guide opening a new PR:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn work_item_pr_url_returns_none_for_project() {
+        let project = WorkItem::Project(crate::work::Project {
+            id: "proj-1".into(),
+            short_id: None,
+            product_id: "prod-1".into(),
+            name: "My Project".into(),
+            description: String::new(),
+            goal: String::new(),
+            status: "active".into(),
+            slug: "my-project".into(),
+            priority: "medium".into(),
+            last_status_actor: "human".into(),
+            created_at: "2026-05-15T00:00:00Z".into(),
+            updated_at: "2026-05-15T00:00:00Z".into(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: None,
+        });
+        assert!(work_item_pr_url(&project).is_none());
+    }
+
+    #[test]
+    fn extract_pr_number_parses_standard_github_url() {
+        assert_eq!(
+            extract_pr_number("https://github.com/org/repo/pull/123"),
+            Some(123),
+        );
+    }
+
+    #[test]
+    fn extract_pr_number_returns_none_for_malformed_url() {
+        assert_eq!(extract_pr_number("https://github.com/org/repo"), None);
+        assert_eq!(extract_pr_number("not-a-url"), None);
     }
 }
 
