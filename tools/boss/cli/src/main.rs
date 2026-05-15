@@ -13,8 +13,8 @@ use boss_protocol::{
     CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortAuditReport,
     EffortLevel, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -2120,12 +2120,14 @@ async fn run_show_leaf(
         },
     )
     .await?;
+    let executions = list_executions_for_item(client, &item.id).await?;
     print_entity(
         ctx,
-        &serde_json::json!({ label: item, "dependencies": detail }),
+        &serde_json::json!({ label: item, "dependencies": detail, "executions": executions }),
         || {
             print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
             print_dependency_section(&detail);
+            print_executions_section(&executions);
         },
     )
 }
@@ -3363,6 +3365,46 @@ async fn list_dependencies_detailed(
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("dependency detail", &other)),
+    }
+}
+
+async fn list_executions_for_item(
+    client: &mut BossClient,
+    work_item_id: &str,
+) -> Result<Vec<WorkExecution>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListExecutions {
+            work_item_id: Some(work_item_id.to_owned()),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::ExecutionsList { mut executions, .. } => {
+            executions.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+            executions.truncate(20);
+            Ok(executions)
+        }
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("executions list", &other)),
+    }
+}
+
+fn print_executions_section(executions: &[WorkExecution]) {
+    if executions.is_empty() {
+        return;
+    }
+    println!();
+    println!("Executions ({}):", executions.len());
+    for exec in executions {
+        let started = exec.started_at.as_deref().unwrap_or("-");
+        let finished = exec.finished_at.as_deref().unwrap_or("-");
+        print!("  {} [{}] started={} finished={}", exec.id, exec.status, started, finished);
+        if let Some(pr) = &exec.pr_url {
+            print!(" pr={pr}");
+        }
+        println!();
     }
 }
 

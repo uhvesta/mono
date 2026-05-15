@@ -359,6 +359,11 @@ pub struct WorkExecution {
     /// immediately. Set during pre-start retry backoff windows.
     #[serde(default)]
     pub dispatch_not_before: Option<String>,
+    /// The PR URL captured at the end of this execution's run, if any.
+    /// Set when the worker successfully opens a PR and the engine
+    /// records the `completed` transition for this execution.
+    #[serde(default)]
+    pub pr_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

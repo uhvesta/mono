@@ -719,7 +719,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before
+                        pre_start_failure_count, dispatch_not_before, pr_url
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -732,7 +732,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before
+                    pre_start_failure_count, dispatch_not_before, pr_url
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -1328,7 +1328,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before
+                    pre_start_failure_count, dispatch_not_before, pr_url
              FROM work_executions
              WHERE status = 'ready'
                AND (dispatch_not_before IS NULL
@@ -1354,7 +1354,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before
+                    pre_start_failure_count, dispatch_not_before, pr_url
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -2954,6 +2954,7 @@ impl WorkDb {
         // for `CREATE TABLE IF NOT EXISTS`.
         migrate_metrics_tables(&conn)?;
         migrate_work_executions_pre_start_retry(&conn)?;
+        migrate_work_executions_pr_url(&conn)?;
         // PR poll state columns for CI + review indicators on Review-lane cards.
         migrate_pr_poll_state_columns(&conn)?;
         // External tracker binding columns (products) and per-work-item
@@ -3276,9 +3277,10 @@ impl WorkDb {
                  cube_lease_id = NULL,
                  cube_workspace_id = NULL,
                  workspace_path = NULL,
-                 finished_at = ?2
+                 finished_at = ?2,
+                 pr_url = ?3
              WHERE id = ?1",
-            params![execution_id, now],
+            params![execution_id, now, pr_url],
         )?;
 
         // Update the most-recent run for this execution: if a summary is
@@ -4744,7 +4746,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before
+                    pre_start_failure_count, dispatch_not_before, pr_url
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -4940,6 +4942,7 @@ fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         finished_at: row.get(13)?,
         pre_start_failure_count: row.get(14)?,
         dispatch_not_before: row.get(15)?,
+        pr_url: row.get(16)?,
     })
 }
 
@@ -5431,7 +5434,7 @@ fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>>
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before
+                pre_start_failure_count, dispatch_not_before, pr_url
          FROM work_executions
          WHERE id = ?1",
         [id],
@@ -5565,6 +5568,16 @@ fn migrate_work_executions_pre_start_retry(conn: &Connection) -> Result<()> {
         if !work_executions_has_column(conn, column)? {
             conn.execute(ddl, [])?;
         }
+    }
+    Ok(())
+}
+
+fn migrate_work_executions_pr_url(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "pr_url")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN pr_url TEXT",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -6910,7 +6923,7 @@ fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before
+                pre_start_failure_count, dispatch_not_before, pr_url
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
