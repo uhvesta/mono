@@ -721,6 +721,9 @@ fn run_workspace(
             // first conflicted-but-repairable workspace found
             let mut conflicted_candidate: Option<(String, Vec<String>)> = None;
             let mut dirty_count = 0usize;
+            // workspaces whose directory exists but has neither .jj/ nor .git/
+            let mut broken_empty_count = 0usize;
+            let mut broken_empty_paths: Vec<String> = Vec::new();
 
             for ws_id in &ordered_ids {
                 let ws = free_workspaces
@@ -789,6 +792,30 @@ fn run_workspace(
                             reason = "dirty_working_copy",
                         );
                     }
+                    WorkspaceHealthOutcome::BrokenEmpty => {
+                        let ws_path_str = ws.workspace_path.display().to_string();
+                        health_checks.push(json!({
+                            "workspace_id": ws_id,
+                            "workspace_path": ws_path_str,
+                            "health": "broken_empty",
+                            "has_git": false,
+                            "has_jj": false,
+                            "skipped": true,
+                            "reason": "neither_git_nor_jj",
+                        }));
+                        broken_empty_count += 1;
+                        broken_empty_paths.push(format!(
+                            "{ws_id} ({})",
+                            ws.workspace_path.display()
+                        ));
+                        audit!(
+                            database_path,
+                            "workspace.broken_empty",
+                            repo = repo,
+                            workspace_id = ws_id,
+                            workspace_path = ws_path_str,
+                        );
+                    }
                 }
             }
 
@@ -819,14 +846,29 @@ fn run_workspace(
                     .map(|(_, b)| b)
                     .unwrap_or_default();
                 (ws, false, bookmarks)
-            } else if !ordered_ids.is_empty() && dirty_count == ordered_ids.len() {
-                // Every free workspace has a dirty working copy. Do NOT
-                // auto-create — the operator needs to clean those up. Return
-                // a structured error so Boss can surface this as `blocked`.
+            } else if !ordered_ids.is_empty()
+                && dirty_count + broken_empty_count == ordered_ids.len()
+            {
+                // Every free workspace is either dirty or broken-empty. Do NOT
+                // auto-create — the operator needs to intervene. Return a
+                // structured error so Boss can surface this as `blocked`.
+                let mut parts: Vec<String> = Vec::new();
+                if dirty_count > 0 {
+                    parts.push(format!(
+                        "{dirty_count} workspace(s) have dirty working copies \
+                         (run `cube workspace force-release --reason crash` to reclaim)"
+                    ));
+                }
+                if broken_empty_count > 0 {
+                    parts.push(format!(
+                        "{broken_empty_count} workspace(s) have neither .git/ nor .jj/ \
+                         (broken-empty): {}; re-clone manually or force-release and retry",
+                        broken_empty_paths.join(", ")
+                    ));
+                }
                 return Err(CubeError::NoAvailableWorkspace(format!(
-                    "{repo} (all {dirty_count} free workspace(s) have dirty working copies; \
-                     run `cube workspace list --repo {repo}` to inspect, then \
-                     `cube workspace force-release --reason crash` to reclaim them)"
+                    "{repo}: {}; run `cube workspace list --repo {repo}` to inspect",
+                    parts.join("; ")
                 )));
             } else {
                 // Pool has no free workspaces (empty or all leased): auto-create.
@@ -1623,6 +1665,10 @@ enum WorkspaceHealthOutcome {
     /// Working copy has uncommitted changes from a prior worker session.
     /// Not safe to auto-repair — skip this workspace.
     DirtyWorkingCopy,
+    /// Workspace directory exists but has neither `.jj/` nor `.git/`.
+    /// The directory was likely wiped externally. Requires manual re-clone or
+    /// force-release. Not safe to auto-repair without the source.
+    BrokenEmpty,
 }
 
 /// Check the health of a free workspace by running `jj status`. Returns
@@ -1634,6 +1680,14 @@ fn check_workspace_health(
     database_path: Option<&Path>,
     workspace_path: &Path,
 ) -> Result<WorkspaceHealthOutcome> {
+    // Detect broken-empty workspaces by checking the directory state
+    // directly rather than waiting for jj to report an error. A workspace
+    // with neither .jj/ nor .git/ cannot be used or healed without a
+    // full re-clone, so return early before spawning jj at all.
+    if !workspace_path.join(".jj").is_dir() && !workspace_path.join(".git").is_dir() {
+        return Ok(WorkspaceHealthOutcome::BrokenEmpty);
+    }
+
     let output = run_jj(
         runner,
         database_path,
@@ -1812,7 +1866,10 @@ fn read_head_status(
 /// `working copy is stale` or `seems to be a sibling`, runs
 /// `jj workspace update-stale` once and retries. If it fails with
 /// `there is no jj repo` and a `.git/` directory is present, runs
-/// `jj git init --colocate` once and retries. Other failures and
+/// `jj git init --colocate` once and retries. If it fails with
+/// `there is no jj repo` and neither `.git/` nor `.jj/` is present,
+/// surfaces a clear `NoAvailableWorkspace` error naming the broken
+/// workspace path instead of the raw jj message. Other failures and
 /// non-`jj` invocations pass through untouched.
 fn run_jj(
     runner: &dyn CommandRunner,
@@ -1847,6 +1904,19 @@ fn run_jj(
                     Ok(out) => Ok(out),
                     Err(_) => Err(err),
                 };
+            }
+
+            // Broken-empty: workspace has neither .jj/ nor .git/ — the
+            // directory was likely wiped externally. Surface a clear error
+            // naming the path and what's missing rather than the raw jj
+            // "no jj repo" message, which gives no actionable information.
+            if jj_workspace_broken_empty(&err, &invocation.cwd) {
+                return Err(CubeError::NoAvailableWorkspace(format!(
+                    "workspace at `{}` has neither .jj/ nor .git/ (broken-empty): \
+                     the workspace directory exists but no jj or git repository was found. \
+                     Re-clone manually or `cube workspace force-release` and retry.",
+                    invocation.cwd.display()
+                )));
             }
 
             let Some(recovery_kind) = jj_update_stale_recovery_kind(&err) else {
@@ -1900,6 +1970,25 @@ fn jj_needs_colocate_init(err: &CubeError, cwd: &Path) -> bool {
     }
     let lower = stderr.to_lowercase();
     lower.contains(JJ_NO_JJ_REPO_SIGNATURE) && cwd.join(".git").is_dir()
+}
+
+/// Returns `true` when the error is `jj`'s "no jj repo" diagnostic AND
+/// neither `.jj/` nor `.git/` exists at `cwd`. This is the shorter error
+/// variant jj emits when the directory has no repo at all (as opposed to
+/// the longer hint-bearing form jj emits when `.git/` is present without
+/// `.jj/`). Directory state is checked directly rather than by inspecting
+/// jj's error text — the text is brittle; the directory check is not.
+fn jj_workspace_broken_empty(err: &CubeError, cwd: &Path) -> bool {
+    let CubeError::CommandFailed { program, stderr, .. } = err else {
+        return false;
+    };
+    if program != "jj" {
+        return false;
+    }
+    let lower = stderr.to_lowercase();
+    lower.contains(JJ_NO_JJ_REPO_SIGNATURE)
+        && !cwd.join(".jj").is_dir()
+        && !cwd.join(".git").is_dir()
 }
 
 /// Returns the audit event name if the error is one that `jj workspace
@@ -3382,8 +3471,8 @@ mod tests {
     fn workspace_lease_claims_first_free_workspace_and_records_head_commit() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -3503,8 +3592,8 @@ mod tests {
     fn workspace_lease_auto_creates_next_id_after_existing() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-007")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -3614,8 +3703,8 @@ mod tests {
     fn workspace_lease_with_prefer_claims_named_workspace_when_free() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -3671,8 +3760,8 @@ mod tests {
     fn workspace_lease_with_prefer_falls_back_when_preferred_is_leased() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -3752,8 +3841,8 @@ mod tests {
     fn workspace_lease_with_unknown_prefer_falls_back_to_first_free() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-005")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-005").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -3821,8 +3910,8 @@ mod tests {
     fn workspace_lease_clean_pool_returns_lowest_workspace() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-003")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-007")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-003").join(".jj")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -3868,8 +3957,8 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         let dirty_path = workspace_root.join("mono-agent-003");
         let clean_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&dirty_path).expect("dirty dir");
-        std::fs::create_dir_all(&clean_path).expect("clean dir");
+        std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
+        std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -3928,8 +4017,8 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         let conflicted_path = workspace_root.join("mono-agent-003");
         let clean_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&conflicted_path).expect("conflicted dir");
-        std::fs::create_dir_all(&clean_path).expect("clean dir");
+        std::fs::create_dir_all(conflicted_path.join(".jj")).expect("conflicted dir");
+        std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -3983,8 +4072,8 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         let path_003 = workspace_root.join("mono-agent-003");
         let path_007 = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&path_003).expect("003 dir");
-        std::fs::create_dir_all(&path_007).expect("007 dir");
+        std::fs::create_dir_all(path_003.join(".jj")).expect("003 dir");
+        std::fs::create_dir_all(path_007.join(".jj")).expect("007 dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -4053,8 +4142,8 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         let path_003 = workspace_root.join("mono-agent-003");
         let path_007 = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&path_003).expect("003 dir");
-        std::fs::create_dir_all(&path_007).expect("007 dir");
+        std::fs::create_dir_all(path_003.join(".jj")).expect("003 dir");
+        std::fs::create_dir_all(path_007.join(".jj")).expect("007 dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -4112,8 +4201,8 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         let dirty_path = workspace_root.join("mono-agent-003");
         let clean_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&dirty_path).expect("dirty dir");
-        std::fs::create_dir_all(&clean_path).expect("clean dir");
+        std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
+        std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -4174,8 +4263,8 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         let dirty_path = workspace_root.join("mono-agent-003");
         let clean_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&dirty_path).expect("dirty dir");
-        std::fs::create_dir_all(&clean_path).expect("clean dir");
+        std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
+        std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -4239,7 +4328,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let ws_path = workspace_root.join("mono-agent-003");
-        std::fs::create_dir_all(&ws_path).expect("workspace dir");
+        std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -4287,8 +4376,8 @@ mod tests {
         let workspace_root = tempdir.path().join("workspaces");
         let conflicted_path = workspace_root.join("mono-agent-003");
         let clean_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&conflicted_path).expect("conflicted dir");
-        std::fs::create_dir_all(&clean_path).expect("clean dir");
+        std::fs::create_dir_all(conflicted_path.join(".jj")).expect("conflicted dir");
+        std::fs::create_dir_all(clean_path.join(".jj")).expect("clean dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -4342,7 +4431,7 @@ mod tests {
     fn workspace_release_resets_and_frees_the_workspace() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -4406,7 +4495,7 @@ mod tests {
     fn lease_and_release_emit_audit_log_entries() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -4523,7 +4612,7 @@ mod tests {
     fn workspace_release_by_workspace_id_resolves_active_lease() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -4575,7 +4664,7 @@ mod tests {
     fn workspace_release_by_workspace_id_errors_when_not_leased() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -4608,7 +4697,7 @@ mod tests {
     fn workspace_release_keep_dirty_skips_reset_and_records_reason() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -4677,7 +4766,7 @@ mod tests {
     fn workspace_force_release_skips_reset() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -4738,7 +4827,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -4804,7 +4893,7 @@ mod tests {
     fn workspace_remove_refuses_leased_row_without_force() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -4877,7 +4966,7 @@ mod tests {
     fn workspace_remove_force_removes_leased_row() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -4945,7 +5034,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -5022,7 +5111,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -5088,7 +5177,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
         std::fs::write(workspace_path.join("marker"), "x").expect("marker file");
 
         run_with_dependencies(
@@ -5162,7 +5251,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -5223,7 +5312,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
         std::fs::write(workspace_path.join("marker"), "x").expect("marker file");
 
         run_with_dependencies(
@@ -5285,7 +5374,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -5407,7 +5496,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             Cli::parse_from([
@@ -5480,7 +5569,7 @@ mod tests {
     fn workspace_heartbeat_extends_expiry() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -5576,7 +5665,7 @@ mod tests {
     fn workspace_status_includes_jj_status_output() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -5643,7 +5732,7 @@ mod tests {
     fn workspace_status_forgets_missing_workspace_rows() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -5701,8 +5790,8 @@ mod tests {
     fn workspace_list_returns_filtered_rows() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-001")).expect("workspace dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-002")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-002").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -5765,7 +5854,7 @@ mod tests {
     fn change_create_records_named_workspace_head() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -5852,7 +5941,7 @@ mod tests {
     fn change_create_from_parent_uses_parent_jj_change_id() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -5974,7 +6063,7 @@ mod tests {
     fn change_info_round_trips_record() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004")).expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         let add = Cli::parse_from([
             "cube",
@@ -6119,7 +6208,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6160,7 +6249,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
         std::fs::write(workspace_path.join("pnpm-lock.yaml"), b"v1").unwrap();
         write_setup_yaml(
             &workspace_path,
@@ -6245,7 +6334,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
         std::fs::write(workspace_path.join("pnpm-lock.yaml"), b"v1").unwrap();
         write_setup_yaml(
             &workspace_path,
@@ -6315,7 +6404,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
         write_setup_yaml(
             &workspace_path,
             r#"version: 1
@@ -6398,7 +6487,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        std::fs::create_dir_all(workspace_path.join(".jj")).unwrap();
         write_setup_yaml(
             &workspace_path,
             r#"version: 1
@@ -6462,7 +6551,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-004");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6531,7 +6620,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-004");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6588,7 +6677,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-004");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6656,7 +6745,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-004");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6712,7 +6801,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-004");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
         // Simulate a workspace that has .git but no .jj.
         std::fs::create_dir_all(workspace_path.join(".git")).expect(".git dir");
 
@@ -6777,12 +6866,16 @@ steps:
     }
 
     #[test]
-    fn workspace_lease_does_not_colocate_init_when_no_git_dir() {
+    fn workspace_lease_broken_empty_gives_clear_error_without_calling_jj() {
+        // When a workspace directory has neither .jj/ nor .git/, cube detects
+        // the broken-empty state via a directory check BEFORE calling jj,
+        // and surfaces a clear NoAvailableWorkspace error naming the
+        // workspace path and what's missing. jj is never invoked.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-004");
+        // Intentionally no .jj/ or .git/ — this is the broken-empty state.
         std::fs::create_dir_all(&workspace_path).expect("workspace dir");
-        // No .git directory — this is truly broken state, not a git+no-jj case.
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6791,23 +6884,38 @@ steps:
         )
         .expect("repo");
 
-        let runner = FakeRunner::new(vec![
-            ExpectedCommand::no_jj_repo(workspace_path.clone(), "jj", &["status", "--no-pager"]),
-            // No jj git init --colocate expected — .git/ is absent so we
-            // should surface the original error verbatim.
-        ]);
+        // FakeRunner has NO expected commands: cube must not call jj at all.
+        let runner = FakeRunner::default();
 
         let error = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "no git dir"]),
             Some(&database_path),
             &runner,
         )
-        .expect_err("lease should fail verbosely when no .git dir present");
+        .expect_err("lease should fail with a clear error when workspace is broken-empty");
         runner.assert_exhausted();
 
+        // Error must be NoAvailableWorkspace (not a raw CommandFailed from jj).
         assert!(
-            matches!(error, CubeError::CommandFailed { .. }),
-            "expected original CommandFailed, got: {error:?}"
+            matches!(error, CubeError::NoAvailableWorkspace(_)),
+            "expected NoAvailableWorkspace, got: {error:?}"
+        );
+        // Error message must name the workspace path and the missing directories.
+        let msg = error.to_string();
+        assert!(
+            msg.contains(workspace_path.to_str().unwrap()),
+            "error should name the workspace path; got: {msg}"
+        );
+        assert!(
+            msg.contains(".git") || msg.contains(".jj"),
+            "error should mention missing .git/ or .jj/; got: {msg}"
+        );
+
+        // Audit log must contain the broken_empty event.
+        let events = audit_events(&tempdir);
+        assert!(
+            events.iter().any(|e| e["event"] == "workspace.broken_empty"),
+            "expected workspace.broken_empty audit event; got: {events:?}"
         );
     }
 
@@ -6849,7 +6957,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-007");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6919,7 +7027,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -6990,7 +7098,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -7064,7 +7172,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -7108,9 +7216,9 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root_a = tempdir.path().join("repos-a/workspaces");
         let workspace_root_b = tempdir.path().join("repos-b/workspaces");
-        std::fs::create_dir_all(workspace_root_a.join("mono-agent-001"))
+        std::fs::create_dir_all(workspace_root_a.join("mono-agent-001").join(".jj"))
             .expect("workspace dir a");
-        std::fs::create_dir_all(workspace_root_b.join("other-agent-001"))
+        std::fs::create_dir_all(workspace_root_b.join("other-agent-001").join(".jj"))
             .expect("workspace dir b");
 
         run_with_dependencies(
@@ -7212,7 +7320,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -7326,7 +7434,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -7443,7 +7551,7 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let workspace_path = workspace_root.join("mono-agent-001");
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
