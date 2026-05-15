@@ -25,17 +25,29 @@ final class ReviewNotificationCenter: NSObject {
 
     private var hasRequestedAuthorization = false
 
+    /// `UNUserNotificationCenter.current()` throws
+    /// `NSInternalInconsistencyException` ("bundleProxyForCurrentProcess
+    /// is nil") when the current process is not running inside a real
+    /// `.app` bundle. Two no-bundle contexts hit this:
+    ///
+    /// 1. xctest, detected via the well-known `XCTestCase` class.
+    /// 2. `swift run` builds, whose `Bundle.main.bundleURL` points at
+    ///    `…/.build/<triple>/debug/` — a plain directory, not a
+    ///    `.app` (so `pathExtension != "app"`).
+    ///
+    /// Returning false skips notification wiring on both.
+    private var isBundleContextSafe: Bool {
+        guard NSClassFromString("XCTestCase") == nil else { return false }
+        return Bundle.main.bundleURL.pathExtension == "app"
+    }
+
     func configure() {
-        // UNUserNotificationCenter.current() requires a proper app bundle
-        // with a bundle proxy. It crashes in xctest and swift-run contexts
-        // even when Bundle.main.bundleIdentifier is non-nil. Use the
-        // well-known XCTestCase class presence as the guard.
-        guard NSClassFromString("XCTestCase") == nil else { return }
+        guard isBundleContextSafe else { return }
         UNUserNotificationCenter.current().delegate = self
     }
 
     func notifyReadyForReview(task: WorkTask) {
-        guard NSClassFromString("XCTestCase") == nil else { return }
+        guard isBundleContextSafe else { return }
         guard !NSApplication.shared.isActive else { return }
 
         let center = UNUserNotificationCenter.current()
