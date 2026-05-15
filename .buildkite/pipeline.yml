@@ -1,10 +1,11 @@
 # Boss/mono Buildkite CI pipeline.
 #
 # Shape:
-#   bootstrap → [bazel-build, checks] → [bazel-test]
+#   bootstrap → [bazel-build, mac-app-build, checks] → [bazel-test]
 #
 # Each steps/*.sh script contains all logic; no inline shell here.
 # Queue: linux-amd64 — Default cluster queue for Linux agents.
+# Queue: macos-arm64 — Zakalwe-1 agent for macOS Swift targets.
 
 steps:
   - label: ":boot: bootstrap"
@@ -19,6 +20,13 @@ steps:
     depends_on: "bootstrap"
     agents:
       queue: "linux-amd64"
+
+  - label: ":apple: mac-app-build"
+    key: "mac-app-build"
+    command: ".buildkite/steps/mac-app-build.sh"
+    depends_on: "bootstrap"
+    agents:
+      queue: "macos-arm64"
 
   - label: ":white_check_mark: checks"
     key: "checks"
