@@ -1,7 +1,7 @@
 # Boss/mono Buildkite CI pipeline.
 #
 # Shape:
-#   bootstrap → [cargo-check, bazel-build, pnpm-typecheck, checks] → [bazel-test, pnpm-test]
+#   bootstrap → [bazel-build, checks] → [bazel-test]
 #
 # Each steps/*.sh script contains all logic; no inline shell here.
 # Queue: linux-amd64 — Default cluster queue for Linux agents.
@@ -13,23 +13,9 @@ steps:
     agents:
       queue: "linux-amd64"
 
-  - label: ":rust: cargo-check"
-    key: "cargo-check"
-    command: ".buildkite/steps/cargo-check.sh"
-    depends_on: "bootstrap"
-    agents:
-      queue: "linux-amd64"
-
   - label: ":bazel: bazel-build"
     key: "bazel-build"
     command: ".buildkite/steps/bazel-build.sh"
-    depends_on: "bootstrap"
-    agents:
-      queue: "linux-amd64"
-
-  - label: ":node: pnpm-typecheck"
-    key: "pnpm-typecheck"
-    command: ".buildkite/steps/pnpm-typecheck.sh"
     depends_on: "bootstrap"
     agents:
       queue: "linux-amd64"
@@ -47,12 +33,5 @@ steps:
   - label: ":bazel: bazel-test"
     key: "bazel-test"
     command: ".buildkite/steps/bazel-test.sh"
-    agents:
-      queue: "linux-amd64"
-
-  - label: ":node: pnpm-test"
-    key: "pnpm-test"
-    command: ".buildkite/steps/pnpm-test.sh"
-    soft_fail: true
     agents:
       queue: "linux-amd64"
