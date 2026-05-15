@@ -15,7 +15,6 @@ import SwiftUI
 /// `work_error` channel.
 struct FeatureFlagsViewer: View {
     @EnvironmentObject private var chatModel: ChatViewModel
-    @AppStorage("boss.featureFlagsViewer.visible") private var isOpen = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,10 +24,7 @@ struct FeatureFlagsViewer: View {
         }
         .onAppear {
             chatModel.refreshFeatureFlags()
-            isOpen = true
         }
-        .onDisappear { isOpen = false }
-        .frame(minWidth: 560, minHeight: 360)
     }
 
     private var header: some View {
