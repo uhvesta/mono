@@ -906,7 +906,7 @@ private struct WorkSearchToolbarItem: View {
 
     var body: some View {
         if isExpanded {
-            NativeSearchField(
+            SearchTextField(
                 text: $model.workSearchText,
                 onEscape: {
                     isExpanded = false
@@ -929,68 +929,31 @@ private struct WorkSearchToolbarItem: View {
     }
 }
 
-private final class AutoFocusSearchField: NSSearchField {
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        window?.makeFirstResponder(self)
-    }
-}
-
-private struct NativeSearchField: NSViewRepresentable {
+private struct SearchTextField: View {
     @Binding var text: String
     var onEscape: () -> Void
     var onFocusLost: () -> Void
+    @FocusState private var isFocused: Bool
 
-    func makeNSView(context: Context) -> NSSearchField {
-        let field = AutoFocusSearchField()
-        field.placeholderString = "Search"
-        field.delegate = context.coordinator
-        return field
-    }
-
-    func updateNSView(_ nsView: NSSearchField, context: Context) {
-        if nsView.stringValue != text {
-            nsView.stringValue = text
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .font(.system(size: 11))
+            TextField("Search", text: $text)
+                .textFieldStyle(.plain)
+                .focused($isFocused)
+                .onKeyPress(.escape) {
+                    onEscape()
+                    return .handled
+                }
         }
-    }
-
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSSearchField, context: Context) -> CGSize? {
-        let intrinsic = nsView.intrinsicContentSize
-        return CGSize(width: proposal.width ?? intrinsic.width, height: intrinsic.height)
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
-
-    final class Coordinator: NSObject, NSSearchFieldDelegate {
-        var parent: NativeSearchField
-        private var escapeHandled = false
-
-        init(_ parent: NativeSearchField) {
-            self.parent = parent
-        }
-
-        func controlTextDidChange(_ obj: Notification) {
-            guard let field = obj.object as? NSSearchField else { return }
-            parent.text = field.stringValue
-        }
-
-        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-                escapeHandled = true
-                parent.onEscape()
-                return true
-            }
-            return false
-        }
-
-        func controlTextDidEndEditing(_ obj: Notification) {
-            if escapeHandled {
-                escapeHandled = false
-                return
-            }
-            parent.onFocusLost()
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(.quaternary, in: Capsule())
+        .onAppear { isFocused = true }
+        .onChange(of: isFocused) { _, focused in
+            if !focused { onFocusLost() }
         }
     }
 }
