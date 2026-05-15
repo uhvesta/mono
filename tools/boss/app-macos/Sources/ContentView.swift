@@ -95,7 +95,7 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                if model.navigationMode == .work {
+                if model.navigationMode == .work && workColumnVisibility == .detailOnly {
                     Button {
                         withAnimation {
                             workColumnVisibility = workColumnVisibility == .detailOnly ? .all : .detailOnly
