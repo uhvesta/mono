@@ -320,6 +320,57 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         XCTAssertEqual(openedURLs.map(\.absoluteString), [webURL])
     }
 
+    /// In-review designs live on a PR branch. When a workspace path is
+    /// available but the branch is not `main`, the dispatcher must skip
+    /// the local-file fast-path (the workspace is likely on a different
+    /// task's branch so the file won't be there) and instead fetch via
+    /// `rawContentURL`. Regression for the bug where clicking a design-doc
+    /// icon on an in_review task surfaced a file-not-found error instead
+    /// of opening the markdown viewer.
+    func testOpenOnResolvedInReviewBranchWithWorkspacePreferssRawContentURL() async {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+
+        // Capture any local-file opens (should stay empty).
+        var openedLocalFiles: [URL] = []
+        model.urlOpener = { url in
+            if url.isFileURL { openedLocalFiles.append(url) }
+        }
+
+        // Record rawContentFetcher invocations.
+        let fetchExpectation = XCTestExpectation(description: "rawContentFetcher called")
+        model.rawContentFetcher = { _ in
+            fetchExpectation.fulfill()
+            return "# Design Doc"
+        }
+        var viewerContents: [MarkdownViewerContent] = []
+        model.markdownViewerOpener = { viewerContents.append($0) }
+
+        // Non-main branch with a workspace path and a rawContentURL present.
+        // This simulates an in_review design task (T371-style).
+        let rawURL = "https://raw.githubusercontent.com/foo/bar/design-boss-ci-buildkite/tools/boss/docs/designs/x.md"
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "git@github.com:foo/bar.git",
+                branch: "design-boss-ci-buildkite",
+                path: "tools/boss/docs/designs/x.md",
+                kind: .sameProduct(productID: project.productID)
+            ),
+            workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-007",
+            webURL: "https://github.com/foo/bar/blob/design-boss-ci-buildkite/tools/boss/docs/designs/x.md",
+            rawContentURL: rawURL
+        )
+        model.openProjectDesignDoc(project)
+
+        await fulfillment(of: [fetchExpectation], timeout: 1.0)
+        XCTAssertTrue(
+            openedLocalFiles.isEmpty,
+            "expected no local-file open for in-review branch; got: \(openedLocalFiles)"
+        )
+        XCTAssertEqual(viewerContents.count, 1)
+        XCTAssertNil(model.workErrorMessage)
+    }
+
     /// An unparseable web URL on a resolved state still must not
     /// silently swallow the click. The dispatcher surfaces a
     /// workErrorMessage the user can act on.

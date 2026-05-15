@@ -919,16 +919,18 @@ final class ChatViewModel: ObservableObject {
     /// - `.broken` — surface the engine's reason as a work error so
     ///   the user can re-point. The re-point sheet is tracked
     ///   separately (design Q5).
-    /// - `.resolved` — same/other-product pointers with a leased cube
-    ///   workspace render in the in-app [[DesignRendererView]] when
-    ///   [[designRendererOpener]] is wired. Without a workspace, if
-    ///   `rawContentURL` is present (GitHub raw-content URL for the
-    ///   doc's branch, populated when the file is on a PR branch),
-    ///   the dispatcher fetches the markdown via [[rawContentFetcher]]
-    ///   and opens it in [[markdownViewerOpener]] — this is how the
-    ///   affordance works for `in_review` design tasks before the PR
-    ///   merges. Otherwise falls through to `urlOpener` with the web
-    ///   URL.
+    /// - `.resolved` — dispatch depends on branch:
+    ///   - `branch == "main"` (merged doc): same/other-product pointers
+    ///     with a leased workspace render via [[designRendererOpener]]
+    ///     when wired, otherwise hand the `file://` URL to [[urlOpener]].
+    ///     The workspace is guaranteed to be on `main` for merged docs so
+    ///     the on-disk path is authoritative.
+    ///   - non-main branch (in-review doc): the leased workspace is
+    ///     commonly on a different task's branch so the on-disk path
+    ///     would not match. Instead, if `rawContentURL` is present the
+    ///     dispatcher fetches the markdown via [[rawContentFetcher]] and
+    ///     opens it in [[markdownViewerOpener]]. Otherwise falls through
+    ///     to [[urlOpener]] with the web URL.
     func openProjectDesignDoc(_ project: WorkProject) {
         let state = designDocStateByProjectID[project.id] ?? .notSet
         switch state {
@@ -937,7 +939,12 @@ final class ChatViewModel: ObservableObject {
         case .broken(let reason):
             workErrorMessage = "Design doc pointer is broken: \(reason)"
         case .resolved(let resolved, let workspacePath, let webURL, let rawContentURL):
-            if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind) {
+            // Only take the workspace fast-path for merged (main-branch) docs.
+            // In-review designs live on a PR branch; the leased workspace is
+            // likely on a different task's branch, so the local path would not
+            // contain the file. Prefer rawContentURL for those cases.
+            if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind),
+               resolved.branch == "main" {
                 if let opener = designRendererOpener,
                    let content = DesignRendererContent.from(
                        projectID: project.id,
