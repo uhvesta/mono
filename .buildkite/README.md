@@ -11,11 +11,8 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
   pipeline.yml          # Buildkite reads this; declares steps, queue tags, depends_on only
   steps/
     bootstrap.sh        # Prime the agent: rust toolchain, bazelisk, pnpm, cache restore
-    cargo-check.sh      # cargo check --workspace (cheap compile guard)
     bazel-build.sh      # bazel build //... (dependency-graph compile guard)
     bazel-test.sh       # bazel test //... (canonical rust + integration tests)
-    pnpm-typecheck.sh   # pnpm -r typecheck
-    pnpm-test.sh        # pnpm -r test
     checks.sh           # CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.)
   README.md             # this file
 ```
@@ -23,16 +20,13 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 ## Pipeline shape
 
 ```
-                      ┌──► cargo-check    ──┐
-                      ├──► bazel-build    ──┤
-bootstrap (queue=mono)┼──► pnpm-typecheck ──┼──► (wait) ──► bazel-test ──┐
-                      ├──► checks         ──┘               pnpm-test  ──┴──► green
+bootstrap (queue=linux-amd64)┬──► bazel-build ──┐
+                             ├──► checks      ──┼──► (wait) ──► bazel-test ──► green
 ```
 
 - `bootstrap` runs first; all other steps depend on it.
-- `cargo-check`, `bazel-build`, `pnpm-typecheck`, and `checks` run in parallel after bootstrap.
-- `bazel-test` and `pnpm-test` run only after all static checks pass (the `wait` step).
-- `pnpm-test` ships as advisory (run-but-not-required) in v1 until its flake rate is stable.
+- `bazel-build` and `checks` run in parallel after bootstrap.
+- `bazel-test` runs only after all static checks pass (the `wait` step).
 
 ## Step details
 
@@ -44,10 +38,6 @@ Ensures the agent has the required toolchain:
 - pnpm: installs if not present, pins to the version in `package.json#packageManager`.
 - Restores the agent-local bazel disk cache (uses `~/.cache/bazelcache` from `.bazelrc`).
 
-### `cargo-check.sh`
-
-Runs `cargo check --workspace`. This is a cheap, fast-failing compile guard — useful when the bazel target graph itself is broken (e.g., a missing `srcs` entry that hides a file from bazel but not from cargo). Does not run tests.
-
 ### `bazel-build.sh`
 
 Runs `bazel build //...`. Catches build-graph rot (visibility violations, missing deps, broken generated files) that cargo cannot see.
@@ -56,45 +46,28 @@ Runs `bazel build //...`. Catches build-graph rot (visibility violations, missin
 
 Runs `bazel test //...`. This is the canonical rust test step. With P1 landed (`tools/boss/engine/BUILD.bazel:86` — `rust_test(name = "engine_lib_test", crate = ":engine_lib")`), this covers the engine lib tests that the 2026-05-12 drift incident exposed, in addition to the integration test targets.
 
-### `pnpm-typecheck.sh`
-
-Runs `pnpm -r typecheck` across all TypeScript workspaces.
-
-### `pnpm-test.sh`
-
-Runs `pnpm -r test` across all JavaScript/TypeScript workspaces.
-
 ### `checks.sh`
 
 Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped to changed paths on PR builds. Does not invoke `jj`; base-ref detection uses git.
 
 ## Agents and queue
 
-All steps run on `queue=mono`. Agents are shared with the flunge fleet (`queue=flunge`) but tagged separately. The `bootstrap.sh` step handles mono-specific toolchain setup that flunge agents don't need by default.
+All steps run on `queue=linux-amd64`. The `bootstrap.sh` step handles toolchain setup (rust, bazel, pnpm, cache restoration).
 
 ## Debugging a red build locally
 
-Each `steps/*.sh` script can be run directly from the repo root (no buildkite-specific env required for the placeholder steps). Once real checks are wired:
+Each `steps/*.sh` script can be run directly from the repo root. To reproduce bazel steps with CI config:
 
 ```sh
-# Run a specific step locally
-bash .buildkite/steps/cargo-check.sh
-
-# Reproduce bazel step locally
-bazel test //...
+# Reproduce bazel step with CI config
+bazel test //... --config=ci
 ```
 
+The CI config is in `.bazelrc.ci`.
 ## Required checks (branch protection)
 
-v1 ships as advisory — no required-status checks yet. Branch protection is added in task #5 per the ramp in the design doc:
-
-1. Land skeleton as advisory (this PR).
-2. Promote `bootstrap`, `cargo-check`, `bazel-build`, `checks` to required.
-3. After two weeks, promote `bazel-test` and `pnpm-typecheck`.
-4. Promote `pnpm-test` once flake rate is < 1%.
-
-The check names buildkite will report (once the pipeline is wired to the buildkite project) are `buildkite/mono/<step-key>`, e.g. `buildkite/mono/cargo-check`. Treat these as a public contract — renaming a step key in `pipeline.yml` requires updating branch protection in lockstep.
+Required checks are managed via branch protection rules. The check names buildkite reports are `buildkite/mono/<step-key>`, e.g. `buildkite/mono/bazel-build`. Treat these as a public contract — renaming a step key in `pipeline.yml` requires updating branch protection in lockstep.
 
 ## Status
 
-Task #3 (static checks) is complete. `cargo-check.sh`, `bazel-build.sh`, `pnpm-typecheck.sh`, and `checks.sh` now run real invocations. `bazel-build.sh` and `bazel-test.sh` use the default disk cache path (`~/.cache/bazelcache` from `.bazelrc`). `pnpm-test.sh` remains advisory; it is wired in task #4 (test steps).
+The pipeline is canonical — `bazel-build` and `bazel-test` are the source of truth. `bazel-build.sh` uses `--config=ci` which sets `--disk_cache=/var/cache/bazel-mono` (defined in `.bazelrc`).

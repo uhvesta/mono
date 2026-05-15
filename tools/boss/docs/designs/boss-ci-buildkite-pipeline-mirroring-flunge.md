@@ -74,11 +74,8 @@ Mirror flunge's `.buildkite/` directory structure verbatim:
   pipeline.yml              # buildkite reads this; defines steps + queue tags
   steps/
     bootstrap.sh            # ensure rust toolchain + bazel + pnpm present; cache restore
-    cargo-check.sh          # cargo check --workspace (cheap compile guard)
     bazel-build.sh          # bazel build //...
     bazel-test.sh           # bazel test //... (covers engine lib tests via P1)
-    pnpm-typecheck.sh       # pnpm -r typecheck
-    pnpm-test.sh            # pnpm -r test
     checks.sh               # checkleft / CHECKS.yaml runner (no-generated-artifacts, etc.)
   README.md                 # what each step does, how to debug a red build locally
 ```
@@ -87,19 +84,16 @@ Mirror flunge's `.buildkite/` directory structure verbatim:
 
 ### Pipeline shape
 
-Five logical phases, parallelised where they don't depend on each other:
+Three logical phases, parallelised where they don't depend on each other:
 
 ```
-                        ┌──► cargo-check    ──┐
-                        ├──► bazel-build    ──┤
-bootstrap (queue=mono) ─┼──► pnpm-typecheck ──┼──► (wait) ──► bazel-test ──┐
-                        ├──► checks         ──┤               pnpm-test  ──┴──► green
-                        └──────────────────────┘
+bootstrap (queue=linux-amd64) ─┬──► bazel-build ──┐
+                               ├──► checks       ──┼──► (wait) ──► bazel-test ──► green
 ```
 
 - `bootstrap` is a single step that primes the agent: installs / pins the rust toolchain (read `rust-toolchain.toml`), pins bazelisk, installs pnpm, and restores the bazel disk cache. Subsequent steps inherit a warm checkout.
-- Cheap static checks (`cargo check`, `bazel build`, `pnpm typecheck`, `checks.sh`) run in parallel. Any one failing is enough to redden the build; reviewers don't need to wait for the heavy steps to see compile failures.
-- Test steps (`bazel test`, `pnpm test`) run after the static checks pass. Order is deliberate: a compile failure caught by `cargo check` is the cheapest possible signal, so we don't burn agent minutes running tests on code that doesn't compile. `bazel test //...` is the canonical rust test step — with P1 landed it covers the engine lib tests as well as the integration test targets.
+- Cheap static checks (`bazel build`, `checks.sh`) run in parallel. Any one failing is enough to redden the build; reviewers don't need to wait for the heavy steps to see compile failures.
+- Test steps (`bazel test`) run after the static checks pass. `bazel test //...` is the canonical rust test step — with P1 landed it covers the engine lib tests as well as the integration test targets.
 - Every step is its own buildkite step (not a sub-target of one umbrella step). When one is red, the buildkite UI shows exactly which, and the engine's `ci_watch` (which already parses required-check names) can route by failing-step name in the future.
 
 ### Required checks for branch protection
@@ -107,36 +101,28 @@ bootstrap (queue=mono) ─┼──► pnpm-typecheck ──┼──► (wait) 
 GitHub branch protection on `main` requires:
 
 - `buildkite/mono/bootstrap`
-- `buildkite/mono/cargo-check`
 - `buildkite/mono/bazel-build`
 - `buildkite/mono/bazel-test`
-- `buildkite/mono/pnpm-typecheck`
 - `buildkite/mono/checks`
 
-`pnpm-test` is run-but-not-yet-required from v1; it ships as a required check once it's stable enough to not flake the org into ignoring red builds. Conservative ramp:
-
-1. Land the pipeline as advisory (no required-status check). Run for one week.
-2. Promote `bootstrap`, `cargo-check`, `bazel-build`, `checks` to required.
-3. After two more weeks (or sooner if confidence is high), promote `bazel-test` and `pnpm-typecheck`.
-4. Promote `pnpm-test` only once flake rates are visibly < 1%.
+The pipeline shape focuses on bazel as the canonical build and test system. Cargo-check and pnpm-based steps have been dropped in favor of bazel's dependency-graph checking and unified rust+node test coverage.
 
 The promotion sequence is the only thing in this design that touches GitHub branch protection settings directly; everything else is repo-local.
 
 ### Agent topology
 
-Single buildkite agent fleet, shared with flunge, two queue tags:
+Single buildkite agent fleet, shared with other projects, queue tag:
 
-- `queue=flunge` — flunge's existing jobs.
-- `queue=mono` — this pipeline.
+- `queue=linux-amd64` — default Linux queue for all projects including mono.
 
-Agents run a `pre-bootstrap` hook (already in flunge's setup; we add a mono branch) that checks the queue tag and runs the matching toolchain prep. For mono, that means:
+Agents run a `bootstrap.sh` step that ensures the required toolchain is present:
 
 - `rustup toolchain install` per `rust-toolchain.toml` if not present.
 - `bazelisk` available on `$PATH`.
 - `pnpm` available on `$PATH`.
 - `jj` *not* installed on agents. Buildkite checks out via git natively; the jj-in-workspace concern is a worker-side issue, not a CI concern (see Risk R3).
 
-If contention shows up — e.g., a flood of flunge jobs starves mono PRs of agents — we split fleets. Until then, one fleet.
+If contention shows up, we can tag and isolate mono jobs separately. Until then, shared queue.
 
 ### Bazel cache
 
@@ -153,12 +139,11 @@ Cache keying:
 
 ### Historical: cargo→bazel transition
 
-The original v1 plan ran `cargo test` and `bazel test` side-by-side until P1 closed the engine-lib coverage gap. **That is no longer needed.** P1 has landed: `tools/boss/engine/BUILD.bazel:86` declares `rust_test(name = "engine_lib_test", crate = ":engine_lib", ...)`, and `bazel test //tools/boss/engine/...` exercises the lib tests that the May-12 drift exposed.
+The original v1 plan ran `cargo test` and `bazel test` side-by-side until P1 closed the engine-lib coverage gap, and included `cargo check` as a cheap compile guard. **Both are no longer needed.** P1 has landed: `tools/boss/engine/BUILD.bazel:86` declares `rust_test(name = "engine_lib_test", crate = ":engine_lib", ...)`, and `bazel test //tools/boss/engine/...` exercises the lib tests that the May-12 drift exposed. Bazel's dependency-graph checking (`bazel build`) catches what cargo-check would catch, making the extra compile guard redundant.
 
-The implementation task that lands the pipeline should therefore wire `bazel test //...` directly as the rust test step; no transitional `cargo-test.sh` is needed. `cargo check --workspace` stays in the pipeline as a cheap, fast-failing compile guard — it's still useful when the bazel target graph itself is broken (e.g., a missing `srcs` entry that hides a file from bazel but not from cargo).
+The implementation now wires `bazel test //...` and `bazel build //...` directly as the canonical rust signal steps, with no transitional `cargo-check` or `cargo-test` steps needed.
 
-Verification before promoting `bazel-test` to required:
-- Run on a cherry-pick of the May-12 drift commit and confirm the build reddens at `bazel-test` (or, ideally, at `cargo-check` first).
+Verification for bazel-test:
 - Spot-check that the bazel-test wall-clock on a warm cache is within the budget assumed by the sharding decision below.
 
 ### Sharding
