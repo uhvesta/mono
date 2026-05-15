@@ -51,7 +51,37 @@ use boss_protocol::FrontendEvent;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
+use crate::metrics::Registry;
 use crate::work::{WorkDb, WorkItem, WorkerPrCompletionTarget};
+
+// Phase-3 counter handles for the PR URL capture paths. The primary path
+// fires when the PostToolUse staging cache already holds the URL; the
+// reconstruction path fires when the cold-path `detect_pr` fallback is
+// invoked instead.
+crate::register_counter!(
+    PR_URL_CAPTURE_PRIMARY_HIT,
+    "pr_url_capture.primary_path.hit",
+    "on_stop / recheck_for_pr found a staged PR URL and skipped the detector.",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_RECONSTRUCTION_HIT,
+    "pr_url_capture.reconstruction_path.hit",
+    "detect_pr cold-path fallback was invoked (staging cache empty).",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_RECONSTRUCTION_FAILED,
+    "pr_url_capture.reconstruction_path.failed",
+    "detect_pr cold-path fallback returned Err (network / date-format class).",
+);
+
+/// Register all PR-URL-capture counter handles with `registry`. Called from
+/// [`crate::metrics::init_all`] at engine startup so duplicate-name panics
+/// surface at boot rather than at the first counter increment.
+pub fn register_metrics(registry: &Registry) {
+    registry.register_counter(&PR_URL_CAPTURE_PRIMARY_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
+}
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
 /// when the bound worker exits without pushing and without otherwise
@@ -482,6 +512,11 @@ pub struct WorkerCompletionHandler {
     /// don't wire one in get the historical behaviour
     /// (`detect_pr_cold_fallback` defaults ON).
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    /// Engine-wide counter registry. Defaults to a fresh local registry
+    /// with the PR-capture counters pre-registered so tests that do not
+    /// call `with_metrics` still get valid increments. Production wires
+    /// in the shared engine registry via `with_metrics` after construction.
+    metrics: Arc<Registry>,
 }
 
 impl WorkerCompletionHandler {
@@ -493,6 +528,11 @@ impl WorkerCompletionHandler {
         pane_releaser: Arc<dyn WorkerPaneReleaser>,
         probe_queuer: Arc<dyn ProbeQueuer>,
     ) -> Self {
+        // Build a local registry for tests that never call `with_metrics`.
+        // Pre-register the PR-capture handles so `.inc()` never panics on
+        // "counter not registered" in a test context.
+        let local_metrics = Arc::new(Registry::new());
+        register_metrics(&local_metrics);
         Self {
             work_db,
             pr_detector,
@@ -504,7 +544,17 @@ impl WorkerCompletionHandler {
             feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(
                 std::path::PathBuf::new(),
             )),
+            metrics: local_metrics,
         }
+    }
+
+    /// Wire the engine-global metrics registry into this handler. `app.rs`
+    /// calls this once after `init_all` has registered the PR-capture
+    /// counter handles. Tests that omit this call use a pre-seeded local
+    /// registry (created in `new`) so counter increments never panic.
+    pub fn with_metrics(mut self, metrics: Arc<Registry>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Wire an externally-owned [`StagedPrUrlCache`] into this
@@ -593,6 +643,7 @@ impl WorkerCompletionHandler {
                 pr_url = %staged_url,
                 "stop event: using PR URL captured from worker hook stream (primary path); skipping detector",
             );
+            PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
             return self
                 .finalize_pr_transition(
                     execution_id,
@@ -637,6 +688,7 @@ impl WorkerCompletionHandler {
         }
 
         let expected_branch = expected_branch_name(&execution.id);
+        PR_URL_CAPTURE_RECONSTRUCTION_HIT.inc(&self.metrics);
         let pr_status = match self
             .pr_detector
             .detect_pr(&execution.repo_remote_url, &expected_branch)
@@ -656,6 +708,7 @@ impl WorkerCompletionHandler {
                     ?err,
                     "stop event: PR detection failed; will retry on next merge-poller sweep"
                 );
+                PR_URL_CAPTURE_RECONSTRUCTION_FAILED.inc(&self.metrics);
                 return StopOutcome::DetectorFailed;
             }
         };
@@ -742,6 +795,7 @@ impl WorkerCompletionHandler {
                 pr_url = %staged_url,
                 "pr-recheck: using PR URL captured from worker hook stream (primary path); skipping detector",
             );
+            PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
             return self
                 .finalize_pr_transition(
                     execution_id,
@@ -778,6 +832,7 @@ impl WorkerCompletionHandler {
         }
 
         let expected_branch = expected_branch_name(&execution.id);
+        PR_URL_CAPTURE_RECONSTRUCTION_HIT.inc(&self.metrics);
         let pr_status = match self
             .pr_detector
             .detect_pr(&execution.repo_remote_url, &expected_branch)
@@ -791,6 +846,7 @@ impl WorkerCompletionHandler {
                     ?err,
                     "pr-recheck: detector failed; will retry next sweep"
                 );
+                PR_URL_CAPTURE_RECONSTRUCTION_FAILED.inc(&self.metrics);
                 return StopOutcome::DetectorFailed;
             }
         };

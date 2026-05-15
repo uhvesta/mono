@@ -40,6 +40,12 @@ pub use registry::{CounterHandle, GaugeHandle, Registry};
 /// its handles so duplicate-name panics surface at boot rather than
 /// at the first increment (design §"Risks / open questions" item 6).
 pub fn init_all(registry: &Registry) {
+    // Phase 3: PR URL capture path counters.
+    crate::completion::register_metrics(registry);
+    // Phase 3: Dependency-unblock sweep gauge.
+    crate::dep_unblock_sweep::register_metrics(registry);
+    // Phase 3: Cube workspace lease counters.
+    crate::coordinator::register_metrics(registry);
     // Phase 4: DispatcherStats counters migrated to the framework.
     crate::live_status_loop::register_metrics(registry);
     // Phase 5: SweepOutcome / merge_poller counters.

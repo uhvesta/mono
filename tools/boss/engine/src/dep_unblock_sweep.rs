@@ -45,10 +45,23 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::metrics::Registry;
 use crate::work::WorkDb;
 
 /// Interval between sweep passes.
 pub const DEP_UNBLOCK_SWEEP_INTERVAL_SECS: u64 = 30;
+
+crate::register_gauge!(
+    DEP_UNBLOCK_LONGEST_STALE_SECONDS,
+    "dependency_unblock.longest_stale_seconds",
+    "Seconds since updated_at for the longest-stale dependency-blocked row observed in the most recent sweep.",
+);
+
+/// Register all dep-unblock gauge handles with `registry`. Called from
+/// [`crate::metrics::init_all`] at engine startup.
+pub fn register_metrics(registry: &Registry) {
+    registry.register_gauge(&DEP_UNBLOCK_LONGEST_STALE_SECONDS);
+}
 
 /// Counters from one sweep pass.
 #[derive(Debug, Default)]
@@ -65,10 +78,15 @@ pub struct DepUnblockSweepOutcome {
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so items blocked before engine boot are
 /// recovered without waiting for the first interval.
-pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::JoinHandle<()> {
+pub fn spawn_loop(
+    work_db: Arc<WorkDb>,
+    interval: Duration,
+    metrics: Arc<Registry>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let outcome = run_one_pass(work_db.as_ref()).await;
+            DEP_UNBLOCK_LONGEST_STALE_SECONDS.set(&metrics, outcome.longest_stale_secs as i64);
             tracing::info!(
                 rows_evaluated = outcome.rows_evaluated,
                 rows_unblocked = outcome.rows_unblocked,

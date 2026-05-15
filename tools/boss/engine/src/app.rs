@@ -650,6 +650,8 @@ impl ServerState {
         let metrics_registry = Arc::new(crate::metrics::Registry::new());
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
+        let metrics_for_completion = metrics_registry.clone();
+        let metrics_for_coordinator = metrics_registry.clone();
 
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -661,7 +663,8 @@ impl ServerState {
                 probe_queuer.clone(),
             )
             .with_staged_pr_urls(staged_pr_urls.clone())
-            .with_feature_flags(feature_flags_for_handler),
+            .with_feature_flags(feature_flags_for_handler)
+            .with_metrics(metrics_for_completion),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -696,6 +699,7 @@ impl ServerState {
                 publisher,
             );
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
+            execution_coordinator_inner.set_metrics(metrics_for_coordinator);
             let execution_coordinator = Arc::new(execution_coordinator_inner);
 
             ServerState {
@@ -2150,6 +2154,7 @@ pub async fn serve(
     let _dep_unblock_handle = crate::dep_unblock_sweep::spawn_loop(
         server_state.work_db.clone(),
         Duration::from_secs(crate::dep_unblock_sweep::DEP_UNBLOCK_SWEEP_INTERVAL_SECS),
+        server_state.metrics.clone(),
     );
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
