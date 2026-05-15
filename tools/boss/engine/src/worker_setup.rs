@@ -30,6 +30,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde_json;
+
 /// All the inputs a worker-config render needs. The shape is
 /// deliberately minimal — anything more (project-specific guidance,
 /// allowlisted tools) lives in higher layers and is rendered separately.
@@ -392,6 +394,116 @@ pub struct WrittenFiles {
 /// Convenience: absolute path to the per-lease `.claude/` dir.
 pub fn claude_dir_for(workspace: &Path) -> PathBuf {
     workspace.join(".claude")
+}
+
+/// Replace the boss-event shim path in a single hook command string.
+///
+/// The command format produced by [`render_settings_json`] is:
+/// `BOSS_EVENTS_SOCKET='...' BOSS_LEASE_ID='...' BOSS_RUN_ID='...' BOSS_WORKSPACE='...' '<shim_path>'`
+///
+/// This function finds the last single-quoted token that contains `boss-event`
+/// and replaces it with a shell-escaped version of `new_boss_event_path`.
+/// Returns the original string unchanged if no recognizable shim path is found.
+pub(crate) fn heal_hook_command(command: &str, new_boss_event_path: &Path) -> String {
+    let Some(shim_pos) = command.rfind("boss-event") else {
+        return command.to_owned();
+    };
+    // Walk backward from shim_pos to find the opening single quote.
+    let Some(open_pos) = command[..shim_pos].rfind('\'') else {
+        return command.to_owned();
+    };
+    // Walk forward past "boss-event" to find the closing single quote.
+    let after = shim_pos + "boss-event".len();
+    let Some(close_offset) = command[after..].find('\'') else {
+        return command.to_owned();
+    };
+    let close_pos = after + close_offset;
+    let new_escaped = shell_escape(&new_boss_event_path.display().to_string());
+    format!(
+        "{}{}{}",
+        &command[..open_pos],
+        new_escaped,
+        &command[close_pos + 1..]
+    )
+}
+
+/// Walk all given worker workspace directories and update the boss-event
+/// shim path in each `.claude/settings.json` to `new_boss_event_path`.
+/// Errors and missing files per-workspace are logged but do not abort
+/// the sweep.
+pub fn heal_worker_settings_json(workspace_paths: &[PathBuf], new_boss_event_path: &Path) {
+    for workspace in workspace_paths {
+        let settings_path = workspace.join(".claude/settings.json");
+        match heal_single_settings_json(&settings_path, new_boss_event_path) {
+            Ok(true) => {
+                tracing::info!(
+                    settings = %settings_path.display(),
+                    "healed boss-event path in worker settings.json",
+                );
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    settings = %settings_path.display(),
+                    ?err,
+                    "failed to heal boss-event path in worker settings.json",
+                );
+            }
+        }
+    }
+}
+
+/// Returns `Ok(true)` if any hook commands were updated, `Ok(false)` if
+/// the file was absent or unchanged.
+fn heal_single_settings_json(
+    settings_path: &Path,
+    new_boss_event_path: &Path,
+) -> io::Result<bool> {
+    let content = match std::fs::read_to_string(settings_path) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    let mut parsed: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let mut changed = false;
+
+    if let Some(hooks) = parsed.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_name, entries) in hooks.iter_mut() {
+            if let Some(arr) = entries.as_array_mut() {
+                for entry in arr.iter_mut() {
+                    if let Some(inner_hooks) = entry
+                        .get_mut("hooks")
+                        .and_then(|h| h.as_array_mut())
+                    {
+                        for inner in inner_hooks.iter_mut() {
+                            if let Some(cmd) = inner
+                                .get("command")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_owned)
+                            {
+                                let healed = heal_hook_command(&cmd, new_boss_event_path);
+                                if healed != cmd {
+                                    inner["command"] = serde_json::Value::String(healed);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        let new_content = serde_json::to_string_pretty(&parsed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        std::fs::write(settings_path, new_content)?;
+    }
+
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -850,5 +962,98 @@ mod tests {
             !rendered.contains("--draft"),
             "CLAUDE.md must NOT include --draft directive when draft_pr_mode is false",
         );
+    }
+
+    #[test]
+    fn heal_hook_command_replaces_shim_path() {
+        let old_cmd = "BOSS_EVENTS_SOCKET='/tmp/events.sock' BOSS_LEASE_ID='lease-1' \
+                       BOSS_RUN_ID='run-1' BOSS_WORKSPACE='/tmp/ws' \
+                       '/old/bazel-bin/tools/boss/event-shim/boss-event'";
+        let new_path = PathBuf::from("/stable/bin/boss-event");
+        let healed = heal_hook_command(old_cmd, &new_path);
+        assert!(
+            healed.contains("'/stable/bin/boss-event'"),
+            "should contain new path: {healed}",
+        );
+        assert!(
+            !healed.contains("/old/bazel-bin"),
+            "should not contain old path: {healed}",
+        );
+        // Env vars and other args must be preserved unchanged.
+        assert!(healed.contains("BOSS_EVENTS_SOCKET="));
+        assert!(healed.contains("BOSS_WORKSPACE="));
+    }
+
+    #[test]
+    fn heal_hook_command_handles_path_with_spaces() {
+        let old_cmd = "BOSS_EVENTS_SOCKET='/tmp/e.sock' BOSS_LEASE_ID='l' \
+                       BOSS_RUN_ID='r' BOSS_WORKSPACE='/tmp/ws' \
+                       '/Users/x/Library/Application Support/Boss/bin/boss-event'";
+        let new_path = PathBuf::from("/Users/y/Library/Application Support/Boss/bin/boss-event");
+        let healed = heal_hook_command(old_cmd, &new_path);
+        assert!(
+            healed.contains("'/Users/y/Library/Application Support/Boss/bin/boss-event'"),
+            "spaces in new path must be inside single quotes: {healed}",
+        );
+    }
+
+    #[test]
+    fn heal_hook_command_no_op_when_no_boss_event_present() {
+        let cmd = "SOME_VAR='val' /unrelated/binary";
+        let new_path = PathBuf::from("/stable/boss-event");
+        let healed = heal_hook_command(cmd, &new_path);
+        assert_eq!(healed, cmd, "should return original when boss-event not found");
+    }
+
+    #[test]
+    fn heal_worker_settings_json_updates_all_hook_events() {
+        let dir = TempDir::new().unwrap();
+        // Write a settings.json with a stale bazel-bin boss-event path.
+        let input = WorkerSetupInput {
+            run_id: "run-heal".into(),
+            lease_id: "lease-heal".into(),
+            workspace_path: dir.path().to_path_buf(),
+            events_socket_path: PathBuf::from("/tmp/events.sock"),
+            boss_event_path: PathBuf::from(
+                "/old/bazel-bin/tools/boss/event-shim/boss-event",
+            ),
+            draft_pr_mode: false,
+        };
+        write_workspace_files(&input).unwrap();
+
+        let new_path = PathBuf::from("/stable/bin/boss-event");
+        heal_worker_settings_json(&[dir.path().to_path_buf()], &new_path);
+
+        let settings =
+            std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        // All seven hook events must now reference the stable path.
+        for hook in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "Notification",
+            "SessionEnd",
+        ] {
+            assert!(
+                settings.contains("/stable/bin/boss-event"),
+                "{hook} hook still references stale path after heal: {settings}",
+            );
+        }
+        assert!(
+            !settings.contains("/old/bazel-bin"),
+            "healed settings.json must not contain the old bazel-bin path: {settings}",
+        );
+        // The settings.json must still be valid JSON.
+        let _: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    }
+
+    #[test]
+    fn heal_worker_settings_json_skips_missing_settings_file() {
+        let dir = TempDir::new().unwrap();
+        let new_path = PathBuf::from("/stable/boss-event");
+        // Should not panic even if .claude/settings.json doesn't exist.
+        heal_worker_settings_json(&[dir.path().to_path_buf()], &new_path);
     }
 }

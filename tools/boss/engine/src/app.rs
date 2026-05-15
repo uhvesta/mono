@@ -1897,6 +1897,82 @@ pub async fn serve(
         }
     }
 
+    // Install boss-event to a stable location and heal existing worker
+    // settings.json files. This ensures that hook paths baked into worker
+    // settings.json survive a `bazel clean` or workspace re-lease.
+    //
+    // Resolution at install time intentionally skips the stable-bin-dir
+    // candidate (pass None) so we always copy the real binary from its
+    // original source rather than potentially re-copying a previous install.
+    let stable_boss_event_path = {
+        let engine_path = std::env::current_exe().unwrap_or_default();
+        let workspace_dir = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
+        let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
+        let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
+        let current_shim = crate::runner::resolve_boss_event_binary(
+            &engine_path,
+            workspace_dir.as_deref(),
+            env_override.as_deref(),
+            boss_bin_dir.as_deref(),
+            None,
+        );
+        if let Some(home) = std::env::var_os("HOME") {
+            let stable_bin_dir =
+                PathBuf::from(home).join("Library/Application Support/Boss/bin");
+            match crate::runner::install_boss_event_to_stable_bin(&current_shim, &stable_bin_dir)
+            {
+                Ok(stable) => {
+                    tracing::info!(
+                        stable_path = %stable.display(),
+                        source_path = %current_shim.display(),
+                        "boss-event installed to stable bin dir",
+                    );
+                    stable
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        source_path = %current_shim.display(),
+                        "failed to install boss-event to stable bin dir; \
+                         new workers will use the resolved path",
+                    );
+                    current_shim
+                }
+            }
+        } else {
+            current_shim
+        }
+    };
+
+    // Heal existing worker settings.json files so pre-fix workers that
+    // already have a stale bazel-bin hook path get updated on next engine restart.
+    match server_state.cube_client.list_workspaces().await {
+        Ok(workspaces) => {
+            let workspace_paths: Vec<PathBuf> =
+                workspaces.iter().map(|w| w.workspace_path.clone()).collect();
+            if workspace_paths.is_empty() {
+                tracing::debug!("no workspaces to heal boss-event paths in");
+            } else {
+                tracing::info!(
+                    count = workspace_paths.len(),
+                    new_path = %stable_boss_event_path.display(),
+                    "healing boss-event path in worker settings.json files",
+                );
+                crate::worker_setup::heal_worker_settings_json(
+                    &workspace_paths,
+                    &stable_boss_event_path,
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to list workspaces for boss-event path healing; \
+                 existing workers may have stale hook paths",
+            );
+        }
+    }
+
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
     // executions ended without being moved out of the column. See

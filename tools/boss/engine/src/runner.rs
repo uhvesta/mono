@@ -1,3 +1,4 @@
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration as StdDuration;
@@ -143,11 +144,15 @@ impl PaneSpawnRunner {
         let workspace = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
         let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
         let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
+        let stable_bin_dir = std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h).join("Library/Application Support/Boss/bin")
+        });
         resolve_boss_event_binary(
             &engine_path,
             workspace.as_deref(),
             env_override.as_deref(),
             boss_bin_dir.as_deref(),
+            stable_bin_dir.as_deref(),
         )
     }
 }
@@ -164,23 +169,29 @@ impl PaneSpawnRunner {
 ///      passes it to the engine; all bundled CLIs and the shim live
 ///      there. This is checked ahead of the dev-mode paths so an
 ///      installed bundle never falls through to a workspace clone.
-///   3. Bazel runfiles next to the engine binary
+///   3. `stable_bin_dir/boss-event` — the copy installed by the engine
+///      at startup into `~/Library/Application Support/Boss/bin/`. In
+///      dev mode the engine copies boss-event there on every startup so
+///      the path baked into worker settings.json is stable across
+///      `bazel clean` and workspace re-leases.
+///   4. Bazel runfiles next to the engine binary
 ///      (`<engine_path>.runfiles/_main/tools/boss/event-shim/boss-event`).
 ///      Requires the engine `rust_binary` to declare a `data` dep
 ///      on `//tools/boss/event-shim:boss-event` — without it bazel
 ///      doesn't include the shim in the engine's runfiles.
-///   4. Workspace `bazel-bin` symlink
+///   5. Workspace `bazel-bin` symlink
 ///      (`<workspace>/bazel-bin/tools/boss/event-shim/boss-event`)
 ///      when `BUILD_WORKSPACE_DIRECTORY` is set (i.e., the engine
 ///      was launched via `bazel run` from a checkout).
-///   5. Cargo / hand-built sibling: `<engine_dir>/boss-event`.
-///   6. Bare name `boss-event` — only useful if the worker's PATH
+///   6. Cargo / hand-built sibling: `<engine_dir>/boss-event`.
+///   7. Bare name `boss-event` — only useful if the worker's PATH
 ///      happens to include it (today it doesn't, on purpose).
 pub(crate) fn resolve_boss_event_binary(
     engine_path: &Path,
     workspace_dir: Option<&Path>,
     env_override: Option<&Path>,
     boss_bin_dir: Option<&Path>,
+    stable_bin_dir: Option<&Path>,
 ) -> PathBuf {
     if let Some(override_path) = env_override {
         return override_path.to_path_buf();
@@ -188,6 +199,16 @@ pub(crate) fn resolve_boss_event_binary(
 
     // Installed mode: BOSS_BIN_DIR is Boss.app/Contents/Resources/bin/.
     if let Some(bin_dir) = boss_bin_dir {
+        let candidate = bin_dir.join("boss-event");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    // Stable dev-mode location. The engine copies boss-event here at
+    // startup so hook paths baked into worker settings.json survive
+    // `bazel clean` and workspace re-leases.
+    if let Some(bin_dir) = stable_bin_dir {
         let candidate = bin_dir.join("boss-event");
         if candidate.exists() {
             return candidate;
@@ -219,6 +240,35 @@ pub(crate) fn resolve_boss_event_binary(
     }
 
     PathBuf::from("boss-event")
+}
+
+/// Copy the boss-event shim binary to a stable location in the Boss
+/// support directory. Called at engine startup so the path baked into
+/// new worker settings.json files remains valid after a `bazel clean`.
+///
+/// `source_shim` is the currently-valid binary (from the runfiles tree
+/// or bazel-bin). `stable_bin_dir` is the target directory
+/// (`~/Library/Application Support/Boss/bin/`). Returns the stable path
+/// on success. If `source_shim` is already inside `stable_bin_dir`,
+/// returns `Ok(source_shim)` without copying (no-op for installed mode).
+pub(crate) fn install_boss_event_to_stable_bin(
+    source_shim: &Path,
+    stable_bin_dir: &Path,
+) -> io::Result<PathBuf> {
+    let stable_path = stable_bin_dir.join("boss-event");
+    if stable_path == source_shim {
+        return Ok(stable_path);
+    }
+    std::fs::create_dir_all(stable_bin_dir)?;
+    std::fs::copy(source_shim, &stable_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&stable_path)?.permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        std::fs::set_permissions(&stable_path, perms)?;
+    }
+    Ok(stable_path)
 }
 
 #[async_trait]
@@ -2286,7 +2336,7 @@ mod pane_spawn_tests {
         let engine = dir.path().join("engine");
         std::fs::write(&engine, b"").unwrap();
         let override_path = PathBuf::from("/opt/whatever/boss-event");
-        let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path), None);
+        let resolved = resolve_boss_event_binary(&engine, None, Some(&override_path), None, None);
         assert_eq!(resolved, override_path);
     }
 
@@ -2310,7 +2360,7 @@ mod pane_spawn_tests {
         std::fs::create_dir_all(&runfiles).unwrap();
         std::fs::write(runfiles.join("boss-event"), b"").unwrap();
 
-        let resolved = resolve_boss_event_binary(&engine, None, None, Some(&bundle_bin));
+        let resolved = resolve_boss_event_binary(&engine, None, None, Some(&bundle_bin), None);
         assert_eq!(resolved, bundle_shim);
     }
 
@@ -2333,7 +2383,7 @@ mod pane_spawn_tests {
         let shim = runfiles.join("boss-event");
         std::fs::write(&shim, b"").unwrap();
 
-        let resolved = resolve_boss_event_binary(&engine, None, None, None);
+        let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
         assert_eq!(resolved, shim);
     }
 
@@ -2353,7 +2403,7 @@ mod pane_spawn_tests {
         let shim = bazel_bin.join("boss-event");
         std::fs::write(&shim, b"").unwrap();
 
-        let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None, None);
+        let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None, None, None);
         assert_eq!(resolved, shim);
     }
 
@@ -2366,7 +2416,68 @@ mod pane_spawn_tests {
         let dir = TempDir::new().unwrap();
         let engine = dir.path().join("engine");
         std::fs::write(&engine, b"").unwrap();
-        let resolved = resolve_boss_event_binary(&engine, None, None, None);
+        let resolved = resolve_boss_event_binary(&engine, None, None, None, None);
         assert_eq!(resolved, PathBuf::from("boss-event"));
+    }
+
+    /// The stable bin dir (installed by the engine at startup) is
+    /// preferred over bazel runfiles and bazel-bin so a `bazel clean`
+    /// doesn't break hook paths already baked into worker settings.json.
+    #[test]
+    fn resolve_boss_event_prefers_stable_bin_dir_over_runfiles() {
+        let dir = TempDir::new().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::write(&engine, b"").unwrap();
+
+        // Synthesize the stable bin dir (engine startup installs it here).
+        let stable_bin = dir.path().join("stable-bin");
+        std::fs::create_dir_all(&stable_bin).unwrap();
+        let stable_shim = stable_bin.join("boss-event");
+        std::fs::write(&stable_shim, b"stable").unwrap();
+
+        // Also synthesize runfiles — must NOT be picked when stable exists.
+        let runfiles = dir.path().join("engine.runfiles/_main/tools/boss/event-shim");
+        std::fs::create_dir_all(&runfiles).unwrap();
+        std::fs::write(runfiles.join("boss-event"), b"runfiles").unwrap();
+
+        let resolved = resolve_boss_event_binary(&engine, None, None, None, Some(&stable_bin));
+        assert_eq!(resolved, stable_shim);
+    }
+
+    /// `install_boss_event_to_stable_bin` copies the shim and marks it
+    /// executable so workers can invoke it directly.
+    #[test]
+    fn install_boss_event_to_stable_bin_copies_and_makes_executable() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("boss-event-source");
+        std::fs::write(&source, b"#!/bin/sh\necho ok\n").unwrap();
+
+        let stable_bin = dir.path().join("stable/bin");
+        let result = install_boss_event_to_stable_bin(&source, &stable_bin);
+        assert!(result.is_ok(), "install should succeed: {result:?}");
+        let stable = result.unwrap();
+        assert_eq!(stable, stable_bin.join("boss-event"));
+        assert!(stable.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&stable).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "boss-event must be executable after install");
+        }
+    }
+
+    /// Installing when src == dst is a no-op (doesn't fail or corrupt the file).
+    #[test]
+    fn install_boss_event_to_stable_bin_no_op_when_already_stable() {
+        let dir = TempDir::new().unwrap();
+        let stable_bin = dir.path().join("bin");
+        std::fs::create_dir_all(&stable_bin).unwrap();
+        let stable = stable_bin.join("boss-event");
+        std::fs::write(&stable, b"#!/bin/sh\n").unwrap();
+
+        let result = install_boss_event_to_stable_bin(&stable, &stable_bin);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), stable);
     }
 }
