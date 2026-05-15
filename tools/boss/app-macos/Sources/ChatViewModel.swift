@@ -186,6 +186,21 @@ final class ChatViewModel: ObservableObject {
     /// headless contexts) falls back to `urlOpener`.
     var markdownViewerOpener: ((MarkdownViewerContent) -> Void)?
 
+    /// Indirection for opening the `"async-markdown-viewer"` Window
+    /// immediately, before the design doc has been fetched. Installed by
+    /// [[ContentView]] via `@Environment(\.openWindow)`. When set, the
+    /// raw-content path opens the window first (loading state) then
+    /// resolves content into [[asyncMarkdownViewerVM]]. `nil` (tests and
+    /// headless) falls back to the legacy fetch-then-open path via
+    /// [[markdownViewerOpener]].
+    var asyncMarkdownViewerOpener: (() -> Void)?
+
+    /// Shared state for the `"async-markdown-viewer"` Window scene.
+    /// The window observes this object to transition from loading →
+    /// loaded/failed without needing to pass content through the
+    /// `openWindow` value type.
+    let asyncMarkdownViewerVM = AsyncMarkdownViewerViewModel()
+
     /// Indirection for fetching raw markdown content from a URL.
     /// Production default hits `URLSession.shared`; tests inject a stub
     /// so the affordance tests never make live network calls.
@@ -976,12 +991,28 @@ final class ChatViewModel: ObservableObject {
             }
             if let rawContentURL, let rawURL = URL(string: rawContentURL) {
                 let projectName = project.name
-                Task { @MainActor in
-                    await self.fetchAndOpenDesignDoc(
-                        projectName: projectName,
-                        rawURL: rawURL,
-                        webURL: webURL
-                    )
+                if let opener = asyncMarkdownViewerOpener {
+                    // Open the window immediately in a loading state, then
+                    // resolve the content asynchronously — the user sees a
+                    // window within one frame of the click (T-open-immediately).
+                    asyncMarkdownViewerVM.state = .loading
+                    opener()
+                    Task { @MainActor in
+                        await self.fetchAndUpdateAsyncMarkdownViewerVM(
+                            projectName: projectName,
+                            rawURL: rawURL
+                        )
+                    }
+                } else {
+                    // Headless / test path: fetch first, then open via the
+                    // legacy markdownViewerOpener (or fall back to urlOpener).
+                    Task { @MainActor in
+                        await self.fetchAndOpenDesignDoc(
+                            projectName: projectName,
+                            rawURL: rawURL,
+                            webURL: webURL
+                        )
+                    }
                 }
                 return
             }
@@ -1012,6 +1043,27 @@ final class ChatViewModel: ObservableObject {
             } else {
                 workErrorMessage = "Failed to fetch design doc: \(error.localizedDescription)"
             }
+        }
+    }
+
+    /// Fetch raw markdown from `rawURL` and update [[asyncMarkdownViewerVM]]
+    /// state. Called after the viewer window is already open in `.loading`
+    /// state. Transitions to `.loaded` on success or `.failed` on error so
+    /// the window always resolves to a terminal state.
+    @MainActor
+    private func fetchAndUpdateAsyncMarkdownViewerVM(
+        projectName: String,
+        rawURL: URL
+    ) async {
+        let title = projectName.isEmpty ? rawURL.lastPathComponent : projectName
+        do {
+            let markdown = try await rawContentFetcher(rawURL)
+            asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown)
+        } catch {
+            asyncMarkdownViewerVM.state = .failed(
+                title: title,
+                message: error.localizedDescription
+            )
         }
     }
 

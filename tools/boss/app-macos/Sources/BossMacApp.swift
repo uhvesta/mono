@@ -40,6 +40,18 @@ struct BossMacApp: App {
         }
         .defaultSize(width: 760, height: 640)
 
+        // Async variant of the markdown viewer: opens immediately in a
+        // loading state when the user clicks a design-doc icon, then
+        // transitions to loaded/failed when the raw-content fetch settles.
+        // Uses [[ChatViewModel.asyncMarkdownViewerVM]] (injected via
+        // environmentObject) rather than a value-type payload so the
+        // window content can be updated after it opens.
+        Window("Design Doc", id: "async-markdown-viewer") {
+            AsyncMarkdownViewerView()
+        }
+        .environmentObject(chatModel)
+        .defaultSize(width: 760, height: 640)
+
         // In-app renderer for a project's design-doc pointer. Wired to
         // the kanban project-card affordance via
         // [[ChatViewModel.designRendererOpener]] so SameProduct /
