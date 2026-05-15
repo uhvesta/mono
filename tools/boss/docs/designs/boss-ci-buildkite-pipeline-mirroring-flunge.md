@@ -1,10 +1,19 @@
 # Boss CI: Buildkite Pipeline Mirroring Flunge
 
+## Status (2026-05-14)
+
+Two pieces of the original design have landed independently of the pipeline itself; the rest of this doc still describes work to do.
+
+- **P1 (bazel engine-lib coverage) has landed.** `tools/boss/engine/BUILD.bazel:86` now declares `rust_test(name = "engine_lib_test", crate = ":engine_lib", ...)`, so `bazel test //tools/boss/engine/...` exercises the engine lib tests that the motivating incident exposed. The doc no longer needs a `cargo test` transitional step in the pipeline; bazel is the canonical rust signal from v1. See "Historical: cargo→bazel transition" below for context.
+- **Kanban CI status indicator has shipped.** `PrCiIndicator` in `tools/boss/app-macos/Sources/ContentView.swift:2683` renders a small badge on Review-lane cards: yellow clock for `in_progress`, green checkmark for `success`, red X for `fail`, hidden for `unknown`. It is fed by the existing `ci_watch` probe path; no new schema column was needed. See "Boss UI integration — shipped" below.
+
+The pipeline itself (the `.buildkite/` skeleton, the per-step shells, the branch-protection ramp) is still pending implementation. Everything below describes that remaining work.
+
 ## Motivating incident
 
 On 2026-05-12, the `#[cfg(test)]` blocks in `tools/boss/engine/src/{completion,merge_poller}.rs` drifted out of sync with their prod signatures. `cargo test -p boss-engine --no-run` reported six compile errors on `main`. The drift sat undetected on `main` for roughly twenty-four hours. La Forge's investigation in closed PR #438 (chore `task_18af35a1e855d7f0_24`) tracked down the cause; the doc didn't land on main, but the findings stand.
 
-Why nothing caught it: `bazel test //tools/boss/engine/...` resolves to only two integration test targets — there is no `rust_test(crate=":engine_lib")`, so bazel silently skipped 561 lib tests. Sibling chore `task_18af3caac58d9748_2c` ("P1") tracks the bazel target gap separately. With no other gate, every dispatched worker is a bet that what landed on `main` since the last green check is still buildable.
+Why nothing caught it: at the time, `bazel test //tools/boss/engine/...` resolved to only two integration test targets — there was no `rust_test(crate=":engine_lib")`, so bazel silently skipped 561 lib tests. Sibling chore `task_18af3caac58d9748_2c` ("P1") tracked that gap separately and has since landed (see Status above); the rule now lives at `tools/boss/engine/BUILD.bazel:86`. With no other gate, every dispatched worker is a bet that what landed on `main` since the last green check is still buildable.
 
 This design proposes the structural fix: a buildkite pipeline for the mono repo, mirroring the shape of the existing flunge pipeline, gating merges on green.
 
@@ -12,7 +21,7 @@ This design proposes the structural fix: a buildkite pipeline for the mono repo,
 
 - A PR to mono cannot be merged while buildkite reports red. GitHub branch protection enforces it; no engine-side gating required.
 - The pipeline runs on every PR open + push + branch update, plus pushes to `main`.
-- The first PR that introduces a `cargo test` compile failure (or, once P1 lands, a `bazel test` failure) is blocked from merging.
+- The first PR that introduces a `bazel test` failure (or a `cargo check` compile failure) is blocked from merging.
 - Reviewers see a clear pass/fail signal in the GitHub PR UI; the Boss UI surfaces the same signal next to in-review rows.
 - Same shape as flunge's buildkite — same buildkite org, same secrets store, same merge-blocking semantics. Diverge only where the rust + bazel + jj surface forces it.
 
@@ -48,13 +57,11 @@ We can split fleets later if real evidence shows mono jobs starving flunge jobs 
 
 ### Alternative C — `cargo` only, drop `bazel` from CI
 
-Drop bazel from CI entirely. Run only `cargo check` / `cargo test` / `pnpm test`. Rationale would be: the bazel coverage gap (P1) is the bug, and adding bazel to CI before P1 lands just adds a green box that doesn't catch anything. Rejected:
+Drop bazel from CI entirely. Run only `cargo check` / `cargo test` / `pnpm test`. Rejected:
 
-- The motivating incident was caught by `cargo test`, not bazel — so cargo-only CI would have caught it. But the pattern we're guarding against is broader. The repobin dispatch-cache regression that PR #439 fixed wasn't visible to cargo; it was a bazel state bug. We want bazel signals in CI even before P1 closes the rust lib gap.
+- The motivating incident was caught by `cargo test`, not bazel — so cargo-only CI would have caught it. But the pattern we're guarding against is broader. The repobin dispatch-cache regression that PR #439 fixed wasn't visible to cargo; it was a bazel state bug. We want bazel signals in CI on top of, not instead of, the rust-level signal.
 - `bazel build //...` and `bazel test //...` are cheap once the cache is warm. They expose dependency-graph rot (visibility violations, missing srcs, dropped deps) that cargo cannot.
-- Splitting into a "cargo-only v1, bazel-later v2" project lets P1 slip indefinitely. Coupling them keeps pressure on closing P1.
-
-So both run, side by side, until P1 lands. After P1, `bazel test //...` subsumes `cargo test` and the cargo step becomes redundant (a follow-up trims it).
+- With P1 landed, `bazel test //...` now exercises the engine lib tests too, so the historical concern that bazel-test was "a green box that doesn't catch anything" no longer applies. Bazel is the canonical rust signal in v1; `cargo check` stays as a cheap, fast-failing compile guard that's still useful when the bazel target graph itself is broken.
 
 ## Chosen approach
 
@@ -67,10 +74,9 @@ Mirror flunge's `.buildkite/` directory structure verbatim:
   pipeline.yml              # buildkite reads this; defines steps + queue tags
   steps/
     bootstrap.sh            # ensure rust toolchain + bazel + pnpm present; cache restore
-    cargo-check.sh          # cargo check --workspace
-    cargo-test.sh           # cargo test --workspace (transitional; remove after P1)
+    cargo-check.sh          # cargo check --workspace (cheap compile guard)
     bazel-build.sh          # bazel build //...
-    bazel-test.sh           # bazel test //...
+    bazel-test.sh           # bazel test //... (covers engine lib tests via P1)
     pnpm-typecheck.sh       # pnpm -r typecheck
     pnpm-test.sh            # pnpm -r test
     checks.sh               # checkleft / CHECKS.yaml runner (no-generated-artifacts, etc.)
@@ -86,14 +92,14 @@ Five logical phases, parallelised where they don't depend on each other:
 ```
                         ┌──► cargo-check    ──┐
                         ├──► bazel-build    ──┤
-bootstrap (queue=mono) ─┼──► pnpm-typecheck ──┼──► (wait) ──► cargo-test ──┐
-                        ├──► checks         ──┤              bazel-test  ──┼──► green
-                        └──────────────────────┘              pnpm-test   ──┘
+bootstrap (queue=mono) ─┼──► pnpm-typecheck ──┼──► (wait) ──► bazel-test ──┐
+                        ├──► checks         ──┤               pnpm-test  ──┴──► green
+                        └──────────────────────┘
 ```
 
 - `bootstrap` is a single step that primes the agent: installs / pins the rust toolchain (read `rust-toolchain.toml`), pins bazelisk, installs pnpm, and restores the bazel disk cache. Subsequent steps inherit a warm checkout.
 - Cheap static checks (`cargo check`, `bazel build`, `pnpm typecheck`, `checks.sh`) run in parallel. Any one failing is enough to redden the build; reviewers don't need to wait for the heavy steps to see compile failures.
-- Test steps (`cargo test`, `bazel test`, `pnpm test`) run after the static checks pass. Order is deliberate: a compile failure caught by `cargo check` is the cheapest possible signal, so we don't burn agent minutes running tests on code that doesn't compile.
+- Test steps (`bazel test`, `pnpm test`) run after the static checks pass. Order is deliberate: a compile failure caught by `cargo check` is the cheapest possible signal, so we don't burn agent minutes running tests on code that doesn't compile. `bazel test //...` is the canonical rust test step — with P1 landed it covers the engine lib tests as well as the integration test targets.
 - Every step is its own buildkite step (not a sub-target of one umbrella step). When one is red, the buildkite UI shows exactly which, and the engine's `ci_watch` (which already parses required-check names) can route by failing-step name in the future.
 
 ### Required checks for branch protection
@@ -107,12 +113,12 @@ GitHub branch protection on `main` requires:
 - `buildkite/mono/pnpm-typecheck`
 - `buildkite/mono/checks`
 
-`cargo-test` and `pnpm-test` are run-as-required from v1; they ship as required checks once they're stable enough to not flake the org into ignoring red builds. Conservative ramp:
+`pnpm-test` is run-but-not-yet-required from v1; it ships as a required check once it's stable enough to not flake the org into ignoring red builds. Conservative ramp:
 
 1. Land the pipeline as advisory (no required-status check). Run for one week.
 2. Promote `bootstrap`, `cargo-check`, `bazel-build`, `checks` to required.
 3. After two more weeks (or sooner if confidence is high), promote `bazel-test` and `pnpm-typecheck`.
-4. Promote `cargo-test` and `pnpm-test` only once flake rates are visibly < 1%.
+4. Promote `pnpm-test` only once flake rates are visibly < 1%.
 
 The promotion sequence is the only thing in this design that touches GitHub branch protection settings directly; everything else is repo-local.
 
@@ -145,20 +151,15 @@ Cache keying:
 - The disk cache key includes `bazel info release` and a hash of `MODULE.bazel.lock` (matches flunge's approach and what the recent PR #439 dispatch-cache fix established for repobin).
 - `cargo` shares the agent-level `~/.cargo/registry` cache; that's it for cargo. Target dirs are not cached across jobs (they're cheap relative to bazel and the cache-poisoning risk is higher).
 
-### Transition plan from `cargo test` to `bazel test`
+### Historical: cargo→bazel transition
 
-The "P1" sibling chore (`task_18af3caac58d9748_2c`) adds proper `rust_test(crate=":engine_lib")` rules so `bazel test //tools/boss/engine/...` covers the engine lib tests. Until P1 lands:
+The original v1 plan ran `cargo test` and `bazel test` side-by-side until P1 closed the engine-lib coverage gap. **That is no longer needed.** P1 has landed: `tools/boss/engine/BUILD.bazel:86` declares `rust_test(name = "engine_lib_test", crate = ":engine_lib", ...)`, and `bazel test //tools/boss/engine/...` exercises the lib tests that the May-12 drift exposed.
 
-- `cargo test` is the rust safety net. It catches what bazel misses today.
-- `bazel test` runs in parallel and catches what cargo misses (visibility rot, missing `srcs`, deps drift).
+The implementation task that lands the pipeline should therefore wire `bazel test //...` directly as the rust test step; no transitional `cargo-test.sh` is needed. `cargo check --workspace` stays in the pipeline as a cheap, fast-failing compile guard — it's still useful when the bazel target graph itself is broken (e.g., a missing `srcs` entry that hides a file from bazel but not from cargo).
 
-Once P1 lands and `bazel test //...` actually exercises the engine lib tests:
-
-- Verify the bazel target count matches the cargo test count (or exceeds it).
-- Verify CI signal on a known-bad PR (e.g., cherry-pick the May-12 drift) reddens via `bazel-test` alone.
-- Remove the `cargo-test` step from `pipeline.yml`; remove it from required checks.
-
-A separate task tracks the cleanup; this design names it as the exit criterion, not the work.
+Verification before promoting `bazel-test` to required:
+- Run on a cherry-pick of the May-12 drift commit and confirm the build reddens at `bazel-test` (or, ideally, at `cargo-check` first).
+- Spot-check that the bazel-test wall-clock on a warm cache is within the budget assumed by the sharding decision below.
 
 ### Sharding
 
@@ -166,11 +167,20 @@ No sharding in v1. The full mono test suite (rust + node) is currently well unde
 
 Re-evaluate when wall-clock for the slowest required step exceeds 15 minutes on a warm cache. At that point the natural unit is bazel test target groups (one shard per top-level package), not file-level test sharding — bazel already shards across cores within a target.
 
-### Boss UI integration
+### Boss UI integration — shipped
 
-Optional but useful (per the parent project's scope §5). The engine already stores `pr_url` on chores. Add a sibling `pr_ci_status` field populated by the existing `ci_watch` probe path (which already runs `gh pr view --json statusCheckRollup`). The kanban surfaces ✅ / ⏳ / ❌ as a small badge on `in_review` cards.
+This piece has landed ahead of the pipeline itself. `PrCiIndicator` at `tools/boss/app-macos/Sources/ContentView.swift:2683` renders a small `caption2`-weight icon next to the PR link on Review-lane cards:
 
-This is additive and has no dependency on the pipeline being live — it's worth filing as its own implementation task. Spelt out here so the design covers parent §5; the schema change (one nullable text column on `tasks`) and the UI badge can land independently.
+| Engine-reported state | Icon (SF Symbol)         | Colour | Tooltip                                                |
+|-----------------------|--------------------------|--------|--------------------------------------------------------|
+| `in_progress`         | `clock.fill`             | yellow | "Required CI checks in progress"                       |
+| `success`             | `checkmark.circle.fill`  | green  | "All required CI checks passed"                        |
+| `fail`                | `xmark.circle.fill`      | red    | "Required CI check(s) failed: <names from rollup>"     |
+| `unknown` / other     | (hidden)                 | —      | hidden, so "no signal yet" doesn't look like all-green |
+
+State is fed by the engine's existing `ci_watch` probe (`tools/boss/engine/src/ci_watch.rs`), which already polls `gh pr view --json statusCheckRollup` for `in_review` rows. The failure detail payload is the same `failed_checks` JSON shape `ci_watch` uses internally — `PrCiIndicator` parses it for the tooltip so reviewers can see which check name(s) reddened the build without leaving the kanban.
+
+No new schema column was needed (the original design speculated a `pr_ci_status` text field on `tasks`; in practice the indicator reads from the same `ci_watch`-populated path as the rest of the remediation pipeline, which kept the change additive). Open polish items, if any, belong on a follow-up chore; nothing about this section blocks the pipeline rollout.
 
 ## Risks / open questions
 
@@ -235,10 +245,10 @@ The next project decomposition will likely produce, roughly in this order:
 1. Audit flunge's buildkite pipeline; produce a short reference doc.
 2. Land `.buildkite/` skeleton in mono (empty steps, "hello world" green).
 3. Wire the static checks (`cargo check`, `bazel build`, `pnpm typecheck`, `checks.sh`).
-4. Wire the test steps (`cargo test`, `bazel test`, `pnpm test`).
+4. Wire the test steps (`bazel test`, `pnpm test`).
 5. Promote checks to required (per ramp above); turn on branch protection.
-6. Surface CI status in Boss UI (kanban badge on in-review cards).
-7. Post-P1 cleanup: drop `cargo-test`; expand bazel coverage signal.
+6. ~~Surface CI status in Boss UI (kanban badge on in-review cards).~~ **Done** — see "Boss UI integration — shipped" above.
+7. ~~Post-P1 cleanup: drop `cargo-test`; expand bazel coverage signal.~~ **Done in this refresh** — P1 has landed, so the pipeline ships without a `cargo-test` step in the first place; no follow-up trim required.
 8. Bazel remote cache (fast-follow once contention warrants).
 
-Each lands as its own PR. Each except #6 is gated on the previous; #6 is independent.
+Each lands as its own PR. Each remaining item (#1–#5, #8) is gated on the previous within that chain.
