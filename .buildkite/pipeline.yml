@@ -41,5 +41,8 @@ steps:
   - label: ":bazel: bazel-test"
     key: "bazel-test"
     command: ".buildkite/steps/bazel-test.sh"
+    artifact_paths:
+      - "bazel-testlogs/**/test.log"
+      - "bazel-testlogs/**/test.xml"
     agents:
       queue: "linux-amd64"
