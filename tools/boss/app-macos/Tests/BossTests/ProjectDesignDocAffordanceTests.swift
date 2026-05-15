@@ -324,10 +324,12 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
     /// available but the branch is not `main`, the dispatcher must skip
     /// the local-file fast-path (the workspace is likely on a different
     /// task's branch so the file won't be there) and instead fetch via
-    /// `rawContentURL`. Regression for the bug where clicking a design-doc
-    /// icon on an in_review task surfaced a file-not-found error instead
-    /// of opening the markdown viewer.
-    func testOpenOnResolvedInReviewBranchWithWorkspacePreferssRawContentURL() async {
+    /// `rawContentURL`. The window must open immediately (before the
+    /// fetch settles) and transition to `.loaded` once the content
+    /// arrives. Regression for the bug where clicking a design-doc icon
+    /// on an in_review task surfaced a file-not-found error instead of
+    /// opening the markdown viewer.
+    func testOpenOnResolvedInReviewBranchOpensWindowImmediatelyThenLoads() async {
         let model = makeModelWithProject()
         let project = model.projectsByProductID.values.first!.first!
 
@@ -337,14 +339,16 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             if url.isFileURL { openedLocalFiles.append(url) }
         }
 
+        // Record async-markdown-viewer window open calls.
+        var asyncWindowOpens = 0
+        model.asyncMarkdownViewerOpener = { asyncWindowOpens += 1 }
+
         // Record rawContentFetcher invocations.
         let fetchExpectation = XCTestExpectation(description: "rawContentFetcher called")
         model.rawContentFetcher = { _ in
             fetchExpectation.fulfill()
             return "# Design Doc"
         }
-        var viewerContents: [MarkdownViewerContent] = []
-        model.markdownViewerOpener = { viewerContents.append($0) }
 
         // Non-main branch with a workspace path and a rawContentURL present.
         // This simulates an in_review design task (T371-style).
@@ -362,12 +366,25 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         )
         model.openProjectDesignDoc(project)
 
+        // The window open must be synchronous — one call before any await.
+        XCTAssertEqual(asyncWindowOpens, 1, "async-markdown-viewer window must open immediately on click")
+        // The VM must be in loading state right after the click.
+        if case .loading = model.asyncMarkdownViewerVM.state { } else {
+            XCTFail("expected .loading state immediately after click; got \(model.asyncMarkdownViewerVM.state)")
+        }
+
         await fulfillment(of: [fetchExpectation], timeout: 1.0)
         XCTAssertTrue(
             openedLocalFiles.isEmpty,
             "expected no local-file open for in-review branch; got: \(openedLocalFiles)"
         )
-        XCTAssertEqual(viewerContents.count, 1)
+        // After the fetch settles the VM must be in the loaded state.
+        if case .loaded(let title, let markdown) = model.asyncMarkdownViewerVM.state {
+            XCTAssertEqual(title, project.name)
+            XCTAssertEqual(markdown, "# Design Doc")
+        } else {
+            XCTFail("expected .loaded state after fetch; got \(model.asyncMarkdownViewerVM.state)")
+        }
         XCTAssertNil(model.workErrorMessage)
     }
 

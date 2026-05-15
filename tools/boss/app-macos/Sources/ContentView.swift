@@ -92,6 +92,9 @@ struct ContentView: View {
             model.markdownViewerOpener = { [openWindow] content in
                 openWindow(id: "markdown-viewer", value: content)
             }
+            model.asyncMarkdownViewerOpener = { [openWindow] in
+                openWindow(id: "async-markdown-viewer")
+            }
             model.startIfNeeded()
         }
         .toolbar {

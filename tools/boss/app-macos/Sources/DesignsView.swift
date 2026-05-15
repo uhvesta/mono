@@ -472,3 +472,56 @@ struct MarkdownViewerView: View {
     }
 }
 
+/// Loading state for the `"async-markdown-viewer"` Window scene, which
+/// opens immediately on click and resolves content asynchronously.
+enum MarkdownDocLoadState {
+    case loading
+    case loaded(title: String, markdown: String)
+    case failed(title: String, message: String)
+}
+
+/// Shared observable model for the `"async-markdown-viewer"` Window
+/// scene. Owned by [[ChatViewModel]] and injected via EnvironmentObject
+/// so the window can observe state transitions without content having to
+/// pass through the `openWindow` value type (which can't be updated
+/// after the window opens).
+@MainActor
+final class AsyncMarkdownViewerViewModel: ObservableObject {
+    @Published var state: MarkdownDocLoadState = .loading
+}
+
+/// Content view for the `"async-markdown-viewer"` Window scene. Shows a
+/// spinner while [[ChatViewModel.asyncMarkdownViewerVM]] is in the
+/// `.loading` state, swaps to the rendered markdown when `.loaded`, and
+/// shows an error affordance when `.failed` — matching the browser-tab
+/// model of open-immediately, then fill.
+struct AsyncMarkdownViewerView: View {
+    @EnvironmentObject private var chatModel: ChatViewModel
+
+    var body: some View {
+        switch chatModel.asyncMarkdownViewerVM.state {
+        case .loading:
+            ProgressView("Loading…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .loaded(let title, let markdown):
+            MarkdownViewerView(title: title, source: markdown)
+                .navigationTitle(title)
+        case .failed(let title, let message):
+            VStack(spacing: 16) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.largeTitle)
+                    .foregroundStyle(.orange)
+                Text("Failed to load \u{201C}\(title)\u{201D}")
+                    .font(.headline)
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle(title)
+        }
+    }
+}
+
