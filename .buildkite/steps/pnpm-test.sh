@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # pnpm-test.sh — pnpm -r test (JavaScript/TypeScript test suite).
-# v1 placeholder: real implementation runs pnpm test.
+# Advisory step: promoted to required once flake rate is visibly < 1%.
 set -euo pipefail
 
 echo "--- [pnpm-test] starting"
-echo "[pnpm-test] placeholder — no real pnpm test yet"
+echo "[pnpm-test] pnpm: $(pnpm --version)"
+
+pnpm -r test
+
 echo "[pnpm-test] ok"

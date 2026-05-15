@@ -53,5 +53,6 @@ steps:
   - label: ":node: pnpm-test"
     key: "pnpm-test"
     command: ".buildkite/steps/pnpm-test.sh"
+    soft_fail: true
     agents:
       queue: "mono"
