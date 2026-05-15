@@ -89,6 +89,10 @@ rust_test(
     crate = ":engine_lib",
     edition = "2024",
     size = "small",
+    # linux-amd64 CI runners run ~6-7x slower than macOS dev boxes; the 60s default
+    # for size="small" was too tight. timeout="moderate" (300s) gives headroom without
+    # inflating the declared resource footprint.
+    timeout = "moderate",
     # HOME must be set so cube_default_workspace_root_for_test (and the
     # production workspace_root_is_cube_default helper it mirrors) can
     # compute the expected path.  Bazel's sandbox does not inherit HOME
