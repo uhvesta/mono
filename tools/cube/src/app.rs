@@ -30,6 +30,10 @@ type Result<T> = std::result::Result<T, CubeError>;
 /// few minutes against this window.
 const DEFAULT_LEASE_TTL_SECS: i64 = 1800;
 
+/// Pool-wide gc runs at most once per 24 hours, triggered from `cube workspace lease`.
+const AUTO_GC_INTERVAL_SECS: i64 = 24 * 60 * 60;
+const POOL_GC_LAST_AT_KEY: &str = "last_pool_gc_at";
+
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub message: String,
@@ -636,11 +640,14 @@ fn run_workspace(
             let repo_record = store
                 .get_repo(&repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
+
+            let leased_at_epoch_s = current_epoch_s()?;
+            // Kick a background pool-wide gc pass at most once per 24h.
+            maybe_trigger_pool_gc(&mut store, database_path, leased_at_epoch_s)?;
+
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
             let mut candidates = discover_workspaces(&repo_record)?;
             store.sync_workspaces(&repo, &candidates)?;
-
-            let leased_at_epoch_s = current_epoch_s()?;
             // Sweep any leases that have already exceeded their TTL so they
             // become claimable again. Audit each reclaimed lease before
             // doing anything else so the timeline shows the prior
@@ -1048,6 +1055,31 @@ fn run_workspace(
                     &workspace.workspace_path,
                     &repo_record.main_branch,
                 )?;
+                // Opportunistically forget consumed boss/exec_* bookmarks.
+                // The fetch above already updated main, so do_fetch = false.
+                // Best-effort: log a warning but never block the release.
+                match gc_workspace_bookmarks(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    false,
+                    false,
+                ) {
+                    Ok(forgotten) if !forgotten.is_empty() => {
+                        eprintln!(
+                            "cube: release gc: {} consumed bookmark(s) forgotten in {}",
+                            forgotten.len(),
+                            workspace.workspace_id,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "warning: bookmark gc on release of {} failed: {e}",
+                            workspace.workspace_id,
+                        );
+                    }
+                }
             }
             let released = store
                 .release_workspace(&lease, reason.as_deref())?
@@ -1293,6 +1325,88 @@ fn run_workspace(
                     "expunged": expunge,
                 }),
             )
+        }
+        WorkspaceCommand::Gc { workspace, dry_run } => {
+            let records = store.list_workspaces_filtered(&WorkspaceListFilter {
+                workspace_id: workspace.as_deref(),
+                ..Default::default()
+            })?;
+
+            #[derive(serde::Serialize)]
+            struct WorkspaceGcResult {
+                workspace_id: String,
+                bookmarks_forgotten: Vec<String>,
+                skipped: bool,
+                skipped_reason: Option<String>,
+                error: Option<String>,
+            }
+
+            let mut results: Vec<WorkspaceGcResult> = Vec::new();
+            for record in &records {
+                if record.state == WorkspaceState::Leased {
+                    results.push(WorkspaceGcResult {
+                        workspace_id: record.workspace_id.clone(),
+                        bookmarks_forgotten: vec![],
+                        skipped: true,
+                        skipped_reason: Some("leased".to_string()),
+                        error: None,
+                    });
+                    continue;
+                }
+                if !workspace_path_exists(record) {
+                    results.push(WorkspaceGcResult {
+                        workspace_id: record.workspace_id.clone(),
+                        bookmarks_forgotten: vec![],
+                        skipped: true,
+                        skipped_reason: Some("directory_missing".to_string()),
+                        error: None,
+                    });
+                    continue;
+                }
+                match gc_workspace_bookmarks(
+                    runner,
+                    database_path,
+                    &record.workspace_path,
+                    true,
+                    dry_run,
+                ) {
+                    Ok(bookmarks) => {
+                        results.push(WorkspaceGcResult {
+                            workspace_id: record.workspace_id.clone(),
+                            bookmarks_forgotten: bookmarks,
+                            skipped: false,
+                            skipped_reason: None,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        results.push(WorkspaceGcResult {
+                            workspace_id: record.workspace_id.clone(),
+                            bookmarks_forgotten: vec![],
+                            skipped: false,
+                            skipped_reason: None,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            }
+
+            let total_forgotten: usize =
+                results.iter().map(|r| r.bookmarks_forgotten.len()).sum();
+            let message = if dry_run {
+                format!(
+                    "{} workspace(s): {} bookmark(s) would be forgotten (dry-run).",
+                    results.len(),
+                    total_forgotten
+                )
+            } else {
+                format!(
+                    "{} workspace(s): {} bookmark(s) forgotten.",
+                    results.len(),
+                    total_forgotten
+                )
+            };
+            RunResult::new(message, json!({ "results": results }))
         }
     }
 }
@@ -1579,6 +1693,138 @@ fn find_workspace_record(
     }
 
     Ok(None)
+}
+
+/// List and optionally forget consumed `boss/exec_*` bookmarks in a workspace.
+///
+/// A bookmark is "consumed" when its tip is reachable from `main`
+/// (`bookmarks(glob:"boss/exec_*") & ::main`). If `do_fetch` is true, runs
+/// `jj git fetch` first so `::main` reflects the latest merged PRs. If
+/// `dry_run` is true, lists what would be forgotten without acting.
+///
+/// Returns the names of bookmarks forgotten (or that would be forgotten on
+/// dry-run). Failures are propagated to the caller; release-path callers
+/// should treat them as warnings.
+fn gc_workspace_bookmarks(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    do_fetch: bool,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    if do_fetch {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
+        )?;
+    }
+
+    let output = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "bookmarks(glob:\"boss/exec_*\") & ::main",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ],
+        ),
+    )?;
+
+    let bookmarks: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        output
+            .split_whitespace()
+            .filter(|s| s.starts_with("boss/exec_") && !s.contains('@'))
+            .filter(|s| seen.insert(s.to_string()))
+            .map(str::to_string)
+            .collect()
+    };
+
+    if bookmarks.is_empty() || dry_run {
+        return Ok(bookmarks);
+    }
+
+    let mut args: Vec<&str> = vec!["bookmark", "forget"];
+    let bookmark_refs: Vec<&str> = bookmarks.iter().map(String::as_str).collect();
+    args.extend_from_slice(&bookmark_refs);
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &args),
+    )?;
+
+    Ok(bookmarks)
+}
+
+/// Update `last_pool_gc_at` and spawn a background thread to gc consumed
+/// bookmarks across all free workspaces, at most once per 24 hours.
+/// The timestamp is written BEFORE the thread is spawned so concurrent lease
+/// calls within the same window skip redundant gc triggers.
+fn maybe_trigger_pool_gc(
+    store: &mut Store,
+    database_path: Option<&Path>,
+    now_epoch_s: i64,
+) -> Result<()> {
+    let last_gc = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)?;
+    let should_trigger = match last_gc {
+        None => true,
+        Some(last) => (now_epoch_s - last) >= AUTO_GC_INTERVAL_SECS,
+    };
+    if !should_trigger {
+        return Ok(());
+    }
+    store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now_epoch_s)?;
+    let db_path_owned = database_path.map(Path::to_path_buf);
+    std::thread::spawn(move || {
+        run_pool_gc_background(db_path_owned);
+    });
+    Ok(())
+}
+
+fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
+    let store = match database_path.as_deref() {
+        Some(p) => Store::open_at(p),
+        None => Store::open_default(),
+    };
+    let Ok(store) = store else {
+        eprintln!("cube: auto gc: failed to open store");
+        return;
+    };
+    let records = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cube: auto gc: failed to list workspaces: {e}");
+            return;
+        }
+    };
+    let runner = RealCommandRunner;
+    for record in &records {
+        if record.state == WorkspaceState::Leased {
+            continue;
+        }
+        if !workspace_path_exists(record) {
+            continue;
+        }
+        if let Err(e) = gc_workspace_bookmarks(
+            &runner,
+            database_path.as_deref(),
+            &record.workspace_path,
+            true,
+            false,
+        ) {
+            eprintln!(
+                "cube: auto gc: {}: {e}",
+                record.workspace_id,
+            );
+        }
+    }
 }
 
 fn reset_workspace(
@@ -2614,8 +2860,8 @@ mod tests {
     use crate::command_runner::{CommandInvocation, CommandRunner};
 
     use super::{
-        CubeError, RepoEnsureDefaults, Result, current_epoch_s, origin_urls_equivalent,
-        parse_origin, run_with_context, run_with_dependencies,
+        CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result, current_epoch_s,
+        origin_urls_equivalent, parse_origin, run_with_context, run_with_dependencies,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -4353,6 +4599,7 @@ mod tests {
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main"], ""),
+            gc_noop_command(&ws_path),
         ]);
         run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
@@ -4478,6 +4725,7 @@ mod tests {
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            gc_noop_command(&workspace_path),
         ]);
         let release = Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]);
         let release_result =
@@ -4542,6 +4790,7 @@ mod tests {
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            gc_noop_command(&workspace_path),
         ]);
         let release = Cli::parse_from([
             "cube",
@@ -4647,6 +4896,7 @@ mod tests {
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            gc_noop_command(&workspace_path),
         ]);
         let release = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
         let result = run_with_dependencies(release, Some(&database_path), &release_runner)
@@ -6168,6 +6418,33 @@ mod tests {
         ])
     }
 
+    /// Returns an expected gc-log command that reports no consumed bookmarks.
+    /// Add to any release runner after `jj new main` to satisfy the gc check.
+    fn gc_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
+        ExpectedCommand::ok(
+            workspace_path.to_path_buf(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "bookmarks(glob:\"boss/exec_*\") & ::main",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ],
+            "",
+        )
+    }
+
+    /// Standard release runner: fetch, reset, then gc-noop.
+    fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner {
+        FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
+            gc_noop_command(workspace_path),
+        ])
+    }
+
     fn lease_runner_with_setup(
         workspace_path: &std::path::Path,
         head: &str,
@@ -6244,6 +6521,300 @@ mod tests {
         assert_eq!(result.payload["setup"]["steps"], json!([]));
     }
 
+    // ── gc tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn workspace_release_gc_forgets_consumed_bookmarks() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "gc test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Release runner returns a consumed bookmark from the gc log query.
+        let release_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    "bookmarks(glob:\"boss/exec_*\") & ::main",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks ++ \"\\n\"",
+                ],
+                "boss/exec_18abcd_01",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "forget", "boss/exec_18abcd_01"],
+                "",
+            ),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+    }
+
+    #[test]
+    fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
+        // Two workspaces: 001 gets leased (skipped by gc), 002 stays free (gc'd).
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws1_path = workspace_root.join("mono-agent-001"); // will be leased
+        let ws2_path = workspace_root.join("mono-agent-002"); // stays free
+        std::fs::create_dir_all(ws1_path.join(".jj")).expect("ws1 dir");
+        std::fs::create_dir_all(ws2_path.join(".jj")).expect("ws2 dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Lease ws1 (001) — picks it first since it's clean. This also syncs
+        // ws2 into the registry as free.
+        let lease_runner = lease_runner_for(&ws1_path, "abc1234");
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "keep leased"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        // gc: ws1 is leased → skipped; ws2 is free → fetch + forget.
+        let gc_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(ws2_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                ws2_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    "bookmarks(glob:\"boss/exec_*\") & ::main",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks ++ \"\\n\"",
+                ],
+                "boss/exec_dead_01",
+            ),
+            ExpectedCommand::ok(
+                ws2_path.clone(),
+                "jj",
+                &["bookmark", "forget", "boss/exec_dead_01"],
+                "",
+            ),
+        ]);
+        let gc_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "gc"]),
+            Some(&database_path),
+            &gc_runner,
+        )
+        .expect("gc");
+        gc_runner.assert_exhausted();
+
+        let results = gc_result.payload["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+
+        let ws1_r = results
+            .iter()
+            .find(|r| r["workspace_id"] == "mono-agent-001")
+            .unwrap();
+        assert_eq!(ws1_r["skipped"], true);
+        assert_eq!(ws1_r["skipped_reason"], "leased");
+
+        let ws2_r = results
+            .iter()
+            .find(|r| r["workspace_id"] == "mono-agent-002")
+            .unwrap();
+        assert_eq!(ws2_r["skipped"], false);
+        assert_eq!(ws2_r["bookmarks_forgotten"].as_array().unwrap().len(), 1);
+        assert_eq!(ws2_r["bookmarks_forgotten"][0], "boss/exec_dead_01");
+    }
+
+    #[test]
+    fn workspace_gc_dry_run_lists_without_forgetting() {
+        // dry-run: fetch + log are called, but bookmark forget is NOT.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Lease then release to get the workspace into the registry as free.
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "seed"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let release_runner = release_runner_for(&workspace_path);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release");
+        release_runner.assert_exhausted();
+
+        // dry-run: fetch + log, but NO bookmark forget.
+        let gc_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    "bookmarks(glob:\"boss/exec_*\") & ::main",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks ++ \"\\n\"",
+                ],
+                "boss/exec_dry_01",
+            ),
+        ]);
+        let gc_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "gc", "--dry-run"]),
+            Some(&database_path),
+            &gc_runner,
+        )
+        .expect("gc dry-run");
+        gc_runner.assert_exhausted();
+
+        assert!(gc_result.message.contains("dry-run"));
+        let results = gc_result.payload["results"].as_array().unwrap();
+        assert_eq!(results[0]["bookmarks_forgotten"].as_array().unwrap().len(), 1);
+        assert_eq!(results[0]["bookmarks_forgotten"][0], "boss/exec_dry_01");
+    }
+
+    #[test]
+    fn auto_gc_updates_timestamp_when_stale() {
+        // When last_pool_gc_at is older than 24h, lease updates it.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Set last_pool_gc_at to 25h ago so the next lease triggers gc.
+        let old_ts = current_epoch_s().unwrap() - (25 * 60 * 60);
+        {
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).unwrap();
+            store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, old_ts).unwrap();
+        }
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "stale gc test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        // last_pool_gc_at must have advanced past old_ts.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ts = store
+            .get_pool_metadata_i(POOL_GC_LAST_AT_KEY)
+            .unwrap()
+            .expect("last_pool_gc_at should be set");
+        assert!(ts > old_ts, "last_pool_gc_at should have been updated");
+        let now = current_epoch_s().unwrap();
+        assert!(now - ts < 10, "last_pool_gc_at should be near now");
+    }
+
+    #[test]
+    fn auto_gc_skips_when_already_ran_within_24h() {
+        // When last_pool_gc_at is recent, lease does NOT update it.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Set last_pool_gc_at to 1h ago — well within 24h.
+        let recent_ts = current_epoch_s().unwrap() - 3600;
+        {
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).unwrap();
+            store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, recent_ts).unwrap();
+        }
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "recent gc test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        // last_pool_gc_at must NOT have changed.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ts = store
+            .get_pool_metadata_i(POOL_GC_LAST_AT_KEY)
+            .unwrap()
+            .expect("last_pool_gc_at should be set");
+        assert_eq!(ts, recent_ts, "last_pool_gc_at should NOT change within 24h");
+    }
+
     #[test]
     fn workspace_setup_runs_steps_then_skips_when_fingerprint_unchanged() {
         let (tempdir, database_path) = with_database_path();
@@ -6302,6 +6873,7 @@ steps:
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            gc_noop_command(&workspace_path),
         ]);
         run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
@@ -6453,6 +7025,7 @@ steps:
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
+            gc_noop_command(&workspace_path),
         ]);
         run_with_dependencies(
             Cli::parse_from([

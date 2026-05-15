@@ -175,6 +175,19 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         holder: Option<String>,
     },
+    /// Forget consumed boss/exec_* bookmarks from workspace pools.
+    ///
+    /// A bookmark is "consumed" when its tip is reachable from `main`
+    /// (i.e. its PR has merged). Without `--workspace`, iterates every
+    /// workspace in the pool; leased workspaces are skipped.
+    Gc {
+        /// Only process this workspace id.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// List what would be forgotten without doing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove a workspace row from the registry.
     ///
     /// Deletes the `workspaces` row (and cascades `workspace_setup`)
@@ -691,6 +704,41 @@ mod tests {
     fn workspace_remove_requires_workspace_id() {
         let result = Cli::try_parse_from(["cube", "workspace", "remove"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn workspace_gc_parses_default() {
+        let cli = Cli::parse_from(["cube", "workspace", "gc"]);
+        match cli.command {
+            Command::Workspace {
+                command: WorkspaceCommand::Gc { workspace, dry_run },
+            } => {
+                assert!(workspace.is_none());
+                assert!(!dry_run);
+            }
+            _ => panic!("expected workspace gc command"),
+        }
+    }
+
+    #[test]
+    fn workspace_gc_parses_with_workspace_and_dry_run() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "gc",
+            "--workspace",
+            "mono-agent-001",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command: WorkspaceCommand::Gc { workspace, dry_run },
+            } => {
+                assert_eq!(workspace.as_deref(), Some("mono-agent-001"));
+                assert!(dry_run);
+            }
+            _ => panic!("expected workspace gc command"),
+        }
     }
 
     #[test]

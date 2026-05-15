@@ -738,6 +738,28 @@ impl Store {
             .map_err(CubeError::Storage)
     }
 
+    pub fn get_pool_metadata_i(&self, key: &str) -> Result<Option<i64>, CubeError> {
+        self.connection
+            .query_row(
+                "SELECT value_i FROM pool_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(CubeError::Storage)
+    }
+
+    pub fn set_pool_metadata_i(&self, key: &str, value: i64) -> Result<(), CubeError> {
+        self.connection
+            .execute(
+                "INSERT INTO pool_metadata (key, value_i) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value_i = excluded.value_i",
+                params![key, value],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
     pub fn upsert_workspace_setup_state(
         &self,
         state: &WorkspaceSetupState,
@@ -1032,6 +1054,11 @@ impl Store {
                     FOREIGN KEY(repo, workspace_id)
                         REFERENCES workspaces(repo, workspace_id)
                         ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS pool_metadata (
+                    key TEXT PRIMARY KEY,
+                    value_i INTEGER
                 );
                 "#,
             )
