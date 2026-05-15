@@ -618,6 +618,7 @@ mod tests {
             head_ref_name: None,
             base_ref_name: None,
             labels: Vec::new(),
+            review: crate::merge_poller::PrReviewState::Unknown,
         }
     }
 
@@ -630,6 +631,7 @@ mod tests {
             head_ref_name: None,
             base_ref_name: None,
             labels: labels.iter().map(|s| (*s).to_owned()).collect(),
+            review: crate::merge_poller::PrReviewState::Unknown,
         }
     }
 

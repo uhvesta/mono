@@ -439,6 +439,11 @@ mod tests {
             ci_attempts_used: 0,
             short_id: None,
             blocked_signals: Vec::new(),
+            ci_required_state: None,
+            ci_required_detail: None,
+            review_required_state: None,
+            review_required_detail: None,
+            pr_state_polled_at: None,
         })
     }
 

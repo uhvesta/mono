@@ -239,6 +239,40 @@ pub struct Task {
     /// introduced default to an empty list.
     #[serde(default)]
     pub blocked_signals: Vec<BlockedSignal>,
+    /// Aggregate state of required CI checks at last poll. Three terminal
+    /// values: `"in_progress"` (at least one required check is still
+    /// running), `"success"` (all required checks passed), `"fail"` (at
+    /// least one required check failed). `"unknown"` means the repo has no
+    /// branch protection or the first poll hasn't run yet. `None` until the
+    /// merge poller has performed at least one successful probe. Only
+    /// meaningful when `status = "in_review"` and `pr_url` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_required_state: Option<String>,
+    /// Structured detail for the CI indicator tooltip. JSON-encoded list of
+    /// objects with `name` and `conclusion` keys, one per failing required
+    /// check. `None` when `ci_required_state` is not `"fail"` or when no
+    /// detail is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_required_detail: Option<String>,
+    /// State of required-review gating at last poll. Values:
+    /// `"required"` (awaiting at least one required review),
+    /// `"approved"` (all required reviews approved),
+    /// `"changes_requested"` (at least one reviewer requested changes),
+    /// `"unknown"` (review state could not be determined). `None` until the
+    /// merge poller has performed at least one successful probe. Only
+    /// meaningful when `status = "in_review"` and `pr_url` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_required_state: Option<String>,
+    /// Reviewer names for the review indicator tooltip. JSON-encoded list of
+    /// login strings. For `"approved"`: the approving reviewers. For
+    /// `"changes_requested"`: the requesting reviewers. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_required_detail: Option<String>,
+    /// RFC 3339 timestamp of the most recent successful poll that wrote
+    /// `ci_required_state` / `review_required_state`. `None` until the first
+    /// probe completes. The UI uses this to render "last checked: N ago".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_state_polled_at: Option<String>,
 }
 
 fn default_true() -> bool {
