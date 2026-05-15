@@ -15,12 +15,16 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Workers", systemImage: "person.2")
                 }
+            FeatureFlagsViewer()
+                .tabItem {
+                    Label("Feature Flags", systemImage: "flag")
+                }
         }
         .environmentObject(chatModel)
         .onAppear {
             chatModel.refreshSettings()
         }
-        .frame(minWidth: 480, minHeight: 260)
+        .frame(minWidth: 560, minHeight: 360)
     }
 }
 
