@@ -18,6 +18,9 @@ struct BossMacApp: App {
         .defaultSize(width: 1060, height: 680)
         .commands {
             TextEditingCommands()
+            CommandMenu("View") {
+                LogViewerCommand()
+            }
             CommandMenu("Debug") {
                 DispatchEventsCommand()
                 EngineCommand()
@@ -66,6 +69,11 @@ struct BossMacApp: App {
         }
         .defaultSize(width: 880, height: 700)
 
+        Window("Activity Log", id: "activity-log") {
+            LogViewer()
+        }
+        .defaultSize(width: 1100, height: 640)
+
         Window("Dispatch Events", id: "dispatch-events") {
             DispatchEventsViewer()
         }
@@ -82,6 +90,25 @@ struct BossMacApp: App {
         }
         .environmentObject(chatModel)
         .defaultSize(width: 720, height: 520)
+    }
+}
+
+private struct LogViewerCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.logViewer.visible") private var isOpen = false
+
+    var body: some View {
+        Button("Activity Log") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "activity-log")
+            } else {
+                isOpen = true
+                openWindow(id: "activity-log")
+            }
+        }
+        .keyboardShortcut("l", modifiers: [.command, .shift])
     }
 }
 

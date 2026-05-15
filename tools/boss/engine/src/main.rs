@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use boss_engine::app;
 use boss_engine::audit::{self, StartContext};
@@ -48,6 +50,44 @@ impl Write for DualLogWriter {
         }
         Ok(())
     }
+}
+
+/// Writer for the engine-trace JSONL file consumed by the macOS log viewer.
+/// Silently no-ops when `file` is `None` so the JSON layer can always be
+/// registered without a conditional layer setup.
+struct JsonlFileWriter {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+impl Write for JsonlFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(ref f) = self.file {
+            if let Ok(mut guard) = f.lock() {
+                let _ = guard.write_all(buf);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(ref f) = self.file {
+            if let Ok(mut guard) = f.lock() {
+                let _ = guard.flush();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Path for the structured-JSON engine trace file consumed by the Activity
+/// Log viewer in the macOS app. Lives alongside other Boss state files.
+fn engine_trace_jsonl_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join("Library/Application Support/Boss")
+            .join("engine-trace.jsonl"),
+    )
 }
 
 fn resolve_log_path() -> PathBuf {
@@ -102,11 +142,36 @@ async fn main() -> Result<()> {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
+    // Text layer: compact human-readable output to stderr + rolling log file.
+    let text_layer = tracing_subscriber::fmt::layer()
         .compact()
-        .with_writer(move || DualLogWriter::new(file_writer.clone()))
+        .with_target(false)
+        .with_writer(move || DualLogWriter::new(file_writer.clone()));
+
+    // JSON layer: structured JSONL for the macOS Activity Log viewer.
+    // Best-effort — silently skipped if the file cannot be opened.
+    let json_file_arc: Option<Arc<Mutex<File>>> = engine_trace_jsonl_path().and_then(|path| {
+        match open_log_file(&path) {
+            Ok(file) => Some(Arc::new(Mutex::new(file))),
+            Err(err) => {
+                eprintln!(
+                    "boss-engine: could not open engine-trace JSONL at {}: {err}",
+                    path.display()
+                );
+                None
+            }
+        }
+    });
+    let json_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(move || JsonlFileWriter {
+            file: json_file_arc.clone(),
+        });
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(text_layer)
+        .with(json_layer)
         .init();
 
     tracing::info!(log_path = %log_path.display(), "boss-engine logging initialized");
