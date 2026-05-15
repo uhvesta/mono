@@ -11,6 +11,6 @@ set -euo pipefail
 echo "--- [bazel-build] starting"
 echo "[bazel-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-bazel build -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...
+bazel build --verbose_failures -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...
 
 echo "[bazel-build] ok"

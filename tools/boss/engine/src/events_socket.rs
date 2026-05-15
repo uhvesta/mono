@@ -6,9 +6,7 @@
 //! peer's process tree is registered with [`crate::worker_registry`])
 //! the matching `run_id`.
 //!
-//! macOS-only. The `LOCAL_PEERPID` getsockopt is not portable; Boss
-//! itself is macOS-only so this is consistent with the rest of the
-//! engine.
+//! Cross-platform: macOS uses `LOCAL_PEERPID`, Linux uses `SO_PEERCRED`.
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -32,9 +30,9 @@ const LOCAL_PEERPID: libc::c_int = 0x002;
 /// One hook event after peer-pid lookup, registry correlation, and
 /// normalization.
 ///
-/// `peer_pid` is best-effort: macOS's `LOCAL_PEERPID` returns
-/// `ENOTCONN` once the peer has closed its end, and the shim closes
-/// immediately after writing. Callers that need a guaranteed pid must
+/// `peer_pid` is best-effort: the peer-pid lookup may return an error
+/// once the peer has closed its end (e.g. `ENOTCONN` on macOS), and
+/// the shim closes immediately after writing. Callers that need a guaranteed pid must
 /// look it up synchronously right after `accept()` (before any async
 /// yield) and not rely on `peer_pid` alone for security decisions —
 /// the lease registry is the authoritative source.
@@ -125,7 +123,7 @@ pub fn bind_events_socket(path: &Path) -> io::Result<UnixListener> {
 }
 
 /// Look up the peer pid of a connected stream socket via
-/// `getsockopt(SOL_LOCAL, LOCAL_PEERPID)`.
+/// `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
 #[cfg(target_os = "macos")]
 pub fn peer_pid(stream: &UnixStream) -> io::Result<libc::pid_t> {
     let fd = stream.as_raw_fd();
@@ -149,11 +147,36 @@ pub fn peer_pid(stream: &UnixStream) -> io::Result<libc::pid_t> {
     Ok(pid)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Look up the peer pid of a connected stream socket via
+/// `getsockopt(SO_PEERCRED)` on Linux.
+#[cfg(target_os = "linux")]
+pub fn peer_pid(stream: &UnixStream) -> io::Result<libc::pid_t> {
+    let fd = stream.as_raw_fd();
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `fd` is borrowed from the caller's UnixStream and remains
+    // valid for this call; `cred` and `len` are stack-local mutables and
+    // their addresses are passed only to `getsockopt`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred.pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "LOCAL_PEERPID is only supported on macOS",
+        "peer pid lookup is not supported on this platform",
     ))
 }
 
@@ -161,10 +184,10 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// The shim half-closes its write side after writing the full hook
 /// payload, so EOF is the message boundary.
 ///
-/// Captures `LOCAL_PEERPID` synchronously before any await; if the
+/// Captures the peer pid synchronously before any await; if the
 /// shim has already closed by then (its write is fast, then it
-/// exits), the pid lookup may fail with `ENOTCONN` and the event is
-/// returned with `peer_pid: None`.
+/// exits), the pid lookup may fail and the event is returned with
+/// `peer_pid: None`.
 ///
 /// `run_id` correlation order:
 ///   1. `_boss_run_id` field embedded in the payload by the

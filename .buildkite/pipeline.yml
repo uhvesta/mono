@@ -18,6 +18,8 @@ steps:
     key: "bazel-build"
     command: ".buildkite/steps/bazel-build.sh"
     depends_on: "bootstrap"
+    artifact_paths:
+      - "bazel-out/**/extra_action_outputs/**/*"
     agents:
       queue: "linux-amd64"
 

@@ -20,3 +20,4 @@ node_modules/
 
 # Boss engine runtime event buffer (written by event-shim to workspace root).
 .boss/
+.bk.yaml
