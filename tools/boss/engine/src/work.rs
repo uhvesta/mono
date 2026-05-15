@@ -2746,7 +2746,9 @@ impl WorkDb {
                 updated_at TEXT NOT NULL,
                 default_model TEXT,
                 ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
-                dispatch_preamble TEXT
+                dispatch_preamble TEXT,
+                external_tracker_kind TEXT,
+                external_tracker_config TEXT
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -2788,7 +2790,12 @@ impl WorkDb {
                 effort_level TEXT,
                 model_override TEXT,
                 ci_attempt_budget INTEGER,
-                ci_attempts_used INTEGER NOT NULL DEFAULT 0
+                ci_attempts_used INTEGER NOT NULL DEFAULT 0,
+                external_ref_kind TEXT,
+                external_ref_canonical_id TEXT,
+                external_ref_raw TEXT,
+                external_ref_synced_at TEXT,
+                external_ref_unbound_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS tasks_product_idx
@@ -2949,8 +2956,12 @@ impl WorkDb {
         migrate_work_executions_pre_start_retry(&conn)?;
         // PR poll state columns for CI + review indicators on Review-lane cards.
         migrate_pr_poll_state_columns(&conn)?;
+        // External tracker binding columns (products) and per-work-item
+        // upstream-ref columns (tasks) plus partial indices. Design:
+        // tools/boss/docs/designs/external-issue-tracker-sync-github-projects.md
+        migrate_external_tracker_columns(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '10')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '11')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -6454,6 +6465,69 @@ fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
             conn.execute(ddl, [])?;
         }
     }
+    Ok(())
+}
+
+/// Add the external-tracker binding columns to `products` and the
+/// per-work-item upstream-ref columns to `tasks`, plus the two partial
+/// indices that support efficient lookup and uniqueness enforcement.
+/// Idempotent — each column add is guarded by `table_has_column`, and
+/// both indices use `CREATE … IF NOT EXISTS`.
+///
+/// Design: `tools/boss/docs/designs/external-issue-tracker-sync-github-projects.md`
+/// Schema section and R6.
+fn migrate_external_tracker_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "external_tracker_kind",
+            "ALTER TABLE products ADD COLUMN external_tracker_kind TEXT",
+        ),
+        (
+            "external_tracker_config",
+            "ALTER TABLE products ADD COLUMN external_tracker_config TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "products", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    for (column, ddl) in [
+        (
+            "external_ref_kind",
+            "ALTER TABLE tasks ADD COLUMN external_ref_kind TEXT",
+        ),
+        (
+            "external_ref_canonical_id",
+            "ALTER TABLE tasks ADD COLUMN external_ref_canonical_id TEXT",
+        ),
+        (
+            "external_ref_raw",
+            "ALTER TABLE tasks ADD COLUMN external_ref_raw TEXT",
+        ),
+        (
+            "external_ref_synced_at",
+            "ALTER TABLE tasks ADD COLUMN external_ref_synced_at TEXT",
+        ),
+        (
+            "external_ref_unbound_at",
+            "ALTER TABLE tasks ADD COLUMN external_ref_unbound_at TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS tasks_external_ref_idx
+             ON tasks (external_ref_kind, external_ref_canonical_id)
+          WHERE external_ref_canonical_id IS NOT NULL;
+
+         CREATE UNIQUE INDEX IF NOT EXISTS tasks_external_ref_bound_uniq
+             ON tasks (external_ref_kind, external_ref_canonical_id)
+          WHERE external_ref_canonical_id IS NOT NULL
+            AND external_ref_unbound_at  IS NULL
+            AND deleted_at               IS NULL;",
+    )?;
     Ok(())
 }
 
@@ -11406,7 +11480,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
 
         let _ = std::fs::remove_file(path);
     }
@@ -13011,7 +13085,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let _ = std::fs::remove_file(path);
     }
 
@@ -13194,7 +13268,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let _ = std::fs::remove_file(path);
     }
 
@@ -13240,7 +13314,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
 
         let _ = std::fs::remove_file(path);
     }
@@ -13328,7 +13402,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
 
         let _ = std::fs::remove_file(path);
     }
@@ -13941,6 +14015,157 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Fresh init must include the external-tracker columns on `products`
+    /// and `tasks`, plus the two partial indices. Migration from a
+    /// pre-existing schema must add the same columns idempotently.
+    #[test]
+    fn fresh_init_includes_external_tracker_schema() {
+        let path = temp_db_path("ext-tracker-fresh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        for column in ["external_tracker_kind", "external_tracker_config"] {
+            assert!(
+                table_has_column(&conn, "products", column).unwrap(),
+                "missing products.{column}",
+            );
+        }
+        for column in [
+            "external_ref_kind",
+            "external_ref_canonical_id",
+            "external_ref_raw",
+            "external_ref_synced_at",
+            "external_ref_unbound_at",
+        ] {
+            assert!(
+                table_has_column(&conn, "tasks", column).unwrap(),
+                "missing tasks.{column}",
+            );
+        }
+        // Both partial indices must be present.
+        for idx in [
+            "tasks_external_ref_idx",
+            "tasks_external_ref_bound_uniq",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'index' AND name = ?1",
+                    [idx],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "index {idx} should exist after fresh init");
+        }
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "11");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A database without the external-tracker columns must pick them
+    /// up on migration and the unique partial index must reject a
+    /// duplicate bound row while allowing the same canonical_id when
+    /// one row is unbound (`external_ref_unbound_at IS NOT NULL`).
+    #[test]
+    fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
+        let path = disk_db_path("ext-tracker-migrate");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE products (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                 description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+                 status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, product_id TEXT NOT NULL, project_id TEXT,
+                 kind TEXT NOT NULL, name TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                 ordinal INTEGER, pr_url TEXT, deleted_at TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 autostart INTEGER NOT NULL DEFAULT 1,
+                 priority TEXT NOT NULL DEFAULT 'medium',
+                 created_via TEXT NOT NULL DEFAULT 'unknown');
+             INSERT INTO products(id, name, slug, status, created_at, updated_at)
+             VALUES ('prod_1', 'P', 'p', 'active', '1700000000', '1700000000');
+             INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+
+        for column in ["external_tracker_kind", "external_tracker_config"] {
+            assert!(
+                table_has_column(&conn, "products", column).unwrap(),
+                "migration must add products.{column}",
+            );
+        }
+        for column in [
+            "external_ref_kind",
+            "external_ref_canonical_id",
+            "external_ref_raw",
+            "external_ref_synced_at",
+            "external_ref_unbound_at",
+        ] {
+            assert!(
+                table_has_column(&conn, "tasks", column).unwrap(),
+                "migration must add tasks.{column}",
+            );
+        }
+
+        // The unique partial index rejects two simultaneously-bound rows.
+        conn.execute(
+            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at,
+                               external_ref_kind, external_ref_canonical_id)
+             VALUES ('t1', 'prod_1', 'chore', 'A', 'todo', '1700000001', '1700000001',
+                     'github', 'spinyfin/mono#1')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at,
+                               external_ref_kind, external_ref_canonical_id)
+             VALUES ('t2', 'prod_1', 'chore', 'B', 'todo', '1700000002', '1700000002',
+                     'github', 'spinyfin/mono#1')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate bound canonical_id must violate unique index",
+        );
+
+        // The same canonical_id is allowed when one row is unbound.
+        conn.execute(
+            "UPDATE tasks SET external_ref_unbound_at = '1700000100' WHERE id = 't1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id, product_id, kind, name, status, created_at, updated_at,
+                               external_ref_kind, external_ref_canonical_id)
+             VALUES ('t3', 'prod_1', 'chore', 'C', 'todo', '1700000003', '1700000003',
+                     'github', 'spinyfin/mono#1')",
+            [],
+        )
+        .unwrap();
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "11");
+        let _ = std::fs::remove_file(path);
+    }
+
     /// A database carrying the Phase-1 merge-conflict schema (but
     /// not yet Phase-7's CI columns) should pick up the new tables
     /// and columns transparently on re-open, and existing rows whose
@@ -14113,7 +14338,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
 
         // After migration we can also write a fresh `blocked` row
         // and re-backfill is still a no-op (the existing rows
