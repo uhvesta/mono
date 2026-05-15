@@ -437,8 +437,64 @@ impl MergeProbe for CommandMergeProbe {
             ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        parse_probe_json(pr_url, &stdout)
+        // When `statusCheckRollup` is empty the GraphQL field omits
+        // required-but-unstarted status contexts ("EXPECTED" in GitHub's
+        // web UI). The legacy commit-status REST endpoint returns
+        // `state:"pending"` in that case, which lets us show a non-green
+        // indicator instead of a false-positive green.
+        let combined_state =
+            fetch_commit_combined_state_for_empty_rollup(&stdout, pr_url).await;
+        parse_probe_json(pr_url, &stdout, combined_state.as_deref())
     }
+}
+
+/// Extract `"owner/repo"` from a GitHub PR URL of the form
+/// `https://github.com/owner/repo/pull/NNN`.
+fn repo_from_pr_url(pr_url: &str) -> Option<&str> {
+    let path = pr_url.strip_prefix("https://github.com/")?;
+    let mut segments = path.splitn(3, '/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let end = owner.len() + 1 + repo.len();
+    Some(&path[..end])
+}
+
+/// When `statusCheckRollup` is empty/null in `json_body`, fetches the
+/// legacy commit-status combined state (`pending` / `success` / `failure`
+/// / `error`) from GitHub's REST endpoint and returns it as a lowercase
+/// string. Returns `None` on any error or when the rollup is non-empty
+/// (the caller should rely on rollup data in that case).
+async fn fetch_commit_combined_state_for_empty_rollup(
+    json_body: &str,
+    pr_url: &str,
+) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_str(json_body.trim()).ok()?;
+    let rollup = root.get("statusCheckRollup").and_then(|v| v.as_array())?;
+    if !rollup.is_empty() {
+        return None; // non-empty rollup; use rollup data
+    }
+    let head_sha = root
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let repo = repo_from_pr_url(pr_url)?;
+    let api_path = format!("repos/{repo}/commits/{head_sha}/status");
+    let output = Command::new("gh")
+        .args(["api", &api_path, "--jq", ".state"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let state = String::from_utf8(output.stdout)
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())?;
+    if state.is_empty() { None } else { Some(state) }
 }
 
 /// Parse the raw JSON document `gh pr view --json …` returns into a
@@ -448,7 +504,12 @@ impl MergeProbe for CommandMergeProbe {
 /// `Open(clean)` shape so a malformed gh response can't fire a
 /// false-positive blocked flip. Real failures (auth, network) come
 /// through as `Err` from the shelling-out layer, not via this path.
-fn parse_probe_json(url: &str, body: &str) -> Result<PrLifecycleProbe> {
+///
+/// `combined_state` is the optional result from the legacy commit-status
+/// REST API (`pending` / `success` / `failure` / `error`). It is only
+/// consulted when `statusCheckRollup` is empty — see
+/// [`fetch_commit_combined_state_for_empty_rollup`].
+fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Result<PrLifecycleProbe> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Err(anyhow!(
@@ -498,7 +559,7 @@ fn parse_probe_json(url: &str, body: &str) -> Result<PrLifecycleProbe> {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let ci = classify_ci(&rollup);
+    let ci = classify_ci(&rollup, combined_state);
     let state = classify_state(raw_state, merged_at, mergeable, merge_state_status, ci);
     let review_decision = root
         .get("reviewDecision")
@@ -594,8 +655,15 @@ fn classify_review(review_decision: &str, reviews: &[serde_json::Value]) -> PrRe
 ///        - If `conclusion ∈ failure-set` → contributes a failure entry.
 ///        - Otherwise (success / neutral / skipped / missing) → no-op.
 ///   4. If any failures collected → `Failing`. Else if any leaf was
-///      InFlight → `InFlight`. Else `Clean`.
-fn classify_ci(leaves: &[serde_json::Value]) -> OpenPrCiStatus {
+///      InFlight → `InFlight`. Else if rollup was empty, consult
+///      `combined_state` from the legacy commit-status REST API:
+///        - `"pending"` / `"failure"` / `"error"` → `InFlight`
+///          (required contexts configured but not yet submitted).
+///        - `"success"` or absent → `Clean` (no required checks).
+///
+/// `combined_state` is only consulted when `leaves` is empty; for a
+/// non-empty rollup the leaf data is authoritative.
+fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> OpenPrCiStatus {
     use std::collections::BTreeMap;
 
     // Group by name, keeping the most-recently-seen leaf per name.
@@ -683,6 +751,23 @@ fn classify_ci(leaves: &[serde_json::Value]) -> OpenPrCiStatus {
     }
     if any_in_flight {
         return OpenPrCiStatus::InFlight;
+    }
+    // No check-run data in the rollup. Consult the legacy commit-status
+    // combined state when available: "pending" means required status
+    // contexts are configured in branch protection but haven't been
+    // submitted yet (GitHub's web UI labels this "Expected"). Treat any
+    // non-success combined state as InFlight so the kanban card shows a
+    // waiting indicator instead of a false-positive green checkmark.
+    if leaves.is_empty() {
+        match combined_state
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("pending") | Some("failure") | Some("error") => {
+                return OpenPrCiStatus::InFlight;
+            }
+            _ => {}
+        }
     }
     OpenPrCiStatus::Clean
 }
@@ -2251,7 +2336,7 @@ mod tests {
                 &[],
                 serde_json::json!([]),
             );
-            let probe = parse_probe_json("https://example.test/pr/1", &body).unwrap();
+            let probe = parse_probe_json("https://example.test/pr/1", &body, None).unwrap();
             assert_eq!(
                 probe.state, case.expect,
                 "case `{}`: state mismatch (body: {:?})",
@@ -2286,7 +2371,7 @@ mod tests {
             &["needs-review", "boss/no-auto-rebase"],
             serde_json::json!([]),
         );
-        let probe = parse_probe_json("https://example.test/pr/2", &body).unwrap();
+        let probe = parse_probe_json("https://example.test/pr/2", &body, None).unwrap();
         assert_eq!(
             probe.labels,
             vec!["needs-review".to_owned(), "boss/no-auto-rebase".to_owned()],
@@ -2295,19 +2380,24 @@ mod tests {
         let body_empty = json_doc(
             "OPEN", "", "MERGEABLE", "CLEAN", "abc", "", &[], serde_json::json!([]),
         );
-        let probe_empty = parse_probe_json("https://example.test/pr/3", &body_empty).unwrap();
+        let probe_empty =
+            parse_probe_json("https://example.test/pr/3", &body_empty, None).unwrap();
         assert!(probe_empty.labels.is_empty());
     }
 
-    /// `(state × mergeability × ci-leaf-set)` matrix for the CI
-    /// predicate. Exercises the latest-leaf-per-name collapse, the
-    /// required/not-required filter, and the closed conclusion set
-    /// from design §Q1 / Phase 8 #21.
+    /// `(state × mergeability × ci-leaf-set × combined-state)` matrix for
+    /// the CI predicate. Exercises the latest-leaf-per-name collapse, the
+    /// required/not-required filter, the closed conclusion set from design
+    /// §Q1 / Phase 8 #21, and the combined-commit-status fallback used to
+    /// surface EXPECTED (not-yet-submitted) required checks.
     #[test]
     fn parse_probe_covers_ci_leaf_set_matrix() {
         struct Case {
             label: &'static str,
             rollup: serde_json::Value,
+            /// Simulates the legacy commit-status combined state returned by
+            /// `GET /repos/{owner}/{repo}/commits/{sha}/status`.
+            combined_state: Option<&'static str>,
             expect_ci: OpenPrCiStatus,
         }
         let failing_check =
@@ -2330,13 +2420,33 @@ mod tests {
         };
         let cases = [
             Case {
-                label: "no rollup → Clean (legacy PRs with branch protection off)",
+                label: "no rollup, no combined state → Clean (no CI configured)",
                 rollup: serde_json::json!([]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Clean,
+            },
+            Case {
+                label: "no rollup + combined pending → InFlight (EXPECTED checks not yet submitted)",
+                rollup: serde_json::json!([]),
+                combined_state: Some("pending"),
+                expect_ci: OpenPrCiStatus::InFlight,
+            },
+            Case {
+                label: "no rollup + combined success → Clean (no required checks)",
+                rollup: serde_json::json!([]),
+                combined_state: Some("success"),
+                expect_ci: OpenPrCiStatus::Clean,
+            },
+            Case {
+                label: "no rollup + combined failure → InFlight (conservative; no check details yet)",
+                rollup: serde_json::json!([]),
+                combined_state: Some("failure"),
+                expect_ci: OpenPrCiStatus::InFlight,
             },
             Case {
                 label: "all required checks SUCCESS → Clean",
                 rollup: serde_json::json!([success_check("ci/build"), success_check("ci/test")]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Clean,
             },
             Case {
@@ -2345,6 +2455,7 @@ mod tests {
                     success_check("ci/build"),
                     failing_check("ci/test", "FAILURE", ""),
                 ]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
                         name: "ci/test".into(),
@@ -2361,6 +2472,7 @@ mod tests {
                     failing_check("ci/test", "FAILURE", ""),
                     success_check("ci/test"),
                 ]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Clean,
             },
             Case {
@@ -2369,6 +2481,7 @@ mod tests {
                     success_check("ci/test"),
                     failing_check("ci/test", "FAILURE", ""),
                 ]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
                         name: "ci/test".into(),
@@ -2390,6 +2503,7 @@ mod tests {
                     },
                     success_check("ci/test"),
                 ]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Clean,
             },
             Case {
@@ -2402,11 +2516,13 @@ mod tests {
                         "isRequired": true,
                     },
                 ]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::InFlight,
             },
             Case {
                 label: "STARTUP_FAILURE counts as failure (engine pre-triages to retrigger)",
                 rollup: serde_json::json!([failing_check("ci/build", "STARTUP_FAILURE", "")]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
                         name: "ci/build".into(),
@@ -2420,6 +2536,7 @@ mod tests {
             Case {
                 label: "TIMED_OUT counts as failure",
                 rollup: serde_json::json!([failing_check("ci/test", "TIMED_OUT", "")]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
                         name: "ci/test".into(),
@@ -2446,6 +2563,7 @@ mod tests {
                         "isRequired": true,
                     },
                 ]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Clean,
             },
             Case {
@@ -2459,6 +2577,7 @@ mod tests {
                         "isRequired": true,
                     },
                 ]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
                         name: "ci/test".into(),
@@ -2476,6 +2595,7 @@ mod tests {
                     "FAILURE",
                     "https://buildkite.com/anthropic/mono/builds/42#01h-job-uuid",
                 )]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
                         name: "buildkite/mono".into(),
@@ -2494,6 +2614,7 @@ mod tests {
                     "FAILURE",
                     "https://github.com/anthropic/mono/actions/runs/12345/job/67890",
                 )]),
+                combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
                         name: "gha/build".into(),
@@ -2510,7 +2631,9 @@ mod tests {
             let body = json_doc(
                 "OPEN", "", "MERGEABLE", "CLEAN", "abc", "head-1", &[], case.rollup.clone(),
             );
-            let probe = parse_probe_json("https://example.test/pr/ci", &body).unwrap();
+            let probe =
+                parse_probe_json("https://example.test/pr/ci", &body, case.combined_state)
+                    .unwrap();
             let actual_ci = match probe.state {
                 PrLifecycleState::Open(OpenPrStatus { ci, .. }) => ci,
                 other => panic!("case `{}`: expected Open, got {other:?}", case.label),
@@ -2544,7 +2667,7 @@ mod tests {
                 "isRequired": true,
             }]),
         );
-        let probe = parse_probe_json("https://example.test/pr/both", &body).unwrap();
+        let probe = parse_probe_json("https://example.test/pr/both", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
             other => panic!("expected Open, got {other:?}"),
@@ -2556,6 +2679,20 @@ mod tests {
             open.ci,
         );
         assert_eq!(probe.head_ref_oid.as_deref(), Some("head-1"));
+    }
+
+    #[test]
+    fn repo_from_pr_url_extracts_owner_repo() {
+        assert_eq!(
+            super::repo_from_pr_url("https://github.com/spinyfin/mono/pull/568"),
+            Some("spinyfin/mono"),
+        );
+        assert_eq!(
+            super::repo_from_pr_url("https://github.com/owner/my-repo/pull/1"),
+            Some("owner/my-repo"),
+        );
+        assert_eq!(super::repo_from_pr_url("https://example.com/owner/repo/pull/1"), None);
+        assert_eq!(super::repo_from_pr_url("not-a-url"), None);
     }
 
     #[test]
