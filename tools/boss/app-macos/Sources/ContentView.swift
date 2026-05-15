@@ -78,6 +78,7 @@ struct ContentView: View {
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)
+        .navigationTitle(model.selectedProduct?.name ?? "Boss")
         .task {
             // Hand the SwiftUI `openWindow` action to the view model
             // so its design-doc dispatch can open the in-app renderer
@@ -146,10 +147,6 @@ struct ContentView: View {
                         Label("New", systemImage: "plus")
                     }
                 }
-            }
-
-            ToolbarItem(placement: .principal) {
-                BossTitleView(model: model)
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
@@ -852,15 +849,6 @@ private struct WorkSidebarFilterRow: View {
         .padding(.vertical, subtitle == nil ? 6 : 7)
         .contentShape(Rectangle())
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct BossTitleView: View {
-    @ObservedObject var model: ChatViewModel
-
-    var body: some View {
-        Text(model.selectedProduct?.name ?? "Boss")
-            .font(.headline)
     }
 }
 
