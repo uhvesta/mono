@@ -655,21 +655,34 @@ mod tests {
     }
 
     #[test]
-    fn init_all_registers_dispatcher_stats_counters() {
+    fn init_all_registers_all_declared_counters() {
         let registry = Registry::new();
         crate::metrics::init_all(&registry);
-        // Phase 4 wired in 9 DispatcherStats counters; init_all is no
-        // longer a no-op.
         let names: Vec<_> = registry
             .counter_snapshots()
             .into_iter()
             .map(|s| s.name)
             .collect();
+        // Phase 4: dispatcher counters.
         assert!(
             names.iter().any(|n| n == "dispatcher.hook_events.total"),
             "expected dispatcher.hook_events.total to be registered; got {names:?}",
         );
-        assert_eq!(names.len(), 9, "expected exactly 9 dispatcher counters registered");
+        // Phase 5: merge_poller counters.
+        for expected in [
+            "merge_poller.merged",
+            "merge_poller.conflict_flagged",
+            "merge_poller.conflict_cleared",
+            "merge_poller.pr_recheck_recovered",
+            "merge_poller.conflict_redispatched",
+            "merge_poller.pr_recheck_unresolved",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
+        assert_eq!(names.len(), 15, "expected 9 dispatcher + 6 merge_poller counters");
         assert!(registry.gauge_snapshots().is_empty());
     }
 
