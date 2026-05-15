@@ -347,7 +347,7 @@ struct ContentView: View {
                         let isArchived = project.status == "archived"
                         WorkSidebarFilterRow(
                             title: project.name,
-                            subtitle: nil,
+                            subtitle: project.shortID.map { "P\($0)" },
                             systemImage: isArchived ? "archivebox" : "folder",
                             isSelected: isOn,
                             trailing: project.status.capitalized,
@@ -690,7 +690,10 @@ struct ContentView: View {
                 sectionID: section.id,
                 title: section.title,
                 count: section.items.count,
-                defaultExpanded: section.defaultExpanded
+                defaultExpanded: section.defaultExpanded,
+                shortIDLabel: section.projectID
+                    .flatMap { model.project(withID: $0)?.shortID }
+                    .map { "P\($0)" }
             ) {
                 workSectionItems(section.items, column: column)
             }
@@ -701,6 +704,13 @@ struct ContentView: View {
                         Text(section.title)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
+                        if let projectID = section.projectID,
+                           let project = model.project(withID: projectID),
+                           let id = project.shortID {
+                            Text("P\(id)")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
                         Spacer(minLength: 0)
                         if let projectID = section.projectID,
                            let project = model.project(withID: projectID) {
@@ -744,6 +754,7 @@ private struct CollapsibleWorkBoardSection<Content: View>: View {
     let title: String
     let count: Int
     let defaultExpanded: Bool
+    var shortIDLabel: String? = nil
     @ViewBuilder let content: () -> Content
 
     @State private var userToggled: Bool = false
@@ -765,6 +776,11 @@ private struct CollapsibleWorkBoardSection<Content: View>: View {
                     Text("\(title) (\(count))")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
+                    if let label = shortIDLabel {
+                        Text(label)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                     Spacer()
                 }
                 .contentShape(Rectangle())
@@ -1001,6 +1017,11 @@ private struct ProjectFilterPopover: View {
                             .font(.body.weight(isOn ? .semibold : .regular))
                             .lineLimit(1)
                             .truncationMode(.tail)
+                        if let id = project.shortID {
+                            Text("P\(id)")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
                         Spacer()
                     }
                     .padding(.horizontal, 12)
