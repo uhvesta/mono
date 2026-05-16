@@ -469,6 +469,7 @@ struct MarkdownViewerView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .textSelection(.enabled)
+        .withComments()
     }
 }
 

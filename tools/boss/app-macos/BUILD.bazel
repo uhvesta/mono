@@ -1,4 +1,4 @@
-load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application")
+load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application", "macos_unit_test")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 
 package(default_visibility = ["//visibility:private"])
@@ -22,6 +22,21 @@ swift_library(
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
     ],
+)
+
+macos_unit_test(
+    name = "BossTests",
+    minimum_os_version = "15.0",
+    deps = [":boss_mac_app_tests_lib"],
+)
+
+swift_library(
+    name = "boss_mac_app_tests_lib",
+    module_name = "BossTests",
+    srcs = glob(["Tests/BossTests/**/*.swift"]),
+    copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    deps = [":boss_mac_app_lib"],
+    testonly = True,
 )
 
 macos_application(

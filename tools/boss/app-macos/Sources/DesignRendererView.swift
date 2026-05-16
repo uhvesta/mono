@@ -127,6 +127,7 @@ struct DesignRendererView: View {
         .task(id: content.filePath) {
             await load()
         }
+        .withComments()
     }
 
     @ViewBuilder
