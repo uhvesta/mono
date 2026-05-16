@@ -13,6 +13,9 @@ steps:
     command: ".buildkite/steps/bootstrap.sh"
     agents:
       queue: "linux-amd64"
+    notify:
+      - github_commit_status:
+          context: "bootstrap"
 
   - label: ":bazel: bazel-build"
     key: "bazel-build"
@@ -22,6 +25,9 @@ steps:
       - "bazel-out/**/extra_action_outputs/**/*"
     agents:
       queue: "linux-amd64"
+    notify:
+      - github_commit_status:
+          context: "bazel-build"
 
   - label: ":apple: mac-app-build"
     key: "mac-app-build"
@@ -29,6 +35,9 @@ steps:
     depends_on: "bootstrap"
     agents:
       queue: "macos-arm64"
+    notify:
+      - github_commit_status:
+          context: "mac-app-build"
 
   - label: ":white_check_mark: checks"
     key: "checks"
@@ -36,6 +45,9 @@ steps:
     depends_on: "bootstrap"
     agents:
       queue: "linux-amd64"
+    notify:
+      - github_commit_status:
+          context: "checks"
 
   - wait: ~
     continue_on_failure: false
@@ -48,3 +60,6 @@ steps:
       - "bazel-testlogs/**/test.xml"
     agents:
       queue: "linux-amd64"
+    notify:
+      - github_commit_status:
+          context: "bazel-test"
