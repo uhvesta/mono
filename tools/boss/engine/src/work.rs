@@ -52,8 +52,8 @@ pub use boss_protocol::{
     ProjectDesignDocState, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
     SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
-    WorkTree, is_known_created_via,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef,
+    WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
@@ -4800,6 +4800,157 @@ impl WorkDb {
             None => Ok(None),
         }
     }
+
+    // ── External-ref methods (T8) ────────────────────────────────────────────
+    // Design: tools/boss/docs/designs/external-issue-tracker-sync-github-projects.md
+    // §"Design Question 4" and §"Lookup methods on WorkDb".
+
+    /// Bind `work_item_id` to the upstream issue identified by `(kind,
+    /// canonical_id)`. Stores the tracker-specific `raw` blob (e.g.
+    /// `{"issue_number": 560, "project_item_id": "..."}` for GitHub).
+    /// Clears any prior `external_ref_unbound_at` marker so the row is
+    /// treated as actively bound. Replaces an existing binding silently.
+    ///
+    /// Returns an error if the work item does not exist or is soft-deleted.
+    pub fn set_external_ref(
+        &self,
+        work_item_id: &str,
+        kind: &str,
+        canonical_id: &str,
+        raw: &serde_json::Value,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let raw_json = serde_json::to_string(raw)
+            .with_context(|| format!("failed to serialise raw blob for {work_item_id}"))?;
+        let n = conn.execute(
+            "UPDATE tasks
+             SET external_ref_kind         = ?2,
+                 external_ref_canonical_id = ?3,
+                 external_ref_raw          = ?4,
+                 external_ref_unbound_at   = NULL,
+                 updated_at                = ?5
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, kind, canonical_id, raw_json, now_string()],
+        )?;
+        if n == 0 {
+            bail!("work item not found or soft-deleted: {work_item_id}");
+        }
+        Ok(())
+    }
+
+    /// Mark the external-ref binding on `work_item_id` as unbound.
+    /// Retains `external_ref_kind` and `external_ref_canonical_id` so
+    /// [`find_by_external_ref`][Self::find_by_external_ref] can
+    /// re-bind automatically when the upstream item reappears. Sets
+    /// `external_ref_unbound_at` to now and clears `external_ref_synced_at`.
+    ///
+    /// Returns an error if the work item does not exist or is soft-deleted.
+    pub fn clear_external_ref(&self, work_item_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE tasks
+             SET external_ref_synced_at  = NULL,
+                 external_ref_unbound_at = ?2,
+                 updated_at              = ?2
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        if n == 0 {
+            bail!("work item not found or soft-deleted: {work_item_id}");
+        }
+        Ok(())
+    }
+
+    /// Find the work item actively bound to `(kind, canonical_id)`.
+    /// Returns `None` when no matching active binding exists. Rows where
+    /// `external_ref_unbound_at IS NOT NULL` are excluded (they retain
+    /// their `canonical_id` for automatic re-binding, but are not
+    /// considered "found" by this query). Soft-deleted tasks are always
+    /// excluded.
+    ///
+    /// The returned `Task.external_ref` is populated; `web_url` is left
+    /// as an empty string — derivation is tracker-specific and handled by
+    /// the reconciler layer (T9).
+    pub fn find_by_external_ref(
+        &self,
+        kind: &str,
+        canonical_id: &str,
+    ) -> Result<Option<Task>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
+                    pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
+                    priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
+                    effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
+                    ci_required_state, review_required_state, ci_required_detail,
+                    review_required_detail, pr_state_polled_at,
+                    external_ref_kind, external_ref_canonical_id, external_ref_raw,
+                    external_ref_synced_at, external_ref_unbound_at
+             FROM tasks
+             WHERE external_ref_kind          = ?1
+               AND external_ref_canonical_id  = ?2
+               AND external_ref_unbound_at   IS NULL
+               AND deleted_at               IS NULL",
+            params![kind, canonical_id],
+            map_task_with_external_ref,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Return every task under `product_id` that has a non-null
+    /// `external_ref_canonical_id`, including previously-unbound rows
+    /// (where `external_ref_unbound_at IS NOT NULL`). The reconciler
+    /// uses this list to detect reappearing items (and re-bind them via
+    /// [`set_external_ref`][Self::set_external_ref]) as well as to build
+    /// the canonical-id → work-item map for each reconcile pass.
+    ///
+    /// Soft-deleted tasks are excluded.
+    pub fn list_external_refs_for_product(
+        &self,
+        product_id: &str,
+    ) -> Result<Vec<(String, StoredExternalRef)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, external_ref_kind, external_ref_canonical_id,
+                    external_ref_raw, external_ref_synced_at, external_ref_unbound_at
+             FROM tasks
+             WHERE product_id                = ?1
+               AND external_ref_canonical_id IS NOT NULL
+               AND deleted_at               IS NULL",
+        )?;
+        let rows = stmt.query_map([product_id], |row| {
+            let raw_json: Option<String> = row.get(3)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                raw_json,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, kind, canonical_id, raw_json, synced_at, unbound_at) = row?;
+            let raw: serde_json::Value = raw_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Null);
+            result.push((
+                id,
+                StoredExternalRef {
+                    kind,
+                    canonical_id,
+                    raw,
+                    synced_at,
+                    unbound_at,
+                },
+            ));
+        }
+        Ok(result)
+    }
 }
 
 /// Where the chore should land after [`WorkDb::record_worker_pr_completion`].
@@ -4844,6 +4995,19 @@ pub struct PendingMergeCheck {
     pub work_item_id: String,
     pub product_id: String,
     pub pr_url: String,
+}
+
+/// Raw external-ref data as stored in the `tasks` table. Returned by
+/// [`WorkDb::list_external_refs_for_product`]. The `web_url` field present
+/// on [`WorkItemExternalRef`] is tracker-specific and is derived by the
+/// reconciler layer; the DB layer does not compute it.
+#[derive(Debug, Clone)]
+pub struct StoredExternalRef {
+    pub kind: String,
+    pub canonical_id: String,
+    pub raw: serde_json::Value,
+    pub synced_at: Option<String>,
+    pub unbound_at: Option<String>,
 }
 
 /// A `conflict_resolutions` row that is `pending` but has no live
@@ -4967,10 +5131,37 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         ci_required_detail: row.get::<_, Option<String>>(26)?.filter(|s| !s.is_empty()),
         review_required_detail: row.get::<_, Option<String>>(27)?.filter(|s| !s.is_empty()),
         pr_state_polled_at: row.get::<_, Option<String>>(28)?.filter(|s| !s.is_empty()),
-        // T1 schema columns; populated by T8 WorkDb methods when the migration
-        // has run. Until then the protocol field carries None.
+        // Standard queries omit the external_ref columns; the T8 methods
+        // use map_task_with_external_ref which adds columns 29-33.
         external_ref: None,
     })
+}
+
+/// Like [`map_task`] but reads columns 29–33 carrying the external-ref
+/// data and populates `Task.external_ref`. Used by the T8 WorkDb
+/// methods (`find_by_external_ref`) whose SELECT explicitly includes
+/// those columns. The `web_url` field is not stored in the DB; it is
+/// derived at the reconciler layer and left as an empty string here.
+fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task(row)?;
+    let kind: Option<String> = row.get(29)?;
+    let canonical_id: Option<String> = row.get(30)?;
+    if let (Some(kind), Some(canonical_id)) = (kind, canonical_id) {
+        let raw_json: Option<String> = row.get(31)?;
+        let raw: serde_json::Value = raw_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        task.external_ref = Some(WorkItemExternalRef {
+            kind,
+            canonical_id,
+            raw,
+            web_url: String::new(),
+            synced_at: row.get(32)?,
+            unbound_at: row.get(33)?,
+        });
+    }
+    Ok(task)
 }
 
 fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
@@ -14336,6 +14527,226 @@ mod tests {
             .unwrap();
         assert_eq!(version, "11");
         let _ = std::fs::remove_file(path);
+    }
+
+    // ── T8 WorkDb external-ref method tests ─────────────────────────────────
+
+    /// Helper: create a product and a chore in a fresh in-memory db.
+    /// Returns `(db, product_id, chore_id)`.
+    fn setup_product_and_chore() -> (WorkDb, String, String) {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "TestProduct".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Fix thing".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        (db, product.id, chore.id)
+    }
+
+    /// set_external_ref writes the columns; find_by_external_ref returns
+    /// the row with external_ref populated.
+    #[test]
+    fn set_and_find_external_ref_round_trip() {
+        let (db, _product_id, chore_id) = setup_product_and_chore();
+        let raw = serde_json::json!({ "issue_number": 560, "project_item_id": "PVT_abc" });
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#560", &raw)
+            .unwrap();
+
+        let task = db
+            .find_by_external_ref("github", "spinyfin/mono#560")
+            .unwrap()
+            .expect("must find the row");
+        assert_eq!(task.id, chore_id);
+        let ext = task.external_ref.expect("external_ref must be populated");
+        assert_eq!(ext.kind, "github");
+        assert_eq!(ext.canonical_id, "spinyfin/mono#560");
+        assert_eq!(ext.raw["issue_number"], 560);
+        assert_eq!(ext.unbound_at, None);
+    }
+
+    /// set_external_ref on a work item that already has a binding replaces
+    /// it silently (update semantics).
+    #[test]
+    fn set_external_ref_replaces_existing_binding() {
+        let (db, _product_id, chore_id) = setup_product_and_chore();
+        let raw1 = serde_json::json!({ "issue_number": 1 });
+        let raw2 = serde_json::json!({ "issue_number": 2 });
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#1", &raw1)
+            .unwrap();
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#2", &raw2)
+            .unwrap();
+
+        assert!(
+            db.find_by_external_ref("github", "spinyfin/mono#1")
+                .unwrap()
+                .is_none(),
+            "old canonical_id must no longer match"
+        );
+        let task = db
+            .find_by_external_ref("github", "spinyfin/mono#2")
+            .unwrap()
+            .expect("new canonical_id must match");
+        assert_eq!(task.id, chore_id);
+    }
+
+    /// clear_external_ref sets unbound_at; find_by_external_ref then
+    /// returns None for that canonical_id.
+    #[test]
+    fn clear_external_ref_hides_from_find() {
+        let (db, _product_id, chore_id) = setup_product_and_chore();
+        let raw = serde_json::json!({});
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#10", &raw)
+            .unwrap();
+        db.clear_external_ref(&chore_id).unwrap();
+
+        let found = db
+            .find_by_external_ref("github", "spinyfin/mono#10")
+            .unwrap();
+        assert!(found.is_none(), "cleared row must not appear in find_by_external_ref");
+    }
+
+    /// After clear, set_external_ref on the same row (rebind from unbound
+    /// state) resets unbound_at and makes the row findable again.
+    #[test]
+    fn rebind_from_unbound_state() {
+        let (db, _product_id, chore_id) = setup_product_and_chore();
+        let raw = serde_json::json!({ "issue_number": 99 });
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#99", &raw)
+            .unwrap();
+        db.clear_external_ref(&chore_id).unwrap();
+        // Rebind.
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#99", &raw)
+            .unwrap();
+
+        let task = db
+            .find_by_external_ref("github", "spinyfin/mono#99")
+            .unwrap()
+            .expect("rebind must make the row findable again");
+        let ext = task.external_ref.unwrap();
+        assert_eq!(ext.unbound_at, None, "unbound_at must be cleared on rebind");
+    }
+
+    /// The unique partial index rejects two simultaneously-bound rows for
+    /// the same (kind, canonical_id) while the same canonical_id is
+    /// allowed when one row is unbound.
+    #[test]
+    fn unique_index_rejects_duplicate_bound_rows() {
+        let (db, product_id, chore_id) = setup_product_and_chore();
+        let chore2 = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.clone(),
+                name: "Second chore".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let raw = serde_json::json!({});
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#77", &raw)
+            .unwrap();
+        // Binding the same canonical_id to a second chore while the first
+        // is still bound must fail (unique partial index violation).
+        let err = db.set_external_ref(&chore2.id, "github", "spinyfin/mono#77", &raw);
+        assert!(err.is_err(), "duplicate bound binding must be rejected");
+
+        // After unbinding the first, the second bind must succeed.
+        db.clear_external_ref(&chore_id).unwrap();
+        db.set_external_ref(&chore2.id, "github", "spinyfin/mono#77", &raw)
+            .unwrap();
+        let task = db
+            .find_by_external_ref("github", "spinyfin/mono#77")
+            .unwrap()
+            .expect("second bind after unbind must be findable");
+        assert_eq!(task.id, chore2.id);
+    }
+
+    /// list_external_refs_for_product returns both bound and unbound rows
+    /// (those with external_ref_canonical_id IS NOT NULL).
+    #[test]
+    fn list_external_refs_includes_unbound_rows() {
+        let (db, product_id, chore_id) = setup_product_and_chore();
+        let chore2 = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.clone(),
+                name: "Another chore".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        let raw = serde_json::json!({ "n": 1 });
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#1", &raw)
+            .unwrap();
+        db.set_external_ref(&chore2.id, "github", "spinyfin/mono#2", &raw)
+            .unwrap();
+        db.clear_external_ref(&chore_id).unwrap();
+
+        let refs = db.list_external_refs_for_product(&product_id).unwrap();
+        assert_eq!(refs.len(), 2, "both bound and unbound rows must appear");
+
+        let ids: Vec<&str> = refs.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&chore_id.as_str()));
+        assert!(ids.contains(&chore2.id.as_str()));
+
+        let unbound = refs
+            .iter()
+            .find(|(id, _)| id == &chore_id)
+            .map(|(_, r)| r)
+            .unwrap();
+        assert!(unbound.unbound_at.is_some(), "cleared row must have unbound_at set");
+
+        let bound = refs
+            .iter()
+            .find(|(id, _)| id == &chore2.id)
+            .map(|(_, r)| r)
+            .unwrap();
+        assert!(bound.unbound_at.is_none(), "active row must have no unbound_at");
+    }
+
+    /// A database that does not yet have the external-tracker columns must
+    /// return an empty list from list_external_refs_for_product (migration
+    /// adds the columns with NULL defaults, so no rows qualify).
+    #[test]
+    fn list_external_refs_returns_empty_when_no_refs_set() {
+        let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "NoRefs".into(),
+                description: None,
+                repo_remote_url: None,
+            })
+            .unwrap();
+        let refs = db
+            .list_external_refs_for_product(&product.id)
+            .unwrap();
+        assert!(refs.is_empty());
     }
 
     /// A database carrying the Phase-1 merge-conflict schema (but
