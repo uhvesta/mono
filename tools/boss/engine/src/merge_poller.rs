@@ -300,11 +300,14 @@ pub enum CiProvider {
 /// required-check predicate (design §Q1). `ACTION_REQUIRED` is a
 /// special case: the worker can't approve manual workflows, so we
 /// surface it as a failure but the engine's pre-triage immediately
-/// flags it `manual_action_required` (design §Q4).
+/// flags it `manual_action_required` (design §Q4). `ERROR` is the
+/// legacy-commit-status equivalent of `FAILURE` (StatusContext leaves
+/// — see [`normalize_leaf`]) and lands in the same bucket.
 fn is_failure_conclusion(c: &str) -> bool {
     matches!(
         c.to_ascii_uppercase().as_str(),
         "FAILURE"
+            | "ERROR"
             | "TIMED_OUT"
             | "CANCELLED"
             | "STARTUP_FAILURE"
@@ -639,6 +642,101 @@ fn classify_review(review_decision: &str, reviews: &[serde_json::Value]) -> PrRe
     }
 }
 
+/// Verdict bucket a single rollup leaf contributes to. Produced by
+/// [`normalize_leaf`] so the two GraphQL leaf shapes
+/// (`CheckRun` and `StatusContext`) feed the same downstream branches
+/// in [`classify_ci`].
+enum LeafVerdict {
+    /// Leaf is in a non-terminal state (queued / running / expected /
+    /// briefly post-completion with empty conclusion).
+    InFlight,
+    /// Leaf reached a successful terminal state (`SUCCESS` /
+    /// `NEUTRAL` / `SKIPPED`).
+    Pass,
+    /// Leaf reached a failing terminal state. `conclusion` is the
+    /// uppercased token kept verbatim for the worker prompt /
+    /// `ci_remediations.failed_checks` JSON.
+    Fail { conclusion: String },
+}
+
+/// Normalize one rollup leaf into a [`LeafVerdict`]. `gh pr view
+/// --json statusCheckRollup` returns a heterogeneous array containing
+/// two GraphQL types:
+///
+///   - `CheckRun` — modern check-runs (GitHub Actions, most CI
+///     integrations). Carries `name`, `status`, `conclusion`.
+///   - `StatusContext` — the legacy commit-status API shape (Buildkite,
+///     some self-hosted CI). Carries `context`, `state`. **No** `status`
+///     or `conclusion` field.
+///
+/// Treating the two uniformly via `status`+`conclusion` (the pre-fix
+/// behaviour) silently classifies every StatusContext leaf as InFlight
+/// because both fields read empty, which is why a green Buildkite-only
+/// PR stayed pinned on the yellow-clock badge indefinitely.
+fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
+    let typename = leaf
+        .get("__typename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // StatusContext: `state` carries the verdict. Values per GitHub's
+    // commit-status API: SUCCESS / FAILURE / ERROR / PENDING / EXPECTED.
+    // Dispatch on `__typename` when present; fall back to "has `state`
+    // but no `conclusion`" so older fixtures (and any future leaf shape
+    // that mirrors StatusContext) classify correctly.
+    let has_status_context_shape = typename.eq_ignore_ascii_case("StatusContext")
+        || (leaf.get("state").is_some() && leaf.get("conclusion").is_none());
+    if has_status_context_shape {
+        let state = leaf
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        return match state.as_str() {
+            "SUCCESS" => LeafVerdict::Pass,
+            "FAILURE" | "ERROR" => LeafVerdict::Fail { conclusion: state },
+            // PENDING (running), EXPECTED (branch protection lists the
+            // context but no run has reported yet), empty, or anything
+            // else GitHub may add later → wait for a terminal verdict.
+            _ => LeafVerdict::InFlight,
+        };
+    }
+
+    // CheckRun (and unknown typenames that still carry CheckRun-shaped
+    // fields): combine `status` and `conclusion`. A leaf is in-flight
+    // when its status is one of GitHub's pending-shape values OR when
+    // the conclusion is still empty (briefly, post-completion).
+    let status = leaf
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let conclusion = leaf
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let status_in_flight = matches!(
+        status.as_str(),
+        "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED" | ""
+    );
+    if conclusion.is_empty() {
+        return LeafVerdict::InFlight;
+    }
+    if is_failure_conclusion(&conclusion) {
+        return LeafVerdict::Fail { conclusion };
+    }
+    if is_pass_conclusion(&conclusion) {
+        return LeafVerdict::Pass;
+    }
+    if status_in_flight {
+        return LeafVerdict::InFlight;
+    }
+    // Unknown conclusion shape — treat as in-flight rather than
+    // misclassifying it as a failure.
+    LeafVerdict::InFlight
+}
+
 /// Collapse the `statusCheckRollup` array into one [`OpenPrCiStatus`]
 /// per the design's §Q1 predicate:
 ///
@@ -650,11 +748,9 @@ fn classify_review(review_decision: &str, reviews: &[serde_json::Value]) -> PrRe
 ///   2. Group by check name; pick the latest leaf per name (we use the
 ///      last entry, which matches GitHub's natural ordering for
 ///      re-runs — the most recent run lands last in the rollup).
-///   3. For each surviving leaf:
-///        - If `status != COMPLETED` and the conclusion isn't already a
-///          recognised pass/fail signal, it's `InFlight`.
-///        - If `conclusion ∈ failure-set` → contributes a failure entry.
-///        - Otherwise (success / neutral / skipped / missing) → no-op.
+///   3. For each surviving leaf, run [`normalize_leaf`] to fold the
+///      two leaf shapes (`CheckRun` and `StatusContext`) into a single
+///      verdict bucket.
 ///   4. If any failures collected → `Failing`. Else if any leaf was
 ///      InFlight → `InFlight`. Else if rollup was empty, consult
 ///      `combined_state` from the legacy commit-status REST API:
@@ -695,56 +791,29 @@ fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> Op
     let mut failures: Vec<RequiredCheckFailure> = Vec::new();
     let mut any_in_flight = false;
     for (name, leaf) in by_name {
-        let status = leaf
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        let conclusion = leaf
-            .get("conclusion")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        // A leaf is in-flight when its status is one of GitHub's
-        // pending-shape values OR when status==COMPLETED but the
-        // conclusion is still empty (briefly, post-completion).
-        let status_in_flight = matches!(
-            status.as_str(),
-            "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED" | ""
-        );
-        let conclusion_empty = conclusion.is_empty();
-        if conclusion_empty || status_in_flight {
-            // No terminal conclusion yet — count toward InFlight but
-            // don't fail.
-            if conclusion_empty {
+        match normalize_leaf(leaf) {
+            LeafVerdict::Pass => {}
+            LeafVerdict::InFlight => {
                 any_in_flight = true;
-                continue;
+            }
+            LeafVerdict::Fail { conclusion } => {
+                let target_url = leaf
+                    .get("targetUrl")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| leaf.get("detailsUrl").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_owned();
+                let provider = provider_for_url(&target_url);
+                let provider_job_id = parse_provider_job_id(provider, &target_url);
+                failures.push(RequiredCheckFailure {
+                    name,
+                    conclusion,
+                    target_url,
+                    provider,
+                    provider_job_id,
+                });
             }
         }
-        if is_failure_conclusion(&conclusion) {
-            let target_url = leaf
-                .get("targetUrl")
-                .and_then(|v| v.as_str())
-                .or_else(|| leaf.get("detailsUrl").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_owned();
-            let provider = provider_for_url(&target_url);
-            let provider_job_id = parse_provider_job_id(provider, &target_url);
-            failures.push(RequiredCheckFailure {
-                name,
-                conclusion,
-                target_url,
-                provider,
-                provider_job_id,
-            });
-            continue;
-        }
-        if is_pass_conclusion(&conclusion) {
-            continue;
-        }
-        // Unknown conclusion shape — treat as in-flight rather than
-        // misclassifying it as a failure.
-        any_in_flight = true;
     }
 
     if !failures.is_empty() {
@@ -2665,6 +2734,110 @@ mod tests {
                         provider_job_id: Some("67890".into()),
                     }],
                 },
+            },
+            // ---- StatusContext leaf shape (legacy commit-status API,
+            // used by Buildkite and other CI integrations). These
+            // leaves carry `context` + `state` and have NO `status` or
+            // `conclusion` field. Pre-fix the parser silently classified
+            // every StatusContext leaf as InFlight; the next four cases
+            // pin the StatusContext code path so a future regression
+            // shows up as a test failure rather than a stuck yellow
+            // clock on every chore card.
+            Case {
+                label: "StatusContext: all SUCCESS → Clean (Buildkite-style rollup)",
+                rollup: serde_json::json!([
+                    {
+                        "__typename": "StatusContext",
+                        "context": "buildkite/mono",
+                        "state": "SUCCESS",
+                        "targetUrl": "https://buildkite.com/flunge/mono/builds/91",
+                    },
+                    {
+                        "__typename": "StatusContext",
+                        "context": "buildkite/mono/checks",
+                        "state": "SUCCESS",
+                        "targetUrl": "https://buildkite.com/flunge/mono/builds/91#abc",
+                    },
+                ]),
+                combined_state: None,
+                expect_ci: OpenPrCiStatus::Clean,
+            },
+            Case {
+                label: "StatusContext: PENDING → InFlight",
+                rollup: serde_json::json!([
+                    {
+                        "__typename": "StatusContext",
+                        "context": "buildkite/mono",
+                        "state": "PENDING",
+                    },
+                ]),
+                combined_state: None,
+                expect_ci: OpenPrCiStatus::InFlight,
+            },
+            Case {
+                label: "StatusContext: FAILURE → Failing",
+                rollup: serde_json::json!([
+                    {
+                        "__typename": "StatusContext",
+                        "context": "buildkite/mono",
+                        "state": "FAILURE",
+                        "targetUrl": "https://buildkite.com/flunge/mono/builds/91#019e",
+                    },
+                ]),
+                combined_state: None,
+                expect_ci: OpenPrCiStatus::Failing {
+                    failures: vec![RequiredCheckFailure {
+                        name: "buildkite/mono".into(),
+                        conclusion: "FAILURE".into(),
+                        target_url: "https://buildkite.com/flunge/mono/builds/91#019e".into(),
+                        provider: CiProvider::Buildkite,
+                        provider_job_id: Some("019e".into()),
+                    }],
+                },
+            },
+            Case {
+                label: "StatusContext: ERROR is a failure (legacy commit-status crash state)",
+                rollup: serde_json::json!([
+                    {
+                        "__typename": "StatusContext",
+                        "context": "buildkite/mono",
+                        "state": "ERROR",
+                    },
+                ]),
+                combined_state: None,
+                expect_ci: OpenPrCiStatus::Failing {
+                    failures: vec![RequiredCheckFailure {
+                        name: "buildkite/mono".into(),
+                        conclusion: "ERROR".into(),
+                        target_url: "".into(),
+                        provider: CiProvider::Other,
+                        provider_job_id: None,
+                    }],
+                },
+            },
+            Case {
+                label: "Mixed CheckRun + StatusContext, all green → Clean",
+                rollup: serde_json::json!([
+                    success_check("ci/build"),
+                    {
+                        "__typename": "StatusContext",
+                        "context": "buildkite/mono",
+                        "state": "SUCCESS",
+                    },
+                ]),
+                combined_state: None,
+                expect_ci: OpenPrCiStatus::Clean,
+            },
+            Case {
+                label: "StatusContext: SUCCESS without __typename (defensive fallback)",
+                rollup: serde_json::json!([
+                    {
+                        "context": "legacy/check",
+                        "state": "SUCCESS",
+                    },
+                ]),
+                combined_state: None,
+                expect_ci: OpenPrCiStatus::Clean,
             },
         ];
         for case in cases {
