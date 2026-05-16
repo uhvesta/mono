@@ -13,7 +13,7 @@ use boss_protocol::{
     CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortAuditReport,
     EffortLevel, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, WorkExecution, WorkItem,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkExecution, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -2121,15 +2121,73 @@ async fn run_show_leaf(
     )
     .await?;
     let executions = list_executions_for_item(client, &item.id).await?;
+    let runtime = get_task_runtime(client, &item.id).await?;
+    let task_json = task_json_with_runtime(&item, &runtime)?;
     print_entity(
         ctx,
-        &serde_json::json!({ label: item, "dependencies": detail, "executions": executions }),
+        &serde_json::json!({
+            label: task_json,
+            "dependencies": detail,
+            "executions": executions,
+        }),
         || {
             print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
+            print_runtime_section(&runtime);
             print_dependency_section(&detail);
             print_executions_section(&executions);
         },
     )
+}
+
+/// Serialise `item` and splice the runtime's `current_execution_id`
+/// / `current_run_id` onto the resulting JSON object so a downstream
+/// `jq .task.current_execution_id` resolves to the engine's view of
+/// the dispatched execution. Both fields land as `null` when no
+/// execution / run exists yet — the coordinator wants the keys
+/// present so it can distinguish "engine returned null" from "this
+/// client predates the field." Cloning into a `serde_json::Value`
+/// keeps the wire shape of [`Task`] unchanged everywhere else.
+fn task_json_with_runtime(item: &Task, runtime: &TaskRuntime) -> Result<serde_json::Value, CliError> {
+    let mut value = serde_json::to_value(item).map_err(CliError::internal)?;
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "current_execution_id".to_owned(),
+            runtime
+                .execution_id
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+        map.insert(
+            "current_run_id".to_owned(),
+            runtime
+                .current_run_id
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+    }
+    Ok(value)
+}
+
+fn print_runtime_section(runtime: &TaskRuntime) {
+    if runtime.execution_id.is_none() && runtime.current_run_id.is_none() {
+        return;
+    }
+    println!();
+    println!("Runtime:");
+    println!(
+        "  current_execution_id: {}",
+        runtime.execution_id.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  current_run_id:       {}",
+        runtime.current_run_id.as_deref().unwrap_or("-")
+    );
+    if let Some(status) = &runtime.execution_status {
+        println!("  execution_status:     {status}");
+    }
+    if let Some(status) = &runtime.run_status {
+        println!("  run_status:           {status}");
+    }
 }
 
 /// Check whether a work item resolved from a short id matches the verb
@@ -3388,6 +3446,25 @@ async fn list_executions_for_item(
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("executions list", &other)),
+    }
+}
+
+async fn get_task_runtime(
+    client: &mut BossClient,
+    work_item_id: &str,
+) -> Result<TaskRuntime, CliError> {
+    match client
+        .send_request(&FrontendRequest::GetTaskRuntime {
+            work_item_id: work_item_id.to_owned(),
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::TaskRuntimeResult { runtime } => Ok(runtime),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("task runtime", &other)),
     }
 }
 

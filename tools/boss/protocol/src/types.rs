@@ -721,7 +721,10 @@ pub struct ExecutionReconcileResult {
 /// `execution_id` is the active or most recent execution row; the
 /// engine uses the same value as `run_id` when registering live
 /// worker state, so UI consumers can join `task → execution_id →
-/// LiveWorkerState`.
+/// LiveWorkerState`. `current_run_id` is the latest `work_runs` row
+/// attached to that execution (`None` until the dispatch loop has
+/// progressed past the cube-workspace-lease stage and called
+/// `start_execution_run`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRuntime {
     pub work_item_id: String,
@@ -729,6 +732,8 @@ pub struct TaskRuntime {
     pub run_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

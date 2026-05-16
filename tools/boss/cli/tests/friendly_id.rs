@@ -427,3 +427,45 @@ async fn project_show_json_includes_short_id() -> Result<()> {
     );
     Ok(())
 }
+
+/// `boss chore show <id> --json` always emits `current_execution_id`
+/// and `current_run_id` inside the chore object — `null` when the
+/// chore has never been dispatched. The coordinator parses these
+/// keys directly off `.chore`, so the engine must keep them present
+/// (not skipped) even when the underlying engine state is empty.
+/// Backs the agent-visibility chore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chore_show_json_exposes_runtime_keys_when_empty() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let chore = create_chore(&mut client, &product.id, "Just created").await?;
+
+    let value = run_boss(engine.socket_str(), &["chore", "show", &chore.id])?;
+    let chore_value = value
+        .get("chore")
+        .ok_or_else(|| anyhow!("expected `chore` key in JSON: {value}"))?;
+    assert!(
+        chore_value
+            .as_object()
+            .map(|m| m.contains_key("current_execution_id"))
+            .unwrap_or(false),
+        "current_execution_id key must always be present: {value}",
+    );
+    assert!(
+        chore_value
+            .as_object()
+            .map(|m| m.contains_key("current_run_id"))
+            .unwrap_or(false),
+        "current_run_id key must always be present: {value}",
+    );
+    assert!(
+        chore_value["current_execution_id"].is_null(),
+        "pre-dispatch chore must have null current_execution_id: {value}",
+    );
+    assert!(
+        chore_value["current_run_id"].is_null(),
+        "pre-dispatch chore must have null current_run_id: {value}",
+    );
+    Ok(())
+}

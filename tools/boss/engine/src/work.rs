@@ -2336,6 +2336,21 @@ impl WorkDb {
         }
     }
 
+    /// Single-item version of the per-task runtime data carried in
+    /// `WorkTree::task_runtimes`. Backs the `GetTaskRuntime` RPC that
+    /// `boss chore show` / `boss task show` use to surface the active
+    /// execution + run on the rendered work item. The lookup never
+    /// fails on missing executions: an untouched work item simply
+    /// returns a `TaskRuntime` with every `Option` field set to
+    /// `None`. Friendly ids (`T42`, `boss/42`) are resolved to primary
+    /// ids before the query runs, matching `get_work_item`'s contract.
+    pub fn get_task_runtime(&self, work_item_id: &str) -> Result<TaskRuntime> {
+        let conn = self.connect()?;
+        let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?
+            .unwrap_or_else(|| work_item_id.to_owned());
+        query_task_runtime(&conn, &resolved)
+    }
+
     /// Look up a work item by its per-product short_id. Searches both
     /// the `tasks` table (returning `Task` or `Chore`) and the
     /// `projects` table, returning the first match. Returns `None` if
@@ -6928,32 +6943,42 @@ fn collect_task_runtimes(
 ) -> Result<Vec<TaskRuntime>> {
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     for task in tasks.iter().chain(chores.iter()) {
-        let execution = query_latest_execution_for_work_item(conn, &task.id)?;
-        let (execution_status, run_status, execution_id) = if let Some(execution) = execution {
-            let run_status = query_latest_run_status(conn, &execution.id)?;
-            (Some(execution.status), run_status, Some(execution.id))
-        } else {
-            (None, None, None)
-        };
-        runtimes.push(TaskRuntime {
-            work_item_id: task.id.clone(),
-            execution_status,
-            run_status,
-            execution_id,
-        });
+        runtimes.push(query_task_runtime(conn, &task.id)?);
     }
     Ok(runtimes)
 }
 
-fn query_latest_run_status(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
+fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Result<TaskRuntime> {
+    let execution = query_latest_execution_for_work_item(conn, work_item_id)?;
+    let (execution_status, run_status, execution_id, current_run_id) =
+        if let Some(execution) = execution {
+            let latest_run = query_latest_run(conn, &execution.id)?;
+            let (run_status, run_id) = match latest_run {
+                Some((id, status)) => (Some(status), Some(id)),
+                None => (None, None),
+            };
+            (Some(execution.status), run_status, Some(execution.id), run_id)
+        } else {
+            (None, None, None, None)
+        };
+    Ok(TaskRuntime {
+        work_item_id: work_item_id.to_owned(),
+        execution_status,
+        run_status,
+        execution_id,
+        current_run_id,
+    })
+}
+
+fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
     conn.query_row(
-        "SELECT status
+        "SELECT id, status
          FROM work_runs
          WHERE execution_id = ?1
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
         [execution_id],
-        |row| row.get::<_, String>(0),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )
     .optional()
     .map_err(Into::into)
@@ -8554,6 +8579,89 @@ mod tests {
             .expect("missing running runtime entry");
         assert_eq!(runtime_running.execution_status.as_deref(), Some("running"));
         assert_eq!(runtime_running.run_status.as_deref(), Some("active"));
+        assert!(
+            runtime_running.current_run_id.is_some(),
+            "running chore must surface its work_runs id so chore show resolves \
+             current_run_id without going through events.sock",
+        );
+        assert!(runtime_idle.current_run_id.is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `get_task_runtime` returns the same per-task runtime shape that
+    /// `WorkTree::task_runtimes` carries, sourced from the engine's
+    /// own execution/run tables. The data path must populate
+    /// `execution_id` from the moment `request_execution` accepts the
+    /// dispatch (status=`ready`, no run yet), and add
+    /// `current_run_id` once `start_execution_run` commits — without
+    /// waiting for any hook event. This is the contract `bossctl
+    /// agents list` and `boss chore show` rely on so the visibility
+    /// surface stops lagging behind events.sock.
+    #[test]
+    fn get_task_runtime_tracks_execution_then_run_id() {
+        let path = temp_db_path("runtime_single");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Investigate".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Pre-dispatch: nothing in flight, every field is `None`.
+        let pre = db.get_task_runtime(&chore.id).unwrap();
+        assert_eq!(pre.work_item_id, chore.id);
+        assert!(pre.execution_status.is_none());
+        assert!(pre.execution_id.is_none());
+        assert!(pre.current_run_id.is_none());
+
+        // After dispatch acceptance (request_execution via reconcile):
+        // execution_id is populated, run_id is still None because no
+        // work_runs row has been created yet.
+        db.reconcile_product_executions(&product.id).unwrap();
+        let after_ready = db.get_task_runtime(&chore.id).unwrap();
+        assert_eq!(after_ready.execution_status.as_deref(), Some("ready"));
+        assert!(after_ready.execution_id.is_some());
+        assert!(
+            after_ready.current_run_id.is_none(),
+            "ready execution has no work_runs row yet",
+        );
+
+        // After start_execution_run: a work_runs row exists; both
+        // execution_id and current_run_id are populated.
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        let (_, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+        let after_run = db.get_task_runtime(&chore.id).unwrap();
+        assert_eq!(after_run.execution_status.as_deref(), Some("running"));
+        assert_eq!(after_run.execution_id.as_deref(), Some(execution.id.as_str()));
+        assert_eq!(after_run.current_run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(after_run.run_status.as_deref(), Some("active"));
 
         let _ = std::fs::remove_file(path);
     }
