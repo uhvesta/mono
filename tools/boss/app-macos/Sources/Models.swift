@@ -17,6 +17,202 @@ struct WorkProduct: Identifiable, Hashable {
     var status: String
     var createdAt: String
     var updatedAt: String
+    /// Discriminator for the bound external tracker (`"github"`, etc.).
+    /// `nil` when no tracker is bound. Mirrors `Product.external_tracker_kind`.
+    var externalTrackerKind: String? = nil
+    /// Kind-specific tracker config as raw JSON string. `nil` when no
+    /// tracker is bound. Mirrors `Product.external_tracker_config`.
+    var externalTrackerConfig: String? = nil
+}
+
+/// Swift mirror of `boss_protocol::WorkItemExternalRef`. Stable upstream
+/// pointer stored on a work item that is linked to an external tracker issue.
+struct WorkItemExternalRef: Codable, Hashable {
+    /// Tracker discriminator (`"github"`, etc.).
+    var kind: String
+    /// Stable opaque lookup key (`"spinyfin/mono#560"` for GitHub).
+    var canonicalID: String
+    /// Tracker-specific extras as a raw JSON string (engine-opaque).
+    var raw: String
+    /// Canonical browser URL for the upstream issue.
+    var webURL: String
+    /// Unix-seconds string of the last successful upstream→Boss reconcile.
+    var syncedAt: String?
+    /// Unix-seconds string when the binding was cleared. `nil` while active.
+    var unboundAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case canonicalID = "canonical_id"
+        case raw
+        case webURL = "web_url"
+        case syncedAt = "synced_at"
+        case unboundAt = "unbound_at"
+    }
+
+    init(kind: String, canonicalID: String, raw: String, webURL: String,
+         syncedAt: String? = nil, unboundAt: String? = nil) {
+        self.kind = kind
+        self.canonicalID = canonicalID
+        self.raw = raw
+        self.webURL = webURL
+        self.syncedAt = syncedAt
+        self.unboundAt = unboundAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(String.self, forKey: .kind)
+        canonicalID = try container.decode(String.self, forKey: .canonicalID)
+        webURL = try container.decode(String.self, forKey: .webURL)
+        syncedAt = try container.decodeIfPresent(String.self, forKey: .syncedAt)
+        unboundAt = try container.decodeIfPresent(String.self, forKey: .unboundAt)
+        // `raw` is an arbitrary JSON value; decode into Data then re-encode
+        // as a string so callers get a stable type without depending on
+        // AnyCodable or similar.
+        if let rawValue = try? container.decode(AnyDecodable.self, forKey: .raw) {
+            let data = try JSONSerialization.data(withJSONObject: rawValue.value)
+            raw = String(data: data, encoding: .utf8) ?? "{}"
+        } else {
+            raw = "{}"
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(canonicalID, forKey: .canonicalID)
+        try container.encode(webURL, forKey: .webURL)
+        try container.encodeIfPresent(syncedAt, forKey: .syncedAt)
+        try container.encodeIfPresent(unboundAt, forKey: .unboundAt)
+        if let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) {
+            let wrapped = AnyEncodable(obj)
+            try container.encode(wrapped, forKey: .raw)
+        } else {
+            try container.encode([String: String](), forKey: .raw)
+        }
+    }
+}
+
+/// Type-erased helper for decoding arbitrary JSON values in `WorkItemExternalRef.raw`.
+private struct AnyDecodable: Decodable {
+    let value: Any
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.singleValueContainer() {
+            if let v = try? container.decode(Bool.self) { value = v; return }
+            if let v = try? container.decode(Int.self) { value = v; return }
+            if let v = try? container.decode(Double.self) { value = v; return }
+            if let v = try? container.decode(String.self) { value = v; return }
+            if let v = try? container.decode([String: AnyDecodable].self) {
+                value = v.mapValues { $0.value }; return
+            }
+            if let v = try? container.decode([AnyDecodable].self) {
+                value = v.map { $0.value }; return
+            }
+        }
+        value = NSNull()
+    }
+}
+
+private struct AnyEncodable: Encodable {
+    let value: Any
+    init(_ value: Any) { self.value = value }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch value {
+        case let v as Bool: try container.encode(v)
+        case let v as Int: try container.encode(v)
+        case let v as Double: try container.encode(v)
+        case let v as String: try container.encode(v)
+        case let v as [String: Any]:
+            let mapped = v.mapValues { AnyEncodable($0) }
+            try container.encode(mapped)
+        case let v as [Any]:
+            try container.encode(v.map { AnyEncodable($0) })
+        default:
+            try container.encodeNil()
+        }
+    }
+}
+
+/// Swift mirror of `boss_protocol::SetProductExternalTrackerInput`.
+struct SetProductExternalTrackerInput: Codable, Hashable {
+    var productID: String
+    var kind: String?
+    var config: String?
+    var unset: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case productID = "product_id"
+        case kind
+        case config
+        case unset
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(productID, forKey: .productID)
+        try container.encodeIfPresent(kind, forKey: .kind)
+        if let config, let data = config.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) {
+            try container.encode(AnyEncodable(obj), forKey: .config)
+        }
+        try container.encode(unset, forKey: .unset)
+    }
+
+    init(productID: String, kind: String? = nil, config: String? = nil, unset: Bool = false) {
+        self.productID = productID
+        self.kind = kind
+        self.config = config
+        self.unset = unset
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        productID = try container.decode(String.self, forKey: .productID)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind)
+        unset = (try? container.decodeIfPresent(Bool.self, forKey: .unset)) ?? false
+        if let rawValue = try? container.decodeIfPresent(AnyDecodable.self, forKey: .config) {
+            let data = try JSONSerialization.data(withJSONObject: rawValue.value)
+            config = String(data: data, encoding: .utf8)
+        } else {
+            config = nil
+        }
+    }
+}
+
+/// Swift mirror of `boss_protocol::LinkExternalRefInput`.
+struct LinkExternalRefInput: Codable, Hashable, Equatable {
+    var workItemID: String
+    var kind: String
+    var canonicalID: String
+
+    init(workItemID: String, kind: String, canonicalID: String) {
+        self.workItemID = workItemID
+        self.kind = kind
+        self.canonicalID = canonicalID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        workItemID = try c.decode(String.self, forKey: .workItemID)
+        kind = try c.decode(String.self, forKey: .kind)
+        canonicalID = try c.decode(String.self, forKey: .canonicalID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(workItemID, forKey: .workItemID)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(canonicalID, forKey: .canonicalID)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case workItemID = "work_item_id"
+        case kind
+        case canonicalID = "canonical_id"
+    }
 }
 
 struct WorkProject: Identifiable, Hashable {
@@ -296,6 +492,9 @@ struct WorkTask: Identifiable, Hashable {
     /// RFC 3339 timestamp of the most recent successful poll that wrote the
     /// PR state fields above. `nil` until the first probe completes.
     var prStatePolledAt: String? = nil
+    /// Stable upstream pointer to the external tracker issue linked to this
+    /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
+    var externalRef: WorkItemExternalRef? = nil
 
     var isChore: Bool {
         kind == "chore"

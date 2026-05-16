@@ -4919,6 +4919,7 @@ mod tests {
             review_required_detail: None,
             pr_state_polled_at: None,
             short_id: None,
+            external_ref: None,
         }
     }
 
@@ -4948,6 +4949,8 @@ mod tests {
             updated_at: String::new(),
             default_model: None,
             dispatch_preamble: None,
+            external_tracker_kind: None,
+            external_tracker_config: None,
         };
         assert!(expect_leaf_work_item(WorkItem::Product(product)).is_err());
 
@@ -4986,6 +4989,8 @@ mod tests {
             updated_at: String::new(),
             default_model: None,
             dispatch_preamble: None,
+            external_tracker_kind: None,
+            external_tracker_config: None,
         }
     }
 
@@ -5973,6 +5978,8 @@ mod tests {
             updated_at: String::new(),
             default_model: None,
             dispatch_preamble: None,
+            external_tracker_kind: None,
+            external_tracker_config: None,
         }
     }
 

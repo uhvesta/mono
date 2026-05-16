@@ -5,10 +5,11 @@ use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
     AddDependencyInput, ConflictResolution, CreateAttentionItemInput, CreateChoreInput,
     CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyFilter, ListDependenciesInput,
-    Product, Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyFilter, LinkExternalRefInput,
+    ListDependenciesInput, Product, Project, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
+    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -569,6 +570,43 @@ pub enum FrontendRequest {
     GetTaskRuntime {
         work_item_id: String,
     },
+    /// Bind (or unbind) an external tracker on a product. When `unset`
+    /// is `true`, both `external_tracker_kind` and
+    /// `external_tracker_config` are cleared. Otherwise both `kind` and
+    /// `config` must be present; the engine passes `config` through the
+    /// tracker impl's `validate_config` before persisting. Replies with
+    /// [`FrontendEvent::WorkItemUpdated`] carrying the updated product
+    /// row, or [`FrontendEvent::WorkError`] on validation failure.
+    SetProductExternalTracker {
+        #[serde(flatten)]
+        input: SetProductExternalTrackerInput,
+    },
+    /// Trigger an immediate reconcile pass for a single product's external
+    /// tracker binding. Runs the same per-product logic as the periodic
+    /// loop but synchronously in response to an explicit request. Useful
+    /// for `boss product sync-external-tracker <selector>`. Replies with
+    /// [`FrontendEvent::ExternalTrackerSyncStarted`] when the pass starts,
+    /// or [`FrontendEvent::WorkError`] if the product has no binding.
+    SyncProductExternalTracker {
+        product_id: String,
+    },
+    /// Manually link a work item to a specific upstream tracker issue.
+    /// The engine stores `kind`/`canonical_id` on the row; `raw` and
+    /// `web_url` are populated on the next reconcile tick via
+    /// `fetch_item`. Replies with [`FrontendEvent::WorkItemUpdated`]
+    /// carrying the updated row, or [`FrontendEvent::WorkError`] if the
+    /// work item or tracker kind is not found.
+    LinkWorkItemExternalRef {
+        #[serde(flatten)]
+        input: LinkExternalRefInput,
+    },
+    /// Remove the external-tracker binding from a work item. Clears the
+    /// `external_ref_*` columns without touching other fields. Replies with
+    /// [`FrontendEvent::WorkItemUpdated`] carrying the updated row, or
+    /// [`FrontendEvent::WorkError`] if the work item is not found.
+    UnlinkWorkItemExternalRef {
+        work_item_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1077,6 +1115,12 @@ pub enum FrontendEvent {
     /// has not yet started the poller (race at startup — treat as a
     /// no-op).
     PrReconcilersKicked { kicked: bool },
+    /// Response to [`FrontendRequest::SyncProductExternalTracker`].
+    /// Emitted when the engine begins the on-demand reconcile pass
+    /// for the named product. The pass runs synchronously; this event
+    /// is the "pass started" confirmation rather than a streaming
+    /// progress push.
+    ExternalTrackerSyncStarted { product_id: String },
 }
 
 /// Snapshot of one feature flag's static metadata + current value.

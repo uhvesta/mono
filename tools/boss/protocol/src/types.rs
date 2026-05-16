@@ -26,6 +26,19 @@ pub struct Product {
     /// see on every spawn rather than only when they read AGENTS.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_preamble: Option<String>,
+    /// Discriminator for the external tracker bound to this product.
+    /// `None` means no tracker is bound and the reconciler skips this
+    /// product. When set (e.g. `"github"`), `external_tracker_config`
+    /// carries the kind-specific JSON config. See the external-tracker
+    /// sync design (`external-issue-tracker-sync-github-projects.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_tracker_kind: Option<String>,
+    /// Kind-specific config blob for the bound external tracker.
+    /// JSON shape is validated by the tracker impl's `validate_config`
+    /// at write time; the protocol type carries it opaquely so new
+    /// tracker kinds can ship without a protocol version bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_tracker_config: Option<serde_json::Value>,
 }
 
 /// Allowed values for `tasks.effort_level`. Per design §"Naming" /
@@ -134,6 +147,36 @@ pub struct Project {
     /// `None` the other two are ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_doc_path: Option<String>,
+}
+
+/// Stable upstream pointer stored on a work item that has been linked to
+/// an external tracker issue. All three `kind`/`canonical_id`/`raw` fields
+/// mirror the corresponding `tasks.external_ref_*` columns; `web_url` is
+/// the canonical browser URL for the upstream issue (derived by the engine
+/// at read time, not stored). See the external-tracker sync design.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkItemExternalRef {
+    /// Tracker discriminator (`"github"`, eventually `"jira"`, etc.).
+    pub kind: String,
+    /// Stable opaque id used as the reconciler's lookup key.
+    /// For GitHub: `"spinyfin/mono#560"`.
+    pub canonical_id: String,
+    /// Tracker-specific extras opaque to the engine. For GitHub: the
+    /// `project_item_id` needed for status-field reads/writes.
+    pub raw: serde_json::Value,
+    /// Canonical browser URL for the upstream issue. Derived at read
+    /// time by the engine; not stored in the DB.
+    pub web_url: String,
+    /// Unix-seconds string of the last successful upstream→Boss
+    /// reconcile. `None` until the first reconcile completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_at: Option<String>,
+    /// Unix-seconds string when the binding was cleared because the
+    /// upstream item disappeared from the product's configured scope.
+    /// `None` while the binding is active. Retained so the reconciler
+    /// can re-bind automatically if the item reappears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbound_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +316,12 @@ pub struct Task {
     /// probe completes. The UI uses this to render "last checked: N ago".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_state_polled_at: Option<String>,
+    /// Stable pointer to the upstream tracker issue linked to this work item.
+    /// `None` when no external tracker binding exists. Populated by the
+    /// reconciler on import or manual link; cleared (with `unbound_at` set)
+    /// when the upstream item leaves the product's configured scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<WorkItemExternalRef>,
 }
 
 fn default_true() -> bool {
@@ -311,6 +360,7 @@ pub const CREATED_VIA_CLI: &str = "cli";
 pub const CREATED_VIA_BOSSCTL: &str = "bossctl";
 pub const CREATED_VIA_MAC_APP: &str = "mac_app";
 pub const CREATED_VIA_ENGINE_AUTO: &str = "engine_auto";
+pub const CREATED_VIA_EXTERNAL_TRACKER_SYNC: &str = "external_tracker_sync";
 pub const CREATED_VIA_UNKNOWN: &str = "unknown";
 
 /// Documented `created_via` values. The engine canonicalises caller-
@@ -321,6 +371,7 @@ pub const KNOWN_CREATED_VIA: &[&str] = &[
     CREATED_VIA_BOSSCTL,
     CREATED_VIA_MAC_APP,
     CREATED_VIA_ENGINE_AUTO,
+    CREATED_VIA_EXTERNAL_TRACKER_SYNC,
     CREATED_VIA_UNKNOWN,
 ];
 
@@ -1238,6 +1289,44 @@ pub struct ResolveProjectDesignDocOutput {
     pub state: ProjectDesignDocState,
 }
 
+/// Input to `SetProductExternalTracker`: bind (or unbind) an external
+/// tracker on a product. When `unset` is `true`, the engine clears both
+/// `external_tracker_kind` and `external_tracker_config` regardless of the
+/// other fields. When `unset` is `false`, both `kind` and `config` must be
+/// `Some`; the engine passes `config` through the tracker's
+/// `validate_config` before persisting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SetProductExternalTrackerInput {
+    pub product_id: String,
+    /// Tracker discriminator (`"github"`, etc.). `None` only when
+    /// `unset = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Kind-specific JSON config. `None` only when `unset = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+    /// When `true`, clear the tracker binding. All other fields are
+    /// ignored.
+    #[serde(default)]
+    pub unset: bool,
+}
+
+/// Input to `LinkWorkItemExternalRef`: manually bind a work item to a
+/// specific upstream issue. The engine stores `kind`/`canonical_id` in
+/// the `tasks.external_ref_*` columns so the reconciler can start
+/// mirroring state for the row on its next tick. The `raw` blob and
+/// `web_url` are populated by the engine from the tracker's
+/// `fetch_item` response; the caller does not supply them here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkExternalRefInput {
+    pub work_item_id: String,
+    /// Tracker discriminator matching `products.external_tracker_kind`
+    /// for the work item's product.
+    pub kind: String,
+    /// Stable tracker-specific id (`"spinyfin/mono#560"` for GitHub).
+    pub canonical_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1773,9 +1862,8 @@ mod tests {
         assert_eq!(task.model_override, task2.model_override);
     }
 
-    #[test]
-    fn product_decodes_without_default_model() {
-        let raw = json!({
+    fn sample_product_json(extra: Value) -> Value {
+        let mut base = json!({
             "id": "prod_1",
             "name": "Boss",
             "slug": "boss",
@@ -1785,27 +1873,62 @@ mod tests {
             "created_at": "1747000000",
             "updated_at": "1747000000",
         });
+        if let (Value::Object(target), Value::Object(extra)) = (&mut base, extra) {
+            for (k, v) in extra {
+                target.insert(k, v);
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn product_decodes_without_default_model() {
+        let raw = sample_product_json(json!({}));
         let product: Product = serde_json::from_value(raw).unwrap();
         assert!(product.default_model.is_none());
     }
 
     #[test]
     fn product_roundtrips_with_default_model() {
-        let raw = json!({
-            "id": "prod_1",
-            "name": "Boss",
-            "slug": "boss",
-            "description": "",
-            "repo_remote_url": Value::Null,
-            "status": "active",
-            "created_at": "1747000000",
-            "updated_at": "1747000000",
-            "default_model": "sonnet",
-        });
+        let raw = sample_product_json(json!({"default_model": "sonnet"}));
         let product: Product = serde_json::from_value(raw).unwrap();
         assert_eq!(product.default_model.as_deref(), Some("sonnet"));
         let encoded = serde_json::to_value(&product).unwrap();
         assert_eq!(encoded["default_model"], Value::String("sonnet".into()));
+    }
+
+    #[test]
+    fn product_decodes_without_external_tracker_fields() {
+        let raw = sample_product_json(json!({}));
+        let product: Product = serde_json::from_value(raw).unwrap();
+        assert!(product.external_tracker_kind.is_none());
+        assert!(product.external_tracker_config.is_none());
+    }
+
+    #[test]
+    fn product_skips_none_external_tracker_fields_on_encode() {
+        let product: Product = serde_json::from_value(sample_product_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&product).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("external_tracker_kind"));
+        assert!(!obj.contains_key("external_tracker_config"));
+    }
+
+    #[test]
+    fn product_roundtrips_with_external_tracker_fields() {
+        let config = json!({"org": "spinyfin", "repo": "mono", "project_number": 1});
+        let raw = sample_product_json(json!({
+            "external_tracker_kind": "github",
+            "external_tracker_config": config.clone(),
+        }));
+        let product: Product = serde_json::from_value(raw).unwrap();
+        assert_eq!(product.external_tracker_kind.as_deref(), Some("github"));
+        assert_eq!(product.external_tracker_config.as_ref().unwrap()["org"], "spinyfin");
+
+        let reencoded = serde_json::to_value(&product).unwrap();
+        let product2: Product = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(product.external_tracker_kind, product2.external_tracker_kind);
+        assert_eq!(product.external_tracker_config, product2.external_tracker_config);
     }
 
     #[test]
@@ -1918,6 +2041,107 @@ mod tests {
         let raw = serde_json::to_value(&attempt).unwrap();
         let back: CiRemediation = serde_json::from_value(raw).unwrap();
         assert_eq!(attempt, back);
+    }
+
+    #[test]
+    fn task_decodes_without_external_ref() {
+        let raw = sample_task_json(json!({}));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert!(task.external_ref.is_none());
+    }
+
+    #[test]
+    fn task_skips_none_external_ref_on_encode() {
+        let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(!encoded.as_object().unwrap().contains_key("external_ref"));
+    }
+
+    #[test]
+    fn task_roundtrips_with_external_ref() {
+        let raw = sample_task_json(json!({
+            "external_ref": {
+                "kind": "github",
+                "canonical_id": "spinyfin/mono#560",
+                "raw": {"issue_number": 560, "project_item_id": "PVTI_abc"},
+                "web_url": "https://github.com/spinyfin/mono/issues/560",
+                "synced_at": "1747000100",
+            },
+        }));
+        let task: Task = serde_json::from_value(raw).unwrap();
+        let ext = task.external_ref.as_ref().unwrap();
+        assert_eq!(ext.kind, "github");
+        assert_eq!(ext.canonical_id, "spinyfin/mono#560");
+        assert_eq!(ext.web_url, "https://github.com/spinyfin/mono/issues/560");
+        assert_eq!(ext.synced_at.as_deref(), Some("1747000100"));
+        assert!(ext.unbound_at.is_none());
+
+        let reencoded = serde_json::to_value(&task).unwrap();
+        let task2: Task = serde_json::from_value(reencoded).unwrap();
+        assert_eq!(task.external_ref, task2.external_ref);
+    }
+
+    #[test]
+    fn work_item_external_ref_skips_optional_fields_on_encode() {
+        let ext = WorkItemExternalRef {
+            kind: "github".into(),
+            canonical_id: "spinyfin/mono#560".into(),
+            raw: json!({"issue_number": 560}),
+            web_url: "https://github.com/spinyfin/mono/issues/560".into(),
+            synced_at: None,
+            unbound_at: None,
+        };
+        let encoded = serde_json::to_value(&ext).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("synced_at"));
+        assert!(!obj.contains_key("unbound_at"));
+        let back: WorkItemExternalRef = serde_json::from_value(encoded).unwrap();
+        assert_eq!(ext, back);
+    }
+
+    #[test]
+    fn set_product_external_tracker_input_roundtrips() {
+        let input = SetProductExternalTrackerInput {
+            product_id: "prod_1".into(),
+            kind: Some("github".into()),
+            config: Some(json!({"org": "spinyfin", "repo": "mono", "project_number": 1})),
+            unset: false,
+        };
+        let raw = serde_json::to_value(&input).unwrap();
+        let back: SetProductExternalTrackerInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(back.product_id, "prod_1");
+        assert_eq!(back.kind.as_deref(), Some("github"));
+        assert!(!back.unset);
+    }
+
+    #[test]
+    fn set_product_external_tracker_input_unset_skips_kind_and_config() {
+        let input = SetProductExternalTrackerInput {
+            product_id: "prod_1".into(),
+            kind: None,
+            config: None,
+            unset: true,
+        };
+        let encoded = serde_json::to_value(&input).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("kind"));
+        assert!(!obj.contains_key("config"));
+        assert_eq!(obj["unset"], Value::Bool(true));
+    }
+
+    #[test]
+    fn link_external_ref_input_roundtrips() {
+        let input = LinkExternalRefInput {
+            work_item_id: "task_1".into(),
+            kind: "github".into(),
+            canonical_id: "spinyfin/mono#560".into(),
+        };
+        let raw = serde_json::to_value(&input).unwrap();
+        assert_eq!(raw["work_item_id"], Value::String("task_1".into()));
+        assert_eq!(raw["kind"], Value::String("github".into()));
+        assert_eq!(raw["canonical_id"], Value::String("spinyfin/mono#560".into()));
+        let back: LinkExternalRefInput = serde_json::from_value(raw).unwrap();
+        assert_eq!(back, input);
     }
 
     #[test]

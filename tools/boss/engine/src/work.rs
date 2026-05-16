@@ -4884,6 +4884,10 @@ fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         updated_at: row.get(7)?,
         default_model: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
         dispatch_preamble: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
+        // T1 schema columns; populated by T8 WorkDb methods when the migration
+        // has run. Until then the protocol fields carry None.
+        external_tracker_kind: None,
+        external_tracker_config: None,
     })
 }
 
@@ -4963,6 +4967,9 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         ci_required_detail: row.get::<_, Option<String>>(26)?.filter(|s| !s.is_empty()),
         review_required_detail: row.get::<_, Option<String>>(27)?.filter(|s| !s.is_empty()),
         pr_state_polled_at: row.get::<_, Option<String>>(28)?.filter(|s| !s.is_empty()),
+        // T1 schema columns; populated by T8 WorkDb methods when the migration
+        // has run. Until then the protocol field carries None.
+        external_ref: None,
     })
 }
 

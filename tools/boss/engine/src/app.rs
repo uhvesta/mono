@@ -5599,6 +5599,54 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            FrontendRequest::SetProductExternalTracker { input } => {
+                // T3+ (ExternalTracker trait + reconciler) will implement
+                // persistence; this stub keeps the protocol enum exhaustive.
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!(
+                            "SetProductExternalTracker not yet implemented (product_id={})",
+                            input.product_id
+                        ),
+                    },
+                );
+            }
+            FrontendRequest::SyncProductExternalTracker { product_id } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!(
+                            "SyncProductExternalTracker not yet implemented (product_id={product_id})"
+                        ),
+                    },
+                );
+            }
+            FrontendRequest::LinkWorkItemExternalRef { input } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!(
+                            "LinkWorkItemExternalRef not yet implemented (work_item_id={})",
+                            input.work_item_id
+                        ),
+                    },
+                );
+            }
+            FrontendRequest::UnlinkWorkItemExternalRef { work_item_id } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!(
+                            "UnlinkWorkItemExternalRef not yet implemented (work_item_id={work_item_id})"
+                        ),
+                    },
+                );
+            }
         }
     }
 

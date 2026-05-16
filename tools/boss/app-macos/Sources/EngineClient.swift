@@ -962,6 +962,12 @@ final class EngineClient: @unchecked Sendable {
             return nil
         }
 
+        var externalTrackerConfigString: String? = nil
+        if let configObj = payload["external_tracker_config"],
+           !(configObj is NSNull),
+           let data = try? JSONSerialization.data(withJSONObject: configObj) {
+            externalTrackerConfigString = String(data: data, encoding: .utf8)
+        }
         return WorkProduct(
             id: id,
             name: name,
@@ -970,7 +976,9 @@ final class EngineClient: @unchecked Sendable {
             repoRemoteURL: payload["repo_remote_url"] as? String,
             status: status,
             createdAt: createdAt,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            externalTrackerKind: payload["external_tracker_kind"] as? String,
+            externalTrackerConfig: externalTrackerConfigString
         )
     }
 
@@ -1052,7 +1060,30 @@ final class EngineClient: @unchecked Sendable {
             ciRequiredDetail: payload["ci_required_detail"] as? String,
             reviewRequiredState: payload["review_required_state"] as? String,
             reviewRequiredDetail: payload["review_required_detail"] as? String,
-            prStatePolledAt: payload["pr_state_polled_at"] as? String
+            prStatePolledAt: payload["pr_state_polled_at"] as? String,
+            externalRef: parseExternalRef(payload["external_ref"])
+        )
+    }
+
+    private func parseExternalRef(_ value: Any?) -> WorkItemExternalRef? {
+        guard let dict = value as? [String: Any],
+              let kind = dict["kind"] as? String,
+              let canonicalID = dict["canonical_id"] as? String,
+              let webURL = dict["web_url"] as? String
+        else { return nil }
+        var rawString = "{}"
+        if let rawObj = dict["raw"],
+           !(rawObj is NSNull),
+           let data = try? JSONSerialization.data(withJSONObject: rawObj) {
+            rawString = String(data: data, encoding: .utf8) ?? "{}"
+        }
+        return WorkItemExternalRef(
+            kind: kind,
+            canonicalID: canonicalID,
+            raw: rawString,
+            webURL: webURL,
+            syncedAt: dict["synced_at"] as? String,
+            unboundAt: dict["unbound_at"] as? String
         )
     }
 

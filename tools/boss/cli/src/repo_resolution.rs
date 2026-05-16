@@ -483,6 +483,7 @@ mod tests {
             review_required_detail: None,
             pr_state_polled_at: None,
             short_id: None,
+            external_ref: None,
         }
     }
 

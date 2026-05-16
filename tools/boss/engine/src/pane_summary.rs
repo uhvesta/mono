@@ -444,6 +444,7 @@ mod tests {
             review_required_state: None,
             review_required_detail: None,
             pr_state_polled_at: None,
+            external_ref: None,
         })
     }
 
