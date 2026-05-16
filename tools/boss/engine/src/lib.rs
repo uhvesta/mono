@@ -16,6 +16,7 @@ pub mod dispatch_events;
 pub mod dispatch_reader;
 pub mod effort;
 pub mod events_socket;
+pub mod external_tracker;
 pub mod feature_flags;
 pub mod ipc_log;
 pub mod live_status;
