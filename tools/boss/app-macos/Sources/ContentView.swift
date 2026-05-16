@@ -867,14 +867,14 @@ private struct WorkSidebarFilterRow: View {
                             .layoutPriority(2)
                             .opacity(dimmed ? 0.65 : 1.0)
                     }
-                    if let unblockedCount {
-                        ProjectTaskCountChip(count: unblockedCount, kind: .unblocked)
+                    if let blockedCount {
+                        ProjectTaskCountChip(count: blockedCount, kind: .blocked)
                             .fixedSize(horizontal: true, vertical: false)
                             .layoutPriority(2)
                             .opacity(dimmed ? 0.65 : 1.0)
                     }
-                    if let blockedCount {
-                        ProjectTaskCountChip(count: blockedCount, kind: .blocked)
+                    if let unblockedCount {
+                        ProjectTaskCountChip(count: unblockedCount, kind: .unblocked)
                             .fixedSize(horizontal: true, vertical: false)
                             .layoutPriority(2)
                             .opacity(dimmed ? 0.65 : 1.0)
