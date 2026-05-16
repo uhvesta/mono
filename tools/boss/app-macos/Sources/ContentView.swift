@@ -48,6 +48,10 @@ struct ContentView: View {
                 .opacity(model.navigationMode == .agents ? 1 : 0)
                 .allowsHitTesting(model.navigationMode == .agents)
 
+            ActivityLogView()
+                .opacity(model.navigationMode == .activity ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .activity)
+
             if model.navigationMode == .designs {
                 DesignsView(chat: model)
             }
@@ -121,7 +125,7 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 200)
+                .frame(width: 270)
             }
 
             ToolbarItem {
