@@ -17,6 +17,15 @@ swift_library(
         # Mirror the swiftSettings define in Package.swift so @inlinable
         # Textual APIs (e.g. .textual.textSelection) expand correctly here.
         "-DTEXTUAL_ENABLE_TEXT_SELECTION",
+        # Match Package.swift's `swift-tools-version: 6.2`. Without this,
+        # bazel compiles under the rules_swift default (Swift 5 mode) and
+        # silently skips the strict-concurrency diagnostics that
+        # `swift run` would fire. CI then passes on changes that break
+        # the dev workflow — see #601 (LogViewer.swift global formatter)
+        # for a recent example.
+        "-swift-version",
+        "6",
+        "-strict-concurrency=complete",
     ],
     deps = [
         "@ghostty_kit//:GhosttyKit",
