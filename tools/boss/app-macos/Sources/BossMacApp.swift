@@ -22,8 +22,6 @@ struct BossMacApp: App {
                 LogViewerCommand()
             }
             CommandMenu("Debug") {
-                DispatchEventsCommand()
-                EngineCommand()
                 MetricsCommand()
                 Divider()
                 BossSessionInvocationCommand()
@@ -74,17 +72,6 @@ struct BossMacApp: App {
         }
         .defaultSize(width: 1100, height: 640)
 
-        Window("Dispatch Events", id: "dispatch-events") {
-            DispatchEventsViewer()
-        }
-        .defaultSize(width: 1040, height: 620)
-
-        Window("Engine", id: "engine") {
-            EngineView()
-        }
-        .environmentObject(chatModel)
-        .defaultSize(width: 1040, height: 620)
-
         Window("Metrics", id: "metrics") {
             MetricsViewer()
         }
@@ -109,44 +96,6 @@ private struct LogViewerCommand: View {
             }
         }
         .keyboardShortcut("l", modifiers: [.command, .shift])
-    }
-}
-
-private struct DispatchEventsCommand: View {
-    @Environment(\.openWindow) private var openWindow
-    @Environment(\.dismissWindow) private var dismissWindow
-    @AppStorage("boss.dispatchEventsViewer.visible") private var isOpen = false
-
-    var body: some View {
-        Button("Dispatch Events") {
-            if isOpen {
-                isOpen = false
-                dismissWindow(id: "dispatch-events")
-            } else {
-                isOpen = true
-                openWindow(id: "dispatch-events")
-            }
-        }
-        .keyboardShortcut("d", modifiers: [.command, .shift])
-    }
-}
-
-private struct EngineCommand: View {
-    @Environment(\.openWindow) private var openWindow
-    @Environment(\.dismissWindow) private var dismissWindow
-    @AppStorage("boss.engineViewer.visible") private var isOpen = false
-
-    var body: some View {
-        Button("Engine") {
-            if isOpen {
-                isOpen = false
-                dismissWindow(id: "engine")
-            } else {
-                isOpen = true
-                openWindow(id: "engine")
-            }
-        }
-        .keyboardShortcut("e", modifiers: [.command, .shift])
     }
 }
 
