@@ -975,18 +975,18 @@ final class ChatViewModel: ObservableObject {
     /// - `.broken` — surface the engine's reason as a work error so
     ///   the user can re-point. The re-point sheet is tracked
     ///   separately (design Q5).
-    /// - `.resolved` — dispatch depends on branch:
-    ///   - `branch == "main"` (merged doc): same/other-product pointers
-    ///     with a leased workspace render via [[designRendererOpener]]
-    ///     when wired, otherwise hand the `file://` URL to [[urlOpener]].
-    ///     The workspace is guaranteed to be on `main` for merged docs so
-    ///     the on-disk path is authoritative.
-    ///   - non-main branch (in-review doc): the leased workspace is
-    ///     commonly on a different task's branch so the on-disk path
-    ///     would not match. Instead, if `rawContentURL` is present the
-    ///     dispatcher fetches the markdown via [[rawContentFetcher]] and
-    ///     opens it in [[markdownViewerOpener]]. Otherwise falls through
-    ///     to [[urlOpener]] with the web URL.
+    /// - `.resolved` — dispatch priority:
+    ///   1. `rawContentURL` present: fetch from GitHub via [[rawContentFetcher]]
+    ///      and open in the async markdown viewer. This is correct for both
+    ///      merged (main) and in-review (PR branch) docs — the GitHub ref in
+    ///      the URL is the authoritative source regardless of cube workspace
+    ///      state. A leased workspace may be on a different task's branch even
+    ///      when `resolved.branch == "main"`, so reading from disk is not safe.
+    ///   2. `rawContentURL` absent (non-GitHub repo or older engine) AND a
+    ///      workspace is leased for the resolved repo AND branch is `main`:
+    ///      render via [[designRendererOpener]] (in-app renderer) when wired,
+    ///      otherwise hand the `file://` URL to [[urlOpener]].
+    ///   3. Fall through to [[urlOpener]] with the web URL.
     func openProjectDesignDoc(_ project: WorkProject) {
         let state = designDocStateByProjectID[project.id] ?? .notSet
         switch state {
@@ -995,28 +995,9 @@ final class ChatViewModel: ObservableObject {
         case .broken(let reason):
             workErrorMessage = "Design doc pointer is broken: \(reason)"
         case .resolved(let resolved, let workspacePath, let webURL, let rawContentURL):
-            // Only take the workspace fast-path for merged (main-branch) docs.
-            // In-review designs live on a PR branch; the leased workspace is
-            // likely on a different task's branch, so the local path would not
-            // contain the file. Prefer rawContentURL for those cases.
-            if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind),
-               resolved.branch == "main" {
-                if let opener = designRendererOpener,
-                   let content = DesignRendererContent.from(
-                       projectID: project.id,
-                       projectName: project.name,
-                       resolved: resolved,
-                       workspacePath: workspacePath,
-                       webURL: webURL
-                   ) {
-                    opener(content)
-                    return
-                }
-                let absolute = (workspacePath as NSString)
-                    .appendingPathComponent(resolved.path)
-                urlOpener(URL(fileURLWithPath: absolute))
-                return
-            }
+            // Prefer fetching via rawContentURL (GitHub API). This is correct
+            // regardless of cube workspace state — the workspace may be on a
+            // different branch even when resolved.branch == "main".
             if let rawContentURL, let rawURL = URL(string: rawContentURL) {
                 let projectName = project.name
                 if let opener = asyncMarkdownViewerOpener {
@@ -1042,6 +1023,28 @@ final class ChatViewModel: ObservableObject {
                         )
                     }
                 }
+                return
+            }
+            // rawContentURL absent (non-GitHub repo or older engine): fall back
+            // to the workspace fast-path for merged docs when a workspace is
+            // available. Only safe for branch == "main" designs where we can
+            // reasonably assume the workspace holds the merged file.
+            if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind),
+               resolved.branch == "main" {
+                if let opener = designRendererOpener,
+                   let content = DesignRendererContent.from(
+                       projectID: project.id,
+                       projectName: project.name,
+                       resolved: resolved,
+                       workspacePath: workspacePath,
+                       webURL: webURL
+                   ) {
+                    opener(content)
+                    return
+                }
+                let absolute = (workspacePath as NSString)
+                    .appendingPathComponent(resolved.path)
+                urlOpener(URL(fileURLWithPath: absolute))
                 return
             }
             guard let url = URL(string: webURL) else {

@@ -97,14 +97,14 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         XCTAssertNil(model.workErrorMessage)
     }
 
-    /// `.resolved` with a same-product kind and a leased cube workspace
-    /// hands the open dispatcher a `file://` URL that points at the
-    /// resolved doc inside that workspace, **not** the GitHub web URL.
-    /// This is the "open in `$EDITOR` / OS-registered .md handler"
-    /// fast path from design Q3 (the table row `SameProduct + workspace
-    /// available`). The stub captures the URL so the test asserts (a)
-    /// the dispatcher chose the local file branch and (b) the path
-    /// composition is `workspacePath/resolved.path`.
+    /// `.resolved` with a same-product kind, a leased workspace, and
+    /// **no `rawContentURL`** (non-GitHub repo or older engine) hands
+    /// the open dispatcher a `file://` URL pointing at the resolved doc
+    /// inside that workspace. This is the workspace fast-path fallback
+    /// from design Q3 (`SameProduct + workspace available`), exercised
+    /// only when GitHub raw-content is not available. When `rawContentURL`
+    /// IS set the dispatcher prefers GitHub; see
+    /// [[testOpenOnResolvedMainBranchWithRawContentURLPrefersGitHub]].
     func testOpenOnResolvedSameProductWithWorkspaceOpensLocalFile() {
         let model = makeModelWithProject()
         let project = model.projectsByProductID.values.first!.first!
@@ -133,15 +133,13 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         )
     }
 
-    /// SameProduct + leased workspace with a `designRendererOpener`
-    /// wired (the production wiring `ContentView` installs) routes
-    /// the click to the in-app renderer window — chore #12 of
-    /// `project-design-doc-pointer.md`. The legacy `urlOpener` path
-    /// is bypassed so the OS-registered `.md` handler doesn't also
-    /// fire. The stub captures the payload so the test asserts (a)
-    /// the renderer was chosen, (b) the file path is composed from
-    /// `workspacePath + resolved.path`, and (c) the web URL is
-    /// threaded through for the "Open on GitHub" affordance.
+    /// SameProduct + leased workspace + `designRendererOpener` wired
+    /// (the production wiring `ContentView` installs) routes the click
+    /// to the in-app renderer window — chore #12 of
+    /// `project-design-doc-pointer.md`. Exercises the workspace fallback
+    /// path when `rawContentURL` is **nil** (non-GitHub repo or older
+    /// engine). When `rawContentURL` is present the dispatcher prefers
+    /// GitHub; see [[testOpenOnResolvedMainBranchWithRawContentURLPrefersGitHub]].
     func testOpenOnResolvedSameProductWithRendererOpensInRendererWindow() {
         let model = makeModelWithProject()
         let project = model.projectsByProductID.values.first!.first!
@@ -384,6 +382,66 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
             XCTAssertEqual(markdown, "# Design Doc")
         } else {
             XCTFail("expected .loaded state after fetch; got \(model.asyncMarkdownViewerVM.state)")
+        }
+        XCTAssertNil(model.workErrorMessage)
+    }
+
+    /// Regression test for P491: a merged (main-branch) design whose
+    /// `rawContentURL` is set must be fetched from GitHub even when a
+    /// cube workspace path is available for the repo. The workspace may
+    /// be leased to a different task on a different branch, so the
+    /// on-disk file can be absent or stale. `rawContentURL` is preferred
+    /// in all cases, not just for in-review (non-main) branches.
+    func testOpenOnResolvedMainBranchWithRawContentURLPrefersGitHub() async {
+        let model = makeModelWithProject()
+        let project = model.projectsByProductID.values.first!.first!
+
+        // Capture any local-file opens — must stay empty.
+        var openedLocalFiles: [URL] = []
+        model.urlOpener = { url in
+            if url.isFileURL { openedLocalFiles.append(url) }
+        }
+
+        // Wire the async viewer so we can observe the open call.
+        var asyncWindowOpens = 0
+        model.asyncMarkdownViewerOpener = { asyncWindowOpens += 1 }
+
+        let fetchExpectation = XCTestExpectation(description: "rawContentFetcher called")
+        model.rawContentFetcher = { _ in
+            fetchExpectation.fulfill()
+            return "# Merged design"
+        }
+
+        // main branch + rawContentURL + workspacePath — the P491 shape.
+        let rawURL = "https://raw.githubusercontent.com/foo/bar/main/tools/boss/docs/designs/x.md"
+        model.designDocStateByProjectID[project.id] = .resolved(
+            resolved: ResolvedDesignDoc(
+                repoRemoteURL: "git@github.com:foo/bar.git",
+                branch: "main",
+                path: "tools/boss/docs/designs/x.md",
+                kind: .sameProduct(productID: project.productID)
+            ),
+            workspacePath: "/Users/me/Documents/dev/workspaces/mono-agent-007",
+            webURL: "https://github.com/foo/bar/blob/main/tools/boss/docs/designs/x.md",
+            rawContentURL: rawURL
+        )
+        model.openProjectDesignDoc(project)
+
+        // Window must open immediately.
+        XCTAssertEqual(asyncWindowOpens, 1, "async-markdown-viewer window must open immediately")
+        if case .loading = model.asyncMarkdownViewerVM.state { } else {
+            XCTFail("expected .loading immediately after click; got \(model.asyncMarkdownViewerVM.state)")
+        }
+
+        await fulfillment(of: [fetchExpectation], timeout: 1.0)
+        XCTAssertTrue(
+            openedLocalFiles.isEmpty,
+            "dispatcher must not open a local file when rawContentURL is present; got: \(openedLocalFiles)"
+        )
+        if case .loaded(let title, _) = model.asyncMarkdownViewerVM.state {
+            XCTAssertEqual(title, project.name)
+        } else {
+            XCTFail("expected .loaded after fetch; got \(model.asyncMarkdownViewerVM.state)")
         }
         XCTAssertNil(model.workErrorMessage)
     }

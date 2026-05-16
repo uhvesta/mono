@@ -7779,6 +7779,17 @@ fn validate_design_doc_path(path: &str) -> Result<String> {
     if trimmed.split('/').any(|seg| seg == "..") {
         bail!("design_doc_path may not contain `..` segments: {trimmed}");
     }
+    // Cube workspace paths are ephemeral machine-local locations that
+    // become invalid once the workspace is re-leased to a different task.
+    // They must never be persisted as a design-doc pointer; GitHub is the
+    // durable store. Reject any path that looks like a workspace-relative
+    // path escaped into the repo-relative field.
+    if trimmed.contains("cube/workspaces/") {
+        bail!(
+            "design_doc_path must not reference a cube workspace path \
+             (contains 'cube/workspaces/'): {trimmed}"
+        );
+    }
     if !(trimmed.ends_with(".md") || trimmed.ends_with(".markdown")) {
         bail!("design_doc_path must reference a markdown file (.md or .markdown): {trimmed}");
     }
@@ -15147,6 +15158,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("`..`"), "got: {err}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn set_project_design_doc_rejects_cube_workspace_path() {
+        // A workspace-relative path like
+        // `cube/workspaces/<id>/tools/boss/docs/designs/foo.md` starts
+        // without `/` so the absolute-path guard misses it. The explicit
+        // `cube/workspaces/` check catches it.
+        let path = temp_db_path("design-doc-cube-ws-path");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_product, project) = seed_project_for_design_doc(&db);
+
+        let err = db
+            .set_project_design_doc(set_design_doc_input(
+                &project.id,
+                "cube/workspaces/mono-agent-001/tools/boss/docs/designs/foo.md",
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cube/workspaces/"),
+            "expected cube/workspaces guard error, got: {err}"
+        );
 
         let _ = std::fs::remove_file(path);
     }
