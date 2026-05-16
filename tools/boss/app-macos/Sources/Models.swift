@@ -1416,3 +1416,47 @@ struct EngineMetric: Identifiable, Hashable {
     /// engine binary has no matching handle.
     let stale: Bool
 }
+
+/// Presentation model for the kanban card's upstream-link affordance.
+/// Derived from `WorkTask.externalRef`; `nil` when no external ref is present.
+///
+/// Three states map to three visual treatments:
+/// - `externalRef == nil` → `forTask` returns `nil` (no affordance)
+/// - `externalRef.unboundAt == nil` → bound; label in accent color, opens URL
+/// - `externalRef.unboundAt != nil` → stale; label dimmed/strikethrough, still opens URL
+struct ExternalRefLinkPresentation: Equatable {
+    /// Short label rendered on the card, e.g. `↗ #560`.
+    let label: String
+    /// Canonical browser URL to open on click.
+    let url: String
+    /// Hover tooltip text.
+    let tooltip: String
+    /// True when the upstream binding was cleared (`unboundAt` is set).
+    let isStale: Bool
+
+    /// Derive the presentation for a task. Returns `nil` when the task has no
+    /// external ref — callers use this to suppress the affordance entirely.
+    static func forTask(_ task: WorkTask) -> ExternalRefLinkPresentation? {
+        guard let ref = task.externalRef else { return nil }
+        let stale = ref.unboundAt != nil
+        let label = issueLabel(from: ref.canonicalID)
+        var tooltip = ref.canonicalID
+        if stale {
+            tooltip += "\nUpstream binding cleared"
+        } else if let syncedAt = ref.syncedAt {
+            tooltip += "\nLast synced: \(syncedAt)"
+        }
+        return ExternalRefLinkPresentation(label: label, url: ref.webURL, tooltip: tooltip, isStale: stale)
+    }
+
+    /// Extracts a short display label from a canonical ID. For GitHub
+    /// (`"spinyfin/mono#560"`) this yields `"↗ #560"`. Any canonical ID
+    /// without a `#` fragment falls back to `"↗ <canonical_id>"`.
+    static func issueLabel(from canonicalID: String) -> String {
+        if let hashIdx = canonicalID.lastIndex(of: "#") {
+            let fragment = String(canonicalID[hashIdx...])
+            return "↗ \(fragment)"
+        }
+        return "↗ \(canonicalID)"
+    }
+}
