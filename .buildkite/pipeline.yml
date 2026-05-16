@@ -15,7 +15,7 @@ steps:
       queue: "linux-amd64"
     notify:
       - github_commit_status:
-          context: "bootstrap"
+          context: "buildkite/mono/bootstrap"
 
   - label: ":bazel: bazel-build"
     key: "bazel-build"
@@ -27,7 +27,7 @@ steps:
       queue: "linux-amd64"
     notify:
       - github_commit_status:
-          context: "bazel-build"
+          context: "buildkite/mono/bazel-build"
 
   - label: ":apple: mac-app-build"
     key: "mac-app-build"
@@ -37,7 +37,7 @@ steps:
       queue: "macos-arm64"
     notify:
       - github_commit_status:
-          context: "mac-app-build"
+          context: "buildkite/mono/mac-app-build"
 
   - label: ":white_check_mark: checks"
     key: "checks"
@@ -47,7 +47,7 @@ steps:
       queue: "linux-amd64"
     notify:
       - github_commit_status:
-          context: "checks"
+          context: "buildkite/mono/checks"
 
   - wait: ~
     continue_on_failure: false
@@ -62,4 +62,4 @@ steps:
       queue: "linux-amd64"
     notify:
       - github_commit_status:
-          context: "bazel-test"
+          context: "buildkite/mono/bazel-test"

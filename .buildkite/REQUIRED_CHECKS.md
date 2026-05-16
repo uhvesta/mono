@@ -22,7 +22,7 @@ These checks are currently **required** (block merge if red):
 
 ## How contexts are emitted
 
-Each gating step in `pipeline.yml` carries an explicit `notify: github_commit_status: { context: <step-key> }` block. This pins the GitHub check context name to the step's `key:` field, decoupling it from the step `label:` (which may include emoji and can be changed freely without affecting the gate).
+Each gating step in `pipeline.yml` carries an explicit `notify: github_commit_status: { context: "buildkite/mono/<step-key>" }` block. This pins the GitHub check context name to the step's `key:` field, decoupling it from the step `label:` (which may include emoji and can be changed freely without affecting the gate).
 
 The resulting context names are `buildkite/mono/<step-key>` — e.g. `buildkite/mono/bootstrap`.
 
