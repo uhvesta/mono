@@ -184,9 +184,10 @@ pub async fn collect(
     let use_new_syntax = git_version()
         .await
         .map(version_supports_write_tree)
-        // If version is unknown, assume new syntax (preserves prior behaviour on
-        // platforms where `git --version` might be unusual but git is recent).
-        .unwrap_or(true);
+        // Default to legacy on probe failure — legacy works on every git ≥ 2.0,
+        // so this is the safer fallback. New syntax only works on git ≥ 2.38;
+        // defaulting to it on a failed probe breaks old-git environments silently.
+        .unwrap_or(false);
 
     if use_new_syntax {
         collect_new_syntax(workspace_path, &git_dir, base_sha, head_sha).await
@@ -359,7 +360,15 @@ fn parse_legacy_output(base_sha: &str, head_sha: &str, stdout: &str) -> Conflict
     let mut conflicted_files: Vec<String> = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
-        if !line.starts_with("<<<<<<<") {
+        // Legacy git merge-tree embeds diff output; conflict-marker lines are
+        // prefixed with '+' (new content). Strip one diff-prefix character
+        // before checking so both bare and prefixed forms match.
+        let bare = line
+            .strip_prefix('+')
+            .or_else(|| line.strip_prefix('-'))
+            .or_else(|| line.strip_prefix(' '))
+            .unwrap_or(line);
+        if !bare.starts_with("<<<<<<<") {
             continue;
         }
         // Walk backwards from this conflict marker to find the nearest
@@ -484,19 +493,19 @@ mod tests {
     #[test]
     fn legacy_conflict_extracts_filename() {
         // Simulate `git merge-tree <base> main feature` output for a.txt conflict.
+        // Conflict markers are embedded in a unified diff, so they're prefixed
+        // with '+' (the diff "added" prefix) — matching real git output.
         let stdout = "\
 changed in both\n\
   base   100644 aaa000 a.txt\n\
   our    100644 bbb111 a.txt\n\
   their  100644 ccc222 a.txt\n\
-@@ -1,1 +1,1 @@\n\
-<<<<<<< .our\n\
-main side\n\
-||||||| .base\n\
-alpha\n\
-=======\n\
-feature side\n\
->>>>>>> .their\n";
+@@ -1,1 +1,5 @@\n\
++<<<<<<< .our\n\
+ main side\n\
++=======\n\
++feature side\n\
++>>>>>>> .their\n";
         let parsed = parse_legacy_output("base", "head", stdout);
         assert_eq!(parsed.files.len(), 1, "expected one conflicted file");
         assert_eq!(parsed.files[0].path, "a.txt");
@@ -510,17 +519,17 @@ changed in both\n\
   base   100644 aaa a.txt\n\
   our    100644 bbb a.txt\n\
   their  100644 ccc a.txt\n\
-@@ -1,1 +1,1 @@\n\
-<<<<<<< .our\n\
-hunk1 our\n\
-=======\n\
-hunk1 their\n\
->>>>>>> .their\n\
-<<<<<<< .our\n\
-hunk2 our\n\
-=======\n\
-hunk2 their\n\
->>>>>>> .their\n";
+@@ -1,1 +1,9 @@\n\
++<<<<<<< .our\n\
++hunk1 our\n\
++=======\n\
++hunk1 their\n\
++>>>>>>> .their\n\
++<<<<<<< .our\n\
++hunk2 our\n\
++=======\n\
++hunk2 their\n\
++>>>>>>> .their\n";
         let parsed = parse_legacy_output("base", "head", stdout);
         assert_eq!(parsed.files.len(), 1, "should deduplicate");
         assert_eq!(parsed.files[0].path, "a.txt");
@@ -664,6 +673,53 @@ hunk2 their\n\
             diag.files.len(),
             1,
             "jj-only workspace: expected one conflicted file, got: {:?}",
+            diag.files
+        );
+        assert_eq!(diag.files[0].path, "a.txt");
+    }
+
+    /// Regression test: the legacy `collect_legacy` path must work independently
+    /// of version detection. If the version probe fails and we fall back to
+    /// legacy, `collect_legacy` must still produce a correct diagnosis.
+    /// This guards against future changes that accidentally remove the legacy
+    /// path or default back to new syntax on probe failure.
+    #[tokio::test]
+    async fn collect_legacy_path_works_independently() {
+        if which_git().is_none() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        run_git(repo, &["init", "-q", "--initial-branch=main"]).await;
+        run_git(repo, &["config", "user.email", "test@example.invalid"]).await;
+        run_git(repo, &["config", "user.name", "Test"]).await;
+
+        std::fs::write(repo.join("a.txt"), "alpha\n").unwrap();
+        run_git(repo, &["add", "a.txt"]).await;
+        run_git(repo, &["commit", "-q", "-m", "init"]).await;
+
+        run_git(repo, &["checkout", "-q", "-b", "feature"]).await;
+        std::fs::write(repo.join("a.txt"), "feature side\n").unwrap();
+        run_git(repo, &["commit", "-q", "-am", "feature"]).await;
+
+        run_git(repo, &["checkout", "-q", "main"]).await;
+        std::fs::write(repo.join("a.txt"), "main side\n").unwrap();
+        run_git(repo, &["commit", "-q", "-am", "main"]).await;
+
+        let git_dir = repo.join(".git");
+        let diag = collect_legacy(repo, &git_dir, "main", "feature")
+            .await
+            .unwrap();
+        assert!(
+            diag.error.is_none(),
+            "collect_legacy errored: {:?}",
+            diag.error
+        );
+        assert_eq!(
+            diag.files.len(),
+            1,
+            "collect_legacy: expected one conflicted file, got: {:?}",
             diag.files
         );
         assert_eq!(diag.files[0].path, "a.txt");
