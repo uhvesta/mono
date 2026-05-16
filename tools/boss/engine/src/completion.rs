@@ -51,8 +51,9 @@ use boss_protocol::FrontendEvent;
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
+use crate::merge_poller::{MergeProbe, NoopMergeProbe, update_pr_poll_state};
 use crate::metrics::Registry;
-use crate::work::{WorkDb, WorkItem, WorkerPrCompletionTarget};
+use crate::work::{PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget};
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
 // fires when the PostToolUse staging cache already holds the URL; the
@@ -653,6 +654,13 @@ pub struct WorkerCompletionHandler {
     /// call `with_metrics` still get valid increments. Production wires
     /// in the shared engine registry via `with_metrics` after construction.
     metrics: Arc<Registry>,
+    /// GitHub probe used for the on-transition CI-status pre-fetch.
+    /// When a task moves to Review the handler spawns a background task
+    /// that probes the new PR's CI state so the UI card has a real icon
+    /// from the first poll rather than waiting for the merge-poller sweep.
+    /// Defaults to [`NoopMergeProbe`]; production wires in the shared
+    /// [`CommandMergeProbe`] via [`Self::with_merge_probe`].
+    merge_probe: Arc<dyn MergeProbe>,
 }
 
 impl WorkerCompletionHandler {
@@ -682,6 +690,7 @@ impl WorkerCompletionHandler {
             )),
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             metrics: local_metrics,
+            merge_probe: Arc::new(NoopMergeProbe),
         }
     }
 
@@ -731,6 +740,16 @@ impl WorkerCompletionHandler {
         flags: Arc<crate::feature_flags::FeatureFlagsStore>,
     ) -> Self {
         self.feature_flags = flags;
+        self
+    }
+
+    /// Wire the shared [`MergeProbe`] for the on-transition CI pre-fetch.
+    /// `app.rs` passes the same [`CommandMergeProbe`] used by the merge
+    /// poller so both paths share probe logic. Tests that do not need the
+    /// CI-fetch path can omit this call and rely on the default
+    /// [`NoopMergeProbe`].
+    pub fn with_merge_probe(mut self, probe: Arc<dyn MergeProbe>) -> Self {
+        self.merge_probe = probe;
         self
     }
 
@@ -1280,6 +1299,39 @@ impl WorkerCompletionHandler {
                 source,
                 "pr completion: PR detected; moved work item to in_review"
             );
+            // Pre-fetch CI status so the Review card has a real icon from
+            // the first frame. The fetch is fire-and-forget: if it fails or
+            // the probe is slow the UI falls back to the in-progress default
+            // and the merge-poller sweep picks it up on its next pass.
+            let probe = self.merge_probe.clone();
+            let work_db = self.work_db.clone();
+            let publisher = self.publisher.clone();
+            let candidate = PendingMergeCheck {
+                work_item_id: work_item_id.clone(),
+                product_id: product_id.clone(),
+                pr_url: pr_url.clone(),
+            };
+            tokio::spawn(async move {
+                match probe.probe(&candidate.pr_url).await {
+                    Ok(lifecycle_probe) => {
+                        update_pr_poll_state(
+                            &work_db,
+                            publisher.as_ref(),
+                            &candidate,
+                            &lifecycle_probe,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            ?err,
+                            "pr completion: on-transition CI pre-fetch failed; \
+                             merge poller will retry on next sweep",
+                        );
+                    }
+                }
+            });
             StopOutcome::PrDetected { pr_url }
         }
     }

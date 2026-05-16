@@ -378,6 +378,19 @@ pub trait MergeProbe: Send + Sync {
     async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe>;
 }
 
+/// `MergeProbe` that always returns an error — used as the default in
+/// contexts that do not need real GitHub probing (e.g. unit tests that
+/// never reach the CI-fetch path).
+#[derive(Debug, Default)]
+pub struct NoopMergeProbe;
+
+#[async_trait]
+impl MergeProbe for NoopMergeProbe {
+    async fn probe(&self, _pr_url: &str) -> Result<PrLifecycleProbe> {
+        anyhow::bail!("NoopMergeProbe: no real probe configured")
+    }
+}
+
 /// `MergeProbe` that shells out to `gh pr view <url> --json …`.
 #[derive(Debug, Default)]
 pub struct CommandMergeProbe;
@@ -1283,8 +1296,9 @@ fn review_detail_json(reviewers: &[String]) -> Option<String> {
 }
 
 /// Persist CI + review poll state and emit a change event when either
-/// field flips value. Called from `sweep_one` for every open PR.
-async fn update_pr_poll_state(
+/// field flips value. Called from `sweep_one` for every open PR and
+/// from `completion.rs` after the on-transition initial CI fetch.
+pub(crate) async fn update_pr_poll_state(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     candidate: &PendingMergeCheck,

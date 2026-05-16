@@ -677,6 +677,7 @@ impl ServerState {
         let pr_reconciler_kick = Arc::new(Notify::new());
         let pr_reconciler_kick_for_state = pr_reconciler_kick.clone();
 
+        let ci_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -688,6 +689,7 @@ impl ServerState {
             )
             .with_staged_pr_urls(staged_pr_urls.clone())
             .with_feature_flags(feature_flags_for_handler)
+            .with_merge_probe(ci_probe)
             .with_metrics(metrics_for_completion),
         );
 
