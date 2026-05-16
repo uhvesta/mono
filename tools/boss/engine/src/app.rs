@@ -4121,6 +4121,26 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            FrontendRequest::GetTaskRuntime { work_item_id } => {
+                match work_db.get_task_runtime(&work_item_id) {
+                    Ok(runtime) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::TaskRuntimeResult { runtime },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::GetExecution { id } => match work_db.get_execution(&id) {
                 Ok(execution) => {
                     send_response(

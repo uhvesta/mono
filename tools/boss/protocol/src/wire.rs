@@ -558,6 +558,17 @@ pub enum FrontendRequest {
     /// repeated GitHub API calls on rapid focus-toggle events.
     /// Replies with [`FrontendEvent::PrReconcilersKicked`].
     KickPrReconcilers,
+    /// Per-work-item runtime snapshot — single-item flavour of the
+    /// `task_runtimes` block carried in `WorkTree`. Used by
+    /// `boss chore show` / `boss task show` to enrich the rendered work
+    /// item with the active execution and run ids without re-fetching
+    /// the entire product tree. Replies with
+    /// [`FrontendEvent::TaskRuntimeResult`]. Returns the same
+    /// `TaskRuntime` shape `WorkTree` uses; every `Option` is `None`
+    /// when the work item has no executions yet.
+    GetTaskRuntime {
+        work_item_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,6 +643,13 @@ pub enum FrontendEvent {
     ExecutionsList {
         work_item_id: Option<String>,
         executions: Vec<WorkExecution>,
+    },
+    /// Reply for [`FrontendRequest::GetTaskRuntime`]. Carries the
+    /// engine's view of the currently dispatched (or most-recent)
+    /// execution and run for one work item. Fields are `None` when no
+    /// execution exists yet.
+    TaskRuntimeResult {
+        runtime: TaskRuntime,
     },
     ExecutionResult {
         execution: WorkExecution,
