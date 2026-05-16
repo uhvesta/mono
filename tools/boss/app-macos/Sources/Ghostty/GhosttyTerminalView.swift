@@ -129,7 +129,35 @@ final class GhosttyTerminalHostView: NSView {
         }
 
         guard let surface else {
-            fatalError("ghostty_surface_new failed")
+            // libghostty's C API (as of 1.3.2) exposes no log callback and
+            // ghostty_surface_new returns void* with no error code, so the
+            // best we can do on failure is dump every input we control.
+            // Without this, the only visible signal is a Swift fatalError
+            // string and a Sentry minidump — neither of which tells us
+            // which precondition libghostty rejected. Print to stderr so
+            // it lands in the dev `swift run` log and in os_log for
+            // bundled installs.
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            let cwdExists = fm.fileExists(atPath: launchSpec.workingDirectory, isDirectory: &isDir)
+            let appNonNil = runtime.app != nil
+            let envSummary = launchSpec.env.prefix(8)
+                .map { "\($0.0)=\($0.1.prefix(60))" }
+                .joined(separator: ", ")
+            FileHandle.standardError.write(Data("""
+            [GhosttyTerminalView] ghostty_surface_new returned NULL. Context:
+              runtime.app != nil:    \(appNonNil)
+              workingDirectory:      \(launchSpec.workingDirectory)
+                exists:              \(cwdExists)
+                isDirectory:         \(isDir.boolValue)
+              fontSize:              \(launchSpec.fontSize)
+              scale_factor:          \(NSScreen.main?.backingScaleFactor ?? 2.0)
+              env_var_count:         \(launchSpec.env.count)
+              env (first 8):         \(envSummary)
+              initialInput (chars):  \(launchSpec.initialInput.count)
+
+            """.utf8))
+            fatalError("ghostty_surface_new failed (see stderr above for context)")
         }
 
         self.surface = surface
