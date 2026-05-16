@@ -719,7 +719,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -732,7 +732,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -1328,7 +1328,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
              FROM work_executions
              WHERE status = 'ready'
                AND (dispatch_not_before IS NULL
@@ -1354,7 +1354,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -1534,6 +1534,32 @@ impl WorkDb {
             .with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
         Ok((execution, run))
+    }
+
+    /// Record the head SHA of the chore's bound PR captured at run
+    /// start. Used by the Stop-boundary SHA-delta gate to decide
+    /// whether a resume run actually contributed to the bound PR
+    /// before falling through to the `PROBE_NO_PR` nudge. Idempotent;
+    /// callers may invoke once per execution start (or skip when no
+    /// PR is bound). Empty `sha` is rejected — pass `None` semantics
+    /// by simply not calling.
+    pub fn set_execution_pr_head_before(
+        &self,
+        execution_id: &str,
+        sha: &str,
+    ) -> Result<()> {
+        if sha.is_empty() {
+            bail!("set_execution_pr_head_before: sha must be non-empty");
+        }
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET pr_head_before = ?2 WHERE id = ?1",
+            params![execution_id, sha],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
     }
 
     pub fn fail_execution_start(
@@ -2955,6 +2981,7 @@ impl WorkDb {
         migrate_metrics_tables(&conn)?;
         migrate_work_executions_pre_start_retry(&conn)?;
         migrate_work_executions_pr_url(&conn)?;
+        migrate_work_executions_pr_head_before(&conn)?;
         // PR poll state columns for CI + review indicators on Review-lane cards.
         migrate_pr_poll_state_columns(&conn)?;
         // External tracker binding columns (products) and per-work-item
@@ -4746,7 +4773,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -4943,6 +4970,7 @@ fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         pre_start_failure_count: row.get(14)?,
         dispatch_not_before: row.get(15)?,
         pr_url: row.get(16)?,
+        pr_head_before: row.get(17)?,
     })
 }
 
@@ -5434,7 +5462,7 @@ fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>>
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
          FROM work_executions
          WHERE id = ?1",
         [id],
@@ -5576,6 +5604,22 @@ fn migrate_work_executions_pr_url(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "pr_url")? {
         conn.execute(
             "ALTER TABLE work_executions ADD COLUMN pr_url TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// `pr_head_before`: the head SHA of the chore's bound PR captured
+/// at the moment this execution started running. The Stop boundary's
+/// SHA-delta gate uses it to decide whether a resume run actually
+/// contributed to the bound PR before falling through to the
+/// `PROBE_NO_PR` nudge — see the resume-bounce nudge-loop fix.
+/// Idempotent.
+fn migrate_work_executions_pr_head_before(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "pr_head_before")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN pr_head_before TEXT",
             [],
         )?;
     }
@@ -6923,7 +6967,7 @@ fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC

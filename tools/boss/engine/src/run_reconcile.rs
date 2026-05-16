@@ -339,6 +339,7 @@ mod tests {
             pre_start_failure_count: 0,
             dispatch_not_before: None,
             pr_url: None,
+            pr_head_before: None,
         }
     }
 

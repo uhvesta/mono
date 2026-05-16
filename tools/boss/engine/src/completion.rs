@@ -280,6 +280,13 @@ pub trait BranchVerifier: Send + Sync {
     /// Returns the `headRefName` for PR `pr_number` in `repo_slug`, or
     /// an error on network / API failure.
     async fn fetch_pr_head_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns the `headRefOid` (commit SHA of the PR's head ref) for
+    /// PR `pr_number` in `repo_slug`. Used by the Stop-boundary
+    /// SHA-delta gate to decide whether a resume run actually moved
+    /// the chore's bound PR before falling through to the
+    /// `PROBE_NO_PR` nudge.
+    async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
@@ -296,6 +303,10 @@ impl CommandBranchVerifier {
 impl BranchVerifier for CommandBranchVerifier {
     async fn fetch_pr_head_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
         fetch_pr_head_ref_cmd(repo_slug, pr_number).await
+    }
+
+    async fn fetch_pr_head_oid(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        fetch_pr_head_oid_cmd(repo_slug, pr_number).await
     }
 }
 
@@ -333,6 +344,44 @@ async fn fetch_pr_head_ref_cmd(repo_slug: &str, pr_number: u64) -> Result<String
         return Err(anyhow!("empty headRefName for PR {pr_number} in {repo_slug}"));
     }
     Ok(head_ref)
+}
+
+/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json headRefOid`
+/// and return the head SHA, or an error on failure / empty response.
+async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
+    let pr_str = pr_number.to_string();
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_str,
+            "-R",
+            repo_slug,
+            "--json",
+            "headRefOid",
+            "--jq",
+            ".headRefOid",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| {
+            format!("failed to spawn `gh pr view {pr_number} -R {repo_slug} --json headRefOid`")
+        })?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`gh pr view {pr_number} -R {repo_slug} --json headRefOid` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let head_oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if head_oid.is_empty() {
+        return Err(anyhow!("empty headRefOid for PR {pr_number} in {repo_slug}"));
+    }
+    Ok(head_oid)
 }
 
 /// Parse the PR number from a canonical GitHub PR URL
@@ -822,6 +871,45 @@ impl WorkerCompletionHandler {
                 "stop event: no staged URL and execution is not waiting_human — skipping fallback (running-status gate)",
             );
             return StopOutcome::RunningNoStagedPr;
+        }
+
+        // Resume-bounce SHA-delta gate: when the chore already has a
+        // PR bound to it (`task.pr_url` populated by an earlier run's
+        // on-Stop machinery), use that URL as the authoritative
+        // identifier — never branch-search. If the bound PR's head
+        // SHA moved during this run (vs the snapshot captured at run
+        // start in `execution.pr_head_before`), the worker
+        // contributed and we should finalize without nudging. If the
+        // PR did not move, queue the nudge directly and skip the
+        // cold-path detector entirely (its branch-keyed search would
+        // miss the bound PR on a resume, producing the false-positive
+        // nudge loop this gate exists to prevent).
+        match self.evaluate_sha_delta_gate(execution_id, &execution).await {
+            ShaDeltaGateOutcome::Contributed { pr_url } => {
+                return self
+                    .finalize_pr_transition(
+                        execution_id,
+                        pr_url,
+                        WorkerPrCompletionTarget::InReview,
+                        "stop_sha_delta",
+                    )
+                    .await;
+            }
+            ShaDeltaGateOutcome::NoContribution => {
+                tracing::info!(
+                    execution_id,
+                    "stop event: bound PR did not move during this run — probing to push and open one"
+                );
+                self.publish_awaiting_pr(&execution).await;
+                self.probe_queuer
+                    .queue_probe(execution_id, PROBE_NO_PR);
+                return StopOutcome::AwaitingInput;
+            }
+            ShaDeltaGateOutcome::Inapplicable => {
+                // No bound `chore.pr_url`, or the snapshot/fetch was
+                // unavailable. Fall through to the existing
+                // branch-keyed cold-path detector (new-PR flow).
+            }
         }
 
         // AI #5 feature-flag gate (incident 001 §5): the cold-path
@@ -1390,6 +1478,247 @@ impl WorkerCompletionHandler {
             )
             .await;
     }
+
+    /// Hook invoked once when an execution transitions to `running`
+    /// (from the coordinator's `start_execution_run` path). If the
+    /// bound chore already has a PR URL (i.e. this is a resume /
+    /// bounce-back of an already-bound chore), capture the PR's
+    /// current head SHA into `work_executions.pr_head_before` so the
+    /// Stop-boundary SHA-delta gate can verify the run's contribution.
+    ///
+    /// Best-effort: every step is fallible (work item lookup, repo
+    /// slug parsing, PR number parsing, GitHub fetch) and on failure
+    /// we log at WARN and leave `pr_head_before` unset. The gate
+    /// treats a missing snapshot as "inapplicable" and falls through
+    /// to the existing branch-keyed detector path — never noisier
+    /// than the pre-change behaviour.
+    pub async fn on_execution_started(&self, execution_id: &str) {
+        let execution = match self.work_db.get_execution(execution_id) {
+            Ok(execution) => execution,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    ?err,
+                    "execution_started hook: unknown execution — skipping pr_head_before snapshot"
+                );
+                return;
+            }
+        };
+        let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id) {
+            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
+                task.pr_url.filter(|s| !s.is_empty())
+            }
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "execution_started hook: work item lookup failed; skipping pr_head_before snapshot"
+                );
+                return;
+            }
+        };
+        let bound_pr_url = match bound_pr_url {
+            Some(url) => url,
+            None => {
+                tracing::debug!(
+                    execution_id,
+                    "execution_started hook: chore has no bound pr_url — new-PR flow, no snapshot needed"
+                );
+                return;
+            }
+        };
+        let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
+            Ok(slug) => slug,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    repo_remote_url = %execution.repo_remote_url,
+                    ?err,
+                    "execution_started hook: cannot parse repo slug; skipping pr_head_before snapshot"
+                );
+                return;
+            }
+        };
+        let pr_number = match pr_number_from_url(&bound_pr_url) {
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url = %bound_pr_url,
+                    "execution_started hook: cannot parse PR number from bound URL; skipping pr_head_before snapshot"
+                );
+                return;
+            }
+        };
+        let head_oid = match self
+            .branch_verifier
+            .fetch_pr_head_oid(&repo_slug, pr_number)
+            .await
+        {
+            Ok(oid) => oid,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url = %bound_pr_url,
+                    ?err,
+                    "execution_started hook: fetch headRefOid failed; skipping pr_head_before snapshot"
+                );
+                return;
+            }
+        };
+        if let Err(err) = self
+            .work_db
+            .set_execution_pr_head_before(execution_id, &head_oid)
+        {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "execution_started hook: failed to persist pr_head_before"
+            );
+            return;
+        }
+        tracing::info!(
+            execution_id,
+            bound_pr_url = %bound_pr_url,
+            head_oid = %head_oid,
+            "execution_started hook: snapshotted pr_head_before for SHA-delta gate"
+        );
+    }
+
+    /// Evaluate the resume-bounce SHA-delta gate. The gate uses the
+    /// chore's bound `pr_url` (set by an earlier run's on-Stop
+    /// machinery) as the authoritative PR identifier — never
+    /// branch-search — and verifies "this run contributed" by
+    /// comparing the bound PR's current head SHA against the
+    /// snapshot in `execution.pr_head_before`. See [`Self::on_execution_started`]
+    /// for the snapshot path.
+    async fn evaluate_sha_delta_gate(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+    ) -> ShaDeltaGateOutcome {
+        // The chore-bound PR URL is the only authoritative identifier
+        // permitted here. No branch search.
+        let work_item = match self.work_db.get_work_item(&execution.work_item_id) {
+            Ok(item) => item,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "sha-delta gate: work item lookup failed; treating as inapplicable"
+                );
+                return ShaDeltaGateOutcome::Inapplicable;
+            }
+        };
+        let bound_pr_url = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => {
+                match task.pr_url.filter(|s| !s.is_empty()) {
+                    Some(url) => url,
+                    None => return ShaDeltaGateOutcome::Inapplicable,
+                }
+            }
+            _ => return ShaDeltaGateOutcome::Inapplicable,
+        };
+        let pr_head_before = match execution.pr_head_before.as_deref() {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => {
+                tracing::debug!(
+                    execution_id,
+                    bound_pr_url = %bound_pr_url,
+                    "sha-delta gate: bound PR present but pr_head_before snapshot missing; falling through"
+                );
+                return ShaDeltaGateOutcome::Inapplicable;
+            }
+        };
+        let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
+            Ok(slug) => slug,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    repo_remote_url = %execution.repo_remote_url,
+                    ?err,
+                    "sha-delta gate: cannot parse repo slug; falling through"
+                );
+                return ShaDeltaGateOutcome::Inapplicable;
+            }
+        };
+        let pr_number = match pr_number_from_url(&bound_pr_url) {
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url = %bound_pr_url,
+                    "sha-delta gate: cannot parse PR number from bound URL; falling through"
+                );
+                return ShaDeltaGateOutcome::Inapplicable;
+            }
+        };
+        let head_now = match self
+            .branch_verifier
+            .fetch_pr_head_oid(&repo_slug, pr_number)
+            .await
+        {
+            Ok(oid) => oid,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url = %bound_pr_url,
+                    ?err,
+                    "sha-delta gate: fetch headRefOid failed; falling through to cold-path detector"
+                );
+                return ShaDeltaGateOutcome::Inapplicable;
+            }
+        };
+        if head_now == pr_head_before {
+            tracing::info!(
+                execution_id,
+                bound_pr_url = %bound_pr_url,
+                pr_head_before = %pr_head_before,
+                "sha-delta gate: bound PR head unchanged — worker did not contribute"
+            );
+            ShaDeltaGateOutcome::NoContribution
+        } else {
+            tracing::info!(
+                execution_id,
+                bound_pr_url = %bound_pr_url,
+                pr_head_before = %pr_head_before,
+                head_now = %head_now,
+                "sha-delta gate: bound PR head moved — contribution verified"
+            );
+            ShaDeltaGateOutcome::Contributed { pr_url: bound_pr_url }
+        }
+    }
+}
+
+#[async_trait]
+impl crate::coordinator::ExecutionStartedHook for WorkerCompletionHandler {
+    async fn on_execution_started(&self, execution_id: &str) {
+        // Inherent method already does the work; this just satisfies
+        // the trait the coordinator depends on.
+        WorkerCompletionHandler::on_execution_started(self, execution_id).await
+    }
+}
+
+/// Outcome of the resume-bounce SHA-delta gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShaDeltaGateOutcome {
+    /// The chore had a bound `pr_url`, snapshot+current SHA were
+    /// fetched, and the SHAs differ — this run moved the bound PR.
+    /// Caller should finalize via `finalize_pr_transition(InReview)`.
+    Contributed { pr_url: String },
+    /// The chore had a bound `pr_url`, snapshot+current SHA were
+    /// fetched, and the SHAs are equal — this run did not move the
+    /// bound PR. Caller should queue `PROBE_NO_PR` directly without
+    /// falling through to the cold-path branch detector.
+    NoContribution,
+    /// The gate could not evaluate (no bound PR, no snapshot, or a
+    /// fetch failure). Caller falls through to the existing
+    /// branch-keyed cold-path detector — preserves pre-change
+    /// behaviour for the new-PR flow.
+    Inapplicable,
 }
 
 /// Probe text dispatched when a worker stops without producing any PR
@@ -1580,15 +1909,31 @@ mod tests {
     }
 
     /// Configurable branch verifier for tests. Returns a fixed
-    /// `headRefName` (or error) without shelling out to `gh`.
+    /// `headRefName` (or error) and a fixed `headRefOid` (or error)
+    /// without shelling out to `gh`.
     struct StubBranchVerifier {
         result: Result<String, String>,
+        head_oid_result: Mutex<Result<String, String>>,
     }
 
     impl StubBranchVerifier {
-        /// Verifier that always reports the given branch name.
+        /// Verifier that always reports the given branch name. The
+        /// `headRefOid` defaults to the literal string `"oid_unknown"`
+        /// so tests that don't touch the SHA-delta path get a stable
+        /// stand-in without having to wire one explicitly. Tests that
+        /// exercise the gate call [`Self::with_head_oid`] to override.
         fn ok(branch: &str) -> Arc<Self> {
-            Arc::new(Self { result: Ok(branch.to_owned()) })
+            Arc::new(Self {
+                result: Ok(branch.to_owned()),
+                head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
+            })
+        }
+
+        /// Override the `headRefOid` returned by `fetch_pr_head_oid`.
+        /// Used by the SHA-delta gate tests to simulate a PR whose
+        /// head has (or has not) moved during the worker's run.
+        async fn set_head_oid(&self, oid: Result<String, String>) {
+            *self.head_oid_result.lock().await = oid;
         }
     }
 
@@ -1597,6 +1942,14 @@ mod tests {
         async fn fetch_pr_head_ref(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
             match &self.result {
                 Ok(branch) => Ok(branch.clone()),
+                Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+            }
+        }
+
+        async fn fetch_pr_head_oid(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+            let guard = self.head_oid_result.lock().await;
+            match &*guard {
+                Ok(oid) => Ok(oid.clone()),
                 Err(msg) => Err(anyhow::anyhow!(msg.clone())),
             }
         }
@@ -4248,5 +4601,341 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------
+    // Resume-bounce SHA-delta gate regressions.
+    //
+    // Reproduces the nudge-loop bug: when a chore was bounced back
+    // to a worker that already had a PR bound (`chore.pr_url`
+    // populated), the cold-path detector kept missing the bound PR
+    // (it searches by `boss/<execution_id>` branch, which is a
+    // FRESH name for the resume execution but the worker correctly
+    // pushed to the OLD branch where the PR lives). That false
+    // miss queued `PROBE_NO_PR`, the worker explained "PR exists",
+    // the runtime nudged again — loop.
+    //
+    // The fix: when `chore.pr_url` is bound, ignore the cold-path
+    // detector and verify contribution via SHA delta on the bound
+    // PR's head ref instead. The tests below pin three cases:
+    //   1. Resume + push (head moved) → no probe, chore finalized.
+    //   2. Resume + no push (head same) → probe fires.
+    //   3. No bound PR → existing branch detector still runs
+    //      (new-PR flow preserved).
+    // -----------------------------------------------------------
+
+    /// Variant of [`fixture`] that mirrors a resume bounce-back: the
+    /// chore already carries a `pr_url` (set by an earlier run's
+    /// on-Stop machinery), and the new execution has its
+    /// `pr_head_before` snapshot already persisted (the equivalent of
+    /// `on_execution_started` having run at dispatch time).
+    fn resume_fixture(
+        workspace_path: &Path,
+        bound_pr_url: &str,
+        head_before: &str,
+    ) -> (Arc<WorkDb>, String, String, String) {
+        let (db, product_id, chore_id, execution_id) = fixture(workspace_path);
+        db.update_work_item(
+            &chore_id,
+            crate::work::WorkItemPatch {
+                pr_url: Some(bound_pr_url.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.set_execution_pr_head_before(&execution_id, head_before)
+            .unwrap();
+        (db, product_id, chore_id, execution_id)
+    }
+
+    #[tokio::test]
+    async fn resume_push_to_bound_pr_finalizes_without_nudge() {
+        // T495-style scenario: chore already had PR 606 bound from a
+        // prior run, this run pushed a fix commit so the bound PR's
+        // head moved during the run. The cold-path detector would
+        // miss the PR (it searches by the new execution's branch
+        // name, not the OLD branch where the PR lives) — that's the
+        // bug. The SHA-delta gate must intervene and finalize.
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/606";
+        let head_before = "1111111111111111111111111111111111111111";
+        let (db, product_id, chore_id, execution_id) =
+            resume_fixture(workspace.path(), pr_url, head_before);
+        // Cold-path detector reports None — this is what the live
+        // engine sees on a resume because the detector searches by
+        // `boss/<new-execution-id>`, which has no PR.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let verifier = StubBranchVerifier::ok("boss/exec_old");
+        // Worker pushed a fix commit: head SHA moved.
+        verifier
+            .set_head_oid(Ok("2222222222222222222222222222222222222222".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/606"),
+            "SHA-delta gate must finalize the bound PR when the head moved; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "no probe must fire when the bound PR moved during this run; saw {:?}",
+            probes.snapshot()
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(t.pr_url.as_deref(), Some(pr_url));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "completed");
+        assert!(execution.finished_at.is_some());
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released after the SHA-delta finalize"
+        );
+        let work_events = publisher.work_events.lock().await.clone();
+        assert!(
+            work_events.iter().any(|(p, w, _)| p == &product_id && w == &chore_id),
+            "work-item invalidation must fire for the chore",
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_without_push_to_bound_pr_still_probes() {
+        // Resume bounce-back where the worker exited without pushing
+        // any commit. The gate must NOT swallow this case — the
+        // loop-catch nudge is load-bearing for genuinely-idle workers.
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/606";
+        let head = "1111111111111111111111111111111111111111";
+        let (db, _product_id, chore_id, execution_id) =
+            resume_fixture(workspace.path(), pr_url, head);
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let verifier = StubBranchVerifier::ok("boss/exec_old");
+        // Head SHA matches the snapshot — worker didn't push.
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "unchanged head SHA means no contribution; probe must fire"
+        );
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].1, PROBE_NO_PR);
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            // Chore stays put — no finalize.
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "active");
+                assert_eq!(t.pr_url.as_deref(), Some(pr_url));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "lease must stay held; the worker has unfinished business"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_pr_flow_still_falls_through_to_cold_detector() {
+        // Regression guard: when `chore.pr_url` is empty (new-PR
+        // flow, first run of the chore), the SHA-delta gate must
+        // declare itself inapplicable and let the existing
+        // branch-keyed detector run unchanged. Otherwise the fix
+        // would regress the brand-new-PR path.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // No `chore.pr_url` set; no `pr_head_before` snapshot.
+        let detector = StubPrDetector::ok(Some("https://github.com/foo/bar/pull/42"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(t.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/42"));
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert!(
+            probes.snapshot().is_empty(),
+            "new-PR flow must not probe; got {:?}",
+            probes.snapshot()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_with_missing_snapshot_falls_through_to_cold_detector() {
+        // Fail-safe: `chore.pr_url` is bound but `pr_head_before`
+        // was never captured (e.g. the snapshot fetch failed at run
+        // start). Gate declares itself inapplicable and the existing
+        // detector path runs — never noisier than pre-change.
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/606";
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        db.update_work_item(
+            &chore_id,
+            crate::work::WorkItemPatch {
+                pr_url: Some(pr_url.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        // Intentionally NOT calling `set_execution_pr_head_before`.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "fall-through to cold-path detector preserves the existing nudge behaviour",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].1, PROBE_NO_PR);
+    }
+
+    #[tokio::test]
+    async fn execution_started_hook_persists_pr_head_before_when_bound() {
+        // The run-start hook must snapshot the bound PR's head SHA
+        // into `work_executions.pr_head_before` so the Stop-boundary
+        // SHA-delta gate has something to compare against. Skips
+        // gracefully when no PR is bound (new-PR flow).
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/606";
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        db.update_work_item(
+            &chore_id,
+            crate::work::WorkItemPatch {
+                pr_url: Some(pr_url.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let verifier = StubBranchVerifier::ok("boss/exec_old");
+        verifier
+            .set_head_oid(Ok("abcdef0123456789".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        // Before the hook: no snapshot.
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().pr_head_before,
+            None
+        );
+        handler.on_execution_started(&execution_id).await;
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().pr_head_before.as_deref(),
+            Some("abcdef0123456789"),
+            "hook must persist the snapshot when a PR is bound",
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_started_hook_skips_when_no_pr_bound() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let verifier = StubBranchVerifier::ok("boss/exec_old");
+        // A verifier that would explode if called — we expect it not
+        // to be touched at all when no PR is bound.
+        verifier.set_head_oid(Err("must not be called".into())).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        handler.on_execution_started(&execution_id).await;
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().pr_head_before,
+            None,
+            "no bound PR ⇒ no snapshot",
+        );
     }
 }

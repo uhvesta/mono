@@ -714,6 +714,7 @@ impl ServerState {
         let dispatch_event_root_for_state = dispatch_event_root.clone();
         let ipc_logger = IpcLogger::new(&dispatch_event_root);
 
+        let completion_handler_for_coordinator = completion_handler.clone();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
@@ -724,6 +725,13 @@ impl ServerState {
             );
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
+            // Wire the SHA-delta gate's run-start snapshot: when an
+            // execution transitions to `running`, the completion
+            // handler captures the bound chore PR's head SHA into
+            // `work_executions.pr_head_before`.
+            execution_coordinator_inner.set_execution_started_hook(
+                completion_handler_for_coordinator.clone(),
+            );
             let execution_coordinator = Arc::new(execution_coordinator_inner);
 
             ServerState {

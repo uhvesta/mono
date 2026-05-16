@@ -48,6 +48,29 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&CUBE_WORKSPACE_LEASE_FAILURE);
 }
 
+/// Hook invoked once per execution at the moment it transitions from
+/// `ready` to `running` (`start_execution_run` succeeded). Production
+/// wiring routes this into [`crate::completion::WorkerCompletionHandler::on_execution_started`],
+/// which snapshots the bound chore PR's head SHA into
+/// `work_executions.pr_head_before` for the Stop-boundary SHA-delta
+/// gate. Decoupled from `WorkerCompletionHandler` directly so the
+/// coordinator module doesn't take a hard dependency on the
+/// completion module's surface.
+#[async_trait]
+pub trait ExecutionStartedHook: Send + Sync {
+    async fn on_execution_started(&self, execution_id: &str);
+}
+
+/// No-op hook used as the default. Production swaps it out via
+/// [`ExecutionCoordinator::set_execution_started_hook`].
+#[derive(Debug, Default)]
+pub struct NoopExecutionStartedHook;
+
+#[async_trait]
+impl ExecutionStartedHook for NoopExecutionStartedHook {
+    async fn on_execution_started(&self, _execution_id: &str) {}
+}
+
 /// Hard cap on the worker pool. The runtime config can request a smaller
 /// pool, but values above this are clamped (with a warning). The V2
 /// design fixes 8 as the upper bound.
@@ -888,6 +911,12 @@ pub struct ExecutionCoordinator {
     /// `set_metrics` still get valid increments. Production wires in the
     /// shared engine registry via `set_metrics` after construction.
     metrics: Arc<Registry>,
+    /// Hook called when an execution transitions to `running`.
+    /// Defaults to [`NoopExecutionStartedHook`]; production installs
+    /// the `WorkerCompletionHandler` via
+    /// [`Self::set_execution_started_hook`] so the SHA-delta gate
+    /// can snapshot the bound chore PR's head SHA at run start.
+    execution_started_hook: Arc<dyn ExecutionStartedHook>,
 }
 
 impl ExecutionCoordinator {
@@ -930,7 +959,16 @@ impl ExecutionCoordinator {
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
             pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
             metrics: local_metrics,
+            execution_started_hook: Arc::new(NoopExecutionStartedHook),
         }
+    }
+
+    /// Wire the execution-started hook. Production installs the
+    /// `WorkerCompletionHandler` here so it can snapshot the bound
+    /// chore PR's head SHA into `work_executions.pr_head_before`
+    /// when an execution transitions to `running`.
+    pub fn set_execution_started_hook(&mut self, hook: Arc<dyn ExecutionStartedHook>) {
+        self.execution_started_hook = hook;
     }
 
     /// Wire the engine-global metrics registry into this coordinator.
@@ -1591,6 +1629,19 @@ impl ExecutionCoordinator {
                         )
                         .await;
                 }
+                // Resume-bounce SHA-delta gate: capture the bound
+                // chore PR's head SHA into the execution row BEFORE
+                // the worker spawns and starts pushing. The Stop
+                // boundary uses this snapshot to decide whether the
+                // run contributed to the bound PR. Best-effort: the
+                // hook logs and swallows every failure mode (no
+                // bound PR, slug/number parse failure, GitHub fetch
+                // failure), and the gate treats a missing snapshot
+                // as "inapplicable" — never noisier than the
+                // pre-change behaviour.
+                self.execution_started_hook
+                    .on_execution_started(&execution.id)
+                    .await;
                 let coordinator = self.clone();
                 tokio::spawn(async move {
                     coordinator

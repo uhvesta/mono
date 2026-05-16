@@ -364,6 +364,19 @@ pub struct WorkExecution {
     /// records the `completed` transition for this execution.
     #[serde(default)]
     pub pr_url: Option<String>,
+    /// SHA of the bound chore PR's head ref at the moment this
+    /// execution started running. Captured once at run start when
+    /// `Task.pr_url` is already populated (i.e. this is a resume /
+    /// bounce-back of an already-bound chore). Used by the Stop
+    /// boundary's SHA-delta gate to decide whether the run actually
+    /// contributed to the bound PR before falling through to the
+    /// `PROBE_NO_PR` nudge — fixes the runtime-nudge-loop bug where
+    /// resume runs that pushed a fix commit got re-nudged forever.
+    /// `None` when `Task.pr_url` was empty at run start (new-PR
+    /// flow), when the snapshot fetch failed, or on rows that
+    /// predate this column.
+    #[serde(default)]
+    pub pr_head_before: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
