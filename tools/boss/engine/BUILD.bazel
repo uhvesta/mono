@@ -130,6 +130,11 @@ rust_test(
     name = "control_verbs_test",
     srcs = ["tests/control_verbs.rs"],
     edition = "2024",
+    size = "small",
+    # linux-amd64 CI runners run ~6-7x slower than macOS dev boxes; the 60s default
+    # for size="small" is too tight when concurrent tests contend on the
+    # binary_fingerprint OnceLock during startup. timeout="moderate" (300s) gives headroom.
+    timeout = "moderate",
     deps = [
         ":engine_lib",
         "//tools/boss/client",

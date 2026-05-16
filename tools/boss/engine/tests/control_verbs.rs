@@ -34,7 +34,11 @@ use boss_protocol::{
     RequestExecutionInput, WorkItem, WorkItemPatch,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+// linux-amd64 CI runners run ~6-7x slower than macOS dev boxes. Under
+// concurrent test load the first batch of tests blocks on the
+// binary_fingerprint OnceLock in build_info::init() — 5 s is too tight on
+// slow CI hardware. 30 s gives headroom for cold starts.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestEngine {
     socket_path: PathBuf,
