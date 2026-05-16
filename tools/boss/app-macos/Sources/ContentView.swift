@@ -1154,6 +1154,7 @@ private struct WorkBoardCardItem: View {
             : nil
         let designDocState: ProjectDesignDocState? = designDocProject
             .map { model.designDocStateByProjectID[$0.id] ?? .notSet }
+        let externalRefLink = ExternalRefLinkPresentation.forTask(task)
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -1178,7 +1179,8 @@ private struct WorkBoardCardItem: View {
                     ciRequiredState: column == .review ? task.ciRequiredState : nil,
                     ciRequiredDetail: column == .review ? task.ciRequiredDetail : nil,
                     reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
-                    reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil
+                    reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
+                    externalRefLink: externalRefLink
                 )
             }
             .buttonStyle(.plain)
@@ -1328,6 +1330,13 @@ struct WorkBoardCardView: View {
     var reviewRequiredState: String? = nil
     /// JSON-encoded reviewer list for the review tooltip.
     var reviewRequiredDetail: String? = nil
+    /// Upstream-link affordance derived from `task.externalRef`. `nil`
+    /// when the task has no external binding — the affordance is hidden
+    /// entirely in that state. Bound refs show an accent-colored `↗ #N`
+    /// link; stale refs (binding cleared upstream) show it dimmed with a
+    /// strikethrough so the history is preserved but the staleness is
+    /// communicated at a glance.
+    var externalRefLink: ExternalRefLinkPresentation? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1414,6 +1423,9 @@ struct WorkBoardCardView: View {
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .accessibilityLabel("T\(id)")
+                    }
+                    if let extRef = externalRefLink {
+                        ExternalRefLinkView(presentation: extRef)
                     }
                     if task.kind == "design",
                        let state = designDocState,
@@ -2647,6 +2659,43 @@ struct RepoChipView: View {
         )
         .help(presentation.tooltip)
         .accessibilityLabel(presentation.accessibilityLabel)
+    }
+}
+
+/// Upstream-link affordance rendered in the kanban card footer when
+/// a work item carries an `externalRef`. Three visual states:
+///
+/// - **Bound** (`isStale == false`): accent-colored `↗ #N` link, opens the
+///   upstream URL in the default browser.
+/// - **Stale** (`isStale == true`): secondary-colored with strikethrough,
+///   still clickable; tooltip explains the binding was cleared.
+/// - **Absent** (`ExternalRefLinkPresentation.forTask` returns `nil`): no
+///   view rendered at all (callers gate on nil).
+private struct ExternalRefLinkView: View {
+    let presentation: ExternalRefLinkPresentation
+
+    var body: some View {
+        if let url = URL(string: presentation.url), url.scheme != nil {
+            Link(destination: url) {
+                labelText
+            }
+            .buttonStyle(.plain)
+            .pointerStyle(.link)
+            .help(presentation.tooltip)
+        } else {
+            labelText
+                .help(presentation.tooltip)
+        }
+    }
+
+    private var labelText: some View {
+        Text(presentation.label)
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(presentation.isStale ? Color.secondary : Color.accentColor)
+            .strikethrough(presentation.isStale)
+            .accessibilityLabel(presentation.isStale
+                ? "Upstream issue (stale): \(presentation.label)"
+                : "Open upstream issue: \(presentation.label)")
     }
 }
 
