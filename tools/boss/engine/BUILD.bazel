@@ -148,3 +148,16 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+filegroup(
+    name = "engine_srcs",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:private"],
+)
+
+sh_test(
+    name = "no_gh_pr_merge_test",
+    srcs = ["tests/no_gh_pr_merge_test.sh"],
+    data = [":engine_srcs"],
+    size = "small",
+)
