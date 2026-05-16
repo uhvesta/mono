@@ -1,71 +1,61 @@
 import SwiftUI
 
-/// Authoring sheet for a new comment. Pre-populates the quoted-text field
-/// with whatever text was selected when "Add Comment" was clicked. The user
-/// can edit the snippet and must supply a non-empty comment body before
-/// the "Comment" button enables.
+/// Popover for creating a new comment. Appears anchored near the selection.
+/// Does not echo the selected text back — the yellow highlight in the viewer
+/// already shows what is being commented on.
+///
+/// Behaviour:
+///   - Plain Return submits (via CommentTextEditor's key handler).
+///   - Shift+Return inserts a newline so multi-line comments are still possible.
+///   - Cancel clears state without adding a comment.
 struct CommentPopover: View {
     @ObservedObject var layer: CommentLayer
 
-    @State private var quotedText: String = ""
     @State private var commentBody: String = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Add Comment")
+        VStack(alignment: .leading, spacing: 12) {
+            Text("New Comment")
                 .font(.headline)
 
-            if !quotedText.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Selected text")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(quotedText)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(4)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
-                        )
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Comment")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                TextEditor(text: $commentBody)
-                    .font(.callout)
-                    .frame(minHeight: 80, maxHeight: 160)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-                    )
-            }
+            CommentTextEditor(text: $commentBody, onSubmit: submit)
+                .frame(minHeight: 80, maxHeight: 160)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+                )
 
             HStack {
                 Spacer()
                 Button("Cancel") {
-                    layer.isShowingPopover = false
-                    commentBody = ""
+                    cancel()
                 }
                 .keyboardShortcut(.cancelAction)
 
                 Button("Comment") {
-                    layer.addComment(quoted: quotedText, body: commentBody)
-                    commentBody = ""
+                    submit()
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(commentBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(20)
-        .frame(width: 360)
+        .padding(16)
+        .frame(width: 320)
         .onAppear {
-            quotedText = layer.pendingQuotedText
+            if let first = layer.pendingFirstChar {
+                commentBody = String(first)
+            }
         }
+    }
+
+    private func submit() {
+        layer.addComment(quoted: layer.pendingQuotedText, body: commentBody)
+        commentBody = ""
+    }
+
+    private func cancel() {
+        layer.isShowingPopover = false
+        layer.pendingFirstChar = nil
+        commentBody = ""
     }
 }

@@ -448,9 +448,28 @@ struct MarkdownViewerContent: Codable, Hashable {
 /// chrome matches `MarkdownDocumentView` so the "Read full description"
 /// affordance lands in a layout that visually mirrors the Designs file
 /// viewer.
+///
+/// The view is split into an outer wrapper that applies `.withComments()` and
+/// an inner `MarkdownViewerContent` that reads the comment-environment values
+/// injected by `WithCommentsModifier` and feeds them to `HighlightingMarkdownParser`.
 struct MarkdownViewerView: View {
     let title: String
     let source: String
+
+    var body: some View {
+        MarkdownViewerScrollContent(title: title, source: source)
+            .withComments()
+    }
+}
+
+/// Inner content view that reads comment state from the environment and uses
+/// HighlightingMarkdownParser to paint persistent yellow highlights on commented spans.
+private struct MarkdownViewerScrollContent: View {
+    let title: String
+    let source: String
+
+    @Environment(\.commentedTexts) private var commentedTexts
+    @Environment(\.commentFlashText) private var commentFlashText
 
     var body: some View {
         ScrollView {
@@ -459,17 +478,37 @@ struct MarkdownViewerView: View {
                     .font(.title3.weight(.semibold))
                     .fixedSize(horizontal: false, vertical: true)
                 Divider()
-                StructuredText(markdown: source)
+                StructuredText(source, parser: markdownParser)
                     .bossMarkdown()
                     .textual.textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    // Force StructuredText recreation when highlight state changes so the
+                    // new HighlightingMarkdownParser instance is used to re-parse the source.
+                    // StructuredText only re-parses on markup changes; the id() change is the
+                    // trigger that ensures highlight updates are reflected immediately.
+                    .id(highlightKey)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .textSelection(.enabled)
-        .withComments()
+    }
+
+    private var markdownParser: any MarkupParser {
+        if commentedTexts.isEmpty && commentFlashText == nil {
+            return AttributedStringMarkdownParser.markdown()
+        }
+        return HighlightingMarkdownParser(
+            highlightedTexts: commentedTexts,
+            flashingText: commentFlashText
+        )
+    }
+
+    private var highlightKey: Int {
+        var h = commentedTexts.hashValue
+        h ^= commentFlashText?.hashValue ?? 0
+        return h
     }
 }
 
