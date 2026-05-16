@@ -1184,6 +1184,7 @@ private struct WorkBoardCardItem: View {
                     ciRequiredDetail: column == .review ? task.ciRequiredDetail : nil,
                     reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
+                    mergeQueueState: column == .review ? task.mergeQueueState : nil,
                     externalRefLink: externalRefLink
                 )
             }
@@ -1334,6 +1335,10 @@ struct WorkBoardCardView: View {
     var reviewRequiredState: String? = nil
     /// JSON-encoded reviewer list for the review tooltip.
     var reviewRequiredDetail: String? = nil
+    /// Merge-queue state for the merging indicator. `"queued"` when the PR
+    /// is in GitHub's merge queue; `nil` otherwise. When set, replaces the
+    /// CI indicator so the card clearly shows the PR is actively being shipped.
+    var mergeQueueState: String? = nil
     /// Upstream-link affordance derived from `task.externalRef`. `nil`
     /// when the task has no external binding — the affordance is hidden
     /// entirely in that state. Bound refs show an accent-colored `↗ #N`
@@ -1450,7 +1455,9 @@ struct WorkBoardCardView: View {
 
             if let prURL = task.prURL, !prURL.isEmpty {
                 HStack(alignment: .center, spacing: 6) {
-                    if let ciState = ciRequiredState {
+                    if mergeQueueState == "queued" {
+                        PrMergingIndicator()
+                    } else if let ciState = ciRequiredState {
                         PrCiIndicator(state: ciState, detail: ciRequiredDetail)
                     }
                     PRURLLink(urlString: prURL, font: .caption)
@@ -2783,6 +2790,28 @@ private struct PrCiIndicator: View {
               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
         else { return nil }
         return arr.compactMap { $0["name"] as? String }
+    }
+}
+
+/// Merge-queue indicator for Review-lane cards. Shown when the PR is
+/// currently in GitHub's merge queue — replaces the CI icon so the user
+/// can immediately distinguish cards that are actively being shipped from
+/// cards waiting for CI or human action.
+private struct PrMergingIndicator: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "arrow.triangle.merge")
+                .font(.caption2.weight(.semibold))
+            Text("merging")
+                .font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(Color.accentColor)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.accentColor.opacity(0.12))
+        .clipShape(Capsule())
+        .help("PR is in the merge queue and actively being shipped.")
+        .accessibilityLabel("In merge queue — merging")
     }
 }
 

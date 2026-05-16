@@ -1061,6 +1061,7 @@ final class EngineClient: @unchecked Sendable {
             reviewRequiredState: payload["review_required_state"] as? String,
             reviewRequiredDetail: payload["review_required_detail"] as? String,
             prStatePolledAt: payload["pr_state_polled_at"] as? String,
+            mergeQueueState: payload["merge_queue_state"] as? String,
             externalRef: parseExternalRef(payload["external_ref"])
         )
     }

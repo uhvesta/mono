@@ -316,6 +316,12 @@ pub struct Task {
     /// probe completes. The UI uses this to render "last checked: N ago".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_state_polled_at: Option<String>,
+    /// Merge-queue state at last poll. `Some("queued")` when the PR is
+    /// currently in GitHub's merge queue; `None` when it is not queued or the
+    /// repo does not have a merge queue configured. Replaces the CI indicator
+    /// on Review-lane cards while the PR is actively merging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_state: Option<String>,
     /// Stable pointer to the upstream tracker issue linked to this work item.
     /// `None` when no external tracker binding exists. Populated by the
     /// reconciler on import or manual link; cleared (with `unbound_at` set)

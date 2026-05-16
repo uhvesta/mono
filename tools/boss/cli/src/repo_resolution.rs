@@ -482,6 +482,7 @@ mod tests {
             review_required_state: None,
             review_required_detail: None,
             pr_state_polled_at: None,
+            merge_queue_state: None,
             short_id: None,
             external_ref: None,
         }
