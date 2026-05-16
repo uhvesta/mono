@@ -1,5 +1,7 @@
 build --jobs=200
 build --disk_cache=~/.cache/bazelcache
+build --experimental_disk_cache_gc_max_size=30G
+build --experimental_disk_cache_gc_max_age=7d
 
 # Release config: stamps binaries with the git SHA and wires the
 # workspace-status.sh script so STABLE_BOSS_GIT_SHA and BUILD_EMBED_LABEL
