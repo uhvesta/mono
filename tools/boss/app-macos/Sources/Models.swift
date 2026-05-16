@@ -493,6 +493,10 @@ struct WorkTask: Identifiable, Hashable {
     /// RFC 3339 timestamp of the most recent successful poll that wrote the
     /// PR state fields above. `nil` until the first probe completes.
     var prStatePolledAt: String? = nil
+    /// Merge-queue state at last poll. `"queued"` when the PR is currently in
+    /// GitHub's merge queue; `nil` when not queued or the repo has no merge
+    /// queue. Replaces the CI indicator on Review-lane cards while merging.
+    var mergeQueueState: String? = nil
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil

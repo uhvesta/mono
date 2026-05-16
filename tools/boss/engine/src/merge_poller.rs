@@ -174,6 +174,11 @@ pub struct PrLifecycleProbe {
     /// `review_required_state` / `review_required_detail` columns on
     /// the task row for display in the macOS kanban Review-lane card.
     pub review: PrReviewState,
+    /// Whether the PR is currently in GitHub's merge queue at probe time.
+    /// Derived from `mergeQueueEntry` — non-null means in queue, null means
+    /// not queued. Used to render the merging indicator on Review-lane cards
+    /// (replaces the CI icon while the PR is merging).
+    pub in_merge_queue: bool,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -417,7 +422,9 @@ impl MergeProbe for CommandMergeProbe {
                 // take the raw JSON document from gh instead.
                 // `reviewDecision` and `reviews` are added to capture
                 // the review-required state for UI indicators.
-                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews",
+                // `mergeQueueEntry` is non-null when the PR is in GitHub's
+                // merge queue — used to render the merging indicator.
+                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews,mergeQueueEntry",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -446,6 +453,7 @@ impl MergeProbe for CommandMergeProbe {
                     base_ref_name: None,
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
+                    in_merge_queue: false,
                 });
             }
             return Err(anyhow!(
@@ -588,6 +596,12 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         .cloned()
         .unwrap_or_default();
     let review = classify_review(review_decision, &reviews);
+    // `mergeQueueEntry` is non-null when the PR is in GitHub's merge queue.
+    // Null, missing, or explicit JSON null → not in queue.
+    let in_merge_queue = root
+        .get("mergeQueueEntry")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
     Ok(PrLifecycleProbe {
         url: url.to_owned(),
         state,
@@ -597,6 +611,7 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         base_ref_name,
         labels,
         review,
+        in_merge_queue,
     })
 }
 
@@ -1295,8 +1310,14 @@ fn review_detail_json(reviewers: &[String]) -> Option<String> {
     serde_json::to_string(reviewers).ok()
 }
 
-/// Persist CI + review poll state and emit a change event when either
-/// field flips value. Called from `sweep_one` for every open PR and
+/// Derive the `merge_queue_state` DB string from a probe's merge-queue flag.
+/// Returns `Some("queued")` when in queue, `None` when not (NULL in DB).
+fn merge_queue_state_str(in_merge_queue: bool) -> Option<&'static str> {
+    if in_merge_queue { Some("queued") } else { None }
+}
+
+/// Persist CI + review + merge-queue poll state and emit a change event
+/// when any field flips value. Called from `sweep_one` for every open PR and
 /// from `completion.rs` after the on-transition initial CI fetch.
 pub(crate) async fn update_pr_poll_state(
     work_db: &WorkDb,
@@ -1312,6 +1333,7 @@ pub(crate) async fn update_pr_poll_state(
     let review_state = probe.review.as_db_str();
     let ci_detail = ci_detail_json(&open.ci);
     let review_detail = review_detail_json(probe.review.reviewers());
+    let merge_queue_state = merge_queue_state_str(probe.in_merge_queue);
 
     match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
@@ -1319,10 +1341,11 @@ pub(crate) async fn update_pr_poll_state(
         review_state,
         ci_detail.as_deref(),
         review_detail.as_deref(),
+        merge_queue_state,
     ) {
         Ok(true) => {
             // State changed — emit event so the macOS kanban refreshes the
-            // card's CI / review indicators within the poll interval.
+            // card's CI / review / merging indicators within the poll interval.
             publisher
                 .publish_work_item_changed(
                     &candidate.product_id,
@@ -1334,6 +1357,7 @@ pub(crate) async fn update_pr_poll_state(
                 work_item_id = %candidate.work_item_id,
                 ci_state,
                 review_state,
+                in_merge_queue = probe.in_merge_queue,
                 "merge poller: PR poll state changed",
             );
         }
@@ -1550,6 +1574,7 @@ mod tests {
                     base_ref_name: None,
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
+                    in_merge_queue: false,
                 }),
             );
         }
@@ -1566,6 +1591,7 @@ mod tests {
                     base_ref_name: None,
                     labels: labels.iter().map(|s| (*s).to_owned()).collect(),
                     review: PrReviewState::Unknown,
+                    in_merge_queue: false,
                 }),
             );
         }
@@ -1594,6 +1620,7 @@ mod tests {
                     base_ref_name: None,
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
+                    in_merge_queue: false,
                 }),
             }
         }
@@ -2119,6 +2146,7 @@ mod tests {
             base_ref_name: None,
             labels: Vec::new(),
             review: PrReviewState::Unknown,
+            in_merge_queue: false,
         }
     }
 
@@ -2132,6 +2160,7 @@ mod tests {
             base_ref_name: None,
             labels: Vec::new(),
             review: PrReviewState::Unknown,
+            in_merge_queue: false,
         }
     }
 
@@ -2906,6 +2935,48 @@ mod tests {
             open.ci,
         );
         assert_eq!(probe.head_ref_oid.as_deref(), Some("head-1"));
+    }
+
+    /// `mergeQueueEntry` field: non-null → `in_merge_queue = true`,
+    /// null / absent → `in_merge_queue = false`.
+    #[test]
+    fn parse_probe_detects_merge_queue_entry() {
+        // PR in merge queue — mergeQueueEntry is a non-null object.
+        let body_in_queue = {
+            let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+                "OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]),
+            ))
+            .unwrap();
+            doc["mergeQueueEntry"] = serde_json::json!({"state": "QUEUED"});
+            doc.to_string()
+        };
+        let probe = parse_probe_json("https://example.test/pr/mq1", &body_in_queue, None).unwrap();
+        assert!(probe.in_merge_queue, "non-null mergeQueueEntry should set in_merge_queue");
+
+        // PR not in merge queue — mergeQueueEntry is JSON null.
+        let body_null = {
+            let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+                "OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]),
+            ))
+            .unwrap();
+            doc["mergeQueueEntry"] = serde_json::Value::Null;
+            doc.to_string()
+        };
+        let probe_null =
+            parse_probe_json("https://example.test/pr/mq2", &body_null, None).unwrap();
+        assert!(!probe_null.in_merge_queue, "null mergeQueueEntry should clear in_merge_queue");
+
+        // PR not in merge queue — mergeQueueEntry field absent entirely
+        // (older gh versions or repos without queue enabled).
+        let body_absent = json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]),
+        );
+        let probe_absent =
+            parse_probe_json("https://example.test/pr/mq3", &body_absent, None).unwrap();
+        assert!(
+            !probe_absent.in_merge_queue,
+            "absent mergeQueueEntry should clear in_merge_queue",
+        );
     }
 
     #[test]
