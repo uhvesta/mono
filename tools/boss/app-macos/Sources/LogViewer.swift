@@ -806,7 +806,12 @@ private let logTimestampFormatter: DateFormatter = {
     return f
 }()
 
-private let engineTimestampFormatter: ISO8601DateFormatter = {
+// `ISO8601DateFormatter.date(from:)` is documented thread-safe in
+// Foundation, but the type is not `Sendable` so Swift 6 strict-
+// concurrency rejects a plain `private let` global. The only callers
+// are read-only parses; `nonisolated(unsafe)` is the idiomatic Swift 6
+// escape hatch when the access pattern is safe by design.
+private nonisolated(unsafe) let engineTimestampFormatter: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
     f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return f
