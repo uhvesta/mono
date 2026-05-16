@@ -1176,7 +1176,7 @@ private struct WorkBoardCardItem: View {
                     isResolvingConflicts: isResolvingConflicts,
                     designDocState: designDocState,
                     onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } },
-                    ciRequiredState: column == .review ? task.ciRequiredState : nil,
+                    ciRequiredState: column == .review ? (task.ciRequiredState ?? "in_progress") : nil,
                     ciRequiredDetail: column == .review ? task.ciRequiredDetail : nil,
                     reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
@@ -2724,11 +2724,12 @@ private struct ConflictClearedBadge: View {
     }
 }
 
-/// CI status indicator shown on Review-lane cards when the engine has polled
-/// GitHub for required check results. Three visual states: in-progress
-/// (yellow clock), success (green checkmark), fail (red X). The `"unknown"`
-/// state (no branch protection / first poll pending) hides the indicator
-/// entirely so a missing result doesn't look like an all-green pass.
+/// CI status indicator shown on Review-lane cards. Four visual states:
+/// in-progress (yellow clock), success (green checkmark), fail (red X),
+/// and unknown / nil (also rendered as in-progress). The unknown state
+/// means the first poll is still pending — showing in-progress is truthful
+/// ("we haven't checked yet") and keeps the icon slot occupied so it
+/// doesn't pop in later.
 private struct PrCiIndicator: View {
     let state: String
     var detail: String? = nil
@@ -2745,26 +2746,22 @@ private struct PrCiIndicator: View {
 
     private var systemImage: String? {
         switch state {
-        case "in_progress": return "clock.fill"
-        case "success":     return "checkmark.circle.fill"
-        case "fail":        return "xmark.circle.fill"
-        default:            return nil
+        case "success": return "checkmark.circle.fill"
+        case "fail":    return "xmark.circle.fill"
+        default:        return "clock.fill"
         }
     }
 
     private var tint: Color {
         switch state {
-        case "in_progress": return .yellow
-        case "success":     return .green
-        case "fail":        return .red
-        default:            return .secondary
+        case "success": return .green
+        case "fail":    return .red
+        default:        return .yellow
         }
     }
 
     private var tooltipText: String {
         switch state {
-        case "in_progress":
-            return "Required CI checks in progress"
         case "success":
             return "All required CI checks passed"
         case "fail":
@@ -2773,7 +2770,7 @@ private struct PrCiIndicator: View {
             }
             return "Required CI check(s) failed"
         default:
-            return "CI check state unknown"
+            return "Required CI checks in progress"
         }
     }
 
