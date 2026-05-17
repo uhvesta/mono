@@ -160,7 +160,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateNow
     }
 
+    /// When the last window is closed and workers are still alive, keep
+    /// the app running instead of quitting. The window-close path
+    /// (red traffic light / Cmd-W) does not consistently route through
+    /// `applicationShouldTerminate(_:)` under SwiftUI's `WindowGroup`
+    /// lifecycle, so returning `true` here let macOS exit silently —
+    /// killing every running Claude pane underneath. Returning `false`
+    /// while workers are active leaves the process alive (workers keep
+    /// running); the user can re-open the window from the Dock or
+    /// explicitly Cmd-Q to hit the confirmation modal.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        (liveWorkerStates?.activeAgentCount ?? 0) == 0
     }
 }
