@@ -422,9 +422,11 @@ impl MergeProbe for CommandMergeProbe {
                 // take the raw JSON document from gh instead.
                 // `reviewDecision` and `reviews` are added to capture
                 // the review-required state for UI indicators.
-                // `mergeQueueEntry` is non-null when the PR is in GitHub's
-                // merge queue — used to render the merging indicator.
-                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews,mergeQueueEntry",
+                // NOTE: `mergeQueueEntry` is intentionally omitted here —
+                // `gh pr view --json` does not expose it in all `gh` versions.
+                // Merge-queue state is queried separately via `gh api graphql`
+                // in `fetch_merge_queue_status` below.
+                "state,mergedAt,closedAt,mergeable,mergeStateStatus,baseRefOid,headRefOid,headRefName,baseRefName,labels,statusCheckRollup,reviewDecision,reviews",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -469,7 +471,11 @@ impl MergeProbe for CommandMergeProbe {
         // indicator instead of a false-positive green.
         let combined_state =
             fetch_commit_combined_state_for_empty_rollup(&stdout, pr_url).await;
-        parse_probe_json(pr_url, &stdout, combined_state.as_deref())
+        let mut probe = parse_probe_json(pr_url, &stdout, combined_state.as_deref())?;
+        // Query merge-queue status separately via GraphQL since `gh pr view --json`
+        // does not expose `mergeQueueEntry` in all installed `gh` versions.
+        probe.in_merge_queue = fetch_merge_queue_status(pr_url).await;
+        Ok(probe)
     }
 }
 
@@ -485,6 +491,60 @@ fn repo_from_pr_url(pr_url: &str) -> Option<&str> {
     }
     let end = owner.len() + 1 + repo.len();
     Some(&path[..end])
+}
+
+/// Extract the PR number from a GitHub PR URL of the form
+/// `https://github.com/owner/repo/pull/NNN`.
+fn pr_number_from_url(pr_url: &str) -> Option<u64> {
+    let path = pr_url.strip_prefix("https://github.com/")?;
+    // path is now "owner/repo/pull/NNN" or similar
+    let mut segments = path.splitn(4, '/');
+    segments.next()?; // owner
+    segments.next()?; // repo
+    let pull = segments.next()?;
+    if pull != "pull" {
+        return None;
+    }
+    segments.next()?.parse().ok()
+}
+
+/// Query GitHub's GraphQL API to determine whether `pr_url` is currently
+/// in the repository's merge queue. Returns `true` when `mergeQueueEntry`
+/// is non-null (the PR is queued), `false` on any error or when not queued.
+///
+/// This is a separate call from the main `gh pr view` probe because
+/// `mergeQueueEntry` is not exposed as a `--json` field in all installed
+/// versions of the `gh` CLI. The GraphQL API is stable and available across
+/// versions.
+async fn fetch_merge_queue_status(pr_url: &str) -> bool {
+    let (Some(owner_repo), Some(number)) = (repo_from_pr_url(pr_url), pr_number_from_url(pr_url)) else {
+        return false;
+    };
+    let (owner, repo) = match owner_repo.split_once('/') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let query = format!(
+        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state }} }} }} }}"#
+    );
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let body: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // data.repository.pullRequest.mergeQueueEntry — non-null → in queue.
+    !body["data"]["repository"]["pullRequest"]["mergeQueueEntry"].is_null()
 }
 
 /// When `statusCheckRollup` is empty/null in `json_body`, fetches the
@@ -2991,6 +3051,20 @@ mod tests {
         );
         assert_eq!(super::repo_from_pr_url("https://example.com/owner/repo/pull/1"), None);
         assert_eq!(super::repo_from_pr_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn pr_number_from_url_extracts_number() {
+        assert_eq!(
+            super::pr_number_from_url("https://github.com/spinyfin/mono/pull/568"),
+            Some(568),
+        );
+        assert_eq!(
+            super::pr_number_from_url("https://github.com/owner/my-repo/pull/1"),
+            Some(1),
+        );
+        assert_eq!(super::pr_number_from_url("https://example.com/owner/repo/pull/1"), None);
+        assert_eq!(super::pr_number_from_url("not-a-url"), None);
     }
 
     #[test]
