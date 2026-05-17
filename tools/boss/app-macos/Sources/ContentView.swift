@@ -48,10 +48,6 @@ struct ContentView: View {
                 .opacity(model.navigationMode == .agents ? 1 : 0)
                 .allowsHitTesting(model.navigationMode == .agents)
 
-            ActivityLogView()
-                .opacity(model.navigationMode == .activity ? 1 : 0)
-                .allowsHitTesting(model.navigationMode == .activity)
-
             if model.navigationMode == .designs {
                 DesignsView(chat: model)
             }
