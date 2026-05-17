@@ -41,9 +41,16 @@ struct CommentTextEditor: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         if textView.string != text {
+            let wasEmpty = textView.string.isEmpty
             let sel = textView.selectedRanges
             textView.string = text
-            textView.selectedRanges = sel
+
+            if wasEmpty && !text.isEmpty {
+                // Initial text being set; position cursor at the end
+                textView.setSelectedRange(NSRange(location: text.utf16.count, length: 0))
+            } else {
+                textView.selectedRanges = sel
+            }
         }
     }
 
