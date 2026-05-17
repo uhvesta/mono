@@ -3797,4 +3797,82 @@ mod tests {
             "kick after quiesce window must break out of wait loop",
         );
     }
+
+    /// Cold-path regression pin: when a conflict-resolution worker pushes
+    /// a resolved branch but the engine's in-memory `StagedResolutionSignalCache`
+    /// is empty (e.g. engine restarted between the push and the Stop hook),
+    /// the merge-poller sweep must still detect the PR as mergeable and run
+    /// the retire path — transitioning the parent back to `in_review` and
+    /// marking the attempt `succeeded`.
+    ///
+    /// This is the signal-missed recovery scenario that the primary-path
+    /// (on-Stop) shortcut cannot cover alone. The merge-poller sweep is the
+    /// structural fallback.
+    #[tokio::test]
+    async fn merge_poller_recovers_conflict_resolution_when_signal_missed() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/700";
+        let (product, chore) = make_chore_in_review(&db, "C-signal-missed", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let cube = Arc::new(RecordingCubeClient::default());
+
+        // Pass 1: flip to blocked, then install the attempt (mirroring
+        // Phase 3's worker-spawn path).
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
+        run_one_pass(
+            &db,
+            probe.as_ref(),
+            publisher.as_ref(),
+            Some(cube.as_ref() as &dyn CubeClient),
+            None,
+        )
+        .await;
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 700,
+                head_branch: "feature-700".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base-700".into()),
+                head_sha_before: Some("head-700".into()),
+            })
+            .unwrap()
+            .unwrap();
+        db.mark_conflict_resolution_running(&attempt.id, "lease-700", "ws-700", "worker-700")
+            .unwrap();
+
+        // Simulate: the worker pushed and resolved the conflict but the
+        // engine restarted — StagedResolutionSignalCache is empty and the
+        // on-Stop primary path cannot fire. The PR is now MERGEABLE.
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let outcome = run_one_pass(
+            &db,
+            probe.as_ref(),
+            publisher.as_ref(),
+            Some(cube.as_ref() as &dyn CubeClient),
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome.conflict_cleared, 1,
+            "merge-poller must recover the conflict transition when the signal was missed",
+        );
+
+        // Parent in_review.
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // Attempt succeeded.
+        let after = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert_eq!(after.status, "succeeded");
+    }
 }

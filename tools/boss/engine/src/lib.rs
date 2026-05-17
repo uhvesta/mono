@@ -30,6 +30,7 @@ pub mod orphan_sweep;
 pub mod pane_summary;
 pub mod pr_url_capture;
 pub mod protocol;
+pub mod resolution_signal_capture;
 pub mod run_reconcile;
 pub mod runner;
 pub mod settings;

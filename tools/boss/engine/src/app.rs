@@ -328,6 +328,17 @@ struct ServerState {
     /// [`WorkerCompletionHandler::with_staged_pr_urls`] so writes
     /// here and reads in `on_stop` see the same map.
     staged_pr_urls: Arc<crate::pr_url_capture::StagedPrUrlCache>,
+    /// Primary-path resolution-signal staging for `conflict_resolution`
+    /// executions. Populated by [`dispatch_live_worker_state`] from
+    /// `PostToolUse` Bash hooks that are force-push commands or
+    /// PR-comment posts. Read by [`WorkerCompletionHandler::on_stop`]
+    /// to transition the parent chore `blocked → in_review` immediately
+    /// on Stop, without waiting for the merge-poller sweep.
+    ///
+    /// Shared with the completion handler via
+    /// [`WorkerCompletionHandler::with_staged_resolution_signals`].
+    staged_resolution_signals:
+        Arc<crate::resolution_signal_capture::StagedResolutionSignalCache>,
     /// Snapshot of the Anthropic API key captured at engine startup.
     /// Used by the live-status summarizer for the per-slot task; the
     /// pane-titlebar summarizer continues to resolve the key
@@ -602,6 +613,9 @@ impl ServerState {
         let pane_releaser = Arc::new(ServerStatePaneReleaser::default());
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        let staged_resolution_signals = Arc::new(
+            crate::resolution_signal_capture::StagedResolutionSignalCache::new(),
+        );
 
         // Resolve the Boss state root early — both the feature-flags
         // store (loaded below, before the completion handler is
@@ -688,6 +702,7 @@ impl ServerState {
                 probe_queuer.clone(),
             )
             .with_staged_pr_urls(staged_pr_urls.clone())
+            .with_staged_resolution_signals(staged_resolution_signals.clone())
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
             .with_metrics(metrics_for_completion),
@@ -755,6 +770,7 @@ impl ServerState {
                     crate::live_status_loop::TranscriptPathCache::new(),
                 ),
                 staged_pr_urls,
+                staged_resolution_signals,
                 anthropic_api_key,
                 next_session_id: AtomicU64::new(1),
                 work_revision,
@@ -2799,6 +2815,44 @@ async fn dispatch_live_worker_state(
                         }
                     }
                     } // else (is_gh_pr_command)
+                }
+            }
+            // Conflict-resolution primary-path signal capture. For
+            // executions of kind `conflict_resolution`, detect force-push
+            // and resolution-comment events and stage them so `on_stop`
+            // can transition the parent chore without a merge-poller sweep.
+            if tool_name == "Bash" {
+                let is_conflict_resolution = server_state
+                    .work_db
+                    .get_execution(run_id)
+                    .map(|e| e.kind == "conflict_resolution")
+                    .unwrap_or(false);
+                if is_conflict_resolution {
+                    if crate::resolution_signal_capture::is_force_push_command(tool_input) {
+                        server_state.staged_resolution_signals.record_signal(
+                            run_id,
+                            crate::resolution_signal_capture::ResolutionSignal::ForcePushed,
+                        );
+                        tracing::info!(
+                            execution_id = run_id,
+                            "resolution_signal_capture: staged ForcePushed signal",
+                        );
+                    }
+                    if let Some(comment_url) =
+                        crate::resolution_signal_capture::extract_resolution_comment_url(
+                            tool_response,
+                        )
+                    {
+                        server_state.staged_resolution_signals.record_signal(
+                            run_id,
+                            crate::resolution_signal_capture::ResolutionSignal::ResolutionCommentPosted,
+                        );
+                        tracing::info!(
+                            execution_id = run_id,
+                            %comment_url,
+                            "resolution_signal_capture: staged ResolutionCommentPosted signal",
+                        );
+                    }
                 }
             }
         }

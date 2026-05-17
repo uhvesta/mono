@@ -669,6 +669,17 @@ pub struct WorkerCompletionHandler {
     /// Defaults to [`NoopMergeProbe`]; production wires in the shared
     /// [`CommandMergeProbe`] via [`Self::with_merge_probe`].
     merge_probe: Arc<dyn MergeProbe>,
+    /// Primary-path resolution-signal staging for `conflict_resolution`
+    /// executions. Populated by the `PostToolUse` dispatcher in `app.rs`
+    /// when a Bash event is a force-push or a PR-comment post. On Stop,
+    /// `on_stop` checks this cache first: if any signal is present it
+    /// transitions the parent chore `blocked → in_review` immediately,
+    /// without waiting for the merge-poller sweep to notice GitHub now
+    /// reports the PR as `MERGEABLE`. Defaults to an empty cache so tests
+    /// that don't exercise the signal path fall through to the catch-all
+    /// finalizer unchanged.
+    staged_resolution_signals:
+        Arc<crate::resolution_signal_capture::StagedResolutionSignalCache>,
 }
 
 impl WorkerCompletionHandler {
@@ -699,6 +710,9 @@ impl WorkerCompletionHandler {
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             metrics: local_metrics,
             merge_probe: Arc::new(NoopMergeProbe),
+            staged_resolution_signals: Arc::new(
+                crate::resolution_signal_capture::StagedResolutionSignalCache::new(),
+            ),
         }
     }
 
@@ -761,15 +775,27 @@ impl WorkerCompletionHandler {
         self
     }
 
+    /// Wire an externally-owned [`StagedResolutionSignalCache`] into this
+    /// handler so the `PostToolUse` dispatcher and the on-Stop resolver
+    /// share the same cache. `app.rs` calls this once after construction;
+    /// tests that want to exercise the signal path can call it with their
+    /// own cache. Tests that don't invoke it get the default empty cache
+    /// and fall through to the existing catch-all finalizer — preserving
+    /// pre-change behaviour without a signature break.
+    pub fn with_staged_resolution_signals(
+        mut self,
+        cache: Arc<crate::resolution_signal_capture::StagedResolutionSignalCache>,
+    ) -> Self {
+        self.staged_resolution_signals = cache;
+        self
+    }
+
     /// Handle a `Stop` event for `execution_id`. Returns the outcome
     /// classification so callers can log/test what happened.
     pub async fn on_stop(&self, execution_id: &str) -> StopOutcome {
         let outcome = self.on_stop_inner(execution_id).await;
-        // Phase 4 #11: for `conflict_resolution` executions, run the
-        // catch-all attempt finalizer regardless of how the inner path
-        // resolved. The finalizer decides whether to mark the bound
-        // `conflict_resolutions` row `failed` based on whether the
-        // worker pushed (see [`Self::finalize_conflict_resolution_attempt`]).
+        // Phase 4 #11: for `conflict_resolution` executions, drive the
+        // parent-chore transition and attempt finalization.
         //
         // Phase 10 #33: the same catch-all applies to `ci_remediation`
         // executions. The two flows share the on-Stop hook but write to
@@ -777,6 +803,23 @@ impl WorkerCompletionHandler {
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
             match execution.kind.as_str() {
                 "conflict_resolution" => {
+                    // Primary path: at least one resolution signal was staged
+                    // from `PostToolUse` Bash events (force-push or PR comment).
+                    // Transition parent blocked → in_review immediately, without
+                    // waiting for the merge-poller sweep to see GitHub report the
+                    // PR as MERGEABLE. The catch-all finalizer below is idempotent
+                    // (early-exits if the attempt is already terminal).
+                    if self
+                        .staged_resolution_signals
+                        .has_any_signal(execution_id)
+                    {
+                        self.finalize_via_resolution_signal(&execution).await;
+                        self.staged_resolution_signals.forget(execution_id);
+                    }
+                    // Catch-all finalizer: always runs so the attempt is marked
+                    // `failed` when the worker exited without pushing (no signal
+                    // staged, detector returned nothing). Idempotent — skips when
+                    // the attempt is already in a terminal state.
                     self.finalize_conflict_resolution_attempt(&execution, &outcome)
                         .await;
                 }
@@ -1352,6 +1395,138 @@ impl WorkerCompletionHandler {
                 }
             });
             StopOutcome::PrDetected { pr_url }
+        }
+    }
+
+    /// Primary-path handler for a `conflict_resolution` execution whose
+    /// `PostToolUse` events staged at least one resolution signal
+    /// (force-push or PR comment). Transitions the parent chore from
+    /// `blocked` → `in_review` and marks the `conflict_resolutions`
+    /// attempt `succeeded` without waiting for the merge-poller sweep.
+    ///
+    /// Best-effort: every step is fallible. Failures are logged and the
+    /// caller falls through to `finalize_conflict_resolution_attempt`,
+    /// which either marks the attempt `failed` (worker truly didn't push)
+    /// or stays quiet (attempt is terminal from this call).
+    async fn finalize_via_resolution_signal(
+        &self,
+        execution: &crate::work::WorkExecution,
+    ) {
+        let attempt = match self
+            .work_db
+            .active_conflict_resolution_for_work_item(&execution.work_item_id)
+        {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    "resolution_signal: no active attempt; cannot transition parent",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "resolution_signal: failed to look up active attempt",
+                );
+                return;
+            }
+        };
+
+        // Transition parent chore blocked → in_review. The attempt-id guard
+        // ensures we only undo our own blocked row (design Q5).
+        let task_transitioned = match self
+            .work_db
+            .clear_chore_blocked_merge_conflict_for_attempt(
+                &execution.work_item_id,
+                &attempt.pr_url,
+                &attempt.id,
+            ) {
+            Ok(Some(_)) => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    attempt_id = %attempt.id,
+                    "resolution_signal: parent chore transitioned blocked → in_review (primary path)",
+                );
+                true
+            }
+            Ok(None) => {
+                // WHERE guard missed — chore already moved (manual override
+                // or concurrent on_resolved from the poller).
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    attempt_id = %attempt.id,
+                    "resolution_signal: parent chore WHERE guard missed; already transitioned",
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "resolution_signal: failed to clear blocked merge_conflict",
+                );
+                false
+            }
+        };
+
+        // Mark attempt succeeded. Independent of the parent-task transition
+        // per design Q5: both updates run even if the other was a no-op.
+        let attempt_succeeded = match self
+            .work_db
+            .mark_conflict_resolution_succeeded(&attempt.id, None)
+        {
+            Ok(Some(_)) => {
+                tracing::info!(
+                    attempt_id = %attempt.id,
+                    "resolution_signal: attempt marked succeeded",
+                );
+                true
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    "resolution_signal: attempt already terminal",
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "resolution_signal: failed to mark attempt succeeded",
+                );
+                false
+            }
+        };
+
+        if task_transitioned {
+            self.publisher
+                .publish_work_item_changed(
+                    &attempt.product_id,
+                    &attempt.work_item_id,
+                    "merge_conflict_resolved",
+                )
+                .await;
+        }
+
+        if attempt_succeeded {
+            self.publisher
+                .publish_frontend_event_on_product(
+                    &attempt.product_id,
+                    FrontendEvent::ConflictResolutionSucceeded {
+                        product_id: attempt.product_id.clone(),
+                        work_item_id: attempt.work_item_id.clone(),
+                        attempt_id: attempt.id.clone(),
+                        pr_url: attempt.pr_url.clone(),
+                    },
+                )
+                .await;
         }
     }
 
@@ -3639,6 +3814,123 @@ mod tests {
         assert_eq!(
             after.status, "running",
             "non-conflict-kind executions must not trip the conflict-resolution finalizer",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_resolution_on_stop_uses_staged_signal_and_transitions_parent() {
+        // Primary-path test: a ForcePushed signal is staged before Stop fires.
+        // The on-Stop handler must transition the parent chore blocked →
+        // in_review and mark the attempt succeeded — without a gh pr
+        // round-trip. The PR detector is set to return None so any
+        // mergeability call would leave the attempt in `running`; if the
+        // assertion passes the staged-signal path (not the detector) ran.
+        let workspace = tempdir().unwrap();
+        let (db, product_id, chore_id, execution_id, attempt_id) =
+            conflict_fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let signals = Arc::new(
+            crate::resolution_signal_capture::StagedResolutionSignalCache::new(),
+        );
+        signals.record_signal(
+            &execution_id,
+            crate::resolution_signal_capture::ResolutionSignal::ForcePushed,
+        );
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_staged_resolution_signals(signals);
+
+        let _ = handler.on_stop(&execution_id).await;
+
+        // Parent chore must be in_review with blocked columns cleared.
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review", "parent must transition to in_review");
+                assert!(t.blocked_reason.is_none(), "blocked_reason must be cleared");
+                assert!(t.blocked_attempt_id.is_none(), "blocked_attempt_id must be cleared");
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // Attempt must be succeeded (not left running for the poller).
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "succeeded",
+            "attempt must be marked succeeded by primary path",
+        );
+
+        // ConflictResolutionSucceeded event must be published.
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(pid, ev)| {
+                pid == &product_id
+                    && matches!(
+                        ev,
+                        boss_protocol::FrontendEvent::ConflictResolutionSucceeded {
+                            attempt_id: a,
+                            ..
+                        } if a == &attempt_id
+                    )
+            }),
+            "expected ConflictResolutionSucceeded for {attempt_id}; got {typed:?}",
+        );
+
+        // ConflictResolutionFailed must NOT be published.
+        assert!(
+            typed.iter().all(|(_, ev)| !matches!(
+                ev,
+                boss_protocol::FrontendEvent::ConflictResolutionFailed { .. }
+            )),
+            "ConflictResolutionFailed must not fire when primary path succeeds",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_resolution_on_stop_with_no_staged_signal_falls_back_to_finalizer() {
+        // Cold-path regression: empty staging cache — the catch-all
+        // finalizer must run and mark the attempt failed (worker exited
+        // without pushing). This is the pre-existing behaviour; the new
+        // primary-path code must not change it.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id, attempt_id) =
+            conflict_fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        // No signals staged — uses the default empty cache from `new`.
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+
+        // Attempt must be failed by the catch-all.
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(
+            attempt.failure_reason.as_deref(),
+            Some(CONFLICT_NO_PUSH_REASON),
         );
     }
 

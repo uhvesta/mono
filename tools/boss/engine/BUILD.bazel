@@ -43,6 +43,7 @@ rust_library(
         "src/pane_summary.rs",
         "src/pr_url_capture.rs",
         "src/protocol.rs",
+        "src/resolution_signal_capture.rs",
         "src/run_reconcile.rs",
         "src/runner.rs",
         "src/settings.rs",
