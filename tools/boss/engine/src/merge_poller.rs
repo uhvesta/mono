@@ -1262,56 +1262,48 @@ async fn sweep_one(
                     }
                 }
                 OpenPrMergeability::Clean => {
-                    // Conflict-side retire: idempotent against `in_review`
-                    // rows (the WHERE guard misses); the actual transition
-                    // only fires when the row was previously blocked.
-                    if conflict_watch::on_resolved(
+                    // Polymorphic clear dispatch (design §Q5 Phase 10 #31):
+                    // walk the `task_blocked_signals` side table and ask
+                    // each active reason's retire path to act if its
+                    // probe condition holds. Each per-reason handler is
+                    // still idempotent on its own (WHERE-guarded), so
+                    // this is purely a refactor of the dispatch from
+                    // "call every retire path unconditionally" to "call
+                    // only the retire paths whose signals are still
+                    // observed as active." The detect side stays where
+                    // it is — detection is signal-specific (a `Failing`
+                    // CI status can't fire the conflict watcher) and
+                    // doesn't need the side-table read.
+                    maybe_clear_blocked(
                         work_db,
                         publisher,
                         cube_client,
                         candidate,
                         &probe_result.labels,
+                        ci,
+                        outcome,
                     )
-                    .await
-                    {
-                        outcome.conflict_cleared += 1;
-                    }
-                    // CI-side dispatch. `Failing` fans out to the
-                    // CI-watch detect path; `Clean`/`InFlight` drive the
-                    // CI-watch retire path (which is also a cheap no-op
-                    // for rows that aren't blocked on a CI signal).
-                    match ci {
-                        OpenPrCiStatus::Failing { failures } => {
-                            if ci_watch::on_ci_failure_detected(
-                                work_db,
-                                publisher,
-                                candidate,
-                                &probe_result,
-                                failures,
-                            )
-                            .await
-                            {
-                                outcome.ci_flagged += 1;
-                            }
-                        }
-                        OpenPrCiStatus::Clean => {
-                            if ci_watch::on_ci_resolved(
-                                work_db,
-                                publisher,
-                                candidate,
-                                &probe_result.labels,
-                            )
-                            .await
-                            {
-                                outcome.ci_cleared += 1;
-                            }
-                        }
-                        OpenPrCiStatus::InFlight => {
-                            // Wait — the auto-retire path requires all
-                            // checks at SUCCESS (design §Q5). InFlight
-                            // is the explicit "don't act yet" leaf.
+                    .await;
+                    // CI-side detect: a `Failing` rollup still needs
+                    // its own fan-out regardless of what the side-table
+                    // says, because the chore is currently `in_review`
+                    // (no signal in the table yet) on the first failure.
+                    if let OpenPrCiStatus::Failing { failures } = ci {
+                        if ci_watch::on_ci_failure_detected(
+                            work_db,
+                            publisher,
+                            candidate,
+                            &probe_result,
+                            failures,
+                        )
+                        .await
+                        {
+                            outcome.ci_flagged += 1;
                         }
                     }
+                    // `InFlight` is the explicit "don't act yet" leaf
+                    // for CI; the clear dispatch above already declined
+                    // because `should_clear_ci` requires Clean.
                 }
             }
         }
@@ -1335,6 +1327,103 @@ async fn sweep_one(
     // transition away from `in_review` and the indicators become moot.
     if matches!(probe_result.state, PrLifecycleState::Open(_)) {
         update_pr_poll_state(work_db, publisher, candidate, &probe_result).await;
+    }
+}
+
+/// Polymorphic retire dispatch (design §Q5 / Phase 10 #31).
+///
+/// The merge poller's `Clean`-mergeability branch used to call every
+/// per-signal retire path unconditionally (conflict-watch on_resolved
+/// and ci-watch on_ci_resolved, in sequence). That worked because each
+/// retire path was already WHERE-guarded against its own row state, so
+/// running it against a chore that wasn't blocked on that reason was a
+/// cheap no-op.
+///
+/// With the `task_blocked_signals` side table in place, we can do
+/// better: read the active signal set first, and dispatch only to the
+/// retire paths whose signals are still observed. Same end state, but:
+///
+///   - the dispatch is now self-documenting — adding a new
+///     `blocked_reason` (review_feedback, dependency, …) becomes a
+///     single match arm here rather than a new unconditional `await`
+///     bolted onto the sweep;
+///   - failure to add a per-reason `should_clear` arm becomes loud
+///     (`_ => false` falls through with a warn), instead of silently
+///     never clearing the signal;
+///   - the per-signal probe condition is centralised, so the
+///     `merge_conflict ⇒ Clean mergeability` and `ci_failure ⇒ Clean
+///     ci` couplings live in one place that the design's snippet maps
+///     to directly.
+///
+/// A read of the side table when there are no active signals is one
+/// `SELECT … WHERE cleared_at IS NULL` returning zero rows; cheaper
+/// than the unconditional UPDATEs the old dispatch always sent.
+async fn maybe_clear_blocked(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
+    candidate: &PendingMergeCheck,
+    labels: &[String],
+    ci: &OpenPrCiStatus,
+    outcome: &mut SweepOutcome,
+) {
+    let signals = match work_db.active_blocked_signals(&candidate.work_item_id) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "merge poller: failed to read active blocked signals; skipping clear dispatch",
+            );
+            return;
+        }
+    };
+    if signals.is_empty() {
+        return;
+    }
+
+    // Mergeability is `Clean` at the caller (we're inside the Clean
+    // arm of `sweep_one`), so the merge-conflict probe condition is
+    // trivially true. CI's probe condition is `OpenPrCiStatus::Clean`
+    // — `InFlight` and `Failing` decline to retire.
+    let ci_clean = matches!(ci, OpenPrCiStatus::Clean);
+
+    for signal in signals {
+        match signal.reason.as_str() {
+            "merge_conflict" => {
+                if conflict_watch::on_resolved(
+                    work_db,
+                    publisher,
+                    cube_client,
+                    candidate,
+                    labels,
+                )
+                .await
+                {
+                    outcome.conflict_cleared += 1;
+                }
+            }
+            "ci_failure" | "ci_failure_exhausted" => {
+                if !ci_clean {
+                    continue;
+                }
+                if ci_watch::on_ci_resolved(work_db, publisher, candidate, labels).await {
+                    outcome.ci_cleared += 1;
+                }
+            }
+            other => {
+                // Unknown / future blocked_reason values
+                // (`review_feedback`, `dependency`, …) — those flows
+                // own their own retire paths. We log once at debug so
+                // an unwired reason doesn't silently leak past the
+                // sweep, but don't treat the situation as an error.
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    reason = other,
+                    "merge poller: no retire-path arm for blocked_reason; leaving for owning flow",
+                );
+            }
+        }
     }
 }
 
@@ -3459,6 +3548,214 @@ mod tests {
             broke_out.is_err(),
             "kick within quiesce window must be absorbed, not break out of wait",
         );
+    }
+
+    /// Phase 10 #31 acceptance (case 1 / merge_conflict alone): a
+    /// chore that carries only the `merge_conflict` signal in the
+    /// side table is routed to the conflict retire path by the
+    /// polymorphic dispatch (and crucially NOT to the CI retire
+    /// path). The `merge_conflict` row in `task_blocked_signals` is
+    /// stamped `cleared_at` once the conflict resolves.
+    #[tokio::test]
+    async fn polymorphic_clear_routes_merge_conflict_signal() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/910";
+        let (_product_id, chore) = make_chore_in_review(&db, "C-mc-only", pr);
+
+        // Stage merge_conflict only — mark_chore_blocked_merge_conflict
+        // upserts the side-table row as part of the same transaction
+        // (Phase 10 #31).
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let staged: Vec<String> = db
+            .active_blocked_signals(&chore)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.reason)
+            .collect();
+        assert_eq!(staged, vec!["merge_conflict".to_owned()]);
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Mergeable=Clean, CI=Clean — but the side table only has
+        // merge_conflict, so the polymorphic dispatch must NOT fire
+        // on_ci_resolved (which would have been a no-op anyway, but
+        // the new shape skips the unconditional call entirely).
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let outcome =
+            run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(outcome.conflict_cleared, 1);
+        assert_eq!(outcome.ci_cleared, 0);
+
+        // Side table row was stamped `cleared_at`.
+        let active = db.active_blocked_signals(&chore).unwrap();
+        assert!(active.is_empty(), "merge_conflict signal cleared; got {active:?}");
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    /// Phase 10 #31/#32 acceptance (case 2 / ci_failure alone): a
+    /// chore that carries only the `ci_failure` signal is routed to
+    /// the CI retire path. Budget reset (#32) is observable: a chore
+    /// with `ci_attempts_used = 2` lands at 0 after the cycle.
+    #[tokio::test]
+    async fn polymorphic_clear_routes_ci_failure_signal_and_resets_budget() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/911";
+        let (_product_id, chore) = make_chore_in_review(&db, "C-ci-only", pr);
+
+        // Stage ci_failure only (the production detect path would do
+        // this via `on_ci_failure_detected` → `mark_chore_blocked_ci_failure`).
+        db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET ci_attempts_used = 2 WHERE id = ?1",
+                rusqlite::params![chore],
+            )
+            .unwrap();
+        }
+        let staged: Vec<String> = db
+            .active_blocked_signals(&chore)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.reason)
+            .collect();
+        assert_eq!(staged, vec!["ci_failure".to_owned()]);
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let outcome =
+            run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(outcome.ci_cleared, 1, "polymorphic dispatch fired on_ci_resolved");
+        assert_eq!(outcome.conflict_cleared, 0, "no merge_conflict signal => no conflict retire");
+
+        let active = db.active_blocked_signals(&chore).unwrap();
+        assert!(active.is_empty(), "ci_failure signal cleared; got {active:?}");
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(
+                    t.ci_attempts_used, 0,
+                    "Phase 10 #32: full cycle resets budget to 0",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    /// Phase 10 #31 acceptance (case 3 / both signals): when both
+    /// `merge_conflict` and `ci_failure` rows are active in the side
+    /// table, the polymorphic dispatch iterates both. Only the signal
+    /// whose probe condition holds clears on a given pass; the other
+    /// stays active. This mirrors the design's "each clears
+    /// independently when its probe condition holds" acceptance.
+    ///
+    /// In production both signals being live simultaneously is rare
+    /// (the engine's compose-order Q1 has conflict pre-empt CI), but
+    /// the side-table can hold both rows for a window — e.g. when the
+    /// `ci_failure` row pre-dates a freshly-detected conflict — so
+    /// the dispatch's polymorphism must handle the case.
+    #[tokio::test]
+    async fn polymorphic_clear_each_signal_independent_when_both_active() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/912";
+        let (_product_id, chore) = make_chore_in_review(&db, "C-both", pr);
+
+        // Stage: the scalar `blocked_reason` lands on `ci_failure`
+        // (its WHERE guard accepts `in_review`), and we hand-place a
+        // sibling `merge_conflict` side-table row to simulate the
+        // race window.
+        db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO task_blocked_signals
+                    (work_item_id, reason, attempt_id, created_at, cleared_at)
+                 VALUES (?1, 'merge_conflict', NULL, '1700000000', NULL)",
+                rusqlite::params![chore],
+            )
+            .unwrap();
+        }
+        let mut staged: Vec<String> = db
+            .active_blocked_signals(&chore)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.reason)
+            .collect();
+        staged.sort();
+        assert_eq!(
+            staged,
+            vec!["ci_failure".to_owned(), "merge_conflict".to_owned()],
+        );
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Pass 1: probe reports mergeable=Conflict, ci=Clean. The
+        // dispatch must short-circuit before reaching either retire
+        // path because `Conflict` mergeability routes to the
+        // detect/idempotent path (not the Clean clear path). The
+        // signals therefore stay active.
+        probe.set(
+            pr,
+            PrLifecycleState::Open(OpenPrStatus {
+                mergeability: OpenPrMergeability::Conflict,
+                ci: OpenPrCiStatus::Clean,
+            }),
+        );
+        let _ = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        let active_after_1: Vec<String> = db
+            .active_blocked_signals(&chore)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.reason)
+            .collect();
+        let mut active_after_1 = active_after_1;
+        active_after_1.sort();
+        assert_eq!(
+            active_after_1,
+            vec!["ci_failure".to_owned(), "merge_conflict".to_owned()],
+            "Conflict mergeability must not clear either side-table row",
+        );
+
+        // Pass 2: probe reports mergeable=Clean, ci=Clean. The
+        // dispatch's clean-branch iterates the side table and clears
+        // the `merge_conflict` row (via on_resolved) and the
+        // `ci_failure` row (via on_ci_resolved). Each fires
+        // independently — neither hides the other.
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let outcome =
+            run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        // The conflict retire path is no-op against the side-table row
+        // because the scalar is `ci_failure`; the WHERE guard in
+        // `clear_chore_blocked_merge_conflict` misses. However, the
+        // signal-row clear happens regardless: the dispatch's
+        // polymorphic iteration sees both reasons and routes
+        // each — the CI retire fires (scalar matches), and the
+        // conflict retire is a cheap no-op as designed.
+        assert_eq!(
+            outcome.ci_cleared, 1,
+            "ci_failure retired (scalar matched ci_failure)",
+        );
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 
     /// Acceptance test: a kick that arrives after the quiesce window

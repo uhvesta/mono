@@ -133,6 +133,29 @@ enum EngineEvent {
     case conflictResolutionFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
     /// Activity-feed push: an attempt was abandoned on purpose.
     case conflictResolutionAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    /// Activity-feed push: a fresh CI-remediation attempt was created
+    /// for an in-review PR. `attemptKind` is `"fix"` or `"retrigger"`
+    /// per the engine's pre-spawn triage. Mirrors
+    /// `conflictResolutionStarted` (merge-conflict-handling-in-review
+    /// Phase 10 #34).
+    case ciRemediationStarted(productID: String, workItemID: String, attemptID: String, prURL: String, attemptKind: String)
+    /// Activity-feed push: the engine observed the parent PR back at
+    /// CI clean and retired the remediation attempt. The parent has
+    /// been flipped from `blocked: ci_failure` back to `in_review`.
+    case ciRemediationSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String)
+    /// Activity-feed push: a CI-remediation attempt terminated in
+    /// `failed`. Fired when the worker calls
+    /// `boss engine ci mark-failed` or when the completion-path
+    /// catch-all (`no_push_no_classification`) fires.
+    case ciRemediationFailed(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    /// Activity-feed push: a CI-remediation attempt was abandoned on
+    /// purpose (parent PR closed externally, manual move, etc.).
+    case ciRemediationAbandoned(productID: String, workItemID: String, attemptID: String, prURL: String, failureReason: String)
+    /// Activity-feed push: the engine has given up auto-fixing this
+    /// PR's CI. The parent is now `blocked: ci_failure_exhausted` and
+    /// the user is the next actor (typically via
+    /// `boss engine ci retry <work-item-id>`).
+    case ciRemediationExhausted(productID: String, workItemID: String, prURL: String, attemptsUsed: Int, budget: Int)
     /// Response to `list_feature_flags` — a snapshot of every
     /// registered engine feature flag and its current value. Drives
     /// the Feature Flags debug pane.
@@ -900,6 +923,45 @@ final class EngineClient: @unchecked Sendable {
                     attemptID: payload["attempt_id"] as? String ?? "",
                     prURL: payload["pr_url"] as? String ?? "",
                     failureReason: payload["failure_reason"] as? String ?? ""
+                ))
+            case "ci_remediation_started":
+                emit(.ciRemediationStarted(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? "",
+                    attemptKind: payload["attempt_kind"] as? String ?? ""
+                ))
+            case "ci_remediation_succeeded":
+                emit(.ciRemediationSucceeded(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? ""
+                ))
+            case "ci_remediation_failed":
+                emit(.ciRemediationFailed(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? "",
+                    failureReason: payload["failure_reason"] as? String ?? ""
+                ))
+            case "ci_remediation_abandoned":
+                emit(.ciRemediationAbandoned(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? "",
+                    failureReason: payload["failure_reason"] as? String ?? ""
+                ))
+            case "ci_remediation_exhausted":
+                emit(.ciRemediationExhausted(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? "",
+                    attemptsUsed: (payload["attempts_used"] as? NSNumber)?.intValue ?? 0,
+                    budget: (payload["budget"] as? NSNumber)?.intValue ?? 0
                 ))
             case "feature_flags_list":
                 let raw = payload["flags"] as? [[String: Any]] ?? []

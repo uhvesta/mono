@@ -97,6 +97,14 @@ pub fn register_metrics(registry: &Registry) {
 /// loudly so the user knows the engine gave up rather than churning.
 pub const CONFLICT_NO_PUSH_REASON: &str = "no_push_no_stop_condition";
 
+/// Catch-all `failure_reason` stamped on a `ci_remediations` row when
+/// the bound worker exits without pushing and without otherwise
+/// classifying the outcome via `boss engine ci mark-failed`
+/// (design §Phase 10 #33). Mirrors [`CONFLICT_NO_PUSH_REASON`]; the
+/// name diverges to make audits unambiguous about which flow the
+/// catch-all fired in.
+pub const CI_NO_PUSH_REASON: &str = "no_push_no_classification";
+
 /// Asks the registered app session to tear down the libghostty pane
 /// hosting `run_id`. Implementations must be idempotent: a duplicate
 /// call after the slot has been released is a no-op, not an error.
@@ -762,10 +770,21 @@ impl WorkerCompletionHandler {
         // resolved. The finalizer decides whether to mark the bound
         // `conflict_resolutions` row `failed` based on whether the
         // worker pushed (see [`Self::finalize_conflict_resolution_attempt`]).
+        //
+        // Phase 10 #33: the same catch-all applies to `ci_remediation`
+        // executions. The two flows share the on-Stop hook but write to
+        // different attempt tables — dispatch by `execution.kind`.
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
-            if execution.kind == "conflict_resolution" {
-                self.finalize_conflict_resolution_attempt(&execution, &outcome)
-                    .await;
+            match execution.kind.as_str() {
+                "conflict_resolution" => {
+                    self.finalize_conflict_resolution_attempt(&execution, &outcome)
+                        .await;
+                }
+                "ci_remediation" => {
+                    self.finalize_ci_remediation_attempt(&execution, &outcome)
+                        .await;
+                }
+                _ => {}
             }
         }
         outcome
@@ -1471,6 +1490,138 @@ impl WorkerCompletionHandler {
                     attempt_id: updated.id.clone(),
                     pr_url: updated.pr_url.clone(),
                     failure_reason: CONFLICT_NO_PUSH_REASON.to_owned(),
+                },
+            )
+            .await;
+    }
+
+    /// Phase 10 #33: catch-all finaliser for `ci_remediation` workers.
+    /// Mirrors [`Self::finalize_conflict_resolution_attempt`]. Fires for
+    /// every Stop event on a `ci_remediation` execution; decides whether
+    /// to mark the bound `ci_remediations` row `failed` with the
+    /// catch-all reason ([`CI_NO_PUSH_REASON`]).
+    ///
+    /// Same rule as the conflict-resolver flow: if the attempt is still
+    /// `running`, `head_sha_after IS NULL`, `failure_reason IS NULL`,
+    /// AND the worker exited without pushing (PR not freshly bound),
+    /// the engine has no signal that the worker classified its own
+    /// outcome — default to `failed` with the catch-all reason. On
+    /// `Fresh` / `Merged` outcomes the merge poller's `on_ci_resolved`
+    /// retire path will mark the attempt `succeeded` shortly. On the
+    /// `Stale` / `EmptyDiff` paths the on-Stop probe queue is already
+    /// chasing the worker for a follow-up push, so leave the attempt
+    /// alone.
+    ///
+    /// Idempotent — the underlying
+    /// [`WorkDb::mark_ci_remediation_failed`] WHERE-guards on
+    /// `status IN ('pending', 'running')`, so a duplicate finaliser
+    /// call after a terminal transition writes nothing.
+    pub async fn finalize_ci_remediation_attempt(
+        &self,
+        execution: &crate::work::WorkExecution,
+        outcome: &StopOutcome,
+    ) {
+        let attempt = match self
+            .work_db
+            .active_ci_remediation_for_work_item(&execution.work_item_id)
+        {
+            Ok(Some(attempt)) => attempt,
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    "ci-remediation finalizer: no active attempt; nothing to do",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "ci-remediation finalizer: failed to look up active attempt",
+                );
+                return;
+            }
+        };
+        // Already past the "running with no outcome" window — the
+        // worker classified via `mark-failed` / `mark-retriggered`,
+        // the poller already retired it, or some other path closed
+        // the row. Nothing for the catch-all to do.
+        if attempt.status != "running"
+            || attempt.head_sha_after.is_some()
+            || attempt.failure_reason.is_some()
+        {
+            return;
+        }
+
+        let should_mark_failed = match outcome {
+            // Worker pushed (or the PR is already merged from this run).
+            // The merge poller's on_ci_resolved retire path will mark
+            // the attempt `succeeded` once CI is green.
+            StopOutcome::PrDetected { .. } | StopOutcome::PrMerged { .. } => false,
+            // Worker pushed something but the PR head still trails the
+            // worker's local commits, or pushed an empty diff. The
+            // on-Stop probe path has already nudged the worker; don't
+            // pre-empt with a `failed` mark.
+            StopOutcome::StalePr { .. } | StopOutcome::EmptyDiffPr { .. } => false,
+            // Race with an already-finalized execution.
+            StopOutcome::AlreadyTerminal | StopOutcome::UnknownExecution => false,
+            // Incident-001 gates (mirrors conflict finalizer).
+            StopOutcome::RunningNoStagedPr => false,
+            StopOutcome::FallbackDisabledByFlag => false,
+            // Catch-all branches: worker exited without evidence of a
+            // push and without classifying via `mark-failed`.
+            StopOutcome::AwaitingInput
+            | StopOutcome::DetectorFailed
+            | StopOutcome::NoWorkspace
+            | StopOutcome::DbError => true,
+        };
+        if !should_mark_failed {
+            return;
+        }
+
+        let updated = match self
+            .work_db
+            .mark_ci_remediation_failed(&attempt.id, CI_NO_PUSH_REASON)
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    "ci-remediation finalizer: attempt already terminal between probes",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "ci-remediation finalizer: failed to mark attempt failed",
+                );
+                return;
+            }
+        };
+
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            attempt_id = %updated.id,
+            pr_url = %updated.pr_url,
+            reason = CI_NO_PUSH_REASON,
+            ?outcome,
+            "ci-remediation finalizer: worker exited without pushing; attempt marked failed",
+        );
+
+        self.publisher
+            .publish_frontend_event_on_product(
+                &updated.product_id,
+                FrontendEvent::CiRemediationFailed {
+                    product_id: updated.product_id.clone(),
+                    work_item_id: updated.work_item_id.clone(),
+                    attempt_id: updated.id.clone(),
+                    pr_url: updated.pr_url.clone(),
+                    failure_reason: CI_NO_PUSH_REASON.to_owned(),
                 },
             )
             .await;
@@ -3201,6 +3352,241 @@ mod tests {
             typed.iter().all(|(_, ev)| !matches!(
                 ev,
                 boss_protocol::FrontendEvent::ConflictResolutionFailed { .. }
+            )),
+            "Failed event must not be re-broadcast by the catch-all",
+        );
+    }
+
+    /// Stand up a fixture for the CI-remediation completion path:
+    /// chore in `blocked: ci_failure` with a `ci_remediations` row in
+    /// `status='running'` and a `kind='ci_remediation'` execution row
+    /// bound to the same work item. Mirrors [`conflict_fixture`] but
+    /// for Phase 10 #33.
+    fn ci_remediation_fixture(
+        workspace_path: &Path,
+    ) -> (Arc<WorkDb>, String, String, String, String) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Fix CI".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        db.update_work_item(
+            &chore.id,
+            crate::work::WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let attempt = db
+            .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: pr_url.into(),
+                pr_number: 88,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: "head-1".into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+            })
+            .unwrap()
+            .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, pr_url, Some(&attempt.id))
+            .unwrap();
+        db.mark_ci_remediation_running(&attempt.id, "lease-1", "ws-1", "worker-1")
+            .unwrap();
+
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "ci_remediation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        (db, product.id, chore.id, execution.id, attempt.id)
+    }
+
+    #[tokio::test]
+    async fn ci_remediation_worker_exits_without_push_marks_attempt_failed() {
+        // Phase 10 #33: a `ci_remediation` worker bound to a running
+        // attempt exits with no PR detected (`StopOutcome::AwaitingInput`).
+        // The completion-path catch-all must flip the attempt to
+        // `failed` with the documented reason and emit the typed event.
+        let workspace = tempdir().unwrap();
+        let (db, product_id, _chore_id, execution_id, attempt_id) =
+            ci_remediation_fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube,
+            publisher.clone(),
+            pane,
+            probes,
+        );
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(outcome, StopOutcome::AwaitingInput);
+
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(attempt.failure_reason.as_deref(), Some(CI_NO_PUSH_REASON));
+        assert!(attempt.finished_at.is_some());
+
+        let typed = publisher.typed_events.lock().await.clone();
+        let failed_event = typed.iter().find(|(pid, ev)| {
+            pid == &product_id
+                && matches!(
+                    ev,
+                    boss_protocol::FrontendEvent::CiRemediationFailed {
+                        attempt_id: a,
+                        failure_reason,
+                        ..
+                    } if a == &attempt_id && failure_reason == CI_NO_PUSH_REASON
+                )
+        });
+        assert!(
+            failed_event.is_some(),
+            "expected CiRemediationFailed event for {attempt_id}, got {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_remediation_worker_pushed_does_not_mark_attempt_failed() {
+        // Worker pushed (PrStatus::Fresh) — the merge poller's
+        // on_ci_resolved retire path will mark the attempt `succeeded`
+        // once CI goes green. The completion finalizer must NOT pre-empt
+        // that with a `failed` mark.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id, attempt_id) =
+            ci_remediation_fixture(workspace.path());
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/88"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube,
+            publisher.clone(),
+            pane,
+            probes,
+        );
+        let _ = handler.on_stop(&execution_id).await;
+
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "running",
+            "fresh-PR finalization must leave the attempt for the poller",
+        );
+        assert!(attempt.failure_reason.is_none());
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().all(|(_, ev)| !matches!(
+                ev,
+                boss_protocol::FrontendEvent::CiRemediationFailed { .. }
+            )),
+            "no CiRemediationFailed event must fire when the worker pushed",
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_remediation_worker_with_mark_failed_already_set_is_skipped() {
+        // Worker called `boss engine ci mark-failed` first. The
+        // completion catch-all must observe the existing failure_reason
+        // and NOT overwrite with the catch-all reason.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, _chore_id, execution_id, attempt_id) =
+            ci_remediation_fixture(workspace.path());
+        db.mark_ci_remediation_failed(&attempt_id, "triage_bailout")
+            .unwrap();
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube,
+            publisher.clone(),
+            pane,
+            probes,
+        );
+        let _ = handler.on_stop(&execution_id).await;
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(
+            attempt.failure_reason.as_deref(),
+            Some("triage_bailout"),
+            "catch-all must not overwrite an existing failure_reason",
+        );
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().all(|(_, ev)| !matches!(
+                ev,
+                boss_protocol::FrontendEvent::CiRemediationFailed { .. }
             )),
             "Failed event must not be re-broadcast by the catch-all",
         );
