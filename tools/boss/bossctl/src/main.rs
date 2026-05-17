@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use boss_engine::host_registry::{Host, HostCapability};
 use boss_engine::work::WorkDb;
 
 use anyhow::{Context, Result, bail};
@@ -117,6 +118,16 @@ enum Command {
     Metrics {
         #[command(subcommand)]
         action: MetricsAction,
+    },
+    /// Register and manage remote SSH hosts in the Boss host registry.
+    ///
+    /// All subcommands read or write `state.db` directly — they work
+    /// even when the engine is not running. The `local` host is
+    /// auto-registered at engine first start with capabilities
+    /// discovered from the local machine.
+    Hosts {
+        #[command(subcommand)]
+        action: HostsAction,
     },
 }
 
@@ -316,6 +327,94 @@ enum MetricsAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum HostsAction {
+    /// Register a new remote host. The host is enabled immediately and
+    /// persisted to `state.db`. No SSH connection is made in Phase 1.
+    Add {
+        /// Unique identifier for this host (e.g. `zakalwe`).
+        id: String,
+        /// SSH target used to reach this host (alias or `user@host`).
+        #[arg(long)]
+        ssh_target: String,
+        /// Number of concurrent worker slots on this host.
+        #[arg(long, default_value_t = 1)]
+        pool_size: i64,
+        /// User-defined capability tags (e.g. `--tag os=macos --tag arch=arm64`).
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// List all registered hosts with their enabled state and capability count.
+    List {
+        /// Only show enabled hosts.
+        #[arg(long)]
+        enabled: bool,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Show full details for a single host including all capabilities.
+    Show {
+        id: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Add or remove user-defined capability tags on a host.
+    Tag {
+        #[command(subcommand)]
+        action: HostsTagAction,
+    },
+    /// Enable a previously disabled host.
+    Enable {
+        id: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Disable a host so no new work is dispatched to it.
+    Disable {
+        id: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Remove a host from the registry. Fails for the built-in `local` host.
+    Remove {
+        id: String,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HostsTagAction {
+    /// Add one or more user capability tags to a host.
+    Add {
+        id: String,
+        /// Capability tag(s) to add (e.g. `os=macos`, `bazel=7`).
+        #[arg(required = true)]
+        tags: Vec<String>,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Remove one or more user capability tags from a host.
+    Remove {
+        id: String,
+        /// Capability tag(s) to remove.
+        #[arg(required = true)]
+        tags: Vec<String>,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+}
+
 fn bossctl_version_string() -> String {
     let sha = option_env!("BOSS_GIT_SHA").unwrap_or("unknown");
     let time = option_env!("BOSS_BUILD_TIME").unwrap_or("unknown");
@@ -458,6 +557,43 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let target = if all { None } else { name };
             metrics_reset(&cli.socket_path, cli.json, target).await
         }
+        Command::Hosts {
+            action:
+                HostsAction::Add {
+                    id,
+                    ssh_target,
+                    pool_size,
+                    tags,
+                    state_root,
+                },
+        } => hosts_add(cli.json, state_root, id, ssh_target, pool_size, tags),
+        Command::Hosts {
+            action: HostsAction::List { enabled, state_root },
+        } => hosts_list(cli.json, state_root, enabled),
+        Command::Hosts {
+            action: HostsAction::Show { id, state_root },
+        } => hosts_show(cli.json, state_root, id),
+        Command::Hosts {
+            action:
+                HostsAction::Tag {
+                    action: HostsTagAction::Add { id, tags, state_root },
+                },
+        } => hosts_tag_add(cli.json, state_root, id, tags),
+        Command::Hosts {
+            action:
+                HostsAction::Tag {
+                    action: HostsTagAction::Remove { id, tags, state_root },
+                },
+        } => hosts_tag_remove(cli.json, state_root, id, tags),
+        Command::Hosts {
+            action: HostsAction::Enable { id, state_root },
+        } => hosts_set_enabled(cli.json, state_root, id, true),
+        Command::Hosts {
+            action: HostsAction::Disable { id, state_root },
+        } => hosts_set_enabled(cli.json, state_root, id, false),
+        Command::Hosts {
+            action: HostsAction::Remove { id, state_root },
+        } => hosts_remove(cli.json, state_root, id),
     }
 }
 
@@ -1924,6 +2060,207 @@ fn print_live_status_slot_debug(slot: &LiveStatusSlotDebug) {
         println!("  last_redacted_bytes: {bytes}");
     }
     println!();
+}
+
+// ── bossctl hosts handlers ────────────────────────────────────────────────────
+
+fn open_hosts_db(state_root: Option<PathBuf>) -> Result<WorkDb> {
+    let db_path = resolve_db_path(state_root)?;
+    WorkDb::open(db_path).context("opening state.db for hosts")
+}
+
+fn hosts_add(
+    json: bool,
+    state_root: Option<PathBuf>,
+    id: String,
+    ssh_target: String,
+    pool_size: i64,
+    tags: Vec<String>,
+) -> Result<()> {
+    let db = open_hosts_db(state_root)?;
+    let host = db.add_host(&id, &ssh_target, pool_size, &tags)?;
+    let caps = db.list_host_capabilities(&host.id)?;
+    if json {
+        println!("{}", host_to_json(&host, &caps));
+    } else {
+        println!("registered host {}", host.id);
+        print_host_detail(&host, &caps);
+    }
+    Ok(())
+}
+
+fn hosts_list(json: bool, state_root: Option<PathBuf>, only_enabled: bool) -> Result<()> {
+    let db = open_hosts_db(state_root)?;
+    let mut hosts = db.list_hosts()?;
+    if only_enabled {
+        hosts.retain(|h| h.enabled);
+    }
+    if json {
+        let arr: Vec<serde_json::Value> = hosts
+            .iter()
+            .map(|h| {
+                let caps = db.list_host_capabilities(&h.id).unwrap_or_default();
+                host_to_json(h, &caps)
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "hosts": arr }));
+    } else if hosts.is_empty() {
+        println!("no hosts registered");
+    } else {
+        for host in &hosts {
+            let caps = db.list_host_capabilities(&host.id).unwrap_or_default();
+            print_host_short(host, &caps);
+        }
+    }
+    Ok(())
+}
+
+fn hosts_show(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()> {
+    let db = open_hosts_db(state_root)?;
+    match db.get_host(&id)? {
+        None => {
+            if json {
+                println!("{}", serde_json::json!({ "host": null, "id": id }));
+            } else {
+                println!("host not found: {id}");
+            }
+        }
+        Some(host) => {
+            let caps = db.list_host_capabilities(&host.id)?;
+            if json {
+                println!("{}", host_to_json(&host, &caps));
+            } else {
+                print_host_detail(&host, &caps);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hosts_tag_add(
+    json: bool,
+    state_root: Option<PathBuf>,
+    id: String,
+    tags: Vec<String>,
+) -> Result<()> {
+    let db = open_hosts_db(state_root)?;
+    for tag in &tags {
+        db.add_user_host_capability(&id, tag)?;
+    }
+    let host = db.get_host(&id)?.context("host disappeared after tag add")?;
+    let caps = db.list_host_capabilities(&id)?;
+    if json {
+        println!("{}", host_to_json(&host, &caps));
+    } else {
+        println!("added {} tag(s) to host {id}", tags.len());
+        print_host_detail(&host, &caps);
+    }
+    Ok(())
+}
+
+fn hosts_tag_remove(
+    json: bool,
+    state_root: Option<PathBuf>,
+    id: String,
+    tags: Vec<String>,
+) -> Result<()> {
+    let db = open_hosts_db(state_root)?;
+    for tag in &tags {
+        db.remove_user_host_capability(&id, tag)?;
+    }
+    let host = db.get_host(&id)?.context("host disappeared after tag remove")?;
+    let caps = db.list_host_capabilities(&id)?;
+    if json {
+        println!("{}", host_to_json(&host, &caps));
+    } else {
+        println!("removed {} tag(s) from host {id}", tags.len());
+        print_host_detail(&host, &caps);
+    }
+    Ok(())
+}
+
+fn hosts_set_enabled(
+    json: bool,
+    state_root: Option<PathBuf>,
+    id: String,
+    enabled: bool,
+) -> Result<()> {
+    let db = open_hosts_db(state_root)?;
+    db.set_host_enabled(&id, enabled)?;
+    let host = db.get_host(&id)?.context("host disappeared after enable/disable")?;
+    let caps = db.list_host_capabilities(&host.id)?;
+    if json {
+        println!("{}", host_to_json(&host, &caps));
+    } else {
+        let verb = if enabled { "enabled" } else { "disabled" };
+        println!("{verb} host {id}");
+    }
+    Ok(())
+}
+
+fn hosts_remove(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()> {
+    let db = open_hosts_db(state_root)?;
+    db.remove_host(&id)?;
+    if json {
+        println!("{}", serde_json::json!({ "status": "removed", "id": id }));
+    } else {
+        println!("removed host {id}");
+    }
+    Ok(())
+}
+
+fn host_to_json(host: &Host, caps: &[HostCapability]) -> serde_json::Value {
+    serde_json::json!({
+        "id": host.id,
+        "ssh_target": host.ssh_target,
+        "pool_size": host.pool_size,
+        "enabled": host.enabled,
+        "last_seen_at": host.last_seen_at,
+        "last_error_text": host.last_error_text,
+        "created_at": host.created_at,
+        "capabilities": caps.iter().map(|c| serde_json::json!({
+            "capability": c.capability,
+            "source": c.source,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn print_host_short(host: &Host, caps: &[HostCapability]) {
+    let enabled = if host.enabled { "enabled" } else { "disabled" };
+    let target = host.ssh_target.as_deref().unwrap_or("(local)");
+    println!(
+        "{}  {}  pool={}  caps={}  target={}",
+        host.id,
+        enabled,
+        host.pool_size,
+        caps.len(),
+        target,
+    );
+}
+
+fn print_host_detail(host: &Host, caps: &[HostCapability]) {
+    let enabled = if host.enabled { "enabled" } else { "disabled" };
+    println!("host {}", host.id);
+    println!("  status:      {enabled}");
+    println!("  pool_size:   {}", host.pool_size);
+    if let Some(t) = &host.ssh_target {
+        println!("  ssh_target:  {t}");
+    }
+    println!("  created_at:  {}", host.created_at);
+    if let Some(s) = &host.last_seen_at {
+        println!("  last_seen:   {s}");
+    }
+    if let Some(e) = &host.last_error_text {
+        println!("  last_error:  {e}");
+    }
+    if caps.is_empty() {
+        println!("  capabilities: (none)");
+    } else {
+        println!("  capabilities:");
+        for cap in caps {
+            println!("    {} [{}]", cap.capability, cap.source);
+        }
+    }
 }
 
 #[cfg(test)]

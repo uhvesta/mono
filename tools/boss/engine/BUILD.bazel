@@ -27,6 +27,7 @@ rust_library(
         "src/external_tracker/github.rs",
         "src/external_tracker/mod.rs",
         "src/feature_flags.rs",
+        "src/host_registry.rs",
         "src/ipc_log.rs",
         "src/lib.rs",
         "src/live_status.rs",

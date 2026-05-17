@@ -3039,15 +3039,22 @@ impl WorkDb {
         // upstream-ref columns (tasks) plus partial indices. Design:
         // tools/boss/docs/designs/external-issue-tracker-sync-github-projects.md
         migrate_external_tracker_columns(&conn)?;
+        // Host registry tables + work_executions host columns for distributed
+        // agent execution (phase 1 — schema + CLI only, no dispatch change).
+        // Design: tools/boss/docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md
+        crate::host_registry::migrate_host_registry_tables(&conn)?;
+        crate::host_registry::migrate_work_executions_host_columns(&conn)?;
+        crate::host_registry::ensure_local_host(&conn)?;
+        crate::host_registry::refresh_local_host_auto_capabilities(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '11')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '12')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
         Ok(())
     }
 
-    fn connect(&self) -> Result<Connection> {
+    pub(crate) fn connect(&self) -> Result<Connection> {
         let mut conn = if let Some(mem) = &self.memory {
             // For in-memory databases, connect via the named shared-cache URI
             // so every connect() call shares the same database instance.
@@ -11933,7 +11940,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
 
         let _ = std::fs::remove_file(path);
     }
@@ -13538,7 +13545,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let _ = std::fs::remove_file(path);
     }
 
@@ -13721,7 +13728,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let _ = std::fs::remove_file(path);
     }
 
@@ -13767,7 +13774,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
 
         let _ = std::fs::remove_file(path);
     }
@@ -13855,7 +13862,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
 
         let _ = std::fs::remove_file(path);
     }
@@ -14516,7 +14523,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let _ = std::fs::remove_file(path);
     }
 
@@ -14615,7 +14622,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let _ = std::fs::remove_file(path);
     }
 
@@ -15011,7 +15018,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
 
         // After migration we can also write a fresh `blocked` row
         // and re-backfill is still a no-op (the existing rows
