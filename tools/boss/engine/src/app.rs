@@ -5602,18 +5602,58 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::SetProductExternalTracker { input } => {
-                // T3+ (ExternalTracker trait + reconciler) will implement
-                // persistence; this stub keeps the protocol enum exhaustive.
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: format!(
-                            "SetProductExternalTracker not yet implemented (product_id={})",
-                            input.product_id
-                        ),
-                    },
-                );
+                let validation_result = if input.unset {
+                    Ok(())
+                } else {
+                    match (input.kind.as_deref(), input.config.as_ref()) {
+                        (None, _) | (_, None) => Err("both kind and config must be provided when not using unset".to_owned()),
+                        (Some(kind), Some(config)) => validate_external_tracker_config(kind, config),
+                    }
+                };
+                match validation_result {
+                    Err(msg) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError { message: msg },
+                    ),
+                    Ok(()) => {
+                        let result = work_db.set_product_external_tracker(
+                            &input.product_id,
+                            input.kind.as_deref(),
+                            input.config.as_ref(),
+                            input.unset,
+                        );
+                        match result {
+                            Ok(product) => {
+                                let item = WorkItem::Product(product);
+                                let product_id = work_item_product_id(&item);
+                                let revision = publish_work_invalidation(
+                                    &server_state,
+                                    &session_id,
+                                    &request_id,
+                                    vec![work_product_topic(&product_id)],
+                                    "external_tracker_updated",
+                                    Some(product_id),
+                                    vec![work_item_id(&item)],
+                                )
+                                .await;
+                                send_response_with_revision(
+                                    &sink,
+                                    &request_id,
+                                    revision,
+                                    FrontendEvent::WorkItemUpdated { item },
+                                );
+                            }
+                            Err(err) => send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: err.to_string(),
+                                },
+                            ),
+                        }
+                    }
+                }
             }
             FrontendRequest::SyncProductExternalTracker { product_id } => {
                 send_response(
@@ -6123,6 +6163,33 @@ fn work_item_id(item: &WorkItem) -> String {
         WorkItem::Product(product) => product.id.clone(),
         WorkItem::Project(project) => project.id.clone(),
         WorkItem::Task(task) | WorkItem::Chore(task) => task.id.clone(),
+    }
+}
+
+/// Validate a kind-specific external tracker config JSON.
+/// Returns `Err` with a human-readable message when validation fails.
+fn validate_external_tracker_config(
+    kind: &str,
+    config: &serde_json::Value,
+) -> Result<(), String> {
+    match kind {
+        "github" => {
+            for field in ["org", "repo"] {
+                match config.get(field).and_then(|v| v.as_str()) {
+                    None | Some("") => {
+                        return Err(format!("missing required field '{field}' for kind=github"));
+                    }
+                    _ => {}
+                }
+            }
+            match config.get("project_number") {
+                None => return Err("missing required field 'project_number' for kind=github".to_owned()),
+                Some(v) if !v.is_number() => return Err("'project_number' must be a number for kind=github".to_owned()),
+                _ => {}
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown tracker kind '{other}'; supported: github")),
     }
 }
 

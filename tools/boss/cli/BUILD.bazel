@@ -167,3 +167,26 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+# End-to-end coverage for `boss product set-external-tracker` and the
+# external-tracker block in `boss product show` (chores 11 + 14 of the
+# external-issue-tracker-sync design). Drives the `boss` binary against
+# an in-process engine and verifies bind → show → unbind → show lifecycle.
+rust_test(
+    name = "external_tracker_test",
+    srcs = ["tests/external_tracker.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
