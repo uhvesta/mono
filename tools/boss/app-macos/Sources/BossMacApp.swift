@@ -63,9 +63,10 @@ struct BossMacApp: App {
         }
         .defaultSize(width: 880, height: 700)
 
-        Window("Activity Log", id: "activity-log") {
-            LogViewer()
+        Window("Activity", id: "activity") {
+            ActivityView()
         }
+        .environmentObject(chatModel)
         .defaultSize(width: 1100, height: 640)
 
         Window("Metrics", id: "metrics") {
@@ -79,19 +80,34 @@ struct BossMacApp: App {
 private struct LogViewerCommand: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
-    @AppStorage("boss.logViewer.visible") private var isOpen = false
+    @AppStorage("boss.activity.visible") private var isOpen = false
 
     var body: some View {
-        Button("Activity Log") {
+        Button("Show Activity") {
             if isOpen {
                 isOpen = false
-                dismissWindow(id: "activity-log")
+                dismissWindow(id: "activity")
             } else {
                 isOpen = true
-                openWindow(id: "activity-log")
+                openWindow(id: "activity")
             }
         }
         .keyboardShortcut("l", modifiers: [.command, .shift])
+    }
+}
+
+private struct ActivityView: View {
+    @AppStorage("boss.activity.visible") private var isOpen = false
+
+    var body: some View {
+        TabView {
+            ActivityLogView()
+                .tabItem { Label("Activity", systemImage: "list.bullet") }
+            LogViewer()
+                .tabItem { Label("Logs", systemImage: "doc.text.magnifyingglass") }
+        }
+        .onAppear { isOpen = true }
+        .onDisappear { isOpen = false }
     }
 }
 

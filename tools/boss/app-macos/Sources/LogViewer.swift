@@ -523,7 +523,6 @@ final class LogViewerModel: ObservableObject {
 struct LogViewer: View {
     @StateObject private var model = LogViewerModel()
     @State private var selected: LogEntry?
-    @AppStorage("boss.logViewer.visible") private var isOpen = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -533,8 +532,8 @@ struct LogViewer: View {
             Divider()
             content
         }
-        .onAppear { model.start(); isOpen = true }
-        .onDisappear { model.stop(); isOpen = false }
+        .onAppear { model.start() }
+        .onDisappear { model.stop() }
         .frame(minWidth: 1000, minHeight: 520)
     }
 
