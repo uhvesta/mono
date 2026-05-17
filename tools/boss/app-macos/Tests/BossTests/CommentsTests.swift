@@ -133,6 +133,67 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
+    // MARK: - HighlightingMarkdownParser: multi-comment correctness
+
+    /// Returns true if the run containing the character at `charOffset` in `plain`
+    /// has a non-nil backgroundColor attribute in the attributed string.
+    private func isHighlighted(at charOffset: Int, in result: AttributedString) -> Bool {
+        let idx = result.characters.index(result.characters.startIndex, offsetBy: charOffset)
+        return result.runs.contains { run in
+            run.range.contains(idx) && run.swiftUI.backgroundColor != nil
+        }
+    }
+
+    /// Verifies that HighlightingMarkdownParser applies a yellow background to
+    /// every quoted-text span when two comments reference different words in the
+    /// same document.  Regression test for the bug where only the first
+    /// comment's text received a highlight while the second was silently skipped.
+    func testHighlightingParserHighlightsBothCommentedTexts() throws {
+        let source = "The fox jumped over the lazy dog and the cat sat quietly."
+        let parser = HighlightingMarkdownParser(highlightedTexts: ["fox", "cat"])
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+
+        guard let foxRange = plain.range(of: "fox") else {
+            return XCTFail("'fox' not found in rendered plain text")
+        }
+        let foxOffset = plain.distance(from: plain.startIndex, to: foxRange.lowerBound)
+        XCTAssertTrue(
+            isHighlighted(at: foxOffset, in: result),
+            "'fox' span must carry a backgroundColor attribute"
+        )
+
+        guard let catRange = plain.range(of: "cat") else {
+            return XCTFail("'cat' not found in rendered plain text")
+        }
+        let catOffset = plain.distance(from: plain.startIndex, to: catRange.lowerBound)
+        XCTAssertTrue(
+            isHighlighted(at: catOffset, in: result),
+            "'cat' span must carry a backgroundColor attribute — second comment must be highlighted"
+        )
+    }
+
+    /// Verifies that multiple occurrences of the same quoted text are each highlighted.
+    func testHighlightingParserHighlightsMultipleOccurrences() throws {
+        let source = "alpha beta alpha gamma"
+        let parser = HighlightingMarkdownParser(highlightedTexts: ["alpha"])
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+
+        var searchStart = plain.startIndex
+        var occurrenceCount = 0
+        while let range = plain.range(of: "alpha", range: searchStart..<plain.endIndex) {
+            let offset = plain.distance(from: plain.startIndex, to: range.lowerBound)
+            XCTAssertTrue(
+                isHighlighted(at: offset, in: result),
+                "Occurrence of 'alpha' at character offset \(offset) must be highlighted"
+            )
+            occurrenceCount += 1
+            searchStart = range.upperBound
+        }
+        XCTAssertEqual(occurrenceCount, 2, "Expected exactly two 'alpha' occurrences")
+    }
+
     // MARK: - View: highlight overlay placeholder compiles and renders
 
     func testCommentHighlightOverlayRendersWithComments() {

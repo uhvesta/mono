@@ -217,13 +217,19 @@ private struct DesignRendererMarkdownContent: View {
 
     @Environment(\.commentedTexts) private var commentedTexts
     @Environment(\.commentFlashText) private var commentFlashText
+    /// Monotonically-increasing counter bumped whenever the highlight state
+    /// changes. Used as the `.id()` for `StructuredText` to force a fresh
+    /// parse when comments are added/removed or the flash text changes.
+    @State private var parseVersion: Int = 0
 
     var body: some View {
         StructuredText(source, parser: markdownParser)
             .bossMarkdown()
             .textual.textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .id(highlightKey)
+            .id(parseVersion)
+            .onChange(of: commentedTexts) { _, _ in parseVersion &+= 1 }
+            .onChange(of: commentFlashText) { _, _ in parseVersion &+= 1 }
     }
 
     private var markdownParser: any MarkupParser {
@@ -235,11 +241,5 @@ private struct DesignRendererMarkdownContent: View {
             flashingText: commentFlashText,
             baseURL: baseURL
         )
-    }
-
-    private var highlightKey: Int {
-        var h = commentedTexts.hashValue
-        h ^= commentFlashText?.hashValue ?? 0
-        return h
     }
 }

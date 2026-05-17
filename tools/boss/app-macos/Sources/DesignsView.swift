@@ -501,6 +501,12 @@ private struct MarkdownViewerScrollContent: View {
     @Environment(\.commentFlashText) private var commentFlashText
     @State private var parseStartTime: Date? = nil
     @State private var parseLogged = false
+    /// Monotonically-increasing counter bumped whenever the highlight state
+    /// changes. Used as the `.id()` for `StructuredText` to force a fresh
+    /// parse when comments are added/removed or the flash text changes.
+    /// A counter avoids hash collisions that can occur with XOR-combined
+    /// hashValues and guarantees identity changes on every highlight update.
+    @State private var parseVersion: Int = 0
 
     var body: some View {
         ScrollView {
@@ -517,7 +523,11 @@ private struct MarkdownViewerScrollContent: View {
                     // new HighlightingMarkdownParser instance is used to re-parse the source.
                     // StructuredText only re-parses on markup changes; the id() change is the
                     // trigger that ensures highlight updates are reflected immediately.
-                    .id(highlightKey)
+                    // A monotonic counter is used instead of a hashValue-based key to avoid
+                    // hash collisions and guarantee a new identity on every comment update.
+                    .id(parseVersion)
+                    .onChange(of: commentedTexts) { _, _ in parseVersion &+= 1 }
+                    .onChange(of: commentFlashText) { _, _ in parseVersion &+= 1 }
                     .background(
                         GeometryReader { geo in
                             Color.clear.preference(
@@ -561,12 +571,6 @@ private struct MarkdownViewerScrollContent: View {
             highlightedTexts: commentedTexts,
             flashingText: commentFlashText
         )
-    }
-
-    private var highlightKey: Int {
-        var h = commentedTexts.hashValue
-        h ^= commentFlashText?.hashValue ?? 0
-        return h
     }
 }
 

@@ -49,11 +49,13 @@ struct HighlightingMarkdownParser: MarkupParser {
 
         var searchStart = plain.startIndex
         while let matchRange = plain.range(of: text, range: searchStart..<plain.endIndex) {
-            let nsRange = NSRange(matchRange, in: plain)
-            let startIdx = result.characters.index(
-                result.characters.startIndex, offsetBy: nsRange.location)
-            let endIdx = result.characters.index(startIdx, offsetBy: nsRange.length)
-            // Subscript to get the AttributedSubstring and merge attributes on that range.
+            // Use character-level distances (not UTF-16 offsets) so the index
+            // into result.characters is correct for all Unicode text including
+            // non-BMP code points such as emoji that span two UTF-16 units.
+            let startOffset = plain.distance(from: plain.startIndex, to: matchRange.lowerBound)
+            let matchLength = plain.distance(from: matchRange.lowerBound, to: matchRange.upperBound)
+            let startIdx = result.characters.index(result.characters.startIndex, offsetBy: startOffset)
+            let endIdx = result.characters.index(startIdx, offsetBy: matchLength)
             result[startIdx..<endIdx].mergeAttributes(container)
             searchStart = matchRange.upperBound
         }
