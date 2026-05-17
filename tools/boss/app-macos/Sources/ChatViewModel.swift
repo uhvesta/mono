@@ -1398,6 +1398,16 @@ final class ChatViewModel: ObservableObject {
             // for an ageing window measured in hours.
             recentlyClearedConflictPRs[prURL] = Date()
             engine.sendListConflictResolutions(limit: 200)
+        case .ciRemediationStarted, .ciRemediationSucceeded,
+             .ciRemediationFailed, .ciRemediationAbandoned,
+             .ciRemediationExhausted:
+            // Phase 10 #34: the CI-remediation activity-feed events
+            // currently drive nothing more than the engine-tab refresh
+            // we already do for conflict resolutions. The dedicated
+            // `ci_remediations` UI (Engine tab + per-PR badge) ships in
+            // Phase 11 — this arm exists to keep the dispatcher
+            // exhaustive without dropping the wire events on the floor.
+            break
         }
     }
 

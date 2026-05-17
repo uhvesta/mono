@@ -44,12 +44,12 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 pub const DUPLICATE_GUARD_WINDOW_SECS: i64 = 60;
 
 pub use boss_protocol::{
-    AddDependencyInput, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, CiRemediation,
-    ConflictResolution, CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    EffortLevel, ExecutionReconcileResult, ListDependenciesInput, Product, Project,
-    ProjectDesignDocState, RemoveDependencyInput, RequestExecutionInput,
+    AddDependencyInput, BlockedSignal, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN,
+    CiRemediation, ConflictResolution, CreateAttentionItemInput, CreateChoreInput,
+    CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge,
+    DependencyFilter, EffortLevel, ExecutionReconcileResult, ListDependenciesInput, Product,
+    Project, ProjectDesignDocState, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedDesignDoc, ResolvedDesignDocKind,
     SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef,
@@ -3715,6 +3715,15 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // Phase 10 #31: keep the multi-signal side table in sync with
+        // the scalar flip. `attempt_id` is `None` here because
+        // `insert_conflict_resolution` runs immediately after this
+        // method (it stamps `tasks.blocked_attempt_id`); the side
+        // table's `attempt_id` is filled lazily by the attempt-insert
+        // path below. The polymorphic clear dispatch only needs the
+        // `reason` row to be present, so this stays correct even
+        // before the attempt id lands.
+        upsert_task_blocked_signal(&tx, work_item_id, "merge_conflict", None, &now)?;
         let updated = query_task(&tx, work_item_id)?
             .with_context(|| format!("unknown task after merge_conflict flip: {work_item_id}"))?;
         tx.commit()?;
@@ -3753,6 +3762,17 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // Phase 10 #31: mark the matching side-table row(s) cleared so
+        // the polymorphic clear dispatch doesn't re-fire on the next
+        // probe. Mirrors `clear_chore_blocked_ci_failure`.
+        tx.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = 'merge_conflict'
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
         let updated = query_task(&tx, work_item_id)?.with_context(|| {
             format!("unknown task after merge_conflict clear: {work_item_id}")
         })?;
@@ -3796,6 +3816,16 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // Phase 10 #31: keep the side table in sync (see the relaxed
+        // sibling [`Self::clear_chore_blocked_merge_conflict`]).
+        tx.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = 'merge_conflict'
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
         let updated = query_task(&tx, work_item_id)?.with_context(|| {
             format!("unknown task after merge_conflict clear: {work_item_id}")
         })?;
@@ -3980,6 +4010,39 @@ impl WorkDb {
         Ok(effective.clamp(0, 10))
     }
 
+    /// Snapshot of every active `task_blocked_signals` row for one
+    /// work item. "Active" means `cleared_at IS NULL` — flapping
+    /// signals are reset to active on re-observation via
+    /// [`upsert_task_blocked_signal`] so a row only stays active while
+    /// the underlying condition is still observed.
+    ///
+    /// Returned in `created_at ASC` order so the polymorphic clear
+    /// path in the merge poller iterates oldest-first (mirrors the
+    /// design's `maybe_clear_blocked` snippet — order doesn't affect
+    /// correctness because each signal clears against its own probe
+    /// condition, but the deterministic ordering keeps the log /
+    /// activity-feed trail predictable).
+    pub fn active_blocked_signals(&self, work_item_id: &str) -> Result<Vec<BlockedSignal>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT work_item_id, reason, attempt_id, created_at, cleared_at
+             FROM task_blocked_signals
+             WHERE work_item_id = ?1
+               AND cleared_at IS NULL
+             ORDER BY created_at ASC, reason ASC",
+        )?;
+        let rows = stmt.query_map([work_item_id], |row| {
+            Ok(BlockedSignal {
+                work_item_id: row.get(0)?,
+                reason: row.get(1)?,
+                attempt_id: row.get(2)?,
+                created_at: row.get(3)?,
+                cleared_at: row.get(4)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Read the current `ci_attempts_used` counter for a work item.
     /// Defaults to 0 when the row or column is missing (the budget
     /// kicks in only when the parent first enters the CI-failure
@@ -4078,6 +4141,13 @@ impl WorkDb {
         Ok(Some(inserted))
     }
 
+    /// Fetch a single `ci_remediations` row by id. `Ok(None)` if the
+    /// row is missing. Mirrors [`Self::get_conflict_resolution`].
+    pub fn get_ci_remediation(&self, attempt_id: &str) -> Result<Option<CiRemediation>> {
+        let conn = self.connect()?;
+        query_ci_remediation(&conn, attempt_id)
+    }
+
     /// Latest non-terminal `ci_remediations` row for `work_item_id`,
     /// or `None`. Used by `ci_watch` to detect "an attempt is already
     /// in flight" and by the retire path to find the row to flip to
@@ -4142,6 +4212,78 @@ impl WorkDb {
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
             params![attempt_id, head_sha_after, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Flip a `ci_remediations` attempt to `running` and stamp the
+    /// coordinator-owned spawn metadata (lease, workspace, worker
+    /// pane). Mirrors [`Self::mark_conflict_resolution_running`].
+    /// Used by the Phase 9 spawn-flow wiring and by Phase 10 #33's
+    /// completion finalizer tests. Idempotent over a row already in
+    /// `running` — the WHERE guard accepts both `pending` and
+    /// `running` so a re-spawn after engine restart re-stamps the
+    /// columns without rejecting.
+    pub fn mark_ci_remediation_running(
+        &self,
+        attempt_id: &str,
+        cube_lease_id: &str,
+        cube_workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET status            = 'running',
+                    cube_lease_id     = ?2,
+                    cube_workspace_id = ?3,
+                    worker_id         = ?4,
+                    started_at        = COALESCE(started_at, ?5)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, cube_lease_id, cube_workspace_id, worker_id, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Flip a non-terminal `ci_remediations` attempt to `failed` with
+    /// `failure_reason`. Mirrors
+    /// [`Self::mark_conflict_resolution_failed`]. Used by the
+    /// completion-path catch-all (design Phase 10 #33) when a worker
+    /// exits without pushing and without calling
+    /// `boss engine ci mark-failed` to classify its own outcome —
+    /// the engine defaults to `failure_reason='no_push_no_classification'`.
+    /// Idempotent — a row already terminal returns `Ok(None)`.
+    pub fn mark_ci_remediation_failed(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET status         = 'failed',
+                    failure_reason = ?2,
+                    finished_at    = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, reason, now],
         )?;
         if rows == 0 {
             tx.commit()?;
