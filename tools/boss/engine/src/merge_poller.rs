@@ -1103,6 +1103,14 @@ pub async fn run_one_pass(
     if total == 0 {
         return SweepOutcome::default();
     }
+    tracing::debug!(
+        in_review = in_review.len(),
+        blocked_conflict = blocked_conflict.len(),
+        blocked_ci = blocked_ci.len(),
+        pending_pr_recheck = pending_pr_recheck.len(),
+        stranded_attempts = stranded_attempts.len(),
+        "merge poller: sweep started",
+    );
     let mut outcome = SweepOutcome::default();
     // De-duplicate by work_item_id: a chore that's both pending and
     // blocked-on-CI (shouldn't happen but defensive) only gets one
@@ -1217,7 +1225,7 @@ async fn sweep_one(
     let probe_result = match probe.probe(&candidate.pr_url).await {
         Ok(state) => state,
         Err(err) => {
-            tracing::debug!(
+            tracing::warn!(
                 work_item_id = %candidate.work_item_id,
                 pr_url = %candidate.pr_url,
                 ?err,
