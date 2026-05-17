@@ -139,7 +139,7 @@ The `HostAdapter` trait abstracts spawn / probe / interrupt across local and rem
 4. Streams stdio back over the master channel.
 5. Opens a second channel on the same master for probe / signal traffic, addressed by remote PID returned at spawn.
 
-The wrapper script lives in the user's PATH on the remote (`~/.local/bin/boss-remote-run` or similar). It is shipped via the same out-of-band mechanism the user uses to install cube and claude — Boss does not deploy it. Its contents are stable and documented; users can update it manually when the contract changes (rare, version-pinned in the design doc).
+The wrapper script is deployed and kept current by Boss itself — see "Wrapper Distribution" below for install and update mechanics. From Q1's perspective the wrapper is a known-good executable at `~/.boss-remote/bin/boss-remote-run` whose contract (env vars in, exec shape out, sentinel JSON on the channel) the engine controls and the engine refreshes on drift.
 
 ### Q2 — Hook-Event Transport
 
@@ -258,6 +258,7 @@ Each row: how Boss detects it, what Boss surfaces, whether the chore retries els
 | Remote `gh` missing or unauthed | gh failure detected from worker logs at PR-create time | run reason `host_missing_gh`; host marked `degraded` | same as above |
 | Worker SIGKILLed on remote (OOM, logout) | `ControlMaster` channel exits non-zero with signal code; transcript ends abruptly | run reason `worker_killed`; treated as a `host_unreachable` variant for retry purposes | retry once; if it happens twice on the same host, mark host `degraded` |
 | Clock skew between hosts | event timestamps drift visibly from engine receipt time | the engine **never trusts remote timestamps** for ordering; it stamps engine-receipt time on hook events and uses remote timestamps only as informational metadata | n/a; design avoids the problem rather than reconciling it |
+| Wrapper push fails (disk full, permission denied, host unreachable mid-push) | `scp` non-zero exit with recognizable stderr classification | run reason `host_wrapper_push_failed` with `disk_full` / `permission_denied` / `connection_lost` sub-classification in `last_error_text`; host marked `degraded` for disk/permission, `unreachable` for connection-lost | retry on a different eligible host once per the `max_host_retries` policy; never auto-recover the original host — `bossctl hosts probe` re-attempts after the user fixes the cause |
 
 `degraded` is a derived state, not a column: hosts with auto-discovery flags that no longer match required tags are filtered out as if they were missing those tags.
 
@@ -322,6 +323,78 @@ The host on the coordinator side SSHes to the remote and runs arbitrary commands
 - **No new privileged surface on the coordinator.** Engine code that handles SSH errors must not shell out with unsanitized host fields. Host id and ssh_target are validated at insert time (regex: `^[a-zA-Z0-9._@:-]+$`).
 
 The security posture is: nothing new on the wire that was not already exposed by the worker model; nothing new on the coordinator beyond a few SSH subprocess invocations whose arguments come from the validated `hosts` table.
+
+### Wrapper Distribution
+
+**Decision:** Boss owns the wrapper's lifecycle on every registered host. The engine pushes `boss-remote-run` at registration and refreshes it whenever an embedded version string drifts from the engine's expected version. The user installs cube, claude, gh, and the project toolchain; Boss installs everything Boss-specific.
+
+#### Artifact location in the Boss repo
+
+The canonical source lives at `tools/boss/engine/remote/boss-remote-run.sh` and is bundled into the engine binary via `include_str!` at build time. Keeping the source under `engine/remote/` (not `tools/boss/docs/runbooks/` as the previous draft assumed) makes it clear that the artifact is engine-owned: the engine is the only thing that knows what the wrapper must do, and the engine is what ships it. The wrapper is a small POSIX shell script — no compilation, no per-arch fan-out, the same bytes for every remote.
+
+#### Embedded version
+
+The wrapper carries a `BOSS_REMOTE_RUN_VERSION` constant at the top, derived at engine build time from the engine's git short SHA (e.g. `eng-7a3f2c1`). Invoking the wrapper with `--version` prints just that string and exits zero. The engine's expected version is the same string baked into the engine binary; comparison is exact-equality, not semver — any mismatch triggers a re-push. This keeps the version contract trivial and removes any ambiguity about "is this skew compatible?".
+
+#### Install trigger
+
+Both eager and lazy:
+
+- **Eager** at `bossctl hosts add`: register, immediately push the wrapper, immediately invoke `--version` to confirm. A failure here leaves the host in `disabled` state with `last_error_text` populated and prints the actionable diagnostic; the user fixes the cause and retries with `bossctl hosts probe <id>`. This makes registration honest — a host that can't accept the wrapper is a host that can't run jobs.
+- **Lazy** before each dispatch: the `SshHostAdapter` opens its `ControlMaster` connection, invokes `ssh remote ~/.boss-remote/bin/boss-remote-run --version`, and compares with the engine's expected version. Missing file or stale version triggers a push before the worker is launched. The check piggybacks on the existing session so the cost is one extra channel and a few bytes per dispatch.
+
+The lazy check covers what eager cannot: engine upgrades after registration, remotes that were wiped or restored, hosts disabled and re-enabled across versions.
+
+#### Update trigger
+
+Drift is detected by the lazy version handshake above. On drift the engine pushes unconditionally — the wrapper has no in-place upgrade path because the push itself is the upgrade. There is no "warn and continue with old version" branch: the wrapper contract is part of the engine's ABI with remote workers, and a stale wrapper is a bug, not a degraded mode.
+
+#### Push transport
+
+`scp` over the same SSH config the dispatch uses, ridden on the existing `ControlMaster` via `scp -o ControlPath=...`. Reasons over `cat | ssh remote 'cat > path'`:
+
+- Honors the SSH-config alias identically to `ssh`, so `zakalwe` works without separate plumbing.
+- Reuses the control connection — no fresh handshake, no fresh auth prompt.
+- Error surface is well-defined: non-zero exit with recognizable stderr for `No space left on device`, `Permission denied`, `No such file or directory`.
+- `cat | ssh` can return success while truncating if the remote `cat` is killed mid-write; `scp` reports the failure.
+
+#### Install location on the remote
+
+`~/.boss-remote/bin/boss-remote-run`, mode `0755`. Revising the previous draft's `~/.local/bin/boss-remote-run`:
+
+- A Boss-owned directory eliminates the "did Boss or the user write this?" question.
+- Sibling files — a version stamp, future helper binaries, log scratch space — can land under `~/.boss-remote/` without competing with the user's own `~/.local/bin/`.
+- The engine invokes the wrapper by absolute path, so `PATH` membership is not required.
+
+The first push runs `ssh remote 'mkdir -p ~/.boss-remote/bin'` if the directory does not exist.
+
+#### Atomic replace
+
+Push sequence:
+
+1. `scp <local-file> remote:~/.boss-remote/bin/boss-remote-run.new`
+2. `ssh remote 'chmod 0755 ~/.boss-remote/bin/boss-remote-run.new && mv ~/.boss-remote/bin/boss-remote-run.new ~/.boss-remote/bin/boss-remote-run'`
+
+POSIX `rename(2)` on the same filesystem is atomic. A concurrent dispatch sees either the old version (and either matches or triggers its own re-push that will be a no-op once the in-flight one lands) or the new version — never a half-written file. The engine takes a per-host push lock to serialize push attempts so two dispatches on the same host don't race on the `.new` filename.
+
+#### Failure handling
+
+A new run-failure reason: `host_wrapper_push_failed`. Distinct from `host_unreachable` because the diagnostic differs — the engine reached the host but couldn't deliver the artifact. Sub-classification surfaced in `last_error_text`:
+
+- `disk_full` — `scp` reported `No space left on device`. Host marked `degraded`; user clears space, then `bossctl hosts probe <id>`.
+- `permission_denied` — write to `~/.boss-remote/bin/` denied. Surfaces as a registration-time checklist gap.
+- `connection_lost` — SSH error mid-push. Same retry posture as `host_unreachable` (retry on a different eligible host).
+
+Eager-push failure at `bossctl hosts add` leaves only that host disabled — it does not block adding others. Lazy-push failure at dispatch time fails the run with `host_wrapper_push_failed` and feeds back into the Q6 retry policy.
+
+#### Interaction with the cube-managed shim
+
+This revision does not alter the existing decision that the **shim** binary ships under cube's umbrella. The split stands and Boss-managed wrapper distribution is purely additive:
+
+- The **wrapper** (`boss-remote-run`) is the engine's contract with the remote: env vars, exec shape, sentinel output. The engine owns the contract, so the engine owns deployment.
+- The **shim** (`event-shim`) is the event protocol's contract: how a hook event is shaped on the wire. Every cube workspace, local or remote, needs it. Cube owns it and updates it through cube's normal install flow.
+
+The wrapper continues to not interpret events; it only invokes the shim. The engine's version handshake covers the wrapper's contract. The shim's contract is covered by cube's existing distribution path. Stating this explicitly so the reader does not have to infer.
 
 ## Storage Additions
 
@@ -392,9 +465,9 @@ Outcome: a stable adapter seam. The diff is mechanical and reviewable on its own
 - Implement `SshHostAdapter`: `ControlMaster` lifecycle, events-socket remote-forward, transcript-readback socket, control-channel exec, wrapper-script contract.
 - Add the `run_id` correlation token to the event protocol (Q2).
 - Wire the scheduler's capability filter and branch-affinity tiebreaker.
-- Wrapper script `boss-remote-run` documented in `tools/boss/docs/runbooks/` (separate PR is fine).
+- Land the wrapper script source at `tools/boss/engine/remote/boss-remote-run.sh`, bundle it into the engine via `include_str!`, and implement the eager-push at `bossctl hosts add` plus the lazy `--version` check at dispatch (see "Wrapper Distribution"). `host_wrapper_push_failed` becomes a real run-failure reason in the same PR.
 
-Outcome: the user installs cube + claude + gh + the wrapper on zakalwe, runs `bossctl hosts add zakalwe …`, and a capability-matching chore lands there. PR is created identically to a local run. UI shows the host badge.
+Outcome: the user installs cube + claude + gh on zakalwe, runs `bossctl hosts add zakalwe …`, and Boss pushes its wrapper automatically as part of registration. A capability-matching chore lands on zakalwe. PR is created identically to a local run. UI shows the host badge.
 
 ### Phase 4: Probe / Interrupt / Stop Over SSH
 
@@ -427,12 +500,11 @@ Outcome: the user installs cube + claude + gh + the wrapper on zakalwe, runs `bo
 
 These should be resolved before Phase 3 ships.
 
-- **Wrapper script distribution.** The design assumes the user installs `boss-remote-run` on each remote alongside cube and claude. If the wrapper contract changes, every remote must be re-installed. Should the wrapper instead be `scp`'d at registration time from a copy embedded in the engine? Embedding is appealing because the engine knows its own contract, but adds a deploy-on-add step. **Recommendation:** v1 ships the wrapper as a user-installed artifact; v1.1 evaluates auto-deploy after the contract stabilizes.
 - **`ControlMaster` socket lifecycle on coordinator reboot.** Stale control sockets at `~/.ssh/cm-*` can break subsequent connections. Engine startup should sweep its own control sockets. Detail to nail down: socket path policy (engine-owned dir vs `~/.ssh`).
 - **`peer_pid` vs `run_id` correlation.** The events socket today identifies workers by peer pid. Adding `run_id` correlation is a protocol change; existing local workers will need to start sending it too (event-shim change). Backwards-compat shim: accept either, prefer `run_id`, plan to remove pid lookup in a later cleanup.
 - **Multiple repos per host.** This design assumes each host hosts one cube pool per repo, matching the current local model. If a host ever hosts pools for multiple repos, capability tags can cover it (`repo=mono`), but the registry has no explicit notion of which repos a host services. v1 punts; if it bites, add `host_repos` later.
 - **`gh` auth drift on the remote.** GitHub tokens expire silently. The Phase 6 failure detection catches it at PR-create time, which is late. Should the heartbeat run `gh auth status` as part of capability discovery? Probably yes — cheap, catches the failure mode hours earlier. **Recommendation:** include in Phase 1 capability discovery.
-- **Engine ↔ wrapper version skew.** If the engine ships a new event envelope format and the remote wrapper is old, hook events break. Solutions: (a) the wrapper does not interpret events, only forwards; the shim binary version matters more, so ship the shim under cube's umbrella. (b) version-handshake at SSH session start. **Recommendation:** option (a). The shim is small enough to live in the cube repo and update with cube; the wrapper stays stable.
+- **Engine ↔ shim version skew.** The wrapper side of this question is resolved (see "Wrapper Distribution"): Boss distributes the wrapper and refreshes it on exact-version mismatch. What remains is the **shim**'s version-skew story. The shim ships under cube's umbrella per the cube/wrapper split, so its update cadence is cube's update cadence rather than the engine's. If the engine introduces an event-envelope change before the shim catches up, hook events break on hosts whose cube is behind. **Recommendation:** keep the cube/shim split, but have the engine emit a clear `cube too old: shim contract vX expected, got vY` error at lazy version-handshake time (the wrapper can read the shim's `--version` and surface it alongside its own). Treat that as a `degraded` host until the user updates cube.
 - **Branch-affinity scope.** Affinity uses `pr_url` as the affinity key, which is unset until the first run pushes. For the very first run on a branch the engine falls back to free-slots-first. Is that good enough, or do we need a pre-PR affinity hint (e.g. project id)? **Recommendation:** good enough for v1; revisit if cold-cache cost is high.
 - **What does "identical to local" actually mean for transcripts when SSH drops mid-stream?** A truncated transcript on a remote run is more likely than on a local run because the network failure mode exists. The UI should distinguish "transcript ended because run completed" from "transcript ended because SSH died and we don't know what came after," but the existing local model does not draw this distinction either. Probably a v1.1 polish item; flagging here so the reviewer knows it is not addressed.
 
