@@ -118,20 +118,25 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
-    /// Write a shell script to a NamedTempFile and make it executable.
-    fn make_fake_gh(script: &str) -> tempfile::NamedTempFile {
+    /// Write a shell script to a temp file, close the write fd, and make it executable.
+    ///
+    /// Returning `TempPath` (not `NamedTempFile`) is intentional: `NamedTempFile` holds
+    /// the file open for writing, and on Linux exec fails with ETXTBSY if any fd with
+    /// O_WRONLY is open against the target. `into_temp_path()` closes the write fd while
+    /// keeping the file on disk until the returned value is dropped.
+    fn make_fake_gh(script: &str) -> tempfile::TempPath {
         let mut f = tempfile::NamedTempFile::new().expect("temp file");
         write!(f, "#!/bin/sh\n{script}").expect("write script");
         let mut perms = f.as_file().metadata().expect("metadata").permissions();
         perms.set_mode(0o755);
         f.as_file().set_permissions(perms).expect("set permissions");
-        f
+        f.into_temp_path()
     }
 
     #[tokio::test]
     async fn resolves_ambient_credential_when_gh_auth_succeeds() {
         let fake = make_fake_gh("exit 0");
-        let resolver = GhAuthStatusResolver::with_gh_binary(fake.path());
+        let resolver = GhAuthStatusResolver::with_gh_binary(&*fake);
         let cred = resolver
             .resolve("github", &serde_json::Value::Null)
             .await
@@ -142,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn returns_auth_failed_when_gh_exits_nonzero() {
         let fake = make_fake_gh("echo 'not logged in to github.com' >&2; exit 1");
-        let resolver = GhAuthStatusResolver::with_gh_binary(fake.path());
+        let resolver = GhAuthStatusResolver::with_gh_binary(&*fake);
         let err = resolver
             .resolve("github", &serde_json::Value::Null)
             .await
