@@ -404,13 +404,20 @@ final class AppLogWatcher: @unchecked Sendable {
 @MainActor
 final class LogViewerModel: ObservableObject {
     @Published var entries: [LogEntry] = []
+    @Published var displayedEntries: [LogEntry] = []
     @Published var searchText: String = ""
     @Published var minLevel: LogLevel = .info
     @Published var showEngine: Bool = true
     @Published var showApp: Bool = true
     @Published var showDispatch: Bool = true
     @Published var targetFilter: String = ""
-    @Published var autoScroll: Bool = true
+    @Published var autoScroll: Bool = true {
+        didSet {
+            if autoScroll {
+                displayedEntries = entries
+            }
+        }
+    }
     @Published var entryCount: Int = 0
 
     private var engineTailer: JsonlLineTailer?
@@ -472,20 +479,25 @@ final class LogViewerModel: ObservableObject {
 
     private func addEntries(_ new: [LogEntry]) {
         guard !new.isEmpty else { return }
-        // Newest first (matches dispatch viewer convention)
         let sorted = new.sorted { $0.timestampMs > $1.timestampMs }
         entries.insert(contentsOf: sorted, at: 0)
         if entries.count > Self.maxEntries {
             entries.removeLast(entries.count - Self.maxEntries)
         }
         entryCount = entries.count
+        if autoScroll {
+            displayedEntries.insert(contentsOf: sorted, at: 0)
+            if displayedEntries.count > Self.maxEntries {
+                displayedEntries.removeLast(displayedEntries.count - Self.maxEntries)
+            }
+        }
     }
 
     var filtered: [LogEntry] {
         let query = searchText.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let target = targetFilter.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return entries.filter { entry in
+        return displayedEntries.filter { entry in
             switch entry.source {
             case .engine where !showEngine: return false
             case .app where !showApp: return false
