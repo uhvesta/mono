@@ -13,8 +13,9 @@ use boss_protocol::{
     CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortAuditReport,
     EffortLevel, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
+    TaskRuntime, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -133,6 +134,20 @@ enum ProductCommand {
     /// higher level in the §Q4 rules).
     #[command(name = "audit-effort")]
     AuditEffort(ProductAuditEffortArgs),
+    /// Bind (or unbind) an external issue tracker on a product.
+    ///
+    /// Use `--kind github --org ORG --repo REPO --project N` to bind the
+    /// product to a GitHub Projects board. The engine validates the config
+    /// and stores the binding; the reconciler (once running) will begin
+    /// syncing upstream issues as Boss chores.
+    ///
+    /// `--reverse-close` enables opt-in writeback: when a Boss work item
+    /// under this product is marked done without a merged PR, Boss will
+    /// explicitly close the upstream GitHub issue. Off by default.
+    ///
+    /// `--unset` removes any existing binding. All other flags are ignored.
+    #[command(name = "set-external-tracker")]
+    SetExternalTracker(ProductSetExternalTrackerArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -458,6 +473,39 @@ struct ProductAuditEffortArgs {
     /// the last N days. Default: all recorded events.
     #[arg(long, value_name = "DAYS")]
     window_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProductSetExternalTrackerArgs {
+    /// Product id or slug to bind.
+    selector: String,
+
+    /// Tracker kind. Currently only `github` is supported.
+    #[arg(long, value_name = "KIND", conflicts_with = "unset")]
+    kind: Option<String>,
+
+    /// GitHub organisation name (required when `--kind github`).
+    #[arg(long, value_name = "ORG", conflicts_with = "unset")]
+    org: Option<String>,
+
+    /// GitHub repository name (required when `--kind github`).
+    #[arg(long, value_name = "REPO", conflicts_with = "unset")]
+    repo: Option<String>,
+
+    /// GitHub project number (required when `--kind github`).
+    #[arg(long, value_name = "N", conflicts_with = "unset")]
+    project: Option<u64>,
+
+    /// Opt in to reverse-close: when a Boss work item is marked done
+    /// without a merged PR, Boss closes the upstream issue. Off by
+    /// default. Only meaningful for `--kind github`.
+    #[arg(long, conflicts_with = "unset")]
+    reverse_close: bool,
+
+    /// Remove the external-tracker binding from this product.
+    /// Mutually exclusive with all other tracker flags.
+    #[arg(long)]
+    unset: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1638,6 +1686,50 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 other => Err(unexpected_event("product audit-effort", &other)),
             }
         }
+        ProductCommand::SetExternalTracker(args) => {
+            if !args.unset && args.kind.is_none() {
+                return Err(CliError::usage(
+                    "provide either --kind (with kind-specific flags) or --unset",
+                ));
+            }
+            let selector = args.selector.clone();
+            let product = resolve_product(&mut client, Some(selector), ctx).await?;
+            let (kind, config) = if args.unset {
+                (None, None)
+            } else {
+                let kind = args.kind.as_deref().unwrap_or("github").to_owned();
+                let config = build_external_tracker_config(&kind, &args)?;
+                (Some(kind), Some(config))
+            };
+            let input = SetProductExternalTrackerInput {
+                product_id: product.id.clone(),
+                kind,
+                config,
+                unset: args.unset,
+            };
+            let response = client
+                .send_request(&FrontendRequest::SetProductExternalTracker { input })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::WorkItemUpdated { item } => {
+                    let updated = expect_product(item)?;
+                    print_entity(ctx, &serde_json::json!({ "product": updated }), || {
+                        if args.unset {
+                            if !ctx.quiet {
+                                println!("External tracker binding removed from product {}.", updated.slug);
+                            }
+                        } else {
+                            print_product_details("Updated product", &updated);
+                        }
+                    })
+                }
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("product set-external-tracker", &other)),
+            }
+        }
     }
 }
 
@@ -2779,6 +2871,35 @@ async fn set_product_default_model(
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("set-default-model", &other)),
+    }
+}
+
+/// Build the kind-specific JSON config for `set-external-tracker` from CLI args.
+fn build_external_tracker_config(
+    kind: &str,
+    args: &ProductSetExternalTrackerArgs,
+) -> Result<serde_json::Value, CliError> {
+    match kind {
+        "github" => {
+            let org = args.org.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+                CliError::usage("--org is required for --kind github")
+            })?;
+            let repo = args.repo.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
+                CliError::usage("--repo is required for --kind github")
+            })?;
+            let project_number = args.project.ok_or_else(|| {
+                CliError::usage("--project is required for --kind github")
+            })?;
+            Ok(serde_json::json!({
+                "org": org,
+                "repo": repo,
+                "project_number": project_number,
+                "reverse_close": args.reverse_close,
+            }))
+        }
+        other => Err(CliError::usage(format!(
+            "unknown tracker kind '{other}'; supported: github"
+        ))),
     }
 }
 
@@ -4409,6 +4530,27 @@ fn print_product_details(title: &str, product: &Product) {
     }
     if let Some(preamble) = product.dispatch_preamble.as_deref() {
         println!("Dispatch preamble: {preamble}");
+    }
+    if let Some(kind) = product.external_tracker_kind.as_deref() {
+        println!("External tracker:");
+        println!("  Kind: {kind}");
+        if let Some(config) = product.external_tracker_config.as_ref() {
+            if kind == "github" {
+                if let Some(org) = config["org"].as_str() {
+                    println!("  Org: {org}");
+                }
+                if let Some(repo) = config["repo"].as_str() {
+                    println!("  Repo: {repo}");
+                }
+                if let Some(project_number) = config["project_number"].as_u64() {
+                    println!("  Project: {project_number}");
+                }
+                let reverse_close = config["reverse_close"].as_bool().unwrap_or(false);
+                println!("  Reverse-close: {reverse_close}");
+            } else {
+                println!("  Config: {config}");
+            }
+        }
     }
     if !product.description.is_empty() {
         println!("Description: {}", product.description);

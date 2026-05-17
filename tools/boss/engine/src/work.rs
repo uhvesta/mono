@@ -171,7 +171,7 @@ impl WorkDb {
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble
+            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config
              FROM products
              ORDER BY name COLLATE NOCASE ASC",
         )?;
@@ -789,6 +789,42 @@ impl WorkDb {
             "UPDATE products SET default_model = ?2, updated_at = ?3 WHERE id = ?1",
             params![product_id, stored, now],
         )?;
+        let updated = query_product(&tx, product_id)?
+            .with_context(|| format!("unknown product: {product_id}"))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Bind (or unbind) a product's external tracker columns.
+    ///
+    /// When `unset = true`: clears both `external_tracker_kind` and
+    /// `external_tracker_config` to NULL regardless of any other fields.
+    /// When `unset = false`: both `kind` and `config` must be `Some`;
+    /// the engine stores `config` as its JSON string representation.
+    pub fn set_product_external_tracker(
+        &self,
+        product_id: &str,
+        kind: Option<&str>,
+        config: Option<&serde_json::Value>,
+        unset: bool,
+    ) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let _ = query_product(&tx, product_id)?
+            .with_context(|| format!("unknown product: {product_id}"))?;
+        let now = now_string();
+        if unset {
+            tx.execute(
+                "UPDATE products SET external_tracker_kind = NULL, external_tracker_config = NULL, updated_at = ?2 WHERE id = ?1",
+                params![product_id, now],
+            )?;
+        } else {
+            let config_json = config.map(|c| c.to_string());
+            tx.execute(
+                "UPDATE products SET external_tracker_kind = ?2, external_tracker_config = ?3, updated_at = ?4 WHERE id = ?1",
+                params![product_id, kind, config_json, now],
+            )?;
+        }
         let updated = query_product(&tx, product_id)?
             .with_context(|| format!("unknown product: {product_id}"))?;
         tx.commit()?;
@@ -5041,6 +5077,11 @@ fn collect_rows<T>(
 }
 
 fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
+    let external_tracker_kind: Option<String> =
+        row.get::<_, Option<String>>(10)?.filter(|s| !s.is_empty());
+    let external_tracker_config: Option<serde_json::Value> = row
+        .get::<_, Option<String>>(11)?
+        .and_then(|s| serde_json::from_str(&s).ok());
     Ok(Product {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -5052,10 +5093,8 @@ fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         updated_at: row.get(7)?,
         default_model: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
         dispatch_preamble: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
-        // T1 schema columns; populated by T8 WorkDb methods when the migration
-        // has run. Until then the protocol fields carry None.
-        external_tracker_kind: None,
-        external_tracker_config: None,
+        external_tracker_kind,
+        external_tracker_config,
     })
 }
 
@@ -5642,7 +5681,7 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
 
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
-        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble
+        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config
          FROM products
          WHERE id = ?1",
         [id],
