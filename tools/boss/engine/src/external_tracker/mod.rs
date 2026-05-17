@@ -5,6 +5,9 @@
 //! All tracker-specific logic lives in a sub-module; the reconciler only
 //! touches the types and trait defined here.
 
+pub mod credentials;
+pub mod github;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

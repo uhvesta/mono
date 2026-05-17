@@ -23,6 +23,8 @@ rust_library(
         "src/dispatch_reader.rs",
         "src/effort.rs",
         "src/events_socket.rs",
+        "src/external_tracker/credentials.rs",
+        "src/external_tracker/github.rs",
         "src/external_tracker/mod.rs",
         "src/feature_flags.rs",
         "src/ipc_log.rs",
@@ -51,6 +53,7 @@ rust_library(
         "src/worker_setup.rs",
     ],
     crate_root = "src/lib.rs",
+    compile_data = glob(["src/external_tracker/testdata/**"]),
     edition = "2024",
     visibility = [
         "//tools/boss/bossctl:__pkg__",
