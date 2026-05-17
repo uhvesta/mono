@@ -705,7 +705,25 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        assert_eq!(names.len(), 22, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 6 merge_poller counters");
+        // External tracker reconciler counters.
+        for expected in [
+            "external_tracker.fetch_succeeded",
+            "external_tracker.fetch_failed",
+            "external_tracker.imported",
+            "external_tracker.closed",
+            "external_tracker.pr_attached",
+            "external_tracker.pr_merge_close_succeeded",
+            "external_tracker.pr_merge_close_failed",
+            "external_tracker.unbound",
+            "external_tracker.skipped_closed_at_first_sight",
+            "external_tracker.skip_no_credential",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
+        assert_eq!(names.len(), 32, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 6 merge_poller + 10 external_tracker counters");
         // Phase 3: dep_unblock gauge.
         let gauge_names: Vec<_> = registry
             .gauge_snapshots()
