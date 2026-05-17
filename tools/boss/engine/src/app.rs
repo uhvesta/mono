@@ -5667,27 +5667,75 @@ async fn handle_frontend_connection(
                 );
             }
             FrontendRequest::LinkWorkItemExternalRef { input } => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: format!(
-                            "LinkWorkItemExternalRef not yet implemented (work_item_id={})",
-                            input.work_item_id
-                        ),
-                    },
-                );
+                let result = work_db
+                    .set_external_ref(
+                        &input.work_item_id,
+                        &input.kind,
+                        &input.canonical_id,
+                        &serde_json::Value::Null,
+                    )
+                    .and_then(|()| work_db.get_task_with_external_ref(&input.work_item_id));
+                match result {
+                    Ok(item) => {
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "work_item_updated",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemUpdated { item },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
             }
-            FrontendRequest::UnlinkWorkItemExternalRef { work_item_id } => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: format!(
-                            "UnlinkWorkItemExternalRef not yet implemented (work_item_id={work_item_id})"
-                        ),
-                    },
-                );
+            FrontendRequest::UnlinkWorkItemExternalRef { work_item_id: target_id } => {
+                let result = work_db
+                    .clear_external_ref(&target_id)
+                    .and_then(|()| work_db.get_task_with_external_ref(&target_id));
+                match result {
+                    Ok(item) => {
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "work_item_updated",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemUpdated { item },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
             }
         }
     }

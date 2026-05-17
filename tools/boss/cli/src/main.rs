@@ -11,8 +11,8 @@ use boss_protocol::{
     AddDependencyInput, CREATED_VIA_CLI, ConflictResolution, CreateChoreInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EffortAuditReport,
-    EffortLevel, FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
-    ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
+    EffortLevel, FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
+    Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
     TaskRuntime, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
     WorkItemDependencyView, WorkItemPatch,
@@ -232,6 +232,22 @@ enum TaskCommand {
     /// if needed.
     #[command(name = "bind-pr")]
     BindPr(BindPrArgs),
+    /// Manually link a work item to a specific upstream tracker issue.
+    ///
+    /// The engine stores `kind`/`id` on the row. The `raw` blob and
+    /// `web_url` fields are populated on the next reconcile tick when
+    /// the engine fetches the upstream item. Replaces an existing
+    /// binding silently.
+    #[command(name = "link-external")]
+    LinkExternal(LinkExternalArgs),
+    /// Remove the external-tracker binding from a work item.
+    ///
+    /// Clears the active binding flag (`external_ref_unbound_at` is
+    /// set to now). The `kind`/`canonical_id` columns are retained so
+    /// the reconciler can re-bind automatically if the upstream item
+    /// reappears. Other fields are unaffected.
+    #[command(name = "unlink-external")]
+    UnlinkExternal(TaskIdArg),
 }
 
 /// Subcommands under `boss chore ...`. Kind-agnostic verbs here are
@@ -262,6 +278,12 @@ enum ChoreCommand {
     /// Alias for `boss task bind-pr`. Accepts any leaf work item id.
     #[command(name = "bind-pr")]
     BindPr(BindPrArgs),
+    /// Alias for `boss task link-external`. Accepts any leaf work item id.
+    #[command(name = "link-external")]
+    LinkExternal(LinkExternalArgs),
+    /// Alias for `boss task unlink-external`. Accepts any leaf work item id.
+    #[command(name = "unlink-external")]
+    UnlinkExternal(TaskIdArg),
 }
 
 /// Shared subcommands for dependency CRUD. The engine doesn't care
@@ -1073,6 +1095,22 @@ struct BindPrArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct LinkExternalArgs {
+    /// Task or chore id to link.
+    id: String,
+
+    /// Tracker discriminator matching `products.external_tracker_kind`
+    /// for the work item's product (e.g. `github`).
+    #[arg(long)]
+    kind: String,
+
+    /// Stable tracker-specific id for this upstream issue
+    /// (e.g. `spinyfin/mono#560` for GitHub).
+    #[arg(long = "id", id = "upstream_id")]
+    upstream_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
 struct ProductMoveArgs {
     selector: String,
 
@@ -1447,14 +1485,14 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Do not use boss ... --help for syntax discovery when this reference is available.",
             "Omit --socket-path unless you explicitly need a non-default socket.",
             "Omit --no-autostart unless you explicitly need to forbid engine startup or auto-dispatch on `task create` / `chore create` (also gates the auto-spawned `kind=design` seed task on `project create`).",
-            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
+            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
             "Project selectors accept a project id, slug, short id (#42 or 42), or 1-based interactive index within the selected product. For agent use, prefer slug, short id, or primary id; avoid numeric indexes.",
             "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `T441` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `P7` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
-            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
+            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         status_semantics: vec![
@@ -2097,6 +2135,8 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         }
         TaskCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
         TaskCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
+        TaskCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
+        TaskCommand::UnlinkExternal(args) => run_unlink_external(&mut client, ctx, args).await,
         TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,
     }
 }
@@ -2167,6 +2207,8 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
         ChoreCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
+        ChoreCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
+        ChoreCommand::UnlinkExternal(args) => run_unlink_external(&mut client, ctx, args).await,
         ChoreCommand::CreateMany(args) => run_chore_create_many(&mut client, ctx, args).await,
     }
 }
@@ -3115,6 +3157,68 @@ async fn run_bind_pr(
             "rebinding": prior_url.is_some(),
             "previous_pr_url": prior_url,
         }),
+        || print_task_details(&title, &updated, None, false),
+    )
+}
+
+/// Shared handler for `boss task link-external` and `boss chore link-external`.
+async fn run_link_external(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: LinkExternalArgs,
+) -> Result<(), CliError> {
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
+    let item = match client
+        .send_request(&FrontendRequest::LinkWorkItemExternalRef {
+            input: LinkExternalRefInput {
+                work_item_id: resolved_id,
+                kind: args.kind,
+                canonical_id: args.upstream_id,
+            },
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemUpdated { item } => item,
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            return Err(CliError::application(message));
+        }
+        other => return Err(unexpected_event("link-external", &other)),
+    };
+    let (updated, label) = expect_leaf_work_item(item)?;
+    let title = format!("Linked external ref on {label}");
+    print_entity(
+        ctx,
+        &serde_json::json!({ label: updated }),
+        || print_task_details(&title, &updated, None, false),
+    )
+}
+
+/// Shared handler for `boss task unlink-external` and `boss chore unlink-external`.
+async fn run_unlink_external(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskIdArg,
+) -> Result<(), CliError> {
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
+    let item = match client
+        .send_request(&FrontendRequest::UnlinkWorkItemExternalRef {
+            work_item_id: resolved_id,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemUpdated { item } => item,
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            return Err(CliError::application(message));
+        }
+        other => return Err(unexpected_event("unlink-external", &other)),
+    };
+    let (updated, label) = expect_leaf_work_item(item)?;
+    let title = format!("Unlinked external ref on {label}");
+    print_entity(
+        ctx,
+        &serde_json::json!({ label: updated }),
         || print_task_details(&title, &updated, None, false),
     )
 }
@@ -5378,6 +5482,80 @@ mod tests {
                 assert_eq!(args.pr_url, "https://github.com/a/b/pull/10");
             }
             _ => panic!("expected chore bind-pr command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_link_external_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "task",
+            "link-external",
+            "task_1",
+            "--kind",
+            "github",
+            "--id",
+            "spinyfin/mono#560",
+        ]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::LinkExternal(args),
+            } => {
+                assert_eq!(args.id, "task_1");
+                assert_eq!(args.kind, "github");
+                assert_eq!(args.upstream_id, "spinyfin/mono#560");
+            }
+            _ => panic!("expected task link-external command"),
+        }
+    }
+
+    #[test]
+    fn parses_chore_link_external_command() {
+        let cli = Cli::parse_from([
+            "boss",
+            "chore",
+            "link-external",
+            "task_2",
+            "--kind",
+            "github",
+            "--id",
+            "spinyfin/mono#561",
+        ]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::LinkExternal(args),
+            } => {
+                assert_eq!(args.id, "task_2");
+                assert_eq!(args.kind, "github");
+                assert_eq!(args.upstream_id, "spinyfin/mono#561");
+            }
+            _ => panic!("expected chore link-external command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_unlink_external_command() {
+        let cli = Cli::parse_from(["boss", "task", "unlink-external", "task_3"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::UnlinkExternal(args),
+            } => {
+                assert_eq!(args.id, "task_3");
+            }
+            _ => panic!("expected task unlink-external command"),
+        }
+    }
+
+    #[test]
+    fn parses_chore_unlink_external_command() {
+        let cli = Cli::parse_from(["boss", "chore", "unlink-external", "task_4"]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::UnlinkExternal(args),
+            } => {
+                assert_eq!(args.id, "task_4");
+            }
+            _ => panic!("expected chore unlink-external command"),
         }
     }
 

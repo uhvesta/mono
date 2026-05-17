@@ -4902,6 +4902,34 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Fetch a single task/chore by primary id, including the
+    /// `external_ref_*` columns. Used by the `LinkWorkItemExternalRef` /
+    /// `UnlinkWorkItemExternalRef` handlers so the `WorkItemUpdated`
+    /// response carries the live `external_ref` snapshot.
+    ///
+    /// Returns an error if the work item does not exist or is soft-deleted.
+    pub fn get_task_with_external_ref(&self, id: &str) -> Result<WorkItem> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
+                    pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor,
+                    priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
+                    effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
+                    ci_required_state, review_required_state, ci_required_detail,
+                    review_required_detail, pr_state_polled_at, merge_queue_state,
+                    external_ref_kind, external_ref_canonical_id, external_ref_raw,
+                    external_ref_synced_at, external_ref_unbound_at
+             FROM tasks
+             WHERE id = ?1 AND deleted_at IS NULL",
+            [id],
+            map_task_with_external_ref,
+        )
+        .optional()
+        .map_err(anyhow::Error::from)?
+        .map(task_to_item)
+        .with_context(|| format!("work item not found or soft-deleted: {id}"))
+    }
+
     /// Find the work item actively bound to `(kind, canonical_id)`.
     /// Returns `None` when no matching active binding exists. Rows where
     /// `external_ref_unbound_at IS NOT NULL` are excluded (they retain

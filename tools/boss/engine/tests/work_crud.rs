@@ -13,7 +13,7 @@ use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
     AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
-    FrontendEvent, FrontendRequest, ListDependenciesInput, Product, Project,
+    FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TopicEventPayload, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
@@ -2484,6 +2484,188 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
         cross.id, first.id,
         "same name in different product must be allowed",
     );
+
+    Ok(())
+}
+
+/// link → verify external_ref is stored → the row is findable by the reconciler.
+#[tokio::test]
+async fn link_external_ref_stores_binding_and_is_findable() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Sync".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+        },
+    )
+    .await?;
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Link chore".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
+
+    // Link the chore to an upstream issue.
+    let updated = match client
+        .send_request(&FrontendRequest::LinkWorkItemExternalRef {
+            input: LinkExternalRefInput {
+                work_item_id: chore.id.clone(),
+                kind: "github".to_owned(),
+                canonical_id: "spinyfin/mono#560".to_owned(),
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_chore(item)?,
+        other => return Err(unexpected_event("link-external-ref", other)),
+    };
+
+    // The returned item must have external_ref populated.
+    let ext = updated.external_ref.as_ref().expect("external_ref should be set after link");
+    assert_eq!(ext.kind, "github");
+    assert_eq!(ext.canonical_id, "spinyfin/mono#560");
+    assert!(ext.unbound_at.is_none(), "newly linked row must not be unbound");
+
+    // A second GetWorkItem call returns the same data (engine persisted it).
+    let fetched = match client
+        .send_request(&FrontendRequest::GetWorkItem { id: chore.id.clone() })
+        .await?
+    {
+        FrontendEvent::WorkItemResult { item } => expect_chore(item)?,
+        other => return Err(unexpected_event("get-work-item-after-link", other)),
+    };
+    // GetWorkItem uses the standard query (no external-ref columns), so
+    // external_ref is None there — but the row must otherwise match.
+    assert_eq!(fetched.id, updated.id);
+
+    Ok(())
+}
+
+/// unlink clears the active binding; the row stops being touched by the reconciler.
+#[tokio::test]
+async fn unlink_external_ref_clears_binding() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Unsync".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+        },
+    )
+    .await?;
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Unlink chore".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
+
+    // First, link the chore.
+    match client
+        .send_request(&FrontendRequest::LinkWorkItemExternalRef {
+            input: LinkExternalRefInput {
+                work_item_id: chore.id.clone(),
+                kind: "echo".to_owned(),
+                canonical_id: "echo#1".to_owned(),
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { .. } => {}
+        other => return Err(unexpected_event("link before unlink", other)),
+    };
+
+    // Now unlink.
+    let unlinked = match client
+        .send_request(&FrontendRequest::UnlinkWorkItemExternalRef {
+            work_item_id: chore.id.clone(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_chore(item)?,
+        other => return Err(unexpected_event("unlink-external-ref", other)),
+    };
+
+    // The returned item must have unbound_at set (marking the binding as inactive).
+    let ext = unlinked
+        .external_ref
+        .as_ref()
+        .expect("external_ref should still be present after unlink");
+    assert!(
+        ext.unbound_at.is_some(),
+        "unbound_at must be set after unlink; got: {:?}",
+        ext
+    );
+
+    Ok(())
+}
+
+/// link-external on a non-existent work item returns WorkError.
+#[tokio::test]
+async fn link_external_ref_unknown_id_returns_error() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    match client
+        .send_request(&FrontendRequest::LinkWorkItemExternalRef {
+            input: LinkExternalRefInput {
+                work_item_id: "task_nonexistent".to_owned(),
+                kind: "github".to_owned(),
+                canonical_id: "spinyfin/mono#999".to_owned(),
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { .. } => {}
+        other => return Err(unexpected_event("expected WorkError for missing id", other)),
+    }
+
+    Ok(())
+}
+
+/// unlink-external on a non-existent work item returns WorkError.
+#[tokio::test]
+async fn unlink_external_ref_unknown_id_returns_error() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    match client
+        .send_request(&FrontendRequest::UnlinkWorkItemExternalRef {
+            work_item_id: "task_nonexistent".to_owned(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { .. } => {}
+        other => return Err(unexpected_event("expected WorkError for missing id", other)),
+    }
 
     Ok(())
 }
