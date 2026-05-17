@@ -12,13 +12,15 @@ final class LiveWorkerStateStore: ObservableObject {
     @Published private(set) var byRunID: [String: WorkerLiveState] = [:]
     @Published private(set) var bySlot: [Int: WorkerLiveState] = [:]
 
-    /// Count of workers in an actively-doing-work state: `spawning` or
-    /// `working`. Used by the quit-confirmation guard to decide whether
-    /// to warn before exiting. Does not include `waitingForInput` or
-    /// error/terminal states — those are not "work in flight" for the
-    /// purposes of the dialog.
+    /// Count of workers in a non-terminal "alive" state: `spawning`,
+    /// `working`, or `waitingForInput`. Used by the quit-confirmation
+    /// guard — from the user's perspective a worker idle at a Claude
+    /// prompt is still kill-worthy (live conversation history,
+    /// possibly in-progress edits in its leased workspace). Excludes
+    /// `idle`, `errored`, and `terminated`.
     var activeAgentCount: Int {
-        bySlot.values.filter { $0.activity == .spawning || $0.activity == .working }.count
+        let live: Set<WorkerActivity> = [.spawning, .working, .waitingForInput]
+        return bySlot.values.filter { live.contains($0.activity) }.count
     }
 
     /// Replace the snapshot with `states`. Skips the publish when the
