@@ -16,6 +16,10 @@ final class CommentLayer: ObservableObject {
     @Published var pendingFirstChar: Character? = nil
     /// Quoted text of the comment just clicked in the sidebar; clears after the flash.
     @Published var flashingText: String? = nil
+    /// Bottom-left of the last selected character, in AppKit screen coordinates (y-up).
+    /// Nil when the selection anchor could not be determined; the popover falls back to
+    /// a fixed top-of-document position in that case.
+    @Published var selectionAnchorInScreen: CGPoint? = nil
 
     // NSEvent monitor tokens; stored nonisolated(unsafe) because the opaque Any
     // tokens are installed/removed only on the main actor.
@@ -58,6 +62,7 @@ final class CommentLayer: ObservableObject {
     func requestNewComment(firstChar: Character? = nil) {
         pendingQuotedText = captureCurrentSelection() ?? ""
         pendingFirstChar = firstChar
+        selectionAnchorInScreen = captureSelectionAnchor()
         isShowingPopover = true
     }
 
@@ -108,6 +113,22 @@ final class CommentLayer: ObservableObject {
             responder = current.nextResponder
         }
         return false
+    }
+
+    /// Returns the bottom-left of the last selected character in AppKit screen
+    /// coordinates (origin bottom-left of primary screen, y increases upward).
+    /// Returns nil if no text-input client or no selection is active.
+    private func captureSelectionAnchor() -> CGPoint? {
+        guard let client = NSTextInputContext.current?.client else { return nil }
+        let range = client.selectedRange()
+        guard range.length > 0, range.location != NSNotFound else { return nil }
+        let lastCharRange = NSRange(location: range.upperBound - 1, length: 1)
+        var actualRange = NSRange()
+        let screenRect = client.firstRect(forCharacterRange: lastCharRange, actualRange: &actualRange)
+        guard screenRect != .zero else { return nil }
+        // minY is the bottom edge of the glyph rect in AppKit screen coords (y-up),
+        // which becomes the anchor point just below the selected text.
+        return CGPoint(x: screenRect.minX, y: screenRect.minY)
     }
 
     /// Reads the selection via pasteboard copy. Acceptable Phase 1 trade-off:
@@ -188,6 +209,10 @@ private final class CommentMenuTarget: NSObject, @unchecked Sendable {
 /// ```
 struct WithCommentsModifier: ViewModifier {
     @StateObject private var layer = CommentLayer()
+    /// Viewer's frame in SwiftUI global coordinates (top-left origin, y-down).
+    /// Updated via a background GeometryReader so we can translate screen-space
+    /// selection coordinates into view-local offset for the popover anchor.
+    @State private var viewFrameInGlobal: CGRect = .zero
 
     func body(content: Content) -> some View {
         let commentedTexts = layer.comments.map(\.quotedText).filter { !$0.isEmpty }
@@ -198,13 +223,21 @@ struct WithCommentsModifier: ViewModifier {
                 content
                     .environment(\.commentedTexts, commentedTexts)
                     .environment(\.commentFlashText, flashingText)
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onAppear { viewFrameInGlobal = geo.frame(in: .global) }
+                                .onChange(of: geo.frame(in: .global)) { _, newFrame in
+                                    viewFrameInGlobal = newFrame
+                                }
+                        }
+                    )
 
-                // Zero-size anchor for the popover; appears near the top of the content.
+                // Zero-size anchor for the popover; positioned near the text selection.
                 Color.clear
                     .frame(width: 0, height: 0)
-                    .padding(.top, 48)
-                    .padding(.leading, 8)
-                    .popover(isPresented: $layer.isShowingPopover, arrowEdge: .leading) {
+                    .offset(popoverAnchorOffset())
+                    .popover(isPresented: $layer.isShowingPopover, arrowEdge: .top) {
                         CommentPopover(layer: layer)
                     }
             }
@@ -233,6 +266,38 @@ struct WithCommentsModifier: ViewModifier {
         }
         .onAppear { layer.installMonitors() }
         .onDisappear { layer.removeMonitors() }
+    }
+
+    /// Converts the stored AppKit screen-space selection anchor to a SwiftUI offset
+    /// relative to the viewer's top-leading corner, so the popover appears adjacent
+    /// to the selection rather than at the document's origin.
+    private func popoverAnchorOffset() -> CGSize {
+        guard let screenPt = layer.selectionAnchorInScreen,
+              let primaryScreen = NSScreen.screens.first,
+              viewFrameInGlobal != .zero else {
+            // Fallback when selection coordinates are unavailable.
+            return CGSize(width: 8, height: 48)
+        }
+
+        // AppKit screen coords: origin at bottom-left of primary screen, y increases upward.
+        // SwiftUI global coords: origin at top-left of primary screen, y increases downward.
+        let primaryH = primaryScreen.frame.height
+        let swiftuiX = screenPt.x
+        let swiftuiY = primaryH - screenPt.y
+
+        // Compute offset from the viewer's top-left to the selection anchor.
+        var dx = swiftuiX - viewFrameInGlobal.minX
+        var dy = swiftuiY - viewFrameInGlobal.minY
+
+        // Clamp horizontally so the ~320 pt wide popover stays within the view.
+        let popoverWidth: CGFloat = 320
+        let margin: CGFloat = 16
+        dx = max(0, min(dx, viewFrameInGlobal.width - popoverWidth - margin))
+
+        // Clamp vertically so the anchor stays within the view bounds.
+        dy = max(0, min(dy, viewFrameInGlobal.height - margin))
+
+        return CGSize(width: dx, height: dy)
     }
 
     private var addCommentButton: some View {
