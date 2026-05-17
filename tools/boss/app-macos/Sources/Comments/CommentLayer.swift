@@ -25,10 +25,29 @@ final class CommentLayer: ObservableObject {
     // tokens are installed/removed only on the main actor.
     nonisolated(unsafe) private var keyMonitor: Any?
     nonisolated(unsafe) private var rightClickMonitor: Any?
+    nonisolated(unsafe) private var selectionObserver: NSObjectProtocol?
+
+    /// Anchor captured eagerly at selection-change time, while the text view still owns
+    /// NSTextInputContext. Read by requestNewComment rather than capturing at trigger time,
+    /// which is too late (first responder has moved to the key handler / menu / button).
+    private var cachedSelectionAnchor: CGPoint?
 
     // MARK: - Monitor lifecycle
 
     func installMonitors() {
+        selectionObserver = NotificationCenter.default.addObserver(
+            forName: NSTextView.didChangeSelectionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                // Only update while the popover is closed; the comment form's own
+                // NSTextView (SwiftUI TextEditor) would otherwise overwrite the anchor.
+                guard !self.isShowingPopover else { return }
+                self.cachedSelectionAnchor = self.captureSelectionAnchor()
+            }
+        }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             // Extract Sendable values before crossing into the MainActor isolation context.
@@ -55,6 +74,7 @@ final class CommentLayer: ObservableObject {
     func removeMonitors() {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         if let m = rightClickMonitor { NSEvent.removeMonitor(m); rightClickMonitor = nil }
+        if let obs = selectionObserver { NotificationCenter.default.removeObserver(obs); selectionObserver = nil }
     }
 
     // MARK: - Authoring
@@ -62,7 +82,11 @@ final class CommentLayer: ObservableObject {
     func requestNewComment(firstChar: Character? = nil) {
         pendingQuotedText = captureCurrentSelection() ?? ""
         pendingFirstChar = firstChar
-        selectionAnchorInScreen = captureSelectionAnchor()
+        // Prefer the anchor captured eagerly at selection-change time (while the
+        // text view still owned NSTextInputContext). Fall back to capturing now
+        // in case the caller skipped the selection path (e.g. toolbar button with
+        // no selection, or a future entry point that doesn't go through a monitor).
+        selectionAnchorInScreen = cachedSelectionAnchor ?? captureSelectionAnchor()
         isShowingPopover = true
     }
 
@@ -78,6 +102,7 @@ final class CommentLayer: ObservableObject {
         isShowingPopover = false
         pendingQuotedText = ""
         pendingFirstChar = nil
+        cachedSelectionAnchor = nil
     }
 
     func dismiss(_ comment: Comment) {
