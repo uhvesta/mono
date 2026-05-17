@@ -2824,6 +2824,8 @@ private struct PrCiIndicator: View {
 /// can immediately distinguish cards that are actively being shipped from
 /// cards waiting for CI or human action.
 private struct PrMergingIndicator: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: "arrow.triangle.merge")
@@ -2831,13 +2833,24 @@ private struct PrMergingIndicator: View {
             Text("merging")
                 .font(.caption.weight(.semibold))
         }
-        .foregroundStyle(Color.accentColor)
+        .foregroundStyle(Color.white)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
-        .background(Color.accentColor.opacity(0.12))
+        .background(backgroundColor)
         .clipShape(Capsule())
         .help("PR is in the merge queue and actively being shipped.")
         .accessibilityLabel("In merge queue — merging")
+    }
+
+    private var backgroundColor: Color {
+        switch colorScheme {
+        case .light:
+            return Color(red: 165/255, green: 107/255, blue: 0/255)
+        case .dark:
+            return Color(red: 158/255, green: 106/255, blue: 3/255)
+        @unknown default:
+            return Color(red: 165/255, green: 107/255, blue: 0/255)
+        }
     }
 }
 
