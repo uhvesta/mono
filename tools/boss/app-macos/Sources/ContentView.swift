@@ -351,6 +351,9 @@ struct ContentView: View {
                         let isArchived = project.status == "archived"
                         let unblocked = model.unblockedTaskCount(forProjectID: project.id)
                         let blocked = model.blockedTaskCount(forProjectID: project.id)
+                        let docPresentation = ProjectDesignDocAffordancePresentation.from(
+                            state: model.designDocStateByProjectID[project.id] ?? .notSet
+                        )
                         WorkSidebarFilterRow(
                             title: project.name,
                             subtitle: project.shortID.map { "P\($0)" },
@@ -361,7 +364,9 @@ struct ContentView: View {
                             isCheckboxOn: isOn,
                             dimmed: isArchived,
                             unblockedCount: unblocked > 0 ? unblocked : nil,
-                            blockedCount: blocked > 0 ? blocked : nil
+                            blockedCount: blocked > 0 ? blocked : nil,
+                            designDocPresentation: docPresentation,
+                            onOpenDesignDoc: docPresentation != nil ? { model.openProjectDesignDoc(project) } : nil
                         )
                         .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
                         .listRowBackground(Color.clear)
@@ -828,6 +833,16 @@ private struct WorkSidebarFilterRow: View {
     /// When non-nil, a red `⏸ N` chip is shown for dependency-blocked
     /// task count. Suppressed when nil (no dependency-blocked tasks).
     var blockedCount: Int? = nil
+    /// When non-nil, shows a design-doc affordance link under the badges.
+    /// Suppressed when nil (project has no design doc pointer set).
+    var designDocPresentation: ProjectDesignDocAffordancePresentation? = nil
+    /// Called when the user clicks the design-doc affordance. Required
+    /// when `designDocPresentation` is non-nil.
+    var onOpenDesignDoc: (() -> Void)? = nil
+
+    private var hasExtraRow: Bool {
+        (subtitle != nil && !subtitle!.isEmpty) || designDocPresentation != nil
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -845,7 +860,7 @@ private struct WorkSidebarFilterRow: View {
                     .frame(width: 15, alignment: .center)
                     .padding(.top, 2)
             }
-            VStack(alignment: .leading, spacing: subtitle == nil ? 0 : 2) {
+            VStack(alignment: .leading, spacing: hasExtraRow ? 2 : 0) {
                 HStack(alignment: .top, spacing: 8) {
                     if dimmed {
                         Image(systemName: systemImage)
@@ -892,13 +907,23 @@ private struct WorkSidebarFilterRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+                if let presentation = designDocPresentation, let openDoc = onOpenDesignDoc {
+                    Button(action: openDoc) {
+                        Label("Design doc", systemImage: presentation.systemImage)
+                            .font(.caption)
+                            .foregroundStyle(presentation.tint)
+                    }
+                    .buttonStyle(.plain)
+                    .help(presentation.tooltip)
+                    .accessibilityLabel(presentation.accessibilityLabel)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.leading, 8)
         .padding(.trailing, 4)
-        .padding(.vertical, subtitle == nil ? 6 : 7)
+        .padding(.vertical, hasExtraRow ? 7 : 6)
         .contentShape(Rectangle())
         .frame(maxWidth: .infinity, alignment: .leading)
     }
