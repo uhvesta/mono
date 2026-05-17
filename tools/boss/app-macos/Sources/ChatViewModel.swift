@@ -1,7 +1,10 @@
 import Foundation
+import os
 #if canImport(AppKit)
 import AppKit
 #endif
+
+private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "DesignDocTiming")
 
 @MainActor
 final class ChatViewModel: ObservableObject {
@@ -115,6 +118,10 @@ final class ChatViewModel: ObservableObject {
     /// A missing entry means "we haven't asked yet" — the affordance
     /// stays hidden until the engine replies.
     @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
+    /// In-flight resolve-RPC start times, keyed by project id. Populated in
+    /// `refreshDesignDocStates` and consumed when the engine replies so we
+    /// can log the full resolve round-trip duration.
+    private var designDocResolveStartTimes: [String: (date: Date, shortID: String)] = [:]
 
     /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
     /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
@@ -964,6 +971,8 @@ final class ChatViewModel: ObservableObject {
     func refreshDesignDocStates(for projects: [WorkProject]) {
         guard isConnected else { return }
         for project in projects where project.designDocPath != nil {
+            let shortID = project.shortID.map { "\($0)" } ?? project.id
+            designDocResolveStartTimes[project.id] = (date: Date(), shortID: shortID)
             engine.sendResolveProjectDesignDoc(projectID: project.id)
         }
     }
@@ -988,6 +997,7 @@ final class ChatViewModel: ObservableObject {
     ///      otherwise hand the `file://` URL to [[urlOpener]].
     ///   3. Fall through to [[urlOpener]] with the web URL.
     func openProjectDesignDoc(_ project: WorkProject) {
+        let shortID = project.shortID.map { "\($0)" } ?? project.id
         let state = designDocStateByProjectID[project.id] ?? .notSet
         switch state {
         case .notSet:
@@ -1000,6 +1010,7 @@ final class ChatViewModel: ObservableObject {
             // different branch even when resolved.branch == "main".
             if let rawContentURL, let rawURL = URL(string: rawContentURL) {
                 let projectName = project.name
+                designDocTimingLog.info("phase=dispatch project=\(shortID, privacy: .public) path=rawContentURL")
                 if let opener = asyncMarkdownViewerOpener {
                     // Open the window immediately in a loading state, then
                     // resolve the content asynchronously — the user sees a
@@ -1009,7 +1020,8 @@ final class ChatViewModel: ObservableObject {
                     Task { @MainActor in
                         await self.fetchAndUpdateAsyncMarkdownViewerVM(
                             projectName: projectName,
-                            rawURL: rawURL
+                            rawURL: rawURL,
+                            projectShortID: shortID
                         )
                     }
                 } else {
@@ -1019,7 +1031,8 @@ final class ChatViewModel: ObservableObject {
                         await self.fetchAndOpenDesignDoc(
                             projectName: projectName,
                             rawURL: rawURL,
-                            webURL: webURL
+                            webURL: webURL,
+                            projectShortID: shortID
                         )
                     }
                 }
@@ -1031,6 +1044,7 @@ final class ChatViewModel: ObservableObject {
             // reasonably assume the workspace holds the merged file.
             if let workspacePath, isWorkspaceFastPathEligible(kind: resolved.kind),
                resolved.branch == "main" {
+                designDocTimingLog.info("phase=dispatch project=\(shortID, privacy: .public) path=workspace")
                 if let opener = designRendererOpener,
                    let content = DesignRendererContent.from(
                        projectID: project.id,
@@ -1051,6 +1065,7 @@ final class ChatViewModel: ObservableObject {
                 workErrorMessage = "Design doc URL could not be parsed: \(webURL)"
                 return
             }
+            designDocTimingLog.info("phase=dispatch project=\(shortID, privacy: .public) path=webURL")
             urlOpener(url)
         }
     }
@@ -1059,9 +1074,18 @@ final class ChatViewModel: ObservableObject {
     /// [[markdownViewerOpener]] window. Falls back to `urlOpener(webURL)`
     /// if the fetch fails or [[markdownViewerOpener]] is not wired.
     @MainActor
-    private func fetchAndOpenDesignDoc(projectName: String, rawURL: URL, webURL: String) async {
+    private func fetchAndOpenDesignDoc(
+        projectName: String,
+        rawURL: URL,
+        webURL: String,
+        projectShortID: String
+    ) async {
         do {
+            let fetchStart = Date()
+            designDocTimingLog.info("phase=fetch_start project=\(projectShortID, privacy: .public) url=\(rawURL.absoluteString, privacy: .public)")
             let markdown = try await rawContentFetcher(rawURL)
+            let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
+            designDocTimingLog.info("phase=fetch_end project=\(projectShortID, privacy: .public) duration_ms=\(fetchMs, privacy: .public) bytes=\(markdown.utf8.count, privacy: .public)")
             if let opener = markdownViewerOpener {
                 let title = projectName.isEmpty ? rawURL.lastPathComponent : projectName
                 opener(MarkdownViewerContent(title: title, markdown: markdown))
@@ -1084,11 +1108,18 @@ final class ChatViewModel: ObservableObject {
     @MainActor
     private func fetchAndUpdateAsyncMarkdownViewerVM(
         projectName: String,
-        rawURL: URL
+        rawURL: URL,
+        projectShortID: String
     ) async {
         let title = projectName.isEmpty ? rawURL.lastPathComponent : projectName
         do {
+            let fetchStart = Date()
+            designDocTimingLog.info("phase=fetch_start project=\(projectShortID, privacy: .public) url=\(rawURL.absoluteString, privacy: .public)")
             let markdown = try await rawContentFetcher(rawURL)
+            let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
+            designDocTimingLog.info("phase=fetch_end project=\(projectShortID, privacy: .public) duration_ms=\(fetchMs, privacy: .public) bytes=\(markdown.utf8.count, privacy: .public)")
+            asyncMarkdownViewerVM.pendingRenderProjectShortID = projectShortID
+            asyncMarkdownViewerVM.renderStartTime = Date()
             asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown)
         } catch {
             asyncMarkdownViewerVM.state = .failed(
@@ -1317,6 +1348,10 @@ final class ChatViewModel: ObservableObject {
         case .metricsListLiveResult(let entries):
             engineMetrics = entries
         case .projectDesignDocResolved(let output):
+            if let entry = designDocResolveStartTimes.removeValue(forKey: output.projectID) {
+                let ms = Int(Date().timeIntervalSince(entry.date) * 1000)
+                designDocTimingLog.info("phase=resolve project=\(entry.shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
+            }
             designDocStateByProjectID[output.projectID] = output.state
         case .conflictResolutionsList(let attempts):
             conflictResolutions = attempts
