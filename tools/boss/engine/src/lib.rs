@@ -18,6 +18,7 @@ pub mod effort;
 pub mod events_socket;
 pub mod external_tracker;
 pub mod feature_flags;
+pub mod host_adapter;
 pub mod host_registry;
 pub mod ipc_log;
 pub mod live_status;

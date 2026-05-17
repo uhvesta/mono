@@ -17,6 +17,7 @@ use crate::conflict_diagnosis;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
+use crate::host_adapter::{HostAdapter, LocalHostAdapter};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{
@@ -127,14 +128,14 @@ struct HeartbeatGuard {
 
 impl HeartbeatGuard {
     fn spawn(
-        cube_client: Arc<dyn CubeClient>,
+        host_adapter: Arc<dyn HostAdapter>,
         lease_id: String,
         execution_id: String,
         run_id: String,
         worker_id: String,
     ) -> Self {
         Self::spawn_with_interval(
-            cube_client,
+            host_adapter,
             lease_id,
             execution_id,
             run_id,
@@ -148,7 +149,7 @@ impl HeartbeatGuard {
     /// without depending on tokio's paused-time API. Production
     /// callers go through [`Self::spawn`].
     fn spawn_with_interval(
-        cube_client: Arc<dyn CubeClient>,
+        host_adapter: Arc<dyn HostAdapter>,
         lease_id: String,
         execution_id: String,
         run_id: String,
@@ -165,7 +166,7 @@ impl HeartbeatGuard {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                match cube_client.heartbeat_lease(&lease_id, None).await {
+                match host_adapter.heartbeat_lease(&lease_id, None).await {
                     Ok(()) => {
                         tracing::debug!(
                             %execution_id,
@@ -871,8 +872,7 @@ impl RevisionSource for AtomicU64 {
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
-    cube_client: Arc<dyn CubeClient>,
-    execution_runner: Arc<dyn ExecutionRunner>,
+    host_adapter: Arc<dyn HostAdapter>,
     publisher: Arc<dyn ExecutionPublisher>,
     /// Structured stream of dispatch-pipeline events. Defaults to a
     /// no-op so legacy tests and short-lived callers don't need to
@@ -920,26 +920,45 @@ pub struct ExecutionCoordinator {
 }
 
 impl ExecutionCoordinator {
+    /// Convenience constructor for tests and simple callers. Wraps the
+    /// provided `cube_client` and `execution_runner` in a
+    /// `LocalHostAdapter` and calls [`Self::with_publisher`].
     pub fn new(
         work_db: Arc<WorkDb>,
         worker_pool: WorkerPool,
         cube_client: Arc<dyn CubeClient>,
         execution_runner: Arc<dyn ExecutionRunner>,
     ) -> Self {
-        Self::with_publisher(
+        let host_adapter = Arc::new(LocalHostAdapter::new(cube_client, execution_runner));
+        Self::with_host_adapter_and_publisher(
             work_db,
             worker_pool,
-            cube_client,
-            execution_runner,
+            host_adapter,
             Arc::new(NoopExecutionPublisher::default()),
         )
     }
 
+    /// Constructor that accepts a publisher alongside the cube/runner
+    /// primitives. Wraps them in `LocalHostAdapter` and delegates to
+    /// [`Self::with_host_adapter_and_publisher`].
     pub fn with_publisher(
         work_db: Arc<WorkDb>,
         worker_pool: WorkerPool,
         cube_client: Arc<dyn CubeClient>,
         execution_runner: Arc<dyn ExecutionRunner>,
+        publisher: Arc<dyn ExecutionPublisher>,
+    ) -> Self {
+        let host_adapter = Arc::new(LocalHostAdapter::new(cube_client, execution_runner));
+        Self::with_host_adapter_and_publisher(work_db, worker_pool, host_adapter, publisher)
+    }
+
+    /// Primary constructor for Phase 3+. Callers that need to dispatch
+    /// to a non-local host (e.g. `SshHostAdapter`) build the adapter
+    /// themselves and pass it here directly.
+    pub fn with_host_adapter_and_publisher(
+        work_db: Arc<WorkDb>,
+        worker_pool: WorkerPool,
+        host_adapter: Arc<dyn HostAdapter>,
         publisher: Arc<dyn ExecutionPublisher>,
     ) -> Self {
         // Build a local registry for tests that never call `set_metrics`.
@@ -950,8 +969,7 @@ impl ExecutionCoordinator {
         Self {
             work_db,
             worker_pool,
-            cube_client,
-            execution_runner,
+            host_adapter,
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink::default()),
             scheduling_active: AtomicBool::new(false),
@@ -1375,13 +1393,13 @@ impl ExecutionCoordinator {
 
         let repo = match tokio::time::timeout(
             CUBE_REPO_ENSURE_TIMEOUT,
-            self.cube_client.ensure_repo(&execution.repo_remote_url),
+            self.host_adapter.ensure_repo(&execution.repo_remote_url),
         )
         .await
         {
             Ok(Ok(repo)) => repo,
             Ok(Err(err)) => {
-                let ensure_repr = self.cube_client.command_repr(&[
+                let ensure_repr = self.host_adapter.command_repr(&[
                     "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
                 ]);
                 self.dispatch_events
@@ -1413,7 +1431,7 @@ impl ExecutionCoordinator {
                     "cube `repo ensure` timed out after {}s",
                     CUBE_REPO_ENSURE_TIMEOUT.as_secs()
                 );
-                let ensure_repr = self.cube_client.command_repr(&[
+                let ensure_repr = self.host_adapter.command_repr(&[
                     "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
                 ]);
                 self.dispatch_events
@@ -1452,7 +1470,7 @@ impl ExecutionCoordinator {
                     .with_work_item(&execution.work_item_id)
                     .with_worker(worker_id)
                     .with_cube_repo(&repo.repo_id)
-                    .with_cube_invocation(self.cube_client.command_repr(&[
+                    .with_cube_invocation(self.host_adapter.command_repr(&[
                         "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
                     ])),
             )
@@ -1500,13 +1518,13 @@ impl ExecutionCoordinator {
                     .with_cube_repo(&repo.repo_id)
                     .with_cube_lease(&lease.lease_id)
                     .with_cube_workspace(&lease.workspace_id)
-                    .with_cube_invocation(self.cube_client.command_repr(&lease_args)),
+                    .with_cube_invocation(self.host_adapter.command_repr(&lease_args)),
                 )
                 .await;
         }
         let change_title = execution_change_title(execution, &work_item);
         let workspace_path_str = lease.workspace_path.display().to_string();
-        let change_repr: Option<(String, String)> = self.cube_client.command_repr(&[
+        let change_repr: Option<(String, String)> = self.host_adapter.command_repr(&[
             "--json",
             "change",
             "create",
@@ -1516,13 +1534,13 @@ impl ExecutionCoordinator {
             &change_title,
         ]);
         let change = match self
-            .cube_client
+            .host_adapter
             .create_change(&lease.workspace_path, &change_title)
             .await
         {
             Ok(change) => change,
             Err(err) => {
-                if let Err(release_err) = self.cube_client.release_workspace(&lease.lease_id).await
+                if let Err(release_err) = self.host_adapter.release_workspace(&lease.lease_id).await
                 {
                     tracing::error!(
                         ?release_err,
@@ -1651,7 +1669,7 @@ impl ExecutionCoordinator {
                 Ok(())
             }
             Err(err) => {
-                let release_result = self.cube_client.release_workspace(&lease.lease_id).await;
+                let release_result = self.host_adapter.release_workspace(&lease.lease_id).await;
                 if let Err(release_err) = release_result {
                     tracing::error!(
                         ?release_err,
@@ -1710,7 +1728,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        let repos = match self.cube_client.list_repos().await {
+        let repos = match self.host_adapter.list_repos().await {
             Ok(repos) => repos,
             Err(err) => {
                 tracing::warn!(
@@ -1816,7 +1834,7 @@ impl ExecutionCoordinator {
         if let Some(p) = prefer {
             attempt1_args.extend_from_slice(&["--prefer", p]);
         }
-        let attempt1_repr = self.cube_client.command_repr(&attempt1_args);
+        let attempt1_repr = self.host_adapter.command_repr(&attempt1_args);
 
         // First attempt: use the preferred workspace if the caller
         // pinned one. Emit `cube_workspace_lease_attempted` *before*
@@ -1898,7 +1916,7 @@ impl ExecutionCoordinator {
         let attempt2_args = vec![
             "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task,
         ];
-        let attempt2_repr = self.cube_client.command_repr(&attempt2_args);
+        let attempt2_repr = self.host_adapter.command_repr(&attempt2_args);
 
         self.dispatch_events
             .emit(
@@ -1980,7 +1998,7 @@ impl ExecutionCoordinator {
     ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
         match tokio::time::timeout(
             timeout,
-            self.cube_client
+            self.host_adapter
                 .lease_workspace(&repo.repo_id, task, prefer_workspace_id),
         )
         .await
@@ -2143,7 +2161,7 @@ impl ExecutionCoordinator {
         // run and accidentally extend a lease the engine has already
         // released downstream.
         let heartbeat = HeartbeatGuard::spawn(
-            self.cube_client.clone(),
+            Arc::clone(&self.host_adapter),
             lease.lease_id.clone(),
             execution.id.clone(),
             run.id.clone(),
@@ -2158,8 +2176,8 @@ impl ExecutionCoordinator {
         }
 
         let run_outcome = self
-            .execution_runner
-            .run_execution(
+            .host_adapter
+            .spawn_worker(
                 &worker_id,
                 &execution,
                 &work_item,
@@ -2263,7 +2281,7 @@ impl ExecutionCoordinator {
                     .await;
             }
             Err(err) => {
-                let released = match self.cube_client.release_workspace(&lease.lease_id).await {
+                let released = match self.host_adapter.release_workspace(&lease.lease_id).await {
                     Ok(()) => true,
                     Err(release_err) => {
                         tracing::error!(
@@ -2539,7 +2557,7 @@ impl ExecutionCoordinator {
     ) -> Result<()> {
         let release_workspace = outcome.wait_state.release_workspace();
         let released = if release_workspace {
-            match self.cube_client.release_workspace(&lease.lease_id).await {
+            match self.host_adapter.release_workspace(&lease.lease_id).await {
                 Ok(()) => true,
                 Err(err) => {
                     tracing::error!(
@@ -6123,12 +6141,19 @@ mod tests {
     /// is shortened to 50 ms here so the test stays fast.
     #[tokio::test]
     async fn heartbeat_guard_renews_lease_until_dropped() {
-        use super::HeartbeatGuard;
+        use super::{HeartbeatGuard, LocalHostAdapter};
+        use crate::host_adapter::HostAdapter;
 
         let cube = Arc::new(FakeCubeClient::default());
-        let cube_dyn: Arc<dyn CubeClient> = cube.clone();
+        // Thin shim: wrap the FakeCubeClient in a LocalHostAdapter so the
+        // HostAdapter-typed HeartbeatGuard interface is satisfied. The test
+        // still inspects heartbeat_calls on the inner FakeCubeClient.
+        let adapter: Arc<dyn HostAdapter> = Arc::new(LocalHostAdapter::new(
+            cube.clone() as Arc<dyn CubeClient>,
+            Arc::new(FakeExecutionRunner::default()),
+        ));
         let guard = HeartbeatGuard::spawn_with_interval(
-            cube_dyn,
+            adapter,
             "lease-1".to_owned(),
             "exec-1".to_owned(),
             "run-1".to_owned(),
