@@ -118,10 +118,22 @@ final class ChatViewModel: ObservableObject {
     /// A missing entry means "we haven't asked yet" — the affordance
     /// stays hidden until the engine replies.
     @Published var designDocStateByProjectID: [String: ProjectDesignDocState] = [:]
-    /// In-flight resolve-RPC start times, keyed by project id. Populated in
-    /// `refreshDesignDocStates` and consumed when the engine replies so we
-    /// can log the full resolve round-trip duration.
-    private var designDocResolveStartTimes: [String: (date: Date, shortID: String)] = [:]
+    /// In-flight resolve-RPC batch. The engine resolves design-doc
+    /// pointers in lock-step (responses arrive back-to-back regardless of
+    /// per-project work), so stamping each project with its own
+    /// start-to-response delta produces N near-identical numbers and
+    /// destroys per-project attribution. Instead we track one batch per
+    /// `refreshDesignDocStates` call and emit a single
+    /// `phase=resolve project=batch count=<n>` summary when the last
+    /// pending response arrives. Stray responses for projects outside the
+    /// current batch (a refresh that landed mid-flight) still update
+    /// state — they just don't drive timing.
+    private struct DesignDocResolveBatch {
+        var startDate: Date
+        var pendingProjectIDs: Set<String>
+        let initialCount: Int
+    }
+    private var currentDesignDocResolveBatch: DesignDocResolveBatch?
 
     /// Engine-tab attempt list, freshest first. Refreshed on Engine-tab
     /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
@@ -970,9 +982,14 @@ final class ChatViewModel: ObservableObject {
     /// landed in another session flows through to the icon.
     func refreshDesignDocStates(for projects: [WorkProject]) {
         guard isConnected else { return }
-        for project in projects where project.designDocPath != nil {
-            let shortID = project.shortID.map { "\($0)" } ?? project.id
-            designDocResolveStartTimes[project.id] = (date: Date(), shortID: shortID)
+        let pending = projects.filter { $0.designDocPath != nil }
+        guard !pending.isEmpty else { return }
+        currentDesignDocResolveBatch = DesignDocResolveBatch(
+            startDate: Date(),
+            pendingProjectIDs: Set(pending.map(\.id)),
+            initialCount: pending.count
+        )
+        for project in pending {
             engine.sendResolveProjectDesignDoc(projectID: project.id)
         }
     }
@@ -1010,12 +1027,14 @@ final class ChatViewModel: ObservableObject {
             // different branch even when resolved.branch == "main".
             if let rawContentURL, let rawURL = URL(string: rawContentURL) {
                 let projectName = project.name
+                let clickStart = Date()
                 designDocTimingLog.info("phase=dispatch project=\(shortID, privacy: .public) path=rawContentURL")
                 if let opener = asyncMarkdownViewerOpener {
                     // Open the window immediately in a loading state, then
                     // resolve the content asynchronously — the user sees a
                     // window within one frame of the click (T-open-immediately).
                     asyncMarkdownViewerVM.state = .loading
+                    asyncMarkdownViewerVM.clickStartTime = clickStart
                     let openWindowStart = Date()
                     opener()
                     let openWindowMs = Int(Date().timeIntervalSince(openWindowStart) * 1000)
@@ -1352,9 +1371,15 @@ final class ChatViewModel: ObservableObject {
         case .metricsListLiveResult(let entries):
             engineMetrics = entries
         case .projectDesignDocResolved(let output):
-            if let entry = designDocResolveStartTimes.removeValue(forKey: output.projectID) {
-                let ms = Int(Date().timeIntervalSince(entry.date) * 1000)
-                designDocTimingLog.info("phase=resolve project=\(entry.shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
+            if var batch = currentDesignDocResolveBatch,
+               batch.pendingProjectIDs.remove(output.projectID) != nil {
+                if batch.pendingProjectIDs.isEmpty {
+                    let ms = Int(Date().timeIntervalSince(batch.startDate) * 1000)
+                    designDocTimingLog.info("phase=resolve project=batch count=\(batch.initialCount, privacy: .public) duration_ms=\(ms, privacy: .public)")
+                    currentDesignDocResolveBatch = nil
+                } else {
+                    currentDesignDocResolveBatch = batch
+                }
             }
             designDocStateByProjectID[output.projectID] = output.state
         case .conflictResolutionsList(let attempts):

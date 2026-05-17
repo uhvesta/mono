@@ -461,10 +461,20 @@ struct MarkdownViewerView: View {
     /// Project short-ID for timing logs. Empty string when called outside
     /// the async-markdown-viewer context (e.g. tests, design-doc browser).
     var projectShortID: String = ""
+    /// Wall-clock time of the user's click that triggered this open, for
+    /// the `phase=interactive` total. Nil outside the async-markdown-viewer
+    /// flow (e.g. design-doc browser) — interactive is only meaningful for
+    /// the click-to-first-paint user journey.
+    var clickStartTime: Date? = nil
 
     var body: some View {
-        MarkdownViewerScrollContent(title: title, source: source, projectShortID: projectShortID)
-            .withComments()
+        MarkdownViewerScrollContent(
+            title: title,
+            source: source,
+            projectShortID: projectShortID,
+            clickStartTime: clickStartTime
+        )
+        .withComments()
     }
 }
 
@@ -481,6 +491,11 @@ private struct MarkdownViewerScrollContent: View {
     let title: String
     let source: String
     let projectShortID: String
+    /// Click→first-paint anchor passed in from `MarkdownViewerView`. When
+    /// non-nil and layout completes, we additionally emit `phase=interactive`
+    /// so the unified log carries a single end-to-end number alongside the
+    /// per-stage spans.
+    let clickStartTime: Date?
 
     @Environment(\.commentedTexts) private var commentedTexts
     @Environment(\.commentFlashText) private var commentFlashText
@@ -527,6 +542,10 @@ private struct MarkdownViewerScrollContent: View {
             let ms = Int(Date().timeIntervalSince(start) * 1000)
             let bytes = source.utf8.count
             designDocTimingLog.info("phase=parse project=\(projectShortID, privacy: .public) duration_ms=\(ms, privacy: .public) bytes=\(bytes, privacy: .public)")
+            if let clickStart = clickStartTime {
+                let totalMs = Int(Date().timeIntervalSince(clickStart) * 1000)
+                designDocTimingLog.info("phase=interactive project=\(projectShortID, privacy: .public) duration_ms=\(totalMs, privacy: .public)")
+            }
             DispatchQueue.main.async {
                 parseLogged = true
                 parseStartTime = nil
@@ -575,6 +594,14 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
     /// `MarkdownViewerView` so SwiftUI recreates the view on each content
     /// load, ensuring `.onAppear` fires even when the window is reused.
     var renderContentID: UUID? = nil
+    /// Wall-clock time `openProjectDesignDoc` first dispatched the
+    /// rawContentURL path for this click. Read by
+    /// `MarkdownViewerScrollContent` to emit a single
+    /// `phase=interactive` line covering the full click→first-paint
+    /// budget. Each click overwrites it, and the inner content's
+    /// `parseLogged` flag guards against double-emission on a single
+    /// content load — so we don't need to null it out after consumption.
+    var clickStartTime: Date? = nil
 }
 
 /// Content view for the `"async-markdown-viewer"` Window scene. Shows a
@@ -594,7 +621,8 @@ struct AsyncMarkdownViewerView: View {
             MarkdownViewerView(
                 title: title,
                 source: markdown,
-                projectShortID: chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID ?? ""
+                projectShortID: chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID ?? "",
+                clickStartTime: chatModel.asyncMarkdownViewerVM.clickStartTime
             )
             // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
             // content load, so .onAppear fires even when the window is reused across
@@ -609,6 +637,10 @@ struct AsyncMarkdownViewerView: View {
                     chatModel.asyncMarkdownViewerVM.renderStartTime = nil
                     chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
                 }
+                // clickStartTime is consumed by MarkdownViewerScrollContent's
+                // layout-complete handler. It is not cleared here on purpose —
+                // SwiftUI may rebuild AsyncMarkdownViewerView before layout
+                // completes, and the next click re-stamps it.
             }
         case .failed(let title, let message):
             VStack(spacing: 16) {
