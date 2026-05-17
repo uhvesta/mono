@@ -13,17 +13,19 @@ import Textual
 struct HighlightingMarkdownParser: MarkupParser {
     var highlightedTexts: [String]
     var flashingText: String?
+    var baseURL: URL?
 
     private static let yellowColor = Color(nsColor: NSColor.systemYellow).opacity(0.45)
     private static let orangeColor = Color(nsColor: NSColor.systemOrange).opacity(0.55)
 
-    init(highlightedTexts: [String], flashingText: String? = nil) {
+    init(highlightedTexts: [String], flashingText: String? = nil, baseURL: URL? = nil) {
         self.highlightedTexts = highlightedTexts
         self.flashingText = flashingText
+        self.baseURL = baseURL
     }
 
     func attributedString(for input: String) throws -> AttributedString {
-        var result = try AttributedStringMarkdownParser.markdown().attributedString(for: input)
+        var result = try AttributedStringMarkdownParser.markdown(baseURL: baseURL).attributedString(for: input)
         let plain = String(result.characters)
 
         for text in highlightedTexts where !text.isEmpty {

@@ -175,13 +175,10 @@ struct DesignRendererView: View {
                 }
             }
         } else {
-            StructuredText(
-                markdown: source,
+            DesignRendererMarkdownContent(
+                source: source,
                 baseURL: URL(fileURLWithPath: content.filePath).deletingLastPathComponent()
             )
-            .bossMarkdown()
-            .textual.textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -207,5 +204,42 @@ struct DesignRendererView: View {
             self.loadError = "Failed to read \(path): \(error.localizedDescription)"
             self.source = ""
         }
+    }
+}
+
+/// Inner content view for `DesignRendererView` that reads comment highlights from the
+/// environment (injected by `.withComments()` on the parent ScrollView) and switches to
+/// `HighlightingMarkdownParser` when comments are present. Mirrors the pattern used by
+/// `MarkdownViewerScrollContent` so both surfaces highlight consistently.
+private struct DesignRendererMarkdownContent: View {
+    let source: String
+    let baseURL: URL?
+
+    @Environment(\.commentedTexts) private var commentedTexts
+    @Environment(\.commentFlashText) private var commentFlashText
+
+    var body: some View {
+        StructuredText(source, parser: markdownParser)
+            .bossMarkdown()
+            .textual.textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .id(highlightKey)
+    }
+
+    private var markdownParser: any MarkupParser {
+        if commentedTexts.isEmpty && commentFlashText == nil {
+            return AttributedStringMarkdownParser.markdown(baseURL: baseURL)
+        }
+        return HighlightingMarkdownParser(
+            highlightedTexts: commentedTexts,
+            flashingText: commentFlashText,
+            baseURL: baseURL
+        )
+    }
+
+    private var highlightKey: Int {
+        var h = commentedTexts.hashValue
+        h ^= commentFlashText?.hashValue ?? 0
+        return h
     }
 }
