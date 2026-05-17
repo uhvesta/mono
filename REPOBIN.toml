@@ -3,6 +3,9 @@ version = 1
 [tools.boss]
 target = "//tools/boss/cli:boss"
 
+[tools.boss-event]
+target = "//tools/boss/event-shim:boss-event"
+
 [tools.bossctl]
 target = "//tools/boss/bossctl:bossctl"
 
