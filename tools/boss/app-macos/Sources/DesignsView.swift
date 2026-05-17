@@ -458,11 +458,21 @@ struct MarkdownViewerContent: Codable, Hashable {
 struct MarkdownViewerView: View {
     let title: String
     let source: String
+    /// Project short-ID for timing logs. Empty string when called outside
+    /// the async-markdown-viewer context (e.g. tests, design-doc browser).
+    var projectShortID: String = ""
 
     var body: some View {
-        MarkdownViewerScrollContent(title: title, source: source)
+        MarkdownViewerScrollContent(title: title, source: source, projectShortID: projectShortID)
             .withComments()
     }
+}
+
+/// Preference key used to detect when `StructuredText` has been laid out
+/// for the first time, signalling that Textual has completed parsing.
+private struct StructuredTextHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 /// Inner content view that reads comment state from the environment and uses
@@ -470,9 +480,12 @@ struct MarkdownViewerView: View {
 private struct MarkdownViewerScrollContent: View {
     let title: String
     let source: String
+    let projectShortID: String
 
     @Environment(\.commentedTexts) private var commentedTexts
     @Environment(\.commentFlashText) private var commentFlashText
+    @State private var parseStartTime: Date? = nil
+    @State private var parseLogged = false
 
     var body: some View {
         ScrollView {
@@ -490,12 +503,35 @@ private struct MarkdownViewerScrollContent: View {
                     // StructuredText only re-parses on markup changes; the id() change is the
                     // trigger that ensures highlight updates are reflected immediately.
                     .id(highlightKey)
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(
+                                key: StructuredTextHeightKey.self,
+                                value: geo.size.height
+                            )
+                        }
+                    )
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .textSelection(.enabled)
+        .onAppear {
+            parseStartTime = Date()
+            parseLogged = false
+        }
+        .onPreferenceChange(StructuredTextHeightKey.self) { height in
+            guard !parseLogged, height > 0, let start = parseStartTime,
+                  !projectShortID.isEmpty else { return }
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            let bytes = source.utf8.count
+            designDocTimingLog.info("phase=parse project=\(projectShortID, privacy: .public) duration_ms=\(ms, privacy: .public) bytes=\(bytes, privacy: .public)")
+            DispatchQueue.main.async {
+                parseLogged = true
+                parseStartTime = nil
+            }
+        }
     }
 
     private var markdownParser: any MarkupParser {
@@ -535,6 +571,10 @@ final class AsyncMarkdownViewerViewModel: ObservableObject {
     /// render-complete log entry can report the full parse+layout duration.
     var renderStartTime: Date? = nil
     var pendingRenderProjectShortID: String? = nil
+    /// Stamped alongside `renderStartTime`; applied as `.id()` to
+    /// `MarkdownViewerView` so SwiftUI recreates the view on each content
+    /// load, ensuring `.onAppear` fires even when the window is reused.
+    var renderContentID: UUID? = nil
 }
 
 /// Content view for the `"async-markdown-viewer"` Window scene. Shows a
@@ -551,17 +591,25 @@ struct AsyncMarkdownViewerView: View {
             ProgressView("Loading…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .loaded(let title, let markdown):
-            MarkdownViewerView(title: title, source: markdown)
-                .navigationTitle(title)
-                .onAppear {
-                    if let start = chatModel.asyncMarkdownViewerVM.renderStartTime,
-                       let shortID = chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID {
-                        let ms = Int(Date().timeIntervalSince(start) * 1000)
-                        designDocTimingLog.info("phase=render project=\(shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
-                        chatModel.asyncMarkdownViewerVM.renderStartTime = nil
-                        chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
-                    }
+            MarkdownViewerView(
+                title: title,
+                source: markdown,
+                projectShortID: chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID ?? ""
+            )
+            // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
+            // content load, so .onAppear fires even when the window is reused across
+            // documents (stable case identity would otherwise suppress it).
+            .id(chatModel.asyncMarkdownViewerVM.renderContentID)
+            .navigationTitle(title)
+            .onAppear {
+                if let start = chatModel.asyncMarkdownViewerVM.renderStartTime,
+                   let shortID = chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID {
+                    let ms = Int(Date().timeIntervalSince(start) * 1000)
+                    designDocTimingLog.info("phase=render project=\(shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
+                    chatModel.asyncMarkdownViewerVM.renderStartTime = nil
+                    chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
                 }
+            }
         case .failed(let title, let message):
             VStack(spacing: 16) {
                 Image(systemName: "exclamationmark.triangle")

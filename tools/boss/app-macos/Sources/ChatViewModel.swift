@@ -1016,7 +1016,10 @@ final class ChatViewModel: ObservableObject {
                     // resolve the content asynchronously — the user sees a
                     // window within one frame of the click (T-open-immediately).
                     asyncMarkdownViewerVM.state = .loading
+                    let openWindowStart = Date()
                     opener()
+                    let openWindowMs = Int(Date().timeIntervalSince(openWindowStart) * 1000)
+                    designDocTimingLog.info("phase=open_window project=\(shortID, privacy: .public) duration_ms=\(openWindowMs, privacy: .public)")
                     Task { @MainActor in
                         await self.fetchAndUpdateAsyncMarkdownViewerVM(
                             projectName: projectName,
@@ -1120,6 +1123,7 @@ final class ChatViewModel: ObservableObject {
             designDocTimingLog.info("phase=fetch_end project=\(projectShortID, privacy: .public) duration_ms=\(fetchMs, privacy: .public) bytes=\(markdown.utf8.count, privacy: .public)")
             asyncMarkdownViewerVM.pendingRenderProjectShortID = projectShortID
             asyncMarkdownViewerVM.renderStartTime = Date()
+            asyncMarkdownViewerVM.renderContentID = UUID()
             asyncMarkdownViewerVM.state = .loaded(title: title, markdown: markdown)
         } catch {
             asyncMarkdownViewerVM.state = .failed(
