@@ -1,0 +1,85 @@
+{
+  "data": {
+    "organization": {
+      "projectV2": {
+        "items": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpHOABk"
+          },
+          "nodes": [
+            {
+              "id": "PVTI_lADOBjE2Ms4Aa56JzgC7x8Y",
+              "content": {
+                "__typename": "Issue",
+                "number": 560,
+                "title": "Implement external tracker sync",
+                "body": "We need to build a sync layer between external issue trackers and Boss.",
+                "state": "OPEN",
+                "stateReason": null,
+                "url": "https://github.com/spinyfin/mono/issues/560",
+                "repository": {
+                  "nameWithOwner": "spinyfin/mono"
+                },
+                "labels": {
+                  "nodes": [
+                    {"name": "enhancement"},
+                    {"name": "boss"}
+                  ]
+                },
+                "assignees": {
+                  "nodes": [
+                    {"login": "brianduff"}
+                  ]
+                },
+                "closedByPullRequestsReferences": {
+                  "nodes": []
+                },
+                "updatedAt": "2026-05-17T10:00:00Z"
+              }
+            },
+            {
+              "id": "PVTI_lADOBjE2Ms4Aa56JzgC7y9Z",
+              "content": {
+                "__typename": "Issue",
+                "number": 561,
+                "title": "Fix bug in reconciler",
+                "body": "There is a concurrency bug in the reconciler.",
+                "state": "CLOSED",
+                "stateReason": "COMPLETED",
+                "url": "https://github.com/spinyfin/mono/issues/561",
+                "repository": {
+                  "nameWithOwner": "spinyfin/mono"
+                },
+                "labels": {
+                  "nodes": [
+                    {"name": "bug"}
+                  ]
+                },
+                "assignees": {
+                  "nodes": []
+                },
+                "closedByPullRequestsReferences": {
+                  "nodes": [
+                    {
+                      "url": "https://github.com/spinyfin/mono/pull/620",
+                      "merged": true,
+                      "mergedAt": "2026-05-16T15:30:00Z"
+                    }
+                  ]
+                },
+                "updatedAt": "2026-05-16T15:30:00Z"
+              }
+            },
+            {
+              "id": "PVTI_lADOBjE2Ms4Aa56JzgC7z0A",
+              "content": {
+                "__typename": "DraftIssue"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
