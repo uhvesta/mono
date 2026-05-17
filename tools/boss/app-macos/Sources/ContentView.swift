@@ -860,7 +860,7 @@ private struct WorkSidebarFilterRow: View {
                     .frame(width: 15, alignment: .center)
                     .padding(.top, 2)
             }
-            VStack(alignment: .leading, spacing: hasExtraRow ? 2 : 0) {
+            VStack(alignment: .leading, spacing: subtitle != nil && !subtitle!.isEmpty ? 2 : 0) {
                 HStack(alignment: .top, spacing: 8) {
                     if dimmed {
                         Image(systemName: systemImage)
@@ -901,21 +901,26 @@ private struct WorkSidebarFilterRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                if let subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                if let presentation = designDocPresentation, let openDoc = onOpenDesignDoc {
-                    Button(action: openDoc) {
-                        Label("Design doc", systemImage: presentation.systemImage)
-                            .font(.caption)
-                            .foregroundStyle(presentation.tint)
+                if (subtitle != nil && !subtitle!.isEmpty) || designDocPresentation != nil {
+                    HStack(alignment: .center, spacing: 6) {
+                        if let subtitle, !subtitle.isEmpty {
+                            Text(subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        if let presentation = designDocPresentation, let openDoc = onOpenDesignDoc {
+                            Button(action: openDoc) {
+                                Image(systemName: presentation.systemImage)
+                                    .font(.caption)
+                                    .foregroundStyle(presentation.tint)
+                                    .accessibilityLabel(presentation.accessibilityLabel)
+                            }
+                            .buttonStyle(.plain)
+                            .help(presentation.tooltip)
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .help(presentation.tooltip)
-                    .accessibilityLabel(presentation.accessibilityLabel)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
