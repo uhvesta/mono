@@ -5026,6 +5026,75 @@ impl WorkDb {
         }
         Ok(result)
     }
+
+    /// Bump `external_ref_synced_at` to the current time for a work item.
+    /// Called by the reconciler on every successful tick regardless of whether
+    /// any other column changed. Does NOT update `updated_at` (keeping the
+    /// reconciler tick invisible in the general-purpose "last modified" timeline).
+    pub fn touch_external_ref_synced_at(&self, work_item_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_string();
+        conn.execute(
+            "UPDATE tasks SET external_ref_synced_at = ?2
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Move `work_item_id` to `status = 'done'`, clearing any block reason.
+    /// No-op (returns `false`) when the row is already done/archived or soft-deleted.
+    /// Used by the external-tracker reconciler for close-mirror (Behavior 2) and
+    /// PR-merge-close (Behavior 5). Cascades the dep-unblock sweep after commit.
+    pub fn reconciler_close_work_item(&self, work_item_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let Some(task) = query_task(&tx, work_item_id)? else {
+            return Ok(false);
+        };
+        if task.deleted_at.is_some()
+            || task.status == "done"
+            || task.status == "archived"
+        {
+            return Ok(false);
+        }
+        let now = now_string();
+        let n = tx.execute(
+            "UPDATE tasks
+             SET status             = 'done',
+                 updated_at         = ?2,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1
+               AND status NOT IN ('done', 'archived')
+               AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        if n > 0 {
+            cascade_dependents_after_prereq_status_change(&tx, work_item_id, "done", &now)?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// Set `pr_url` on a work item if it is currently `NULL` or empty.
+    /// Returns `true` when the column was written, `false` when it was
+    /// already set (preserving the existing URL, which may come from a
+    /// more-trusted source like the `pr_url_capture` pipeline).
+    pub fn reconciler_attach_pr_url(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE tasks
+             SET pr_url = ?2, updated_at = ?3
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND (pr_url IS NULL OR pr_url = '')",
+            params![work_item_id, pr_url, now],
+        )?;
+        Ok(n > 0)
+    }
 }
 
 /// Where the chore should land after [`WorkDb::record_worker_pr_completion`].

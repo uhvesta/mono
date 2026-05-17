@@ -50,4 +50,6 @@ pub fn init_all(registry: &Registry) {
     crate::live_status_loop::register_metrics(registry);
     // Phase 5: SweepOutcome / merge_poller counters.
     crate::merge_poller::init(registry);
+    // External tracker reconciler pass counters.
+    crate::external_tracker::reconcile::register_metrics(registry);
 }
