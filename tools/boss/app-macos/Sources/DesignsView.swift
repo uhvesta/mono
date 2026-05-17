@@ -1,6 +1,9 @@
 import Foundation
+import os
 import SwiftUI
 import Textual
+
+private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "DesignDocTiming")
 
 // MARK: - Repo path resolution
 
@@ -528,6 +531,10 @@ enum MarkdownDocLoadState {
 @MainActor
 final class AsyncMarkdownViewerViewModel: ObservableObject {
     @Published var state: MarkdownDocLoadState = .loading
+    /// Set by the fetch path just before transitioning to `.loaded` so the
+    /// render-complete log entry can report the full parse+layout duration.
+    var renderStartTime: Date? = nil
+    var pendingRenderProjectShortID: String? = nil
 }
 
 /// Content view for the `"async-markdown-viewer"` Window scene. Shows a
@@ -546,6 +553,15 @@ struct AsyncMarkdownViewerView: View {
         case .loaded(let title, let markdown):
             MarkdownViewerView(title: title, source: markdown)
                 .navigationTitle(title)
+                .onAppear {
+                    if let start = chatModel.asyncMarkdownViewerVM.renderStartTime,
+                       let shortID = chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID {
+                        let ms = Int(Date().timeIntervalSince(start) * 1000)
+                        designDocTimingLog.info("phase=render project=\(shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
+                        chatModel.asyncMarkdownViewerVM.renderStartTime = nil
+                        chatModel.asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
+                    }
+                }
         case .failed(let title, let message):
             VStack(spacing: 16) {
                 Image(systemName: "exclamationmark.triangle")
