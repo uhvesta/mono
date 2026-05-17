@@ -53,6 +53,7 @@ use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
 use crate::work::{PendingMergeCheck, WorkDb};
+use boss_protocol;
 
 /// Review-gating state of a PR at probe time. Derived from
 /// GitHub's `reviewDecision` field and the `reviews` array.
@@ -1378,9 +1379,41 @@ async fn maybe_clear_blocked(
             return;
         }
     };
-    if signals.is_empty() {
-        return;
-    }
+    // Drift guard (T230): if `task_blocked_signals` is empty but the task
+    // still has a non-null `blocked_reason`, the signals table and the
+    // scalar got out of sync (e.g. the polymorphic-clear path cleared the
+    // signal row before the parent task was cleared). Fall back to the
+    // `blocked_reason` scalar so the retire path can still fire on a Clean
+    // probe, preventing the task from being stuck blocked indefinitely.
+    let signals = if signals.is_empty() {
+        match work_db.task_blocked_reason(&candidate.work_item_id) {
+            Ok(Some(reason)) => {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    %reason,
+                    "merge poller: task_blocked_signals empty but blocked_reason set; using blocked_reason as fallback",
+                );
+                vec![boss_protocol::BlockedSignal {
+                    work_item_id: candidate.work_item_id.clone(),
+                    reason,
+                    attempt_id: None,
+                    created_at: String::new(),
+                    cleared_at: None,
+                }]
+            }
+            Ok(None) => return, // task not blocked or no reason — nothing to do
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "merge poller: failed to read blocked_reason for drift fallback; skipping clear dispatch",
+                );
+                return;
+            }
+        }
+    } else {
+        signals
+    };
 
     // Mergeability is `Clean` at the caller (we're inside the Clean
     // arm of `sweep_one`), so the merge-conflict probe condition is
@@ -3419,6 +3452,217 @@ mod tests {
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.conflict_redispatched, 0);
         assert!(db.list_ready_executions().unwrap().is_empty());
+    }
+
+    /// T230 scenario integration test: worker B resolved against stale main
+    /// SHA (already-succeeded crz), but PR is still CONFLICTING. The next
+    /// merge-poller sweep must:
+    ///   1. Detect the stale-base situation (succeeded crz + CONFLICTING PR).
+    ///   2. Re-arm `task_blocked_signals`.
+    ///   3. Dispatch a fresh crz against the new base SHA.
+    ///   4. Leave all four state surfaces mutually consistent.
+    #[tokio::test]
+    async fn stale_base_succeeded_crz_rearmed_on_conflicting_pr() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/910";
+        let (product, chore) = make_chore_in_review(&db, "C-t230", pr);
+
+        // Simulate: conflict detected against old main SHA "sha-old".
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 910,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("sha-old".into()),
+                head_sha_before: Some("sha-head-before".into()),
+            })
+            .unwrap()
+            .expect("attempt insert must succeed");
+        db.mark_conflict_resolution_running(&attempt.id, "lease-t230", "ws-t230", "worker-t230")
+            .unwrap();
+
+        // Worker B ran against the stale base and marked the crz succeeded.
+        // (In the real scenario the task flip inside finalize_via_resolution_signal
+        // missed due to blocked_attempt_id mismatch; here we reproduce the exact
+        // wedged state: crz=succeeded, task=blocked:merge_conflict.)
+        db.mark_conflict_resolution_succeeded(&attempt.id, Some("sha-head-after"))
+            .unwrap();
+        // Ensure task is still blocked (the primary path's WHERE guard missed).
+        let task = match db.get_work_item(&chore).unwrap() {
+            crate::work::WorkItem::Chore(t) => t,
+            other => panic!("expected Chore, got {other:?}"),
+        };
+        assert_eq!(task.status, "blocked");
+        assert_eq!(task.blocked_reason.as_deref(), Some("merge_conflict"));
+
+        // Probe now reports CONFLICTING against the *new* main SHA "sha-new".
+        let probe = StubProbe::new();
+        probe.set_with_base(
+            pr,
+            PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+            Some("sha-new"),
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+
+        // The sweep must NOT count this as a new conflict_flagged
+        // (the task didn't flip from in_review — it was already blocked).
+        assert_eq!(outcome.conflict_flagged, 0, "no new flip expected");
+
+        // A fresh ready execution must have been dispatched for the re-arm.
+        let ready = db.list_ready_executions().unwrap();
+        assert!(
+            ready
+                .iter()
+                .any(|e| e.work_item_id == chore && e.kind == "conflict_resolution"),
+            "expected a fresh ready conflict_resolution execution for the re-arm; got {ready:?}",
+        );
+
+        // A new crz must exist with base_sha_at_trigger = "sha-new".
+        let crz_rows = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap();
+        let fresh_crz = crz_rows
+            .iter()
+            .find(|r| r.base_sha_at_trigger.as_deref() == Some("sha-new"));
+        assert!(
+            fresh_crz.is_some(),
+            "expected a fresh crz with base_sha_at_trigger=sha-new; rows={crz_rows:?}",
+        );
+        assert_eq!(
+            fresh_crz.unwrap().status,
+            "pending",
+            "fresh crz must be pending",
+        );
+
+        // The original crz must still be succeeded.
+        let orig = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+        assert_eq!(orig.status, "succeeded");
+
+        // task_blocked_signals must have an active merge_conflict row.
+        let signals = db.active_blocked_signals(&chore).unwrap();
+        assert!(
+            signals.iter().any(|s| s.reason == "merge_conflict"),
+            "merge_conflict signal must be active after re-arm; got {signals:?}",
+        );
+
+        // tasks.blocked_reason must still be merge_conflict.
+        let task_after = match db.get_work_item(&chore).unwrap() {
+            crate::work::WorkItem::Chore(t) => t,
+            other => panic!("expected Chore, got {other:?}"),
+        };
+        assert_eq!(task_after.status, "blocked");
+        assert_eq!(task_after.blocked_reason.as_deref(), Some("merge_conflict"));
+    }
+
+    /// Complement test: a `failed` crz must NOT be re-armed (churn guard
+    /// and human own the retry). Verifies the stale-base path doesn't
+    /// widen to swallow the churn guard's intention.
+    #[tokio::test]
+    async fn failed_crz_is_not_rearmed_on_conflicting_pr() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/911";
+        let (product, chore) = make_chore_in_review(&db, "C-failed-norearm", pr);
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product,
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 911,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("sha-fail".into()),
+                head_sha_before: None,
+            })
+            .unwrap()
+            .expect("attempt insert must succeed");
+        db.mark_conflict_resolution_failed(&attempt.id, "worker_died")
+            .unwrap();
+
+        let probe = StubProbe::new();
+        probe.set_with_base(
+            pr,
+            PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+            Some("sha-new"),
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+
+        let ready = db.list_ready_executions().unwrap();
+        assert!(
+            ready.is_empty(),
+            "failed crz must not be re-armed automatically; got {ready:?}",
+        );
+    }
+
+    /// Drift-guard: when `task_blocked_signals` is empty but
+    /// `blocked_reason = 'merge_conflict'` and the probe returns Clean,
+    /// `maybe_clear_blocked` must still fire the retire path and flip the
+    /// task back to `in_review`.
+    #[tokio::test]
+    async fn drift_guard_clears_blocked_task_when_signals_empty_but_pr_clean() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/912";
+        let (product, chore) = make_chore_in_review(&db, "C-drift-clean", pr);
+
+        // Put the task into blocked:merge_conflict (signals + reason both set).
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+
+        // Simulate the drift: clear the signal row manually without clearing
+        // the blocked_reason on the tasks table.
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("boss.db")).unwrap();
+            conn.execute(
+                "UPDATE task_blocked_signals SET cleared_at = '9999' WHERE work_item_id = ?1",
+                [&chore],
+            )
+            .unwrap();
+        }
+
+        // Sanity: signal is now empty but blocked_reason is still set.
+        assert!(db.active_blocked_signals(&chore).unwrap().is_empty());
+        let task = match db.get_work_item(&chore).unwrap() {
+            crate::work::WorkItem::Chore(t) => t,
+            _ => panic!(),
+        };
+        assert_eq!(task.blocked_reason.as_deref(), Some("merge_conflict"));
+
+        // Probe now returns Clean — the PR is mergeable.
+        let probe = StubProbe::new();
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+
+        // The drift guard must have fired the retire path.
+        assert_eq!(
+            outcome.conflict_cleared, 1,
+            "drift guard must clear the blocked task when signals empty and PR clean",
+        );
+
+        // Task must be back in_review.
+        let task_after = match db.get_work_item(&chore).unwrap() {
+            crate::work::WorkItem::Chore(t) => t,
+            _ => panic!(),
+        };
+        assert_eq!(task_after.status, "in_review");
+        assert!(task_after.blocked_reason.is_none());
+
+        // work_item_changed event must have fired.
+        let events = publisher.events.lock().await;
+        assert!(
+            events.iter().any(|(pid, wid, r)| pid == &product && wid == &chore && r == "merge_conflict_resolved"),
+            "expected merge_conflict_resolved event; got {events:?}",
+        );
     }
 
     #[tokio::test]

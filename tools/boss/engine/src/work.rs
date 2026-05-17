@@ -4081,6 +4081,61 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Re-upsert the `task_blocked_signals` row for `merge_conflict` when the
+    /// parent task is already `blocked: merge_conflict` but the signal row
+    /// was cleared (e.g. by the polymorphic-clear path that ran prematurely
+    /// against a stale probe — T230 scenario).
+    ///
+    /// Returns `true` if the task IS `blocked: merge_conflict` (and the
+    /// signal was upserted); `false` when the task is not in that state, which
+    /// lets the caller distinguish a "human moved the row" miss from the
+    /// stale-crz re-arm scenario. A `false` return means the caller should
+    /// leave the row alone.
+    pub fn rearm_blocked_merge_conflict_signal(&self, work_item_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let is_blocked: bool = tx
+            .query_row(
+                "SELECT 1 FROM tasks
+                 WHERE id = ?1
+                   AND status = 'blocked'
+                   AND blocked_reason = 'merge_conflict'
+                   AND deleted_at IS NULL",
+                params![work_item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_blocked {
+            tx.commit()?;
+            return Ok(false);
+        }
+        upsert_task_blocked_signal(&tx, work_item_id, "merge_conflict", None, &now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Read `tasks.blocked_reason` for a task currently in `status='blocked'`.
+    /// Returns `Ok(None)` when the task is not blocked (or is soft-deleted,
+    /// or does not exist). Used by the merge-poller's drift-guard fallback in
+    /// `maybe_clear_blocked` to drive the retire path even when
+    /// `task_blocked_signals` is empty (T230-style inconsistency).
+    pub fn task_blocked_reason(&self, work_item_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT blocked_reason FROM tasks
+             WHERE id = ?1
+               AND status = 'blocked'
+               AND blocked_reason IS NOT NULL
+               AND deleted_at IS NULL",
+            params![work_item_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Read the current `ci_attempts_used` counter for a work item.
     /// Defaults to 0 when the row or column is missing (the budget
     /// kicks in only when the parent first enters the CI-failure
@@ -4506,6 +4561,37 @@ impl WorkDb {
     pub fn get_conflict_resolution(&self, attempt_id: &str) -> Result<Option<ConflictResolution>> {
         let conn = self.connect()?;
         query_conflict_resolution(&conn, attempt_id)
+    }
+
+    /// Most recent `conflict_resolutions` row for `work_item_id`,
+    /// regardless of status. Used by the stale-base re-arm path in
+    /// `conflict_watch::on_conflict_detected` to check whether the
+    /// previous attempt ended in `succeeded` (eligible for re-arm when
+    /// the PR is still CONFLICTING) vs `failed`/`abandoned` (not eligible
+    /// — the churn guard or human owns the retry decision in that case).
+    ///
+    /// Returns `None` when no attempt has ever been recorded for this
+    /// work item.
+    pub fn latest_conflict_resolution_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
+                    base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
+                    cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
+                    created_at, started_at, finished_at
+             FROM conflict_resolutions
+             WHERE work_item_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([work_item_id], map_conflict_resolution)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     /// Latest non-terminal attempt for `work_item_id`. Used by the

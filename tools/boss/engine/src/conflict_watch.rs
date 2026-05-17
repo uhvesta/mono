@@ -195,17 +195,123 @@ pub async fn on_conflict_detected(
             return false;
         }
     }
-    let updated = match work_db
+    // Try to flip the parent from `in_review` → `blocked: merge_conflict`.
+    // This is the primary path (new conflict). If the WHERE guard misses, we
+    // check the stale-crz re-arm path before giving up (T230 scenario: the
+    // task is already blocked but the previous resolution worker ran against
+    // an obsolete base SHA, so GitHub still reports CONFLICTING).
+    let task_flipped_now = match work_db
         .mark_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
     {
-        Ok(Some(task)) => task,
+        Ok(Some(_task)) => true,
         Ok(None) => {
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                "conflict_watch: WHERE guard missed; row already blocked or manually moved",
-            );
-            return false;
+            // WHERE guard missed. Two sub-cases:
+            // (a) Human moved the row — leave it alone.
+            // (b) Task IS blocked:merge_conflict with no active crz —
+            //     the previous resolution targeted a stale base. Re-arm
+            //     the signal and let the crz-insert path below dispatch
+            //     a fresh attempt against the current base SHA.
+            let is_blocked = match work_db
+                .rearm_blocked_merge_conflict_signal(&candidate.work_item_id)
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        ?err,
+                        "conflict_watch: failed to check/rearm blocked signal; skipping",
+                    );
+                    return false;
+                }
+            };
+            if !is_blocked {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    "conflict_watch: WHERE guard missed; row not blocked:merge_conflict (manually moved); skipping",
+                );
+                return false;
+            }
+            // Task IS blocked:merge_conflict; signal re-armed.
+            //
+            // Check for an active (pending/running) crz. If one exists, the
+            // worker is still in flight — no new dispatch needed. If none
+            // exists, check the most recent crz's terminal status:
+            //   - `succeeded`: the worker resolved against a stale base SHA
+            //     (T230 scenario). Re-arm — fall through to insert a fresh crz
+            //     against the current base SHA.
+            //   - `failed`/`abandoned`: the churn guard or human already owns
+            //     the retry decision; do NOT automatically re-dispatch.
+            match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
+                Ok(Some(_)) => {
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        "conflict_watch: blocked signal re-armed; active crz still in flight; no new dispatch",
+                    );
+                    return false;
+                }
+                Ok(None) => {
+                    // No active crz. Check the most recent crz status to
+                    // decide whether to re-arm.
+                    let latest_status = match work_db
+                        .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
+                    {
+                        Ok(Some(crz)) => crz.status,
+                        Ok(None) => {
+                            // No crz at all — this is a fresh block, not
+                            // a stale-base scenario. The insert path will
+                            // handle it.
+                            "pending".to_owned()
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                work_item_id = %candidate.work_item_id,
+                                ?err,
+                                "conflict_watch: failed to read latest crz during re-arm; skipping dispatch",
+                            );
+                            return false;
+                        }
+                    };
+                    match latest_status.as_str() {
+                        "succeeded" => {
+                            // Previous worker succeeded against an obsolete base.
+                            // Fall through to dispatch against the current base SHA.
+                            tracing::info!(
+                                work_item_id = %candidate.work_item_id,
+                                pr_url = %candidate.pr_url,
+                                base_ref_oid = ?probe.base_ref_oid,
+                                "conflict_watch: stale-base re-arm: succeeded crz but PR still CONFLICTING; dispatching fresh attempt",
+                            );
+                        }
+                        "pending" => {
+                            // No previous crz (or brand-new pending one) — fall
+                            // through to the insert path; it handles idempotency
+                            // via the UNIQUE key guard.
+                        }
+                        other => {
+                            // failed / abandoned — churn guard or human owns retry.
+                            tracing::debug!(
+                                work_item_id = %candidate.work_item_id,
+                                terminal_status = other,
+                                "conflict_watch: blocked signal re-armed; latest crz terminal ({other}); churn guard owns retry",
+                            );
+                            return false;
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        ?err,
+                        "conflict_watch: failed to check active crz during re-arm; skipping dispatch",
+                    );
+                    return false;
+                }
+            }
+            // task didn't flip (it was already blocked), but we proceed
+            // with the crz-insert path below.
+            false
         }
         Err(err) => {
             tracing::warn!(
@@ -217,18 +323,25 @@ pub async fn on_conflict_detected(
             return false;
         }
     };
-    publisher
-        .publish_work_item_changed(
-            &candidate.product_id,
-            &updated.id,
-            "blocked_merge_conflict",
-        )
-        .await;
+
+    // Only publish the "newly blocked" work-item event when the task actually
+    // flipped status (not in the re-arm path where it was already blocked).
+    if task_flipped_now {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "blocked_merge_conflict",
+            )
+            .await;
+    }
 
     // Insert the `conflict_resolutions` attempt row now that the parent
     // is blocked. The UNIQUE key is `(work_item_id, base_sha_at_trigger)`,
     // so a second sweep for the same base sha returns `Ok(None)` —
     // idempotent and safe to call on every conflict-detected event.
+    // In the re-arm path the base SHA is the *current* main SHA (different
+    // from the stale crz's base_sha_at_trigger), so a new row is inserted.
     // The churn guard pre-abandons the 4th attempt inside a rolling 1h
     // window; those rows get no execution request.
     let attempt = match work_db.insert_conflict_resolution(ConflictResolutionInsertInput {
@@ -307,15 +420,15 @@ pub async fn on_conflict_detected(
     }
 
     tracing::info!(
-        work_item_id = %updated.id,
-        kind = %updated.kind,
+        work_item_id = %candidate.work_item_id,
         pr_url = %candidate.pr_url,
         base_ref_oid = ?probe.base_ref_oid,
         attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
         attempt_status = ?attempt.as_ref().map(|a| a.status.as_str()),
-        "conflict_watch: PR conflicts with base; work item flipped to blocked: merge_conflict",
+        task_flipped_now,
+        "conflict_watch: PR conflicts with base; conflict detection ran",
     );
-    true
+    task_flipped_now
 }
 
 /// Symmetric resolution path: flip a `blocked: merge_conflict` row
