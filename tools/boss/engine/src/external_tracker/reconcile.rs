@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use boss_protocol::{CreateChoreInput, CREATED_VIA_EXTERNAL_TRACKER_SYNC};
 use tracing::{info, warn};
 
@@ -24,6 +25,34 @@ use super::{
 };
 use crate::metrics::Registry;
 use crate::work::WorkDb;
+
+// ── Work-invalidation publisher ───────────────────────────────────────────────
+
+/// Sink for work-invalidation broadcasts emitted by the reconciler.
+///
+/// Implemented by `ServerState` in production so live UI clients see
+/// reconciler-driven mutations (import, close-mirror, PR-attach, unbind)
+/// without waiting for a restart or product re-open.
+/// `NoopWorkInvalidationPublisher` is used in tests and CLI single-pass paths.
+#[async_trait]
+pub trait WorkInvalidationPublisher: Send + Sync {
+    async fn publish_work_item_invalidated(
+        &self,
+        product_id: &str,
+        work_item_id: &str,
+        reason: &str,
+    );
+}
+
+/// No-op implementation; used in tests and CLI paths where live UI
+/// broadcast is not needed.
+#[derive(Default)]
+pub struct NoopWorkInvalidationPublisher;
+
+#[async_trait]
+impl WorkInvalidationPublisher for NoopWorkInvalidationPublisher {
+    async fn publish_work_item_invalidated(&self, _: &str, _: &str, _: &str) {}
+}
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
@@ -140,6 +169,7 @@ pub async fn run_one_pass(
     work_db: &WorkDb,
     registry: &TrackerRegistry,
     metrics: &Registry,
+    publisher: &dyn WorkInvalidationPublisher,
 ) -> PassOutcome {
     let products = match work_db.list_products() {
         Ok(p) => p,
@@ -173,7 +203,7 @@ pub async fn run_one_pass(
             credential: TrackerCredential::ambient(),
         };
 
-        process_product(work_db, &*tracker, &product.id, &ctx, &mut outcome, metrics)
+        process_product(work_db, &*tracker, &product.id, &ctx, &mut outcome, metrics, publisher)
             .await;
         outcome.products_processed += 1;
     }
@@ -194,10 +224,17 @@ pub fn spawn_loop(
     registry: Arc<TrackerRegistry>,
     interval: Duration,
     metrics: Arc<Registry>,
+    publisher: Arc<dyn WorkInvalidationPublisher>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let outcome = run_one_pass(work_db.as_ref(), registry.as_ref(), metrics.as_ref()).await;
+            let outcome = run_one_pass(
+                work_db.as_ref(),
+                registry.as_ref(),
+                metrics.as_ref(),
+                publisher.as_ref(),
+            )
+            .await;
             if outcome.products_processed > 0
                 || outcome.products_skipped > 0
                 || outcome.items_imported > 0
@@ -234,6 +271,7 @@ pub async fn run_one_pass_for_product(
     registry: &TrackerRegistry,
     metrics: &Registry,
     product_id: &str,
+    publisher: &dyn WorkInvalidationPublisher,
 ) -> Option<PassOutcome> {
     let products = match work_db.list_products() {
         Ok(p) => p,
@@ -265,7 +303,7 @@ pub async fn run_one_pass_for_product(
     };
 
     let mut outcome = PassOutcome::default();
-    process_product(work_db, &*tracker, product_id, &ctx, &mut outcome, metrics).await;
+    process_product(work_db, &*tracker, product_id, &ctx, &mut outcome, metrics, publisher).await;
     outcome.products_processed += 1;
     Some(outcome)
 }
@@ -295,6 +333,7 @@ async fn process_product(
     ctx: &TrackerContext,
     outcome: &mut PassOutcome,
     metrics: &Registry,
+    publisher: &dyn WorkInvalidationPublisher,
 ) {
     let reverse_close = ctx.config["reverse_close"].as_bool().unwrap_or(false);
 
@@ -397,7 +436,10 @@ async fn process_product(
                     &mut close_candidates,
                     outcome,
                     metrics,
-                );
+                    product_id,
+                    publisher,
+                )
+                .await;
             }
             Ok(None) => {
                 if known_canonical_ids.contains(canonical_id.as_str()) {
@@ -432,7 +474,10 @@ async fn process_product(
                                     &mut close_candidates,
                                     outcome,
                                     metrics,
-                                );
+                                    product_id,
+                                    publisher,
+                                )
+                                .await;
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -441,7 +486,7 @@ async fn process_product(
                         }
                     }
                 } else {
-                    import_new(work_db, product_id, item, outcome, metrics);
+                    import_new(work_db, product_id, item, outcome, metrics, publisher).await;
                 }
             }
             Err(e) => {
@@ -465,6 +510,9 @@ async fn process_product(
                         canonical_id = %stored_ref.canonical_id,
                         "upstream item no longer in project scope; external ref unbound"
                     );
+                    publisher
+                        .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
+                        .await;
                     let title = format!(
                         "Upstream binding for {} cleared",
                         stored_ref.canonical_id
@@ -608,7 +656,7 @@ async fn process_product(
 ///   `done`, no merged PR drove the transition, and `reverse_close=true` in
 ///   the product config, queue a `close_issue` call.
 /// - Always bumps `external_ref_synced_at`.
-fn reconcile_existing(
+async fn reconcile_existing(
     work_db: &WorkDb,
     task: &boss_protocol::Task,
     upstream: &UpstreamItem,
@@ -616,6 +664,8 @@ fn reconcile_existing(
     close_candidates: &mut Vec<CloseCandidate>,
     outcome: &mut PassOutcome,
     metrics: &Registry,
+    product_id: &str,
+    publisher: &dyn WorkInvalidationPublisher,
 ) {
     let work_item_id = &task.id;
 
@@ -627,6 +677,9 @@ fn reconcile_existing(
                     PR_ATTACHED.inc(metrics);
                     outcome.pr_attached += 1;
                     info!(work_item_id, pr_url = %best_pr.pr_url, "Behavior 4: pr_url attached");
+                    publisher
+                        .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
+                        .await;
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -648,6 +701,9 @@ fn reconcile_existing(
                             work_item_id,
                             "Behavior 2: close-mirror — upstream Closed → boss done"
                         );
+                        publisher
+                            .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
+                            .await;
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -671,6 +727,9 @@ fn reconcile_existing(
                             work_item_id,
                             "Behavior 5: merged PR detected → boss row → done"
                         );
+                        publisher
+                            .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
+                            .await;
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -712,12 +771,13 @@ fn reconcile_existing(
 /// Skip if the item is already `Closed` at first sight (bootstrap rule from
 /// Design Q7: turning on a binding must not flood Boss with historic closed
 /// issues).
-fn import_new(
+async fn import_new(
     work_db: &WorkDb,
     product_id: &str,
     upstream: &UpstreamItem,
     outcome: &mut PassOutcome,
     metrics: &Registry,
+    publisher: &dyn WorkInvalidationPublisher,
 ) {
     // Bootstrap rule: skip items that are already closed.
     if matches!(upstream.status, UpstreamStatus::Closed { .. }) {
@@ -780,6 +840,10 @@ fn import_new(
         warn!(work_item_id = %chore.id, error = %e, "touch_external_ref_synced_at failed after import");
     }
 
+    publisher
+        .publish_work_item_invalidated(product_id, &chore.id, "chore_created")
+        .await;
+
     IMPORTED.inc(metrics);
     outcome.items_imported += 1;
     info!(
@@ -821,6 +885,40 @@ mod tests {
     };
     use crate::metrics::Registry;
     use crate::work::WorkDb;
+
+    // ── Test helpers ──────────────────────────────────────────────────────────
+
+    fn noop_pub() -> NoopWorkInvalidationPublisher {
+        NoopWorkInvalidationPublisher
+    }
+
+    /// Records every `publish_work_item_invalidated` call for assertions.
+    #[derive(Default)]
+    struct RecordingPublisher {
+        calls: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl RecordingPublisher {
+        fn recorded(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkInvalidationPublisher for RecordingPublisher {
+        async fn publish_work_item_invalidated(
+            &self,
+            product_id: &str,
+            work_item_id: &str,
+            reason: &str,
+        ) {
+            self.calls.lock().unwrap().push((
+                product_id.to_owned(),
+                work_item_id.to_owned(),
+                reason.to_owned(),
+            ));
+        }
+    }
 
     // ── SpyTracker ────────────────────────────────────────────────────────────
 
@@ -1043,7 +1141,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.items_imported, 1, "should import one item");
         assert_eq!(outcome.products_processed, 1);
@@ -1060,6 +1158,27 @@ mod tests {
         assert!(ext.synced_at.is_some(), "synced_at should be set after import");
     }
 
+    // ── Test: import emits work-invalidation event ────────────────────────────
+
+    #[tokio::test]
+    async fn import_emits_chore_created_invalidation() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![open_item(99, "Event test issue")]);
+        let registry = spy_registry(tracker);
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        run_one_pass(&db, &registry, &metrics, publisher.as_ref()).await;
+
+        let calls = publisher.recorded();
+        assert_eq!(calls.len(), 1, "expected exactly one invalidation event");
+        let (pid, _wid, reason) = &calls[0];
+        assert_eq!(pid, &product.id, "product_id should match");
+        assert_eq!(reason, "chore_created", "reason should be chore_created");
+    }
+
     // ── Test: skip already-closed at first sight ──────────────────────────────
 
     #[tokio::test]
@@ -1071,7 +1190,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.items_imported, 0, "closed item should be skipped");
         let found = db.find_by_external_ref("spy", "spy#2").expect("query ok");
@@ -1114,7 +1233,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.items_closed, 1);
         let updated = db
@@ -1160,7 +1279,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.pr_attached, 1);
         let updated = db
@@ -1206,7 +1325,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.close_issue_succeeded, 1, "close_issue should succeed");
         assert_eq!(outcome.items_closed, 1, "boss row should flip to done");
@@ -1251,7 +1370,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.items_unbound, 1, "one item should be unbound");
 
@@ -1299,7 +1418,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome1 = run_one_pass(&db, &registry, &metrics).await;
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome1.close_issue_failed, 1, "tick 1: should record failed close");
         assert_eq!(outcome1.items_closed, 1, "tick 1: boss row should flip to done");
@@ -1313,7 +1432,7 @@ mod tests {
         // Tick 2: upstream is still Open (close didn't land); close_issue succeeds.
         tracker.push_ok();
 
-        let outcome2 = run_one_pass(&db, &registry, &metrics).await;
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome2.close_issue_succeeded, 1, "tick 2: close should succeed");
         assert_eq!(outcome2.items_closed, 0, "tick 2: boss already done, no extra close");
@@ -1336,11 +1455,11 @@ mod tests {
         register_metrics(&metrics);
 
         // First pass: import.
-        let outcome1 = run_one_pass(&db, &registry, &metrics).await;
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
         assert_eq!(outcome1.items_imported, 1);
 
         // Second pass: nothing should change.
-        let outcome2 = run_one_pass(&db, &registry, &metrics).await;
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
         assert_eq!(outcome2.items_imported, 0);
         assert_eq!(outcome2.items_closed, 0);
         assert_eq!(outcome2.pr_attached, 0);
@@ -1386,7 +1505,7 @@ mod tests {
         let registry_empty = spy_registry(tracker_empty);
         let metrics = Registry::new();
         register_metrics(&metrics);
-        let outcome_unbind = run_one_pass(&db, &registry_empty, &metrics).await;
+        let outcome_unbind = run_one_pass(&db, &registry_empty, &metrics, &noop_pub()).await;
         assert_eq!(outcome_unbind.items_unbound, 1);
 
         // Verify unbound.
@@ -1401,7 +1520,7 @@ mod tests {
         let registry_reappear = spy_registry(tracker_reappear);
         let metrics2 = Registry::new();
         register_metrics(&metrics2);
-        let outcome_rebind = run_one_pass(&db, &registry_reappear, &metrics2).await;
+        let outcome_rebind = run_one_pass(&db, &registry_reappear, &metrics2, &noop_pub()).await;
         assert_eq!(outcome_rebind.items_imported, 0, "should rebind, not import");
 
         // Only one chore with spy#9 should exist.
@@ -1460,7 +1579,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.reverse_close_succeeded, 1, "reverse-close should succeed");
         assert_eq!(outcome.close_issue_succeeded, 0, "Behavior 5 should NOT fire");
@@ -1489,7 +1608,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         // Behavior 5 fires; reverse-close path must not.
         assert_eq!(outcome.close_issue_succeeded, 1, "Behavior 5 should succeed");
@@ -1520,7 +1639,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass(&db, &registry, &metrics).await;
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         assert_eq!(outcome.reverse_close_succeeded, 0, "reverse-close disabled");
         assert_eq!(outcome.reverse_close_failed, 0);
@@ -1566,7 +1685,13 @@ mod tests {
 
         // Use a large interval: only the immediate first tick fires before abort.
         let interval = std::time::Duration::from_secs(3600);
-        let handle = spawn_loop(db.clone(), registry, interval, metrics.clone());
+        let handle = spawn_loop(
+            db.clone(),
+            registry,
+            interval,
+            metrics.clone(),
+            Arc::new(noop_pub()),
+        );
 
         // Poll until the imported counter advances (max 5 s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1609,7 +1734,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let outcome = run_one_pass_for_product(&db, &registry, &metrics, &product.id)
+        let outcome = run_one_pass_for_product(&db, &registry, &metrics, &product.id, &noop_pub())
             .await
             .expect("should return Some for a bound product");
 
@@ -1631,7 +1756,8 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        let result = run_one_pass_for_product(&db, &registry, &metrics, &product.id).await;
+        let result =
+            run_one_pass_for_product(&db, &registry, &metrics, &product.id, &noop_pub()).await;
         assert!(result.is_none(), "unbound product should return None");
     }
 
@@ -1657,7 +1783,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         let items = attention_items_for_product(&db, &product.id);
         let auth_items: Vec<_> = items.iter()
@@ -1683,7 +1809,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         let items = attention_items_for_product(&db, &product.id);
         let transient_items: Vec<_> = items.iter()
@@ -1723,7 +1849,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         let items = attention_items_for_work_item(&db, &chore.id);
         let unbound_items: Vec<_> = items.iter()
@@ -1772,7 +1898,7 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         let items = attention_items_for_work_item(&db, &chore.id);
         let perm_items: Vec<_> = items.iter()
@@ -1800,8 +1926,8 @@ mod tests {
         let metrics = Registry::new();
         register_metrics(&metrics);
 
-        run_one_pass(&db, &registry, &metrics).await;
-        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
 
         let items = attention_items_for_product(&db, &product.id);
         let auth_items: Vec<_> = items.iter()
@@ -1823,7 +1949,7 @@ mod tests {
         register_metrics(&metrics);
 
         // Tick 1: auth failure → attention item created.
-        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
         let items = attention_items_for_product(&db, &product.id);
         assert!(
             items.iter().any(|i| i.kind == "external_tracker_auth_failed" && i.status == "open"),
@@ -1831,7 +1957,7 @@ mod tests {
         );
 
         // Tick 2: fetch succeeds (no more queued error) → attention item resolved.
-        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
         let items2 = attention_items_for_product(&db, &product.id);
         let still_open = items2.iter()
             .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")

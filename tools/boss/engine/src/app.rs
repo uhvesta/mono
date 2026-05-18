@@ -1533,6 +1533,20 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerState {
+    async fn publish_work_item_invalidated(
+        &self,
+        product_id: &str,
+        work_item_id: &str,
+        reason: &str,
+    ) {
+        self.publisher
+            .publish_work_item_changed(product_id, work_item_id, reason)
+            .await;
+    }
+}
+
 /// Maximum events that can be queued for one session before we treat the
 /// client as slow. Sized for typical work-invalidation traffic: each
 /// mutation emits at most a couple of envelopes, and same-topic
@@ -2245,6 +2259,7 @@ pub async fn serve(
             server_state.tracker_registry.clone(),
             Duration::from_secs(120),
             server_state.metrics.clone(),
+            server_state.clone(),
         );
 
     // Dependency-unblock safety-net sweeper: periodically re-evaluates
@@ -6211,6 +6226,7 @@ async fn handle_frontend_connection(
                 let work_db = server_state.work_db.clone();
                 let registry = server_state.tracker_registry.clone();
                 let metrics = server_state.metrics.clone();
+                let publisher = server_state.clone();
                 let sink2 = sink.clone();
                 let request_id2 = request_id.clone();
                 tokio::spawn(async move {
@@ -6219,6 +6235,7 @@ async fn handle_frontend_connection(
                         registry.as_ref(),
                         metrics.as_ref(),
                         &product_id,
+                        publisher.as_ref(),
                     )
                     .await
                     {
