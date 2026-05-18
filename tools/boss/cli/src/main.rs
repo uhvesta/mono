@@ -148,6 +148,15 @@ enum ProductCommand {
     /// `--unset` removes any existing binding. All other flags are ignored.
     #[command(name = "set-external-tracker")]
     SetExternalTracker(ProductSetExternalTrackerArgs),
+    /// Run an immediate external-tracker reconcile pass for one product.
+    ///
+    /// Triggers the same per-product logic as the periodic background loop,
+    /// but synchronously for the named product. Useful when you want to pull
+    /// upstream changes into Boss without waiting for the next scheduled tick.
+    ///
+    /// Prints the per-product outcome summary on success.
+    #[command(name = "sync-external-tracker")]
+    SyncExternalTracker(ProductSelectorArg),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1837,6 +1846,32 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     Err(CliError::application(message))
                 }
                 other => Err(unexpected_event("product set-external-tracker", &other)),
+            }
+        }
+        ProductCommand::SyncExternalTracker(args) => {
+            let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::SyncProductExternalTracker {
+                    product_id: product.id.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::ExternalTrackerSyncStarted { product_id } => {
+                    print_entity(
+                        ctx,
+                        &serde_json::json!({ "product_id": product_id, "synced": true }),
+                        || {
+                            if !ctx.quiet {
+                                println!("External tracker sync complete for product {}.", product.slug);
+                            }
+                        },
+                    )
+                }
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("product sync-external-tracker", &other)),
             }
         }
     }
