@@ -1,5 +1,8 @@
 @preconcurrency import AppKit
+import os.log
 import SwiftUI
+
+private let anchorLog = Logger(subsystem: "com.boss.app", category: "CommentPopupAnchor")
 
 /// Owns the in-memory comment array for a single markdown viewer instance
 /// and coordinates the selection → authoring → sidebar → highlight flow.
@@ -21,11 +24,25 @@ final class CommentLayer: NSObject, ObservableObject {
     // tokens are installed/removed only on the main actor.
     nonisolated(unsafe) private var keyMonitor: Any?
     nonisolated(unsafe) private var rightClickMonitor: Any?
+    nonisolated(unsafe) private var mouseUpMonitor: Any?
 
     /// The NSTextView whose selection seeded the pending comment request.
     /// Captured from NSTextView.didChangeSelectionNotification (the object is the text view).
     /// Queried at present-time via firstRect(forCharacterRange:) — never cached as screen coords.
     private weak var anchorTextView: NSTextView?
+
+    // MARK: - Textual/NSTextInteractionView anchor
+    //
+    // Textual's NSTextInteractionView does NOT post NSTextView.didChangeSelectionNotification,
+    // so anchorTextView is never populated from StructuredText selections. Instead we install
+    // a leftMouseUp monitor and capture the mouse position (in screen coords) at the moment
+    // the user finishes dragging/clicking to make a selection. resolveAnchor() uses this as
+    // the popup anchor when anchorTextView is nil.
+
+    /// Screen-space point saved on leftMouseUp while a non-NSTextView first-responder has a selection.
+    private var anchorInteractionScreenPoint: NSPoint?
+    /// The NSView (Textual's NSTextInteractionView) that owned the selection at mouseUp time.
+    private weak var anchorInteractionView: NSView?
 
     /// The live NSPopover, if one is currently visible.
     private var activePopover: NSPopover?
@@ -60,14 +77,51 @@ final class CommentLayer: NSObject, ObservableObject {
             }
             return consume ? nil : event
         }
+        // Capture selection endpoint for Textual's NSTextInteractionView, which does not
+        // post NSTextView.didChangeSelectionNotification.
+        mouseUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+            guard let self else { return event }
+            let loc = event.locationInWindow
+            let win = event.window
+            MainActor.assumeIsolated {
+                self.captureInteractionAnchor(locationInWindow: loc, window: win)
+            }
+            return event
+        }
     }
 
     func removeMonitors() {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         if let m = rightClickMonitor { NSEvent.removeMonitor(m); rightClickMonitor = nil }
+        if let m = mouseUpMonitor { NSEvent.removeMonitor(m); mouseUpMonitor = nil }
         NotificationCenter.default.removeObserver(
             self, name: NSTextView.didChangeSelectionNotification, object: nil)
         activePopover?.close()
+        anchorInteractionScreenPoint = nil
+        anchorInteractionView = nil
+    }
+
+    /// Called on leftMouseUp. If the current first responder is a non-NSTextView view
+    /// (Textual's NSTextInteractionView) whose bounds contain the mouseUp point and there
+    /// is a live selection, saves the screen-space anchor for use by resolveAnchor().
+    /// The bounds-containment guard prevents the "Add Comment" button click (which lands
+    /// outside the text view) from overwriting a valid earlier anchor.
+    private func captureInteractionAnchor(locationInWindow: NSPoint, window: NSWindow?) {
+        guard !isShowingPopover, let window else { return }
+        guard let responder = window.firstResponder as? NSView,
+              !(responder is NSTextView) else { return }
+        let pointInResponder = responder.convert(locationInWindow, from: nil)
+        guard responder.bounds.contains(pointInResponder) else {
+            anchorLog.info("captureInteractionAnchor: mouseUp outside responder bounds (\(NSStringFromClass(type(of: responder))) bounds=\(NSStringFromRect(responder.bounds)) point=\(NSStringFromPoint(pointInResponder))) — anchor not updated")
+            return
+        }
+        guard hasCurrentSelection() else { return }
+        let screenOrigin = window.convertToScreen(
+            NSRect(origin: locationInWindow, size: CGSize(width: 1, height: 1))
+        ).origin
+        anchorInteractionScreenPoint = screenOrigin
+        anchorInteractionView = responder
+        anchorLog.info("captureInteractionAnchor: stored screen anchor \(NSStringFromPoint(screenOrigin)) responder=\(NSStringFromClass(type(of: responder))) bounds=\(NSStringFromRect(responder.bounds))")
     }
 
     /// Called by NotificationCenter on the main thread when any NSTextView changes selection.
@@ -80,6 +134,14 @@ final class CommentLayer: NSObject, ObservableObject {
             // Only update while the popover is closed; the comment form's own
             // NSTextView (CommentTextEditor) would otherwise overwrite the anchor.
             self.anchorTextView = textView
+            // An NSTextView firing means focus moved to an NSTextView area; clear the
+            // Textual interaction anchor so the NSTextView path runs in resolveAnchor().
+            self.anchorInteractionScreenPoint = nil
+            self.anchorInteractionView = nil
+            if let tv = textView {
+                let range = tv.selectedRange()
+                anchorLog.info("textViewSelectionDidChange: NSTextView \(NSStringFromClass(type(of: tv))) range=\(NSStringFromRange(range))")
+            }
         }
     }
 
@@ -89,7 +151,12 @@ final class CommentLayer: NSObject, ObservableObject {
         pendingQuotedText = captureCurrentSelection() ?? ""
         pendingFirstChar = firstChar
 
-        guard let (posRect, posView) = resolveAnchor() else { return }
+        guard let (posRect, posView) = resolveAnchor() else {
+            anchorLog.error("requestNewComment: resolveAnchor returned nil — popover not shown")
+            return
+        }
+
+        anchorLog.info("requestNewComment: showing popover relativeTo=\(NSStringFromRect(posRect)) of=\(NSStringFromClass(type(of: posView))) isFlipped=\(posView.isFlipped)")
 
         let popover = NSPopover()
         popover.contentViewController = NSHostingController(
@@ -161,34 +228,63 @@ final class CommentLayer: NSObject, ObservableObject {
         return false
     }
 
-    /// Returns the positioning rect (in positioningView coords) and view for NSPopover,
-    /// queried fresh from anchorTextView at present-time. AppKit handles coordinate-space
-    /// conversions natively, so this works correctly across multiple displays.
-    /// Falls back to a rect near the top of the key window when no selection is available.
+    /// Returns the positioning rect (in positioningView coords) and view for NSPopover.
+    ///
+    /// Priority order:
+    ///   1. Textual NSTextInteractionView anchor — mouseUp screen point captured at
+    ///      selection-end. Textual does not post NSTextView.didChangeSelectionNotification,
+    ///      so the NSTextView path below never fires for StructuredText.
+    ///   2. NSTextView anchor — standard path for non-Textual text views (header Text fields).
+    ///   3. Fallback near the top of the key window.
     private func resolveAnchor() -> (NSRect, NSView)? {
+        // --- 1. Textual NSTextInteractionView anchor ---
+        if let view = anchorInteractionView,
+           let window = view.window,
+           let screenPoint = anchorInteractionScreenPoint {
+            // Convert saved screen point → window coords → view (flipped) coords.
+            let windowOrigin = window.convertFromScreen(
+                NSRect(origin: screenPoint, size: CGSize(width: 1, height: 1))
+            ).origin
+            let viewPoint = view.convert(windowOrigin, from: nil)
+            // A 1-pt-high rect so the popover arrow tip lands at the character baseline.
+            let viewRect = NSRect(x: viewPoint.x - 20, y: viewPoint.y, width: 40, height: 1)
+            anchorLog.info("resolveAnchor: Textual path — screenPoint=\(NSStringFromPoint(screenPoint)) windowOrigin=\(NSStringFromPoint(windowOrigin)) viewPoint=\(NSStringFromPoint(viewPoint)) viewRect=\(NSStringFromRect(viewRect)) view.isFlipped=\(view.isFlipped)")
+            return (viewRect, view)
+        }
+
+        // --- 2. NSTextView anchor ---
         if let tv = anchorTextView, let window = tv.window {
             let range = tv.selectedRange()
+            anchorLog.info("resolveAnchor: NSTextView path — range=\(NSStringFromRange(range))")
             if range.length > 0, range.location != NSNotFound {
                 let lastCharRange = NSRange(location: range.upperBound - 1, length: 1)
                 var actualRange = NSRange()
                 let screenRect = tv.firstRect(forCharacterRange: lastCharRange, actualRange: &actualRange)
                 if screenRect != .zero {
-                    // screen → window → text view coordinates; AppKit handles the conversion
+                    // screen → window → text-view coordinates; AppKit handles the conversion
                     // correctly for any display arrangement without explicit screen lookup.
                     let windowRect = window.convertFromScreen(screenRect)
                     let viewRect = tv.convert(windowRect, from: nil)
+                    anchorLog.info("resolveAnchor: NSTextView anchor screenRect=\(NSStringFromRect(screenRect)) viewRect=\(NSStringFromRect(viewRect))")
                     return (viewRect, tv)
                 }
             }
         }
-        // Fallback: anchor near the top-centre of the key window.
+
+        // --- 3. Fallback ---
+        // Place anchor near the top-left of the key window's content view.
+        // Uses minY (top in flipped SwiftUI hosting views) + small offset.
         if let contentView = NSApp.keyWindow?.contentView {
+            let topY: CGFloat = contentView.isFlipped
+                ? 60                              // flipped: y=0 is top, increase down
+                : contentView.bounds.maxY - 60    // non-flipped: maxY is top
             let fallback = NSRect(
                 x: contentView.bounds.midX - 8,
-                y: contentView.bounds.maxY - 60,
+                y: topY,
                 width: 16,
                 height: 16
             )
+            anchorLog.warning("resolveAnchor: fallback — anchorTextView=\(String(describing: self.anchorTextView)) anchorInteractionView=\(String(describing: self.anchorInteractionView)) fallback=\(NSStringFromRect(fallback)) isFlipped=\(contentView.isFlipped)")
             return (fallback, contentView)
         }
         return nil
@@ -261,6 +357,8 @@ extension CommentLayer: NSPopoverDelegate {
             self.pendingFirstChar = nil
             self.pendingQuotedText = ""
             self.activePopover = nil
+            self.anchorInteractionScreenPoint = nil
+            self.anchorInteractionView = nil
         }
     }
 }
