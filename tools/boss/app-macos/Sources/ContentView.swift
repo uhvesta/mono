@@ -1633,7 +1633,7 @@ struct WorkBoardCardView: View {
                     if let repoChip {
                         RepoChipView(presentation: repoChip)
                     }
-                    Spacer()
+                    Spacer(minLength: 0)
                     if let id = task.shortID {
                         Text("T\(id)")
                             .font(.system(.caption2, design: .monospaced))
@@ -2999,6 +2999,7 @@ struct RepoChipView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
+        .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(Color(nsColor: .labelColor))
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
@@ -3066,7 +3067,9 @@ private struct ConflictClearedBadge: View {
                 .font(.caption2.weight(.semibold))
             Text("conflict cleared")
                 .font(.caption.weight(.semibold))
+                .lineLimit(1)
         }
+        .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(Color.green)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
@@ -3088,7 +3091,9 @@ private struct CIAutoFixedBadge: View {
                 .font(.caption2.weight(.semibold))
             Text("ci auto-fixed")
                 .font(.caption.weight(.semibold))
+                .lineLimit(1)
         }
+        .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(Color.green)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
@@ -3149,7 +3154,9 @@ private struct CIFailureChip: View {
                 .font(.caption2.weight(.semibold))
             Text(label)
                 .font(.caption.weight(.semibold))
+                .lineLimit(1)
         }
+        .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(color)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
@@ -3326,7 +3333,9 @@ private struct ResolvingConflictsBadge: View {
             Text("resolving conflicts")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Color.orange)
+                .lineLimit(1)
         }
+        .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(Color.orange.opacity(0.12))
@@ -3348,7 +3357,9 @@ private struct ResolvingCIFailureBadge: View {
             Text("resolving CI failure")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Color.orange)
+                .lineLimit(1)
         }
+        .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(Color.orange.opacity(0.12))
