@@ -63,6 +63,16 @@ crate::register_counter!(
     "close_issue calls that failed (transient or permission) after a linked PR merged (Behavior 5).",
 );
 crate::register_counter!(
+    REVERSE_CLOSE_SUCCEEDED,
+    "external_tracker.reverse_close_succeeded",
+    "close_issue calls that succeeded from the reverse-close path (Behavior 3).",
+);
+crate::register_counter!(
+    REVERSE_CLOSE_FAILED,
+    "external_tracker.reverse_close_failed",
+    "close_issue calls that failed from the reverse-close path (Behavior 3).",
+);
+crate::register_counter!(
     UNBOUND,
     "external_tracker.unbound",
     "Work items whose external ref was cleared because the upstream item left project scope.",
@@ -88,6 +98,8 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_ATTACHED);
     registry.register_counter(&PR_MERGE_CLOSE_SUCCEEDED);
     registry.register_counter(&PR_MERGE_CLOSE_FAILED);
+    registry.register_counter(&REVERSE_CLOSE_SUCCEEDED);
+    registry.register_counter(&REVERSE_CLOSE_FAILED);
     registry.register_counter(&UNBOUND);
     registry.register_counter(&SKIPPED_CLOSED_AT_FIRST_SIGHT);
     registry.register_counter(&SKIP_NO_CREDENTIAL);
@@ -104,9 +116,15 @@ pub struct PassOutcome {
     pub items_imported: usize,
     pub items_closed: usize,
     pub pr_attached: usize,
+    /// Behavior 5: close_issue calls that succeeded after a linked PR merged.
     pub close_issue_succeeded: usize,
+    /// Behavior 5: close_issue calls that failed after a linked PR merged.
     pub close_issue_failed: usize,
     pub items_unbound: usize,
+    /// Behavior 3: close_issue calls that succeeded via reverse-close.
+    pub reverse_close_succeeded: usize,
+    /// Behavior 3: close_issue calls that failed via reverse-close.
+    pub reverse_close_failed: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -165,11 +183,20 @@ pub async fn run_one_pass(
 
 // ── Per-product processing ────────────────────────────────────────────────────
 
+/// Which code path queued this close.  Drives metric selection in the close loop.
+enum CloseTrigger {
+    /// Behavior 5: a linked PR merged upstream.
+    PrMerge,
+    /// Behavior 3: boss row flipped to `done` without a merged PR (reverse-close).
+    ReverseClose,
+}
+
 /// Carries intent to call `close_issue` on the upstream tracker after all
 /// Boss-side SQL writes are done.
 struct CloseCandidate {
     work_item_id: String,
     upstream_ref: UpstreamRef,
+    trigger: CloseTrigger,
 }
 
 async fn process_product(
@@ -180,6 +207,8 @@ async fn process_product(
     outcome: &mut PassOutcome,
     metrics: &Registry,
 ) {
+    let reverse_close = ctx.config["reverse_close"].as_bool().unwrap_or(false);
+
     // ── 1. Fetch upstream items ───────────────────────────────────────────────
     let upstream_items = match tracker.fetch_items(ctx).await {
         Ok(items) => {
@@ -226,6 +255,7 @@ async fn process_product(
                     work_db,
                     &task,
                     item,
+                    reverse_close,
                     &mut close_candidates,
                     outcome,
                     metrics,
@@ -260,6 +290,7 @@ async fn process_product(
                                     work_db,
                                     &task,
                                     item,
+                                    reverse_close,
                                     &mut close_candidates,
                                     outcome,
                                     metrics,
@@ -304,37 +335,64 @@ async fn process_product(
         }
     }
 
-    // ── 5. Issue close calls post-commit (Behavior 5) ─────────────────────────
+    // ── 5. Issue close calls post-commit (Behavior 5 and Behavior 3) ──────────
     // Cap at 20 per tick to avoid saturating the rate-limit window.
     const CLOSE_BUDGET: usize = 20;
     for candidate in close_candidates.into_iter().take(CLOSE_BUDGET) {
+        let is_b3 = matches!(candidate.trigger, CloseTrigger::ReverseClose);
         match tracker
             .close_issue(ctx, &candidate.upstream_ref, CloseReason::Completed)
             .await
         {
             Ok(()) => {
-                PR_MERGE_CLOSE_SUCCEEDED.inc(metrics);
-                outcome.close_issue_succeeded += 1;
-                info!(
-                    work_item_id = %candidate.work_item_id,
-                    canonical_id = %candidate.upstream_ref.canonical_id,
-                    "Behavior 5: upstream issue closed after merged PR"
-                );
+                if is_b3 {
+                    REVERSE_CLOSE_SUCCEEDED.inc(metrics);
+                    outcome.reverse_close_succeeded += 1;
+                    info!(
+                        work_item_id = %candidate.work_item_id,
+                        canonical_id = %candidate.upstream_ref.canonical_id,
+                        "Behavior 3: upstream issue closed via reverse-close"
+                    );
+                } else {
+                    PR_MERGE_CLOSE_SUCCEEDED.inc(metrics);
+                    outcome.close_issue_succeeded += 1;
+                    info!(
+                        work_item_id = %candidate.work_item_id,
+                        canonical_id = %candidate.upstream_ref.canonical_id,
+                        "Behavior 5: upstream issue closed after merged PR"
+                    );
+                }
             }
             Err(TrackerError::NotFound(_)) => {
                 // Issue already closed (404). Treat as success.
-                PR_MERGE_CLOSE_SUCCEEDED.inc(metrics);
-                outcome.close_issue_succeeded += 1;
+                if is_b3 {
+                    REVERSE_CLOSE_SUCCEEDED.inc(metrics);
+                    outcome.reverse_close_succeeded += 1;
+                } else {
+                    PR_MERGE_CLOSE_SUCCEEDED.inc(metrics);
+                    outcome.close_issue_succeeded += 1;
+                }
             }
             Err(e) => {
-                PR_MERGE_CLOSE_FAILED.inc(metrics);
-                outcome.close_issue_failed += 1;
-                warn!(
-                    work_item_id = %candidate.work_item_id,
-                    canonical_id = %candidate.upstream_ref.canonical_id,
-                    error = %e,
-                    "Behavior 5: close_issue failed (transient or permission); will retry next tick"
-                );
+                if is_b3 {
+                    REVERSE_CLOSE_FAILED.inc(metrics);
+                    outcome.reverse_close_failed += 1;
+                    warn!(
+                        work_item_id = %candidate.work_item_id,
+                        canonical_id = %candidate.upstream_ref.canonical_id,
+                        error = %e,
+                        "Behavior 3: reverse-close failed (transient or permission); will retry next tick"
+                    );
+                } else {
+                    PR_MERGE_CLOSE_FAILED.inc(metrics);
+                    outcome.close_issue_failed += 1;
+                    warn!(
+                        work_item_id = %candidate.work_item_id,
+                        canonical_id = %candidate.upstream_ref.canonical_id,
+                        error = %e,
+                        "Behavior 5: close_issue failed (transient or permission); will retry next tick"
+                    );
+                }
             }
         }
     }
@@ -351,11 +409,15 @@ async fn process_product(
 /// - **Behavior 5** (PR-merge close): if upstream is `Open` and either a
 ///   merged PR is present in the associations, or the boss row is already
 ///   `done` with a `pr_url` (retry path), queue a `close_issue` call.
+/// - **Behavior 3** (reverse-close, opt-in): if upstream is `Open`, boss is
+///   `done`, no merged PR drove the transition, and `reverse_close=true` in
+///   the product config, queue a `close_issue` call.
 /// - Always bumps `external_ref_synced_at`.
 fn reconcile_existing(
     work_db: &WorkDb,
     task: &boss_protocol::Task,
     upstream: &UpstreamItem,
+    reverse_close: bool,
     close_candidates: &mut Vec<CloseCandidate>,
     outcome: &mut PassOutcome,
     metrics: &Registry,
@@ -422,13 +484,23 @@ fn reconcile_existing(
                 }
             }
 
-            // Queue close_issue if:
+            // Queue close_issue for Behavior 5 if:
             //   (a) merged PR detected in upstream associations, OR
             //   (b) boss is already done with a pr_url (retry from prior failed close)
             if has_merged_pr || (boss_is_done && boss_has_pr) {
                 close_candidates.push(CloseCandidate {
                     work_item_id: work_item_id.clone(),
                     upstream_ref: upstream.upstream_ref.clone(),
+                    trigger: CloseTrigger::PrMerge,
+                });
+            } else if reverse_close && boss_is_done {
+                // Behavior 3: boss done without a merged PR driving the
+                // transition.  Only queue if B5 didn't already claim it
+                // (guarded by the `else` branch above).
+                close_candidates.push(CloseCandidate {
+                    work_item_id: work_item_id.clone(),
+                    upstream_ref: upstream.upstream_ref.clone(),
+                    trigger: CloseTrigger::ReverseClose,
                 });
             }
         }
@@ -651,6 +723,10 @@ mod tests {
         json!({ "kind": "spy" })
     }
 
+    fn spy_config_reverse_close() -> serde_json::Value {
+        json!({ "kind": "spy", "reverse_close": true })
+    }
+
     fn upstream_ref(id: u64) -> UpstreamRef {
         UpstreamRef {
             kind: "spy".to_owned(),
@@ -708,6 +784,24 @@ mod tests {
             false,
         )
         .expect("set external tracker");
+        product
+    }
+
+    fn setup_product_with_reverse_close(db: &WorkDb) -> boss_protocol::Product {
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Reverse Close Product".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            })
+            .expect("create product");
+        db.set_product_external_tracker(
+            &product.id,
+            Some("spy"),
+            Some(&spy_config_reverse_close()),
+            false,
+        )
+        .expect("set external tracker with reverse_close");
         product
     }
 
@@ -1089,5 +1183,123 @@ mod tests {
         assert_eq!(spy9_rows.len(), 1, "exactly one binding for spy#9");
         let (_, bound) = spy9_rows[0];
         assert!(bound.unbound_at.is_none(), "should be rebound (unbound_at cleared)");
+    }
+
+    // ── Behavior 3 (reverse-close) tests ─────────────────────────────────────
+
+    // Helper: create a chore that is already in `done` status.
+    fn seed_done_chore(db: &WorkDb, product_id: &str, canonical_id: &str, issue_num: u64) -> boss_protocol::Task {
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.to_owned(),
+                name: format!("Done chore {canonical_id}"),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .expect("create chore");
+        db.set_external_ref(
+            &chore.id,
+            "spy",
+            canonical_id,
+            &json!({ "issue_number": issue_num }),
+        )
+        .expect("set_external_ref");
+        db.reconciler_close_work_item(&chore.id).expect("close work item");
+        db.find_by_external_ref("spy", canonical_id)
+            .expect("query ok")
+            .expect("chore exists")
+    }
+
+    /// Behavior 3 happy path: `reverse_close=true`, boss is done, no merged PR
+    /// → `close_issue` fires.
+    #[tokio::test]
+    async fn reverse_close_fires_when_boss_done_and_no_merged_pr() {
+        let db = in_memory_db();
+        let product = setup_product_with_reverse_close(&db);
+
+        let chore = seed_done_chore(&db, &product.id, "spy#10", 10);
+        assert_eq!(chore.status, "done");
+
+        // Upstream still Open, no PR associations.
+        let tracker = SpyTracker::new(vec![open_item(10, "Issue 10")]);
+        tracker.push_ok();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics).await;
+
+        assert_eq!(outcome.reverse_close_succeeded, 1, "reverse-close should succeed");
+        assert_eq!(outcome.close_issue_succeeded, 0, "Behavior 5 should NOT fire");
+
+        let calls = tracker.close_calls();
+        assert_eq!(calls, vec!["spy#10"], "close_issue should be called once");
+    }
+
+    /// Behavior 3 + Behavior 5 mutual exclusion: `reverse_close=true` AND
+    /// upstream shows a merged PR → Behavior 5 fires; reverse-close is skipped.
+    #[tokio::test]
+    async fn reverse_close_skipped_when_pr_merge_drove_transition() {
+        let db = in_memory_db();
+        let product = setup_product_with_reverse_close(&db);
+
+        // Boss row bound and done, upstream shows a merged PR.
+        let chore = seed_done_chore(&db, &product.id, "spy#11", 11);
+        assert_eq!(chore.status, "done");
+
+        let tracker = SpyTracker::new(vec![item_with_merged_pr(
+            11,
+            "https://github.com/example/repo/pull/200",
+        )]);
+        tracker.push_ok();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics).await;
+
+        // Behavior 5 fires; reverse-close path must not.
+        assert_eq!(outcome.close_issue_succeeded, 1, "Behavior 5 should succeed");
+        assert_eq!(outcome.reverse_close_succeeded, 0, "Behavior 3 must not fire");
+        assert_eq!(outcome.reverse_close_failed, 0);
+
+        let calls = tracker.close_calls();
+        assert_eq!(calls.len(), 1, "close_issue called exactly once");
+        assert_eq!(calls[0], "spy#11");
+    }
+
+    /// With `reverse_close=false` (the default), boss done without a merged PR
+    /// → no `close_issue` call regardless.
+    #[tokio::test]
+    async fn reverse_close_disabled_by_default_no_close_issue() {
+        let db = in_memory_db();
+        // Default product has reverse_close absent (defaults to false).
+        let product = setup_product_with_tracker(&db);
+
+        let chore = seed_done_chore(&db, &product.id, "spy#12", 12);
+        assert_eq!(chore.status, "done");
+
+        // Upstream still Open, no PR associations.
+        let tracker = SpyTracker::new(vec![open_item(12, "Issue 12")]);
+        // No close response queued — if close_issue is called, it returns Ok(())
+        // via the default, but we still assert it wasn't called.
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics).await;
+
+        assert_eq!(outcome.reverse_close_succeeded, 0, "reverse-close disabled");
+        assert_eq!(outcome.reverse_close_failed, 0);
+        assert_eq!(outcome.close_issue_succeeded, 0, "Behavior 5 should not fire either");
+
+        let calls = tracker.close_calls();
+        assert!(calls.is_empty(), "close_issue must not be called when reverse_close=false");
     }
 }
