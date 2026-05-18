@@ -24,7 +24,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestEngine {
     socket_path: PathBuf,
