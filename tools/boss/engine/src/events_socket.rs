@@ -18,8 +18,6 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::worker_registry::WorkerRegistry;
-
 /// `level` for `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on macOS.
 #[cfg(target_os = "macos")]
 const SOL_LOCAL: libc::c_int = 0;
@@ -27,7 +25,7 @@ const SOL_LOCAL: libc::c_int = 0;
 #[cfg(target_os = "macos")]
 const LOCAL_PEERPID: libc::c_int = 0x002;
 
-/// One hook event after peer-pid lookup, registry correlation, and
+/// One hook event after peer-pid lookup, payload extraction, and
 /// normalization.
 ///
 /// `peer_pid` is best-effort: the peer-pid lookup may return an error
@@ -37,10 +35,9 @@ const LOCAL_PEERPID: libc::c_int = 0x002;
 /// yield) and not rely on `peer_pid` alone for security decisions —
 /// the lease registry is the authoritative source.
 ///
-/// `run_id` is set when an ancestor of the peer pid is registered as
-/// a worker. The shim runs as a descendant of the worker process, so
-/// we walk up the process tree (see [`WorkerRegistry::lookup_with_ancestor_walk`])
-/// to find the run this hook belongs to.
+/// `run_id` is extracted from the `_boss_run_id` field in the hook
+/// payload, which the event-shim embeds whenever `BOSS_RUN_ID` is set
+/// in its environment. The worker-spawn flow always sets this.
 ///
 /// `transcript_path` is the verbatim `transcript_path` field claude
 /// stamps on every hook payload — `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
@@ -189,19 +186,13 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// exits), the pid lookup may fail and the event is returned with
 /// `peer_pid: None`.
 ///
-/// `run_id` correlation order:
-///   1. `_boss_run_id` field embedded in the payload by the
-///      `boss-event` shim (sourced from `BOSS_RUN_ID` in the worker's
-///      env). This is the reliable path — it doesn't depend on
-///      `proc_listpids` working in the app, which it currently
-///      doesn't.
-///   2. `peer_pid` ancestor walk against `WorkerRegistry`. Useful
-///      whenever the shim is invoked outside the BOSS_RUN_ID env (e.g.
-///      direct test fixtures) and when the worker registry actually
-///      has a real shell pid registered.
+/// `run_id` is extracted from the `_boss_run_id` field embedded in
+/// the payload by the `boss-event` shim (sourced from `BOSS_RUN_ID` in
+/// the worker's env). Every production event connection should carry
+/// this field. If missing, a warning is logged but the event is
+/// returned with `run_id: None`.
 pub async fn handle_connection(
     stream: UnixStream,
-    registry: &WorkerRegistry,
 ) -> Result<IncomingHookEvent, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
@@ -209,9 +200,12 @@ pub async fn handle_connection(
     stream.read_to_end(&mut bytes).await?;
     let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
     let payload_run_id = extract_run_id_from_payload(&raw);
-    let run_id = payload_run_id.or_else(|| {
-        peer_pid_value.and_then(|pid| registry.lookup_with_ancestor_walk(pid))
-    });
+    let run_id = if payload_run_id.is_none() {
+        tracing::warn!("incoming hook event missing _boss_run_id field");
+        None
+    } else {
+        payload_run_id
+    };
     let transcript_path = extract_transcript_path_from_payload(&raw);
     let event = normalize_hook_event(&raw)?;
     Ok(IncomingHookEvent {
@@ -358,7 +352,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        let incoming = handle_connection(stream).await.unwrap();
         client_task.await.unwrap();
 
         match incoming.event {
@@ -391,7 +385,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        let incoming = handle_connection(stream).await.unwrap();
         client.await.unwrap();
 
         assert_eq!(
@@ -420,7 +414,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        let incoming = handle_connection(stream).await.unwrap();
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -447,7 +441,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        let incoming = handle_connection(stream).await.unwrap();
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -473,23 +467,20 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &WorkerRegistry::new()).await.unwrap();
+        let incoming = handle_connection(stream).await.unwrap();
         client.await.unwrap();
 
         assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
     }
 
     #[tokio::test]
-    async fn payload_run_id_wins_over_pid_lookup() {
+    async fn payload_run_id_wins_over_missing_fallback() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("events.sock");
         let listener = bind_events_socket(&path).unwrap();
 
-        // Register our pid against a *different* run id than the
-        // payload carries; the payload field must take precedence.
-        let registry = WorkerRegistry::new();
-        registry.register(std::process::id() as libc::pid_t, "run-from-pid");
-
+        // The `_boss_run_id` field in the payload is the only path for
+        // run correlation. This test confirms it's correctly extracted.
         let path_owned = path.clone();
         let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
         let client = std::thread::spawn(move || {
@@ -503,71 +494,8 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry).await.unwrap();
+        let incoming = handle_connection(stream).await.unwrap();
         assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
-
-        close_tx.send(()).ok();
-        client.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn empty_payload_run_id_falls_back_to_pid_lookup() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
-        let listener = bind_events_socket(&path).unwrap();
-
-        let registry = WorkerRegistry::new();
-        registry.register(std::process::id() as libc::pid_t, "run-from-pid");
-
-        let path_owned = path.clone();
-        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
-        let client = std::thread::spawn(move || {
-            use std::io::Write;
-            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(
-                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":""}"#,
-            ).unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-            let _ = close_rx.recv();
-        });
-
-        let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry).await.unwrap();
-        // Empty `_boss_run_id` is treated as missing; pid lookup wins.
-        assert_eq!(incoming.run_id.as_deref(), Some("run-from-pid"));
-
-        close_tx.send(()).ok();
-        client.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_id_resolved_when_self_pid_registered() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
-        let listener = bind_events_socket(&path).unwrap();
-
-        let registry = WorkerRegistry::new();
-        // Pretend the test process *is* the worker for run "run-xyz".
-        // The peer (also us — the spawn_blocking thread is in the same
-        // process) will be looked up against this registry, and the
-        // ancestor walk should hit our registered self pid immediately.
-        registry.register(std::process::id() as libc::pid_t, "run-xyz");
-
-        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
-        let path_owned = path.clone();
-        let client = std::thread::spawn(move || {
-            use std::io::Write;
-            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream
-                .write_all(br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false}"#)
-                .unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-            let _ = close_rx.recv();
-        });
-
-        let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &registry).await.unwrap();
-        assert_eq!(incoming.run_id.as_deref(), Some("run-xyz"));
 
         close_tx.send(()).ok();
         client.join().unwrap();
@@ -588,7 +516,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream, &WorkerRegistry::new()).await;
+        let result = handle_connection(stream).await;
         client.await.unwrap();
 
         match result {
@@ -613,7 +541,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream, &WorkerRegistry::new()).await;
+        let result = handle_connection(stream).await;
         client.await.unwrap();
 
         match result {

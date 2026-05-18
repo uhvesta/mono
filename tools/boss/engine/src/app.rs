@@ -2542,8 +2542,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
             Ok((stream, _)) => {
                 let server_state = server_state.clone();
                 tokio::spawn(async move {
-                    let registry = server_state.worker_registry.clone();
-                    match handle_connection(stream, &registry).await {
+                    match handle_connection(stream).await {
                         Ok(incoming) => {
                             tracing::info!(
                                 peer_pid = ?incoming.peer_pid,
