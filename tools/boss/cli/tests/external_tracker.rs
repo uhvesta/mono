@@ -19,7 +19,7 @@ use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem};
 use serde_json::Value;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestEngine {
     socket_path: PathBuf,

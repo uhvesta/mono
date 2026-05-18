@@ -3360,6 +3360,14 @@ impl WorkDb {
         }
         task.updated_at = now_string();
 
+        // Invariant: blocked_reason and blocked_attempt_id must be NULL for any
+        // non-blocked status. Enforce this here so every write path honours it,
+        // not just the engine's targeted CI/conflict-resolution helpers.
+        if task.status != "blocked" {
+            task.blocked_reason = None;
+            task.blocked_attempt_id = None;
+        }
+
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &task.status)?;
         }
@@ -3372,7 +3380,7 @@ impl WorkDb {
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
                  priority = ?9, repo_remote_url = ?10,
                  effort_level = ?11, model_override = ?12, autostart = ?13,
-                 blocked_reason = ?14,
+                 blocked_reason = ?14, blocked_attempt_id = ?15,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
              WHERE id = ?1",
             params![
@@ -3390,6 +3398,7 @@ impl WorkDb {
                 task.model_override,
                 task.autostart as i64,
                 task.blocked_reason,
+                task.blocked_attempt_id,
             ],
         )?;
 
@@ -3485,10 +3494,12 @@ impl WorkDb {
         };
         tx.execute(
             "UPDATE tasks
-             SET status = ?2,
-                 pr_url = ?3,
-                 updated_at = ?4,
-                 last_status_actor = 'engine'
+             SET status             = ?2,
+                 pr_url             = ?3,
+                 updated_at         = ?4,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL
              WHERE id = ?1",
             params![task.id, new_status, pr_url, now],
         )?;
@@ -19431,6 +19442,77 @@ mod tests {
         // Limit honoured.
         let capped = db.list_engine_attempts(&[], None, &[], None, Some(1)).unwrap();
         assert_eq!(capped.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Transitioning a chore out of `blocked` must clear `blocked_reason`
+    /// and `blocked_attempt_id` even when the patch does not explicitly
+    /// include those fields. Covers the human-unblock path
+    /// (`update_work_item`) as the belt-and-suspenders invariant.
+    #[test]
+    fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
+        let path = temp_db_path("unblock-clears-blocked-fields");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:example/repo.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "C".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Simulate the engine having set blocked fields directly.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', blocked_reason = 'ci_failure', \
+                 blocked_attempt_id = 'cir_test123' WHERE id = ?1",
+                rusqlite::params![chore.id],
+            )
+            .unwrap();
+        }
+
+        // Human (or engine) flips status to in_review without touching blocked fields.
+        let updated = db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+
+        let task = match updated {
+            WorkItem::Chore(t) => t,
+            other => panic!("expected Chore, got {other:?}"),
+        };
+        assert_eq!(task.status, "in_review");
+        assert!(
+            task.blocked_reason.is_none(),
+            "blocked_reason must be NULL after unblock; got {:?}",
+            task.blocked_reason
+        );
+        assert!(
+            task.blocked_attempt_id.is_none(),
+            "blocked_attempt_id must be NULL after unblock; got {:?}",
+            task.blocked_attempt_id
+        );
 
         let _ = std::fs::remove_file(path);
     }
