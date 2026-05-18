@@ -413,6 +413,11 @@ struct ServerState {
     /// counter state isolated per `ServerState` instance and
     /// makes unit tests cheap.
     metrics: Arc<crate::metrics::Registry>,
+    /// Registry of external-tracker backends. Holds the `GitHubTracker`
+    /// at startup; future backends (Jira, Linear) are registered the
+    /// same way. Shared between the periodic spawn loop and the
+    /// on-demand `SyncProductExternalTracker` handler.
+    tracker_registry: Arc<crate::external_tracker::TrackerRegistry>,
     /// Shared kick signal for the merge-poller loop. The macOS app
     /// fires [`FrontendRequest::KickPrReconcilers`] on window
     /// activation; the handler calls `notify_one()` here so the
@@ -691,6 +696,15 @@ impl ServerState {
         let pr_reconciler_kick = Arc::new(Notify::new());
         let pr_reconciler_kick_for_state = pr_reconciler_kick.clone();
 
+        let mut tracker_registry = crate::external_tracker::TrackerRegistry::new();
+        tracker_registry
+            .register(Arc::new(
+                crate::external_tracker::github::GitHubTracker::new(),
+            ))
+            .expect("github tracker is the only registered kind; duplicate is impossible");
+        let tracker_registry = Arc::new(tracker_registry);
+        let tracker_registry_for_state = tracker_registry.clone();
+
         let ci_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -787,6 +801,7 @@ impl ServerState {
                 settings: settings_for_state,
                 metrics: metrics_for_state,
                 pr_reconciler_kick: pr_reconciler_kick_for_state,
+                tracker_registry: tracker_registry_for_state,
             }
         });
 
@@ -2193,6 +2208,19 @@ pub async fn serve(
         server_state.dispatch_events.clone(),
         Duration::from_secs(60),
     );
+
+    // External-tracker reconciler: periodically pulls upstream issue state
+    // into Boss's work-item taxonomy. Default cadence: 120 s (2 min) per
+    // the design doc's §"Cadence" rationale (Design Q5). Fires immediately
+    // on spawn so any drift accumulated while the engine was offline is
+    // reconciled at boot without waiting for the first interval.
+    let _external_tracker_handle =
+        crate::external_tracker::reconcile::spawn_loop(
+            server_state.work_db.clone(),
+            server_state.tracker_registry.clone(),
+            Duration::from_secs(120),
+            server_state.metrics.clone(),
+        );
 
     // Dependency-unblock safety-net sweeper: periodically re-evaluates
     // every dependency-blocked work item and unblocks any whose gating
@@ -5883,15 +5911,50 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::SyncProductExternalTracker { product_id } => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: format!(
-                            "SyncProductExternalTracker not yet implemented (product_id={product_id})"
-                        ),
-                    },
-                );
+                let work_db = server_state.work_db.clone();
+                let registry = server_state.tracker_registry.clone();
+                let metrics = server_state.metrics.clone();
+                let sink2 = sink.clone();
+                let request_id2 = request_id.clone();
+                tokio::spawn(async move {
+                    match crate::external_tracker::reconcile::run_one_pass_for_product(
+                        work_db.as_ref(),
+                        registry.as_ref(),
+                        metrics.as_ref(),
+                        &product_id,
+                    )
+                    .await
+                    {
+                        Some(outcome) => {
+                            tracing::info!(
+                                product_id,
+                                items_imported = outcome.items_imported,
+                                items_closed = outcome.items_closed,
+                                pr_attached = outcome.pr_attached,
+                                close_issue_succeeded = outcome.close_issue_succeeded,
+                                close_issue_failed = outcome.close_issue_failed,
+                                items_unbound = outcome.items_unbound,
+                                "on-demand external tracker sync complete",
+                            );
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::ExternalTrackerSyncStarted { product_id },
+                            );
+                        }
+                        None => {
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::WorkError {
+                                    message: format!(
+                                        "product '{product_id}' has no external tracker binding"
+                                    ),
+                                },
+                            );
+                        }
+                    }
+                });
             }
             FrontendRequest::LinkWorkItemExternalRef { input } => {
                 let result = work_db
