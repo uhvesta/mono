@@ -2262,6 +2262,64 @@ impl WorkDb {
         query_attention_item(&conn, id)?.with_context(|| format!("unknown attention item: {id}"))
     }
 
+    /// Create an external-tracker attention item for `work_item_id` unless one
+    /// with the same `kind` is already open. Idempotent: repeated reconciler
+    /// ticks for the same failure do not pile up rows.
+    pub fn upsert_external_tracker_attention(
+        &self,
+        work_item_id: &str,
+        kind: &str,
+        title: &str,
+        body_markdown: &str,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let _ = product_id_for_work_item(&tx, work_item_id)?;
+        let already_open: i64 = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM work_attention_items
+                 WHERE work_item_id = ?1
+                   AND kind = ?2
+                   AND status = 'open'
+             )",
+            params![work_item_id, kind],
+            |row| row.get(0),
+        )?;
+        if already_open == 0 {
+            let id = next_id("attn");
+            let now = now_string();
+            tx.execute(
+                "INSERT INTO work_attention_items (
+                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+                 ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL)",
+                params![id, work_item_id, kind, title, body_markdown, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark all open attention items of `kind` for `work_item_id` as resolved.
+    /// A no-op when none are open. Used by the external-tracker reconciler to
+    /// clear stale failure items once a product recovers.
+    pub fn resolve_external_tracker_attention(
+        &self,
+        work_item_id: &str,
+        kind: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_string();
+        conn.execute(
+            "UPDATE work_attention_items
+             SET status = 'resolved', resolved_at = ?1
+             WHERE work_item_id = ?2
+               AND kind = ?3
+               AND status = 'open'",
+            params![now, work_item_id, kind],
+        )?;
+        Ok(())
+    }
+
     pub fn update_work_item(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
         self.update_work_item_as_actor(id, patch, "human")
     }

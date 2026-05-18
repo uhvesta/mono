@@ -302,7 +302,56 @@ async fn process_product(
     let upstream_items = match tracker.fetch_items(ctx).await {
         Ok(items) => {
             FETCH_SUCCEEDED.inc(metrics);
+            // Clear any stale fetch-failure attention items now that the
+            // fetch has succeeded.
+            for kind in &[
+                "external_tracker_auth_failed",
+                "external_tracker_transient_errors",
+            ] {
+                if let Err(e) = work_db.resolve_external_tracker_attention(product_id, kind) {
+                    warn!(product_id, %kind, error = %e, "resolve_external_tracker_attention failed");
+                }
+            }
             items
+        }
+        Err(ref e @ TrackerError::Auth(ref msg)) => {
+            FETCH_FAILED.inc(metrics);
+            warn!(product_id, error = %e, "fetch_items auth failure; skipping product this tick");
+            let title = format!("External tracker auth failed for product {product_id}");
+            let body = format!(
+                "Boss could not authenticate with the external tracker: {msg}\n\n\
+                 Run `gh auth login` to refresh credentials, then try again."
+            );
+            if let Err(attn_err) = work_db.upsert_external_tracker_attention(
+                product_id,
+                "external_tracker_auth_failed",
+                &title,
+                &body,
+            ) {
+                warn!(product_id, error = %attn_err,
+                    "upsert_external_tracker_attention (auth_failed) failed");
+            }
+            return;
+        }
+        Err(ref e @ TrackerError::Transient(ref msg)) => {
+            FETCH_FAILED.inc(metrics);
+            warn!(product_id, error = %e,
+                "fetch_items transient error; skipping product this tick");
+            let title = format!("External tracker fetch failing for product {product_id}");
+            let body = format!(
+                "Boss is unable to reach the external tracker: {msg}\n\n\
+                 This is usually a transient network issue. Boss will retry automatically."
+            );
+            if let Err(attn_err) = work_db.upsert_external_tracker_attention(
+                product_id,
+                "external_tracker_transient_errors",
+                &title,
+                &body,
+            ) {
+                warn!(product_id, error = %attn_err,
+                    "upsert_external_tracker_attention (transient_errors) failed");
+            }
+            return;
         }
         Err(e) => {
             FETCH_FAILED.inc(metrics);
@@ -416,6 +465,25 @@ async fn process_product(
                         canonical_id = %stored_ref.canonical_id,
                         "upstream item no longer in project scope; external ref unbound"
                     );
+                    let title = format!(
+                        "Upstream binding for {} cleared",
+                        stored_ref.canonical_id
+                    );
+                    let body = format!(
+                        "`{}` was bound to upstream `{}` which is no longer in the configured \
+                         project. The link has been cleared; re-bind manually with \
+                         `boss chore link-external` if this was unintended.",
+                        work_item_id, stored_ref.canonical_id
+                    );
+                    if let Err(e) = work_db.upsert_external_tracker_attention(
+                        work_item_id,
+                        "external_tracker_removed_upstream",
+                        &title,
+                        &body,
+                    ) {
+                        warn!(work_item_id, error = %e,
+                            "upsert_external_tracker_attention (removed_upstream) failed");
+                    }
                 }
                 Err(e) => {
                     warn!(work_item_id, error = %e, "clear_external_ref failed");
@@ -462,6 +530,44 @@ async fn process_product(
                     outcome.close_issue_succeeded += 1;
                 }
             }
+            Err(ref e @ TrackerError::PermissionDenied(ref msg)) => {
+                if is_b3 {
+                    REVERSE_CLOSE_FAILED.inc(metrics);
+                    outcome.reverse_close_failed += 1;
+                } else {
+                    PR_MERGE_CLOSE_FAILED.inc(metrics);
+                    outcome.close_issue_failed += 1;
+                }
+                warn!(
+                    work_item_id = %candidate.work_item_id,
+                    canonical_id = %candidate.upstream_ref.canonical_id,
+                    error = %e,
+                    "close_issue permission denied; credential lacks write scope"
+                );
+                let title = format!(
+                    "Cannot close upstream issue {} — permission denied",
+                    candidate.upstream_ref.canonical_id
+                );
+                let body = format!(
+                    "Boss could not close upstream issue `{}`: {msg}\n\n\
+                     The credential lacks `issues:write` scope. \
+                     Re-run `gh auth login --scopes repo` to grant write permission, \
+                     or close the issue manually.",
+                    candidate.upstream_ref.canonical_id
+                );
+                if let Err(e) = work_db.upsert_external_tracker_attention(
+                    &candidate.work_item_id,
+                    "external_tracker_permission_denied",
+                    &title,
+                    &body,
+                ) {
+                    warn!(
+                        work_item_id = %candidate.work_item_id,
+                        error = %e,
+                        "upsert_external_tracker_attention (permission_denied) failed"
+                    );
+                }
+            }
             Err(e) => {
                 if is_b3 {
                     REVERSE_CLOSE_FAILED.inc(metrics);
@@ -470,7 +576,7 @@ async fn process_product(
                         work_item_id = %candidate.work_item_id,
                         canonical_id = %candidate.upstream_ref.canonical_id,
                         error = %e,
-                        "Behavior 3: reverse-close failed (transient or permission); will retry next tick"
+                        "Behavior 3: reverse-close failed (transient); will retry next tick"
                     );
                 } else {
                     PR_MERGE_CLOSE_FAILED.inc(metrics);
@@ -479,7 +585,7 @@ async fn process_product(
                         work_item_id = %candidate.work_item_id,
                         canonical_id = %candidate.upstream_ref.canonical_id,
                         error = %e,
-                        "Behavior 5: close_issue failed (transient or permission); will retry next tick"
+                        "Behavior 5: close_issue failed (transient); will retry next tick"
                     );
                 }
             }
@@ -719,9 +825,11 @@ mod tests {
     // ── SpyTracker ────────────────────────────────────────────────────────────
 
     /// Test double: records `close_issue` calls and returns pre-configured
-    /// responses.  `fetch_items` always returns the same list.
+    /// responses.  `fetch_items` returns the item list unless a fetch error
+    /// has been queued via `push_fetch_error`.
     struct SpyTracker {
         items: Vec<UpstreamItem>,
+        fetch_errors: Mutex<VecDeque<crate::external_tracker::Result<Vec<UpstreamItem>>>>,
         close_responses: Mutex<VecDeque<crate::external_tracker::Result<()>>>,
         close_calls: Mutex<Vec<String>>,
     }
@@ -730,6 +838,7 @@ mod tests {
         fn new(items: Vec<UpstreamItem>) -> Arc<Self> {
             Arc::new(Self {
                 items,
+                fetch_errors: Mutex::new(VecDeque::new()),
                 close_responses: Mutex::new(VecDeque::new()),
                 close_calls: Mutex::new(Vec::new()),
             })
@@ -745,6 +854,32 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push_back(Err(TrackerError::Transient("network error".to_owned())));
+            self
+        }
+
+        fn push_permission_denied(self: &Arc<Self>) -> &Arc<Self> {
+            self.close_responses
+                .lock()
+                .unwrap()
+                .push_back(Err(TrackerError::PermissionDenied(
+                    "credential lacks issues:write".to_owned(),
+                )));
+            self
+        }
+
+        fn push_fetch_auth_error(self: &Arc<Self>) -> &Arc<Self> {
+            self.fetch_errors
+                .lock()
+                .unwrap()
+                .push_back(Err(TrackerError::Auth("token invalid".to_owned())));
+            self
+        }
+
+        fn push_fetch_transient_error(self: &Arc<Self>) -> &Arc<Self> {
+            self.fetch_errors
+                .lock()
+                .unwrap()
+                .push_back(Err(TrackerError::Transient("connection refused".to_owned())));
             self
         }
 
@@ -770,6 +905,9 @@ mod tests {
             &self,
             _ctx: &TrackerContext,
         ) -> crate::external_tracker::Result<Vec<UpstreamItem>> {
+            if let Some(next) = self.fetch_errors.lock().unwrap().pop_front() {
+                return next;
+            }
             Ok(self.items.clone())
         }
 
@@ -1495,5 +1633,209 @@ mod tests {
 
         let result = run_one_pass_for_product(&db, &registry, &metrics, &product.id).await;
         assert!(result.is_none(), "unbound product should return None");
+    }
+
+    // ── Attention item integration tests (chore 16) ───────────────────────────
+
+    fn attention_items_for_product(db: &WorkDb, product_id: &str) -> Vec<boss_protocol::WorkAttentionItem> {
+        db.list_attention_items_for_work_item(product_id).expect("list attention items")
+    }
+
+    fn attention_items_for_work_item(db: &WorkDb, work_item_id: &str) -> Vec<boss_protocol::WorkAttentionItem> {
+        db.list_attention_items_for_work_item(work_item_id).expect("list attention items")
+    }
+
+    /// Reason 1: auth failure on `fetch_items` emits `external_tracker_auth_failed`
+    /// on the product.
+    #[tokio::test]
+    async fn attention_item_emitted_for_auth_failure() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![]);
+        tracker.push_fetch_auth_error();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics).await;
+
+        let items = attention_items_for_product(&db, &product.id);
+        let auth_items: Vec<_> = items.iter()
+            .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
+            .collect();
+        assert_eq!(auth_items.len(), 1, "should emit exactly one auth_failed attention item");
+        assert!(
+            auth_items[0].body_markdown.contains("gh auth login"),
+            "body should contain remediation hint; got: {}",
+            auth_items[0].body_markdown
+        );
+    }
+
+    /// Reason 2: transient fetch error emits `external_tracker_transient_errors`
+    /// on the product.
+    #[tokio::test]
+    async fn attention_item_emitted_for_transient_fetch_error() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![]);
+        tracker.push_fetch_transient_error();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics).await;
+
+        let items = attention_items_for_product(&db, &product.id);
+        let transient_items: Vec<_> = items.iter()
+            .filter(|i| i.kind == "external_tracker_transient_errors" && i.status == "open")
+            .collect();
+        assert_eq!(transient_items.len(), 1,
+            "should emit exactly one transient_errors attention item");
+    }
+
+    /// Reason 3: upstream item removed from project emits
+    /// `external_tracker_removed_upstream` on the unbound work item.
+    #[tokio::test]
+    async fn attention_item_emitted_for_removed_upstream() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Chore to be unbound".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .expect("create chore");
+        db.set_external_ref(&chore.id, "spy", "spy#20", &json!({ "issue_number": 20 }))
+            .expect("set_external_ref");
+
+        // Empty upstream: spy#20 is no longer in scope.
+        let tracker = SpyTracker::new(vec![]);
+        let registry = spy_registry(tracker);
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics).await;
+
+        let items = attention_items_for_work_item(&db, &chore.id);
+        let unbound_items: Vec<_> = items.iter()
+            .filter(|i| i.kind == "external_tracker_removed_upstream" && i.status == "open")
+            .collect();
+        assert_eq!(unbound_items.len(), 1,
+            "should emit exactly one removed_upstream attention item on the work item");
+        assert!(
+            unbound_items[0].body_markdown.contains("spy#20"),
+            "body should reference the canonical_id; got: {}",
+            unbound_items[0].body_markdown
+        );
+    }
+
+    /// Reason 4: `close_issue` permission denied emits
+    /// `external_tracker_permission_denied` on the work item.
+    #[tokio::test]
+    async fn attention_item_emitted_for_permission_denied_on_close() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Chore with permission-denied close".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .expect("create chore");
+        db.set_external_ref(&chore.id, "spy", "spy#21", &json!({ "issue_number": 21 }))
+            .expect("set_external_ref");
+
+        // Upstream shows a merged PR; boss row is not yet done → close_issue fires.
+        let tracker = SpyTracker::new(vec![item_with_merged_pr(
+            21,
+            "https://github.com/example/repo/pull/300",
+        )]);
+        tracker.push_permission_denied();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics).await;
+
+        let items = attention_items_for_work_item(&db, &chore.id);
+        let perm_items: Vec<_> = items.iter()
+            .filter(|i| i.kind == "external_tracker_permission_denied" && i.status == "open")
+            .collect();
+        assert_eq!(perm_items.len(), 1,
+            "should emit exactly one permission_denied attention item");
+        assert!(
+            perm_items[0].body_markdown.contains("issues:write"),
+            "body should mention required scope; got: {}",
+            perm_items[0].body_markdown
+        );
+    }
+
+    /// Idempotency: a second pass with the same auth failure does not create
+    /// a duplicate attention item.
+    #[tokio::test]
+    async fn attention_items_are_idempotent_on_repeated_failures() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![]);
+        tracker.push_fetch_auth_error();
+        tracker.push_fetch_auth_error();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics).await;
+        run_one_pass(&db, &registry, &metrics).await;
+
+        let items = attention_items_for_product(&db, &product.id);
+        let auth_items: Vec<_> = items.iter()
+            .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
+            .collect();
+        assert_eq!(auth_items.len(), 1,
+            "repeated auth failures must not pile up duplicate attention items");
+    }
+
+    /// Recovery: a successful fetch clears stale fetch-failure attention items.
+    #[tokio::test]
+    async fn attention_items_cleared_on_recovery() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![]);
+        tracker.push_fetch_auth_error();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        // Tick 1: auth failure → attention item created.
+        run_one_pass(&db, &registry, &metrics).await;
+        let items = attention_items_for_product(&db, &product.id);
+        assert!(
+            items.iter().any(|i| i.kind == "external_tracker_auth_failed" && i.status == "open"),
+            "attention item should exist after auth failure"
+        );
+
+        // Tick 2: fetch succeeds (no more queued error) → attention item resolved.
+        run_one_pass(&db, &registry, &metrics).await;
+        let items2 = attention_items_for_product(&db, &product.id);
+        let still_open = items2.iter()
+            .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
+            .count();
+        assert_eq!(still_open, 0, "auth_failed attention item should be resolved after recovery");
     }
 }
