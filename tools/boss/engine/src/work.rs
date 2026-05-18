@@ -2399,23 +2399,23 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
-            let rows = stmt.query_map([product_id], map_task)?;
+            let rows = stmt.query_map([product_id], map_task_with_external_ref)?;
             collect_rows(rows)?
         };
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
             )?;
-            let rows = stmt.query_map([product_id], map_task)?;
+            let rows = stmt.query_map([product_id], map_task_with_external_ref)?;
             collect_rows(rows)?
         };
 
@@ -5971,9 +5971,8 @@ impl WorkDb {
     /// considered "found" by this query). Soft-deleted tasks are always
     /// excluded.
     ///
-    /// The returned `Task.external_ref` is populated; `web_url` is left
-    /// as an empty string — derivation is tracker-specific and handled by
-    /// the reconciler layer (T9).
+    /// The returned `Task.external_ref` is populated, including a derived
+    /// `web_url` (see [`derive_external_ref_web_url`]).
     pub fn find_by_external_ref(
         &self,
         kind: &str,
@@ -6314,11 +6313,23 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+/// Derives the canonical browser URL from an external-ref kind and
+/// canonical_id at read time. For GitHub (`kind="github"`) the
+/// canonical_id encodes `"owner/repo#number"`, which maps to
+/// `https://github.com/owner/repo/issues/number`. Returns an empty
+/// string for unknown trackers so callers can still surface the ref.
+fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> String {
+    if kind == "github" {
+        if let Some((repo, number)) = canonical_id.rsplit_once('#') {
+            return format!("https://github.com/{repo}/issues/{number}");
+        }
+    }
+    String::new()
+}
+
 /// Like [`map_task`] but reads columns 30–34 carrying the external-ref
-/// data and populates `Task.external_ref`. Used by the T8 WorkDb
-/// methods (`find_by_external_ref`) whose SELECT explicitly includes
-/// those columns. The `web_url` field is not stored in the DB; it is
-/// derived at the reconciler layer and left as an empty string here.
+/// data and populates `Task.external_ref`. Used whenever the SELECT
+/// explicitly includes those columns (e.g. `get_work_tree`, `find_by_external_ref`).
 fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     let kind: Option<String> = row.get(30)?;
@@ -6329,11 +6340,12 @@ fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(serde_json::Value::Null);
+        let web_url = derive_external_ref_web_url(&kind, &canonical_id);
         task.external_ref = Some(WorkItemExternalRef {
             kind,
             canonical_id,
             raw,
-            web_url: String::new(),
+            web_url,
             synced_at: row.get(33)?,
             unbound_at: row.get(34)?,
         });
@@ -16034,6 +16046,41 @@ mod tests {
             .map(|(_, r)| r)
             .unwrap();
         assert!(bound.unbound_at.is_none(), "active row must have no unbound_at");
+    }
+
+    /// get_work_tree populates external_ref on chores so the kanban card
+    /// can render the upstream-link affordance (T503 follow-up / T588).
+    #[test]
+    fn get_work_tree_includes_external_ref_on_chores() {
+        let (db, product_id, chore_id) = setup_product_and_chore();
+        let raw = serde_json::json!({ "issue_number": 561 });
+        db.set_external_ref(&chore_id, "github", "spinyfin/mono#561", &raw)
+            .unwrap();
+
+        let tree = db.get_work_tree(&product_id).unwrap();
+        let chore = tree.chores.iter().find(|c| c.id == chore_id).unwrap();
+        let ext = chore.external_ref.as_ref().expect("external_ref must be populated in work tree");
+        assert_eq!(ext.kind, "github");
+        assert_eq!(ext.canonical_id, "spinyfin/mono#561");
+        assert_eq!(ext.web_url, "https://github.com/spinyfin/mono/issues/561");
+    }
+
+    /// derive_external_ref_web_url derives correct GitHub URLs and returns
+    /// empty string for unknown trackers.
+    #[test]
+    fn derive_external_ref_web_url_github() {
+        assert_eq!(
+            derive_external_ref_web_url("github", "spinyfin/mono#560"),
+            "https://github.com/spinyfin/mono/issues/560"
+        );
+        assert_eq!(
+            derive_external_ref_web_url("github", "org/repo#1"),
+            "https://github.com/org/repo/issues/1"
+        );
+        assert_eq!(
+            derive_external_ref_web_url("unknown", "jira-BOSS-42"),
+            ""
+        );
     }
 
     /// A database that does not yet have the external-tracker columns must
