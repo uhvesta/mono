@@ -2700,7 +2700,6 @@ private struct WorkEditSheet: View {
                     trackerProjectNumber: $trackerProjectNumber,
                     trackerReverseClose: $trackerReverseClose,
                     initialTrackerBound: initialTrackerBound,
-                    onSetTracker: onSetTracker,
                     onUnsetTracker: onUnsetTracker
                 )
 
@@ -2735,13 +2734,35 @@ private struct WorkEditSheet: View {
                 Button("Cancel", action: onCancel)
                 Button("Save") {
                     onSave(name, description, status, repoRemoteURL, goal, priority, prURL)
+                    if case .product = request.item, trackerFormValid,
+                       let num = Int(trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        onSetTracker?(trackerKind, trackerOrg, trackerRepo, num, trackerReverseClose)
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    trackerFieldsEntered && !trackerFormValid
+                )
             }
         }
         .padding(20)
         .frame(width: 440)
+    }
+
+    private var trackerFieldsEntered: Bool {
+        let org = trackerOrg.trimmingCharacters(in: .whitespacesAndNewlines)
+        let repo = trackerRepo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let project = trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !org.isEmpty || !repo.isEmpty || !project.isEmpty
+    }
+
+    private var trackerFormValid: Bool {
+        guard trackerKind == "github" else { return false }
+        let org = trackerOrg.trimmingCharacters(in: .whitespacesAndNewlines)
+        let repo = trackerRepo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let project = trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !org.isEmpty && !repo.isEmpty && Int(project) != nil
     }
 
     private var title: String {
@@ -2768,7 +2789,6 @@ private struct ExternalTrackerSection: View {
     @Binding var trackerReverseClose: Bool
 
     let initialTrackerBound: Bool
-    let onSetTracker: ((String, String, String, Int, Bool) -> Void)?
     let onUnsetTracker: (() -> Void)?
 
     var body: some View {
@@ -2790,31 +2810,18 @@ private struct ExternalTrackerSection: View {
                 Toggle("Reverse-close", isOn: $trackerReverseClose)
                     .help("When a work item is marked done without a merged PR, close the upstream GitHub issue.")
 
-                HStack {
-                    if initialTrackerBound {
+                if initialTrackerBound {
+                    HStack {
                         Button("Unset", role: .destructive) {
                             onUnsetTracker?()
                         }
+                        Spacer()
                     }
-                    Spacer()
-                    Button("Save Tracker") {
-                        if let num = Int(trackerProjectNumber) {
-                            onSetTracker?("github", trackerOrg, trackerRepo, num, trackerReverseClose)
-                        }
-                    }
-                    .disabled(!trackerFormValid)
                 }
             }
         }
     }
 
-    private var trackerFormValid: Bool {
-        guard trackerKind == "github" else { return false }
-        let org = trackerOrg.trimmingCharacters(in: .whitespacesAndNewlines)
-        let repo = trackerRepo.trimmingCharacters(in: .whitespacesAndNewlines)
-        let project = trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !org.isEmpty && !repo.isEmpty && Int(project) != nil
-    }
 }
 
 /// Capsule chip surfacing a repo's short name on a kanban card or
