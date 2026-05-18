@@ -106,6 +106,17 @@ impl std::fmt::Display for DuplicateTaskError {
 
 impl std::error::Error for DuplicateTaskError {}
 
+/// One row demoted by [`WorkDb::heal_ghost_active_chores`]. Carries the
+/// owning `product_id` so the caller can publish a `work_item_changed`
+/// invalidation on the product's topic — the kanban view subscribes on
+/// product topics, not task ids, so the topic must be the product to
+/// reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealedGhostActive {
+    pub work_item_id: String,
+    pub product_id: String,
+}
+
 use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -416,16 +427,23 @@ impl WorkDb {
     /// show those — they have no run history and should fall back to
     /// the To-Do lane so the human can retry.
     ///
-    /// Returns the work item ids that were demoted. Items whose
+    /// Demotion also stamps `last_status_actor = 'engine'` so the
+    /// kanban surface can distinguish the engine's auto-demote from a
+    /// human drag, and returns the per-row `product_id` so the caller
+    /// can publish a work-item-changed event on the product's topic —
+    /// without that event the UI keeps showing the card in Doing
+    /// until the next manual refetch.
+    ///
+    /// Returns one [`HealedGhostActive`] per demoted row. Items whose
     /// executions already produced a run (active worker that crashed,
     /// terminated cleanly, or is still executing) are left alone —
     /// `reconcile_active_dispatch` handles those via re-dispatch.
-    pub fn heal_ghost_active_chores(&self) -> Result<Vec<String>> {
+    pub fn heal_ghost_active_chores(&self) -> Result<Vec<HealedGhostActive>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let candidate_ids: Vec<String> = {
+        let candidates: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT t.id FROM tasks t
+                "SELECT t.id, t.product_id FROM tasks t
                  WHERE t.status = 'active'
                    AND t.deleted_at IS NULL
                    AND NOT EXISTS (
@@ -434,12 +452,14 @@ impl WorkDb {
                        WHERE we.work_item_id = t.id
                    )",
             )?;
-            stmt.query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut healed = Vec::new();
         let now = now_string();
-        for work_item_id in candidate_ids {
+        for (work_item_id, product_id) in candidates {
             // Abandon any non-terminal executions so they don't get
             // picked up by the dispatcher after the demote. Terminal
             // executions are left alone — they're already settled.
@@ -453,9 +473,14 @@ impl WorkDb {
             )?;
             // Demote the kanban status. Use a guarded update so we
             // don't race a concurrent move to `done`/`archived`.
+            // Stamps `last_status_actor = 'engine'` so the kanban can
+            // render "demoted by engine: dispatch never reached a
+            // worker" instead of attributing the move to the human who
+            // last touched the row.
             let updated = tx.execute(
                 "UPDATE tasks
                  SET status = 'todo',
+                     last_status_actor = 'engine',
                      updated_at = ?2
                  WHERE id = ?1
                    AND status = 'active'
@@ -463,7 +488,10 @@ impl WorkDb {
                 params![work_item_id, now],
             )?;
             if updated > 0 {
-                healed.push(work_item_id);
+                healed.push(HealedGhostActive {
+                    work_item_id,
+                    product_id,
+                });
             }
         }
         tx.commit()?;
