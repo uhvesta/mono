@@ -116,6 +116,16 @@ crate::register_counter!(
     "external_tracker.skip_no_credential",
     "Products skipped because credential resolution failed.",
 );
+crate::register_counter!(
+    IN_PROGRESS_SET_SUCCEEDED,
+    "external_tracker.in_progress_set_succeeded",
+    "set_project_status calls that succeeded when a task moved to active (Behavior 6).",
+);
+crate::register_counter!(
+    IN_PROGRESS_SET_FAILED,
+    "external_tracker.in_progress_set_failed",
+    "set_project_status calls that failed when a task moved to active (Behavior 6).",
+);
 
 /// Register all reconciler metrics with the engine's registry.
 /// Must be called from `metrics::init_all`.
@@ -132,6 +142,8 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&UNBOUND);
     registry.register_counter(&SKIPPED_CLOSED_AT_FIRST_SIGHT);
     registry.register_counter(&SKIP_NO_CREDENTIAL);
+    registry.register_counter(&IN_PROGRESS_SET_SUCCEEDED);
+    registry.register_counter(&IN_PROGRESS_SET_FAILED);
 }
 
 // ── Outcome ───────────────────────────────────────────────────────────────────
@@ -154,6 +166,10 @@ pub struct PassOutcome {
     pub reverse_close_succeeded: usize,
     /// Behavior 3: close_issue calls that failed via reverse-close.
     pub reverse_close_failed: usize,
+    /// Behavior 6: set_project_status calls that succeeded when a task moved to active.
+    pub in_progress_set_succeeded: usize,
+    /// Behavior 6: set_project_status calls that failed when a task moved to active.
+    pub in_progress_set_failed: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -243,6 +259,8 @@ pub fn spawn_loop(
                 || outcome.close_issue_succeeded > 0
                 || outcome.close_issue_failed > 0
                 || outcome.items_unbound > 0
+                || outcome.in_progress_set_succeeded > 0
+                || outcome.in_progress_set_failed > 0
             {
                 tracing::info!(
                     products_processed = outcome.products_processed,
@@ -253,6 +271,8 @@ pub fn spawn_loop(
                     close_issue_succeeded = outcome.close_issue_succeeded,
                     close_issue_failed = outcome.close_issue_failed,
                     items_unbound = outcome.items_unbound,
+                    in_progress_set_succeeded = outcome.in_progress_set_succeeded,
+                    in_progress_set_failed = outcome.in_progress_set_failed,
                     "external tracker reconciler: pass complete",
                 );
             }
@@ -326,6 +346,13 @@ struct CloseCandidate {
     trigger: CloseTrigger,
 }
 
+/// Carries intent to call `set_project_status` (Behavior 6) after all
+/// Boss-side SQL writes are done.
+struct InProgressCandidate {
+    work_item_id: String,
+    upstream_ref: UpstreamRef,
+}
+
 async fn process_product(
     work_db: &WorkDb,
     tracker: &dyn ExternalTracker,
@@ -336,6 +363,8 @@ async fn process_product(
     publisher: &dyn WorkInvalidationPublisher,
 ) {
     let reverse_close = ctx.config["reverse_close"].as_bool().unwrap_or(false);
+    let in_progress_column =
+        ctx.config["in_progress_column"].as_str().unwrap_or("In progress").to_owned();
 
     // ── 1. Fetch upstream items ───────────────────────────────────────────────
     let upstream_items = match tracker.fetch_items(ctx).await {
@@ -421,6 +450,7 @@ async fn process_product(
         existing.iter().map(|(_, r)| r.canonical_id.as_str()).collect();
 
     let mut close_candidates: Vec<CloseCandidate> = Vec::new();
+    let mut in_progress_candidates: Vec<InProgressCandidate> = Vec::new();
 
     // ── 3. Reconcile each upstream item ───────────────────────────────────────
     for item in &upstream_items {
@@ -433,7 +463,9 @@ async fn process_product(
                     &task,
                     item,
                     reverse_close,
+                    &in_progress_column,
                     &mut close_candidates,
+                    &mut in_progress_candidates,
                     outcome,
                     metrics,
                     product_id,
@@ -471,7 +503,9 @@ async fn process_product(
                                     &task,
                                     item,
                                     reverse_close,
+                                    &in_progress_column,
                                     &mut close_candidates,
+                                    &mut in_progress_candidates,
                                     outcome,
                                     metrics,
                                     product_id,
@@ -639,6 +673,35 @@ async fn process_product(
             }
         }
     }
+
+    // ── 6. Set project status to "In progress" (Behavior 6) ──────────────────
+    // Fires when a Boss task entered the active (Doing) state and the upstream
+    // item's project column is not already at the configured in-progress value.
+    // Cap at 20 per tick to match the close-candidates budget.
+    const IN_PROGRESS_BUDGET: usize = 20;
+    for candidate in in_progress_candidates.into_iter().take(IN_PROGRESS_BUDGET) {
+        match tracker.set_project_status(ctx, &candidate.upstream_ref).await {
+            Ok(()) => {
+                IN_PROGRESS_SET_SUCCEEDED.inc(metrics);
+                outcome.in_progress_set_succeeded += 1;
+                info!(
+                    work_item_id = %candidate.work_item_id,
+                    canonical_id = %candidate.upstream_ref.canonical_id,
+                    "Behavior 6: project status set to In progress"
+                );
+            }
+            Err(e) => {
+                IN_PROGRESS_SET_FAILED.inc(metrics);
+                outcome.in_progress_set_failed += 1;
+                warn!(
+                    work_item_id = %candidate.work_item_id,
+                    canonical_id = %candidate.upstream_ref.canonical_id,
+                    error = %e,
+                    "Behavior 6: set_project_status failed (transient); will retry next tick"
+                );
+            }
+        }
+    }
 }
 
 // ── Per-item helpers ──────────────────────────────────────────────────────────
@@ -661,7 +724,9 @@ async fn reconcile_existing(
     task: &boss_protocol::Task,
     upstream: &UpstreamItem,
     reverse_close: bool,
+    in_progress_column: &str,
     close_candidates: &mut Vec<CloseCandidate>,
+    in_progress_candidates: &mut Vec<InProgressCandidate>,
     outcome: &mut PassOutcome,
     metrics: &Registry,
     product_id: &str,
@@ -756,6 +821,22 @@ async fn reconcile_existing(
                     upstream_ref: upstream.upstream_ref.clone(),
                     trigger: CloseTrigger::ReverseClose,
                 });
+            }
+
+            // Behavior 6: mirror boss→active to the upstream project column.
+            // Queue only when the task is active (Doing) and the upstream
+            // project status is not already the target column; this prevents
+            // a regression if the user has manually advanced the item to a
+            // later column while the task is still in progress.
+            if task.status == "active" {
+                let already_at_target =
+                    upstream.project_status.as_deref() == Some(in_progress_column);
+                if !already_at_target {
+                    in_progress_candidates.push(InProgressCandidate {
+                        work_item_id: work_item_id.clone(),
+                        upstream_ref: upstream.upstream_ref.clone(),
+                    });
+                }
             }
         }
     }
@@ -922,14 +1003,16 @@ mod tests {
 
     // ── SpyTracker ────────────────────────────────────────────────────────────
 
-    /// Test double: records `close_issue` calls and returns pre-configured
-    /// responses.  `fetch_items` returns the item list unless a fetch error
-    /// has been queued via `push_fetch_error`.
+    /// Test double: records `close_issue` and `set_project_status` calls and
+    /// returns pre-configured responses.  `fetch_items` returns the item list
+    /// unless a fetch error has been queued via `push_fetch_error`.
     struct SpyTracker {
         items: Vec<UpstreamItem>,
         fetch_errors: Mutex<VecDeque<crate::external_tracker::Result<Vec<UpstreamItem>>>>,
         close_responses: Mutex<VecDeque<crate::external_tracker::Result<()>>>,
         close_calls: Mutex<Vec<String>>,
+        set_project_status_responses: Mutex<VecDeque<crate::external_tracker::Result<()>>>,
+        set_project_status_calls: Mutex<Vec<String>>,
     }
 
     impl SpyTracker {
@@ -939,6 +1022,8 @@ mod tests {
                 fetch_errors: Mutex::new(VecDeque::new()),
                 close_responses: Mutex::new(VecDeque::new()),
                 close_calls: Mutex::new(Vec::new()),
+                set_project_status_responses: Mutex::new(VecDeque::new()),
+                set_project_status_calls: Mutex::new(Vec::new()),
             })
         }
 
@@ -981,8 +1066,25 @@ mod tests {
             self
         }
 
+        fn push_set_project_status_ok(self: &Arc<Self>) -> &Arc<Self> {
+            self.set_project_status_responses.lock().unwrap().push_back(Ok(()));
+            self
+        }
+
+        fn push_set_project_status_transient(self: &Arc<Self>) -> &Arc<Self> {
+            self.set_project_status_responses
+                .lock()
+                .unwrap()
+                .push_back(Err(TrackerError::Transient("network error".to_owned())));
+            self
+        }
+
         fn close_calls(&self) -> Vec<String> {
             self.close_calls.lock().unwrap().clone()
+        }
+
+        fn set_project_status_calls(&self) -> Vec<String> {
+            self.set_project_status_calls.lock().unwrap().clone()
         }
     }
 
@@ -1030,6 +1132,19 @@ mod tests {
             let next = self.close_responses.lock().unwrap().pop_front();
             next.unwrap_or(Ok(()))
         }
+
+        async fn set_project_status(
+            &self,
+            _ctx: &TrackerContext,
+            ref_: &UpstreamRef,
+        ) -> crate::external_tracker::Result<()> {
+            self.set_project_status_calls
+                .lock()
+                .unwrap()
+                .push(ref_.canonical_id.clone());
+            let next = self.set_project_status_responses.lock().unwrap().pop_front();
+            next.unwrap_or(Ok(()))
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1071,6 +1186,14 @@ mod tests {
             assignees: vec![],
             pr_associations: vec![],
             updated_at: 0,
+            project_status: None,
+        }
+    }
+
+    fn open_item_with_project_status(id: u64, title: &str, project_status: &str) -> UpstreamItem {
+        UpstreamItem {
+            project_status: Some(project_status.to_owned()),
+            ..open_item(id, title)
         }
     }
 
@@ -1963,5 +2086,224 @@ mod tests {
             .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
             .count();
         assert_eq!(still_open, 0, "auth_failed attention item should be resolved after recovery");
+    }
+
+    // ── Behavior 6: set project status to "In progress" ──────────────────────
+
+    fn seed_active_chore(
+        db: &WorkDb,
+        product_id: &str,
+        canonical_id: &str,
+        issue_num: u64,
+    ) -> boss_protocol::Task {
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.to_owned(),
+                name: format!("Active chore {canonical_id}"),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .expect("create chore");
+        db.set_external_ref(
+            &chore.id,
+            "spy",
+            canonical_id,
+            &json!({ "issue_number": issue_num }),
+        )
+        .expect("set_external_ref");
+        // Simulate the task being dragged to Doing (active) via direct SQL,
+        // mirroring what the engine's update_task RPC does.
+        let conn = db.connect().expect("connect for seed_active_chore");
+        conn.execute(
+            "UPDATE tasks SET status = 'active' WHERE id = ?1",
+            rusqlite::params![chore.id],
+        )
+        .expect("set status to active");
+        db.find_by_external_ref("spy", canonical_id)
+            .expect("query ok")
+            .expect("chore exists")
+    }
+
+    /// Behavior 6 happy path: boss is active, upstream is Open, project_status
+    /// is "Todo" → set_project_status fires.
+    #[tokio::test]
+    async fn set_project_status_fires_when_boss_active_and_upstream_open_todo() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = seed_active_chore(&db, &product.id, "spy#30", 30);
+        assert_eq!(chore.status, "active");
+
+        // Upstream is Open with project_status = "Todo" (not yet In progress).
+        let item = open_item_with_project_status(30, "Issue 30", "Todo");
+        let tracker = SpyTracker::new(vec![item]);
+        tracker.push_set_project_status_ok();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert_eq!(outcome.in_progress_set_succeeded, 1, "Behavior 6 should succeed");
+        assert_eq!(outcome.in_progress_set_failed, 0);
+
+        let calls = tracker.set_project_status_calls();
+        assert_eq!(calls, vec!["spy#30"], "set_project_status called for spy#30");
+    }
+
+    /// Behavior 6 is idempotent: if the upstream item is already "In progress",
+    /// set_project_status must NOT be called.
+    #[tokio::test]
+    async fn set_project_status_skipped_when_already_in_progress() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = seed_active_chore(&db, &product.id, "spy#31", 31);
+        assert_eq!(chore.status, "active");
+
+        // Upstream already at "In progress".
+        let item = open_item_with_project_status(31, "Issue 31", "In progress");
+        let tracker = SpyTracker::new(vec![item]);
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert_eq!(outcome.in_progress_set_succeeded, 0, "should not fire when already In progress");
+        assert_eq!(outcome.in_progress_set_failed, 0);
+        assert!(
+            tracker.set_project_status_calls().is_empty(),
+            "set_project_status must not be called when already at target"
+        );
+    }
+
+    /// Behavior 6 does not fire when the Boss task is in todo or done.
+    #[tokio::test]
+    async fn set_project_status_not_fired_for_non_active_task() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        // todo task
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Todo chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .expect("create chore");
+        db.set_external_ref(&chore.id, "spy", "spy#32", &json!({ "issue_number": 32 }))
+            .expect("set_external_ref");
+        // Leave as todo (default).
+
+        let item = open_item_with_project_status(32, "Issue 32", "Todo");
+        let tracker = SpyTracker::new(vec![item]);
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert_eq!(outcome.in_progress_set_succeeded, 0, "should not fire for todo task");
+        assert!(tracker.set_project_status_calls().is_empty());
+    }
+
+    /// Behavior 6 does not fire when upstream is Closed (Behavior 2 handles that).
+    #[tokio::test]
+    async fn set_project_status_not_fired_when_upstream_closed() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = seed_active_chore(&db, &product.id, "spy#33", 33);
+        assert_eq!(chore.status, "active");
+
+        // Upstream is Closed → Behavior 2 fires; Behavior 6 should not.
+        let item = UpstreamItem {
+            status: UpstreamStatus::Closed {
+                reason: crate::external_tracker::ClosedReason::Completed,
+            },
+            project_status: Some("Done".to_owned()),
+            ..open_item(33, "Closed issue 33")
+        };
+        let tracker = SpyTracker::new(vec![item]);
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert!(
+            tracker.set_project_status_calls().is_empty(),
+            "set_project_status must not be called when upstream is Closed"
+        );
+    }
+
+    /// Behavior 6 transient failure: set_project_status is retried on the next tick.
+    #[tokio::test]
+    async fn set_project_status_transient_failure_retried_on_next_tick() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = seed_active_chore(&db, &product.id, "spy#34", 34);
+        assert_eq!(chore.status, "active");
+
+        // project_status remains "Todo" both ticks (mutation didn't land yet).
+        let item = open_item_with_project_status(34, "Issue 34", "Todo");
+        let tracker = SpyTracker::new(vec![item]);
+
+        // Tick 1: set_project_status fails transiently.
+        tracker.push_set_project_status_transient();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        assert_eq!(outcome1.in_progress_set_failed, 1, "tick 1: should record failure");
+        assert_eq!(outcome1.in_progress_set_succeeded, 0);
+
+        // Tick 2: succeeds.
+        tracker.push_set_project_status_ok();
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        assert_eq!(outcome2.in_progress_set_succeeded, 1, "tick 2: should succeed");
+
+        let calls = tracker.set_project_status_calls();
+        assert_eq!(calls, vec!["spy#34", "spy#34"], "called on both ticks");
+    }
+
+    /// Behavior 6 fires when project_status is None (item has no Status column set yet).
+    #[tokio::test]
+    async fn set_project_status_fires_when_project_status_none() {
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = seed_active_chore(&db, &product.id, "spy#35", 35);
+        assert_eq!(chore.status, "active");
+
+        // project_status is None (Status field not set on the GitHub Project item).
+        let item = open_item(35, "Issue 35");
+        assert!(item.project_status.is_none());
+        let tracker = SpyTracker::new(vec![item]);
+        tracker.push_set_project_status_ok();
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        assert_eq!(outcome.in_progress_set_succeeded, 1, "should fire when project_status is None");
+        let calls = tracker.set_project_status_calls();
+        assert_eq!(calls, vec!["spy#35"]);
     }
 }
