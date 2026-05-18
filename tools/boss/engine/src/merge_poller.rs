@@ -645,8 +645,20 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let ci = classify_ci(&rollup, combined_state);
+    // Per-org reclassification: a status check that GitHub reports as a
+    // required CI check but that semantically gates merge on a human
+    // approval signal (e.g. LinkedIn's `Owner Approval` / LI-ACL) is
+    // partitioned out of the rollup before CI classification and fed
+    // into the review-signal axis instead. Outside the configured orgs
+    // the partition is a no-op and the rollup is classified normally.
+    let owner = owner_from_pr_url(url).unwrap_or("");
+    let review_signal_names = review_signal_checks_for_owner(owner);
+    let (review_signal_leaves, ci_leaves): (Vec<serde_json::Value>, Vec<serde_json::Value>) = rollup
+        .into_iter()
+        .partition(|leaf| leaf_matches_check_name(leaf, review_signal_names));
+    let ci = classify_ci(&ci_leaves, combined_state);
     let state = classify_state(raw_state, merged_at, mergeable, merge_state_status, ci);
+    let review_signal = classify_review_signal(&review_signal_leaves);
     let review_decision = root
         .get("reviewDecision")
         .and_then(|v| v.as_str())
@@ -656,7 +668,7 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let review = classify_review(review_decision, &reviews);
+    let review = classify_review(review_decision, &reviews, review_signal);
     // `mergeQueueEntry` is non-null when the PR is in GitHub's merge queue.
     // Null, missing, or explicit JSON null → not in queue.
     let in_merge_queue = root
@@ -676,8 +688,10 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
     })
 }
 
-/// Derive the [`PrReviewState`] from GitHub's `reviewDecision` string
-/// and the `reviews` array. Rules:
+/// Derive the [`PrReviewState`] from GitHub's `reviewDecision` string,
+/// the `reviews` array, and an optional per-org review-signal verdict
+/// produced from reclassified status checks (e.g. LinkedIn's
+/// `Owner Approval`). Rules for the GitHub portion:
 ///
 ///   - `REVIEW_REQUIRED` → `Required` (no reviewers needed yet).
 ///   - `CHANGES_REQUESTED` → `ChangesRequested`; reviewers are the
@@ -687,7 +701,19 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
 ///   - Empty / `null` / unrecognised → `Unknown` (no branch
 ///     protection or first poll hasn't run). The UI hides the
 ///     indicator in this case rather than showing a misleading green.
-fn classify_review(review_decision: &str, reviews: &[serde_json::Value]) -> PrReviewState {
+///
+/// `review_signal` then overlays per the dominance rule:
+///   - `Pass` / `None` → no override; the GitHub verdict stands.
+///   - `InFlight` → force `Required` unless the GitHub verdict is
+///     `ChangesRequested` (a stronger negative signal we preserve).
+///   - `Fail` → force `ChangesRequested { reviewers: [] }`. An ACL
+///     rejection is conceptually "approval refused" but the rollup
+///     leaf carries no reviewer identity, so we leave the list empty.
+fn classify_review(
+    review_decision: &str,
+    reviews: &[serde_json::Value],
+    review_signal: ReviewSignalVerdict,
+) -> PrReviewState {
     // Collect the most-recent review state per author from the
     // `reviews` array. GitHub orders reviews oldest-to-newest so
     // iterating forward and overwriting gives us the latest per author.
@@ -709,7 +735,7 @@ fn classify_review(review_decision: &str, reviews: &[serde_json::Value]) -> PrRe
         }
     }
 
-    match review_decision.to_ascii_uppercase().as_str() {
+    let base = match review_decision.to_ascii_uppercase().as_str() {
         "REVIEW_REQUIRED" => PrReviewState::Required,
         "CHANGES_REQUESTED" => {
             let reviewers = by_author
@@ -728,6 +754,114 @@ fn classify_review(review_decision: &str, reviews: &[serde_json::Value]) -> PrRe
             PrReviewState::Approved { reviewers }
         }
         _ => PrReviewState::Unknown,
+    };
+    apply_review_signal(base, review_signal)
+}
+
+/// Apply a per-org review-signal verdict over the base GitHub review
+/// state. `None` / `Pass` are no-ops; `InFlight` forces `Required`
+/// unless the base already says `ChangesRequested`; `Fail` forces
+/// `ChangesRequested { reviewers: [] }` (the leaf carries no identity).
+fn apply_review_signal(base: PrReviewState, signal: ReviewSignalVerdict) -> PrReviewState {
+    match signal {
+        ReviewSignalVerdict::None | ReviewSignalVerdict::Pass => base,
+        ReviewSignalVerdict::InFlight => match base {
+            PrReviewState::ChangesRequested { .. } => base,
+            _ => PrReviewState::Required,
+        },
+        ReviewSignalVerdict::Fail => PrReviewState::ChangesRequested { reviewers: Vec::new() },
+    }
+}
+
+/// Verdict on a per-org "review signal" status check, after
+/// [`normalize_leaf`]'s buckets are folded across all reclassified
+/// leaves. `None` means no reclassified check is present on the PR
+/// (the common case — non-LinkedIn org, or the check is absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewSignalVerdict {
+    None,
+    /// At least one reclassified check is still running.
+    InFlight,
+    /// All reclassified checks have completed successfully.
+    Pass,
+    /// At least one reclassified check has failed/errored.
+    Fail,
+}
+
+/// Per-org table of status-check `context` names that are reclassified
+/// from CI signals to review signals. Match is case-insensitive on
+/// both axes. v1 hardcodes the two LinkedIn orgs known to ship the
+/// `Owner Approval` (LI-ACL) check; the table shape is deliberately
+/// extensible so adding more orgs (or more check names per org) later
+/// is a one-line change rather than another aggregation-layer hook.
+const REVIEW_SIGNAL_RULES: &[(&str, &[&str])] = &[
+    ("linkedin-multiproduct", &["Owner Approval"]),
+    ("linkedin-eng", &["Owner Approval"]),
+];
+
+/// The list of status-check `context` names to reclassify for `owner`.
+/// Empty slice for unconfigured owners — the call site partitions on
+/// that and the rollup is classified normally.
+fn review_signal_checks_for_owner(owner: &str) -> &'static [&'static str] {
+    for (org, names) in REVIEW_SIGNAL_RULES {
+        if org.eq_ignore_ascii_case(owner) {
+            return names;
+        }
+    }
+    &[]
+}
+
+/// Extract just the `<owner>` segment from a GitHub PR URL of the
+/// form `https://github.com/<owner>/<repo>/pull/<n>`. Returns `None`
+/// when the URL does not match the GitHub PR shape.
+fn owner_from_pr_url(pr_url: &str) -> Option<&str> {
+    let repo = repo_from_pr_url(pr_url)?;
+    Some(repo.split_once('/')?.0)
+}
+
+/// Whether a rollup leaf's check name (the `name` field on a CheckRun
+/// or the `context` field on a StatusContext) matches any of `names`
+/// case-insensitively. An empty `names` slice yields `false` without
+/// inspecting the leaf, so the common no-reclassification path costs
+/// one branch.
+fn leaf_matches_check_name(leaf: &serde_json::Value, names: &[&str]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let leaf_name = leaf
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| leaf.get("context").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if leaf_name.is_empty() {
+        return false;
+    }
+    names.iter().any(|n| n.eq_ignore_ascii_case(leaf_name))
+}
+
+/// Fold the partitioned review-signal leaves into one
+/// [`ReviewSignalVerdict`] via [`normalize_leaf`]'s buckets.
+/// Fail dominates InFlight which dominates Pass; an empty input
+/// (the common case) → `None`.
+fn classify_review_signal(leaves: &[serde_json::Value]) -> ReviewSignalVerdict {
+    if leaves.is_empty() {
+        return ReviewSignalVerdict::None;
+    }
+    let mut any_in_flight = false;
+    let mut any_fail = false;
+    for leaf in leaves {
+        match normalize_leaf(leaf) {
+            LeafVerdict::Fail { .. } => any_fail = true,
+            LeafVerdict::InFlight => any_in_flight = true,
+            LeafVerdict::Pass => {}
+        }
+    }
+    if any_fail {
+        ReviewSignalVerdict::Fail
+    } else if any_in_flight {
+        ReviewSignalVerdict::InFlight
+    } else {
+        ReviewSignalVerdict::Pass
     }
 }
 
@@ -3179,6 +3313,259 @@ mod tests {
             !probe_absent.in_merge_queue,
             "absent mergeQueueEntry should clear in_merge_queue",
         );
+    }
+
+    /// Build a CheckRun rollup leaf with the given name + verdict shape.
+    fn check_run(name: &str, status: &str, conclusion: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "isRequired": true,
+        })
+    }
+
+    /// LinkedIn-org reclassification: a PR in `linkedin-multiproduct`
+    /// with `Owner Approval` pending and no other failing check should
+    /// surface as CI clean + review required, not CI in-flight. Without
+    /// the reclassification at the aggregation layer the card reads
+    /// "Required CI checks in progress" when the real situation is
+    /// "waiting for owner review", which is what the issue asks to fix.
+    #[test]
+    fn owner_approval_pending_in_linkedin_org_routes_to_review() {
+        let rollup = serde_json::json!([
+            check_run("ci/build", "COMPLETED", "SUCCESS"),
+            check_run("Owner Approval", "IN_PROGRESS", ""),
+        ]);
+        let body = json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        );
+        let probe = parse_probe_json(
+            "https://github.com/linkedin-multiproduct/mono/pull/1",
+            &body,
+            None,
+        )
+        .unwrap();
+        let open = match probe.state {
+            PrLifecycleState::Open(open) => open,
+            other => panic!("expected Open, got {other:?}"),
+        };
+        assert_eq!(
+            open.ci,
+            OpenPrCiStatus::Clean,
+            "Owner Approval pending must not contribute to CI status",
+        );
+        assert_eq!(
+            probe.review,
+            PrReviewState::Required,
+            "Owner Approval pending must surface as review-required",
+        );
+    }
+
+    /// Dominance rule: even when GitHub's `reviewDecision` reports
+    /// `APPROVED` (the code-review side is satisfied), a pending
+    /// `Owner Approval` check still gates merge and must show the
+    /// PR as awaiting required review.
+    #[test]
+    fn owner_approval_pending_overrides_github_approved_decision() {
+        let rollup = serde_json::json!([
+            check_run("Owner Approval", "IN_PROGRESS", ""),
+        ]);
+        let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        ))
+        .unwrap();
+        doc["reviewDecision"] = serde_json::json!("APPROVED");
+        doc["reviews"] = serde_json::json!([
+            {"author": {"login": "alice"}, "state": "APPROVED"},
+        ]);
+        let probe = parse_probe_json(
+            "https://github.com/linkedin-eng/foo/pull/2",
+            &doc.to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(probe.review, PrReviewState::Required);
+    }
+
+    /// `ChangesRequested` is a stronger negative signal than a pending
+    /// owner-approval check; preserve it rather than overriding to
+    /// `Required` so the user still sees who blocked the PR.
+    #[test]
+    fn owner_approval_pending_preserves_changes_requested() {
+        let rollup = serde_json::json!([
+            check_run("Owner Approval", "IN_PROGRESS", ""),
+        ]);
+        let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        ))
+        .unwrap();
+        doc["reviewDecision"] = serde_json::json!("CHANGES_REQUESTED");
+        doc["reviews"] = serde_json::json!([
+            {"author": {"login": "bob"}, "state": "CHANGES_REQUESTED"},
+        ]);
+        let probe = parse_probe_json(
+            "https://github.com/linkedin-multiproduct/mono/pull/3",
+            &doc.to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            probe.review,
+            PrReviewState::ChangesRequested { reviewers: vec!["bob".to_owned()] },
+        );
+    }
+
+    /// Successful Owner Approval is a no-op for the review axis — the
+    /// GitHub verdict (here `Unknown` since `reviewDecision` is unset)
+    /// stands.
+    #[test]
+    fn owner_approval_success_does_not_override_review() {
+        let rollup = serde_json::json!([
+            check_run("Owner Approval", "COMPLETED", "SUCCESS"),
+            check_run("ci/build", "COMPLETED", "SUCCESS"),
+        ]);
+        let body = json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        );
+        let probe = parse_probe_json(
+            "https://github.com/linkedin-multiproduct/mono/pull/4",
+            &body,
+            None,
+        )
+        .unwrap();
+        let open = match probe.state {
+            PrLifecycleState::Open(open) => open,
+            other => panic!("expected Open, got {other:?}"),
+        };
+        assert_eq!(open.ci, OpenPrCiStatus::Clean);
+        assert_eq!(probe.review, PrReviewState::Unknown);
+    }
+
+    /// Failed Owner Approval (ACL rejection) is reported as
+    /// `ChangesRequested` with no reviewer identity, and is removed
+    /// from the CI axis so the engine's CI-fix flow doesn't try to
+    /// auto-remediate a human-approval refusal.
+    #[test]
+    fn owner_approval_failure_becomes_changes_requested() {
+        let rollup = serde_json::json!([
+            check_run("Owner Approval", "COMPLETED", "FAILURE"),
+        ]);
+        let body = json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        );
+        let probe = parse_probe_json(
+            "https://github.com/linkedin-eng/foo/pull/5",
+            &body,
+            None,
+        )
+        .unwrap();
+        let open = match probe.state {
+            PrLifecycleState::Open(open) => open,
+            other => panic!("expected Open, got {other:?}"),
+        };
+        assert_eq!(
+            open.ci,
+            OpenPrCiStatus::Clean,
+            "Owner Approval failure must not show as a CI failure",
+        );
+        assert_eq!(
+            probe.review,
+            PrReviewState::ChangesRequested { reviewers: Vec::new() },
+        );
+    }
+
+    /// Outside the configured LinkedIn orgs, an `Owner Approval` check
+    /// is left in the CI rollup and behaves like any other required
+    /// check — this guards against the reclassification leaking into
+    /// repos where the check doesn't have ACL semantics.
+    #[test]
+    fn owner_approval_in_other_org_stays_a_ci_check() {
+        let rollup = serde_json::json!([
+            check_run("Owner Approval", "IN_PROGRESS", ""),
+        ]);
+        let body = json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        );
+        let probe = parse_probe_json(
+            "https://github.com/spinyfin/mono/pull/6",
+            &body,
+            None,
+        )
+        .unwrap();
+        let open = match probe.state {
+            PrLifecycleState::Open(open) => open,
+            other => panic!("expected Open, got {other:?}"),
+        };
+        assert_eq!(
+            open.ci,
+            OpenPrCiStatus::InFlight,
+            "non-LinkedIn org: Owner Approval contributes to CI as normal",
+        );
+        assert_eq!(probe.review, PrReviewState::Unknown);
+    }
+
+    /// Org matching is case-insensitive on the URL owner segment;
+    /// GitHub preserves casing for org slugs but the engine should
+    /// tolerate drift in user-supplied URLs.
+    #[test]
+    fn linkedin_org_match_is_case_insensitive() {
+        let rollup = serde_json::json!([
+            check_run("owner approval", "IN_PROGRESS", ""),
+        ]);
+        let body = json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        );
+        let probe = parse_probe_json(
+            "https://github.com/LinkedIn-Multiproduct/mono/pull/7",
+            &body,
+            None,
+        )
+        .unwrap();
+        let open = match probe.state {
+            PrLifecycleState::Open(open) => open,
+            other => panic!("expected Open, got {other:?}"),
+        };
+        assert_eq!(open.ci, OpenPrCiStatus::Clean);
+        assert_eq!(probe.review, PrReviewState::Required);
+    }
+
+    /// A LinkedIn-org PR without an `Owner Approval` check at all
+    /// (e.g. an older PR that predates the gate) is treated as having
+    /// no review-signal verdict — both axes behave as normal.
+    #[test]
+    fn linkedin_org_without_owner_approval_is_unchanged() {
+        let rollup = serde_json::json!([
+            check_run("ci/build", "COMPLETED", "SUCCESS"),
+        ]);
+        let body = json_doc(
+            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+        );
+        let probe = parse_probe_json(
+            "https://github.com/linkedin-multiproduct/mono/pull/8",
+            &body,
+            None,
+        )
+        .unwrap();
+        let open = match probe.state {
+            PrLifecycleState::Open(open) => open,
+            other => panic!("expected Open, got {other:?}"),
+        };
+        assert_eq!(open.ci, OpenPrCiStatus::Clean);
+        assert_eq!(probe.review, PrReviewState::Unknown);
+    }
+
+    #[test]
+    fn owner_from_pr_url_extracts_owner_segment() {
+        assert_eq!(
+            super::owner_from_pr_url("https://github.com/linkedin-multiproduct/mono/pull/1"),
+            Some("linkedin-multiproduct"),
+        );
+        assert_eq!(
+            super::owner_from_pr_url("https://github.com/spinyfin/mono/pull/568"),
+            Some("spinyfin"),
+        );
+        assert_eq!(super::owner_from_pr_url("not-a-url"), None);
     }
 
     #[test]
