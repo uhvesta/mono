@@ -2746,12 +2746,12 @@ private struct ExternalRefLinkView: View {
 private struct ConflictClearedBadge: View {
     var body: some View {
         HStack(spacing: 3) {
-            Text("🔧")
-                .font(.caption2)
+            Image(systemName: "checkmark.circle.fill")
+                .font(.caption2.weight(.semibold))
             Text("conflict cleared")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(Color.green)
         }
+        .foregroundStyle(Color.green)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(Color.green.opacity(0.12))

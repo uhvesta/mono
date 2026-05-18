@@ -2,7 +2,7 @@ import XCTest
 @testable import Boss
 
 /// Phase 5 #15 of the merge-conflict design: the
-/// `"🔧 conflict cleared"` PR-card chip appears on cards whose PR was
+/// `"✓ conflict cleared"` PR-card chip appears on cards whose PR was
 /// the target of a successful conflict-resolution attempt in the last
 /// 24 hours and ages out beyond that window. The view-model owns the
 /// state map; the kanban card view binds to
