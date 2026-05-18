@@ -42,6 +42,12 @@ pub struct UpstreamItem {
     pub pr_associations: Vec<UpstreamPrAssociation>,
     /// Last-modified time as Unix seconds.
     pub updated_at: i64,
+    /// Current project-board column name for this item, if available.
+    /// Populated by trackers that expose a project-status concept
+    /// (GitHub Projects V2 "Status" field). `None` for trackers that
+    /// don't have a board column, where the Status field hasn't been
+    /// set on the item, or where fetching it is not supported.
+    pub project_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +195,26 @@ pub trait ExternalTracker: Send + Sync {
         ref_: &UpstreamRef,
         reason: CloseReason,
     ) -> Result<()>;
+
+    /// Set the project-board status for an upstream item to the tracker's
+    /// configured "in progress" column.
+    ///
+    /// Called by the reconciler when a linked Boss task enters the `active`
+    /// (Doing) state.  The target column name is read from `ctx.config`
+    /// (key `"in_progress_column"`, default `"In progress"`).
+    ///
+    /// Implementations MUST be idempotent: setting the status to a value
+    /// it already holds is success.  The default no-op is correct for
+    /// trackers that do not have a project-board concept.
+    ///
+    /// Error classification: same as `close_issue`.
+    async fn set_project_status(
+        &self,
+        _ctx: &TrackerContext,
+        _ref_: &UpstreamRef,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────
@@ -356,6 +382,7 @@ mod tests {
             assignees: vec![],
             pr_associations: vec![],
             updated_at: 0,
+            project_status: None,
         };
         let tracker = EchoTracker::new(vec![item]);
         let ctx = TrackerContext {

@@ -26,6 +26,16 @@ pub struct GitHubConfig {
     pub label_filter: Option<Vec<String>>,
     #[serde(default)]
     pub reverse_close: bool,
+    /// Name of the GitHub Projects V2 "Status" single-select option to use
+    /// when a linked Boss task moves to the active (Doing) state.
+    /// Defaults to `"In progress"` when absent.
+    pub in_progress_column: Option<String>,
+}
+
+impl GitHubConfig {
+    fn in_progress_column_name(&self) -> &str {
+        self.in_progress_column.as_deref().unwrap_or("In progress")
+    }
 }
 
 impl GitHubConfig {
@@ -200,6 +210,18 @@ query($org: String!, $number: Int!, $after: String) {
         }
         nodes {
           id
+          fieldValues(first: 20) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+                field {
+                  ... on ProjectV2SingleSelectField {
+                    name
+                  }
+                }
+              }
+            }
+          }
           content {
             __typename
             ... on Issue {
@@ -220,6 +242,46 @@ query($org: String!, $number: Int!, $after: String) {
           }
         }
       }
+    }
+  }
+}
+";
+
+/// Query to fetch project-level metadata needed for `updateProjectV2ItemFieldValue`:
+/// the project node ID and all single-select field IDs + option IDs.
+const GITHUB_PROJECT_METADATA_QUERY: &str = "
+query($org: String!, $number: Int!) {
+  organization(login: $org) {
+    projectV2(number: $number) {
+      id
+      fields(first: 20) {
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            options {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+";
+
+/// Mutation that sets a single-select field value on a project item.
+const GITHUB_SET_FIELD_MUTATION: &str = "
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: $projectId
+    itemId: $itemId
+    fieldId: $fieldId
+    value: { singleSelectOptionId: $optionId }
+  }) {
+    projectV2Item {
+      id
     }
   }
 }
@@ -340,6 +402,24 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
         _ => UpstreamStatus::Open,
     };
 
+    // Read the current GitHub Projects "Status" column name, if set.
+    let project_status: Option<String> = node
+        .get("fieldValues")
+        .and_then(|fv| fv.get("nodes"))
+        .and_then(|n| n.as_array())
+        .into_iter()
+        .flatten()
+        .find_map(|field_node| {
+            let field_name = field_node
+                .get("field")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())?;
+            if field_name != "Status" {
+                return None;
+            }
+            field_node.get("name")?.as_str().map(|s| s.to_owned())
+        });
+
     let canonical_id = format!("{}#{}", repo_name_with_owner, number);
     let raw = serde_json::json!({
         "issue_number": number,
@@ -356,6 +436,7 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
         assignees,
         pr_associations,
         updated_at,
+        project_status,
     })
 }
 
@@ -413,6 +494,7 @@ fn parse_rest_issue(body: &Value, org: &str, repo: &str) -> Option<UpstreamItem>
         assignees,
         pr_associations: vec![],
         updated_at,
+        project_status: None,
     })
 }
 
@@ -632,6 +714,103 @@ impl ExternalTracker for GitHubTracker {
             Err(e) => Err(map_write_error(e)),
         }
     }
+
+    async fn set_project_status(
+        &self,
+        ctx: &TrackerContext,
+        ref_: &UpstreamRef,
+    ) -> Result<()> {
+        let config = GitHubConfig::from_ctx(ctx)?;
+        let target_column = config.in_progress_column_name().to_owned();
+
+        let project_item_id = ref_
+            .raw
+            .get("project_item_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                TrackerError::ConfigInvalid(
+                    "upstream ref missing 'project_item_id' in raw blob".to_owned(),
+                )
+            })?
+            .to_owned();
+
+        // Fetch project metadata: project node ID, Status field ID, option IDs.
+        let project_number_str = config.project_number.to_string();
+        let metadata = self
+            .runner
+            .graphql(
+                GITHUB_PROJECT_METADATA_QUERY,
+                &[("org", &config.org), ("number", &project_number_str)],
+            )
+            .await
+            .map_err(map_graphql_error)?;
+
+        check_graphql_errors(&metadata)?;
+
+        let project_id = metadata
+            .pointer("/data/organization/projectV2/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                TrackerError::ConfigInvalid(format!(
+                    "project #{} not found in org '{}'",
+                    config.project_number, config.org
+                ))
+            })?
+            .to_owned();
+
+        let fields_nodes = metadata
+            .pointer("/data/organization/projectV2/fields/nodes")
+            .and_then(|n| n.as_array())
+            .ok_or_else(|| {
+                TrackerError::Transient(
+                    "unexpected response shape: missing fields.nodes".to_owned(),
+                )
+            })?;
+
+        // Find the Status single-select field and the option matching the target column.
+        let (field_id, option_id) = fields_nodes
+            .iter()
+            .find_map(|field| {
+                let field_name = field.get("name")?.as_str()?;
+                if field_name != "Status" {
+                    return None;
+                }
+                let fid = field.get("id")?.as_str()?.to_owned();
+                let options = field.get("options")?.as_array()?;
+                let oid = options.iter().find_map(|opt| {
+                    if opt.get("name")?.as_str()? == target_column {
+                        opt.get("id")?.as_str().map(|s| s.to_owned())
+                    } else {
+                        None
+                    }
+                })?;
+                Some((fid, oid))
+            })
+            .ok_or_else(|| {
+                TrackerError::ConfigInvalid(format!(
+                    "project #{} has no Status field with option '{target_column}'",
+                    config.project_number
+                ))
+            })?;
+
+        // Apply the mutation.
+        let mutation_result = self
+            .runner
+            .graphql(
+                GITHUB_SET_FIELD_MUTATION,
+                &[
+                    ("projectId", project_id.as_str()),
+                    ("itemId", project_item_id.as_str()),
+                    ("fieldId", field_id.as_str()),
+                    ("optionId", option_id.as_str()),
+                ],
+            )
+            .await
+            .map_err(map_graphql_error)?;
+
+        check_graphql_errors(&mutation_result)?;
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -770,6 +949,14 @@ mod tests {
     fn open_issue_node(id: &str, number: u64, title: &str, labels: &[&str]) -> Value {
         json!({
             "id": id,
+            "fieldValues": {
+                "nodes": [
+                    {
+                        "name": "Todo",
+                        "field": { "name": "Status" }
+                    }
+                ]
+            },
             "content": {
                 "__typename": "Issue",
                 "number": number,
@@ -783,6 +970,72 @@ mod tests {
                 "assignees": { "nodes": [] },
                 "closedByPullRequestsReferences": { "nodes": [] },
                 "updatedAt": "2026-05-17T10:00:00Z"
+            }
+        })
+    }
+
+    fn open_issue_node_with_status(
+        id: &str,
+        number: u64,
+        title: &str,
+        project_status: &str,
+    ) -> Value {
+        json!({
+            "id": id,
+            "fieldValues": {
+                "nodes": [
+                    {
+                        "name": project_status,
+                        "field": { "name": "Status" }
+                    }
+                ]
+            },
+            "content": {
+                "__typename": "Issue",
+                "number": number,
+                "title": title,
+                "body": "Body text.",
+                "state": "OPEN",
+                "stateReason": null,
+                "url": format!("https://github.com/spinyfin/mono/issues/{number}"),
+                "repository": { "nameWithOwner": "spinyfin/mono" },
+                "labels": { "nodes": [] },
+                "assignees": { "nodes": [] },
+                "closedByPullRequestsReferences": { "nodes": [] },
+                "updatedAt": "2026-05-17T10:00:00Z"
+            }
+        })
+    }
+
+    fn project_metadata_response(
+        project_id: &str,
+        field_id: &str,
+        options: &[(&str, &str)],
+    ) -> Value {
+        json!({
+            "data": {
+                "organization": {
+                    "projectV2": {
+                        "id": project_id,
+                        "fields": {
+                            "nodes": [{
+                                "id": field_id,
+                                "name": "Status",
+                                "options": options.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>()
+                            }]
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn set_field_mutation_ok(item_id: &str) -> Value {
+        json!({
+            "data": {
+                "updateProjectV2ItemFieldValue": {
+                    "projectV2Item": { "id": item_id }
+                }
             }
         })
     }
@@ -1146,6 +1399,146 @@ mod tests {
         let tracker = GitHubTracker::new();
         let err = tracker.validate_config(&json!("not an object")).expect_err("should fail");
         assert!(err.message.contains("object"), "{}", err.message);
+    }
+
+    // ── parse_project_item: project_status from fieldValues ──────────────────
+
+    #[tokio::test]
+    async fn fetch_items_parses_project_status_from_field_values() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(
+            vec![open_issue_node_with_status("id1", 1, "Issue 1", "In progress")],
+            false,
+            "c",
+        ));
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker.fetch_items(&github_ctx()).await.expect("fetch_items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].project_status.as_deref(), Some("In progress"));
+    }
+
+    #[tokio::test]
+    async fn fetch_items_project_status_none_when_status_field_absent() {
+        let mut fake = FakeGhRunner::new();
+        // Node has no fieldValues — project_status should be None.
+        let node = json!({
+            "id": "id1",
+            "content": {
+                "__typename": "Issue",
+                "number": 1,
+                "title": "Issue without fieldValues",
+                "body": "",
+                "state": "OPEN",
+                "stateReason": null,
+                "url": "https://github.com/spinyfin/mono/issues/1",
+                "repository": { "nameWithOwner": "spinyfin/mono" },
+                "labels": { "nodes": [] },
+                "assignees": { "nodes": [] },
+                "closedByPullRequestsReferences": { "nodes": [] },
+                "updatedAt": "2026-05-17T10:00:00Z"
+            }
+        });
+        fake.push_graphql_ok(graphql_page(vec![node], false, "c"));
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker.fetch_items(&github_ctx()).await.expect("fetch_items");
+        assert_eq!(items.len(), 1);
+        assert!(items[0].project_status.is_none(), "project_status should be None when fieldValues absent");
+    }
+
+    // ── set_project_status ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_project_status_succeeds_with_valid_project_and_field() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(project_metadata_response(
+            "PVT_project1",
+            "PVTSSF_field1",
+            &[("opt_todo", "Todo"), ("opt_wip", "In progress"), ("opt_done", "Done")],
+        ));
+        fake.push_graphql_ok(set_field_mutation_ok("PVTI_item1"));
+
+        let tracker = GitHubTracker::with_runner(fake);
+        let ref_ = issue_ref(560);
+        tracker
+            .set_project_status(&github_ctx(), &ref_)
+            .await
+            .expect("set_project_status should succeed");
+    }
+
+    #[tokio::test]
+    async fn set_project_status_uses_custom_column_name() {
+        let ctx = TrackerContext {
+            product_id: "prod1".to_owned(),
+            config: serde_json::json!({
+                "org": "spinyfin",
+                "repo": "mono",
+                "project_number": 1,
+                "in_progress_column": "Doing"
+            }),
+            credential: super::super::TrackerCredential::ambient(),
+        };
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(project_metadata_response(
+            "PVT_project1",
+            "PVTSSF_field1",
+            &[("opt_todo", "Todo"), ("opt_doing", "Doing"), ("opt_done", "Done")],
+        ));
+        fake.push_graphql_ok(set_field_mutation_ok("PVTI_item1"));
+
+        let tracker = GitHubTracker::with_runner(fake);
+        tracker
+            .set_project_status(&ctx, &issue_ref(1))
+            .await
+            .expect("set_project_status with custom column should succeed");
+    }
+
+    #[tokio::test]
+    async fn set_project_status_returns_config_invalid_when_option_not_found() {
+        let mut fake = FakeGhRunner::new();
+        // The Status field exists but has no "In progress" option.
+        fake.push_graphql_ok(project_metadata_response(
+            "PVT_project1",
+            "PVTSSF_field1",
+            &[("opt_todo", "Todo"), ("opt_done", "Done")],
+        ));
+
+        let tracker = GitHubTracker::with_runner(fake);
+        let err = tracker
+            .set_project_status(&github_ctx(), &issue_ref(560))
+            .await
+            .expect_err("should fail when option not found");
+        assert!(
+            matches!(err, TrackerError::ConfigInvalid(_)),
+            "expected ConfigInvalid, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_project_status_returns_config_invalid_on_missing_project_item_id() {
+        let ref_without_item_id = UpstreamRef {
+            kind: "github".to_owned(),
+            canonical_id: "spinyfin/mono#1".to_owned(),
+            raw: serde_json::json!({ "issue_number": 1 }), // no project_item_id
+        };
+        let fake = FakeGhRunner::new();
+        let tracker = GitHubTracker::with_runner(fake);
+        let err = tracker
+            .set_project_status(&github_ctx(), &ref_without_item_id)
+            .await
+            .expect_err("should fail when project_item_id missing");
+        assert!(matches!(err, TrackerError::ConfigInvalid(_)));
+    }
+
+    #[tokio::test]
+    async fn set_project_status_returns_transient_on_metadata_5xx() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_err(503, "Service Unavailable (HTTP 503)");
+        let tracker = GitHubTracker::with_runner(fake);
+        let err = tracker
+            .set_project_status(&github_ctx(), &issue_ref(1))
+            .await
+            .expect_err("should fail on 5xx");
+        assert!(matches!(err, TrackerError::Transient(_)), "{err:?}");
     }
 
     // ── parse_iso8601 ──────────────────────────────────────────────────────────
