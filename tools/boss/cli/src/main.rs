@@ -371,6 +371,77 @@ enum EngineCommand {
         #[command(subcommand)]
         command: EngineConflictsCommand,
     },
+    /// Worker-facing markers for the CI-remediation attempt table
+    /// (`ci_remediations`). Phase 9 #30 of
+    /// `tools/boss/docs/designs/merge-conflict-handling-in-review.md`.
+    Ci {
+        #[command(subcommand)]
+        command: EngineCiCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineCiCommand {
+    /// Stamp the worker's post-log triage decision on a
+    /// `ci_remediations` attempt. Canonical values:
+    /// `tractable`, `flaky_or_infra`, `unfixable`. Pure metadata
+    /// column on the attempt row.
+    Classify(EngineCiClassifyArgs),
+    /// Flip a non-terminal `ci_remediations` attempt to `failed` with
+    /// a reason. The worker calls this when triage classifies the
+    /// failure as `unfixable` (or otherwise gives up without pushing).
+    MarkFailed(EngineCiMarkFailedArgs),
+    /// Record that the worker re-triggered the failing build via the
+    /// per-provider CLI. The engine logs `new_id` (Buildkite returns
+    /// a fresh build id; GHA reuses the original run id) and waits for
+    /// the merge-poller to observe the re-run's outcome.
+    MarkRetriggered(EngineCiMarkRetriggeredArgs),
+    /// Record that a rebase-onto-base-HEAD followed by a force-push
+    /// produced green CI without any code change (reconciled 2026-05-17
+    /// design call). The engine flips the attempt to `succeeded` with
+    /// `consumes_budget = 0` and decrements `tasks.ci_attempts_used`
+    /// to refund the detection-side bump.
+    MarkSucceededViaRebase(EngineCiMarkSucceededViaRebaseArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiClassifyArgs {
+    /// Attempt id from the `ci_remediations` table (`cir_…`).
+    #[arg(long = "attempt-id")]
+    attempt_id: String,
+    /// Worker's classification of the failure: `tractable`,
+    /// `flaky_or_infra`, or `unfixable`. Stored verbatim.
+    #[arg(long = "class")]
+    class: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiMarkFailedArgs {
+    /// Attempt id from the `ci_remediations` table.
+    #[arg(long = "attempt-id")]
+    attempt_id: String,
+    /// Free-form failure reason. Stored verbatim on the attempt row.
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiMarkRetriggeredArgs {
+    /// Attempt id from the `ci_remediations` table.
+    #[arg(long = "attempt-id")]
+    attempt_id: String,
+    /// Provider-emitted identifier for the new run/build the worker
+    /// just triggered. Buildkite returns a fresh build id; GHA reuses
+    /// the original run id.
+    #[arg(long = "new-id")]
+    new_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EngineCiMarkSucceededViaRebaseArgs {
+    /// Attempt id from the `ci_remediations` table.
+    #[arg(long = "attempt-id")]
+    attempt_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2497,6 +2568,139 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
             )
         }
         EngineCommand::Conflicts { command } => run_engine_conflicts_command(command, ctx).await,
+        EngineCommand::Ci { command } => run_engine_ci_command(command, ctx).await,
+    }
+}
+
+async fn run_engine_ci_command(
+    command: EngineCiCommand,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    match command {
+        EngineCiCommand::Classify(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::ClassifyCiRemediation {
+                    attempt_id: args.attempt_id.clone(),
+                    triage_class: args.class.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationClassified { attempt } => print_entity(
+                    ctx,
+                    &serde_json::to_value(&attempt).unwrap_or(serde_json::Value::Null),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "ci_remediation {} triage_class set to {}.",
+                                attempt.id,
+                                attempt.triage_class.as_deref().unwrap_or("<unset>"),
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci classify", &other)),
+            }
+        }
+        EngineCiCommand::MarkFailed(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::MarkCiRemediationFailed {
+                    attempt_id: args.attempt_id.clone(),
+                    reason: args.reason.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationMarkedFailed { attempt } => print_entity(
+                    ctx,
+                    &serde_json::to_value(&attempt).unwrap_or(serde_json::Value::Null),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "ci_remediation {} marked failed (reason: {}).",
+                                attempt.id,
+                                attempt.failure_reason.as_deref().unwrap_or("<unset>"),
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci mark-failed", &other)),
+            }
+        }
+        EngineCiCommand::MarkRetriggered(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::MarkCiRemediationRetriggered {
+                    attempt_id: args.attempt_id.clone(),
+                    new_id: args.new_id.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationRetriggered { attempt, new_id } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "attempt": attempt, "new_id": new_id }),
+                    || {
+                        if !ctx.quiet {
+                            println!(
+                                "ci_remediation {} retrigger recorded (new id: {}).",
+                                attempt.id, new_id,
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci mark-retriggered", &other)),
+            }
+        }
+        EngineCiCommand::MarkSucceededViaRebase(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            let response = client
+                .send_request(&FrontendRequest::MarkCiRemediationSucceededViaRebase {
+                    attempt_id: args.attempt_id.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::CiRemediationSucceededViaRebase {
+                    attempt,
+                    budget_refunded,
+                } => print_entity(
+                    ctx,
+                    &serde_json::json!({
+                        "attempt": attempt,
+                        "budget_refunded": budget_refunded,
+                    }),
+                    || {
+                        if !ctx.quiet {
+                            let refund = if budget_refunded {
+                                "budget refunded"
+                            } else {
+                                "no budget change"
+                            };
+                            println!(
+                                "ci_remediation {} marked succeeded_via_rebase ({}).",
+                                attempt.id, refund,
+                            );
+                        }
+                    },
+                ),
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("ci mark-succeeded-via-rebase", &other)),
+            }
+        }
     }
 }
 

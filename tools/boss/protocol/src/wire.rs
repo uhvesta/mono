@@ -3,13 +3,13 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
-    AddDependencyInput, ConflictResolution, CreateAttentionItemInput, CreateChoreInput,
-    CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyFilter, LinkExternalRefInput,
-    ListDependenciesInput, Product, Project, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    AddDependencyInput, CiRemediation, ConflictResolution, CreateAttentionItemInput,
+    CreateChoreInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyFilter,
+    LinkExternalRefInput, ListDependenciesInput, Product, Project, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -422,6 +422,51 @@ pub enum FrontendRequest {
     MarkConflictResolutionFailed {
         attempt_id: String,
         reason: String,
+    },
+    /// Worker → engine marker (Phase 9 #30): record the worker's
+    /// post-log triage decision on a `ci_remediations` attempt.
+    /// Canonical values: `tractable`, `flaky_or_infra`, `unfixable`.
+    /// Pure metadata column on the attempt row; no state-machine
+    /// effect — the worker still calls `mark-failed` (`unfixable` /
+    /// give up), `mark-retriggered` (`flaky_or_infra` → re-ran),
+    /// or simply pushes (`tractable` → fix landed) to drive the
+    /// terminal status.
+    ClassifyCiRemediation {
+        attempt_id: String,
+        triage_class: String,
+    },
+    /// Worker → engine marker (Phase 9 #30): flip a non-terminal
+    /// `ci_remediations` attempt to `failed` with a reason. Mirrors
+    /// [`Self::MarkConflictResolutionFailed`] — the worker calls
+    /// this when it classifies the failure as `unfixable` (or
+    /// otherwise gives up without pushing). The parent stays
+    /// `blocked: ci_failure`.
+    MarkCiRemediationFailed {
+        attempt_id: String,
+        reason: String,
+    },
+    /// Worker → engine marker (Phase 9 #30): record that the worker
+    /// re-triggered the failing build via the per-provider CLI
+    /// (`bk build retry` / `gh run rerun --failed`). `new_id` is the
+    /// provider-emitted identifier for the new run/build (Buildkite
+    /// returns a fresh build id; GHA reuses the original run id).
+    /// The engine stamps it as a debug breadcrumb; the merge-poller's
+    /// CI probe observes the re-run's outcome on the next sweep.
+    /// `retrigger`-kind attempts stay `running` after this call
+    /// because their terminal status is set by the next probe; no
+    /// status flip happens here.
+    MarkCiRemediationRetriggered {
+        attempt_id: String,
+        new_id: String,
+    },
+    /// Worker → engine marker (Phase 9 #30, reconciled 2026-05-17 layered
+    /// design call): the worker rebased onto base HEAD, force-pushed,
+    /// and CI came back green without changing any code. Flip the
+    /// attempt to `succeeded` with `consumes_budget = 0` and refund
+    /// the detection-side `ci_attempts_used` bump. Idempotent — a
+    /// second call on the already-`succeeded` row is a no-op.
+    MarkCiRemediationSucceededViaRebase {
+        attempt_id: String,
     },
     /// Read-only: list `conflict_resolutions` rows. The CLI surface is
     /// `boss engine conflicts list` (design Phase 5 / #13). Filters are
@@ -919,6 +964,36 @@ pub enum FrontendEvent {
     /// reason bar" without a follow-up `get`.
     ConflictResolutionMarkedFailed {
         attempt: ConflictResolution,
+    },
+    /// Response to [`FrontendRequest::ClassifyCiRemediation`]: the
+    /// `ci_remediations` row after the `triage_class` column has been
+    /// stamped.
+    CiRemediationClassified {
+        attempt: CiRemediation,
+    },
+    /// Response to [`FrontendRequest::MarkCiRemediationFailed`]: the
+    /// row after the flip to `failed`.
+    CiRemediationMarkedFailed {
+        attempt: CiRemediation,
+    },
+    /// Response to [`FrontendRequest::MarkCiRemediationRetriggered`]:
+    /// the row after the engine logged the retrigger. `new_id` echoes
+    /// the provider id the worker passed in for the CLI's "marker
+    /// recorded" line.
+    CiRemediationRetriggered {
+        attempt: CiRemediation,
+        new_id: String,
+    },
+    /// Response to
+    /// [`FrontendRequest::MarkCiRemediationSucceededViaRebase`]: the
+    /// row after the rebase-only success flip. `budget_refunded`
+    /// reports whether the engine decremented `tasks.ci_attempts_used`
+    /// — `false` when the attempt was a `retrigger` (which didn't
+    /// consume budget to begin with) or when the row was already
+    /// terminal.
+    CiRemediationSucceededViaRebase {
+        attempt: CiRemediation,
+        budget_refunded: bool,
     },
     /// Response to [`FrontendRequest::ListConflictResolutions`]: the
     /// filtered set of rows, ordered freshest-first.

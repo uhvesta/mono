@@ -4179,8 +4179,10 @@ impl WorkDb {
         Ok(Some(inserted))
     }
 
-    /// Fetch a single `ci_remediations` row by id. `Ok(None)` if the
-    /// row is missing. Mirrors [`Self::get_conflict_resolution`].
+    /// Read a `ci_remediations` row by id, terminal or not. Returns
+    /// `Ok(None)` for an unknown id. Used by the worker-marker
+    /// handlers in `app.rs` to echo the post-update row back to the
+    /// CLI and to snapshot pre-flip state for refund decisions.
     pub fn get_ci_remediation(&self, attempt_id: &str) -> Result<Option<CiRemediation>> {
         let conn = self.connect()?;
         query_ci_remediation(&conn, attempt_id)
@@ -4355,6 +4357,119 @@ impl WorkDb {
         if rows == 0 {
             tx.commit()?;
             return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Store the engine-collected log tail on a pending `ci_remediations`
+    /// attempt. Mirrors [`Self::set_conflict_resolution_diagnosis`]; the
+    /// coordinator calls this pre-spawn (Phase 9 #27) after running the
+    /// per-provider `CiLogReader::read_log_tail`. Idempotent — overwriting
+    /// is fine because the row is `pending` and the worker hasn't read
+    /// it yet. `Ok(None)` when the id is missing.
+    pub fn set_ci_remediation_log_excerpt(
+        &self,
+        attempt_id: &str,
+        log_excerpt: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET log_excerpt = ?2
+              WHERE id = ?1",
+            params![attempt_id, log_excerpt],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Record the worker's post-log triage decision on a `running`
+    /// attempt. Values per design §Q4: `'tractable'`, `'flaky_or_infra'`,
+    /// `'unfixable'`. Pure metadata column — no state machine effect.
+    /// Idempotent overwrite.
+    pub fn set_ci_remediation_triage_class(
+        &self,
+        attempt_id: &str,
+        triage_class: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET triage_class = ?2
+              WHERE id = ?1",
+            params![attempt_id, triage_class],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Mark a `fix`-kind attempt as a "succeeded via rebase only" run —
+    /// the worker rebased onto base HEAD, force-pushed, and CI came back
+    /// green without any code change. The reconciled-2026-05-17 layered
+    /// design call (see project description) keeps this row out of the
+    /// per-PR budget: the worker calls
+    /// `boss engine ci mark-succeeded-via-rebase <attempt-id>` and the
+    /// engine atomically (a) flips `status` to `succeeded`, (b) sets
+    /// `consumes_budget = 0` so the post-cycle counter delta is zero,
+    /// (c) stamps `failure_reason = 'rebase_only'` as the audit
+    /// discriminator (a non-`NULL` value in this column on a
+    /// `'succeeded'` row means "did not consume budget"), and (d)
+    /// decrements `tasks.ci_attempts_used` by one to undo the
+    /// detection-side bump (only when the row was originally
+    /// `consumes_budget = 1`; idempotent re-call is a no-op).
+    /// Idempotent — `Ok(None)` on a terminal row.
+    pub fn mark_ci_remediation_succeeded_via_rebase(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        // Snapshot the row so we know whether to decrement the counter.
+        // A second call for the same id finds `status = 'succeeded'` and
+        // the WHERE guard misses, so the counter is touched at most once.
+        let snapshot = query_ci_remediation(&tx, attempt_id)?;
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET status          = 'succeeded',
+                    consumes_budget = 0,
+                    failure_reason  = COALESCE(failure_reason, 'rebase_only'),
+                    finished_at     = COALESCE(finished_at, ?2)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        if let Some(snap) = snapshot {
+            if snap.consumes_budget != 0 {
+                tx.execute(
+                    "UPDATE tasks
+                        SET ci_attempts_used = CASE
+                                WHEN ci_attempts_used > 0 THEN ci_attempts_used - 1
+                                ELSE 0
+                            END
+                      WHERE id = ?1
+                        AND deleted_at IS NULL",
+                    params![snap.work_item_id],
+                )?;
+            }
         }
         let updated = query_ci_remediation(&tx, attempt_id)?;
         tx.commit()?;

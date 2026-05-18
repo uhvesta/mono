@@ -2162,6 +2162,10 @@ Sized as bite-sized, independently mergeable chores. Each row in this table shou
 
 ### Phase 9: CI worker spawn and triage
 
+> **Reconciled 2026-05-17 amendment — rebase-first inside the `fix` path.** Many CI failures on long-running PRs are caused by `main` moving (a fix landed, a dep bumped, an env changed). Rebasing onto base HEAD alone may produce green CI for free; we shouldn't burn a fix-attempt budget slot to discover that. So inside the `fix` path the dispatched worker's **first** action is `jj rebase -d main -b <branch>` followed by a force-push, then it waits for the re-run's required checks to settle. If post-rebase CI is green the worker calls `boss engine ci mark-succeeded-via-rebase <attempt-id>`; the engine flips the attempt to `succeeded` with `consumes_budget = 0` and decrements `tasks.ci_attempts_used` so the detection-side bump is refunded. Only when post-rebase CI is still red does the worker proceed to a code fix (the budget slot is then genuinely consumed, as today). The pre-spawn triage from #28 is unchanged: `retrigger`-kind attempts still bypass this path entirely.
+>
+> Wire surface added in this phase to support the refund path: `FrontendRequest::MarkCiRemediationSucceededViaRebase { attempt_id }`. CLI surface: `boss engine ci mark-succeeded-via-rebase --attempt-id <id>`.
+
 24. **Execution kind: `ci_remediation`.** Add to `work_executions.kind` enum. Coordinator routes to pre-leased spawn path. Acceptance: an execution of this kind acquires a lease and binds a worker pane.
 
 25. **`CiLogReader` trait + Buildkite impl.** Trait surface from Q4. `BuildkiteLogReader` wrapping `bk job log` / `bk build retry`. Acceptance: integration tests against a mock Buildkite returning canned responses.
@@ -2172,9 +2176,9 @@ Sized as bite-sized, independently mergeable chores. Each row in this table shou
 
 28. **Engine pre-triage: fix vs retrigger.** If every failing check has `conclusion=STARTUP_FAILURE`, pre-classify as `retrigger`; else `fix`. Acceptance: unit tests over conclusion-set permutations.
 
-29. **CI spawn prompt templates.** Implement both prompts (Q4). `spawn_flow.rs` reads `ci_remediations.log_excerpt`, `failed_checks`, `attempt_kind`, and the per-product `test_command`. Acceptance: spawned worker pane receives templated prompt.
+29. **CI spawn prompt templates.** Implement both prompts (Q4). `spawn_flow.rs` reads `ci_remediations.log_excerpt`, `failed_checks`, `attempt_kind`, and the per-product `test_command`. The `fix` prompt instructs the worker to rebase onto base HEAD first (see amendment above) — concrete `jj git fetch / jj edit / jj rebase -d main / jj git push` commands are embedded inline. Acceptance: spawned worker pane receives templated prompt.
 
-30. **Worker → engine markers (CI).** Implement `boss engine ci classify`, `boss engine ci mark-failed`, `boss engine ci mark-retriggered`. Acceptance: workers' calls produce expected UPDATEs.
+30. **Worker → engine markers (CI).** Implement `boss engine ci classify`, `boss engine ci mark-failed`, `boss engine ci mark-retriggered`, and (per the amendment above) `boss engine ci mark-succeeded-via-rebase`. Acceptance: workers' calls produce expected UPDATEs, and the rebase-only path leaves `tasks.ci_attempts_used` unchanged (refunded) for a `fix`-kind attempt.
 
 ### Phase 10: CI auto-retire and completion
 

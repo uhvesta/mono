@@ -5561,6 +5561,179 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            FrontendRequest::ClassifyCiRemediation {
+                attempt_id,
+                triage_class,
+            } => {
+                // Worker-facing marker: stamp `triage_class` on a
+                // `ci_remediations` row. Pure metadata column, no
+                // authority gate — a forged attempt id has no row to
+                // clobber.
+                match work_db.set_ci_remediation_triage_class(&attempt_id, &triage_class) {
+                    Ok(Some(attempt)) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::CiRemediationClassified { attempt },
+                    ),
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "ci_remediation attempt {attempt_id:?} is unknown",
+                            ),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::MarkCiRemediationFailed { attempt_id, reason } => {
+                match work_db.mark_ci_remediation_failed(&attempt_id, &reason) {
+                    Ok(Some(attempt)) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            work_item_id = %attempt.work_item_id,
+                            pr_url = %attempt.pr_url,
+                            %reason,
+                            "mark_ci_remediation_failed: attempt flipped to failed",
+                        );
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &attempt.product_id,
+                                FrontendEvent::CiRemediationFailed {
+                                    product_id: attempt.product_id.clone(),
+                                    work_item_id: attempt.work_item_id.clone(),
+                                    attempt_id: attempt.id.clone(),
+                                    pr_url: attempt.pr_url.clone(),
+                                    failure_reason: reason.clone(),
+                                },
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::CiRemediationMarkedFailed { attempt },
+                        );
+                    }
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
+                            ),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::MarkCiRemediationRetriggered { attempt_id, new_id } => {
+                // The retrigger marker doesn't change the row's status —
+                // the merge-poller observes the re-run's outcome on the
+                // next sweep. We just log + echo so the worker has a
+                // confirmation receipt.
+                match work_db.get_ci_remediation(&attempt_id) {
+                    Ok(Some(attempt)) => {
+                        tracing::info!(
+                            attempt_id = %attempt.id,
+                            work_item_id = %attempt.work_item_id,
+                            new_id = %new_id,
+                            "mark_ci_remediation_retriggered: worker re-ran the failing build",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::CiRemediationRetriggered {
+                                attempt,
+                                new_id,
+                            },
+                        );
+                    }
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!("ci_remediation attempt {attempt_id:?} is unknown"),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::MarkCiRemediationSucceededViaRebase { attempt_id } => {
+                // Snapshot the pre-update row so we can report
+                // `budget_refunded` accurately (only fix-kind attempts
+                // with `consumes_budget = 1` get a counter decrement).
+                let pre = work_db.get_ci_remediation(&attempt_id).ok().flatten();
+                match work_db.mark_ci_remediation_succeeded_via_rebase(&attempt_id) {
+                    Ok(Some(attempt)) => {
+                        let budget_refunded = pre
+                            .as_ref()
+                            .map(|p| p.consumes_budget != 0)
+                            .unwrap_or(false);
+                        tracing::info!(
+                            attempt_id = %attempt.id,
+                            work_item_id = %attempt.work_item_id,
+                            budget_refunded,
+                            "mark_ci_remediation_succeeded_via_rebase: rebase-only success recorded",
+                        );
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &attempt.product_id,
+                                FrontendEvent::CiRemediationSucceeded {
+                                    product_id: attempt.product_id.clone(),
+                                    work_item_id: attempt.work_item_id.clone(),
+                                    attempt_id: attempt.id.clone(),
+                                    pr_url: attempt.pr_url.clone(),
+                                },
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::CiRemediationSucceededViaRebase {
+                                attempt,
+                                budget_refunded,
+                            },
+                        );
+                    }
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
+                            ),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
             FrontendRequest::SetProductDefaultModel { product_id, model } => {
                 match work_db.set_product_default_model(&product_id, model.as_deref()) {
                     Ok(product) => {

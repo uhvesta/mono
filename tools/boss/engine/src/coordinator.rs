@@ -12,8 +12,10 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use crate::ci_log_reader;
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis;
+use crate::merge_poller::CiProvider;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
@@ -2174,6 +2176,14 @@ impl ExecutionCoordinator {
             self.collect_conflict_diagnosis_pre_spawn(&execution, &lease)
                 .await;
         }
+        // Pre-spawn: fetch the failing job's log tail for ci_remediation
+        // executions (Phase 9 #27) so the worker prompt embeds it directly.
+        // Best-effort: a failed fetch leaves `log_excerpt` NULL and the
+        // worker prompt falls back to the CLI invocation hint.
+        if execution.kind == "ci_remediation" {
+            self.collect_ci_log_excerpt_pre_spawn(&execution, &lease)
+                .await;
+        }
 
         let run_outcome = self
             .host_adapter
@@ -2495,6 +2505,107 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Pre-spawn (Phase 9 #27): read the failing job's log tail via the
+    /// per-provider `CiLogReader` and persist it on the matching
+    /// `ci_remediations` row. The worker prompt embeds the excerpt so
+    /// the fix-kind worker doesn't have to shell out to `bk` / `gh` for
+    /// the basic case. Best-effort — failures are logged but never
+    /// propagate; the worker prompt falls back to the CLI invocation
+    /// hint when `log_excerpt` is NULL.
+    ///
+    /// `retrigger`-kind attempts skip the fetch: the engine has already
+    /// decided to re-run the failing job and a log read would only
+    /// drag the spawn path on a non-load-bearing dependency.
+    async fn collect_ci_log_excerpt_pre_spawn(
+        &self,
+        execution: &WorkExecution,
+        _lease: &CubeWorkspaceLease,
+    ) {
+        let attempt = match self
+            .work_db
+            .active_ci_remediation_for_work_item(&execution.work_item_id)
+        {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    "collect_ci_log_excerpt: no active attempt row; skipping",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "collect_ci_log_excerpt: failed to look up attempt row; skipping",
+                );
+                return;
+            }
+        };
+
+        if attempt.attempt_kind == "retrigger" {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                "collect_ci_log_excerpt: retrigger-kind attempt; log read skipped",
+            );
+            return;
+        }
+
+        let Some(failing) = pick_worst_failing_check(&attempt.failed_checks) else {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                "collect_ci_log_excerpt: failed_checks JSON parsed empty / had no actionable entry",
+            );
+            return;
+        };
+
+        let Some(job_id) = failing.provider_job_id else {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                target_url = %failing.target_url,
+                provider = %failing.provider,
+                "collect_ci_log_excerpt: failing check has no provider_job_id; cannot fetch log",
+            );
+            return;
+        };
+        let provider = match failing.provider.as_str() {
+            "buildkite" => CiProvider::Buildkite,
+            "github_actions" => CiProvider::GithubActions,
+            _ => CiProvider::Other,
+        };
+        let reader = ci_log_reader::reader_for(provider);
+        match reader.read_log_tail(&job_id, 200).await {
+            Ok(tail) => {
+                if let Err(err) = self
+                    .work_db
+                    .set_ci_remediation_log_excerpt(&attempt.id, &tail)
+                {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        ?err,
+                        "collect_ci_log_excerpt: failed to persist excerpt; continuing without it",
+                    );
+                } else {
+                    tracing::debug!(
+                        attempt_id = %attempt.id,
+                        bytes = tail.len(),
+                        "collect_ci_log_excerpt: excerpt persisted",
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    job_id = %job_id,
+                    ?err,
+                    "collect_ci_log_excerpt: provider log read failed; continuing without an excerpt",
+                );
+            }
+        }
+    }
+
     /// Release `worker_id` back to the pool, then rescan + kick to
     /// pick up newly-eligible work. Used at the tail of non-pane
     /// `run_execution` calls and from [`ServerState::release_worker_pane`]
@@ -2634,6 +2745,40 @@ fn work_item_product_id(item: &WorkItem) -> String {
     }
 }
 
+/// One failing-check record after parsing `ci_remediations.failed_checks`
+/// back from JSON. Mirrors `ci_watch::FailedCheckRecord` on the read side;
+/// kept here as a separate owned type so the coordinator doesn't depend
+/// on ci_watch's private serialization shape.
+#[derive(Debug, Deserialize)]
+struct FailedCheckJson {
+    #[allow(dead_code)]
+    name: String,
+    conclusion: String,
+    target_url: String,
+    provider: String,
+    #[serde(default)]
+    provider_job_id: Option<String>,
+}
+
+/// Pick the worst-failing entry from a JSON-encoded `failed_checks`
+/// list. Worst-first ordering per design §"pre-spawn fetch": FAILURE >
+/// TIMED_OUT > CANCELLED > everything else. Returns `None` when the
+/// JSON is empty / malformed / has no entry with an identifiable
+/// provider job id at all.
+fn pick_worst_failing_check(failed_checks_json: &str) -> Option<FailedCheckJson> {
+    let parsed: Vec<FailedCheckJson> = serde_json::from_str(failed_checks_json).ok()?;
+    if parsed.is_empty() {
+        return None;
+    }
+    parsed.into_iter().min_by_key(|c| match c.conclusion.as_str() {
+        "FAILURE" => 0,
+        "TIMED_OUT" => 1,
+        "CANCELLED" => 2,
+        "STARTUP_FAILURE" => 3,
+        _ => 4,
+    })
+}
+
 /// Why `drain_ready_queue` returned. Re-entering the outer scheduler
 /// loop immediately is fine for `QueueEmpty` (the post-drain wakeup
 /// check decides whether to actually re-loop); `PoolExhausted` is
@@ -2754,8 +2899,38 @@ mod tests {
     use super::{
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
         CubeWorkspaceStatus, ExecutionCoordinator, ExecutionPublisher, FrontendEvent,
-        MAX_WORKER_POOL_SIZE, WorkerPool, slot_id_from_worker_id,
+        MAX_WORKER_POOL_SIZE, WorkerPool, pick_worst_failing_check, slot_id_from_worker_id,
     };
+
+    #[test]
+    fn pick_worst_failing_check_prefers_failure() {
+        let json = serde_json::json!([
+            {"name": "infra", "conclusion": "CANCELLED", "target_url": "https://buildkite.com/o/p/builds/2#j", "provider": "buildkite", "provider_job_id": "j"},
+            {"name": "tests", "conclusion": "FAILURE", "target_url": "https://buildkite.com/o/p/builds/3#k", "provider": "buildkite", "provider_job_id": "k"},
+            {"name": "x", "conclusion": "TIMED_OUT", "target_url": "https://buildkite.com/o/p/builds/4#l", "provider": "buildkite", "provider_job_id": "l"},
+        ])
+        .to_string();
+        let picked = pick_worst_failing_check(&json).expect("expected one entry");
+        assert_eq!(picked.conclusion, "FAILURE");
+        assert_eq!(picked.provider, "buildkite");
+        assert_eq!(picked.provider_job_id.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn pick_worst_failing_check_handles_malformed_json() {
+        assert!(pick_worst_failing_check("{not json}").is_none());
+        assert!(pick_worst_failing_check("[]").is_none());
+    }
+
+    #[test]
+    fn pick_worst_failing_check_falls_back_to_only_entry() {
+        let json = serde_json::json!([
+            {"name": "n", "conclusion": "STARTUP_FAILURE", "target_url": "u", "provider": "github_actions", "provider_job_id": "1"},
+        ])
+        .to_string();
+        let picked = pick_worst_failing_check(&json).expect("entry");
+        assert_eq!(picked.conclusion, "STARTUP_FAILURE");
+    }
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
         CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput,

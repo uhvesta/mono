@@ -12,7 +12,7 @@ use crate::coordinator::slot_id_from_worker_id;
 use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
-use crate::work::{ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
+use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
 use boss_protocol::WorkItemBinding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +380,19 @@ impl ExecutionRunner for PaneSpawnRunner {
             None
         };
 
+        // For ci_remediation executions, the worker's prompt embeds the
+        // engine's pre-spawn log excerpt and the failing-check list.
+        // The attempt row is created at CI-failure detection time
+        // (`ci_watch::on_ci_failure_detected`) and updated by the
+        // coordinator's `collect_ci_log_excerpt_pre_spawn` before spawn.
+        let ci_attempt = if execution.kind == "ci_remediation" {
+            self.work_db
+                .active_ci_remediation_for_work_item(&execution.work_item_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let prompt_text = compose_execution_prompt(
             execution,
             work_item,
@@ -388,6 +401,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             cube_change_id,
             conflict_attempt.as_ref(),
             recovery_branch.as_deref(),
+            ci_attempt.as_ref(),
         );
 
         // Resolve the per-execution effort + model knobs (design §Q3
@@ -481,6 +495,8 @@ impl ExecutionRunner for PaneSpawnRunner {
         // the execution kind and a truncation of the parent task name.
         let title_summary = if execution.kind == "conflict_resolution" {
             pane_summary::conflict_resolution_summary(work_item_name(work_item))
+        } else if execution.kind == "ci_remediation" {
+            pane_summary::ci_remediation_summary(work_item_name(work_item))
         } else {
             pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await
         };
@@ -547,6 +563,7 @@ fn compose_execution_prompt(
     cube_change_id: Option<&str>,
     conflict_attempt: Option<&ConflictResolution>,
     recovery_branch: Option<&str>,
+    ci_attempt: Option<&CiRemediation>,
 ) -> String {
     // The conflict_resolution kind has a wholly different shape than
     // implementation/design kinds — it carries an embedded diagnosis,
@@ -558,6 +575,22 @@ fn compose_execution_prompt(
     if execution.kind == "conflict_resolution" {
         if let Some(attempt) = conflict_attempt {
             return compose_conflict_resolution_prompt(
+                execution,
+                work_item,
+                workspace_path,
+                cube_change_id,
+                attempt,
+                /* test_command */ None,
+            );
+        }
+    }
+    // Phase 9 #29: ci_remediation has its own templated prompt — embed
+    // the engine-collected log excerpt, the failing-check set, and the
+    // attempt-kind-specific playbook (rebase-first for `fix`, just the
+    // retrigger CLI for `retrigger`).
+    if execution.kind == "ci_remediation" {
+        if let Some(attempt) = ci_attempt {
+            return compose_ci_remediation_prompt(
                 execution,
                 work_item,
                 workspace_path,
@@ -911,6 +944,216 @@ fn compose_conflict_resolution_prompt(
     prompt.push_str("Respond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
+}
+
+/// Templated prompt for the `ci_remediation` execution kind
+/// (`tools/boss/docs/designs/merge-conflict-handling-in-review.md` §Q4).
+///
+/// Two attempt kinds (mirroring `ci_remediations.attempt_kind`):
+///
+/// - `retrigger`: the engine pre-classified every failure as
+///   `STARTUP_FAILURE` / `CANCELLED` (unambiguous infra). The worker's
+///   only job is to re-run the failing build via the per-provider CLI
+///   and call `boss engine ci mark-retriggered`. No code change, no
+///   budget consumed.
+///
+/// - `fix`: at least one failure has a non-infra conclusion. Per the
+///   reconciled 2026-05-17 design call (project description: "Always
+///   try a rebase-onto-base BEFORE consuming a fix-attempt budget
+///   slot"), the worker's **first** action is a rebase onto the base
+///   branch HEAD followed by a force-push. If post-rebase CI goes
+///   green the worker calls `boss engine ci mark-succeeded-via-rebase`
+///   and the engine refunds the detection-side budget bump. Only when
+///   post-rebase CI is still red does the worker proceed to a code
+///   fix (the budget slot is then consumed as today).
+fn compose_ci_remediation_prompt(
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+    workspace_path: &Path,
+    cube_change_id: Option<&str>,
+    attempt: &CiRemediation,
+    test_command: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(&format!(
+        "## CI remediation: PR #{pr_num} ({kind}) — required checks failing\n\n",
+        pr_num = attempt.pr_number,
+        kind = attempt.attempt_kind,
+    ));
+    prompt.push_str(&format!("**PR**: {}\n", attempt.pr_url));
+    if !attempt.head_branch.is_empty() {
+        prompt.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
+    }
+    prompt.push_str(&format!(
+        "**Head sha at trigger**: `{}`\n",
+        attempt.head_sha_at_trigger,
+    ));
+    prompt.push_str(&format!("**Workspace**: `{}`\n", workspace_path.display()));
+    prompt.push_str(&format!("**Attempt id**: `{}`\n", attempt.id));
+    prompt.push_str(&format!("**Execution id**: `{}`\n", execution.id));
+    if let Some(change) = cube_change_id {
+        prompt.push_str(&format!("**Local change**: `{change}`\n"));
+    }
+    prompt.push_str(&format!(
+        "**Work item**: `{}`\n\n",
+        work_item_name(work_item),
+    ));
+
+    // Failing-check list — same JSON the engine seeded on the row at
+    // detection time. Rendered as a bulleted summary; the worker has the
+    // raw `failed_checks` field if it wants to read further.
+    prompt.push_str("### Failing required checks\n\n");
+    match render_failed_checks_markdown(&attempt.failed_checks) {
+        Some(md) => prompt.push_str(&md),
+        None => prompt.push_str(
+            "_The engine did not record a parseable `failed_checks` blob for this attempt. \
+             Read `gh pr checks` to enumerate the failing required checks before deciding the fix._\n",
+        ),
+    }
+    prompt.push('\n');
+
+    if attempt.attempt_kind == "retrigger" {
+        // §Q4 retrigger playbook: every failure is unambiguous infra,
+        // no log read needed, no code change.
+        prompt.push_str("### Action: retrigger the failing build\n\n");
+        prompt.push_str(
+            "The engine has pre-classified this failure as infra (every failing check has \
+             `conclusion ∈ {STARTUP_FAILURE, CANCELLED}`). No log read or code change is needed.\n\n",
+        );
+        prompt.push_str(
+            "1. Re-run the failing build via the per-provider CLI (`bk build retry <build-id>` \
+             for Buildkite or `gh run rerun <run-id> --failed` for GitHub Actions). The failing \
+             check's `target_url` above carries the right id.\n\
+             2. Call `boss engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
+             so the engine records the new run id and stays out of the budget path. Do NOT call \
+             `mark-failed` or push code.\n\
+             3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",
+        );
+    } else {
+        // §"fix" path with the reconciled-2026-05-17 rebase-first step.
+        prompt.push_str("### Action: rebase first, then fix\n\n");
+        prompt.push_str(
+            "Many CI failures on long-running PRs are caused by `main` moving (a dep bump, a fix \
+             that landed, an env change). The cheapest experiment is rebasing onto `main` HEAD \
+             before changing any code — if CI goes green after the rebase, no fix-attempt slot is \
+             consumed against this PR's budget.\n\n",
+        );
+        prompt.push_str("**Step 1 — Rebase onto base HEAD and force-push.**\n\n");
+        prompt.push_str(&format!(
+            "```\n\
+             jj git fetch\n\
+             jj edit {branch}\n\
+             jj rebase -d main -b {branch}\n\
+             jj git push -b {branch}      # force-push: prior approvals will be dismissed by branch protection\n\
+             ```\n\n",
+            branch = if attempt.head_branch.is_empty() {
+                "<branch>"
+            } else {
+                attempt.head_branch.as_str()
+            },
+        ));
+        prompt.push_str(
+            "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
+             - **If post-rebase CI is green**, call \
+             `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. The \
+             engine flips the attempt to `succeeded`, sets `consumes_budget = 0`, and decrements \
+             `tasks.ci_attempts_used` so this attempt does not count against the PR's budget.\n\
+             - **If post-rebase CI is still red**, continue to Step 2. The budget slot is now \
+             consumed; this is the fix attempt the engine pre-classified.\n\n",
+        );
+
+        prompt.push_str("**Step 2 — Read the log, classify, fix, push.**\n\n");
+        prompt.push_str("Engine-collected log excerpt (failing job tail):\n\n");
+        match attempt.log_excerpt.as_deref().map(str::trim) {
+            Some(tail) if !tail.is_empty() => {
+                prompt.push_str("```\n");
+                prompt.push_str(tail);
+                prompt.push_str("\n```\n\n");
+            }
+            _ => {
+                prompt.push_str(
+                    "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
+                     Shell out to the per-provider CLI (`bk job log <job-id>` / \
+                     `gh run view --log-failed --job <job-id>`) from the failing check's `target_url`._\n\n",
+                );
+            }
+        }
+        prompt.push_str(
+            "1. Classify the failure with `boss engine ci classify --attempt-id <attempt-id> --class <tractable|flaky_or_infra|unfixable>`.\n   \
+                - `tractable` → there's a clear code change that resolves it. Make it. Push.\n   \
+                - `flaky_or_infra` → the failure is environmental / not caused by this PR's diff. \
+                Pivot to the retrigger playbook (re-run the failing build via the provider CLI \
+                and call `mark-retriggered`).\n   \
+                - `unfixable` → the failure is real and out of scope (e.g. a hard gate the PR \
+                cannot satisfy). Call `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
+                and stop. Do NOT push.\n",
+        );
+        match test_command {
+            Some(cmd) => prompt.push_str(&format!(
+                "2. Before pushing a code change, validate locally with `{cmd}`.\n",
+            )),
+            None => prompt.push_str(
+                "2. No `test_command` is configured for this product; rely on CI to verify the push.\n",
+            ),
+        }
+        prompt.push_str(&format!(
+            "3. Push your fix with `jj git push -b {branch}` (force-push if your worker rebased \
+                first). The merge-poller will observe the new head sha and re-evaluate CI on the \
+                next sweep — when green it flips the attempt to `succeeded` and unblocks the parent.\n\n",
+            branch = if attempt.head_branch.is_empty() {
+                "<branch>"
+            } else {
+                attempt.head_branch.as_str()
+            },
+        ));
+    }
+
+    prompt.push_str("### Stop conditions\n\n");
+    prompt.push_str(
+        "- **You are not adding scope.** The only allowed change is one that makes the failing \
+         required checks pass (rebase, infra retrigger, or a focused fix).\n\
+         - **Do not close the PR yourself.** Closing is the human's call.\n\
+         - **Always pass `-m \"…\"` to `git commit` / `jj describe` / `jj squash`.** The worker \
+         environment has no usable `$EDITOR`.\n\n",
+    );
+    prompt.push_str("Respond with concise markdown using exactly these sections:\n");
+    prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
+    prompt
+}
+
+/// Render the `failed_checks` JSON blob (one entry per failing required
+/// check at trigger time) as a small bulleted list for the worker
+/// prompt. Returns `None` when the blob is missing or malformed — the
+/// caller falls back to a generic instruction.
+fn render_failed_checks_markdown(failed_checks_json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        name: String,
+        conclusion: String,
+        target_url: String,
+        provider: String,
+        #[serde(default)]
+        provider_job_id: Option<String>,
+    }
+    let entries: Vec<Entry> = serde_json::from_str(failed_checks_json).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for e in &entries {
+        out.push_str(&format!(
+            "- `{name}` — {conclusion} ({provider}): {url}",
+            name = e.name,
+            conclusion = e.conclusion,
+            provider = e.provider,
+            url = e.target_url,
+        ));
+        if let Some(job_id) = e.provider_job_id.as_deref() {
+            out.push_str(&format!(" (job `{job_id}`)"));
+        }
+        out.push('\n');
+    }
+    Some(out)
 }
 
 fn render_diagnosis_markdown(diagnosis: &ConflictDiagnosis) -> String {
@@ -1357,6 +1600,7 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -1375,6 +1619,7 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -1390,6 +1635,7 @@ mod compose_prompt_tests {
             &chore,
             None,
             std::path::Path::new("/tmp/workspace"),
+            None,
             None,
             None,
             None,
@@ -1419,6 +1665,7 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
         );
         let resume_pos = prompt.find("## RESUME EXISTING PR").expect("missing resume block");
         let exec_pos = prompt.find("Execution context:").expect("missing execution context");
@@ -1439,6 +1686,7 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("expected branch name"),
@@ -1453,6 +1701,7 @@ mod compose_prompt_tests {
             &chore_without_pr(),
             None,
             std::path::Path::new("/tmp/workspace"),
+            None,
             None,
             None,
             None,
@@ -1471,6 +1720,7 @@ mod compose_prompt_tests {
             &chore,
             None,
             std::path::Path::new("/tmp/workspace"),
+            None,
             None,
             None,
             None,
@@ -1495,6 +1745,7 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             prompt.contains("jj bookmark create"),
@@ -1516,6 +1767,7 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("STARTUP RECOVERY"),
@@ -1533,6 +1785,7 @@ mod compose_prompt_tests {
             None,
             None,
             Some("boss/exec_prior123_09"),
+            None,
         );
         assert!(
             prompt.contains("## STARTUP RECOVERY"),
@@ -1562,6 +1815,7 @@ mod compose_prompt_tests {
             None,
             None,
             Some("boss/exec_prior123_09"),
+            None,
         );
         assert!(
             !prompt.contains("STARTUP RECOVERY"),
@@ -1583,6 +1837,7 @@ mod compose_prompt_tests {
             None,
             None,
             Some("boss/exec_prior123_09"),
+            None,
         );
         let recovery_pos = prompt.find("## STARTUP RECOVERY").expect("missing recovery block");
         let exec_pos = prompt.find("Execution context:").expect("missing execution context");
@@ -1604,6 +1859,7 @@ mod compose_prompt_tests {
             None,
             None,
             Some("boss/exec_prior123_09"),
+            None,
         );
         // "boss/exec_abc123_01" is the new expected branch
         assert!(

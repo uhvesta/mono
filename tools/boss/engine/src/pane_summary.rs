@@ -154,6 +154,24 @@ pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
     }
 }
 
+/// Pane summary for `ci_remediation` workers — same rationale as
+/// [`conflict_resolution_summary`]. Reads as `"<Name> is fixing CI for
+/// <task-name>"` (or the shorter `"fixing CI"` when the task name is
+/// empty / unavailable).
+pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
+    let short: Vec<String> = task_name
+        .trim()
+        .split_whitespace()
+        .take(3)
+        .map(|w| w.to_lowercase())
+        .collect();
+    if short.is_empty() {
+        Some("fixing CI".to_owned())
+    } else {
+        Some(format!("fixing CI for {}", short.join(" ")))
+    }
+}
+
 /// Resolve a summary for a work item, hitting the cache first and
 /// falling through to Claude only on a miss or basis change. Errors
 /// are swallowed — this function never blocks worker spawn — and a

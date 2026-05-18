@@ -37,7 +37,33 @@ use serde::Serialize;
 
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
-use crate::work::{CiRemediationInsertInput, PendingMergeCheck, WorkDb};
+use crate::work::{CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck, WorkDb};
+
+/// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
+/// has `conclusion ∈ {STARTUP_FAILURE, CANCELLED}` (engine-discernible
+/// infra signals) the attempt is a `retrigger` — the engine doesn't
+/// need to read the log, doesn't burn a fix-budget slot. Everything
+/// else routes to `fix`, where the worker reads the log and (per the
+/// reconciled 2026-05-17 design call) rebases onto base HEAD before
+/// attempting any code change.
+///
+/// Pulled out as a free function so the unit tests can drive every
+/// conclusion-set permutation without standing up a publisher / DB.
+/// Returns `"retrigger"` or `"fix"` — the exact strings stored in
+/// `ci_remediations.attempt_kind`.
+pub fn classify_pre_triage(failures: &[RequiredCheckFailure]) -> &'static str {
+    if failures.is_empty() {
+        // Defensive: an empty failure set isn't an actionable trigger,
+        // but the caller already filters on this — return `fix` so a
+        // future caller that hands us an empty slice still produces a
+        // budgeted attempt rather than silently retriggering.
+        return "fix";
+    }
+    let all_infra = failures
+        .iter()
+        .all(|f| matches!(f.conclusion.as_str(), "STARTUP_FAILURE" | "CANCELLED"));
+    if all_infra { "retrigger" } else { "fix" }
+}
 
 /// Unified opt-out gate. Mirrors `conflict_watch::auto_pr_maintenance_disabled`;
 /// the design (Phase 6 #18 / §Q7) requires both auto-remediation
@@ -267,10 +293,7 @@ pub async fn on_ci_failure_detected(
     // Pre-spawn classification (design §Q4 "pre-triage"): if every
     // failure is `STARTUP_FAILURE` or `CANCELLED` we choose
     // `retrigger`; otherwise `fix`. Retriggers don't consume budget.
-    let all_infra = failures
-        .iter()
-        .all(|f| matches!(f.conclusion.as_str(), "STARTUP_FAILURE" | "CANCELLED"));
-    let attempt_kind = if all_infra { "retrigger" } else { "fix" };
+    let attempt_kind = classify_pre_triage(failures);
     let consumes_budget: i64 = if attempt_kind == "fix" { 1 } else { 0 };
 
     let failed_checks_json = encode_failed_checks(failures);
@@ -287,7 +310,7 @@ pub async fn on_ci_failure_detected(
         work_item_id: candidate.work_item_id.clone(),
         pr_url: candidate.pr_url.clone(),
         pr_number,
-        head_branch: String::new(),
+        head_branch: probe.head_ref_name.clone().unwrap_or_default(),
         head_sha_at_trigger: head_sha.to_owned(),
         attempt_kind: attempt_kind.to_owned(),
         consumes_budget,
@@ -359,6 +382,37 @@ pub async fn on_ci_failure_detected(
             )
             .await;
         if let Some(attempt) = attempt.as_ref() {
+            // Phase 9 #24: a fresh `ci_remediations` row needs a
+            // matching `work_executions` row for the dispatcher to pick
+            // up. Mirror the `conflict_resolution` wiring — create a
+            // `kind = 'ci_remediation'` execution in `ready` state and
+            // kick the scheduler. The unique key on `ci_remediations`
+            // already gated us, so a second probe with the same triplet
+            // sees `attempt = None` above and skips this branch.
+            match work_db.create_execution(CreateExecutionInput {
+                work_item_id: candidate.work_item_id.clone(),
+                kind: "ci_remediation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            }) {
+                Ok(_) => publisher.kick_scheduler(),
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        attempt_id = %attempt.id,
+                        ?err,
+                        "ci_watch: failed to create ci_remediation execution; worker will not be dispatched",
+                    );
+                }
+            }
             publisher
                 .publish_frontend_event_on_product(
                     &candidate.product_id,
@@ -1009,5 +1063,135 @@ mod tests {
         assert_eq!(item["name"], "ci/test");
         assert_eq!(item["provider"], "github_actions");
         assert_eq!(item["provider_job_id"], "2");
+    }
+
+    // ----- Phase 9 #28: pre-triage classification permutations ----------
+
+    fn failure(name: &str, conclusion: &str) -> RequiredCheckFailure {
+        RequiredCheckFailure {
+            name: name.into(),
+            conclusion: conclusion.into(),
+            target_url: "https://buildkite.com/foo/bar/builds/1#x".into(),
+            provider: CiProvider::Buildkite,
+            provider_job_id: Some("x".into()),
+        }
+    }
+
+    #[test]
+    fn pre_triage_all_startup_failure_routes_to_retrigger() {
+        let fs = [failure("a", "STARTUP_FAILURE"), failure("b", "STARTUP_FAILURE")];
+        assert_eq!(super::classify_pre_triage(&fs), "retrigger");
+    }
+
+    #[test]
+    fn pre_triage_mixed_startup_and_cancelled_routes_to_retrigger() {
+        let fs = [failure("a", "STARTUP_FAILURE"), failure("b", "CANCELLED")];
+        assert_eq!(super::classify_pre_triage(&fs), "retrigger");
+    }
+
+    #[test]
+    fn pre_triage_one_real_failure_routes_to_fix() {
+        let fs = [failure("a", "STARTUP_FAILURE"), failure("b", "FAILURE")];
+        assert_eq!(super::classify_pre_triage(&fs), "fix");
+    }
+
+    #[test]
+    fn pre_triage_all_failure_routes_to_fix() {
+        let fs = [failure("a", "FAILURE"), failure("b", "TIMED_OUT")];
+        assert_eq!(super::classify_pre_triage(&fs), "fix");
+    }
+
+    #[test]
+    fn pre_triage_action_required_routes_to_fix() {
+        // ACTION_REQUIRED isn't unambiguous infra — it needs a human or
+        // a worker triage decision, so it stays on the fix path.
+        let fs = [failure("a", "ACTION_REQUIRED")];
+        assert_eq!(super::classify_pre_triage(&fs), "fix");
+    }
+
+    #[test]
+    fn pre_triage_empty_defaults_to_fix() {
+        assert_eq!(super::classify_pre_triage(&[]), "fix");
+    }
+
+    // ----- Phase 9 #24: a fix-kind detection creates a ci_remediation execution -----
+
+    #[tokio::test]
+    async fn detection_creates_ci_remediation_execution() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/100";
+        let (product, chore) = make_in_review(&db, "C-exec", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        let flipped = on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+        assert!(flipped);
+
+        // Exactly one work_executions row with kind = 'ci_remediation'.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_executions WHERE work_item_id = ?1 AND kind = ?2",
+                rusqlite::params![&chore, "ci_remediation"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "expected a single ci_remediation execution row");
+    }
+
+    // ----- Reconciled 2026-05-17 layered design call: rebase-first success ----
+
+    #[tokio::test]
+    async fn rebase_only_success_refunds_budget_slot() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/200";
+        let (product, chore) = make_in_review(&db, "C-rebase", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // 1. Detect a fix-kind failure — counter bumps to 1.
+        let flipped = on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+        assert!(flipped);
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+
+        // 2. Worker rebases onto base HEAD and reports green CI without
+        //    a code change: rebase-only success path.
+        let attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("attempt row");
+        let updated = db
+            .mark_ci_remediation_succeeded_via_rebase(&attempt.id)
+            .unwrap()
+            .expect("WHERE guard hit");
+
+        assert_eq!(updated.status, "succeeded");
+        assert_eq!(updated.consumes_budget, 0);
+        assert_eq!(updated.failure_reason.as_deref(), Some("rebase_only"));
+
+        // 3. Counter refunded: budget slot is NOT consumed.
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
+
+        // 4. Idempotent — repeat is a no-op.
+        let again = db
+            .mark_ci_remediation_succeeded_via_rebase(&attempt.id)
+            .unwrap();
+        assert!(again.is_none(), "second call must be a no-op");
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
     }
 }
