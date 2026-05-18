@@ -43,6 +43,18 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 /// `force_duplicate` is set on the input.
 pub const DUPLICATE_GUARD_WINDOW_SECS: i64 = 60;
 
+/// Phase 12 #40 — sliding window for the CI-retry churn guard. The
+/// engine counts `ci_remediations` created in the last
+/// `CI_CHURN_WINDOW_SECS` for the work item; once the count crosses
+/// [`CI_CHURN_LIMIT`], the next manual `boss engine ci retry`
+/// invocation is rate-limited and requires `--force` to proceed.
+pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
+/// Threshold for [`CI_CHURN_WINDOW_SECS`]. Set well above the default
+/// 3-attempt budget so the natural failure → fix → green cycle never
+/// triggers; the only realistic path to 5 within an hour is repeated
+/// manual retries against a flaky / fundamentally-broken PR.
+pub const CI_CHURN_LIMIT: i64 = 5;
+
 pub use boss_protocol::{
     AddDependencyInput, BlockedSignal, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN,
     CiRemediation, ConflictResolution, CreateAttentionItemInput, CreateChoreInput,
@@ -3049,6 +3061,7 @@ impl WorkDb {
         migrate_task_blocked_signals_table(&conn)?;
         migrate_ci_remediations_table(&conn)?;
         migrate_ci_failure_suppressions_table(&conn)?;
+        migrate_ci_inflight_observations_table(&conn)?;
         migrate_tasks_ci_attempt_columns(&conn)?;
         migrate_products_ci_attempt_budget(&conn)?;
         migrate_products_dispatch_preamble(&conn)?;
@@ -3229,6 +3242,7 @@ impl WorkDb {
             bail!("cannot update a deleted task: {id}");
         }
         let previous_status = task.status.clone();
+        let previous_blocked_reason = task.blocked_reason.clone();
         let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut task.name, patch.name);
@@ -3315,6 +3329,29 @@ impl WorkDb {
 
         if status_changed && previous_status != task.status {
             cascade_dependents_after_prereq_status_change(&tx, id, &task.status, &task.updated_at)?;
+        }
+
+        // Manual-override suppression for `blocked: ci_failure` /
+        // `ci_failure_exhausted` (design §Q5 / Phase 12 #38). A human
+        // pulling a chore out of the CI-failure column is a signal that
+        // the engine should keep its hands off the current head sha —
+        // otherwise the very next probe re-observes the failure and
+        // immediately re-flips the row. We honour the override by:
+        //   1) inserting a `ci_failure_suppressions` row keyed on the
+        //      head_sha of the most recent CI attempt (a fresh push
+        //      changes the key and naturally invalidates suppression),
+        //   2) resetting `ci_attempts_used` so a future probe (on a
+        //      new head) starts with a fresh budget — mirrors the
+        //      `boss engine ci retry` reset rule.
+        if status_changed
+            && previous_status == "blocked"
+            && task.status != "blocked"
+            && matches!(
+                previous_blocked_reason.as_deref(),
+                Some("ci_failure") | Some("ci_failure_exhausted")
+            )
+        {
+            record_ci_failure_suppression_in_tx(&tx, id, &task.updated_at)?;
         }
 
         let updated = query_task(&tx, id)?.with_context(|| format!("unknown task: {id}"))?;
@@ -4231,6 +4268,130 @@ impl WorkDb {
             |row| row.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// Record an `InFlight` observation for `(work_item_id, head_sha)`
+    /// and return the row that is now durably persisted. On the first
+    /// observation for the pair, `first_observed_at` is stamped to
+    /// `now`; subsequent calls find the existing row and leave it
+    /// alone (so elapsed-time math always reads from the *first*
+    /// observation, never the most recent). Per design Phase 12 #39.
+    pub fn observe_ci_in_flight(
+        &self,
+        work_item_id: &str,
+        head_sha: &str,
+    ) -> Result<CiInFlightObservation> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        tx.execute(
+            "INSERT OR IGNORE INTO ci_inflight_observations
+                 (work_item_id, head_sha, first_observed_at, alert_level_emitted)
+             VALUES (?1, ?2, ?3, 'none')",
+            params![work_item_id, head_sha, now],
+        )?;
+        let row: (String, String) = tx.query_row(
+            "SELECT first_observed_at, alert_level_emitted
+               FROM ci_inflight_observations
+              WHERE work_item_id = ?1 AND head_sha = ?2",
+            params![work_item_id, head_sha],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        tx.commit()?;
+        Ok(CiInFlightObservation {
+            work_item_id: work_item_id.to_owned(),
+            head_sha: head_sha.to_owned(),
+            first_observed_at: row.0,
+            alert_level_emitted: row.1,
+        })
+    }
+
+    /// Record that the engine emitted a never-starts alert at `level`
+    /// for the row keyed by `(work_item_id, head_sha)`. Levels are
+    /// monotonic in observation time (`none → warn → alert`); callers
+    /// pass the level they're emitting *now* and the WHERE guard
+    /// ensures we never downgrade. The write is idempotent — a
+    /// repeated emit of the same level is a no-op.
+    pub fn mark_ci_inflight_alert_level(
+        &self,
+        work_item_id: &str,
+        head_sha: &str,
+        level: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE ci_inflight_observations
+                SET alert_level_emitted = ?3
+              WHERE work_item_id = ?1
+                AND head_sha = ?2
+                AND alert_level_emitted != ?3
+                AND (alert_level_emitted = 'none'
+                     OR (alert_level_emitted = 'warn' AND ?3 = 'alert'))",
+            params![work_item_id, head_sha, level],
+        )?;
+        Ok(())
+    }
+
+    /// Drop any `ci_inflight_observations` rows for `work_item_id`.
+    /// Called from the CI-watch detect (Failing) and retire (Clean)
+    /// paths so an in-flight observation row doesn't linger past the
+    /// state the alert was tracking. Cheap — typically zero rows.
+    pub fn clear_ci_inflight_observations(&self, work_item_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM ci_inflight_observations WHERE work_item_id = ?1",
+            params![work_item_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count `ci_remediations` rows for `work_item_id` created within
+    /// the last `window_secs` seconds. Used by the Phase 12 #40 churn
+    /// guard: a manual `boss engine ci retry` invocation that pushes
+    /// the count to ≥5 over the last hour signals the engine should
+    /// rate-limit the next retry until the user explicitly overrides.
+    pub fn count_recent_ci_remediations(
+        &self,
+        work_item_id: &str,
+        window_secs: i64,
+    ) -> Result<i64> {
+        let conn = self.connect()?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now_secs.saturating_sub(window_secs);
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ci_remediations
+              WHERE work_item_id = ?1
+                AND CAST(created_at AS INTEGER) >= ?2",
+            params![work_item_id, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Phase 12 #40 — churn guard for the `boss engine ci retry`
+    /// verb. The retry path bumps `ci_attempts_used` back to 0 and
+    /// re-fires the auto-fix flow; calling it repeatedly without
+    /// addressing the underlying failure puts the chore in a tight
+    /// retry loop. We rate-limit when the work item has ≥
+    /// [`CI_CHURN_LIMIT`] `ci_remediations` rows created in the last
+    /// hour. The verb implementation passes the user-supplied
+    /// `--force` override through `allow_override`; with the override
+    /// set, the function always returns `false` so the engine still
+    /// fires the retry (but the caller is expected to surface a loud
+    /// warning to the user before doing so).
+    pub fn is_ci_retry_rate_limited(
+        &self,
+        work_item_id: &str,
+        allow_override: bool,
+    ) -> Result<bool> {
+        if allow_override {
+            return Ok(false);
+        }
+        let count = self.count_recent_ci_remediations(work_item_id, CI_CHURN_WINDOW_SECS)?;
+        Ok(count >= CI_CHURN_LIMIT)
     }
 
     /// Flip a pending `ci_remediations` attempt to `succeeded` and
@@ -5773,6 +5934,32 @@ pub struct CiRemediationInsertInput {
     pub failed_checks: String,
 }
 
+/// One row of `ci_inflight_observations`. The engine tracks the
+/// first-observed-InFlight time per `(work_item_id, head_sha)` and
+/// the most-recently-emitted alert bucket so the never-starts soft
+/// alert (Phase 12 #39) doesn't churn on every probe.
+#[derive(Debug, Clone)]
+pub struct CiInFlightObservation {
+    pub work_item_id: String,
+    pub head_sha: String,
+    /// Unix epoch seconds (decimal-string), the canonical timestamp
+    /// shape across the boss DB.
+    pub first_observed_at: String,
+    /// `'none'`, `'warn'`, or `'alert'` — the highest bucket the
+    /// engine has emitted for this `(work_item_id, head_sha)` pair.
+    pub alert_level_emitted: String,
+}
+
+impl CiInFlightObservation {
+    /// Parse the decimal-string `first_observed_at` into Unix epoch
+    /// seconds. A malformed value (shouldn't happen — the engine
+    /// always writes the canonical form) falls back to `0` so an
+    /// elapsed-time check that hits a corrupt row still terminates.
+    pub fn first_observed_at_secs(&self) -> i64 {
+        self.first_observed_at.parse::<i64>().unwrap_or(0)
+    }
+}
+
 fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediation> {
     Ok(CiRemediation {
         id: row.get(0)?,
@@ -5824,6 +6011,69 @@ fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option<CiRemediat
 /// `'dependency'` (which has no attempt table) and for the
 /// `'ci_failure_exhausted'` signal (which is the *absence* of an
 /// engine-managed attempt — the engine has stopped trying).
+/// Insert a `ci_failure_suppressions` row for the work item, keyed by
+/// the head sha of the most recent `ci_remediations` attempt. Called
+/// from `update_task` when a human moves a chore out of `blocked:
+/// ci_failure` (or `ci_failure_exhausted`) — see design §Q5 ("Manual
+/// override (CI)") and Phase 12 #38. The function is best-effort:
+/// when no `ci_remediations` row exists (the chore was manually moved
+/// without the engine having ever recorded an attempt — e.g. a budget=0
+/// `notify only` flow) we resort to the `tasks.pr_url` value combined
+/// with a sentinel head sha so the suppression still keys to a real
+/// head if the chore has one; if even that is missing, we leave the
+/// table alone — the engine has no head sha to suppress against and
+/// the next probe will simply re-observe the failure.
+///
+/// We also reset `ci_attempts_used` so the next CI failure (on a new
+/// head sha — the suppression has expired by then) starts with a
+/// fresh budget; mirrors the manual `boss engine ci retry` reset rule.
+fn record_ci_failure_suppression_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    now: &str,
+) -> Result<()> {
+    // The most recent `ci_remediations` row carries the head sha the
+    // engine was reacting to. Prefer the latest attempt regardless of
+    // status — the user may be moving off `ci_failure_exhausted`, in
+    // which case the row is terminal but its head sha is still what
+    // we should suppress.
+    let head_sha: Option<String> = conn
+        .query_row(
+            "SELECT head_sha_at_trigger FROM ci_remediations
+              WHERE work_item_id = ?1
+              ORDER BY created_at DESC, id DESC
+              LIMIT 1",
+            params![work_item_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(head_sha) = head_sha {
+        conn.execute(
+            "INSERT OR REPLACE INTO ci_failure_suppressions
+                 (work_item_id, head_sha, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![work_item_id, head_sha, now],
+        )?;
+    } else {
+        tracing::debug!(
+            work_item_id,
+            "record_ci_failure_suppression_in_tx: no ci_remediations row; skipping suppression insert",
+        );
+    }
+    // Reset the per-PR budget so a future fresh-head failure starts
+    // clean. The reset is unconditional within this code path —
+    // pulling a row out of `ci_failure` is itself an override of the
+    // budget logic.
+    conn.execute(
+        "UPDATE tasks
+            SET ci_attempts_used = 0
+          WHERE id = ?1
+            AND deleted_at IS NULL",
+        params![work_item_id],
+    )?;
+    Ok(())
+}
+
 fn upsert_task_blocked_signal(
     conn: &Connection,
     work_item_id: &str,
@@ -6870,6 +7120,30 @@ fn migrate_ci_failure_suppressions_table(conn: &Connection) -> Result<()> {
              work_item_id  TEXT NOT NULL,
              head_sha      TEXT NOT NULL,
              created_at    TEXT NOT NULL,
+             PRIMARY KEY (work_item_id, head_sha)
+         );",
+    )?;
+    Ok(())
+}
+
+/// Create the `ci_inflight_observations` table — observation log used
+/// by the Phase 12 #39 "never-starts" alert path. One row per
+/// `(work_item_id, head_sha)` pair: `first_observed_at` is stamped on
+/// the probe that first reported `OpenPrCiStatus::InFlight` for the
+/// pair, and `alert_level_emitted` records the highest log/event
+/// bucket the engine has already raised so we don't spam the activity
+/// feed on every subsequent poll. Rows are scoped to one head sha —
+/// a new push invalidates them implicitly (the next probe inserts a
+/// fresh row keyed on the new head sha); the engine also clears the
+/// row when CI moves off InFlight (Clean → retire path; Failing →
+/// detect path).
+fn migrate_ci_inflight_observations_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ci_inflight_observations (
+             work_item_id        TEXT NOT NULL,
+             head_sha            TEXT NOT NULL,
+             first_observed_at   TEXT NOT NULL,
+             alert_level_emitted TEXT NOT NULL DEFAULT 'none',
              PRIMARY KEY (work_item_id, head_sha)
          );",
     )?;
@@ -15510,6 +15784,318 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Manual move out of `blocked: ci_failure` writes a
+    /// `ci_failure_suppressions` row keyed on the most recent
+    /// `ci_remediations` head sha and resets `ci_attempts_used`. The
+    /// suppression is scoped to one head sha — a fresh push (new sha)
+    /// invalidates it automatically per design §Q5.
+    #[test]
+    fn manual_override_writes_ci_failure_suppression() {
+        let path = disk_db_path("ci-manual-override");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-manual".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/foo/bar/pull/77".to_owned();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // Drive the chore into `blocked: ci_failure` via the engine
+        // path so a real `ci_remediations` row exists with a head sha
+        // the suppression can key against.
+        db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr_url.clone(),
+            pr_number: 77,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "head-aaa".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+        })
+        .unwrap();
+        db.mark_chore_blocked_ci_failure(&chore.id, &pr_url, None).unwrap();
+        db.increment_ci_attempts_used(&chore.id).unwrap();
+        assert!(db.get_ci_attempts_used(&chore.id).unwrap() >= 1);
+
+        // Human pulls the chore back to `in_review`.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                blocked_reason: Some("".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            db.is_ci_failure_suppressed(&chore.id, "head-aaa").unwrap(),
+            "suppression row must be keyed on the most recent ci_remediations head sha",
+        );
+        // Budget reset on manual override.
+        assert_eq!(db.get_ci_attempts_used(&chore.id).unwrap(), 0);
+        // Suppression is scoped to one head sha — a new push gets no
+        // protection.
+        assert!(!db.is_ci_failure_suppressed(&chore.id, "head-bbb").unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Same shape as the `ci_failure` override, but from the
+    /// `ci_failure_exhausted` state — the design treats both blocked
+    /// reasons as equivalent triggers for the suppression write.
+    #[test]
+    fn manual_override_from_exhausted_writes_suppression() {
+        let path = disk_db_path("ci-manual-override-exh");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-exh".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/foo/bar/pull/78".to_owned();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr_url.clone(),
+            pr_number: 78,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "head-ccc".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+        })
+        .unwrap();
+        db.mark_chore_blocked_ci_failure_exhausted(&chore.id, &pr_url).unwrap();
+
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                blocked_reason: Some("".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(db.is_ci_failure_suppressed(&chore.id, "head-ccc").unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Phase 12 #40 — the CI-retry churn guard fires once a work
+    /// item has accumulated >= `CI_CHURN_LIMIT` (5) `ci_remediations`
+    /// rows within the last `CI_CHURN_WINDOW_SECS` (1 h). The
+    /// `--force` override path always returns false so the caller can
+    /// still proceed after surfacing a loud warning.
+    #[test]
+    fn ci_retry_rate_limit_fires_after_five_attempts_in_one_hour() {
+        let path = disk_db_path("ci-churn");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-churn".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // 0 attempts → not rate-limited.
+        assert!(!db.is_ci_retry_rate_limited(&chore.id, false).unwrap());
+
+        // Insert 4 attempts in the recent window — still under the
+        // threshold (the engine only rate-limits once the count
+        // reaches CI_CHURN_LIMIT = 5).
+        for i in 0..4 {
+            db.insert_ci_remediation(CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: chore.id.clone(),
+                pr_url: "https://github.com/foo/bar/pull/40".into(),
+                pr_number: 40,
+                head_branch: "feature".into(),
+                head_sha_at_trigger: format!("head-{i}"),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: "[]".into(),
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            db.count_recent_ci_remediations(&chore.id, CI_CHURN_WINDOW_SECS)
+                .unwrap(),
+            4,
+        );
+        assert!(!db.is_ci_retry_rate_limited(&chore.id, false).unwrap());
+
+        // 5th attempt trips the threshold.
+        db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: "https://github.com/foo/bar/pull/40".into(),
+            pr_number: 40,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "head-5".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+        })
+        .unwrap();
+        assert!(
+            db.is_ci_retry_rate_limited(&chore.id, false).unwrap(),
+            "5 attempts in the window must rate-limit the next retry",
+        );
+
+        // `--force` override path always returns false.
+        assert!(!db.is_ci_retry_rate_limited(&chore.id, true).unwrap());
+
+        // Attempts older than the 1h window do not count. Rewrite the
+        // created_at on every existing row to two hours ago and the
+        // guard should drop back to off.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let two_hours_ago = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 2 * CI_CHURN_WINDOW_SECS)
+            .to_string();
+        conn.execute(
+            "UPDATE ci_remediations SET created_at = ?1 WHERE work_item_id = ?2",
+            rusqlite::params![two_hours_ago, &chore.id],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            db.count_recent_ci_remediations(&chore.id, CI_CHURN_WINDOW_SECS)
+                .unwrap(),
+            0,
+        );
+        assert!(!db.is_ci_retry_rate_limited(&chore.id, false).unwrap());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Manual moves between non-CI states must NOT touch the
+    /// suppression table — only moves OUT of `blocked: ci_failure` /
+    /// `ci_failure_exhausted` are an override signal.
+    #[test]
+    fn manual_move_unrelated_to_ci_does_not_write_suppression() {
+        let path = disk_db_path("ci-manual-override-noop");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "P".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "chore-noop".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/foo/bar/pull/79".to_owned();
+        // to_do → in_review → to_do with no CI involvement. None of
+        // these transitions should reach the suppression code path
+        // because the previous `blocked_reason` is never a CI reason.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("to_do".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ci_failure_suppressions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "non-CI moves must not write to ci_failure_suppressions");
         let _ = std::fs::remove_file(path);
     }
 
