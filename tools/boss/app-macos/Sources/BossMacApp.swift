@@ -18,7 +18,8 @@ struct BossMacApp: App {
         .defaultSize(width: 1060, height: 680)
         .commands {
             TextEditingCommands()
-            CommandMenu("View") {
+            CommandGroup(after: .windowList) {
+                Divider()
                 LogViewerCommand()
                 MetricsCommand()
             }
