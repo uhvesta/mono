@@ -32,12 +32,21 @@
 //! covering the same PR (it cleared the conflict moments ago and
 //! hasn't retired yet). `on_ci_failure_detected` defers in that case.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use boss_protocol::FrontendEvent;
 use serde::Serialize;
 
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
 use crate::work::{CiRemediationInsertInput, PendingMergeCheck, WorkDb};
+
+/// Buckets for the Phase 12 #39 never-starts soft alert. The engine
+/// emits a `warn`-level log when CI has been `InFlight` continuously
+/// for at least `WARN_THRESHOLD_SECS`, and a typed soft alert (plus a
+/// louder log line) when the duration crosses `ALERT_THRESHOLD_SECS`.
+const NEVER_STARTS_WARN_THRESHOLD_SECS: i64 = 30 * 60;
+const NEVER_STARTS_ALERT_THRESHOLD_SECS: i64 = 2 * 60 * 60;
 
 /// Unified opt-out gate. Mirrors `conflict_watch::auto_pr_maintenance_disabled`;
 /// the design (Phase 6 #18 / §Q7) requires both auto-remediation
@@ -308,6 +317,19 @@ pub async fn on_ci_failure_detected(
 
     let attempt_id = attempt.as_ref().map(|a| a.id.clone());
 
+    // The CI rollup has now flipped to `Failing`, which means the
+    // never-starts observation (tracked while we were in `InFlight`)
+    // is no longer the relevant signal — clear any leftover rows so
+    // the next time the same PR sits in InFlight we re-key from
+    // scratch. Best-effort.
+    if let Err(err) = work_db.clear_ci_inflight_observations(&candidate.work_item_id) {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            ?err,
+            "ci_watch: failed to clear inflight observations on Failing transition",
+        );
+    }
+
     let task_result = work_db.mark_chore_blocked_ci_failure(
         &candidate.work_item_id,
         &candidate.pr_url,
@@ -384,6 +406,115 @@ pub async fn on_ci_failure_detected(
     } else {
         false
     }
+}
+
+/// Phase 12 #39 — soft alert when CI never starts running.
+///
+/// Called from `merge_poller::sweep_one` whenever the probe reports
+/// `OpenPrCiStatus::InFlight` for an open PR. The engine tracks the
+/// first observation per `(work_item_id, head_sha)` in
+/// `ci_inflight_observations` and crosses two thresholds:
+///
+///   * 30 min → `warn`-level log entry.
+///   * 2  h  → `warn`-level log AND a typed `CiNeverStartsAlert`
+///             frontend event so the UI / activity feed surfaces it.
+///
+/// Each bucket is emitted at most once per pair — the row's
+/// `alert_level_emitted` column monotonically advances `none → warn →
+/// alert` and the WHERE guard on the update rejects regressions.
+/// Returns the bucket the engine landed on this call (`"none"`,
+/// `"warn"`, or `"alert"`) for tests / metrics.
+pub async fn on_ci_in_flight(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+) -> &'static str {
+    let Some(head_sha) = probe.head_ref_oid.as_deref() else {
+        // Without a head sha we can't key the observation row.
+        return "none";
+    };
+    let observation = match work_db.observe_ci_in_flight(&candidate.work_item_id, head_sha) {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to record InFlight observation",
+            );
+            return "none";
+        }
+    };
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let elapsed = now_secs.saturating_sub(observation.first_observed_at_secs());
+    let target_bucket = if elapsed >= NEVER_STARTS_ALERT_THRESHOLD_SECS {
+        "alert"
+    } else if elapsed >= NEVER_STARTS_WARN_THRESHOLD_SECS {
+        "warn"
+    } else {
+        "none"
+    };
+    if target_bucket == "none" || target_bucket == observation.alert_level_emitted {
+        // Either we haven't crossed any threshold yet, or we already
+        // emitted this bucket on a previous probe.
+        return target_bucket;
+    }
+    // For an `alert`-bucket emit, we want to fire even if the previous
+    // observation already recorded `warn` — that's the upgrade case.
+    // The DB-level guard accepts `none → warn`, `none → alert`, and
+    // `warn → alert` and rejects everything else.
+    if let Err(err) =
+        work_db.mark_ci_inflight_alert_level(&candidate.work_item_id, head_sha, target_bucket)
+    {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            target_bucket,
+            ?err,
+            "ci_watch: failed to advance alert_level_emitted",
+        );
+        return match observation.alert_level_emitted.as_str() {
+            "alert" => "alert",
+            "warn" => "warn",
+            _ => "none",
+        };
+    }
+    let level_label = if target_bucket == "warn" { "30m" } else { "2h" };
+    if target_bucket == "warn" {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            head_sha,
+            elapsed,
+            "ci_watch: CI has been InFlight without a definitive result for >=30m",
+        );
+    } else {
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            head_sha,
+            elapsed,
+            "ci_watch: CI never-starts soft alert (>=2h InFlight on same head_sha)",
+        );
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::CiNeverStartsAlert {
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                    head_sha: head_sha.to_owned(),
+                    level: level_label.to_owned(),
+                    elapsed_seconds: elapsed,
+                },
+            )
+            .await;
+    }
+    target_bucket
 }
 
 /// Symmetric retire path: flip a `blocked: ci_failure` (or
@@ -464,6 +595,17 @@ pub async fn on_ci_resolved(
                 );
             }
         }
+    }
+
+    // CI has reached Clean — any leftover never-starts observation
+    // (e.g. a long InFlight stretch finally produced green) is no
+    // longer the relevant signal. Best-effort cleanup.
+    if let Err(err) = work_db.clear_ci_inflight_observations(&candidate.work_item_id) {
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            ?err,
+            "ci_watch: failed to clear inflight observations on Clean transition",
+        );
     }
 
     if !task_transitioned && !attempt_transitioned {
@@ -990,6 +1132,209 @@ mod tests {
         let (status, reason) = chore_state(&db, &chore);
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
+    }
+
+    /// First InFlight probe records `first_observed_at` but emits
+    /// nothing (no threshold crossed). A subsequent probe whose
+    /// observed timestamp is rewound by >30min lands in the `warn`
+    /// bucket; rewinding past 2h lands in `alert`. Repeated probes at
+    /// the same bucket are no-ops (the WHERE guard rejects same-level
+    /// re-emits).
+    #[tokio::test]
+    async fn never_starts_alert_crosses_warn_then_alert() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/30";
+        let (product, chore) = make_in_review(&db, "C-never-starts", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Probe #1: no threshold crossed.
+        let level = on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-A"),
+        )
+        .await;
+        assert_eq!(level, "none");
+        let typed_after_first = pub_.typed_events.lock().await.clone();
+        assert!(typed_after_first.is_empty(), "no event before any bucket");
+
+        // Rewind the observation timestamp by 31 min so the next probe
+        // crosses the warn threshold.
+        let warn_cutoff = current_unix_secs() - (31 * 60);
+        rewind_inflight_observation(&db_path, &chore, "head-A", warn_cutoff);
+        let level = on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-A"),
+        )
+        .await;
+        assert_eq!(level, "warn");
+        // Still no soft-alert frontend event — warn is log-only.
+        let typed_after_warn = pub_.typed_events.lock().await.clone();
+        assert!(
+            typed_after_warn
+                .iter()
+                .all(|(_, ev)| !matches!(ev, FrontendEvent::CiNeverStartsAlert { .. })),
+            "warn bucket must not emit CiNeverStartsAlert event",
+        );
+
+        // A second probe at the same elapsed bucket is a no-op (the
+        // alert-level WHERE guard rejects a same-level rewrite).
+        let again = on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-A"),
+        )
+        .await;
+        assert_eq!(again, "warn");
+
+        // Rewind past 2h so the next probe upgrades to alert.
+        let alert_cutoff = current_unix_secs() - (2 * 60 * 60 + 60);
+        rewind_inflight_observation(&db_path, &chore, "head-A", alert_cutoff);
+        let level = on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-A"),
+        )
+        .await;
+        assert_eq!(level, "alert");
+        let typed = pub_.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(_, ev)| matches!(
+                ev,
+                FrontendEvent::CiNeverStartsAlert {
+                    level,
+                    ..
+                } if level == "2h"
+            )),
+            "alert bucket must emit CiNeverStartsAlert with level=2h",
+        );
+    }
+
+    /// A fresh push (new head sha) keys observations on its own row,
+    /// so the timer restarts from zero and the previous bucket doesn't
+    /// carry over.
+    #[tokio::test]
+    async fn never_starts_alert_resets_on_new_head_sha() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/31";
+        let (product, chore) = make_in_review(&db, "C-new-head", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Drive head-A all the way to `alert`.
+        on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-A"),
+        )
+        .await;
+        rewind_inflight_observation(
+            &db_path,
+            &chore,
+            "head-A",
+            current_unix_secs() - (3 * 60 * 60),
+        );
+        let level = on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-A"),
+        )
+        .await;
+        assert_eq!(level, "alert");
+
+        // A new head sha starts fresh.
+        let level = on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-B"),
+        )
+        .await;
+        assert_eq!(level, "none", "new head sha must reset the timer");
+    }
+
+    /// When the engine flips the chore to `blocked: ci_failure` (CI
+    /// transitions from InFlight to Failing), the leftover observation
+    /// row must be cleared so a later InFlight stretch starts fresh.
+    #[tokio::test]
+    async fn detection_clears_inflight_observation() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/32";
+        let (product, chore) = make_in_review(&db, "C-clear-on-detect", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        on_ci_in_flight(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+        )
+        .await;
+        let n: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM ci_inflight_observations WHERE work_item_id = ?1",
+                [&chore],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "observation row exists after InFlight probe");
+
+        on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+        let n: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM ci_inflight_observations WHERE work_item_id = ?1",
+                [&chore],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "Failing detection must clear inflight observations");
+    }
+
+    fn current_unix_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// Rewrite the `first_observed_at` timestamp on a
+    /// `ci_inflight_observations` row to simulate the passage of time
+    /// without sleeping. Used by the never-starts-alert tests.
+    fn rewind_inflight_observation(
+        db_path: &std::path::Path,
+        work_item_id: &str,
+        head_sha: &str,
+        when_unix_secs: i64,
+    ) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE ci_inflight_observations
+                SET first_observed_at = ?3
+              WHERE work_item_id = ?1 AND head_sha = ?2",
+            rusqlite::params![work_item_id, head_sha, when_unix_secs.to_string()],
+        )
+        .unwrap();
     }
 
     #[test]

@@ -1303,7 +1303,19 @@ async fn sweep_one(
                     }
                     // `InFlight` is the explicit "don't act yet" leaf
                     // for CI; the clear dispatch above already declined
-                    // because `should_clear_ci` requires Clean.
+                    // because `should_clear_ci` requires Clean. The
+                    // never-starts soft alert (Phase 12 #39) tracks
+                    // how long the same head sha has been sitting in
+                    // InFlight and emits a warn at 30m / alert at 2h.
+                    if matches!(ci, OpenPrCiStatus::InFlight) {
+                        ci_watch::on_ci_in_flight(
+                            work_db,
+                            publisher,
+                            candidate,
+                            &probe_result,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -3753,6 +3765,121 @@ mod tests {
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
                 assert_eq!(t.status, "in_review");
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+    }
+
+    /// Phase 12 #41 — cross-flow ordering correctness. When a PR
+    /// develops both a merge conflict and a CI failure
+    /// simultaneously, the engine fires the conflict resolver first,
+    /// the CI fixer only after the conflict resolves. The
+    /// `task_blocked_signals` side table must reflect both signals
+    /// being active and clearing in the right order:
+    ///
+    ///   * Pass 1 (mergeable=Conflict + ci=Failing): `merge_conflict`
+    ///     becomes active. CI detection is *not* invoked (the
+    ///     mergeability=Conflict arm in `sweep_one` short-circuits
+    ///     before reaching the Clean branch where ci_watch fires).
+    ///   * Pass 2 (the worker has pushed; mergeable=Clean +
+    ///     ci=Failing): the `merge_conflict` signal clears (probe
+    ///     condition holds) and the `ci_failure` detect path runs in
+    ///     the same sweep, adding `ci_failure` to the side table.
+    ///   * Pass 3 (mergeable=Clean + ci=Clean): `ci_failure` clears
+    ///     and the parent ends back at `in_review`.
+    #[tokio::test]
+    async fn cross_flow_conflict_then_ci_fires_in_order() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/941";
+        let (_product_id, chore) = make_chore_in_review(&db, "C-cross", pr);
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let failures = vec![RequiredCheckFailure {
+            name: "ci/test".into(),
+            conclusion: "FAILURE".into(),
+            target_url: "https://buildkite.com/anthropic/mono/builds/1#job".into(),
+            provider: CiProvider::Buildkite,
+            provider_job_id: Some("job-1".into()),
+        }];
+
+        // Pass 1: Conflict + Failing.
+        let mut p1 = PrLifecycleProbe {
+            url: pr.into(),
+            state: PrLifecycleState::Open(OpenPrStatus {
+                mergeability: OpenPrMergeability::Conflict,
+                ci: OpenPrCiStatus::Failing { failures: failures.clone() },
+            }),
+            base_ref_oid: Some("base-1".into()),
+            head_ref_oid: Some("head-1".into()),
+            head_ref_name: Some("feature".into()),
+            base_ref_name: Some("main".into()),
+            labels: Vec::new(),
+            review: PrReviewState::Unknown,
+            in_merge_queue: false,
+        };
+        probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
+        let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(
+            out1.conflict_flagged, 1,
+            "conflict_watch must fire first on Conflict+Failing",
+        );
+        assert_eq!(
+            out1.ci_flagged, 0,
+            "ci_watch must NOT fire while mergeability=Conflict (design §Q1)",
+        );
+        let active1: Vec<String> = db
+            .active_blocked_signals(&chore)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.reason)
+            .collect();
+        assert_eq!(active1, vec!["merge_conflict".to_owned()]);
+
+        // Worker resolves the conflict — head sha advances and the
+        // mergeability flips to Clean. CI is still failing on the new
+        // head sha. (The conflict resolution attempt row is not
+        // exercised here — we go straight to the next probe.)
+        p1.state = PrLifecycleState::Open(OpenPrStatus {
+            mergeability: OpenPrMergeability::Clean,
+            ci: OpenPrCiStatus::Failing { failures: failures.clone() },
+        });
+        p1.head_ref_oid = Some("head-2".into());
+        probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
+        let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(
+            out2.conflict_cleared, 1,
+            "merge_conflict retire fires in the Clean branch",
+        );
+        assert_eq!(
+            out2.ci_flagged, 1,
+            "ci_watch detect fires in the same Clean sweep once conflict cleared",
+        );
+        let active2: Vec<String> = db
+            .active_blocked_signals(&chore)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.reason)
+            .collect();
+        assert_eq!(
+            active2,
+            vec!["ci_failure".to_owned()],
+            "after pass 2, only ci_failure is active",
+        );
+
+        // Pass 3: CI goes green. The ci_failure signal retires and
+        // the parent returns to `in_review`.
+        p1.state = PrLifecycleState::Open(OpenPrStatus::clean());
+        probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
+        let out3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(out3.ci_cleared, 1);
+        assert!(db.active_blocked_signals(&chore).unwrap().is_empty());
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
         }

@@ -1042,6 +1042,23 @@ pub enum FrontendEvent {
         attempts_used: i64,
         budget: i64,
     },
+    /// Soft alert (design §Phase 12 #39): a PR's required CI has been
+    /// `InFlight` continuously for the duration named in `level`
+    /// without producing a definitive result — most commonly because
+    /// the provider never started a queued job. `level` is the
+    /// human-readable bucket the engine crossed on this probe (e.g.
+    /// `"30m"` or `"2h"`); `elapsed_seconds` carries the precise
+    /// observed duration. Emitted at most once per bucket per
+    /// `(work_item_id, head_sha)` pair so the UI / log doesn't churn
+    /// on every poll.
+    CiNeverStartsAlert {
+        product_id: String,
+        work_item_id: String,
+        pr_url: String,
+        head_sha: String,
+        level: String,
+        elapsed_seconds: i64,
+    },
     /// Response to [`FrontendRequest::AuditProductEffort`]. Carries
     /// the per-marker under-classification analysis for one
     /// product. Read-only snapshot; the engine recomputes from
