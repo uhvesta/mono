@@ -5702,16 +5702,30 @@ mod tests {
         .unwrap();
 
         let healed = db.heal_ghost_active_chores().unwrap();
-        let mut healed_sorted = healed.clone();
-        healed_sorted.sort();
+        let mut healed_ids: Vec<String> =
+            healed.iter().map(|h| h.work_item_id.clone()).collect();
+        healed_ids.sort();
         let mut expected = vec![ghost_a.id.clone(), ghost_b.id.clone()];
         expected.sort();
-        assert_eq!(healed_sorted, expected, "healed only the ghost rows");
+        assert_eq!(healed_ids, expected, "healed only the ghost rows");
+        // product_id rides along so the caller can publish a
+        // work-item-changed event on the product's kanban topic.
+        for h in &healed {
+            assert_eq!(
+                h.product_id, product.id,
+                "healed row should carry its product_id"
+            );
+        }
 
-        // Demoted ghosts now sit in `todo`.
+        // Demoted ghosts now sit in `todo` and are stamped as engine-
+        // initiated so the kanban can attribute the move correctly
+        // instead of blaming the human who last dragged the row.
         for id in &[&ghost_a.id, &ghost_b.id] {
             match db.get_work_item(id).unwrap() {
-                WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "todo"),
+                WorkItem::Chore(t) | WorkItem::Task(t) => {
+                    assert_eq!(t.status, "todo");
+                    assert_eq!(t.last_status_actor, "engine");
+                }
                 other => panic!("expected chore/task, got {other:?}"),
             }
         }

@@ -1995,11 +1995,27 @@ pub async fn serve(
     // left alone for `reconcile_active_dispatch` below to redispatch.
     match server_state.work_db.heal_ghost_active_chores() {
         Ok(healed) if !healed.is_empty() => {
+            let ids: Vec<&str> = healed.iter().map(|h| h.work_item_id.as_str()).collect();
             tracing::warn!(
                 count = healed.len(),
-                ids = ?healed,
+                ids = ?ids,
                 "demoted ghost-active chores with no run history",
             );
+            // Publish an invalidation on each owning product topic so
+            // subscribed kanban views refetch and move the card out of
+            // Doing immediately — without this the engine's demotion
+            // stays invisible to the UI until the next manual refresh,
+            // which is the silent-divergence half of #680.
+            for h in &healed {
+                server_state
+                    .publisher
+                    .publish_work_item_changed(
+                        &h.product_id,
+                        &h.work_item_id,
+                        "ghost-active demotion: dispatch never reached a worker",
+                    )
+                    .await;
+            }
         }
         Ok(_) => {
             tracing::debug!("no ghost-active chores to demote at startup");
