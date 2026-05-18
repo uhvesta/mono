@@ -3822,6 +3822,57 @@ async fn handle_frontend_connection(
                 // applies. We only care about task/chore — products and
                 // projects have no execution lifecycle.
                 let previous_task_status = task_status_for_id(&work_db, &id);
+                // Bug #679: when the patch is a kanban drag-to-Doing
+                // (a task/chore transitioning from non-active to
+                // `active`) and dispatch would deterministically fail
+                // because the row has no resolvable repo, reject the
+                // `UpdateWorkItem` outright instead of letting the
+                // status flip land and then swallowing the dispatch
+                // error in a `WARN`. The card stays in its previous
+                // column and the user sees a `WorkError` toast naming
+                // the missing repo. Skips when an existing non-terminal
+                // execution would already own the dispatch slot —
+                // there's no point validating a code path we won't run.
+                let intends_active_transition = patch.status.as_deref() == Some("active")
+                    && previous_task_status
+                        .as_deref()
+                        .is_some_and(|prev| prev != "active");
+                if intends_active_transition && work_item_needs_dispatch(&work_db, &id) {
+                    if let Err(err) = work_db.precheck_dispatch_repo(&id) {
+                        let work_item_id_for_event = id.clone();
+                        let from_status = previous_task_status.clone();
+                        let error_message = format!("{err:#}");
+                        let details = serde_json::json!({
+                            "from_status": from_status,
+                            "to_status": "active",
+                            "did_dispatch": false,
+                            "rejected": true,
+                            "reason_if_skipped": error_message,
+                            "dispatched_execution_id": serde_json::Value::Null,
+                        });
+                        server_state
+                            .dispatch_events
+                            .emit(
+                                crate::dispatch_events::DispatchEvent::new(
+                                    crate::dispatch_events::Stage::StatusTransition,
+                                    crate::dispatch_events::Outcome::Error,
+                                    work_item_id_for_event.clone(),
+                                )
+                                .with_work_item(work_item_id_for_event)
+                                .with_error(&err)
+                                .with_details(details),
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                }
                 let actor = resolve_status_actor(&server_state, peer_pid);
                 match work_db.update_work_item_as_actor(&id, patch, actor) {
                     Ok(item) => {
@@ -3908,6 +3959,17 @@ async fn handle_frontend_connection(
                                             (Some(execution.id), true, None)
                                         }
                                         Err(err) => {
+                                            // Deterministic preconditions (no
+                                            // resolvable repo, bug #679) are
+                                            // caught by the pre-update
+                                            // `precheck_dispatch_repo` gate above
+                                            // and reject the patch outright. This
+                                            // arm now only fires for non-
+                                            // deterministic races (e.g., a
+                                            // concurrent execution insert lost
+                                            // the unique-row gate). Keep the WARN
+                                            // so a residual silent skip is still
+                                            // observable in engine-trace.jsonl.
                                             tracing::warn!(
                                                 work_item_id = %work_item_id_for_event,
                                                 ?err,

@@ -378,27 +378,27 @@ impl WorkDb {
         if let Some(resolved) = resolve_friendly_work_item_id(&conn, &input.work_item_id)? {
             input.work_item_id = resolved;
         }
-        // Pre-check the resolver outside the transaction. If the work
-        // item has no repo resolution, write a sticky attention item
-        // via a *separate* short-lived tx that commits before the
-        // bail unwinds — the kanban Attention lane must surface the
-        // same failure the CLI exit code does, per multi-repo Q5.
-        // Doing this inside the dispatch tx would lose the attention
-        // item to the rollback.
-        if resolve_repo_for_work_item(&conn, &input.work_item_id)?.is_none() {
-            let label = repo_unresolved_kind_label(&conn, &input.work_item_id)?;
-            let attn_tx = conn.transaction()?;
-            record_repo_unresolved_attention(&attn_tx, &input.work_item_id, label)?;
-            attn_tx.commit()?;
-            bail!(
-                "{}",
-                repo_unresolved_attention_body(&input.work_item_id, label)
-            );
-        }
+        ensure_dispatch_repo_resolvable(&mut conn, &input.work_item_id)?;
         let tx = conn.transaction()?;
         let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
         tx.commit()?;
         Ok(execution)
+    }
+
+    /// Repo-resolution precheck that does not create or mutate any
+    /// `work_executions` row. The kanban drag-to-Doing path calls this
+    /// before flipping `tasks.status = 'active'` so a deterministic
+    /// dispatch failure (no product default repo, no per-task
+    /// override) rejects the `UpdateWorkItem` instead of leaving the
+    /// card stuck in Doing with no worker (bug #679). Shares the same
+    /// error text and sticky attention item that the request-execution
+    /// path writes, so the kanban Attention lane sees the same shape
+    /// regardless of which trigger surfaced the problem.
+    pub fn precheck_dispatch_repo(&self, work_item_id: &str) -> Result<()> {
+        let mut conn = self.connect()?;
+        let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?
+            .unwrap_or_else(|| work_item_id.to_owned());
+        ensure_dispatch_repo_resolvable(&mut conn, &resolved)
     }
 
     /// Demote `tasks.status = 'active'` rows that never made it past
@@ -8362,6 +8362,28 @@ fn record_repo_unresolved_attention(
         params![id, work_item_id, title, body, now],
     )?;
     Ok(())
+}
+
+/// Shared precheck for any dispatch trigger (request-execution,
+/// kanban drag-to-Doing). Returns `Ok(())` when the work item
+/// resolves to a repo URL. When it doesn't, writes a sticky
+/// `repo_unresolved` attention item via a short-lived transaction
+/// (so the row commits before the caller's bail unwinds anything
+/// else) and bails with the same human-facing message
+/// `repo_unresolved_attention_body` produces. Callers MUST resolve
+/// friendly ids (`T42`) before passing `work_item_id` here.
+fn ensure_dispatch_repo_resolvable(conn: &mut Connection, work_item_id: &str) -> Result<()> {
+    if resolve_repo_for_work_item(conn, work_item_id)?.is_some() {
+        return Ok(());
+    }
+    let label = repo_unresolved_kind_label(conn, work_item_id)?;
+    let attn_tx = conn.transaction()?;
+    record_repo_unresolved_attention(&attn_tx, work_item_id, label)?;
+    attn_tx.commit()?;
+    bail!(
+        "{}",
+        repo_unresolved_attention_body(work_item_id, label)
+    );
 }
 
 /// The exact message text both the attention item and the

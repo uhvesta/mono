@@ -1156,6 +1156,224 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
     Ok(())
 }
 
+/// Bug #679: dragging a card into Doing when the work item has no
+/// resolvable repo used to flip `tasks.status='active'` server-side
+/// and then swallow the dispatch failure in a `WARN`. The card sat
+/// in Doing with no worker. The fix pre-validates the repo
+/// precondition: if the engine can prove dispatch will fail, the
+/// `UpdateWorkItem` is rejected as `WorkError`, the card stays in
+/// its previous column, and the user sees the actionable message
+/// naming the missing repo.
+#[tokio::test]
+async fn kanban_drag_to_doing_rejects_chore_with_no_resolvable_repo() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let chore = seed_unresolvable_chore(&mut client).await?;
+    assert_eq!(chore.status, "todo");
+
+    // The drag. Without the fix this returns WorkItemUpdated with
+    // status=active and only a tracing WARN records the failure.
+    let response = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("has no repo resolution"),
+                "expected repo-resolution message, got: {message}"
+            );
+            assert!(
+                message.contains("boss chore update --repo <url>"),
+                "error should name the CLI fix, got: {message}"
+            );
+        }
+        other => {
+            return Err(anyhow!(
+                "drag-to-Doing with no repo must return WorkError, got: {other:?}"
+            ));
+        }
+    }
+
+    // Status stayed in `todo` — the rejection blocked the patch.
+    assert_eq!(fetch_task_status(&mut client, &chore.id).await?, "todo");
+
+    // No execution row was created.
+    let execs = list_executions_for(&mut client, &chore.id).await?;
+    assert!(
+        execs.is_empty(),
+        "rejected drag must not leave an execution row; got {execs:?}"
+    );
+
+    // The kanban Attention lane mirrors the CLI: a sticky
+    // `repo_unresolved` item names the offender.
+    let attn_response = client
+        .send_request(&FrontendRequest::ListAttentionItemsForWorkItem {
+            work_item_id: chore.id.clone(),
+        })
+        .await?;
+    let attention = match attn_response {
+        FrontendEvent::AttentionItemsForWorkItemList { items, .. } => items,
+        other => {
+            return Err(anyhow!(
+                "unexpected response to ListAttentionItemsForWorkItem: {other:?}"
+            ));
+        }
+    };
+    assert_eq!(
+        attention.len(),
+        1,
+        "exactly one repo_unresolved attention item should be open; got {attention:?}"
+    );
+    assert_eq!(attention[0].kind, "repo_unresolved");
+    assert_eq!(attention[0].status, "open");
+
+    Ok(())
+}
+
+/// The rejected drag still records a `status_transition` event with
+/// `outcome=error` so `bossctl dispatch tail` reflects the
+/// deterministic gate firing — same observability surface as the
+/// successful and skipped paths.
+#[tokio::test]
+async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let chore = seed_unresolvable_chore(&mut client).await?;
+
+    let _ = client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+
+    // Drain a beat so the async emit lands on disk before we read.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
+    let transition: Vec<_> = events
+        .iter()
+        .filter(|e| e.stage == "status_transition")
+        .collect();
+    assert_eq!(
+        transition.len(),
+        1,
+        "expected exactly one status_transition event; got {transition:?}"
+    );
+    assert_eq!(transition[0].outcome, "error");
+    assert_eq!(transition[0].work_item_id.as_deref(), Some(chore.id.as_str()));
+    assert_eq!(
+        transition[0].details.get("did_dispatch"),
+        Some(&serde_json::Value::Bool(false)),
+        "rejection should have did_dispatch=false; got {:?}",
+        transition[0].details
+    );
+    assert_eq!(
+        transition[0].details.get("rejected"),
+        Some(&serde_json::Value::Bool(true)),
+        "rejection should be tagged; got {:?}",
+        transition[0].details
+    );
+    let error_message = transition[0]
+        .error_message
+        .as_deref()
+        .unwrap_or_default();
+    assert!(
+        error_message.contains("has no repo resolution"),
+        "event error_message should name the missing repo; got {error_message:?}"
+    );
+
+    Ok(())
+}
+
+/// Drive the engine into the state the bug report describes: a
+/// task/chore whose product has no default repo and whose row has no
+/// override, so `resolve_repo_for_work_item` returns `None`. The
+/// chore-creation precheck blocks the direct path, so we round-trip
+/// through the engine: create with a repo, then clear the product's
+/// repo via `UpdateWorkItem`. The chore row's own `repo_remote_url`
+/// stays NULL (inherited from product at insert), and the cleared
+/// product default makes resolution fail — the exact failure shape
+/// the bug describes for a `kind=design` task auto-created under a
+/// no-repo product.
+async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protocol::Task> {
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Unresolvable chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+
+    // Clear the product's repo so the chore now resolves to nothing.
+    // `apply_repo_remote_url_patch` canonicalises `Some("")` → `None`,
+    // matching the bossctl `product update --repo ""` clear path.
+    match client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: product.id.clone(),
+            patch: WorkItemPatch {
+                repo_remote_url: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { .. } => {}
+        other => {
+            return Err(anyhow!(
+                "unexpected response clearing product repo: {other:?}"
+            ));
+        }
+    };
+
+    Ok(chore)
+}
+
 async fn list_executions_for(
     client: &mut BossClient,
     work_item_id: &str,
