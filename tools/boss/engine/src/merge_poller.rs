@@ -3658,7 +3658,7 @@ mod tests {
         assert!(task_after.blocked_reason.is_none());
 
         // work_item_changed event must have fired.
-        let events = publisher.events.lock().await;
+        let events = publisher.work_events.lock().await;
         assert!(
             events.iter().any(|(pid, wid, r)| pid == &product && wid == &chore && r == "merge_conflict_resolved"),
             "expected merge_conflict_resolved event; got {events:?}",
