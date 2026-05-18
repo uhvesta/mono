@@ -1794,6 +1794,14 @@ final class ChatViewModel: ObservableObject {
            }) {
             return .doing
         }
+        if task.status == "blocked",
+           task.blockedReason == "ci_failure",
+           let attemptID = task.blockedAttemptID,
+           ciRemediations.contains(where: {
+               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
+           }) {
+            return .doing
+        }
         return task.boardColumn
     }
 
@@ -1802,6 +1810,15 @@ final class ChatViewModel: ObservableObject {
     /// `nil` when no such attempt exists.
     func activeConflictResolution(for taskID: String) -> WorkConflictResolution? {
         conflictResolutions.first {
+            $0.workItemID == taskID && ($0.status == "pending" || $0.status == "running")
+        }
+    }
+
+    /// The active CI remediation for `taskID`, if any. A remediation is
+    /// "active" when its status is `pending` or `running`. Returns `nil`
+    /// when no such attempt exists. Parallel to [[activeConflictResolution(for:)]].
+    func activeCiRemediation(for taskID: String) -> WorkCiRemediation? {
+        ciRemediations.first {
             $0.workItemID == taskID && ($0.status == "pending" || $0.status == "running")
         }
     }

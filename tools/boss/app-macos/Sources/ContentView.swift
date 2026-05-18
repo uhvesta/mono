@@ -1163,11 +1163,19 @@ private struct WorkBoardCardItem: View {
             && task.status == "blocked"
             && task.blockedReason == "merge_conflict"
 
+        // A CI-remediation card is status=blocked+ci_failure with an active
+        // remediation attempt. Symmetric to the merge-conflict path above.
+        let isRemediatingCI = column == .doing
+            && task.status == "blocked"
+            && task.blockedReason == "ci_failure"
+
         let activityState: AgentActivityState? = column == .doing
             ? (isDispatchPending
                 ? .dispatchPending
                 : isResolvingConflicts
                 ? .waiting(reason: "Resolving merge conflict")
+                : isRemediatingCI
+                ? .waiting(reason: "Resolving CI failure")
                 : AgentActivityState(runtime: runtime, liveState: liveState))
             : nil
 
@@ -1175,6 +1183,7 @@ private struct WorkBoardCardItem: View {
             guard column == .doing else { return nil }
             if isDispatchPending { return "Waiting for a slot" }
             if isResolvingConflicts { return nil }
+            if isRemediatingCI { return nil }
             return liveState?.liveStatus
         }()
 
@@ -1223,6 +1232,7 @@ private struct WorkBoardCardItem: View {
                     showsCIAutoFixedBadge: model.showsCIAutoFixedBadge(forPR: task.prURL),
                     ciFailureBadge: model.ciFailureBadge(forPR: task.prURL),
                     isResolvingConflicts: isResolvingConflicts,
+                    isRemediatingCI: isRemediatingCI,
                     designDocState: designDocState,
                     onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } },
                     ciRequiredState: column == .review ? (task.ciRequiredState ?? "in_progress") : nil,
@@ -1368,6 +1378,11 @@ struct WorkBoardCardView: View {
     /// indicator instead so the user can tell at a glance what the
     /// active work is.
     var isResolvingConflicts: Bool = false
+    /// True when this card is in the Doing column because a CI-remediation
+    /// worker is actively running against it. Symmetric to
+    /// [[isResolvingConflicts]]; suppresses orange chrome and renders the
+    /// `"resolving CI failure"` badge instead.
+    var isRemediatingCI: Bool = false
     /// Resolved design-doc state for the parent project. Non-nil only
     /// for `kind=design` tasks whose parent project has populated
     /// `design_doc_*` columns. `nil` hides the affordance entirely.
@@ -1420,7 +1435,7 @@ struct WorkBoardCardView: View {
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        if task.status == "blocked" && !isResolvingConflicts {
+                        if task.status == "blocked" && !isResolvingConflicts && !isRemediatingCI {
                             Image(systemName: "lock.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
@@ -1462,6 +1477,8 @@ struct WorkBoardCardView: View {
                     }
                     if isResolvingConflicts {
                         ResolvingConflictsBadge()
+                    } else if isRemediatingCI {
+                        ResolvingCIFailureBadge()
                     } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
                         WorkStatusBadge(text: blockedText)
                     }
@@ -1588,7 +1605,7 @@ struct WorkBoardCardView: View {
         if isSelected {
             return Color.accentColor.opacity(0.08)
         }
-        if !isResolvingConflicts && task.status == "blocked" {
+        if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
             return Color.orange.opacity(0.08)
         }
         return Color(nsColor: .windowBackgroundColor)
@@ -1598,7 +1615,7 @@ struct WorkBoardCardView: View {
         if isSelected {
             return .accentColor
         }
-        if !isResolvingConflicts && task.status == "blocked" {
+        if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
             return .orange
         }
         return Color(nsColor: .separatorColor)
@@ -3178,6 +3195,28 @@ private struct ResolvingConflictsBadge: View {
         .clipShape(Capsule())
         .help("A worker is actively resolving a merge conflict on this PR.")
         .accessibilityLabel("Resolving merge conflict")
+    }
+}
+
+/// "resolving CI failure" PR-card chip. Rendered on cards routed to the
+/// Doing column because a CI-remediation worker is actively running
+/// against them. Symmetric to [[ResolvingConflictsBadge]] — same visual
+/// vocabulary, same orange tint, different icon and label.
+private struct ResolvingCIFailureBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.caption2)
+            Text("resolving CI failure")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.orange)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(Capsule())
+        .help("A worker is actively resolving a CI failure on this PR.")
+        .accessibilityLabel("Resolving CI failure")
     }
 }
 
