@@ -207,6 +207,9 @@ pub enum FrontendRequest {
     GetAttentionItem {
         id: String,
     },
+    ListAttentionItemsForWorkItem {
+        work_item_id: String,
+    },
     /// App self-identifies as the singleton app session. The engine
     /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
     /// engine's parent). After registration, `EngineRequest` events
@@ -838,6 +841,10 @@ pub enum FrontendEvent {
     },
     AttentionItemCreated {
         item: WorkAttentionItem,
+    },
+    AttentionItemsForWorkItemList {
+        work_item_id: String,
+        items: Vec<WorkAttentionItem>,
     },
     WorkItemDeleted {
         id: String,

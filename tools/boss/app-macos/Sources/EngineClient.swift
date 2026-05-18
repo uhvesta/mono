@@ -180,6 +180,9 @@ enum EngineEvent {
     /// registered engine counter and gauge, sorted by name. Drives the
     /// Metrics debug pane's initial load and its polling timer.
     case metricsListLiveResult(entries: [EngineMetric])
+    /// Response to `list_attention_items_for_work_item` — open and
+    /// resolved attention items for a given product/work-item id.
+    case attentionItemsForWorkItemList(workItemID: String, items: [WorkAttentionItem])
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -347,6 +350,13 @@ final class EngineClient: @unchecked Sendable {
         sendLine([
             "type": "get_work_tree",
             "product_id": productId,
+        ])
+    }
+
+    func sendListAttentionItemsForWorkItem(workItemID: String) {
+        sendLine([
+            "type": "list_attention_items_for_work_item",
+            "work_item_id": workItemID,
         ])
     }
 
@@ -1041,6 +1051,13 @@ final class EngineClient: @unchecked Sendable {
                 let raw = payload["entries"] as? [[String: Any]] ?? []
                 let entries = raw.compactMap(parseEngineMetric)
                 emit(.metricsListLiveResult(entries: entries))
+            case "attention_items_for_work_item_list":
+                let workItemID = payload["work_item_id"] as? String ?? ""
+                let raw = payload["items"] as? [[String: Any]] ?? []
+                let items = raw.compactMap(parseAttentionItem)
+                if !workItemID.isEmpty {
+                    emit(.attentionItemsForWorkItemList(workItemID: workItemID, items: items))
+                }
             default:
                 break
             }
@@ -1307,6 +1324,15 @@ final class EngineClient: @unchecked Sendable {
         )
     }
 
+
+    private func parseAttentionItem(_ payload: [String: Any]) -> WorkAttentionItem? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let item = try? JSONDecoder().decode(WorkAttentionItem.self, from: data)
+        else {
+            return nil
+        }
+        return item
+    }
 
     private func parseWorkItem(_ payload: [String: Any]) -> WorkItemPayload? {
         guard let itemType = payload["item_type"] as? String else {

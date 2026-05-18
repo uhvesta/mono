@@ -41,6 +41,9 @@ final class ChatViewModel: ObservableObject {
     /// these against the task/chore/project name maps to render
     /// "Blocked by <prereq title>" on gated cards.
     @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:]
+    /// Attention items keyed by work-item id (product id for external-tracker
+    /// items). Populated on product selection and on every workTree refresh.
+    @Published var attentionItemsByWorkItemID: [String: [WorkAttentionItem]] = [:]
     @Published var selectedWorkProductID: String? {
         didSet { invalidateWorkCache() }
     }
@@ -356,6 +359,12 @@ final class ChatViewModel: ObservableObject {
         return product(withID: productID)
     }
 
+    /// Unresolved attention items for the currently selected product.
+    var selectedProductOpenAttentionItems: [WorkAttentionItem] {
+        guard let productID = currentSelectedProductID else { return [] }
+        return (attentionItemsByWorkItemID[productID] ?? []).filter { $0.resolvedAt == nil }
+    }
+
     var selectedProject: WorkProject? {
         guard selectedProjectFilterIDs.count == 1,
               let projectID = selectedProjectFilterIDs.first else { return nil }
@@ -609,6 +618,7 @@ final class ChatViewModel: ObservableObject {
         refreshWorkSubscriptions()
         if isConnected {
             engine.sendGetWorkTree(productId: productID)
+            engine.sendListAttentionItemsForWorkItem(workItemID: productID)
         }
     }
 
@@ -1318,9 +1328,11 @@ final class ChatViewModel: ObservableObject {
                topic == workTopic(forProductID: selectedProductID)
             {
                 engine.sendGetWorkTree(productId: selectedProductID)
+                engine.sendListAttentionItemsForWorkItem(workItemID: selectedProductID)
             } else if let productId,
                       productId == currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productId)
+                engine.sendListAttentionItemsForWorkItem(workItemID: productId)
             }
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
@@ -1371,6 +1383,7 @@ final class ChatViewModel: ObservableObject {
             reconcileWorkSelection()
             refreshWorkSubscriptions()
             refreshDesignDocStates(for: projects)
+            engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
             workErrorMessage = nil
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
@@ -1512,6 +1525,8 @@ final class ChatViewModel: ObservableObject {
         case .ciRemediationExhausted(_, _, let prURL, let used, let budget):
             ciFailureBadges[prURL] = CiFailureBadge(state: .exhausted, attemptsUsed: used, budget: budget)
             engine.sendListCiRemediations(limit: 200)
+        case .attentionItemsForWorkItemList(let workItemID, let items):
+            attentionItemsByWorkItemID[workItemID] = items
         }
     }
 

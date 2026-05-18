@@ -4391,6 +4391,29 @@ async fn handle_frontend_connection(
                     );
                 }
             },
+            FrontendRequest::ListAttentionItemsForWorkItem { work_item_id } => {
+                match work_db.list_attention_items_for_work_item(&work_item_id) {
+                    Ok(items) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::AttentionItemsForWorkItemList {
+                                work_item_id,
+                                items,
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::RegisterAppSession => {
                 // Trust the peer if either:
                 //   (a) it matches the declared app pid exactly. The
