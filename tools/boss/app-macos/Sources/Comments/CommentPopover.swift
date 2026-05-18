@@ -54,8 +54,7 @@ struct CommentPopover: View {
     }
 
     private func cancel() {
-        layer.isShowingPopover = false
-        layer.pendingFirstChar = nil
         commentBody = ""
+        layer.cancelNewComment()
     }
 }

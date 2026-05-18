@@ -8,7 +8,7 @@ import SwiftUI
 /// loses all comments. This is intentional and surfaced to the user in
 /// the sidebar header.
 @MainActor
-final class CommentLayer: ObservableObject {
+final class CommentLayer: NSObject, ObservableObject {
     @Published var comments: [Comment] = []
     @Published var isShowingPopover: Bool = false
     @Published var pendingQuotedText: String = ""
@@ -16,41 +16,34 @@ final class CommentLayer: ObservableObject {
     @Published var pendingFirstChar: Character? = nil
     /// Quoted text of the comment just clicked in the sidebar; clears after the flash.
     @Published var flashingText: String? = nil
-    /// Bottom-left of the last selected character, in AppKit screen coordinates (y-up).
-    /// Nil when the selection anchor could not be determined; the popover falls back to
-    /// a fixed top-of-document position in that case.
-    @Published var selectionAnchorInScreen: CGPoint? = nil
 
     // NSEvent monitor tokens; stored nonisolated(unsafe) because the opaque Any
     // tokens are installed/removed only on the main actor.
     nonisolated(unsafe) private var keyMonitor: Any?
     nonisolated(unsafe) private var rightClickMonitor: Any?
-    nonisolated(unsafe) private var selectionObserver: NSObjectProtocol?
 
-    /// Anchor captured eagerly at selection-change time, while the text view still owns
-    /// NSTextInputContext. Read by requestNewComment rather than capturing at trigger time,
-    /// which is too late (first responder has moved to the key handler / menu / button).
-    private var cachedSelectionAnchor: CGPoint?
+    /// The NSTextView whose selection seeded the pending comment request.
+    /// Captured from NSTextView.didChangeSelectionNotification (the object is the text view).
+    /// Queried at present-time via firstRect(forCharacterRange:) — never cached as screen coords.
+    private weak var anchorTextView: NSTextView?
+
+    /// The live NSPopover, if one is currently visible.
+    private var activePopover: NSPopover?
 
     // MARK: - Monitor lifecycle
 
     func installMonitors() {
-        selectionObserver = NotificationCenter.default.addObserver(
-            forName: NSTextView.didChangeSelectionNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            MainActor.assumeIsolated {
-                // Only update while the popover is closed; the comment form's own
-                // NSTextView (SwiftUI TextEditor) would otherwise overwrite the anchor.
-                guard !self.isShowingPopover else { return }
-                self.cachedSelectionAnchor = self.captureSelectionAnchor()
-            }
-        }
+        // ObjC selector form avoids the @Sendable closure constraint on the block-based
+        // addObserver API, which would make `notification` a sending parameter and prevent
+        // capturing the non-Sendable NSTextView inside assumeIsolated.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(textViewSelectionDidChange(_:)),
+            name: NSTextView.didChangeSelectionNotification,
+            object: nil
+        )
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            // Extract Sendable values before crossing into the MainActor isolation context.
             let chars = event.charactersIgnoringModifiers
             let mods = event.modifierFlags
             let consume = MainActor.assumeIsolated {
@@ -60,8 +53,6 @@ final class CommentLayer: ObservableObject {
         }
         rightClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
             guard let self else { return event }
-            // Extract window and location; NSWindow/NSView are also not Sendable, but
-            // we wrap them so they stay on the main thread inside assumeIsolated.
             let loc = event.locationInWindow
             let win = event.window
             let consume = MainActor.assumeIsolated {
@@ -74,7 +65,22 @@ final class CommentLayer: ObservableObject {
     func removeMonitors() {
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
         if let m = rightClickMonitor { NSEvent.removeMonitor(m); rightClickMonitor = nil }
-        if let obs = selectionObserver { NotificationCenter.default.removeObserver(obs); selectionObserver = nil }
+        NotificationCenter.default.removeObserver(
+            self, name: NSTextView.didChangeSelectionNotification, object: nil)
+        activePopover?.close()
+    }
+
+    /// Called by NotificationCenter on the main thread when any NSTextView changes selection.
+    /// Using the ObjC selector form avoids @Sendable parameter constraints that prevent
+    /// capturing the non-Sendable NSTextView across a @Sendable closure boundary.
+    @objc nonisolated private func textViewSelectionDidChange(_ notification: Notification) {
+        let textView = notification.object as? NSTextView
+        MainActor.assumeIsolated { [weak self] in
+            guard let self, !self.isShowingPopover else { return }
+            // Only update while the popover is closed; the comment form's own
+            // NSTextView (CommentTextEditor) would otherwise overwrite the anchor.
+            self.anchorTextView = textView
+        }
     }
 
     // MARK: - Authoring
@@ -82,12 +88,22 @@ final class CommentLayer: ObservableObject {
     func requestNewComment(firstChar: Character? = nil) {
         pendingQuotedText = captureCurrentSelection() ?? ""
         pendingFirstChar = firstChar
-        // Prefer the anchor captured eagerly at selection-change time (while the
-        // text view still owned NSTextInputContext). Fall back to capturing now
-        // in case the caller skipped the selection path (e.g. toolbar button with
-        // no selection, or a future entry point that doesn't go through a monitor).
-        selectionAnchorInScreen = cachedSelectionAnchor ?? captureSelectionAnchor()
+
+        guard let (posRect, posView) = resolveAnchor() else { return }
+
+        let popover = NSPopover()
+        popover.contentViewController = NSHostingController(
+            rootView: CommentPopover(layer: self)
+        )
+        // Transient: clicks outside the popover dismiss it automatically, matching
+        // the previous SwiftUI .popover default behaviour.
+        popover.behavior = .transient
+        // NSPopover.delegate is weak; self outlives the popover so this is safe.
+        popover.delegate = self
+        activePopover = popover
         isShowingPopover = true
+
+        popover.show(relativeTo: posRect, of: posView, preferredEdge: .maxY)
     }
 
     func addComment(quoted: String, body: String) {
@@ -99,10 +115,15 @@ final class CommentLayer: ObservableObject {
             createdAt: Date()
         )
         comments.append(comment)
+        activePopover?.close()
+        activePopover = nil
         isShowingPopover = false
         pendingQuotedText = ""
         pendingFirstChar = nil
-        cachedSelectionAnchor = nil
+    }
+
+    func cancelNewComment() {
+        activePopover?.close()
     }
 
     func dismiss(_ comment: Comment) {
@@ -140,20 +161,37 @@ final class CommentLayer: ObservableObject {
         return false
     }
 
-    /// Returns the bottom-left of the last selected character in AppKit screen
-    /// coordinates (origin bottom-left of primary screen, y increases upward).
-    /// Returns nil if no text-input client or no selection is active.
-    private func captureSelectionAnchor() -> CGPoint? {
-        guard let client = NSTextInputContext.current?.client else { return nil }
-        let range = client.selectedRange()
-        guard range.length > 0, range.location != NSNotFound else { return nil }
-        let lastCharRange = NSRange(location: range.upperBound - 1, length: 1)
-        var actualRange = NSRange()
-        let screenRect = client.firstRect(forCharacterRange: lastCharRange, actualRange: &actualRange)
-        guard screenRect != .zero else { return nil }
-        // minY is the bottom edge of the glyph rect in AppKit screen coords (y-up),
-        // which becomes the anchor point just below the selected text.
-        return CGPoint(x: screenRect.minX, y: screenRect.minY)
+    /// Returns the positioning rect (in positioningView coords) and view for NSPopover,
+    /// queried fresh from anchorTextView at present-time. AppKit handles coordinate-space
+    /// conversions natively, so this works correctly across multiple displays.
+    /// Falls back to a rect near the top of the key window when no selection is available.
+    private func resolveAnchor() -> (NSRect, NSView)? {
+        if let tv = anchorTextView, let window = tv.window {
+            let range = tv.selectedRange()
+            if range.length > 0, range.location != NSNotFound {
+                let lastCharRange = NSRange(location: range.upperBound - 1, length: 1)
+                var actualRange = NSRange()
+                let screenRect = tv.firstRect(forCharacterRange: lastCharRange, actualRange: &actualRange)
+                if screenRect != .zero {
+                    // screen → window → text view coordinates; AppKit handles the conversion
+                    // correctly for any display arrangement without explicit screen lookup.
+                    let windowRect = window.convertFromScreen(screenRect)
+                    let viewRect = tv.convert(windowRect, from: nil)
+                    return (viewRect, tv)
+                }
+            }
+        }
+        // Fallback: anchor near the top-centre of the key window.
+        if let contentView = NSApp.keyWindow?.contentView {
+            let fallback = NSRect(
+                x: contentView.bounds.midX - 8,
+                y: contentView.bounds.maxY - 60,
+                width: 16,
+                height: 16
+            )
+            return (fallback, contentView)
+        }
+        return nil
     }
 
     /// Reads the selection via pasteboard copy. Acceptable Phase 1 trade-off:
@@ -210,6 +248,23 @@ final class CommentLayer: ObservableObject {
     }
 }
 
+// MARK: - NSPopoverDelegate
+
+extension CommentLayer: NSPopoverDelegate {
+    /// Called by AppKit when the popover finishes closing, whether by user dismissal or
+    /// programmatic close. Resets authoring state. The extension lives in the same file
+    /// so it can access private members directly.
+    nonisolated func popoverDidClose(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isShowingPopover = false
+            self.pendingFirstChar = nil
+            self.pendingQuotedText = ""
+            self.activePopover = nil
+        }
+    }
+}
+
 // MARK: - Menu action target
 
 private final class CommentMenuTarget: NSObject, @unchecked Sendable {
@@ -234,38 +289,15 @@ private final class CommentMenuTarget: NSObject, @unchecked Sendable {
 /// ```
 struct WithCommentsModifier: ViewModifier {
     @StateObject private var layer = CommentLayer()
-    /// Viewer's frame in SwiftUI global coordinates (top-left origin, y-down).
-    /// Updated via a background GeometryReader so we can translate screen-space
-    /// selection coordinates into view-local offset for the popover anchor.
-    @State private var viewFrameInGlobal: CGRect = .zero
 
     func body(content: Content) -> some View {
         let commentedTexts = layer.comments.map(\.quotedText).filter { !$0.isEmpty }
         let flashingText = layer.flashingText
 
         HStack(spacing: 0) {
-            ZStack(alignment: .topLeading) {
-                content
-                    .environment(\.commentedTexts, commentedTexts)
-                    .environment(\.commentFlashText, flashingText)
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear
-                                .onAppear { viewFrameInGlobal = geo.frame(in: .global) }
-                                .onChange(of: geo.frame(in: .global)) { _, newFrame in
-                                    viewFrameInGlobal = newFrame
-                                }
-                        }
-                    )
-
-                // Zero-size anchor for the popover; positioned near the text selection.
-                Color.clear
-                    .frame(width: 0, height: 0)
-                    .offset(popoverAnchorOffset())
-                    .popover(isPresented: $layer.isShowingPopover, arrowEdge: .top) {
-                        CommentPopover(layer: layer)
-                    }
-            }
+            content
+                .environment(\.commentedTexts, commentedTexts)
+                .environment(\.commentFlashText, flashingText)
 
             if !layer.comments.isEmpty {
                 Divider()
@@ -291,38 +323,6 @@ struct WithCommentsModifier: ViewModifier {
         }
         .onAppear { layer.installMonitors() }
         .onDisappear { layer.removeMonitors() }
-    }
-
-    /// Converts the stored AppKit screen-space selection anchor to a SwiftUI offset
-    /// relative to the viewer's top-leading corner, so the popover appears adjacent
-    /// to the selection rather than at the document's origin.
-    private func popoverAnchorOffset() -> CGSize {
-        guard let screenPt = layer.selectionAnchorInScreen,
-              let primaryScreen = NSScreen.screens.first,
-              viewFrameInGlobal != .zero else {
-            // Fallback when selection coordinates are unavailable.
-            return CGSize(width: 8, height: 48)
-        }
-
-        // AppKit screen coords: origin at bottom-left of primary screen, y increases upward.
-        // SwiftUI global coords: origin at top-left of primary screen, y increases downward.
-        let primaryH = primaryScreen.frame.height
-        let swiftuiX = screenPt.x
-        let swiftuiY = primaryH - screenPt.y
-
-        // Compute offset from the viewer's top-left to the selection anchor.
-        var dx = swiftuiX - viewFrameInGlobal.minX
-        var dy = swiftuiY - viewFrameInGlobal.minY
-
-        // Clamp horizontally so the ~320 pt wide popover stays within the view.
-        let popoverWidth: CGFloat = 320
-        let margin: CGFloat = 16
-        dx = max(0, min(dx, viewFrameInGlobal.width - popoverWidth - margin))
-
-        // Clamp vertically so the anchor stays within the view bounds.
-        dy = max(0, min(dy, viewFrameInGlobal.height - margin))
-
-        return CGSize(width: dx, height: dy)
     }
 
     private var addCommentButton: some View {
