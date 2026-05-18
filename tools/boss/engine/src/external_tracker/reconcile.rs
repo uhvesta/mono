@@ -1218,6 +1218,7 @@ mod tests {
                 name: "Test Product".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .expect("create product");
         db.set_product_external_tracker(
@@ -1236,6 +1237,7 @@ mod tests {
                 name: "Reverse Close Product".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .expect("create product");
         db.set_product_external_tracker(
@@ -1919,6 +1921,7 @@ mod tests {
                 name: "Unbound".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .expect("create product");
         let registry = TrackerRegistry::new();

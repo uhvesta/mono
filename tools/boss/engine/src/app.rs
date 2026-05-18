@@ -8452,6 +8452,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -8653,6 +8654,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -8777,6 +8779,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -8898,6 +8901,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9012,6 +9016,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9135,6 +9140,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9230,6 +9236,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9409,6 +9416,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9558,6 +9566,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9684,6 +9693,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9807,6 +9817,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9891,6 +9902,7 @@ mod tests {
                 name: "p".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -10192,6 +10204,7 @@ mod tests {
                 name: "Test".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/test.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -10296,6 +10309,7 @@ mod tests {
                 name: "Prod".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let item = WorkItem::Product(product_item);

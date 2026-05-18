@@ -169,6 +169,7 @@ mod tests {
             name: "test-product".to_owned(),
             description: None,
             repo_remote_url: Some("https://github.com/test/repo".to_owned()),
+            design_repo: None,
         })
         .unwrap()
         .id

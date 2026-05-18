@@ -7,6 +7,15 @@ pub struct Product {
     pub slug: String,
     pub description: String,
     pub repo_remote_url: Option<String>,
+    /// Optional override repo for `kind = 'design'` tasks on this
+    /// product. When set, design tasks resolve to this repo (the docs
+    /// site) instead of `repo_remote_url`. Implementation-kind tasks
+    /// (`task`, `chore`, `project_task`) are unaffected. Per-task
+    /// `--repo` overrides still win — this is a new middle layer in
+    /// the existing precedence chain. Stored canonicalised, same as
+    /// `repo_remote_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_repo: Option<String>,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
@@ -905,11 +914,15 @@ pub enum WorkItem {
     Chore(Task),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateProductInput {
     pub name: String,
     pub description: Option<String>,
     pub repo_remote_url: Option<String>,
+    /// See [`Product::design_repo`]. `None` → no override; design
+    /// tasks resolve through the standard chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1132,6 +1145,12 @@ pub struct WorkItemPatch {
     /// `Some("")` → clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_preamble: Option<String>,
+    /// Product-level design-task repo override. Only honoured on
+    /// product-targeted updates; ignored when patching a task /
+    /// chore / project. `None` → leave unchanged. `Some("")` →
+    /// clear (write NULL). Stored canonicalised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_repo: Option<String>,
     /// Flip the `autostart` flag. `None` → leave unchanged.
     /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1988,6 +2007,38 @@ mod tests {
         assert_eq!(product.default_model.as_deref(), Some("sonnet"));
         let encoded = serde_json::to_value(&product).unwrap();
         assert_eq!(encoded["default_model"], Value::String("sonnet".into()));
+    }
+
+    #[test]
+    fn product_decodes_without_design_repo() {
+        let raw = sample_product_json(json!({}));
+        let product: Product = serde_json::from_value(raw).unwrap();
+        assert!(product.design_repo.is_none());
+    }
+
+    #[test]
+    fn product_roundtrips_with_design_repo() {
+        let raw = sample_product_json(
+            json!({"design_repo": "https://github.com/linkedin-sandbox/bduff.git"}),
+        );
+        let product: Product = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            product.design_repo.as_deref(),
+            Some("https://github.com/linkedin-sandbox/bduff.git"),
+        );
+        let encoded = serde_json::to_value(&product).unwrap();
+        assert_eq!(
+            encoded["design_repo"],
+            Value::String("https://github.com/linkedin-sandbox/bduff.git".into()),
+        );
+    }
+
+    #[test]
+    fn product_skips_none_design_repo_on_encode() {
+        let product: Product = serde_json::from_value(sample_product_json(json!({}))).unwrap();
+        let encoded = serde_json::to_value(&product).unwrap();
+        let obj = encoded.as_object().unwrap();
+        assert!(!obj.contains_key("design_repo"));
     }
 
     #[test]

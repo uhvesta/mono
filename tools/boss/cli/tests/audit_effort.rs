@@ -79,6 +79,7 @@ async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> 
                 name: name.to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
+                design_repo: None,
             },
         })
         .await?

@@ -82,6 +82,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
             name: "Boss".to_owned(),
             description: Some("multi-agent coding manager".to_owned()),
             repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -230,6 +231,7 @@ async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
             name: "Priorities".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:priorities.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -327,6 +329,7 @@ async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
             description: None,
             // Product has no default repo — every chore here picks one.
             repo_remote_url: None,
+            design_repo: None,
         },
     )
     .await?;
@@ -426,6 +429,7 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
             name: "Multiplex".to_owned(),
             description: None,
             repo_remote_url: None,
+            design_repo: None,
         },
     )
     .await?;
@@ -480,6 +484,7 @@ async fn cli_status_update_propagates_to_subscriber_within_one_second() -> Resul
             name: "Live".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:live.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -566,6 +571,7 @@ async fn each_mutation_emits_one_invalidation() -> Result<()> {
             name: "Sequenced".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:sequenced.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -632,6 +638,7 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
             name: "Bindable".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:bindable.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -1053,6 +1060,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
             name: "Boss".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -1185,6 +1193,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
             name: "DepTest".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:deptest.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -1432,6 +1441,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
             name: "Boss".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -1616,6 +1626,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
             name: "Mono".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -1764,6 +1775,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
             name: "NoRepo".to_owned(),
             description: None,
             repo_remote_url: None,
+            design_repo: None,
         },
     )
     .await?;
@@ -1845,6 +1857,7 @@ async fn create_task_on_single_repo_product_stores_null_repo() -> Result<()> {
             name: "Boss".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -1924,6 +1937,7 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
             name: "Boss".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -2016,6 +2030,7 @@ async fn create_task_on_no_repo_product_without_override_is_rejected() -> Result
             name: "Greenfield".to_owned(),
             description: None,
             repo_remote_url: None,
+            design_repo: None,
         },
     )
     .await?;
@@ -2102,6 +2117,7 @@ async fn create_task_on_no_repo_product_with_override_stores_it() -> Result<()> 
             name: "Greenfield".to_owned(),
             description: None,
             repo_remote_url: None,
+            design_repo: None,
         },
     )
     .await?;
@@ -2178,6 +2194,7 @@ async fn product_dispatch_preamble_round_trip() -> Result<()> {
             name: "preamble-test".to_owned(),
             description: None,
             repo_remote_url: None,
+            design_repo: None,
         },
     )
     .await?;
@@ -2274,6 +2291,7 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
             name: "dup-test".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:foo/dup-test.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -2382,6 +2400,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
             name: "task-dup-test".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:foo/task-dup-test.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -2448,6 +2467,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
             name: "other-product".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:foo/other.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -2500,6 +2520,7 @@ async fn link_external_ref_stores_binding_and_is_findable() -> Result<()> {
             name: "Sync".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -2568,6 +2589,7 @@ async fn unlink_external_ref_clears_binding() -> Result<()> {
             name: "Unsync".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;

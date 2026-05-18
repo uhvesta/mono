@@ -122,6 +122,7 @@ async fn bind_then_show_renders_external_tracker_block() -> Result<()> {
             name: "Boss".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -192,6 +193,7 @@ async fn bind_with_reverse_close_flag_persists() -> Result<()> {
             name: "ReverseCloseProd".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -233,6 +235,7 @@ async fn missing_org_for_github_is_rejected() -> Result<()> {
             name: "NoBind".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -270,6 +273,7 @@ async fn missing_kind_without_unset_is_rejected() -> Result<()> {
             name: "NoKind".to_owned(),
             description: None,
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
