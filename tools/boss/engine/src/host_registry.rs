@@ -79,6 +79,36 @@ pub(crate) fn migrate_work_executions_host_columns(conn: &Connection) -> Result<
     Ok(())
 }
 
+/// Add the Phase 3 host attribution columns to `work_runs`. Per the
+/// design's "Storage Additions": `host_id` defaults to `'local'` so
+/// the existing local-only deployment is unaffected by the migration;
+/// `cube_workspace_id` and `remote_pid` are NULL for legacy rows and
+/// populated for new runs (the cube workspace id pair `(host_id,
+/// cube_workspace_id)` is the durable identity per Q8 of the design;
+/// `remote_pid` is the addressing key for Phase 4 signal delivery).
+pub(crate) fn migrate_work_runs_host_columns(conn: &Connection) -> Result<()> {
+    let cols = pragma_columns(conn, "work_runs")?;
+    if !cols.contains(&"host_id".to_owned()) {
+        conn.execute(
+            "ALTER TABLE work_runs ADD COLUMN host_id TEXT NOT NULL DEFAULT 'local'",
+            [],
+        )?;
+    }
+    if !cols.contains(&"cube_workspace_id".to_owned()) {
+        conn.execute(
+            "ALTER TABLE work_runs ADD COLUMN cube_workspace_id TEXT",
+            [],
+        )?;
+    }
+    if !cols.contains(&"remote_pid".to_owned()) {
+        conn.execute(
+            "ALTER TABLE work_runs ADD COLUMN remote_pid INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Ensure the `local` host row exists. Idempotent — the `INSERT OR IGNORE`
 /// is a no-op on subsequent engine starts.
 pub(crate) fn ensure_local_host(conn: &Connection) -> Result<()> {

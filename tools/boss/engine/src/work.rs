@@ -2950,7 +2950,10 @@ impl WorkDb {
                 artifacts_path TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
-                finished_at TEXT
+                finished_at TEXT,
+                host_id TEXT NOT NULL DEFAULT 'local',
+                cube_workspace_id TEXT,
+                remote_pid INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS work_runs_execution_idx
@@ -3082,6 +3085,10 @@ impl WorkDb {
         // Design: tools/boss/docs/designs/distributed-agent-execution-register-and-dispatch-to-remote-ssh-hosts.md
         crate::host_registry::migrate_host_registry_tables(&conn)?;
         crate::host_registry::migrate_work_executions_host_columns(&conn)?;
+        // Phase 3: add host_id / cube_workspace_id / remote_pid to work_runs
+        // so the macOS app (and run-failure paths) can see which host
+        // a run executed on.
+        crate::host_registry::migrate_work_runs_host_columns(&conn)?;
         crate::host_registry::ensure_local_host(&conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(&conn)?;
         conn.execute(

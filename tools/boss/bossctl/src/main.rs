@@ -330,7 +330,10 @@ enum MetricsAction {
 #[derive(Subcommand, Debug)]
 enum HostsAction {
     /// Register a new remote host. The host is enabled immediately and
-    /// persisted to `state.db`. No SSH connection is made in Phase 1.
+    /// persisted to `state.db`. Phase 3 eagerly pushes the
+    /// `boss-remote-run` wrapper to the host as part of registration;
+    /// pass `--skip-wrapper-push` to suppress that (offline / dry-run /
+    /// test fixtures).
     Add {
         /// Unique identifier for this host (e.g. `zakalwe`).
         id: String,
@@ -343,6 +346,11 @@ enum HostsAction {
         /// User-defined capability tags (e.g. `--tag os=macos --tag arch=arm64`).
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
+        /// Skip the eager wrapper push at registration. The host row
+        /// is still created. Use when the host is offline at
+        /// registration time; the lazy push at dispatch will catch up.
+        #[arg(long)]
+        skip_wrapper_push: bool,
         /// Override the Boss state-root directory.
         #[arg(long)]
         state_root: Option<PathBuf>,
@@ -564,9 +572,21 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     ssh_target,
                     pool_size,
                     tags,
+                    skip_wrapper_push,
                     state_root,
                 },
-        } => hosts_add(cli.json, state_root, id, ssh_target, pool_size, tags),
+        } => {
+            hosts_add(
+                cli.json,
+                state_root,
+                id,
+                ssh_target,
+                pool_size,
+                tags,
+                skip_wrapper_push,
+            )
+            .await
+        }
         Command::Hosts {
             action: HostsAction::List { enabled, state_root },
         } => hosts_list(cli.json, state_root, enabled),
@@ -2069,24 +2089,130 @@ fn open_hosts_db(state_root: Option<PathBuf>) -> Result<WorkDb> {
     WorkDb::open(db_path).context("opening state.db for hosts")
 }
 
-fn hosts_add(
+async fn hosts_add(
     json: bool,
     state_root: Option<PathBuf>,
     id: String,
     ssh_target: String,
     pool_size: i64,
     tags: Vec<String>,
+    skip_wrapper_push: bool,
 ) -> Result<()> {
     let db = open_hosts_db(state_root)?;
     let host = db.add_host(&id, &ssh_target, pool_size, &tags)?;
+
+    // Phase 3: eagerly push the wrapper unless suppressed. A push
+    // failure leaves the host row in place but disabled with the
+    // failure cause persisted, matching the design's "host that can't
+    // accept the wrapper is a host that can't run jobs" stance.
+    let push_outcome = if skip_wrapper_push {
+        None
+    } else {
+        Some(eager_push_wrapper(&db, &host.id, &ssh_target).await)
+    };
+
+    let host = db
+        .get_host(&host.id)?
+        .context("host disappeared after registration")?;
     let caps = db.list_host_capabilities(&host.id)?;
     if json {
-        println!("{}", host_to_json(&host, &caps));
+        let mut obj = host_to_json(&host, &caps);
+        if let Some(outcome) = push_outcome.as_ref() {
+            obj["wrapper_push"] = serde_json::to_value(outcome)
+                .unwrap_or_else(|_| serde_json::Value::Null);
+        }
+        println!("{}", obj);
     } else {
         println!("registered host {}", host.id);
         print_host_detail(&host, &caps);
+        if let Some(outcome) = push_outcome.as_ref() {
+            match outcome {
+                EagerPushOutcome::Ok { version } => {
+                    println!("wrapper push: ok (version {version})");
+                }
+                EagerPushOutcome::Skipped { reason } => {
+                    println!("wrapper push: skipped ({reason})");
+                }
+                EagerPushOutcome::Failed { kind, detail } => {
+                    println!(
+                        "wrapper push: failed ({kind}) — host disabled. \
+                         Fix the cause, then run `bossctl hosts probe {id}`.\n\
+                         detail: {detail}"
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum EagerPushOutcome {
+    Ok {
+        version: String,
+    },
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        /// One of `disk_full` / `permission_denied` / `connection_lost`
+        /// / `unclassified` (matches the design's Q6 subclass labels).
+        kind: String,
+        detail: String,
+    },
+}
+
+async fn eager_push_wrapper(
+    db: &WorkDb,
+    host_id: &str,
+    ssh_target: &str,
+) -> EagerPushOutcome {
+    use boss_engine::ssh_transport::{
+        SshTransport, default_control_socket_dir,
+    };
+    use boss_engine::wrapper_distribution::{push_wrapper, subclass_label};
+    use boss_engine::remote_wrapper::expected_version;
+
+    let Some(socket_dir) = default_control_socket_dir() else {
+        return EagerPushOutcome::Skipped {
+            reason: "HOME unset; cannot determine control-socket dir".to_owned(),
+        };
+    };
+    let transport = SshTransport::new(host_id, ssh_target, &socket_dir);
+
+    if let Err(err) = transport.open_control_master().await {
+        let detail = format!("opening ssh control master: {err:#}");
+        let _ = db.set_host_enabled(host_id, false);
+        return EagerPushOutcome::Failed {
+            kind: "connection_lost".to_owned(),
+            detail,
+        };
+    }
+
+    let outcome = push_wrapper(&transport).await;
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(err) => {
+            let _ = db.set_host_enabled(host_id, false);
+            return EagerPushOutcome::Failed {
+                kind: "unclassified".to_owned(),
+                detail: format!("wrapper push errored: {err:#}"),
+            };
+        }
+    };
+    match outcome {
+        boss_engine::wrapper_distribution::WrapperPushOutcome::Ok => EagerPushOutcome::Ok {
+            version: expected_version(),
+        },
+        boss_engine::wrapper_distribution::WrapperPushOutcome::Failed(kind, detail) => {
+            let _ = db.set_host_enabled(host_id, false);
+            EagerPushOutcome::Failed {
+                kind: subclass_label(&kind).to_owned(),
+                detail,
+            }
+        }
+    }
 }
 
 fn hosts_list(json: bool, state_root: Option<PathBuf>, only_enabled: bool) -> Result<()> {

@@ -595,6 +595,31 @@ impl ServerState {
             engine_binary_fingerprint = crate::build_info::binary_fingerprint(),
             "live_status: engine starting (build identity)",
         );
+        // Phase 3 of distributed-agent-execution: sweep stale
+        // OpenSSH ControlMaster sockets left behind by a previous
+        // engine run that crashed before `SshTransport::close`. Per
+        // the design's "Risks and Open Questions": this sweep is
+        // non-negotiable — without it, a stale socket file can
+        // prevent the next dispatch from binding a fresh master.
+        if let Some(dir) = crate::ssh_transport::default_control_socket_dir() {
+            match crate::ssh_transport::sweep_stale_control_sockets(&dir) {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        swept = n,
+                        dir = %dir.display(),
+                        "engine startup: swept stale ssh control sockets",
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        dir = %dir.display(),
+                        "engine startup: ssh control-socket sweep failed (non-fatal)",
+                    );
+                }
+            }
+        }
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
