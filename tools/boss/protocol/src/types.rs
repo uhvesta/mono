@@ -763,6 +763,22 @@ pub struct CiRemediation {
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// Discriminates the origin of this attempt:
+    /// `'pr_branch_ci'` — the PR's own required checks failed on the PR's
+    /// head SHA (the normal path). `'merge_queue_rebounce'` — the PR was
+    /// dequeued from GitHub's merge queue with `reason=FAILED_CHECKS` on a
+    /// synthetic merge commit; the PR's own CI is green.
+    /// `None` on rows written before this field existed (treated as
+    /// `'pr_branch_ci'`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    /// For `failure_kind='merge_queue_rebounce'`: the `beforeCommit.oid`
+    /// from the `RemovedFromMergeQueueEvent` — the synthetic merge SHA
+    /// that failed CI. Workers must fetch CI logs from this SHA, not from
+    /// the PR head (whose checks are green). `None` for `'pr_branch_ci'`
+    /// attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_commit_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2114,6 +2130,8 @@ mod tests {
             created_at: "1747000000".into(),
             started_at: Some("1747000010".into()),
             finished_at: Some("1747000100".into()),
+            failure_kind: Some("pr_branch_ci".into()),
+            before_commit_sha: None,
         };
         let raw = serde_json::to_value(&attempt).unwrap();
         let back: CiRemediation = serde_json::from_value(raw).unwrap();
@@ -2245,6 +2263,8 @@ mod tests {
             created_at: "1747000000".into(),
             started_at: None,
             finished_at: None,
+            failure_kind: None,
+            before_commit_sha: None,
         };
         let encoded = serde_json::to_value(&attempt).unwrap();
         let obj = encoded.as_object().unwrap();
@@ -2258,6 +2278,8 @@ mod tests {
             "worker_id",
             "started_at",
             "finished_at",
+            "failure_kind",
+            "before_commit_sha",
         ] {
             assert!(
                 !obj.contains_key(absent),

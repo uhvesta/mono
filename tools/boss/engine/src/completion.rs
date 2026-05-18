@@ -3586,6 +3586,8 @@ mod tests {
                 attempt_kind: "fix".into(),
                 consumes_budget: 1,
                 failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
             })
             .unwrap()
             .unwrap();
