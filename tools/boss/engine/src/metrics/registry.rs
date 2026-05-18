@@ -723,7 +723,7 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        assert_eq!(names.len(), 32, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 6 merge_poller + 10 external_tracker counters");
+        assert_eq!(names.len(), 34, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 6 merge_poller + 12 external_tracker counters");
         // Phase 3: dep_unblock gauge.
         let gauge_names: Vec<_> = registry
             .gauge_snapshots()
