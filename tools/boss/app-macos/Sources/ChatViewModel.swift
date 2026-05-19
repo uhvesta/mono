@@ -1136,6 +1136,51 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// `true` while a user-initiated engine restart is running. The
+    /// unreachable banner binds its "Restart engine" button to the
+    /// inverse so a second click can't queue another terminate +
+    /// relaunch on top of the first one (issue #697).
+    @Published private(set) var isRestartingEngine = false
+
+    /// User-initiated recovery from the unreachable banner. Terminates
+    /// the engine the pid file points at (token-auth shutdown RPC
+    /// first, then SIGTERM/SIGKILL — same path `stop()` uses) and
+    /// relaunches it. The `EngineClient` reconnect loop picks the new
+    /// socket up automatically once it accepts.
+    ///
+    /// Routes the terminate+launch through the same background queue
+    /// `startIfNeeded()` uses so the main thread never blocks on
+    /// `terminateEngine`'s up-to-5s SIGKILL wait. `isRestartingEngine`
+    /// drives the banner button's `.disabled` state.
+    func restartEngine() {
+        guard !isRestartingEngine else { return }
+        isRestartingEngine = true
+
+        let processController = self.processController
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var restartError: Error?
+            do {
+                try processController.restart()
+            } catch {
+                restartError = error
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isRestartingEngine = false
+                if let restartError {
+                    self.appendSystemMessage(
+                        "Failed to restart engine: \(restartError.localizedDescription)",
+                        alwaysShow: true
+                    )
+                }
+                // Make sure the EngineClient is started even if the
+                // very first `startIfNeeded()` failed before launching
+                // it (autostart=0 paths also flow through here).
+                self.startEngineIfNeeded()
+            }
+        }
+    }
+
     func refreshWork() {
         guard isConnected else { return }
         engine.sendListProducts()

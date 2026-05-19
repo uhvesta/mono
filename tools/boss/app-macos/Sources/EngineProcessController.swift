@@ -294,6 +294,42 @@ final class EngineProcessController: @unchecked Sendable {
         emit("[engine stop] terminated pid=\(pid)")
     }
 
+    /// User-initiated recovery for a stale engine: terminate whatever
+    /// engine is bound to the pid file (token-auth RPC first, then
+    /// SIGTERM/SIGKILL — same authority `stop()` uses) and relaunch
+    /// from the same binary `start()` would. Used by the "Restart
+    /// engine" affordance on the unreachable banner so a hung or
+    /// orphaned engine no longer requires a shell `pkill` (issue #697).
+    ///
+    /// Holds the start lock for the whole terminate + launch sequence
+    /// so a concurrent `start()` can't race and end up with two
+    /// engines fighting over the same socket. Safe to call when no
+    /// engine is running — falls through to the launch step.
+    func restart() throws {
+        try withStartLock {
+            if let pid = currentEnginePID() {
+                emit("[engine restart] terminating existing engine pid=\(pid)")
+                terminateEngine(pid: pid)
+                clearPIDFileIfOwned(pid: pid)
+                // The engine itself unlinks its socket on graceful
+                // exit, and the new engine's bind step will retry-
+                // delete any leftover. Wait briefly for the socket
+                // to drop so the new bind doesn't trip the unlink
+                // race in `UnixListener::bind`.
+                _ = waitForSocketClose(socketPath: paths.socketPath, timeoutSeconds: 3.0)
+            }
+
+            let socketPath = paths.socketPath
+            let (command, bossBinDir) = resolveEngineCommand(socketPath: socketPath)
+            try launchDetached(command: command, bossBinDir: bossBinDir)
+            if let pid = waitForEnginePID(timeoutSeconds: 5.0) {
+                emit("[engine restart] detached pid=\(pid) \(command)")
+            } else {
+                emit("[engine restart] started but pid file not observed yet: \(paths.pidPath)")
+            }
+        }
+    }
+
     private func launchDetached(command: String, bossBinDir: String? = nil) throws {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
