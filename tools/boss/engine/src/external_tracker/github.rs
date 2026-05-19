@@ -92,15 +92,11 @@ pub(crate) trait GhRunner: Send + Sync {
         fields: &[(&str, &str)],
     ) -> std::result::Result<GhResponse, GhRunnerError>;
 
-    /// Run `gh api -X POST <path> -f k=v ...` and return parsed JSON body.
-    ///
-    /// Repeating a field name produces a JSON array, matching `gh api`'s
-    /// native semantics. E.g. `[("labels", "tracked")]` posts
-    /// `{"labels": ["tracked"]}`.
+    /// Run `gh api -X POST <path> --input -` with a JSON body and return parsed JSON body.
     async fn rest_post(
         &self,
         path: &str,
-        fields: &[(&str, &str)],
+        body: &serde_json::Value,
     ) -> std::result::Result<GhResponse, GhRunnerError>;
 }
 
@@ -210,21 +206,29 @@ impl GhRunner for CommandGhRunner {
     async fn rest_post(
         &self,
         path: &str,
-        fields: &[(&str, &str)],
+        body: &serde_json::Value,
     ) -> std::result::Result<GhResponse, GhRunnerError> {
+        use tokio::io::AsyncWriteExt as _;
+        let stdin_bytes = serde_json::to_vec(body)
+            .map_err(|e| GhRunnerError::transient(format!("failed to serialize POST body: {e}")))?;
         let mut cmd = Command::new("gh");
-        cmd.args(["api", "-X", "POST", path]);
-        for (k, v) in fields {
-            cmd.args(["-f", &format!("{k}={v}")]);
-        }
-        let output = cmd
-            .stdin(Stdio::null())
+        cmd.args(["api", "-X", "POST", "--input", "-", path])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
             .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&stdin_bytes).await.map_err(|e| {
+                GhRunnerError::transient(format!("failed to write POST body: {e}"))
+            })?;
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| GhRunnerError::transient(format!("failed to wait for gh: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -880,9 +884,9 @@ impl ExternalTracker for GitHubTracker {
             .unwrap_or(&config.repo);
 
         let path = format!("repos/{}/issues/{}/labels", repo_with_owner, issue_number);
-        let fields = [("labels", label)];
+        let body = serde_json::json!({ "labels": [label] });
 
-        match self.runner.rest_post(&path, &fields).await {
+        match self.runner.rest_post(&path, &body).await {
             Ok(_) => Ok(()),
             // 404: issue deleted or never existed; treat as no-op success
             // so a label-add failure can't block reconciliation forever.
@@ -1015,7 +1019,7 @@ mod tests {
         async fn rest_post(
             &self,
             _path: &str,
-            _fields: &[(&str, &str)],
+            _body: &serde_json::Value,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
             self.rest_post_q
                 .lock()
