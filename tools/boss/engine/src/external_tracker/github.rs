@@ -760,6 +760,58 @@ impl ExternalTracker for GitHubTracker {
         }
     }
 
+    async fn post_closing_pr_comment(
+        &self,
+        ctx: &TrackerContext,
+        ref_: &UpstreamRef,
+        pr_url: &str,
+    ) -> Result<()> {
+        let config = GitHubConfig::from_ctx(ctx)?;
+        let issue_number = ref_
+            .raw
+            .get("issue_number")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                TrackerError::ConfigInvalid(
+                    "upstream ref missing 'issue_number' in raw blob".to_owned(),
+                )
+            })?;
+
+        let comments_path = format!(
+            "repos/{}/{}/issues/{}/comments",
+            config.org, config.repo, issue_number
+        );
+
+        // Idempotency: skip if any existing comment already mentions this PR URL.
+        match self.runner.rest_get(&comments_path).await {
+            Ok(resp) => {
+                if let Some(comments) = resp.body.as_array() {
+                    let already_present = comments.iter().any(|c| {
+                        c.get("body")
+                            .and_then(|b| b.as_str())
+                            .map(|b| b.contains(pr_url))
+                            .unwrap_or(false)
+                    });
+                    if already_present {
+                        return Ok(());
+                    }
+                }
+            }
+            // Issue deleted or inaccessible — nothing to comment on.
+            Err(e) if e.http_status == Some(404) => return Ok(()),
+            Err(e) => return Err(map_write_error(e)),
+        }
+
+        let comment_text = format!("Closed by {pr_url}");
+        let comment_body = serde_json::json!({ "body": comment_text });
+        match self.runner.rest_post(&comments_path, &comment_body).await {
+            Ok(_) => Ok(()),
+            // Issue gone between the GET and POST — treat as success.
+            Err(e) if e.http_status == Some(404) => Ok(()),
+            Err(e) => Err(map_write_error(e)),
+        }
+    }
+
     async fn set_project_status(
         &self,
         ctx: &TrackerContext,

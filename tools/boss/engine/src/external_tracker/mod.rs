@@ -235,6 +235,30 @@ pub trait ExternalTracker: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Post a comment on an upstream issue referencing the PR that closed it.
+    ///
+    /// Called by the reconciler immediately after `close_issue` succeeds, so
+    /// that the issue's timeline shows which PR drove the close.
+    ///
+    /// Implementations MUST be idempotent: if the same `pr_url` is already
+    /// present in an existing comment on the issue, do NOT post a duplicate.
+    ///
+    /// The default no-op is correct for trackers where PR linkage is handled
+    /// automatically (e.g. via PR-body `Closes #N` syntax) or that have no
+    /// comment concept.
+    ///
+    /// Error classification: same as `close_issue`.  A failure here is
+    /// non-fatal: the issue is already closed; only the linkage comment is
+    /// missing.
+    async fn post_closing_pr_comment(
+        &self,
+        _ctx: &TrackerContext,
+        _ref_: &UpstreamRef,
+        _pr_url: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────

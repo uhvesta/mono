@@ -368,6 +368,8 @@ struct CloseCandidate {
     work_item_id: String,
     upstream_ref: UpstreamRef,
     trigger: CloseTrigger,
+    /// PR URL to reference in the closing comment on the issue, if known.
+    pr_url: Option<String>,
 }
 
 /// Carries intent to call `set_project_status` (Behavior 6) after all
@@ -628,6 +630,19 @@ async fn process_product(
                         "Behavior 5: upstream issue closed after merged PR"
                     );
                 }
+                if let Some(ref pr_url) = candidate.pr_url {
+                    if let Err(e) = tracker
+                        .post_closing_pr_comment(ctx, &candidate.upstream_ref, pr_url)
+                        .await
+                    {
+                        warn!(
+                            work_item_id = %candidate.work_item_id,
+                            canonical_id = %candidate.upstream_ref.canonical_id,
+                            error = %e,
+                            "post_closing_pr_comment failed (non-fatal); PR linkage comment will be missing"
+                        );
+                    }
+                }
             }
             Err(TrackerError::NotFound(_)) => {
                 // Issue already closed (404). Treat as success.
@@ -834,10 +849,16 @@ async fn reconcile_existing(
             //   (a) merged PR detected in upstream associations, OR
             //   (b) boss is already done with a pr_url (retry from prior failed close)
             if has_merged_pr || (boss_is_done && boss_has_pr) {
+                let pr_url = if has_merged_pr {
+                    pick_best_pr(&upstream.pr_associations).map(|p| p.pr_url.clone())
+                } else {
+                    task.pr_url.clone()
+                };
                 close_candidates.push(CloseCandidate {
                     work_item_id: work_item_id.clone(),
                     upstream_ref: upstream.upstream_ref.clone(),
                     trigger: CloseTrigger::PrMerge,
+                    pr_url,
                 });
             } else if reverse_close && boss_is_done {
                 // Behavior 3: boss done without a merged PR driving the
@@ -847,6 +868,7 @@ async fn reconcile_existing(
                     work_item_id: work_item_id.clone(),
                     upstream_ref: upstream.upstream_ref.clone(),
                     trigger: CloseTrigger::ReverseClose,
+                    pr_url: task.pr_url.clone(),
                 });
             }
 
