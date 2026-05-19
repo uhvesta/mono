@@ -94,6 +94,22 @@ impl LiveWorkerStateRegistry {
             .cloned()
     }
 
+    /// Return the `run_id` of the non-terminal slot currently working on
+    /// `work_item_id`, or `None` if no such slot exists. Used by the
+    /// chore-update notification path to locate the worker that needs to
+    /// hear about an in-flight spec change.
+    pub fn run_id_for_work_item(&self, work_item_id: &str) -> Option<String> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .by_slot
+            .values()
+            .find(|state| {
+                !is_terminal_activity(state.activity)
+                    && state.work_item_id.as_deref() == Some(work_item_id)
+            })
+            .map(|state| state.run_id.clone())
+    }
+
     /// True iff a live state entry exists for `run_id` whose activity
     /// indicates the worker is still attached to the slot. Used by
     /// `RequestExecution` to detect "the latest execution is
@@ -607,6 +623,51 @@ mod tests {
         assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Errored);
         // Idempotent.
         assert!(!reg.mark_errored(1));
+    }
+
+    #[test]
+    fn run_id_for_work_item_finds_live_binding() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(
+            3,
+            "exec-42",
+            "claude-opus-4-7",
+            99,
+            Some(WorkItemBinding {
+                work_item_id: "chore_abc".into(),
+                work_item_name: "My chore".into(),
+                execution_id: "exec-42".into(),
+            }),
+        );
+        assert_eq!(
+            reg.run_id_for_work_item("chore_abc").as_deref(),
+            Some("exec-42")
+        );
+        assert!(reg.run_id_for_work_item("chore_other").is_none());
+    }
+
+    #[test]
+    fn run_id_for_work_item_ignores_terminal_slots() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(
+            1,
+            "exec-dead",
+            "claude-opus-4-7",
+            10,
+            Some(WorkItemBinding {
+                work_item_id: "chore_xyz".into(),
+                work_item_name: "Terminated chore".into(),
+                execution_id: "exec-dead".into(),
+            }),
+        );
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionEnd {
+                session_id: "s".into(),
+                reason: "exit".into(),
+            },
+        );
+        assert!(reg.run_id_for_work_item("chore_xyz").is_none());
     }
 
     #[test]

@@ -3973,6 +3973,15 @@ async fn handle_frontend_connection(
                 // applies. We only care about task/chore — products and
                 // projects have no execution lifecycle.
                 let previous_task_status = task_status_for_id(&work_db, &id);
+                // Capture name+description before the update so the
+                // chore-update worker notification can report old → new.
+                // Only read when the patch touches these fields to avoid
+                // an unconditional DB round-trip on status-only patches.
+                let previous_spec = if patch.name.is_some() || patch.description.is_some() {
+                    task_name_description_for_id(&work_db, &id)
+                } else {
+                    None
+                };
                 // Bug #679: when the patch is a kanban drag-to-Doing
                 // (a task/chore transitioning from non-active to
                 // `active`) and dispatch would deterministically fail
@@ -4175,6 +4184,47 @@ async fn handle_frontend_connection(
                                     .with_details(details),
                                 )
                                 .await;
+                        }
+                        // If the name or description of an active chore
+                        // changed, notify the bound worker. The worker may
+                        // be mid-flight on the old spec; this notice lets it
+                        // adapt without a human manually sending the update.
+                        // Fire-and-forget: a failed send (worker pane gone,
+                        // app session not registered) must not roll back the
+                        // DB update. Two rapid edits may produce two notices
+                        // in sequence — that's acceptable per the acceptance
+                        // criteria.
+                        if let Some((old_name, old_description)) = previous_spec {
+                            if let Some(run_id) = active_chore_run_id(&server_state, &item) {
+                                let (new_name, new_description) = match &item {
+                                    WorkItem::Task(t) | WorkItem::Chore(t) => {
+                                        (t.name.clone(), t.description.clone())
+                                    }
+                                    _ => unreachable!(
+                                        "active_chore_run_id only returns Some for tasks/chores"
+                                    ),
+                                };
+                                if let Some(msg) = build_chore_update_message(
+                                    &old_name,
+                                    &new_name,
+                                    &old_description,
+                                    &new_description,
+                                ) {
+                                    let server_for_notify = server_state.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = server_for_notify
+                                            .send_input_to_worker(&run_id, msg)
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                ?err,
+                                                %run_id,
+                                                "chore-update: failed to notify live worker",
+                                            );
+                                        }
+                                    });
+                                }
+                            }
                         }
                         let revision = publish_work_invalidation(
                             &server_state,
@@ -7331,6 +7381,63 @@ fn in_review_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Option<String
             None
         }
     }
+}
+
+/// Return `(name, description)` for a task/chore id, or `None` when
+/// the id does not name a task/chore or cannot be read from the DB.
+/// Used by the `UpdateWorkItem` handler to snapshot the spec before an
+/// edit so the chore-update worker notification can show old vs. new.
+fn task_name_description_for_id(work_db: &WorkDb, id: &str) -> Option<(String, String)> {
+    match work_db.get_work_item(id) {
+        Ok(WorkItem::Task(t)) | Ok(WorkItem::Chore(t)) => Some((t.name, t.description)),
+        Ok(_) => None,
+        Err(_) => None,
+    }
+}
+
+/// Return the `run_id` of the live worker currently bound to `item`
+/// when `item` is an active task/chore with a non-terminal registry
+/// entry. Returns `None` for products/projects, for statuses other than
+/// `active`, and when no live worker slot carries this item's id.
+fn active_chore_run_id(server_state: &ServerState, item: &WorkItem) -> Option<String> {
+    let task = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        _ => return None,
+    };
+    if task.status != "active" {
+        return None;
+    }
+    server_state
+        .live_worker_states
+        .run_id_for_work_item(&task.id)
+}
+
+/// Build the `[chore-update]` notice text. Returns `None` when neither
+/// name nor description actually changed (so the caller can skip the
+/// send).
+fn build_chore_update_message(
+    old_name: &str,
+    new_name: &str,
+    old_description: &str,
+    new_description: &str,
+) -> Option<String> {
+    if old_name == new_name && old_description == new_description {
+        return None;
+    }
+    let mut changes = Vec::new();
+    if old_name != new_name {
+        changes.push(format!("- name: \"{}\" → \"{}\"", old_name, new_name));
+    }
+    if old_description != new_description {
+        changes.push(format!(
+            "- description: \"{}\" → \"{}\"",
+            old_description, new_description
+        ));
+    }
+    let body = changes.join("\n");
+    Some(format!(
+        "[chore-update] The chore you're working on was edited.\nField changes:\n{body}\nPlease re-read the spec and adjust your in-flight work to match. If the change invalidates work you've already done, surface that in your final response.\n"
+    ))
 }
 
 /// Read the trailing `lines` lines of `transcript_path`. Returns the
@@ -10662,5 +10769,223 @@ mod tests {
             in_review_chore_execution(&db, &item).is_none(),
             "must return None for non-task work items"
         );
+    }
+
+    // --- chore-update notification helpers ---
+
+    #[test]
+    fn build_chore_update_message_returns_none_when_nothing_changed() {
+        assert!(
+            build_chore_update_message("Same name", "Same name", "Same desc", "Same desc")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_chore_update_message_includes_name_diff() {
+        let msg = build_chore_update_message("old name", "new name", "desc", "desc")
+            .expect("should produce a message");
+        assert!(msg.contains("[chore-update]"), "must contain the tag");
+        assert!(msg.contains("old name"), "must contain the old name");
+        assert!(msg.contains("new name"), "must contain the new name");
+        assert!(
+            !msg.contains("description"),
+            "must not mention description when it is unchanged"
+        );
+    }
+
+    #[test]
+    fn build_chore_update_message_includes_description_diff() {
+        let msg =
+            build_chore_update_message("name", "name", "old description", "new description")
+                .expect("should produce a message");
+        assert!(msg.contains("[chore-update]"));
+        assert!(msg.contains("old description"));
+        assert!(msg.contains("new description"));
+    }
+
+    #[test]
+    fn build_chore_update_message_includes_both_when_both_change() {
+        let msg =
+            build_chore_update_message("old name", "new name", "old desc", "new desc")
+                .expect("should produce a message when both fields change");
+        assert!(msg.contains("old name"));
+        assert!(msg.contains("new name"));
+        assert!(msg.contains("old desc"));
+        assert!(msg.contains("new desc"));
+    }
+
+    #[test]
+    fn active_chore_run_id_returns_none_for_todo_chore() {
+        use boss_protocol::WorkItemPatch;
+        let state = test_server_state();
+        let (db, _, chore_id) = make_work_db_with_chore();
+        // Default status is todo (autostart=true makes it active in
+        // make_work_db_with_chore, but let's force todo here).
+        let _ = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch {
+                    status: Some("todo".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let item = db.get_work_item(&chore_id).unwrap();
+        assert!(
+            active_chore_run_id(&state, &item).is_none(),
+            "todo chore should return None (not active)"
+        );
+    }
+
+    #[test]
+    fn active_chore_run_id_returns_none_when_no_live_worker() {
+        use boss_protocol::WorkItemPatch;
+        let state = test_server_state();
+        let (db, _, chore_id) = make_work_db_with_chore();
+        let item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch {
+                    status: Some("active".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // No worker registered — live_worker_states is empty.
+        assert!(
+            active_chore_run_id(&state, &item).is_none(),
+            "active chore with no live worker should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn chore_update_notify_sends_message_to_live_worker() {
+        // End-to-end smoke for the notification path: sets up a live
+        // worker bound to an active chore, then simulates the
+        // UpdateWorkItem name-change flow and verifies a SendToPane
+        // message is enqueued toward the app session.
+        use boss_protocol::{WorkItemBinding, WorkItemPatch};
+
+        let server_state = test_server_state();
+        let (db, _, chore_id) = make_work_db_with_chore();
+
+        // Put the chore in active status.
+        let active_item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch {
+                    status: Some("active".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Register a live worker slot for this chore.
+        let run_id = "exec-notify-test";
+        server_state
+            .worker_registry
+            .register_run_slot(run_id, 4);
+        server_state.live_worker_states.register_spawn(
+            4,
+            run_id,
+            "claude-opus-4-7",
+            9999,
+            Some(WorkItemBinding {
+                work_item_id: chore_id.clone(),
+                work_item_name: "Test chore".into(),
+                execution_id: run_id.into(),
+            }),
+        );
+
+        // Register an app session to capture the outgoing SendToPane.
+        let app_sink = make_session_sink();
+        server_state
+            .register_app_session("session-app".into(), app_sink.clone())
+            .await;
+
+        // Simulate the pre-update snapshot.
+        let chore_task = match &active_item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            _ => panic!("expected task/chore"),
+        };
+        let old_name = chore_task.name.clone();
+        let old_description = chore_task.description.clone();
+
+        // Build and apply the update with a name change.
+        let updated_item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch {
+                    name: Some("Updated chore name".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Exercise the notification logic inline (mirrors the handler).
+        let (new_name, new_description) = match &updated_item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => (t.name.clone(), t.description.clone()),
+            _ => panic!("expected task/chore"),
+        };
+        let msg = build_chore_update_message(
+            &old_name,
+            &new_name,
+            &old_description,
+            &new_description,
+        )
+        .expect("name changed — message should be produced");
+
+        let resolved_run = active_chore_run_id(&server_state, &updated_item)
+            .expect("active chore with live worker should resolve a run_id");
+
+        let server_clone = server_state.clone();
+        let msg_clone = msg.clone();
+        let run_clone = resolved_run.clone();
+        let send = tokio::spawn(async move {
+            server_clone
+                .send_input_to_worker(&run_clone, msg_clone)
+                .await
+        });
+
+        // Drain the app session: expect a SendToPane EngineRequest.
+        let envelope = app_sink
+            .next()
+            .await
+            .expect("SendToPane should be enqueued on the app sink");
+        let (request_id, request) = match envelope.payload {
+            FrontendEvent::EngineRequest {
+                request_id,
+                request,
+            } => (request_id, request),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        match &request {
+            EngineToAppRequest::SendToPane(input) => {
+                assert_eq!(input.slot_id, 4);
+                assert!(
+                    input.text.contains("[chore-update]"),
+                    "message must contain [chore-update] tag"
+                );
+                assert!(
+                    input.text.contains("Updated chore name"),
+                    "message must mention the new name"
+                );
+            }
+            other => panic!("expected SendToPane, got {other:?}"),
+        }
+
+        // Reply success so the spawned task can complete.
+        server_state
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+
+        send.await.expect("send task").expect("send ok");
     }
 }
