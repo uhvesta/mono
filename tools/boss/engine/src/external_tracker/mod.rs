@@ -215,6 +215,26 @@ pub trait ExternalTracker: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Attach a label to an upstream item.
+    ///
+    /// Called by the reconciler after importing a fresh upstream item, so
+    /// that humans browsing the upstream tracker can see at a glance which
+    /// issues Boss is mirroring.  The default no-op is correct for trackers
+    /// that have no label concept.
+    ///
+    /// Implementations MUST be idempotent: attaching an already-present
+    /// label is success.
+    ///
+    /// Error classification: same as `close_issue`.
+    async fn add_label(
+        &self,
+        _ctx: &TrackerContext,
+        _ref_: &UpstreamRef,
+        _label: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────

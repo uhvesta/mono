@@ -126,6 +126,20 @@ crate::register_counter!(
     "external_tracker.in_progress_set_failed",
     "set_project_status calls that failed when a task moved to active (Behavior 6).",
 );
+crate::register_counter!(
+    TRACKED_LABEL_ATTACH_SUCCEEDED,
+    "external_tracker.tracked_label_attach_succeeded",
+    "add_label calls that succeeded when a fresh upstream item was imported.",
+);
+crate::register_counter!(
+    TRACKED_LABEL_ATTACH_FAILED,
+    "external_tracker.tracked_label_attach_failed",
+    "add_label calls that failed when a fresh upstream item was imported.",
+);
+
+/// Label that the reconciler attaches to upstream items it has imported,
+/// so users browsing the upstream tracker can see which issues Boss mirrors.
+const TRACKED_LABEL: &str = "tracked";
 
 /// Register all reconciler metrics with the engine's registry.
 /// Must be called from `metrics::init_all`.
@@ -144,6 +158,8 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&SKIP_NO_CREDENTIAL);
     registry.register_counter(&IN_PROGRESS_SET_SUCCEEDED);
     registry.register_counter(&IN_PROGRESS_SET_FAILED);
+    registry.register_counter(&TRACKED_LABEL_ATTACH_SUCCEEDED);
+    registry.register_counter(&TRACKED_LABEL_ATTACH_FAILED);
 }
 
 // ── Outcome ───────────────────────────────────────────────────────────────────
@@ -170,6 +186,10 @@ pub struct PassOutcome {
     pub in_progress_set_succeeded: usize,
     /// Behavior 6: set_project_status calls that failed when a task moved to active.
     pub in_progress_set_failed: usize,
+    /// Behavior 7: tracked-label add_label calls that succeeded on import.
+    pub tracked_label_attach_succeeded: usize,
+    /// Behavior 7: tracked-label add_label calls that failed on import.
+    pub tracked_label_attach_failed: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -261,6 +281,8 @@ pub fn spawn_loop(
                 || outcome.items_unbound > 0
                 || outcome.in_progress_set_succeeded > 0
                 || outcome.in_progress_set_failed > 0
+                || outcome.tracked_label_attach_succeeded > 0
+                || outcome.tracked_label_attach_failed > 0
             {
                 tracing::info!(
                     products_processed = outcome.products_processed,
@@ -273,6 +295,8 @@ pub fn spawn_loop(
                     items_unbound = outcome.items_unbound,
                     in_progress_set_succeeded = outcome.in_progress_set_succeeded,
                     in_progress_set_failed = outcome.in_progress_set_failed,
+                    tracked_label_attach_succeeded = outcome.tracked_label_attach_succeeded,
+                    tracked_label_attach_failed = outcome.tracked_label_attach_failed,
                     "external tracker reconciler: pass complete",
                 );
             }
@@ -520,7 +544,10 @@ async fn process_product(
                         }
                     }
                 } else {
-                    import_new(work_db, product_id, item, outcome, metrics, publisher).await;
+                    import_new(
+                        work_db, tracker, ctx, product_id, item, outcome, metrics, publisher,
+                    )
+                    .await;
                 }
             }
             Err(e) => {
@@ -854,6 +881,8 @@ async fn reconcile_existing(
 /// issues).
 async fn import_new(
     work_db: &WorkDb,
+    tracker: &dyn ExternalTracker,
+    ctx: &TrackerContext,
     product_id: &str,
     upstream: &UpstreamItem,
     outcome: &mut PassOutcome,
@@ -927,6 +956,34 @@ async fn import_new(
         canonical_id = %upstream.upstream_ref.canonical_id,
         "imported new upstream item as Boss chore"
     );
+
+    // Behavior 7: attach the `tracked` label so humans browsing the upstream
+    // tracker can see which issues Boss is mirroring. Skip the API call when
+    // the label is already present; failures are logged but never block import.
+    if upstream.labels.iter().any(|l| l == TRACKED_LABEL) {
+        return;
+    }
+    match tracker.add_label(ctx, &upstream.upstream_ref, TRACKED_LABEL).await {
+        Ok(()) => {
+            TRACKED_LABEL_ATTACH_SUCCEEDED.inc(metrics);
+            outcome.tracked_label_attach_succeeded += 1;
+            info!(
+                work_item_id = %chore.id,
+                canonical_id = %upstream.upstream_ref.canonical_id,
+                "Behavior 7: tracked label attached to upstream item"
+            );
+        }
+        Err(e) => {
+            TRACKED_LABEL_ATTACH_FAILED.inc(metrics);
+            outcome.tracked_label_attach_failed += 1;
+            warn!(
+                work_item_id = %chore.id,
+                canonical_id = %upstream.upstream_ref.canonical_id,
+                error = %e,
+                "Behavior 7: add_label failed; import continues, will retry on next sync of this item only if re-imported"
+            );
+        }
+    }
 }
 
 /// Pick the best PR to use as the `pr_url`: prefer merged (highest `merged_at`),
@@ -1008,6 +1065,8 @@ mod tests {
         close_calls: Mutex<Vec<String>>,
         set_project_status_responses: Mutex<VecDeque<crate::external_tracker::Result<()>>>,
         set_project_status_calls: Mutex<Vec<String>>,
+        add_label_responses: Mutex<VecDeque<crate::external_tracker::Result<()>>>,
+        add_label_calls: Mutex<Vec<(String, String)>>,
     }
 
     impl SpyTracker {
@@ -1019,6 +1078,8 @@ mod tests {
                 close_calls: Mutex::new(Vec::new()),
                 set_project_status_responses: Mutex::new(VecDeque::new()),
                 set_project_status_calls: Mutex::new(Vec::new()),
+                add_label_responses: Mutex::new(VecDeque::new()),
+                add_label_calls: Mutex::new(Vec::new()),
             })
         }
 
@@ -1081,6 +1142,18 @@ mod tests {
         fn set_project_status_calls(&self) -> Vec<String> {
             self.set_project_status_calls.lock().unwrap().clone()
         }
+
+        fn push_add_label_transient(self: &Arc<Self>) -> &Arc<Self> {
+            self.add_label_responses
+                .lock()
+                .unwrap()
+                .push_back(Err(TrackerError::Transient("network error".to_owned())));
+            self
+        }
+
+        fn add_label_calls(&self) -> Vec<(String, String)> {
+            self.add_label_calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1138,6 +1211,20 @@ mod tests {
                 .unwrap()
                 .push(ref_.canonical_id.clone());
             let next = self.set_project_status_responses.lock().unwrap().pop_front();
+            next.unwrap_or(Ok(()))
+        }
+
+        async fn add_label(
+            &self,
+            _ctx: &TrackerContext,
+            ref_: &UpstreamRef,
+            label: &str,
+        ) -> crate::external_tracker::Result<()> {
+            self.add_label_calls
+                .lock()
+                .unwrap()
+                .push((ref_.canonical_id.clone(), label.to_owned()));
+            let next = self.add_label_responses.lock().unwrap().pop_front();
             next.unwrap_or(Ok(()))
         }
     }
@@ -1297,6 +1384,133 @@ mod tests {
         let (pid, _wid, reason) = &calls[0];
         assert_eq!(pid, &product.id, "product_id should match");
         assert_eq!(reason, "chore_created", "reason should be chore_created");
+    }
+
+    // ── Test: tracked label attach (Behavior 7) ───────────────────────────────
+
+    #[tokio::test]
+    async fn import_attaches_tracked_label_to_upstream() {
+        let db = in_memory_db();
+        setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![open_item(50, "Fresh issue")]);
+        let registry = spy_registry(tracker.clone());
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert_eq!(outcome.items_imported, 1);
+        assert_eq!(outcome.tracked_label_attach_succeeded, 1);
+        assert_eq!(outcome.tracked_label_attach_failed, 0);
+        let calls = tracker.add_label_calls();
+        assert_eq!(
+            calls,
+            vec![("spy#50".to_owned(), "tracked".to_owned())],
+            "add_label should be called once with the tracked label"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_skips_add_label_when_already_present_upstream() {
+        let db = in_memory_db();
+        setup_product_with_tracker(&db);
+        let mut item = open_item(51, "Already labelled issue");
+        item.labels.push("tracked".to_owned());
+        let tracker = SpyTracker::new(vec![item]);
+        let registry = spy_registry(tracker.clone());
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert_eq!(outcome.items_imported, 1);
+        assert_eq!(
+            outcome.tracked_label_attach_succeeded, 0,
+            "should not count an attach when label already present"
+        );
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "add_label must not be called when 'tracked' is already in upstream.labels"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_succeeds_even_when_add_label_fails_transiently() {
+        let db = in_memory_db();
+        setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![open_item(52, "Unlucky issue")]);
+        tracker.push_add_label_transient();
+        let registry = spy_registry(tracker.clone());
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        // Import itself must still succeed.
+        assert_eq!(outcome.items_imported, 1);
+        assert_eq!(outcome.tracked_label_attach_succeeded, 0);
+        assert_eq!(outcome.tracked_label_attach_failed, 1);
+        let chore = db
+            .find_by_external_ref("spy", "spy#52")
+            .expect("query ok")
+            .expect("chore should exist despite label failure");
+        assert_eq!(chore.status, "todo");
+    }
+
+    #[tokio::test]
+    async fn add_label_not_called_for_closed_at_first_sight() {
+        let db = in_memory_db();
+        setup_product_with_tracker(&db);
+        let tracker = SpyTracker::new(vec![closed_item(53)]);
+        let registry = spy_registry(tracker.clone());
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "add_label must not be called when an item is skipped at first sight"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_label_not_called_for_existing_bound_item() {
+        // A subsequent reconcile pass over an item we already imported must
+        // NOT re-attach the label — that would clobber the user's intent if
+        // they had removed it manually.
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        // Seed a Boss chore already bound to upstream spy#54.
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already bound".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .expect("create chore");
+        db.set_external_ref(&chore.id, "spy", "spy#54", &json!({ "issue_number": 54 }))
+            .expect("set_external_ref");
+
+        let tracker = SpyTracker::new(vec![open_item(54, "Already bound issue")]);
+        let registry = spy_registry(tracker.clone());
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "add_label must not fire on a reconcile-only pass"
+        );
     }
 
     // ── Test: skip already-closed at first sight ──────────────────────────────

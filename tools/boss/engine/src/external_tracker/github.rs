@@ -91,6 +91,17 @@ pub(crate) trait GhRunner: Send + Sync {
         path: &str,
         fields: &[(&str, &str)],
     ) -> std::result::Result<GhResponse, GhRunnerError>;
+
+    /// Run `gh api -X POST <path> -f k=v ...` and return parsed JSON body.
+    ///
+    /// Repeating a field name produces a JSON array, matching `gh api`'s
+    /// native semantics. E.g. `[("labels", "tracked")]` posts
+    /// `{"labels": ["tracked"]}`.
+    async fn rest_post(
+        &self,
+        path: &str,
+        fields: &[(&str, &str)],
+    ) -> std::result::Result<GhResponse, GhRunnerError>;
 }
 
 // ── CommandGhRunner (production) ──────────────────────────────────────────────
@@ -193,6 +204,36 @@ impl GhRunner for CommandGhRunner {
 
         let body = serde_json::from_slice(&output.stdout)
             .map_err(|e| GhRunnerError::transient(format!("failed to parse PATCH response: {e}")))?;
+        Ok(GhResponse { body })
+    }
+
+    async fn rest_post(
+        &self,
+        path: &str,
+        fields: &[(&str, &str)],
+    ) -> std::result::Result<GhResponse, GhRunnerError> {
+        let mut cmd = Command::new("gh");
+        cmd.args(["api", "-X", "POST", path]);
+        for (k, v) in fields {
+            cmd.args(["-f", &format!("{k}={v}")]);
+        }
+        let output = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let status = parse_http_status_from_stderr(&stderr).unwrap_or(0);
+            return Err(GhRunnerError::with_status(status, stderr.trim().to_owned()));
+        }
+
+        let body = serde_json::from_slice(&output.stdout)
+            .map_err(|e| GhRunnerError::transient(format!("failed to parse POST response: {e}")))?;
         Ok(GhResponse { body })
     }
 }
@@ -811,6 +852,44 @@ impl ExternalTracker for GitHubTracker {
         check_graphql_errors(&mutation_result)?;
         Ok(())
     }
+
+    async fn add_label(
+        &self,
+        ctx: &TrackerContext,
+        ref_: &UpstreamRef,
+        label: &str,
+    ) -> Result<()> {
+        let config = GitHubConfig::from_ctx(ctx)?;
+        let issue_number = ref_
+            .raw
+            .get("issue_number")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                TrackerError::ConfigInvalid(
+                    "upstream ref missing 'issue_number' in raw blob".to_owned(),
+                )
+            })?;
+
+        // The repo lives in the canonical_id ("owner/repo#number") rather
+        // than the config, because GitHub Projects items can reference
+        // issues across repos in the same org. Parse it back out.
+        let repo_with_owner = ref_
+            .canonical_id
+            .split_once('#')
+            .map(|(r, _)| r)
+            .unwrap_or(&config.repo);
+
+        let path = format!("repos/{}/issues/{}/labels", repo_with_owner, issue_number);
+        let fields = [("labels", label)];
+
+        match self.runner.rest_post(&path, &fields).await {
+            Ok(_) => Ok(()),
+            // 404: issue deleted or never existed; treat as no-op success
+            // so a label-add failure can't block reconciliation forever.
+            Err(e) if e.http_status == Some(404) => Ok(()),
+            Err(e) => Err(map_write_error(e)),
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -830,6 +909,7 @@ mod tests {
         graphql_q: Mutex<VecDeque<std::result::Result<Value, GhRunnerError>>>,
         rest_get_q: Mutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
         rest_patch_q: Mutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
+        rest_post_q: Mutex<VecDeque<std::result::Result<GhResponse, GhRunnerError>>>,
     }
 
     impl FakeGhRunner {
@@ -838,6 +918,7 @@ mod tests {
                 graphql_q: Mutex::new(VecDeque::new()),
                 rest_get_q: Mutex::new(VecDeque::new()),
                 rest_patch_q: Mutex::new(VecDeque::new()),
+                rest_post_q: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -874,6 +955,19 @@ mod tests {
 
         fn push_rest_patch_err(&mut self, status: u16, msg: &str) -> &mut Self {
             self.rest_patch_q
+                .get_mut()
+                .unwrap()
+                .push_back(Err(GhRunnerError::with_status(status, msg)));
+            self
+        }
+
+        fn push_rest_post_ok(&mut self, v: Value) -> &mut Self {
+            self.rest_post_q.get_mut().unwrap().push_back(Ok(GhResponse { body: v }));
+            self
+        }
+
+        fn push_rest_post_err(&mut self, status: u16, msg: &str) -> &mut Self {
+            self.rest_post_q
                 .get_mut()
                 .unwrap()
                 .push_back(Err(GhRunnerError::with_status(status, msg)));
@@ -916,6 +1010,18 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("no rest_patch response queued")
+        }
+
+        async fn rest_post(
+            &self,
+            _path: &str,
+            _fields: &[(&str, &str)],
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            self.rest_post_q
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("no rest_post response queued")
         }
     }
 
@@ -1539,6 +1645,71 @@ mod tests {
             .await
             .expect_err("should fail on 5xx");
         assert!(matches!(err, TrackerError::Transient(_)), "{err:?}");
+    }
+
+    // ── add_label ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_label_succeeds_on_200() {
+        let mut fake = FakeGhRunner::new();
+        // GitHub returns the resulting label set on success.
+        fake.push_rest_post_ok(json!([{"name": "tracked"}]));
+        let tracker = GitHubTracker::with_runner(fake);
+        tracker
+            .add_label(&github_ctx(), &issue_ref(560), "tracked")
+            .await
+            .expect("add_label should succeed");
+    }
+
+    #[tokio::test]
+    async fn add_label_treats_404_as_success() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_rest_post_err(404, "Not Found (HTTP 404)");
+        let tracker = GitHubTracker::with_runner(fake);
+        tracker
+            .add_label(&github_ctx(), &issue_ref(999), "tracked")
+            .await
+            .expect("404 should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn add_label_returns_permission_denied_on_403() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_rest_post_err(403, "Forbidden (HTTP 403)");
+        let tracker = GitHubTracker::with_runner(fake);
+        let err = tracker
+            .add_label(&github_ctx(), &issue_ref(560), "tracked")
+            .await
+            .expect_err("should fail on 403");
+        assert!(matches!(err, TrackerError::PermissionDenied(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn add_label_returns_transient_on_5xx() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_rest_post_err(503, "Service Unavailable (HTTP 503)");
+        let tracker = GitHubTracker::with_runner(fake);
+        let err = tracker
+            .add_label(&github_ctx(), &issue_ref(560), "tracked")
+            .await
+            .expect_err("should fail on 5xx");
+        assert!(matches!(err, TrackerError::Transient(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn add_label_returns_config_invalid_on_missing_issue_number() {
+        let ref_without_number = UpstreamRef {
+            kind: "github".to_owned(),
+            canonical_id: "spinyfin/mono#1".to_owned(),
+            raw: json!({}), // no issue_number
+        };
+        let fake = FakeGhRunner::new();
+        let tracker = GitHubTracker::with_runner(fake);
+        let err = tracker
+            .add_label(&github_ctx(), &ref_without_number, "tracked")
+            .await
+            .expect_err("should fail when issue_number missing");
+        assert!(matches!(err, TrackerError::ConfigInvalid(_)), "{err:?}");
     }
 
     // ── parse_iso8601 ──────────────────────────────────────────────────────────
