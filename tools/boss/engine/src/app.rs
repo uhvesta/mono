@@ -28,8 +28,9 @@ use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_mer
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, InterruptWorkerPaneInput,
-    ReleaseWorkerPaneInput, RequestExecutionInput, SendToPaneInput, TOPIC_WORK_PRODUCTS,
-    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic, work_product_topic,
+    ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput,
+    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic,
+    work_product_topic,
 };
 use crate::work::{DuplicateTaskError, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
 use crate::worker_registry::WorkerRegistry;
@@ -538,6 +539,23 @@ pub enum SendInputError {
 pub enum InterruptPaneError {
     #[error("no worker pane mapped for that run id")]
     UnknownRun,
+    #[error("app reported error: {0:?}")]
+    App(EngineToAppError),
+    #[error(transparent)]
+    Send(#[from] SendToAppError),
+    #[error("app returned unexpected response: {0}")]
+    ResponseKindMismatch(String),
+}
+
+/// Surfaced by [`ServerState::reveal_work_item`]. Separates
+/// id-resolution failures from app-side / transport failures so
+/// `bossctl reveal` can produce a precise error.
+#[derive(Debug, thiserror::Error)]
+pub enum RevealItemError {
+    #[error("no work item found for id: {0}")]
+    NotFound(String),
+    #[error("work item {0} is deleted")]
+    Deleted(String),
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -1127,6 +1145,41 @@ impl ServerState {
             }
             Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(InterruptPaneError::Send(err)),
+        }
+    }
+
+    /// Resolve `id` (short-form `T607` or canonical) to a work item
+    /// and ask the app to scroll the kanban to that card and play a
+    /// short transient highlight. Returns the canonical id on success
+    /// so `bossctl reveal` can confirm what was highlighted.
+    pub async fn reveal_work_item(&self, id: &str) -> Result<String, RevealItemError> {
+        let item = self
+            .work_db
+            .get_work_item_resolving_short_id(id)
+            .map_err(|_| RevealItemError::NotFound(id.to_owned()))?
+            .ok_or_else(|| RevealItemError::NotFound(id.to_owned()))?;
+        let canonical_id = match &item {
+            crate::work::WorkItem::Task(t) | crate::work::WorkItem::Chore(t) => {
+                if t.deleted_at.is_some() {
+                    return Err(RevealItemError::Deleted(id.to_owned()));
+                }
+                t.id.clone()
+            }
+            crate::work::WorkItem::Project(p) => p.id.clone(),
+            crate::work::WorkItem::Product(p) => p.id.clone(),
+        };
+        let product_id = work_item_product_id(&item);
+        let request = EngineToAppRequest::RevealWorkItem(RevealWorkItemInput {
+            work_item_id: canonical_id.clone(),
+            product_id,
+        });
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::RevealWorkItem { result: Ok(_) }) => Ok(canonical_id),
+            Ok(EngineToAppResponse::RevealWorkItem { result: Err(err) }) => {
+                Err(RevealItemError::App(err))
+            }
+            Ok(other) => Err(RevealItemError::ResponseKindMismatch(format!("{other:?}"))),
+            Err(err) => Err(RevealItemError::Send(err)),
         }
     }
 
@@ -4808,6 +4861,51 @@ async fn handle_frontend_connection(
                             &request_id,
                             FrontendEvent::WorkError {
                                 message: format!("interrupt_worker_pane: {err}"),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::RevealWorkItem { id } => {
+                // `bossctl reveal` is a coordinator verb for navigating
+                // the macOS app to a specific work item's card. Same
+                // authority tier as `focus_worker_pane` — it's a UI
+                // steering RPC invoked from the Boss pane or app shell.
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                    tracing::warn!(
+                        peer_pid = ?peer_pid,
+                        id = %id,
+                        "reveal_work_item rejected: caller not in app/Boss subtree",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            message: "reveal_work_item requires app or Boss authority".to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                match server_state.reveal_work_item(&id).await {
+                    Ok(canonical_id) => {
+                        tracing::info!(
+                            id = %id,
+                            canonical_id = %canonical_id,
+                            "reveal_work_item: card highlighted",
+                        );
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkItemRevealed { id: canonical_id },
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, id = %id, "reveal_work_item failed");
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("reveal_work_item: {err}"),
                             },
                         );
                     }

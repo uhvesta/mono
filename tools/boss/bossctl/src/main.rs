@@ -129,6 +129,14 @@ enum Command {
         #[command(subcommand)]
         action: HostsAction,
     },
+    /// Scroll the kanban in the macOS app to a work item's card and
+    /// play a short transient highlight. Accepts a short id (`T607`)
+    /// or a canonical id. Returns an error when the app is not
+    /// running, the item is deleted, or the id is unknown.
+    Reveal {
+        /// Work item to reveal: short id (`T607`) or canonical id.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -614,6 +622,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Hosts {
             action: HostsAction::Remove { id, state_root },
         } => hosts_remove(cli.json, state_root, id),
+        Command::Reveal { id } => reveal_work_item(&cli.socket_path, cli.json, id).await,
     }
 }
 
@@ -1169,6 +1178,38 @@ async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected focus: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn reveal_work_item(
+    socket_path: &Option<String>,
+    json: bool,
+    id: String,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::RevealWorkItem { id: id.clone() })
+        .await
+        .context("sending RevealWorkItem")?;
+    match response {
+        FrontendEvent::WorkItemRevealed { id: canonical_id } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "revealed",
+                        "id": canonical_id,
+                    })
+                );
+            } else {
+                println!("revealed {canonical_id}");
+            }
+            Ok(())
+        }
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected reveal: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }

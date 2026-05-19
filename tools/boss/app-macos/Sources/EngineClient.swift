@@ -76,12 +76,22 @@ enum EngineInterruptResult: Sendable {
     case failure(EngineInterruptError)
 }
 
+enum EngineRevealError: Sendable {
+    case internalFailure(String)
+}
+
+enum EngineRevealResult: Sendable {
+    case success
+    case failure(EngineRevealError)
+}
+
 enum EngineRequestKind: Sendable {
     case spawnWorkerPane(EngineSpawnRequest)
     case releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32)
     case sendToPane(slotId: Int, text: String)
     case focusWorkerPane(slotId: Int)
     case interruptWorkerPane(slotId: Int)
+    case revealWorkItem(workItemId: String, productId: String)
 }
 
 enum EngineEvent {
@@ -640,6 +650,24 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendRevealWorkItemResponse(requestId: String, result: EngineRevealResult) {
+        let resultPayload: [String: Any]
+        switch result {
+        case .success:
+            resultPayload = ["Ok": [String: Any]()]
+        case .failure(let error):
+            resultPayload = ["Err": revealEngineToAppErrorPayload(error)]
+        }
+        sendLine([
+            "type": "engine_response",
+            "request_id": requestId,
+            "response": [
+                "kind": "reveal_work_item",
+                "result": resultPayload,
+            ],
+        ])
+    }
+
     private func engineToAppErrorPayload(_ error: EngineSpawnError) -> [String: Any] {
         switch error {
         case .noAvailableSlot:
@@ -682,6 +710,13 @@ final class EngineClient: @unchecked Sendable {
         switch error {
         case .unknownSlot:
             return ["kind": "unknown_slot"]
+        case .internalFailure(let message):
+            return ["kind": "internal", "message": message]
+        }
+    }
+
+    private func revealEngineToAppErrorPayload(_ error: EngineRevealError) -> [String: Any] {
+        switch error {
         case .internalFailure(let message):
             return ["kind": "internal", "message": message]
         }
@@ -922,6 +957,13 @@ final class EngineClient: @unchecked Sendable {
                     emit(.engineRequest(
                         requestId: requestId,
                         request: .interruptWorkerPane(slotId: slotId)
+                    ))
+                case "reveal_work_item":
+                    let workItemId = request["work_item_id"] as? String ?? ""
+                    let productId = request["product_id"] as? String ?? ""
+                    emit(.engineRequest(
+                        requestId: requestId,
+                        request: .revealWorkItem(workItemId: workItemId, productId: productId)
                     ))
                 default:
                     emit(.error(message:"engine_request unknown kind: \(kind)"))

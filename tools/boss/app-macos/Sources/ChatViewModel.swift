@@ -60,6 +60,21 @@ final class ChatViewModel: ObservableObject {
         didSet { invalidateWorkCache() }
     }
     @Published var selectedWorkCardID: String?
+    /// Task id that the reveal animation is currently highlighting.
+    /// Set by `revealWorkCard`; cleared after 1.5 s. Views observe
+    /// this to apply a transient border-glow overlay on the matching
+    /// card.
+    @Published var revealHighlightID: String?
+    /// Task id that scroll views should bring into the visible area.
+    /// Set by `revealWorkCard`; cleared after a short delay once the
+    /// scroll has been triggered. Views observe this via `.onChange`
+    /// on their `ScrollViewReader` proxies.
+    @Published var revealScrollTarget: String?
+    /// Task id whose card should be scrolled to once its product's
+    /// work tree arrives. Used when a reveal crosses a product
+    /// boundary — `revealWorkCard` sets this and the `workTree`
+    /// event handler promotes it to `revealScrollTarget`.
+    var pendingRevealScrollID: String?
     @Published var workBoardGrouping: WorkBoardGrouping = .none {
         didSet { invalidateWorkCache() }
     }
@@ -673,6 +688,41 @@ final class ChatViewModel: ObservableObject {
         selectedWorkCardID = taskID
         guard let taskID, let task = task(withID: taskID) else { return }
         selectedWorkProductID = task.productID
+    }
+
+    /// Navigate the kanban to `taskID` and play a 1.5 s highlight.
+    /// Switches to the Work tab, selects the task's product, clears
+    /// project filters, and queues a scroll. If the task's product is
+    /// not the one currently loaded, the scroll is deferred until the
+    /// `workTree` event for that product arrives.
+    func revealWorkCard(_ taskID: String, productID: String) {
+        setNavigationMode(.work)
+        selectedProjectFilterIDs = []
+        selectedWorkCardID = taskID
+        let isProductSwitch = currentSelectedProductID != productID
+        if isProductSwitch {
+            selectWorkProduct(productID)
+            pendingRevealScrollID = taskID
+        } else {
+            triggerRevealScroll(taskID)
+        }
+        revealHighlightID = taskID
+        let capturedID = taskID
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            if self?.revealHighlightID == capturedID {
+                self?.revealHighlightID = nil
+            }
+        }
+    }
+
+    private func triggerRevealScroll(_ taskID: String) {
+        revealScrollTarget = taskID
+        let capturedID = taskID
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            if self?.revealScrollTarget == capturedID {
+                self?.revealScrollTarget = nil
+            }
+        }
     }
 
     func setWorkBoardGrouping(_ grouping: WorkBoardGrouping) {
@@ -1316,6 +1366,9 @@ final class ChatViewModel: ObservableObject {
                     ))
                 }
                 engine.sendInterruptWorkerPaneResponse(requestId: requestId, result: result)
+            case .revealWorkItem(let workItemId, let productId):
+                revealWorkCard(workItemId, productID: productId)
+                engine.sendRevealWorkItemResponse(requestId: requestId, result: .success)
             }
         case .disconnected:
             isConnected = false
@@ -1385,6 +1438,13 @@ final class ChatViewModel: ObservableObject {
             refreshDesignDocStates(for: projects)
             engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
             workErrorMessage = nil
+            if let pending = pendingRevealScrollID {
+                let allIDs = Set(tasks.map(\.id) + chores.map(\.id))
+                if allIDs.contains(pending) {
+                    pendingRevealScrollID = nil
+                    triggerRevealScroll(pending)
+                }
+            }
         case .workItemCreated(let item):
             handleCreatedWorkItem(item)
         case .workItemUpdated(let item):

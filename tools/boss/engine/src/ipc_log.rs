@@ -98,6 +98,7 @@ fn request_kind(req: &EngineToAppRequest) -> &'static str {
         EngineToAppRequest::SendToPane(_) => "send_to_pane",
         EngineToAppRequest::FocusWorkerPane(_) => "focus_worker_pane",
         EngineToAppRequest::InterruptWorkerPane(_) => "interrupt_worker_pane",
+        EngineToAppRequest::RevealWorkItem(_) => "reveal_work_item",
     }
 }
 
@@ -108,6 +109,7 @@ fn response_kind(resp: &EngineToAppResponse) -> &'static str {
         EngineToAppResponse::SendToPane { .. } => "send_to_pane",
         EngineToAppResponse::FocusWorkerPane { .. } => "focus_worker_pane",
         EngineToAppResponse::InterruptWorkerPane { .. } => "interrupt_worker_pane",
+        EngineToAppResponse::RevealWorkItem { .. } => "reveal_work_item",
     }
 }
 

@@ -298,7 +298,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         EngineToAppResponse::ReleaseWorkerPane { .. }
         | EngineToAppResponse::SendToPane { .. }
         | EngineToAppResponse::FocusWorkerPane { .. }
-        | EngineToAppResponse::InterruptWorkerPane { .. } => {
+        | EngineToAppResponse::InterruptWorkerPane { .. }
+        | EngineToAppResponse::RevealWorkItem { .. } => {
             return Err(StartWorkerError::ResponseKindMismatch);
         }
     };
