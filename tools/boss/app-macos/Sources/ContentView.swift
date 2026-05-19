@@ -1664,7 +1664,7 @@ struct WorkBoardCardView: View {
                     if showsCIAutoFixedBadge {
                         CIAutoFixedBadge()
                     }
-                    if let ciFailureBadge {
+                    if let ciFailureBadge, !isRemediatingCI {
                         CIFailureChip(badge: ciFailureBadge)
                     }
                     if let repoChip {
