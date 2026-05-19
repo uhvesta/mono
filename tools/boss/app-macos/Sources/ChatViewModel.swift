@@ -115,6 +115,20 @@ final class ChatViewModel: ObservableObject {
     /// first opened in this session.
     @Published var engineSettings: [EngineSetting] = []
 
+    /// Engine-side configuration health issues sourced from
+    /// `get_engine_health` at session start. Empty means the engine
+    /// is healthy. Non-empty drives the top-of-window
+    /// `EngineHealthBanner` and the Settings-pane warning so a
+    /// missing `ANTHROPIC_API_KEY` (or any later "missing config"
+    /// surface) is impossible to miss (#699).
+    @Published var engineHealthIssues: [EngineHealthIssue] = []
+    /// Top-level mirror of the same `get_engine_health` reply. Surfaced
+    /// in the Settings pane next to the (future) API-key field so
+    /// "key set" / "key missing" is legible without parsing the
+    /// `issues` list. `true` until the engine answers at least once,
+    /// so the banner doesn't flash on a transient reconnect.
+    @Published var engineAnthropicApiKeyPresent: Bool = true
+
     /// Engine metrics snapshot — every registered counter and gauge —
     /// sourced from `metrics_list_live` on Metrics pane open and
     /// refreshed by the pane's 5-second polling timer. Empty until the
@@ -314,6 +328,14 @@ final class ChatViewModel: ObservableObject {
     /// snapshot. Called by the Settings window on appear.
     func refreshSettings() {
         engine.sendGetSettings()
+    }
+
+    /// Ask the engine for a fresh engine-health snapshot. Also called
+    /// on every reconnect from the `.connected` arm of `handle`; this
+    /// wrapper exists so the Settings pane can re-poll on appear
+    /// without exposing the private `engine` field.
+    func refreshEngineHealth() {
+        engine.sendGetEngineHealth()
     }
 
     /// Toggle one per-installation setting. Optimistically patches the
@@ -1311,6 +1333,10 @@ final class ChatViewModel: ObservableObject {
             engine.sendListProducts()
             engine.sendListWorkerLiveStates()
             engine.sendListLiveStatusDisabledSlots()
+            // Pull the engine's configuration health on every (re)connect
+            // so the top-of-window banner reflects the *current* engine,
+            // not the one we attached to before a restart (#699).
+            engine.sendGetEngineHealth()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
@@ -1507,6 +1533,9 @@ final class ChatViewModel: ObservableObject {
                     enabled: enabled
                 )
             }
+        case .engineHealthResult(let apiKeyPresent, let issues):
+            engineAnthropicApiKeyPresent = apiKeyPresent
+            engineHealthIssues = issues
         case .settingsList(let settings):
             engineSettings = settings
         case .settingSet(let key, let enabled):

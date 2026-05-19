@@ -567,6 +567,14 @@ pub enum FrontendRequest {
     /// from the bundle, ensuring the user always gets the version that
     /// shipped with the app they launched.
     GetEngineVersion,
+    /// One-shot snapshot of the engine's user-visible configuration
+    /// health — currently a single ANTHROPIC_API_KEY presence bit plus
+    /// any rendered [`EngineHealthIssue`]s the UI should surface as a
+    /// banner / settings-pane warning. Read-only; no side effects.
+    /// Replies with [`FrontendEvent::EngineHealthResult`]. The macOS
+    /// app calls this on session start so a missing API key cannot
+    /// silently break summarization the way it did before #699.
+    GetEngineHealth,
     /// Snapshot of every registered per-installation setting and its
     /// current value. Used by the macOS Settings window to render the
     /// current state on open. Replies with
@@ -1266,6 +1274,13 @@ pub enum FrontendEvent {
         build_time: String,
         binary_fingerprint: String,
     },
+    /// Response to [`FrontendRequest::GetEngineHealth`]: the engine's
+    /// current user-visible configuration health. Empty `issues` means
+    /// the engine is healthy; a non-empty list is the UI's signal to
+    /// render the banner / settings-pane warning.
+    EngineHealthResult {
+        report: EngineHealthReport,
+    },
     /// Response to [`FrontendRequest::GetSettings`]: a snapshot of every
     /// registered per-installation setting and its current value.
     SettingsList { settings: Vec<SettingSnapshot> },
@@ -1380,6 +1395,52 @@ pub struct FeatureFlagSnapshot {
     /// Current effective value — what `is_enabled(name)` returns
     /// right now. Equals `default_enabled` when no override exists.
     pub enabled: bool,
+}
+
+/// Engine-side health snapshot returned by
+/// [`FrontendEvent::EngineHealthResult`]. The chore that introduced
+/// this surface (#699) was triggered by silent summarization failure
+/// when `ANTHROPIC_API_KEY` is missing — the macOS app showed nothing,
+/// the user only noticed because live-status sentences never appeared.
+///
+/// `issues` is the structured list the UI renders. It is intentionally
+/// extensible: the chore notes other required config (engine socket
+/// path, etc.) "likely also applies", so the shape is "report a list
+/// of named problems" rather than a one-off boolean.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineHealthReport {
+    /// True iff the engine's agent config had an `ANTHROPIC_API_KEY`
+    /// at startup. Surfaced as a top-level bit (rather than only via
+    /// the `issues` list) so a CLI consumer doing
+    /// `boss engine health --json | jq .anthropic_api_key_present`
+    /// gets a single boolean without having to grep through the issues
+    /// array.
+    pub anthropic_api_key_present: bool,
+    /// Issues the UI should render, in display order (highest priority
+    /// first). Empty when the engine is healthy.
+    pub issues: Vec<EngineHealthIssue>,
+}
+
+/// One UI-actionable engine-health issue. Carries pre-rendered title
+/// and body strings so the macOS app can show the banner without
+/// translating engine state into prose at the call site. The engine
+/// owns the wording; the UI owns the styling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineHealthIssue {
+    /// Stable lowercase snake_case kind identifier. The UI uses this
+    /// as a styling / icon / dismissal-state key. Initial values:
+    /// - `missing_anthropic_api_key` — engine started without an
+    ///   `ANTHROPIC_API_KEY`; summarizer cannot succeed.
+    pub kind: String,
+    /// `"error"` (a user-visible feature is broken) or `"warning"`
+    /// (a background feature is degraded). The banner styling keys
+    /// off this so an error renders in red and a warning in amber.
+    pub severity: String,
+    /// One-line title rendered inline in the banner.
+    pub title: String,
+    /// Multi-line body with the remediation steps (e.g. which env var
+    /// to set and where to restart). The UI wraps and renders verbatim.
+    pub body: String,
 }
 
 /// Snapshot of one per-installation setting's static metadata + current
@@ -1664,6 +1725,73 @@ mod feature_flags_wire_tests {
                 assert_eq!(name.as_deref(), Some("pr_url_capture.primary_path.hit"));
                 assert_eq!(counters_reset, 1);
                 assert_eq!(gauges_reset, 0);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_engine_health_request_round_trips() {
+        let original = FrontendRequest::GetEngineHealth;
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("get_engine_health"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, FrontendRequest::GetEngineHealth));
+    }
+
+    #[test]
+    fn engine_health_result_event_round_trips_healthy() {
+        let original = FrontendEvent::EngineHealthResult {
+            report: EngineHealthReport {
+                anthropic_api_key_present: true,
+                issues: Vec::new(),
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("engine_health_result"), "serialized: {json}");
+        assert!(json.contains("\"anthropic_api_key_present\":true"), "{json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::EngineHealthResult { report } => {
+                assert!(report.anthropic_api_key_present);
+                assert!(report.issues.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_health_result_event_round_trips_with_issue() {
+        // The macOS app's banner / settings warning binds to the
+        // structured `kind` and `severity`, not the freeform `title`
+        // or `body`. Pin all four so a refactor that drops the
+        // wire-level distinction between kinds gets caught here.
+        let issue = EngineHealthIssue {
+            kind: "missing_anthropic_api_key".into(),
+            severity: "warning".into(),
+            title: "ANTHROPIC_API_KEY is not set".into(),
+            body: "Summarization is disabled. Set ANTHROPIC_API_KEY in \
+                   the engine's environment and restart Boss to enable \
+                   live worker summaries."
+                .into(),
+        };
+        let original = FrontendEvent::EngineHealthResult {
+            report: EngineHealthReport {
+                anthropic_api_key_present: false,
+                issues: vec![issue.clone()],
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(
+            json.contains("\"kind\":\"missing_anthropic_api_key\""),
+            "{json}"
+        );
+        assert!(json.contains("\"severity\":\"warning\""), "{json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::EngineHealthResult { report } => {
+                assert!(!report.anthropic_api_key_present);
+                assert_eq!(report.issues, vec![issue]);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

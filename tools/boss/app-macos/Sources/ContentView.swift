@@ -61,12 +61,23 @@ struct ContentView: View {
             // where every reconnect attempt re-popped a "Work Error"
             // modal (#698) — transport errors are now routed away from
             // `workErrorMessage` in `ChatViewModel.handle`.
-            if !model.isConnected && model.hasConnectedOnce {
-                EngineUnreachableBanner()
-                    .transition(.move(edge: .top).combined(with: .opacity))
+            VStack(spacing: 0) {
+                if !model.isConnected && model.hasConnectedOnce {
+                    EngineUnreachableBanner()
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                // Connection is up but the engine reports degraded
+                // config (currently: missing ANTHROPIC_API_KEY).
+                // Per #699: surface as a first-class affordance so
+                // summarization can't silently disappear.
+                if model.isConnected, !model.engineHealthIssues.isEmpty {
+                    EngineHealthBanner(issues: model.engineHealthIssues)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
         }
         .animation(.easeInOut(duration: 0.15), value: model.isConnected)
+        .animation(.easeInOut(duration: 0.15), value: model.engineHealthIssues)
         #if canImport(GhosttyKit)
         .task {
             // Wire the SwiftPM-only pane allocator into ChatViewModel
@@ -3709,5 +3720,93 @@ private struct EngineUnreachableBanner: View {
         .background(Color.red.opacity(0.85))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Boss engine is unreachable. Reconnecting.")
+    }
+}
+
+/// Chrome-level banner surfacing engine-health issues — currently a
+/// missing `ANTHROPIC_API_KEY`. Introduced after #699 where the
+/// summarizer failed silently and the user only noticed because live
+/// status sentences never appeared. The first issue's title renders
+/// inline; expansion (chevron) reveals each issue's remediation body.
+private struct EngineHealthBanner: View {
+    let issues: [EngineHealthIssue]
+    @State private var isExpanded: Bool = false
+
+    /// Highest severity in the issue list — drives banner color so a
+    /// single `error` row escalates an otherwise-warning banner.
+    private var effectiveSeverity: String {
+        issues.contains(where: { $0.severity == "error" }) ? "error" : "warning"
+    }
+
+    private var background: Color {
+        effectiveSeverity == "error"
+            ? Color.red.opacity(0.85)
+            : Color.orange.opacity(0.85)
+    }
+
+    private var iconName: String {
+        effectiveSeverity == "error"
+            ? "exclamationmark.octagon.fill"
+            : "exclamationmark.triangle.fill"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button(action: { withAnimation(.easeInOut(duration: 0.12)) { isExpanded.toggle() } }) {
+                HStack(spacing: 8) {
+                    Image(systemName: iconName)
+                        .foregroundStyle(.white)
+                    Text(headlineText)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .foregroundStyle(.white)
+                        .font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(issues.first?.body ?? "")
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(issues) { issue in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(issue.title)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.white)
+                            Text(issue.body)
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.92))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 10)
+            }
+        }
+        .background(background)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var headlineText: String {
+        if issues.count == 1 {
+            return issues[0].title
+        }
+        let first = issues[0].title
+        return "\(first) (\(issues.count - 1) more)"
+    }
+
+    private var accessibilityLabel: String {
+        issues.map { "\($0.title). \($0.body)" }.joined(separator: " ")
     }
 }

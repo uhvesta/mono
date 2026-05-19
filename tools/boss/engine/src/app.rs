@@ -5362,6 +5362,14 @@ async fn handle_frontend_connection(
                     },
                 );
             }
+            FrontendRequest::GetEngineHealth => {
+                let report = build_engine_health_report(&server_state);
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::EngineHealthResult { report },
+                );
+            }
             FrontendRequest::ListFeatureFlags => {
                 let flags = server_state
                     .feature_flags
@@ -6582,6 +6590,41 @@ fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u8]) -> Resu
     Ok(())
 }
 
+/// Build the user-visible engine health snapshot returned by
+/// [`FrontendRequest::GetEngineHealth`]. The macOS app polls this on
+/// session start so the banner / settings warning lands before the
+/// user notices that summarization isn't producing output.
+///
+/// Currently checks one thing — `ANTHROPIC_API_KEY` presence — but
+/// the shape is the list-of-issues form the chore brief asked for so
+/// subsequent missing-config surfaces (engine socket, cube binary,
+/// etc.) can be added without bumping the wire format.
+fn build_engine_health_report(server_state: &Arc<ServerState>) -> boss_protocol::EngineHealthReport {
+    use boss_protocol::{EngineHealthIssue, EngineHealthReport};
+
+    let anthropic_api_key_present = server_state.anthropic_api_key.is_some();
+    let mut issues: Vec<EngineHealthIssue> = Vec::new();
+
+    if !anthropic_api_key_present {
+        issues.push(EngineHealthIssue {
+            kind: "missing_anthropic_api_key".to_owned(),
+            severity: "warning".to_owned(),
+            title: "ANTHROPIC_API_KEY is not set".to_owned(),
+            body: "Live worker summaries and pane summarization are \
+                   disabled until ANTHROPIC_API_KEY is exported in the \
+                   environment Boss launches its engine from. Set the \
+                   variable in your shell startup file, then quit and \
+                   relaunch Boss to pick it up."
+                .to_owned(),
+        });
+    }
+
+    EngineHealthReport {
+        anthropic_api_key_present,
+        issues,
+    }
+}
+
 /// Build the per-slot diagnostic snapshot the `live-status debug`
 /// verb returns. Reads the manager's debug store, joins with the
 /// per-slot live state (for transcript_path lookup via WorkDb), and
@@ -7469,6 +7512,66 @@ mod tests {
     fn make_session_sink() -> Arc<SessionSink> {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         Arc::new(SessionSink::new(shutdown_tx))
+    }
+
+    /// The engine-health helper must surface a
+    /// `missing_anthropic_api_key` issue when the agent config
+    /// resolved with no key — that's exactly the case the macOS app
+    /// banner exists to flag, and a silent-success regression here
+    /// would put us right back at the #699 failure mode.
+    #[tokio::test]
+    async fn engine_health_report_flags_missing_anthropic_api_key() {
+        let state = test_server_state();
+        // Pin: the test fixture intentionally builds without an
+        // ANTHROPIC_API_KEY so the missing-key arm is exercised.
+        assert!(
+            state.anthropic_api_key.is_none(),
+            "test fixture should construct without ANTHROPIC_API_KEY",
+        );
+
+        let report = build_engine_health_report(&state);
+        assert!(!report.anthropic_api_key_present);
+        assert_eq!(report.issues.len(), 1, "issues: {:?}", report.issues);
+        let issue = &report.issues[0];
+        assert_eq!(issue.kind, "missing_anthropic_api_key");
+        assert_eq!(issue.severity, "warning");
+        assert!(
+            !issue.title.is_empty() && !issue.body.is_empty(),
+            "title and body must be populated so the banner has \
+             user-visible text"
+        );
+    }
+
+    /// And the symmetric case: when the engine *does* have an API
+    /// key, the report must be empty so the macOS banner stays
+    /// hidden.
+    #[tokio::test]
+    async fn engine_health_report_is_empty_when_api_key_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = crate::config::WorkConfig {
+            cwd: temp.path().to_path_buf(),
+            db_path: temp.path().join("state.db"),
+            worker_pool_size: 1,
+        };
+        let agent = crate::config::AgentConfig {
+            anthropic_api_key: Some("sk-test".to_owned()),
+            cube: crate::config::CubeConfig {
+                command: "cube".to_owned(),
+                args: vec![],
+            },
+            cwd: work.cwd.clone(),
+        };
+        let cfg = Arc::new(RuntimeConfig::from_parts(work, Some(agent)));
+        std::mem::forget(temp);
+        let state = ServerState::new_arc_with_app_pid(cfg, None).unwrap();
+
+        let report = build_engine_health_report(&state);
+        assert!(report.anthropic_api_key_present);
+        assert!(
+            report.issues.is_empty(),
+            "healthy engine must report no issues; got {:?}",
+            report.issues,
+        );
     }
 
     /// Regression guard for the version-mismatch restart path (T460
