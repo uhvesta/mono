@@ -4,10 +4,11 @@ module(
 
 bazel_dep(name = "rules_nodejs", version = "6.7.3")
 bazel_dep(name = "aspect_rules_js", version = "2.8.2")
-bazel_dep(name = "rules_rust", version = "0.68.1")
-bazel_dep(name = "apple_support", version = "1.24.2", repo_name = "build_bazel_apple_support")
-bazel_dep(name = "rules_swift", version = "3.4.1", repo_name = "build_bazel_rules_swift")
-bazel_dep(name = "rules_apple", version = "4.3.3", repo_name = "build_bazel_rules_apple")
+bazel_dep(name = "rules_rust", version = "0.70.0")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "apple_support", version = "2.2.0", repo_name = "build_bazel_apple_support")
+bazel_dep(name = "rules_swift", version = "3.5.0", repo_name = "build_bazel_rules_swift")
+bazel_dep(name = "rules_apple", version = "4.5.1", repo_name = "build_bazel_rules_apple")
 bazel_dep(name = "rules_swift_package_manager", version = "1.13.0")
 
 apple_cc_configure = use_extension(
@@ -44,8 +45,8 @@ use_repo(
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
-    rustfmt_version = "1.93.1",
-    versions = ["1.93.1"],
+    rustfmt_version = "1.95.0",
+    versions = ["1.95.0"],
 )
 use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")

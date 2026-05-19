@@ -1,5 +1,6 @@
 load("@build_bazel_rules_apple//apple:versioning.bzl", "apple_bundle_version")
 load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "build_info_rs")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 package(default_visibility = ["//visibility:private"])
 
