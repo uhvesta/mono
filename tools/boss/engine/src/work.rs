@@ -8818,13 +8818,14 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             //     workspace, return the same execution. (Idempotent —
             //     this is what bossctl `work start` and a kanban
             //     drag both depend on for "don't double-spawn.")
-            //   - is_live=false: the row is stale (waiting_human
-            //     leftover from a worker that died with the app, or a
-            //     run that exited without us seeing the SessionEnd
-            //     hook). Mark it abandoned so future scans don't
-            //     trip on it again, then fall through to insert a
-            //     fresh ready row. This is what makes the kanban
-            //     re-dispatch path work after a crash.
+            //   - is_live=false: the row is stale (worker gone). Two sub-cases:
+            //       * ci_remediation kind: re-queue it instead of abandoning.
+            //         The branch/PR already exists; the human dragging to Doing
+            //         (or calling `bossctl work start`) means "retry the CI fix
+            //         on the existing branch," not "redo the whole chore." See
+            //         the ci_failure retry design for the full invariant set.
+            //       * any other kind: abandon and fall through to insert a
+            //         fresh ready row, which is the normal re-dispatch path.
             if is_live(&existing.id) {
                 let next_status = if existing.status == "waiting_dependency" {
                     "ready".to_owned()
@@ -8843,6 +8844,79 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                      WHERE id = ?1",
                     params![existing.id, next_status, next_priority, next_preferred],
                 )?;
+                return query_execution(conn, &existing.id)?
+                    .with_context(|| format!("unknown execution: {}", existing.id));
+            } else if existing.kind == "ci_remediation" {
+                // Stale ci_remediation — re-queue it for retry.
+                //
+                // For the `bossctl work start` path the task may still be
+                // `status='blocked'` when request_execution is called (the
+                // CLI does not flip the kanban status first, unlike the UI
+                // drag). Clear the ci_failure block so start_execution_run
+                // can advance the task to `active` when the worker picks up.
+                // For the drag-to-Doing path the task is already `active`
+                // (the UI set it before firing RequestExecution), so the
+                // WHERE guard is a no-op.
+                let now = now_string();
+                let rows_cleared = conn.execute(
+                    "UPDATE tasks
+                     SET status             = 'todo',
+                         blocked_reason     = NULL,
+                         blocked_attempt_id = NULL,
+                         last_status_actor  = 'engine',
+                         updated_at         = ?2
+                     WHERE id               = ?1
+                       AND deleted_at       IS NULL
+                       AND status           = 'blocked'
+                       AND blocked_reason   IN ('ci_failure', 'ci_failure_exhausted')",
+                    params![work_item_id, now],
+                )?;
+                if rows_cleared > 0 {
+                    // Clear matching task_blocked_signals rows and insert a
+                    // ci_failure_suppression so the CI watch does not
+                    // immediately re-flip the task before the worker pushes
+                    // a fix. Mirrors what update_work_item_as_actor does when
+                    // a human drags the card out of the Blocked column.
+                    conn.execute(
+                        "UPDATE task_blocked_signals
+                         SET cleared_at = ?2
+                         WHERE work_item_id = ?1
+                           AND reason IN ('ci_failure', 'ci_failure_exhausted')
+                           AND cleared_at IS NULL",
+                        params![work_item_id, now],
+                    )?;
+                    record_ci_failure_suppression_in_tx(conn, &work_item_id, &now)?;
+                    tracing::info!(
+                        work_item_id = %work_item_id,
+                        "RequestExecution: cleared ci_failure block for bossctl retry path",
+                    );
+                }
+                // Re-queue: move the stale cube_workspace_id into
+                // preferred_workspace_id so the dispatcher can attempt to
+                // re-claim the same workspace (and therefore the same
+                // in-progress branch). Clearing cube_lease_id is required
+                // because start_execution_run stamps fresh lease info; the
+                // old lease was released by the worker on clean exit. If the
+                // worker crashed, the orphan reaper eventually reconciles.
+                let preferred = preferred_workspace_id
+                    .clone()
+                    .or_else(|| existing.cube_workspace_id.clone());
+                conn.execute(
+                    "UPDATE work_executions
+                     SET status                 = 'ready',
+                         cube_lease_id          = NULL,
+                         cube_workspace_id      = NULL,
+                         workspace_path         = NULL,
+                         preferred_workspace_id = ?2,
+                         finished_at            = NULL
+                     WHERE id = ?1",
+                    params![existing.id, preferred],
+                )?;
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    execution_id = %existing.id,
+                    "RequestExecution: re-queued stale ci_remediation for retry",
+                );
                 return query_execution(conn, &existing.id)?
                     .with_context(|| format!("unknown execution: {}", existing.id));
             } else {
@@ -12286,6 +12360,208 @@ mod tests {
             .unwrap();
         assert_eq!(stale_after.status, "abandoned");
         assert!(stale_after.finished_at.is_some());
+    }
+
+    /// When drag-to-Doing fires for a chore whose latest non-terminal
+    /// execution is a stale (no live worker) `ci_remediation`, the engine
+    /// must re-queue that execution (flip `waiting_human` → `ready`) rather
+    /// than abandoning it and spawning a fresh `chore_implementation`. The
+    /// existing execution row carries `pr_head_before` and the old workspace
+    /// context; re-queuing it routes the new worker back to the existing
+    /// branch/PR rather than re-implementing from scratch.
+    ///
+    /// The drag-to-Doing case: task is already `active` before
+    /// `request_execution` is called (the UI sets status first).
+    #[test]
+    fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
+        let path = temp_db_path("req-ci-remediation-drag");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "CI-failing chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        // Simulate: chore is active (UI already dragged to Doing),
+        // and a previous ci_remediation worker ran but is now gone.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ci_exec = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "ci_remediation".to_owned(),
+                status: Some("waiting_human".to_owned()),
+                cube_workspace_id: Some("mono-agent-001".to_owned()),
+                cube_lease_id: Some("lease-ci-old".to_owned()),
+                workspace_path: Some("/ws/mono-agent-001".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let requeued = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: chore.id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| false,
+            )
+            .unwrap();
+
+        assert_eq!(requeued.id, ci_exec.id, "must reuse the ci_remediation row, not create a new one");
+        assert_eq!(requeued.status, "ready");
+        assert_eq!(requeued.kind, "ci_remediation");
+        assert_eq!(
+            requeued.preferred_workspace_id.as_deref(),
+            Some("mono-agent-001"),
+            "old workspace promoted to preferred so dispatcher can re-claim it",
+        );
+        assert!(requeued.cube_lease_id.is_none(), "stale lease must be cleared");
+        assert!(requeued.cube_workspace_id.is_none(), "stale workspace columns cleared");
+
+        let all = db.list_executions(Some(&chore.id)).unwrap();
+        assert_eq!(all.len(), 1, "no new execution row inserted");
+    }
+
+    /// Same ci_remediation re-queue semantics via `bossctl work start`:
+    /// the task is still `status='blocked'` (ci_failure) when
+    /// `request_execution` is called (the CLI does not flip kanban status
+    /// first). The engine must clear the ci_failure block so
+    /// `start_execution_run` can advance the task to `active`, and must
+    /// insert a ci_failure_suppression so the CI watch does not immediately
+    /// re-flip the task before the worker pushes a fix.
+    #[test]
+    fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
+        let path = temp_db_path("req-ci-remediation-bossctl");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "CI blocked chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/686".to_owned();
+        // Move to in_review so mark_chore_blocked_ci_failure accepts.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some(pr_url.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Insert a ci_remediations row so the suppression can key on a head sha.
+        db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: chore.id.clone(),
+            pr_url: pr_url.clone(),
+            pr_number: 686,
+            head_branch: "boss/exec_18b0bee86849d850_11".into(),
+            head_sha_at_trigger: "sha-abc123".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap();
+        // Flip to blocked: ci_failure (marks task.status='blocked').
+        db.mark_chore_blocked_ci_failure(&chore.id, &pr_url, None).unwrap();
+        let task_before = match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected Task/Chore, got {other:?}"),
+        };
+        assert_eq!(task_before.status, "blocked");
+        assert_eq!(task_before.blocked_reason.as_deref(), Some("ci_failure"));
+
+        // ci_remediation execution was created and ran, but worker is now gone.
+        let ci_exec = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "ci_remediation".to_owned(),
+                status: Some("waiting_human".to_owned()),
+                cube_workspace_id: Some("mono-agent-001".to_owned()),
+                cube_lease_id: Some("lease-ci-old".to_owned()),
+                workspace_path: Some("/ws/mono-agent-001".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let requeued = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: chore.id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| false,
+            )
+            .unwrap();
+
+        assert_eq!(requeued.id, ci_exec.id, "must reuse ci_remediation row");
+        assert_eq!(requeued.status, "ready");
+        assert_eq!(requeued.kind, "ci_remediation");
+        assert_eq!(
+            requeued.preferred_workspace_id.as_deref(),
+            Some("mono-agent-001"),
+        );
+        assert!(requeued.cube_lease_id.is_none());
+
+        // Task must have been unblocked so start_execution_run can advance it.
+        let task_after = match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected Task/Chore, got {other:?}"),
+        };
+        assert_eq!(task_after.status, "todo", "ci_failure block cleared to todo");
+        assert!(task_after.blocked_reason.is_none());
+
+        // Suppression row must exist so the CI watch stays quiet.
+        assert!(
+            db.is_ci_failure_suppressed(&chore.id, "sha-abc123").unwrap(),
+            "suppression row must be keyed on the ci_remediations head sha",
+        );
     }
 
     /// Reaping a running execution stamps it `orphaned` (terminal),
