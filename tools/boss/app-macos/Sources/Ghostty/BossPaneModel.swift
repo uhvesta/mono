@@ -37,16 +37,48 @@ final class BossPaneModel: ObservableObject {
         // --permission-mode auto is required so the coordinator session
         // runs unattended (same policy as worker spawns from T465).
         logger.info("Boss-session claude invocation: \(bossPaneClaudeInvocation, privacy: .public)")
+        let env = Self.bossSessionEnv()
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
             workingDirectory: workingDirectory,
-            initialInput: "unset ANTHROPIC_API_KEY; \(bossPaneClaudeInvocation)\n"
+            initialInput: "unset ANTHROPIC_API_KEY; \(bossPaneClaudeInvocation)\n",
+            env: env
         )
         self.session = TerminalPaneSession(
             id: "boss",
             role: .boss,
             launchSpec: launchSpec
         )
+    }
+
+    /// Env layered onto the Boss-session shell so `boss` / `bossctl`
+    /// resolve to the binaries bundled inside this `.app`, not whatever
+    /// the user's login `PATH` happens to surface (e.g. a `repobin`
+    /// shim pointing at a cached `spinyfin/mono` revision — see #692).
+    ///
+    /// Sets:
+    ///   - `BOSS_BIN_DIR` — absolute path to the bundled `bin/` dir.
+    ///   - `BOSS_BIN` — absolute path to the bundled `boss` binary.
+    ///   - `PATH` — prepend `BOSS_BIN_DIR` so bare `boss` / `bossctl`
+    ///     calls hit the bundled copies first.
+    ///
+    /// Returns an empty array in dev / `bazel run` mode where the
+    /// bundle has no `Resources/bin/` (the session falls back to the
+    /// developer's `PATH`).
+    private static func bossSessionEnv() -> [(String, String)] {
+        guard let resourcePath = Bundle.main.resourcePath else { return [] }
+        let binDir = "\(resourcePath)/bin"
+        let bossPath = "\(binDir)/boss"
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: bossPath) else { return [] }
+
+        let currentPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let newPath = "\(binDir):\(currentPath)"
+        return [
+            ("BOSS_BIN_DIR", binDir),
+            ("BOSS_BIN", bossPath),
+            ("PATH", newPath),
+        ]
     }
 
     private static func ensureBossWorkingDirectory() -> String {
@@ -126,6 +158,21 @@ private func bossSystemPrompt() -> String {
 
     Use `boss` for taxonomy CRUD (products, projects, tasks, chores) with `--no-input --json`.
 
+    ### Which `boss` / `bossctl` binary
+
+    The Boss session launches with `$BOSS_BIN_DIR` prepended to `PATH`,
+    pointing at the binaries bundled inside this `.app` (`Boss.app/
+    Contents/Resources/bin/`). Bare `boss` / `bossctl` already resolve
+    to the bundled copies — do not run `which boss` and second-guess
+    it; PATH is set deliberately for this session.
+
+    If you need an unambiguous absolute path (e.g. constructing a
+    command for a worker to run, or when in doubt), use `$BOSS_BIN`
+    (full path to `boss`) or `$BOSS_BIN_DIR/bossctl`. Never substitute
+    `/Users/<you>/bin/boss`, `repobin`, or anything else surfaced by a
+    user-shell `PATH` — those may be a different version and the CLI
+    surface drifts.
+
     ## Coordinator contract
 
     - Do not edit code or files; spawn or steer workers via `bossctl`.
@@ -171,7 +218,7 @@ private func bossSystemPrompt() -> String {
 
     Levels: `trivial | small | medium | large`. Never emit `max` — human-only.
 
-    At create time: run the heuristic, pass `--effort <level>`, post the reasons string as a comment on the row (e.g. via `boss chore comment add`).
+    At create time: run the heuristic, pass `--effort <level>`, and append the reasons string to the row's description as a tagged audit line (see "Audit trail on the row" below). The CLI has no `comment` verb; `--description` is the only durable text field on a chore/task.
 
     ### Rules (top-to-bottom, first match wins)
 
@@ -191,6 +238,25 @@ private func bossSystemPrompt() -> String {
     - **Re-classification:** re-run rules if level is unset or matches the prior heuristic. Do not re-classify hand-set levels.
 
     Override with explicit reasoning when intent is clear; record in the reasons string. `max` is off-limits regardless.
+
+    ### Audit trail on the row
+
+    The CLI has no first-class comment surface (no `boss chore comment add` / `boss task comment add`). Append audit entries to the row's `description` field instead, separated from the original brief by a blank line, and tag each entry so future re-classifications can find them:
+
+    ```sh
+    EXISTING=$(boss task show <row-id> --json | jq -r '.task.description // ""')
+    AUDIT='[effort-classification] level=`small` matched-rule=`rule 7 (short desc fallback)` reasons="single-clause title, description < 1500 B"'
+    boss task update <row-id> --description "$EXISTING
+
+    $AUDIT"
+    ```
+
+    Tag conventions (always single line, leading bracket-tag, key=value pairs, double-quoted reason):
+
+    - `[effort-classification]` — creation-time heuristic result. Include `level=` and `matched-rule=` plus a `reasons="…"` summary.
+    - `[effort-escalation]` — worker-requested escalation processed by the Boss (see "Worker effort escalation" below). Include `original=`, `new=`, `matched-markers=`, `reason="…"`.
+
+    Future re-classification re-runs the heuristic and compares against the most recent `[effort-classification]` entry to decide whether to overwrite a heuristic level (per the "Re-classification" edge-case rule). Hand-set levels are detectable by the absence of any `[effort-classification]` tag.
 
     ### Worked examples
 
@@ -231,7 +297,7 @@ private func bossSystemPrompt() -> String {
 
     1. **Identify the row** — the work item the worker is running. Use `bossctl agents status <agent>` if needed.
     2. **Update durably:** `boss task update <row-id> --effort <requested_level>`. If non-zero, surface the error and stop.
-    3. **Record for feedback loop:** append an audit line to the row via `boss chore comment add` (fall back to `boss task update <row-id> --description "<existing> \\n\\n<audit-line>"`). Include: original_level, new_level, worker's reason verbatim, matched markers from the creation-time reasons string. Example: "[effort-escalation] original=`small` new=`large` matched-markers=`short description, no large/medium markers` reason=\\"ran into a multi-subsystem race…\\"".
+    3. **Record for feedback loop:** append an `[effort-escalation]` audit line to the row's `description` per "Audit trail on the row" above. Include: `original=<old-level>`, `new=<requested-level>`, `matched-markers=<markers from the creation-time reasons string>`, and the worker's reason verbatim as `reason="…"`. Example: "[effort-escalation] original=`small` new=`large` matched-markers=`short description, no large/medium markers` reason=\\"ran into a multi-subsystem race…\\"".
     4. **Ack the worker:** `bossctl probe <agent> "[effort-escalation-ack] level=<new-level> next_dispatch=true"`. Always use `next_dispatch=true`.
     5. **Never mid-flight swap** — do not interrupt, stop, or re-spawn the worker. Only the next dispatch sees the updated level.
 
