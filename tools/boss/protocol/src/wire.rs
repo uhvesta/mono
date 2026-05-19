@@ -1178,6 +1178,18 @@ pub enum FrontendEvent {
         attempt_id: String,
         pr_url: String,
     },
+    /// Activity-feed push: the engine observed the parent PR back at
+    /// CI clean and cleared the `blocked: ci_failure` status, but there
+    /// was no active remediation attempt to retire (the prior attempt was
+    /// already terminal — failed, abandoned, or succeeded via the rebase
+    /// path). Distinct from `CiRemediationSucceeded` because the
+    /// clearance was NOT driven by an auto-fix: the UI should clear the
+    /// `ci failing` badge but must NOT set the `ci auto-fixed` badge.
+    CiFailureCleared {
+        product_id: String,
+        work_item_id: String,
+        pr_url: String,
+    },
     /// Activity-feed push: a CI-remediation attempt terminated in
     /// `failed`. Emitted when the worker calls
     /// `boss engine ci mark-failed` or when the completion path's

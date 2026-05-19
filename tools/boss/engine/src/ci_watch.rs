@@ -965,6 +965,25 @@ pub async fn on_ci_resolved(
                 "ci_failure_resolved",
             )
             .await;
+        // When the task transitions back to `in_review` but no active
+        // remediation attempt was found (the prior attempt was already
+        // terminal — failed, abandoned, or succeeded via the rebase path),
+        // emit `CiFailureCleared` so the UI can clear the `ci failing`
+        // badge. The `CiRemediationSucceeded` path covers the case where
+        // an active attempt is retired; this covers every other path where
+        // the blocked status clears without an active attempt (T606).
+        if !attempt_transitioned {
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    FrontendEvent::CiFailureCleared {
+                        product_id: candidate.product_id.clone(),
+                        work_item_id: candidate.work_item_id.clone(),
+                        pr_url: candidate.pr_url.clone(),
+                    },
+                )
+                .await;
+        }
     }
     tracing::info!(
         work_item_id = %candidate.work_item_id,
@@ -1470,6 +1489,76 @@ mod tests {
         let (status, reason) = chore_state(&db, &chore);
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
+    }
+
+    /// When `on_ci_resolved` clears a `blocked: ci_failure` row but finds
+    /// no active (pending/running) remediation attempt — because the prior
+    /// attempt was already terminal (failed, abandoned) — it must emit
+    /// `CiFailureCleared` so the UI can clear its stale `ci failing` badge
+    /// without incorrectly setting the `ci auto-fixed` badge. (T606 fix)
+    #[tokio::test]
+    async fn retire_without_active_attempt_emits_ci_failure_cleared() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/19";
+        let (product, chore) = make_in_review(&db, "C-no-active-attempt", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // 1. Detect failure → attempt created and marked failed (simulating
+        //    a worker that ran but couldn't push a fix).
+        on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+        let attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("attempt row");
+        db.mark_ci_remediation_failed(&attempt.id, "no_push_no_classification")
+            .unwrap();
+
+        // 2. CI goes green on its own — no active attempt left.
+        assert!(
+            db.active_ci_remediation_for_work_item(&chore)
+                .unwrap()
+                .is_none(),
+            "attempt must be terminal before retire"
+        );
+        let resolved = on_ci_resolved(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(resolved, "retire must succeed even without active attempt");
+
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
+
+        // Engine must emit CiFailureCleared (not CiRemediationSucceeded)
+        // so the UI clears the failure badge without setting auto-fixed.
+        let typed = pub_.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(_, ev)| matches!(
+                ev,
+                FrontendEvent::CiFailureCleared { pr_url, .. } if pr_url == pr
+            )),
+            "CiFailureCleared must be emitted when task clears without active attempt"
+        );
+        assert!(
+            !typed.iter().any(|(_, ev)| matches!(
+                ev,
+                FrontendEvent::CiRemediationSucceeded { .. }
+            )),
+            "CiRemediationSucceeded must NOT be emitted when there is no active attempt"
+        );
     }
 
     /// First InFlight probe records `first_observed_at` but emits

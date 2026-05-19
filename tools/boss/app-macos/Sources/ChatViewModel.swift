@@ -1562,6 +1562,9 @@ final class ChatViewModel: ObservableObject {
             // exhausted arm carries those. Show a stub chip with
             // (0, 0) so the card surfaces the in-flight state until
             // the next list refresh fills in real numbers.
+            // A new failure makes any prior "ci auto-fixed" claim stale:
+            // if the auto-fix didn't stick, the badge is misleading (T606).
+            recentlyClearedCIPRs.removeValue(forKey: prURL)
             if ciFailureBadges[prURL] == nil {
                 ciFailureBadges[prURL] = CiFailureBadge(state: .inFlight, attemptsUsed: 0, budget: 0)
             } else if var existing = ciFailureBadges[prURL] {
@@ -1576,6 +1579,12 @@ final class ChatViewModel: ObservableObject {
             ciFailureBadges.removeValue(forKey: prURL)
             recentlyClearedCIPRs[prURL] = Date()
             engine.sendListCiRemediations(limit: 200)
+        case .ciFailureCleared(_, _, let prURL):
+            // Engine cleared `blocked: ci_failure` but found no active
+            // remediation attempt (the prior attempt was already terminal).
+            // Clear the failure badge only — do NOT set the auto-fixed badge
+            // because the clearance was not driven by an auto-fix (T606).
+            ciFailureBadges.removeValue(forKey: prURL)
         case .ciRemediationFailed(_, _, _, _, _),
              .ciRemediationAbandoned(_, _, _, _, _):
             // Terminal failures keep the parent `blocked: ci_failure`
@@ -1583,6 +1592,10 @@ final class ChatViewModel: ObservableObject {
             // refresh keeps the engine tab consistent.
             engine.sendListCiRemediations(limit: 200)
         case .ciRemediationExhausted(_, _, let prURL, let used, let budget):
+            // Budget exhausted means CI is still failing and auto-fix
+            // cannot help further. Any prior "ci auto-fixed" claim is now
+            // stale (T606).
+            recentlyClearedCIPRs.removeValue(forKey: prURL)
             ciFailureBadges[prURL] = CiFailureBadge(state: .exhausted, attemptsUsed: used, budget: budget)
             engine.sendListCiRemediations(limit: 200)
         case .attentionItemsForWorkItemList(let workItemID, let items):

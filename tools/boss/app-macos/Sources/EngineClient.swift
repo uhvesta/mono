@@ -157,6 +157,12 @@ enum EngineEvent {
     /// CI clean and retired the remediation attempt. The parent has
     /// been flipped from `blocked: ci_failure` back to `in_review`.
     case ciRemediationSucceeded(productID: String, workItemID: String, attemptID: String, prURL: String)
+    /// Activity-feed push: the engine cleared `blocked: ci_failure` on a
+    /// task but found no active remediation attempt to retire — the prior
+    /// attempt was already terminal (failed/abandoned). Distinct from
+    /// `ciRemediationSucceeded`: the `ci failing` badge should be cleared
+    /// but the `ci auto-fixed` badge must NOT be set.
+    case ciFailureCleared(productID: String, workItemID: String, prURL: String)
     /// Activity-feed push: a CI-remediation attempt terminated in
     /// `failed`. Fired when the worker calls
     /// `boss engine ci mark-failed` or when the completion-path
@@ -1043,6 +1049,12 @@ final class EngineClient: @unchecked Sendable {
                     productID: payload["product_id"] as? String ?? "",
                     workItemID: payload["work_item_id"] as? String ?? "",
                     attemptID: payload["attempt_id"] as? String ?? "",
+                    prURL: payload["pr_url"] as? String ?? ""
+                ))
+            case "ci_failure_cleared":
+                emit(.ciFailureCleared(
+                    productID: payload["product_id"] as? String ?? "",
+                    workItemID: payload["work_item_id"] as? String ?? "",
                     prURL: payload["pr_url"] as? String ?? ""
                 ))
             case "ci_remediation_failed":
