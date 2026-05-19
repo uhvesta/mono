@@ -2229,6 +2229,16 @@ impl WorkDb {
     }
 
     #[cfg(test)]
+    pub fn force_started_at_for_test(&self, execution_id: &str, epoch_secs: i64) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET started_at = ?2 WHERE id = ?1",
+            params![execution_id, epoch_secs.to_string()],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn clear_run_transcript_path_for_test(&self, run_id: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(

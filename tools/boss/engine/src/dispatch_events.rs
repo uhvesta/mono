@@ -106,6 +106,14 @@ pub enum Stage {
     /// `bossctl dispatch tail` can filter orphan-sweep redispatches
     /// separately from human-initiated ones.
     OrphanActiveRedispatch,
+    /// The periodic dead-PID sweep found a claimed worker slot whose
+    /// backing OS process is gone (ESRCH from `kill(pid, 0)`). The
+    /// execution has been marked `orphaned`, the pool slot released,
+    /// and the work item will be redispatched by the orphan sweep on
+    /// the next tick. Distinct from `orphan_active_redispatch` so
+    /// operators can distinguish "slot claimed but PID dead" from
+    /// "slot not claimed at all."
+    DeadPidReconcile,
 }
 
 impl Stage {
@@ -123,6 +131,7 @@ impl Stage {
             Stage::PaneSpawned => "pane_spawned",
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
+            Stage::DeadPidReconcile => "dead_pid_reconcile",
         }
     }
 }

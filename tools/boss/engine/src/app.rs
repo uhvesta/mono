@@ -2356,6 +2356,20 @@ pub async fn serve(
         server_state.pr_reconciler_kick.clone(),
     );
 
+    // Periodic dead-PID reconciler: detects worker slots whose backing
+    // OS process has died (kill-9, crash, OOM) and reaps them so the
+    // orphan sweep can redispatch the chore. Runs every 60s and fires
+    // immediately on boot. Without this, a kill-9'd worker leaves the
+    // pool slot claimed forever and the orphan sweep skips the chore
+    // ("already claimed"), leaving it stuck in Doing indefinitely.
+    let _dead_pid_sweep_handle = crate::dead_pid_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        Duration::from_secs(60),
+    );
+
     // Periodic orphan-active reconciler: re-dispatches `active` work
     // items that have no live execution (the post-crash "stuck-in-Doing"
     // fix). Runs every 60s and fires immediately on boot so items left
