@@ -3,6 +3,15 @@ import os.log
 import SwiftUI
 
 private let anchorLog = Logger(subsystem: "com.boss.app", category: "CommentPopupAnchor")
+/// Stable category for window↔view coordinate-bridge instrumentation. Both the comment
+/// popover anchor and the right-click context menu funnel their NSEvent.locationInWindow
+/// through `windowPointToView(_:in:)`, which logs here. Keep these lines in place — they
+/// are the regression tripwire for the SwiftUI/AppKit isFlipped mismatch that produced
+/// the FOURTH-report top↔bottom mirror in the markdown viewer.
+///
+/// Stream live with:
+///   log stream --predicate 'subsystem == "com.boss.markdown" AND category == "coordinates"' --style compact
+private let coordLog = Logger(subsystem: "com.boss.markdown", category: "coordinates")
 
 /// Owns the in-memory comment array for a single markdown viewer instance
 /// and coordinates the selection → authoring → sidebar → highlight flow.
@@ -101,6 +110,26 @@ final class CommentLayer: NSObject, ObservableObject {
         anchorInteractionView = nil
     }
 
+    /// Single coordinate-bridge between an NSEvent's window-space location and a target
+    /// view's coordinate system. Both popover-anchor capture and the right-click context
+    /// menu call this — any future surface that opens a popover/menu in response to a
+    /// click MUST also route through here, never pass `event.locationInWindow` directly
+    /// to APIs whose point argument is documented in view coords.
+    ///
+    /// Why this helper exists: when the window's contentView is SwiftUI's NSHostingView
+    /// (`isFlipped == true`) but the NSWindow is bottom-left origin, passing
+    /// `event.locationInWindow` straight to APIs like `NSMenu.popUp(at:in:)` — whose
+    /// `at:` is in the receiving view's coordinate system — produces a `viewHeight - y`
+    /// inversion. A click near the top of the document opens the menu near the bottom
+    /// and vice versa (the top↔bottom mirror reported four times against the markdown
+    /// viewer). `view.convert(_, from: nil)` is the AppKit-blessed bridge that walks
+    /// the view hierarchy and applies every `isFlipped` along the way.
+    private func windowPointToView(_ pointInWindow: NSPoint, in view: NSView) -> NSPoint {
+        let pointInView = view.convert(pointInWindow, from: nil)
+        coordLog.info("windowPointToView: window=\(NSStringFromPoint(pointInWindow)) → view=\(NSStringFromPoint(pointInView)) (\(NSStringFromClass(type(of: view))) isFlipped=\(view.isFlipped) bounds=\(NSStringFromRect(view.bounds)))")
+        return pointInView
+    }
+
     /// Called on leftMouseUp. If the current first responder is a non-NSTextView view
     /// (Textual's NSTextInteractionView) whose bounds contain the mouseUp point and there
     /// is a live selection, saves the screen-space anchor for use by resolveAnchor().
@@ -110,7 +139,7 @@ final class CommentLayer: NSObject, ObservableObject {
         guard !isShowingPopover, let window else { return }
         guard let responder = window.firstResponder as? NSView,
               !(responder is NSTextView) else { return }
-        let pointInResponder = responder.convert(locationInWindow, from: nil)
+        let pointInResponder = windowPointToView(locationInWindow, in: responder)
         guard responder.bounds.contains(pointInResponder) else {
             anchorLog.info("captureInteractionAnchor: mouseUp outside responder bounds (\(NSStringFromClass(type(of: responder))) bounds=\(NSStringFromRect(responder.bounds)) point=\(NSStringFromPoint(pointInResponder))) — anchor not updated")
             return
@@ -157,6 +186,7 @@ final class CommentLayer: NSObject, ObservableObject {
         }
 
         anchorLog.info("requestNewComment: showing popover relativeTo=\(NSStringFromRect(posRect)) of=\(NSStringFromClass(type(of: posView))) isFlipped=\(posView.isFlipped)")
+        coordLog.info("requestNewComment: popover relativeTo \(NSStringFromRect(posRect)) of \(NSStringFromClass(type(of: posView))) isFlipped=\(posView.isFlipped) bounds=\(NSStringFromRect(posView.bounds))")
 
         let popover = NSPopover()
         popover.contentViewController = NSHostingController(
@@ -321,6 +351,12 @@ final class CommentLayer: NSObject, ObservableObject {
     }
 
     /// Returns true if the right-click event is consumed (shows our custom context menu).
+    ///
+    /// `NSMenu.popUp(positioning:at:in:)` interprets `at:` in the *receiving view's*
+    /// coordinate system. Under SwiftUI, `window.contentView` is an NSHostingView whose
+    /// `isFlipped` is true, while `event.locationInWindow` is in the window's bottom-left
+    /// space — passing the window point directly inverts Y and pops the menu at
+    /// `viewHeight - clickY`. Route through `windowPointToView` to apply the flip.
     private func handleRightClick(locationInWindow: NSPoint, window: NSWindow?) -> Bool {
         guard !isShowingPopover, hasCurrentSelection() else { return false }
         guard let window, let view = window.contentView else { return false }
@@ -339,7 +375,9 @@ final class CommentLayer: NSObject, ObservableObject {
         menu.addItem(
             NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
 
-        menu.popUp(positioning: nil, at: locationInWindow, in: view)
+        let pointInView = windowPointToView(locationInWindow, in: view)
+        coordLog.info("handleRightClick: popUp at view-coords \(NSStringFromPoint(pointInView)) in \(NSStringFromClass(type(of: view))) (was: locationInWindow \(NSStringFromPoint(locationInWindow)) — passing window coords to a flipped contentView produced the top↔bottom mirror)")
+        menu.popUp(positioning: nil, at: pointInView, in: view)
         return true
     }
 }
