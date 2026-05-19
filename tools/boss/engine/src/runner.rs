@@ -2303,6 +2303,7 @@ mod pane_spawn_tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         if let Some(model) = product_default_model {
@@ -2630,6 +2631,7 @@ mod pane_spawn_tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = work_db
@@ -2865,6 +2867,7 @@ mod pane_spawn_tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = work_db
@@ -2963,6 +2966,7 @@ mod pane_spawn_tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = work_db
@@ -3097,6 +3101,7 @@ mod pane_spawn_tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = work_db

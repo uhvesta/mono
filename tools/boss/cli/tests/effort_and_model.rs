@@ -153,6 +153,7 @@ async fn chore_create_with_effort_and_model_round_trips_through_show() -> Result
             // this test is about effort / model fields, not repo
             // inference.
             repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -207,6 +208,7 @@ async fn chore_create_rejects_invalid_effort_level() -> Result<()> {
             // this test is about effort / model fields, not repo
             // inference.
             repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -248,6 +250,7 @@ async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
             // this test is about effort / model fields, not repo
             // inference.
             repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -319,6 +322,7 @@ async fn product_set_default_model_lifecycle_round_trips() -> Result<()> {
             // this test is about effort / model fields, not repo
             // inference.
             repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;
@@ -373,6 +377,7 @@ async fn model_override_passes_through_unrecognised_slug() -> Result<()> {
             // this test is about effort / model fields, not repo
             // inference.
             repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
+            design_repo: None,
         },
     )
     .await?;

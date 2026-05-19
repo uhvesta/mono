@@ -195,7 +195,7 @@ impl WorkDb {
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config
+            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo
              FROM products
              ORDER BY name COLLATE NOCASE ASC",
         )?;
@@ -212,11 +212,12 @@ impl WorkDb {
         let slug = unique_product_slug(&tx, &slugify(&input.name))?;
         let description = input.description.unwrap_or_default();
         let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
+        let design_repo = canonicalize_repo_remote_url(input.design_repo);
 
         tx.execute(
-            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL)",
-            params![id, input.name, slug, description, repo_remote_url, now],
+            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, design_repo)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL, ?7)",
+            params![id, input.name, slug, description, repo_remote_url, now, design_repo],
         )?;
 
         let product = query_product(&tx, &id)?
@@ -3003,7 +3004,8 @@ impl WorkDb {
                 ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
                 dispatch_preamble TEXT,
                 external_tracker_kind TEXT,
-                external_tracker_config TEXT
+                external_tracker_config TEXT,
+                design_repo TEXT
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -3197,6 +3199,7 @@ impl WorkDb {
         migrate_tasks_ci_attempt_columns(&conn)?;
         migrate_products_ci_attempt_budget(&conn)?;
         migrate_products_dispatch_preamble(&conn)?;
+        migrate_products_design_repo(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
         migrate_null_redundant_task_repo_remote_urls(&conn)?;
@@ -3288,6 +3291,7 @@ impl WorkDb {
         apply_text_patch(&mut product.name, patch.name);
         apply_text_patch(&mut product.description, patch.description);
         apply_repo_remote_url_patch(&mut product.repo_remote_url, patch.repo_remote_url);
+        apply_repo_remote_url_patch(&mut product.design_repo, patch.design_repo);
         apply_text_patch(&mut product.status, patch.status);
         apply_optional_string_patch(&mut product.default_model, patch.default_model);
         apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
@@ -3296,7 +3300,7 @@ impl WorkDb {
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10
              WHERE id = ?1",
             params![
                 product.id,
@@ -3308,6 +3312,7 @@ impl WorkDb {
                 product.updated_at,
                 product.default_model,
                 product.dispatch_preamble,
+                product.design_repo,
             ],
         )?;
 
@@ -6293,6 +6298,7 @@ fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         slug: row.get(2)?,
         description: row.get(3)?,
         repo_remote_url: row.get(4)?,
+        design_repo: row.get::<_, Option<String>>(12)?.filter(|s| !s.is_empty()),
         status: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
@@ -6998,7 +7004,7 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
 
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
-        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config
+        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo
          FROM products
          WHERE id = ?1",
         [id],
@@ -7881,6 +7887,18 @@ fn migrate_products_ci_attempt_budget(conn: &Connection) -> Result<()> {
 fn migrate_products_dispatch_preamble(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "products", "dispatch_preamble")? {
         conn.execute("ALTER TABLE products ADD COLUMN dispatch_preamble TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add `products.design_repo` — a per-product override that points
+/// `kind = 'design'` tasks at a different repo from the product's
+/// implementation default (`repo_remote_url`). `NULL` → no override;
+/// design tasks resolve through the standard chain. Implementation
+/// kinds (`task`, `chore`, `project_task`) are unaffected.
+fn migrate_products_design_repo(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "design_repo")? {
+        conn.execute("ALTER TABLE products ADD COLUMN design_repo TEXT", [])?;
     }
     Ok(())
 }
@@ -8935,6 +8953,13 @@ fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<Str
 /// caller decides what to do; today's dispatcher will record a
 /// `repo_unresolved` attention item per multi-repo Q5).
 ///
+/// For `kind = 'design'` tasks, a non-NULL `products.design_repo`
+/// takes precedence over `products.repo_remote_url` at the product
+/// layer — the per-row task override still wins, so this slots in as
+/// a new middle layer between the row override and the product
+/// default. Implementation kinds (`task`, `chore`, `project_task`)
+/// are unaffected.
+///
 /// No project layer: projects don't carry their own override (Q2),
 /// they inherit transitively through their tasks. A non-task
 /// `work_item_id` therefore returns `Ok(None)` since project / product
@@ -8952,15 +8977,15 @@ pub(crate) fn resolve_repo_for_work_item(
     conn: &Connection,
     work_item_id: &str,
 ) -> Result<Option<String>> {
-    let row: Option<(Option<String>, String)> = conn
+    let row: Option<(Option<String>, String, String)> = conn
         .query_row(
-            "SELECT repo_remote_url, product_id FROM tasks WHERE id = ?1",
+            "SELECT repo_remote_url, product_id, kind FROM tasks WHERE id = ?1",
             [work_item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
 
-    let Some((override_repo, product_id)) = row else {
+    let Some((override_repo, product_id, kind)) = row else {
         return Ok(None);
     };
 
@@ -8971,6 +8996,11 @@ pub(crate) fn resolve_repo_for_work_item(
     let product = query_product(conn, &product_id)?.with_context(|| {
         format!("orphan task {work_item_id}: parent product {product_id} missing")
     })?;
+    if kind == "design" {
+        if let Some(url) = product.design_repo.as_deref().filter(|s| !s.is_empty()) {
+            return Ok(Some(url.to_owned()));
+        }
+    }
     Ok(product.repo_remote_url)
 }
 
@@ -9904,6 +9934,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: Some("desc".to_owned()),
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -9974,6 +10005,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -10038,6 +10070,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -10114,6 +10147,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -10158,6 +10192,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore_idle = db
@@ -10252,6 +10287,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -10325,6 +10361,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let prereq = db
@@ -10369,6 +10406,7 @@ mod tests {
                 name: "Other".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let other_prereq = db
@@ -10491,6 +10529,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -10559,6 +10598,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -10667,6 +10707,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
 
@@ -10726,6 +10767,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -10829,6 +10871,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -10911,6 +10954,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -10987,6 +11031,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11041,6 +11086,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -11113,6 +11159,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -11177,6 +11224,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -11235,6 +11283,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11425,6 +11474,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11496,6 +11546,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11575,6 +11626,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11652,6 +11704,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11702,6 +11755,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11761,6 +11815,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11819,6 +11874,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11884,6 +11940,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -12002,6 +12059,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -12159,6 +12217,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12223,6 +12282,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12294,6 +12354,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12347,6 +12408,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12434,6 +12496,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12510,6 +12573,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12570,6 +12634,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let _todo_chore = db
@@ -12628,6 +12693,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12710,6 +12776,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12764,6 +12831,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12809,6 +12877,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12868,6 +12937,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -12931,6 +13001,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -12976,6 +13047,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -13022,6 +13094,7 @@ mod tests {
                     name: "Boss".to_owned(),
                     description: None,
                     repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                    design_repo: None,
                 })
                 .unwrap();
             let project = db
@@ -13074,6 +13147,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13129,6 +13203,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13306,6 +13381,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let mut chore_ids = Vec::new();
@@ -13369,6 +13445,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let prereq = db
@@ -13443,6 +13520,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13509,6 +13587,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13605,6 +13684,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13712,6 +13792,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13767,6 +13848,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -13890,6 +13972,7 @@ mod tests {
                 name: "Alpha".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/alpha.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let p2 = db
@@ -13897,6 +13980,7 @@ mod tests {
                 name: "Beta".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/beta.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -13953,6 +14037,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14017,6 +14102,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14089,6 +14175,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14161,6 +14248,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let dependent = db
@@ -14277,6 +14365,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let dependent = db
@@ -14376,6 +14465,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14447,6 +14537,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14535,6 +14626,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14597,6 +14689,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14667,6 +14760,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let a = db
@@ -14734,6 +14828,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let prereq = db
@@ -14968,6 +15063,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -15339,6 +15435,7 @@ mod tests {
                 name: "P".into(),
                 description: None,
                 repo_remote_url: Some("git@example.invalid:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -15711,6 +15808,7 @@ mod tests {
                 name: "P".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let budget: i64 = conn
@@ -15777,6 +15875,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -15986,6 +16085,7 @@ mod tests {
                 name: "TestProduct".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16267,6 +16367,7 @@ mod tests {
                 name: "NoRefs".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let refs = db
@@ -16592,6 +16693,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16675,6 +16777,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16744,6 +16847,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16851,6 +16955,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16908,6 +17013,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -17276,6 +17382,7 @@ mod tests {
                 name: "Wiki".to_owned(),
                 description: None,
                 repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -17405,6 +17512,7 @@ mod tests {
                 name: "NoRepo".to_owned(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -17836,6 +17944,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -17937,6 +18046,7 @@ mod tests {
                 name: "Boss".to_owned(),
                 description: None,
                 repo_remote_url: product_repo.map(str::to_owned),
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -18064,6 +18174,222 @@ mod tests {
         );
     }
 
+    /// Design tasks on a product with `design_repo` set must resolve
+    /// to `design_repo` rather than `repo_remote_url`. Acceptance
+    /// criterion: "`boss task show --json` for a `kind=design` task
+    /// on that product resolves to `design_repo` for its repo,
+    /// without any task-level `--repo` set."
+    #[test]
+    fn resolve_repo_uses_design_repo_for_design_kind() {
+        let path = disk_db_path("resolve-design-repo");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+            })
+            .unwrap();
+        // Project creation seeds a `kind = 'design'` task.
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Project".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+                no_design_task: false,
+            })
+            .unwrap();
+
+        // Find the seed design task (ordinal = 0).
+        let conn = db.connect().unwrap();
+        let design_task_id: String = conn
+            .query_row(
+                "SELECT id FROM tasks WHERE project_id = ?1 AND kind = 'design'",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let resolved = resolve_repo_for_work_item(&conn, &design_task_id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:linkedin-sandbox/bduff.git"),
+            "design task must resolve to product.design_repo",
+        );
+
+        // Implementation-kind tasks on the same product are unaffected.
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Implementation chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:spinyfin/mono.git"),
+            "implementation-kind tasks must continue to resolve to product.repo_remote_url",
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    /// `design_repo` falls through to `repo_remote_url` when unset.
+    /// Pre-existing products (and the explicit None path) behave
+    /// exactly as before.
+    #[test]
+    fn resolve_repo_design_kind_without_design_repo_falls_through_to_product_repo() {
+        let path = disk_db_path("resolve-design-no-override");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Project".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+                no_design_task: false,
+            })
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let design_task_id: String = conn
+            .query_row(
+                "SELECT id FROM tasks WHERE project_id = ?1 AND kind = 'design'",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let resolved = resolve_repo_for_work_item(&conn, &design_task_id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:spinyfin/mono.git"),
+            "without design_repo, a design task must resolve to product.repo_remote_url",
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    /// Task-level `--repo` still wins over `design_repo`. The new
+    /// override slots in as a new middle layer; it does not change
+    /// the priority of per-row overrides above it. To plant a
+    /// row-level override on a single-repo product (the typical case
+    /// when `design_repo` is set), the test bypasses the
+    /// task-creation invariant and writes the column directly.
+    #[test]
+    fn resolve_repo_task_override_wins_over_design_repo() {
+        let path = disk_db_path("resolve-design-override-wins");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "Project".to_owned(),
+                description: None,
+                goal: None,
+                autostart: false,
+                no_design_task: false,
+            })
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let design_task_id: String = conn
+            .query_row(
+                "SELECT id FROM tasks WHERE project_id = ?1 AND kind = 'design'",
+                [&project.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET repo_remote_url = ?2 WHERE id = ?1",
+            params![design_task_id, "git@github.com:custom/elsewhere.git"],
+        )
+        .unwrap();
+
+        let resolved = resolve_repo_for_work_item(&conn, &design_task_id).unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("git@github.com:custom/elsewhere.git"),
+            "row-level override must win over product.design_repo",
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    /// Round-trip: setting `design_repo` via `create` and clearing it
+    /// via `update_work_item("")` mirrors the wire-level behaviour of
+    /// `repo_remote_url`. Confirms the patch path applies / clears
+    /// the column rather than silently ignoring it.
+    #[test]
+    fn product_design_repo_set_and_clear() {
+        let path = disk_db_path("design-repo-set-clear");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            product.design_repo.as_deref(),
+            Some("git@github.com:linkedin-sandbox/bduff.git"),
+        );
+
+        let cleared = db
+            .update_work_item(
+                &product.id,
+                WorkItemPatch {
+                    design_repo: Some(String::new()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        let WorkItem::Product(cleared) = cleared else {
+            panic!("expected Product");
+        };
+        assert!(
+            cleared.design_repo.is_none(),
+            "empty-string patch must clear design_repo, got {:?}",
+            cleared.design_repo,
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
     #[test]
     fn resolve_repo_errors_when_parent_product_is_missing() {
         let (path, db, product_id, task_id) = make_resolve_scaffold(
@@ -18106,6 +18432,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         assert!(product.default_model.is_none());
@@ -18140,6 +18467,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18173,6 +18501,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18240,6 +18569,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18301,6 +18631,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         assert!(product.default_model.is_none());
@@ -18348,6 +18679,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18454,6 +18786,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18526,6 +18859,7 @@ mod tests {
             name: "Foo".to_owned(),
             description: None,
             repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+            design_repo: None,
         }).unwrap();
         let project = db.create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -18622,6 +18956,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:concurrent.git".into()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -18698,6 +19033,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let flunge = db
@@ -18705,6 +19041,7 @@ mod tests {
                 name: "Flunge".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:flunge.git".into()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -18853,6 +19190,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18906,6 +19244,7 @@ mod tests {
                 name: "Flunge".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let other_manual_id = next_id("task");
@@ -18932,6 +19271,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -18981,6 +19321,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -19034,6 +19375,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
 
@@ -19068,6 +19410,7 @@ mod tests {
                 name: "Boss".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
             })
             .unwrap();
 
@@ -19106,6 +19449,7 @@ mod tests {
                 name: "P".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19170,6 +19514,7 @@ mod tests {
                 name: "Prod".into(),
                 description: None,
                 repo_remote_url: None,
+                design_repo: None,
             })
             .unwrap();
         let project = db
@@ -19230,6 +19575,7 @@ mod tests {
                 name: "P".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19295,6 +19641,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore_a = db
@@ -19438,6 +19785,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19496,6 +19844,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19589,6 +19938,7 @@ mod tests {
                 name: "P".to_owned(),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19695,6 +20045,7 @@ mod tests {
                 name: "P".into(),
                 description: None,
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db

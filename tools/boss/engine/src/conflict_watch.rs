@@ -708,6 +708,7 @@ mod tests {
                 name: format!("Product-{name}"),
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
             })
             .unwrap();
         let chore = db

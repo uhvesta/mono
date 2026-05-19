@@ -776,6 +776,13 @@ struct ProductCreateArgs {
     #[arg(long = "repo")]
     #[arg(alias = "repo-remote-url")]
     repo_remote_url: Option<String>,
+
+    /// Per-product override for `kind=design` tasks. When set, design
+    /// tasks on this product resolve to this repo (e.g. a docs site)
+    /// instead of `--repo`. Implementation tasks are unaffected.
+    /// Per-task `--repo` overrides still win.
+    #[arg(long = "design-repo")]
+    design_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -791,6 +798,12 @@ struct ProductUpdateArgs {
     #[arg(long = "repo")]
     #[arg(alias = "repo-remote-url")]
     repo_remote_url: Option<String>,
+
+    /// Set or clear the per-product design-task repo override. Pass a
+    /// URL to set it, `""` to clear, or omit to leave unchanged. See
+    /// `ProductCreateArgs::design_repo`.
+    #[arg(long = "design-repo")]
+    design_repo: Option<String>,
 
     #[arg(long)]
     status: Option<ProductStatus>,
@@ -1828,6 +1841,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
             let name = required_text(args.name, "Product name", ctx)?;
             let description = optional_text(args.description, "Description", ctx)?;
             let repo_remote_url = optional_text(args.repo_remote_url, "Repo remote URL", ctx)?;
+            let design_repo = args.design_repo;
 
             let product = create_product(
                 &mut client,
@@ -1835,6 +1849,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     name,
                     description,
                     repo_remote_url,
+                    design_repo,
                 },
             )
             .await?;
@@ -1862,6 +1877,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 description: args.description,
                 status: args.status.map(|status| status.as_str().to_owned()),
                 repo_remote_url: args.repo_remote_url,
+                design_repo: args.design_repo,
                 dispatch_preamble: args.dispatch_preamble,
                 ..WorkItemPatch::default()
             };
@@ -5379,6 +5395,9 @@ fn print_product_details(title: &str, product: &Product) {
     println!("Slug: {}", product.slug);
     println!("Status: {}", product.status);
     println!("Repo: {}", product.repo_remote_url.as_deref().unwrap_or(""));
+    if let Some(design_repo) = product.design_repo.as_deref() {
+        println!("Design repo: {design_repo}");
+    }
     if let Some(model) = product.default_model.as_deref() {
         println!("Default model: {model}");
     }
@@ -5941,6 +5960,7 @@ mod tests {
             slug: "n".to_owned(),
             description: String::new(),
             repo_remote_url: None,
+            design_repo: None,
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -5981,6 +6001,7 @@ mod tests {
             slug: slug.to_owned(),
             description: String::new(),
             repo_remote_url: repo.map(str::to_owned),
+            design_repo: None,
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -7044,6 +7065,7 @@ mod tests {
             slug: slug.to_owned(),
             description: String::new(),
             repo_remote_url: None,
+            design_repo: None,
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
