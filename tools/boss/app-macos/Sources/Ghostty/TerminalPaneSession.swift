@@ -28,8 +28,9 @@ struct TerminalLaunchSpec {
     /// Env vars to set on the spawned shell, layered over the app's
     /// inherited env. The engine builds a strict allowlist for worker
     /// spawns (sanitized PATH excluding `bossctl`, plus
-    /// `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID`); the Boss pane and
-    /// ad-hoc test panes pass an empty array and inherit the app's env.
+    /// `BOSS_EVENTS_SOCKET` / `BOSS_LEASE_ID`); the Boss pane passes
+    /// `bossSessionEnv()` to set `BOSS_BIN_DIR`, `BOSS_BIN`, and an
+    /// initial PATH prepend; ad-hoc test panes pass an empty array.
     let env: [(String, String)]
 
     init(

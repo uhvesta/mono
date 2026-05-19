@@ -41,7 +41,15 @@ final class BossPaneModel: ObservableObject {
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
             workingDirectory: workingDirectory,
-            initialInput: "unset ANTHROPIC_API_KEY; \(bossPaneClaudeInvocation)\n",
+            // Re-prepend BOSS_BIN_DIR to PATH here rather than relying solely on
+            // bossSessionEnv()'s PATH entry. The shell's init scripts (.zprofile,
+            // .zshrc) rebuild PATH from /etc/paths and user dotfiles after the
+            // surface env is applied, so the BOSS_BIN_DIR prepend we set there gets
+            // overwritten. BOSS_BIN_DIR itself survives (init scripts don't unset
+            // custom vars), so we can re-prepend it via initialInput which runs
+            // after init completes. The guard is a no-op in dev / bazel-run mode
+            // where bossSessionEnv() returns [] and BOSS_BIN_DIR is unset.
+            initialInput: "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; \(bossPaneClaudeInvocation)\n",
             env: env
         )
         self.session = TerminalPaneSession(
