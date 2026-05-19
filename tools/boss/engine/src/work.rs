@@ -304,6 +304,47 @@ impl WorkDb {
         Ok(chore)
     }
 
+    /// Create a chore and immediately bind it to an upstream tracker reference
+    /// in a single SQLite transaction.
+    ///
+    /// The external-tracker importer must use this method instead of a
+    /// separate `create_chore` + `set_external_ref` pair. The two-step
+    /// approach leaves a window where an engine crash produces a chore with
+    /// `external_ref_canonical_id = NULL`; on the next reconcile tick the
+    /// orphaned chore is invisible to `find_by_external_ref`, the reconciler
+    /// re-imports the upstream item as a duplicate, and the original chore
+    /// never participates in reverse-close or forward-transition flows.
+    ///
+    /// Also bumps `external_ref_synced_at` within the same transaction so the
+    /// row is fully ready for the reconciler immediately after commit.
+    pub fn import_chore_with_external_ref(
+        &self,
+        input: CreateChoreInput,
+        kind: &str,
+        canonical_id: &str,
+        raw: &serde_json::Value,
+    ) -> Result<Task> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let chore = insert_chore_in_tx(&tx, input)?;
+        let raw_json = serde_json::to_string(raw)
+            .with_context(|| format!("failed to serialise external_ref raw for {}", chore.id))?;
+        let now = now_string();
+        tx.execute(
+            "UPDATE tasks
+             SET external_ref_kind         = ?2,
+                 external_ref_canonical_id = ?3,
+                 external_ref_raw          = ?4,
+                 external_ref_synced_at    = ?5,
+                 external_ref_unbound_at   = NULL,
+                 updated_at                = ?5
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![chore.id, kind, canonical_id, raw_json, now],
+        )?;
+        tx.commit()?;
+        Ok(chore)
+    }
+
     /// Insert N tasks atomically. The whole batch is wrapped in a
     /// single sqlite transaction; any per-item validation failure
     /// rolls back the entire batch (no partial state). Errors are
@@ -16096,6 +16137,51 @@ mod tests {
             .map(|(_, r)| r)
             .unwrap();
         assert!(bound.unbound_at.is_none(), "active row must have no unbound_at");
+    }
+
+    /// import_chore_with_external_ref creates the chore and binds the
+    /// external_ref in a single transaction: the chore must be immediately
+    /// findable via find_by_external_ref and have synced_at populated.
+    #[test]
+    fn import_chore_with_external_ref_is_atomic_and_findable() {
+        let (db, product_id, _) = setup_product_and_chore();
+        let raw = serde_json::json!({ "issue_number": 42 });
+        let chore = db
+            .import_chore_with_external_ref(
+                CreateChoreInput {
+                    product_id: product_id.clone(),
+                    name: "Imported issue".into(),
+                    description: Some("> Imported from https://github.com/example/repo/issues/42\n\nBody text".into()),
+                    autostart: false,
+                    priority: None,
+                    created_via: Some(boss_protocol::CREATED_VIA_EXTERNAL_TRACKER_SYNC.to_owned()),
+                    repo_remote_url: None,
+                    effort_level: None,
+                    model_override: None,
+                    force_duplicate: true,
+                },
+                "github",
+                "example/repo#42",
+                &raw,
+            )
+            .expect("import_chore_with_external_ref must succeed");
+
+        // The chore must be immediately findable by external_ref
+        // — no separate set_external_ref call required.
+        let found = db
+            .find_by_external_ref("github", "example/repo#42")
+            .expect("query ok")
+            .expect("chore must be findable by external_ref right after import");
+        assert_eq!(found.id, chore.id);
+
+        // external_ref must be populated with the correct fields.
+        let ext = found.external_ref.expect("external_ref must be set");
+        assert_eq!(ext.kind, "github");
+        assert_eq!(ext.canonical_id, "example/repo#42");
+        assert_eq!(ext.raw["issue_number"], 42);
+
+        // synced_at must be set within the same transaction.
+        assert!(ext.synced_at.is_some(), "synced_at must be set after import");
     }
 
     /// get_work_tree populates external_ref on chores so the kanban card

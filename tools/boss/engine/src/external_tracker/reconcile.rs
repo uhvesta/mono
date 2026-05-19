@@ -888,37 +888,32 @@ async fn import_new(
         force_duplicate: true,
     };
 
-    let chore = match work_db.create_chore(input) {
+    // Use the atomic import method so the chore row and its external_ref
+    // binding are committed together. A plain create_chore + set_external_ref
+    // pair leaves a crash window where the chore exists but has no ref,
+    // making it invisible to the reconciler and breaking reverse_close.
+    let chore = match work_db.import_chore_with_external_ref(
+        input,
+        &upstream.upstream_ref.kind,
+        &upstream.upstream_ref.canonical_id,
+        &upstream.upstream_ref.raw,
+    ) {
         Ok(c) => c,
         Err(e) => {
             warn!(
                 canonical_id = %upstream.upstream_ref.canonical_id,
                 error = %e,
-                "create_chore failed; skipping upstream item"
+                "import_chore_with_external_ref failed; skipping upstream item"
             );
             return;
         }
     };
-
-    if let Err(e) = work_db.set_external_ref(
-        &chore.id,
-        &upstream.upstream_ref.kind,
-        &upstream.upstream_ref.canonical_id,
-        &upstream.upstream_ref.raw,
-    ) {
-        warn!(work_item_id = %chore.id, error = %e, "set_external_ref failed after import");
-        return;
-    }
 
     // Attach a PR URL if one is already associated upstream.
     if let Some(pr) = pick_best_pr(&upstream.pr_associations) {
         if let Err(e) = work_db.reconciler_attach_pr_url(&chore.id, &pr.pr_url) {
             warn!(work_item_id = %chore.id, error = %e, "reconciler_attach_pr_url failed after import");
         }
-    }
-
-    if let Err(e) = work_db.touch_external_ref_synced_at(&chore.id) {
-        warn!(work_item_id = %chore.id, error = %e, "touch_external_ref_synced_at failed after import");
     }
 
     publisher
@@ -1770,6 +1765,57 @@ mod tests {
 
         let calls = tracker.close_calls();
         assert!(calls.is_empty(), "close_issue must not be called when reverse_close=false");
+    }
+
+    // ── E2E: import → done → reverse_close ───────────────────────────────────
+
+    /// Verify the full import→done→reverse_close path using `run_one_pass` for
+    /// the import (rather than the `seed_done_chore` helper that bypasses
+    /// `import_chore_with_external_ref`).  This guards against regressions
+    /// where the importer creates the chore and the external_ref binding
+    /// non-atomically, leaving the chore invisible to the reconciler.
+    #[tokio::test]
+    async fn reverse_close_fires_for_reconciler_imported_chore() {
+        let db = in_memory_db();
+        let _product = setup_product_with_reverse_close(&db);
+
+        // Pass 1: import the upstream item as a new Boss chore.
+        let tracker = SpyTracker::new(vec![open_item(30, "Issue 30")]);
+        let registry = spy_registry(Arc::clone(&tracker));
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome1 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+        assert_eq!(outcome1.items_imported, 1, "pass 1: should import one item");
+
+        // The imported chore must have its external_ref bound so the
+        // reconciler can reach it on subsequent passes.
+        let chore = db
+            .find_by_external_ref("spy", "spy#30")
+            .expect("query ok")
+            .expect("imported chore must be findable by external_ref");
+        assert_eq!(chore.status, "todo");
+
+        // Simulate the chore being completed (e.g. PR merged → boss dragged to done).
+        db.reconciler_close_work_item(&chore.id).expect("close work item");
+        let closed = db
+            .find_by_external_ref("spy", "spy#30")
+            .expect("query ok")
+            .expect("chore still exists");
+        assert_eq!(closed.status, "done");
+
+        // Pass 2: upstream still Open, boss is done, no merged PR
+        //         → reverse_close must fire.
+        tracker.push_ok();
+        let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert_eq!(outcome2.reverse_close_succeeded, 1,
+            "reverse_close must fire for an imported-then-done chore");
+        assert_eq!(outcome2.items_imported, 0,
+            "no duplicate import must occur");
+
+        let calls = tracker.close_calls();
+        assert_eq!(calls, vec!["spy#30"], "close_issue called exactly once");
     }
 
     // ── Smoke test: spawn_loop fires one tick and emits metrics ───────────────
