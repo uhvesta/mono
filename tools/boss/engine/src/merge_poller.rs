@@ -626,8 +626,11 @@ async fn fetch_merge_queue_dequeue_events(pr_url: &str) -> Vec<MergeQueueDequeue
 /// When `statusCheckRollup` is empty/null in `json_body`, fetches the
 /// legacy commit-status combined state (`pending` / `success` / `failure`
 /// / `error`) from GitHub's REST endpoint and returns it as a lowercase
-/// string. Returns `None` on any error or when the rollup is non-empty
-/// (the caller should rely on rollup data in that case).
+/// string. Returns `None` on any error, when the rollup is non-empty
+/// (the caller should rely on rollup data in that case), or when the
+/// commit has zero recorded statuses — GitHub reports `state:"pending"`
+/// even when `total_count == 0`, which would otherwise show up as a stuck
+/// yellow "waiting for CI" icon on PRs in repos with no checks configured.
 async fn fetch_commit_combined_state_for_empty_rollup(
     json_body: &str,
     pr_url: &str,
@@ -644,7 +647,12 @@ async fn fetch_commit_combined_state_for_empty_rollup(
     let repo = repo_from_pr_url(pr_url)?;
     let api_path = format!("repos/{repo}/commits/{head_sha}/status");
     let output = Command::new("gh")
-        .args(["api", &api_path, "--jq", ".state"])
+        .args([
+            "api",
+            &api_path,
+            "--jq",
+            "{state: .state, total_count: .total_count}",
+        ])
         .stdin(Stdio::null())
         .output()
         .await
@@ -652,9 +660,26 @@ async fn fetch_commit_combined_state_for_empty_rollup(
     if !output.status.success() {
         return None;
     }
-    let state = String::from_utf8(output.stdout)
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())?;
+    let body = std::str::from_utf8(&output.stdout).ok()?;
+    parse_combined_status_response(body)
+}
+
+/// Pure parser for GitHub's `repos/{owner}/{repo}/commits/{sha}/status`
+/// response shape (`{state, total_count}`). A commit with zero recorded
+/// statuses reports `state:"pending"` even though there is nothing to
+/// wait on — keying on `total_count` collapses that case to `None` so
+/// the caller treats the PR as `Clean` instead of stuck in-flight.
+fn parse_combined_status_response(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let total_count = v.get("total_count").and_then(|t| t.as_u64()).unwrap_or(0);
+    if total_count == 0 {
+        return None;
+    }
+    let state = v
+        .get("state")
+        .and_then(|s| s.as_str())?
+        .trim()
+        .to_ascii_lowercase();
     if state.is_empty() { None } else { Some(state) }
 }
 
@@ -3375,6 +3400,51 @@ mod tests {
                 case.label,
             );
         }
+    }
+
+    /// GitHub's `commits/{sha}/status` endpoint returns `state:"pending"`
+    /// for a commit with zero recorded statuses. Without filtering on
+    /// `total_count` the empty-rollup PR card would render a stuck yellow
+    /// "waiting for CI" icon for repos that have no checks configured at
+    /// all. The helper must collapse that case to `None`, which the
+    /// caller folds into `OpenPrCiStatus::Clean`.
+    #[test]
+    fn parse_combined_status_zero_total_count_returns_none() {
+        let body = serde_json::json!({"state": "pending", "total_count": 0}).to_string();
+        assert_eq!(parse_combined_status_response(&body), None);
+    }
+
+    #[test]
+    fn parse_combined_status_surfaces_state_when_count_positive() {
+        let cases = [
+            ("pending", "pending"),
+            ("PENDING", "pending"),
+            ("success", "success"),
+            ("failure", "failure"),
+            ("error", "error"),
+        ];
+        for (input, expected) in cases {
+            let body = serde_json::json!({"state": input, "total_count": 1}).to_string();
+            assert_eq!(
+                parse_combined_status_response(&body),
+                Some(expected.to_string()),
+                "state={input}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_combined_status_handles_missing_or_empty_fields() {
+        // Missing total_count defaults to 0 → treat as no checks.
+        let no_count = serde_json::json!({"state": "pending"}).to_string();
+        assert_eq!(parse_combined_status_response(&no_count), None);
+
+        // Empty state with positive count → None (defensive).
+        let empty_state = serde_json::json!({"state": "", "total_count": 2}).to_string();
+        assert_eq!(parse_combined_status_response(&empty_state), None);
+
+        // Malformed JSON → None.
+        assert_eq!(parse_combined_status_response("not json"), None);
     }
 
     /// Conflict pre-empts CI in the joint state (design §Q1 dispatch
