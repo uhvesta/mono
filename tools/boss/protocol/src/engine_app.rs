@@ -126,6 +126,21 @@ pub struct InterruptWorkerPaneInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InterruptWorkerPaneResult {}
 
+/// Engine asks the app to scroll the kanban to a specific work item
+/// and play a short transient highlight. `work_item_id` is the
+/// resolved canonical id (`task_…`/`proj_…`). `product_id` is
+/// included so the app can switch to the right product board even
+/// when that product is not currently loaded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevealWorkItemInput {
+    pub work_item_id: String,
+    pub product_id: String,
+}
+
+/// App's reply when the reveal animation has been triggered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevealWorkItemResult {}
+
 /// What the engine is asking the app to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -135,6 +150,7 @@ pub enum EngineToAppRequest {
     SendToPane(SendToPaneInput),
     FocusWorkerPane(FocusWorkerPaneInput),
     InterruptWorkerPane(InterruptWorkerPaneInput),
+    RevealWorkItem(RevealWorkItemInput),
 }
 
 /// App's reply, paired with the `request_id` from the originating
@@ -161,6 +177,9 @@ pub enum EngineToAppResponse {
     },
     InterruptWorkerPane {
         result: Result<InterruptWorkerPaneResult, EngineToAppError>,
+    },
+    RevealWorkItem {
+        result: Result<RevealWorkItemResult, EngineToAppError>,
     },
 }
 

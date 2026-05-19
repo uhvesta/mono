@@ -731,6 +731,16 @@ pub enum FrontendRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
     },
+    /// Boss-tier RPC: ask the macOS app to scroll the kanban to a
+    /// specific work item's card and play a short transient highlight.
+    /// `id` accepts a canonical id (`task_…`, `proj_…`) or a
+    /// short-id form (`T607`). Idempotent — repeat calls re-pulse
+    /// without animation overlap. Replies with [`FrontendEvent::WorkItemRevealed`]
+    /// on success or [`FrontendEvent::WorkError`] on failure (item not
+    /// found, item deleted, app not running, unknown id format).
+    RevealWorkItem {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1338,6 +1348,13 @@ pub enum FrontendEvent {
     /// three attempt subsystems.
     EngineAttemptsList {
         attempts: Vec<EngineAttemptListEntry>,
+    },
+    /// Engine acknowledges a reveal request — the macOS app has
+    /// switched to the kanban, scrolled the target card into view, and
+    /// started its transient highlight. Carries the resolved canonical
+    /// `id` so `bossctl reveal` can confirm which item was highlighted.
+    WorkItemRevealed {
+        id: String,
     },
 }
 

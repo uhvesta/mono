@@ -697,15 +697,23 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
                 Spacer(minLength: 0)
             } else {
-                ScrollView(.vertical) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(sections) { section in
-                            workSectionView(section, column: column)
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(sections) { section in
+                                workSectionView(section, column: column)
+                            }
                         }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .frame(maxHeight: .infinity)
+                    .onChange(of: model.revealScrollTarget) { _, target in
+                        guard let target else { return }
+                        let columnIDs = sections.flatMap { $0.items.map(\.id) }
+                        guard columnIDs.contains(target) else { return }
+                        withAnimation { proxy.scrollTo(target, anchor: .center) }
+                    }
                 }
-                .frame(maxHeight: .infinity)
             }
         }
         .padding(14)
@@ -765,17 +773,23 @@ struct ContentView: View {
 
     @ViewBuilder
     private func workSectionItems(_ items: [WorkTask], column: WorkBoardColumnKey) -> some View {
+        let selectedID = model.selectedTask?.id
+        let highlightID = model.revealHighlightID
         VStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
+                let isSelected = selectedID == task.id
+                let isRevealed = highlightID == task.id
                 WorkBoardCardItem(
                     task: task,
                     projectName: model.cardProjectBadge(for: task),
                     column: column,
                     runtime: column == .doing ? model.taskRuntime(for: task.id) : nil,
-                    isSelected: model.selectedTask?.id == task.id,
+                    isSelected: isSelected,
+                    isRevealed: isRevealed,
                     model: model,
                     liveStates: model.liveWorkerStates
                 )
+                .id(task.id)
             }
         }
     }
@@ -1269,6 +1283,7 @@ private struct WorkBoardCardItem: View {
     let column: WorkBoardColumnKey
     let runtime: WorkTaskRuntime?
     let isSelected: Bool
+    var isRevealed: Bool = false
     @ObservedObject var model: ChatViewModel
     @ObservedObject var liveStates: LiveWorkerStateStore
 
@@ -1375,6 +1390,14 @@ private struct WorkBoardCardItem: View {
                 )
             }
             .buttonStyle(.plain)
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        Color.accentColor.opacity(isRevealed ? 0.85 : 0),
+                        lineWidth: 3
+                    )
+                    .animation(.easeInOut(duration: 0.25), value: isRevealed)
+            )
             .contextMenu {
                 if let id = task.shortID {
                     Button("Copy ID") {

@@ -2550,6 +2550,26 @@ impl WorkDb {
         }
     }
 
+    /// Look up a work item by canonical id or short-form (`T42`,
+    /// `t42`). Returns `Ok(None)` when no item matches, `Ok(Some(…))`
+    /// on success. Canonical ids are passed straight to
+    /// [`get_work_item`]; short-form ids are first resolved via
+    /// [`resolve_friendly_work_item_id`] and then fetched by canonical
+    /// id. Unlike `get_work_item`, this never calls `classify_id`, so
+    /// it accepts both forms without the caller choosing.
+    pub fn get_work_item_resolving_short_id(&self, id: &str) -> Result<Option<WorkItem>> {
+        let conn = self.connect()?;
+        let canonical = resolve_friendly_work_item_id(&conn, id)?
+            .unwrap_or_else(|| id.to_owned());
+        match classify_id(&canonical) {
+            Ok(_) => match self.get_work_item(&canonical) {
+                Ok(item) => Ok(Some(item)),
+                Err(_) => Ok(None),
+            },
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Single-item version of the per-task runtime data carried in
     /// `WorkTree::task_runtimes`. Backs the `GetTaskRuntime` RPC that
     /// `boss chore show` / `boss task show` use to surface the active
