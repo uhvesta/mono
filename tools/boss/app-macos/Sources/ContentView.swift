@@ -1343,6 +1343,8 @@ private struct WorkBoardCardItem: View {
         let activityState: AgentActivityState? = column == .doing
             ? (isDispatchPending
                 ? .dispatchPending
+                : liveState?.slotId != nil
+                ? .active
                 : isResolvingConflicts
                 ? .waiting(reason: "Resolving merge conflict")
                 : isRemediatingCI
