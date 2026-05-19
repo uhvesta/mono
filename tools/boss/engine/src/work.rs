@@ -3191,6 +3191,7 @@ impl WorkDb {
         migrate_products_default_model(&conn)?;
         migrate_task_blocked_signals_table(&conn)?;
         migrate_ci_remediations_table(&conn)?;
+        migrate_ci_remediations_failure_kind_columns(&conn)?;
         migrate_ci_failure_suppressions_table(&conn)?;
         migrate_ci_inflight_observations_table(&conn)?;
         migrate_tasks_ci_attempt_columns(&conn)?;
@@ -4391,8 +4392,9 @@ impl WorkDb {
             "INSERT OR IGNORE INTO ci_remediations
                 (id, product_id, work_item_id, pr_url, pr_number,
                  head_branch, head_sha_at_trigger, attempt_kind,
-                 consumes_budget, failed_checks, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
+                 consumes_budget, failed_checks, status, created_at,
+                 failure_kind, before_commit_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
             params![
                 id,
                 input.product_id,
@@ -4405,6 +4407,8 @@ impl WorkDb {
                 input.consumes_budget,
                 input.failed_checks,
                 now,
+                input.failure_kind,
+                input.before_commit_sha,
             ],
         )?;
         if rows == 0 {
@@ -4446,7 +4450,8 @@ impl WorkDb {
                     attempt_kind, consumes_budget, failed_checks,
                     triage_class, log_excerpt, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at,
+                    failure_kind, before_commit_sha
              FROM ci_remediations WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -4849,7 +4854,8 @@ impl WorkDb {
                     attempt_kind, consumes_budget, failed_checks,
                     triage_class, log_excerpt, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at,
+                    failure_kind, before_commit_sha
              FROM ci_remediations
              WHERE work_item_id = ?1
                AND status IN ('pending', 'running')
@@ -6584,6 +6590,13 @@ pub struct CiRemediationInsertInput {
     /// trigger time. The engine writes this on detection; the worker
     /// reads it via the spawned prompt.
     pub failed_checks: String,
+    /// `'pr_branch_ci'` for normal per-PR CI failures; `'merge_queue_rebounce'`
+    /// when the PR was dequeued from GitHub's merge queue with
+    /// `reason=FAILED_CHECKS`. See `CiRemediation.failure_kind` for semantics.
+    pub failure_kind: String,
+    /// For `'merge_queue_rebounce'`: the synthetic merge SHA (`beforeCommit.oid`)
+    /// from the `RemovedFromMergeQueueEvent`. `None` for `'pr_branch_ci'`.
+    pub before_commit_sha: Option<String>,
 }
 
 /// One row of `ci_inflight_observations`. The engine tracks the
@@ -6635,6 +6648,8 @@ fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediation> {
         created_at: row.get(18)?,
         started_at: row.get(19)?,
         finished_at: row.get(20)?,
+        failure_kind: row.get(21)?,
+        before_commit_sha: row.get(22)?,
     })
 }
 
@@ -6645,7 +6660,8 @@ fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option<CiRemediat
                 attempt_kind, consumes_budget, failed_checks,
                 triage_class, log_excerpt, status, failure_reason,
                 cube_lease_id, cube_workspace_id, worker_id,
-                created_at, started_at, finished_at
+                created_at, started_at, finished_at,
+                failure_kind, before_commit_sha
          FROM ci_remediations
          WHERE id = ?1",
     )?;
@@ -7766,6 +7782,27 @@ fn migrate_ci_remediations_table(conn: &Connection) -> Result<()> {
 /// head sha invalidates it automatically. See
 /// `merge-conflict-handling-in-review.md` §Q5 ("Manual override
 /// (CI)") for the lifecycle.
+/// Add `failure_kind` and `before_commit_sha` columns to `ci_remediations`.
+/// `failure_kind` defaults to `'pr_branch_ci'` so pre-migration rows read as
+/// the normal per-PR CI path. `before_commit_sha` is NULL for those rows.
+fn migrate_ci_remediations_failure_kind_columns(conn: &Connection) -> Result<()> {
+    let has_fk: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('ci_remediations') WHERE name = 'failure_kind'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_fk {
+        conn.execute_batch(
+            "ALTER TABLE ci_remediations ADD COLUMN failure_kind TEXT NOT NULL DEFAULT 'pr_branch_ci';
+             ALTER TABLE ci_remediations ADD COLUMN before_commit_sha TEXT;",
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_ci_failure_suppressions_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS ci_failure_suppressions (
@@ -16595,6 +16632,8 @@ mod tests {
             attempt_kind: "fix".into(),
             consumes_budget: 1,
             failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
         })
         .unwrap();
         db.mark_chore_blocked_ci_failure(&chore.id, &pr_url, None).unwrap();
@@ -16672,6 +16711,8 @@ mod tests {
             attempt_kind: "fix".into(),
             consumes_budget: 1,
             failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
         })
         .unwrap();
         db.mark_chore_blocked_ci_failure_exhausted(&chore.id, &pr_url).unwrap();
@@ -16737,6 +16778,8 @@ mod tests {
                 attempt_kind: "fix".into(),
                 consumes_budget: 1,
                 failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
             })
             .unwrap();
         }
@@ -16758,6 +16801,8 @@ mod tests {
             attempt_kind: "fix".into(),
             consumes_budget: 1,
             failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
         })
         .unwrap();
         assert!(
@@ -19292,6 +19337,8 @@ mod tests {
                 attempt_kind: "fix".into(),
                 consumes_budget: 1,
                 failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
             })
             .unwrap()
             .expect("insert");
@@ -19306,6 +19353,8 @@ mod tests {
                 attempt_kind: "retrigger".into(),
                 consumes_budget: 0,
                 failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
             })
             .unwrap()
             .expect("insert");
@@ -19321,6 +19370,8 @@ mod tests {
                 attempt_kind: "fix".into(),
                 consumes_budget: 1,
                 failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
             })
             .unwrap()
             .expect("insert");
@@ -19576,6 +19627,8 @@ mod tests {
                 attempt_kind: "fix".into(),
                 consumes_budget: 1,
                 failed_checks: "[]".into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
             })
             .unwrap()
             .unwrap();

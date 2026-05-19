@@ -974,15 +974,48 @@ fn compose_ci_remediation_prompt(
     attempt: &CiRemediation,
     test_command: Option<&str>,
 ) -> String {
+    let is_rebounce = attempt
+        .failure_kind
+        .as_deref()
+        .map_or(false, |k| k == "merge_queue_rebounce");
+
     let mut prompt = String::new();
-    prompt.push_str(&format!(
-        "## CI remediation: PR #{pr_num} ({kind}) — required checks failing\n\n",
-        pr_num = attempt.pr_number,
-        kind = attempt.attempt_kind,
-    ));
+
+    if is_rebounce {
+        prompt.push_str(&format!(
+            "## [merge-queue-rebounce] CI remediation: PR #{pr_num} ({kind}) — merge-queue FAILED_CHECKS\n\n",
+            pr_num = attempt.pr_number,
+            kind = attempt.attempt_kind,
+        ));
+        // Clear preamble so the worker doesn't waste time on the PR's own CI.
+        prompt.push_str(
+            "> **Important**: this is a **merge-queue rebounce**, not a per-PR CI failure.\n\
+             > - The PR's own required checks are **green** on its head SHA. Do NOT look at them.\n\
+             > - The failure happened on the **synthetic merge commit** GitHub assembled when the PR\n\
+             >   entered the queue. See `Synthetic merge SHA` below.\n\
+             > - Root cause: something landed on `main` between this PR's CI run and its queue turn\n\
+             >   that is semantically incompatible (a new required field, a renamed type, etc.). This\n\
+             >   is a textbook semantic merge conflict that the merge queue exists to catch.\n\
+             > - After fixing, **re-enqueue** the PR — the merge queue does not auto-retry.\n\n",
+        );
+    } else {
+        prompt.push_str(&format!(
+            "## CI remediation: PR #{pr_num} ({kind}) — required checks failing\n\n",
+            pr_num = attempt.pr_number,
+            kind = attempt.attempt_kind,
+        ));
+    }
+
     prompt.push_str(&format!("**PR**: {}\n", attempt.pr_url));
     if !attempt.head_branch.is_empty() {
         prompt.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
+    }
+    if is_rebounce {
+        if let Some(ref sha) = attempt.before_commit_sha {
+            prompt.push_str(&format!(
+                "**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",
+            ));
+        }
     }
     prompt.push_str(&format!(
         "**Head sha at trigger**: `{}`\n",
@@ -1031,13 +1064,27 @@ fn compose_ci_remediation_prompt(
         );
     } else {
         // §"fix" path with the reconciled-2026-05-17 rebase-first step.
-        prompt.push_str("### Action: rebase first, then fix\n\n");
-        prompt.push_str(
-            "Many CI failures on long-running PRs are caused by `main` moving (a dep bump, a fix \
-             that landed, an env change). The cheapest experiment is rebasing onto `main` HEAD \
-             before changing any code — if CI goes green after the rebase, no fix-attempt slot is \
-             consumed against this PR's budget.\n\n",
-        );
+        if is_rebounce {
+            prompt.push_str("### Action: rebase onto current main, then fix the semantic conflict\n\n");
+            prompt.push_str(
+                "A merge-queue rebounce almost always means something landed on `main` between \
+                 this PR's CI run and its queue turn that is **semantically incompatible** — the \
+                 two patches don't textually conflict (GitHub's merge was clean) but the combined \
+                 code doesn't compile or fails tests. The fix is:\n\
+                 1. Rebase onto current `main` HEAD.\n\
+                 2. Look at the CI failure on the **synthetic merge SHA** (not the PR head) to \
+                    understand what became incompatible.\n\
+                 3. Add a focused fix, push, and re-enqueue the PR.\n\n",
+            );
+        } else {
+            prompt.push_str("### Action: rebase first, then fix\n\n");
+            prompt.push_str(
+                "Many CI failures on long-running PRs are caused by `main` moving (a dep bump, a fix \
+                 that landed, an env change). The cheapest experiment is rebasing onto `main` HEAD \
+                 before changing any code — if CI goes green after the rebase, no fix-attempt slot is \
+                 consumed against this PR's budget.\n\n",
+            );
+        }
         prompt.push_str("**Step 1 — Rebase onto base HEAD and force-push.**\n\n");
         prompt.push_str(&format!(
             "```\n\
@@ -1052,30 +1099,57 @@ fn compose_ci_remediation_prompt(
                 attempt.head_branch.as_str()
             },
         ));
-        prompt.push_str(
-            "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
-             - **If post-rebase CI is green**, call \
-             `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. The \
-             engine flips the attempt to `succeeded`, sets `consumes_budget = 0`, and decrements \
-             `tasks.ci_attempts_used` so this attempt does not count against the PR's budget.\n\
-             - **If post-rebase CI is still red**, continue to Step 2. The budget slot is now \
-             consumed; this is the fix attempt the engine pre-classified.\n\n",
-        );
+        if is_rebounce {
+            prompt.push_str(
+                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
+                 - **If post-rebase CI is green**, call \
+                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. \
+                 Then re-enqueue the PR (see Step 3 below). The engine flips the attempt to \
+                 `succeeded` and the budget slot is not consumed.\n\
+                 - **If post-rebase CI is still red**, the semantic conflict requires a code fix — \
+                 continue to Step 2.\n\n",
+            );
+        } else {
+            prompt.push_str(
+                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
+                 - **If post-rebase CI is green**, call \
+                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. The \
+                 engine flips the attempt to `succeeded`, sets `consumes_budget = 0`, and decrements \
+                 `tasks.ci_attempts_used` so this attempt does not count against the PR's budget.\n\
+                 - **If post-rebase CI is still red**, continue to Step 2. The budget slot is now \
+                 consumed; this is the fix attempt the engine pre-classified.\n\n",
+            );
+        }
 
         prompt.push_str("**Step 2 — Read the log, classify, fix, push.**\n\n");
-        prompt.push_str("Engine-collected log excerpt (failing job tail):\n\n");
-        match attempt.log_excerpt.as_deref().map(str::trim) {
-            Some(tail) if !tail.is_empty() => {
-                prompt.push_str("```\n");
-                prompt.push_str(tail);
-                prompt.push_str("\n```\n\n");
-            }
-            _ => {
-                prompt.push_str(
-                    "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
-                     Shell out to the per-provider CLI (`bk job log <job-id>` / \
-                     `gh run view --log-failed --job <job-id>`) from the failing check's `target_url`._\n\n",
-                );
+        if is_rebounce {
+            // For rebounce, direct the worker to the synthetic merge SHA.
+            // The PR head's logs are green and uninformative.
+            let sha_hint = attempt
+                .before_commit_sha
+                .as_deref()
+                .unwrap_or("<synthetic-merge-sha>");
+            prompt.push_str(&format!(
+                "Fetch CI logs from the **synthetic merge SHA `{sha_hint}`**, not the PR head \
+                 (whose checks are green). Use the per-provider CLI:\n\n\
+                 - Buildkite: `bk job log <job-id>` (job id from the failing check URL)\n\
+                 - GitHub Actions: `gh run view --log-failed --job <job-id>` (job id from failing check URL)\n\n",
+            ));
+        } else {
+            prompt.push_str("Engine-collected log excerpt (failing job tail):\n\n");
+            match attempt.log_excerpt.as_deref().map(str::trim) {
+                Some(tail) if !tail.is_empty() => {
+                    prompt.push_str("```\n");
+                    prompt.push_str(tail);
+                    prompt.push_str("\n```\n\n");
+                }
+                _ => {
+                    prompt.push_str(
+                        "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
+                         Shell out to the per-provider CLI (`bk job log <job-id>` / \
+                         `gh run view --log-failed --job <job-id>`) from the failing check's `target_url`._\n\n",
+                    );
+                }
             }
         }
         prompt.push_str(
@@ -1106,6 +1180,16 @@ fn compose_ci_remediation_prompt(
                 attempt.head_branch.as_str()
             },
         ));
+        if is_rebounce {
+            prompt.push_str(
+                "**Step 3 (after CI is green) — Re-enqueue the PR.**\n\n\
+                 The merge queue does **not** auto-retry after a dequeue. After your push produces \
+                 green CI, re-add the PR to the merge queue:\n\n\
+                 ```\n\
+                 gh pr merge --auto --squash  # or --merge / --rebase per repo policy\n\
+                 ```\n\n",
+            );
+        }
     }
 
     prompt.push_str("### Stop conditions\n\n");

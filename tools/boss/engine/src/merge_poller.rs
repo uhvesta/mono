@@ -123,6 +123,11 @@ crate::register_counter!(
     "merge_poller.pr_recheck_unresolved",
     "PR-detection rechecks that still found no bindable PR in one sweep."
 );
+crate::register_counter!(
+    MERGE_QUEUE_REBOUNCED,
+    "merge_poller.merge_queue_rebounced",
+    "PRs flipped to blocked:ci_failure due to a merge-queue FAILED_CHECKS dequeue in one sweep."
+);
 
 /// Register all merge-poller counter handles with `registry`. Called
 /// from [`crate::metrics::init_all`] at engine startup.
@@ -133,6 +138,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&PR_RECHECK_RECOVERED);
     registry.register_counter(&CONFLICT_REDISPATCHED);
     registry.register_counter(&PR_RECHECK_UNRESOLVED);
+    registry.register_counter(&MERGE_QUEUE_REBOUNCED);
 }
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -546,6 +552,75 @@ async fn fetch_merge_queue_status(pr_url: &str) -> bool {
     };
     // data.repository.pullRequest.mergeQueueEntry — non-null → in queue.
     !body["data"]["repository"]["pullRequest"]["mergeQueueEntry"].is_null()
+}
+
+/// One `RemovedFromMergeQueueEvent` entry from the PR's timeline.
+#[derive(Debug, Clone)]
+pub struct MergeQueueDequeueEvent {
+    pub reason: String,
+    /// `beforeCommit.oid` — the synthetic merge SHA that failed CI.
+    /// `None` when GitHub omitted it (edge case for non-CI reasons).
+    pub before_commit_oid: Option<String>,
+}
+
+/// Query the PR's timeline for `RemovedFromMergeQueueEvent` entries.
+/// Returns events with `reason == "FAILED_CHECKS"` (the only case Boss
+/// treats as a CI failure). Events for other reasons (`MANUAL_REMOVAL`,
+/// `MERGE_CONFLICT`, etc.) are filtered out at the call site.
+///
+/// Returns an empty vec on any error so the sweep degrades gracefully.
+/// The `INSERT OR IGNORE` idempotency on `ci_remediations` deduplicates
+/// re-seen events across sweeps without any extra tracking.
+async fn fetch_merge_queue_dequeue_events(pr_url: &str) -> Vec<MergeQueueDequeueEvent> {
+    let (Some(owner_repo), Some(number)) = (repo_from_pr_url(pr_url), pr_number_from_url(pr_url)) else {
+        return Vec::new();
+    };
+    let (owner, repo) = match owner_repo.split_once('/') {
+        Some(pair) => pair,
+        None => return Vec::new(),
+    };
+    // Query the last 20 timeline items — enough to cover any realistically
+    // plausible burst of re-enqueue/dequeue cycles on a single PR.
+    let query = format!(
+        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT], last: 20) {{ nodes {{ ... on RemovedFromMergeQueueEvent {{ reason beforeCommit {{ oid }} }} }} }} }} }} }}"#
+    );
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let body: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let nodes = match body["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        .as_array()
+    {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    let mut events = Vec::new();
+    for node in nodes {
+        let reason = match node["reason"].as_str() {
+            Some(r) => r.to_owned(),
+            None => continue,
+        };
+        // Only surface FAILED_CHECKS — all other reasons are informational
+        // or terminal-success and must not feed the ci_failure path.
+        if reason != "FAILED_CHECKS" {
+            continue;
+        }
+        let before_commit_oid = node["beforeCommit"]["oid"].as_str().map(|s| s.to_owned());
+        events.push(MergeQueueDequeueEvent { reason, before_commit_oid });
+    }
+    events
 }
 
 /// When `statusCheckRollup` is empty/null in `json_body`, fetches the
@@ -1145,6 +1220,9 @@ pub struct SweepOutcome {
     /// can assert the recheck path actually reached the executions in
     /// its candidate list, even when no transition fired.
     pub pr_recheck_unresolved: usize,
+    /// Number of `in_review` PRs flipped to `blocked: ci_failure` due to
+    /// a merge-queue `FAILED_CHECKS` dequeue event detected in this sweep.
+    pub merge_queue_rebounced: usize,
 }
 
 impl SweepOutcome {
@@ -1156,6 +1234,7 @@ impl SweepOutcome {
             + self.ci_cleared
             + self.pr_recheck_recovered
             + self.conflict_redispatched
+            + self.merge_queue_rebounced
     }
 }
 
@@ -1276,6 +1355,16 @@ pub async fn run_one_pass(
             outcome.conflict_redispatched += 1;
         }
     }
+    // Merge-queue rebounce pass: for every `in_review` PR, poll the
+    // GitHub timeline for `RemovedFromMergeQueueEvent` rows with
+    // `reason=FAILED_CHECKS`. This is a separate pass from the probe
+    // loop above — the probe covers per-PR CI and merge-conflict
+    // signals, while this pass specifically looks for queue dequeues.
+    // The `INSERT OR IGNORE` idempotency on `ci_remediations` ensures
+    // that events already processed on a prior sweep are no-ops.
+    for candidate in &in_review {
+        check_merge_queue_rebounce(work_db, publisher, candidate, &mut outcome).await;
+    }
     outcome
 }
 
@@ -1346,6 +1435,52 @@ async fn sweep_pending_pr(
         | StopOutcome::RunningNoStagedPr
         | StopOutcome::FallbackDisabledByFlag
         | StopOutcome::DbError => {}
+    }
+}
+
+/// Poll the PR's merge-queue timeline for `FAILED_CHECKS` dequeue
+/// events and fire [`ci_watch::on_merge_queue_rebounce_detected`] for
+/// any event whose `beforeCommit.oid` is not yet recorded in
+/// `ci_remediations`. Best-effort: a failed GraphQL call is logged at
+/// debug and skipped; the next sweep will retry.
+async fn check_merge_queue_rebounce(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    outcome: &mut SweepOutcome,
+) {
+    let events = fetch_merge_queue_dequeue_events(&candidate.pr_url).await;
+    if events.is_empty() {
+        return;
+    }
+    for event in &events {
+        let Some(before_commit_sha) = event.before_commit_oid.as_deref() else {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "merge poller: FAILED_CHECKS dequeue event has no beforeCommit.oid; skipping",
+            );
+            continue;
+        };
+        if ci_watch::on_merge_queue_rebounce_detected(
+            work_db,
+            publisher,
+            candidate,
+            None, // head_ref_name not available without a probe round-trip
+            None, // head_ref_oid not needed for rebounce (before_commit_sha is the key)
+            before_commit_sha,
+            &[], // labels not available here; opt-out check uses product flag only
+        )
+        .await
+        {
+            outcome.merge_queue_rebounced += 1;
+            tracing::info!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                before_commit_sha,
+                "merge poller: merge-queue FAILED_CHECKS rebounce → blocked: ci_failure",
+            );
+        }
     }
 }
 
@@ -1820,6 +1955,7 @@ pub fn spawn_loop(
             PR_RECHECK_RECOVERED.inc_by(&metrics, outcome.pr_recheck_recovered as u64);
             CONFLICT_REDISPATCHED.inc_by(&metrics, outcome.conflict_redispatched as u64);
             PR_RECHECK_UNRESOLVED.inc_by(&metrics, outcome.pr_recheck_unresolved as u64);
+            MERGE_QUEUE_REBOUNCED.inc_by(&metrics, outcome.merge_queue_rebounced as u64);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -1830,6 +1966,7 @@ pub fn spawn_loop(
                     ci_cleared = outcome.ci_cleared,
                     pr_recheck_recovered = outcome.pr_recheck_recovered,
                     pr_recheck_unresolved = outcome.pr_recheck_unresolved,
+                    merge_queue_rebounced = outcome.merge_queue_rebounced,
                     "merge poller: sweep transitions",
                 );
             }

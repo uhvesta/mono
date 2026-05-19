@@ -217,6 +217,8 @@ fn seed_chore_with_ci_attempt(
             attempt_kind: attempt_kind.to_owned(),
             consumes_budget,
             failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
         })?
         .expect("insert returned new row");
     Ok((chore.id, attempt.id))

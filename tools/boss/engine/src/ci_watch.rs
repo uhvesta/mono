@@ -324,6 +324,8 @@ pub async fn on_ci_failure_detected(
         attempt_kind: attempt_kind.to_owned(),
         consumes_budget,
         failed_checks: failed_checks_json,
+        failure_kind: "pr_branch_ci".to_owned(),
+        before_commit_sha: None,
     });
     let attempt = match insert_result {
         Ok(row) => row,
@@ -455,6 +457,287 @@ pub async fn on_ci_failure_detected(
             attempt_kind,
             failures = failures.len(),
             "ci_watch: CI failure detected; parent flipped to blocked: ci_failure",
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Entry point for merge-queue rebounce detection.
+///
+/// Called from `merge_poller::sweep` when a `RemovedFromMergeQueueEvent`
+/// with `reason=FAILED_CHECKS` is detected for an `in_review` PR.
+/// Unlike [`on_ci_failure_detected`], the PR's own per-branch CI is
+/// green; the failure is on the **synthetic merge commit**
+/// (`before_commit_sha`) that GitHub assembled when the PR was in the
+/// queue. The worker must look at *that* SHA's CI logs, rebase onto
+/// current `main`, and re-enqueue after pushing.
+///
+/// Shares the same `blocked: ci_failure` / `ci_remediation` flow as
+/// per-PR CI failures but sets `failure_kind='merge_queue_rebounce'`
+/// and stores `before_commit_sha` so the worker prompt and CI-log
+/// fetch path know which SHA is failing.
+///
+/// Returns `true` when the parent transitions to `blocked: ci_failure`.
+pub async fn on_merge_queue_rebounce_detected(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    head_ref_name: Option<&str>,
+    _head_ref_oid: Option<&str>,
+    before_commit_sha: &str,
+    labels: &[String],
+) -> bool {
+    if auto_pr_maintenance_disabled(work_db, candidate, labels) {
+        return false;
+    }
+    match work_db.has_active_rebase_attempt_for_pr(&candidate.pr_url) {
+        Ok(true) => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "ci_watch: rebase attempt active; deferring merge_queue_rebounce flip",
+            );
+            return false;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to check rebase attempt; deferring",
+            );
+            return false;
+        }
+    }
+    match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
+        Ok(Some(_)) => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "ci_watch: conflict resolution attempt active; deferring merge_queue_rebounce flip",
+            );
+            return false;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to check active conflict_resolutions; deferring",
+            );
+            return false;
+        }
+    }
+
+    // Suppression check: if the human manually moved the chore out of
+    // `blocked: ci_failure` for this synthetic merge SHA, honour it.
+    match work_db.is_ci_failure_suppressed(&candidate.work_item_id, before_commit_sha) {
+        Ok(true) => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                before_commit_sha,
+                "ci_watch: ci_failure suppression active for before_commit_sha; skipping rebounce",
+            );
+            return false;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to read suppression table; continuing",
+            );
+        }
+    }
+
+    let used = work_db.get_ci_attempts_used(&candidate.work_item_id).unwrap_or(0);
+    let budget = work_db
+        .effective_ci_budget(&candidate.work_item_id)
+        .unwrap_or(3);
+    if used >= budget {
+        match work_db
+            .mark_chore_blocked_ci_failure_exhausted(&candidate.work_item_id, &candidate.pr_url)
+        {
+            Ok(Some(_)) => {
+                publisher
+                    .publish_work_item_changed(
+                        &candidate.product_id,
+                        &candidate.work_item_id,
+                        "blocked_ci_failure_exhausted",
+                    )
+                    .await;
+                publisher
+                    .publish_frontend_event_on_product(
+                        &candidate.product_id,
+                        FrontendEvent::CiRemediationExhausted {
+                            product_id: candidate.product_id.clone(),
+                            work_item_id: candidate.work_item_id.clone(),
+                            pr_url: candidate.pr_url.clone(),
+                            attempts_used: used,
+                            budget,
+                        },
+                    )
+                    .await;
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    used,
+                    budget,
+                    "ci_watch: rebounce budget exhausted; parent flipped to blocked: ci_failure_exhausted",
+                );
+                return true;
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    "ci_watch: rebounce ci_failure_exhausted WHERE guard missed",
+                );
+                return false;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "ci_watch: failed to flip row to blocked: ci_failure_exhausted (rebounce)",
+                );
+                return false;
+            }
+        }
+    }
+
+    // Merge-queue rebounces are always `fix` — the semantic merge
+    // conflict requires a worker to rebase and potentially resolve
+    // incompatible changes. `retrigger` would not help.
+    let pr_number = parse_pr_number(&candidate.pr_url).unwrap_or(0);
+
+    // The `before_commit_sha` serves as `head_sha_at_trigger` so the
+    // unique key `(work_item_id, head_sha_at_trigger, attempt_kind)`
+    // naturally deduplicates on the synthetic merge SHA: two polls
+    // that see the same bounce event hit the same key and the second
+    // `INSERT OR IGNORE` is a no-op.
+    let insert_result = work_db.insert_ci_remediation(CiRemediationInsertInput {
+        product_id: candidate.product_id.clone(),
+        work_item_id: candidate.work_item_id.clone(),
+        pr_url: candidate.pr_url.clone(),
+        pr_number,
+        head_branch: head_ref_name.unwrap_or_default().to_owned(),
+        head_sha_at_trigger: before_commit_sha.to_owned(),
+        attempt_kind: "fix".to_owned(),
+        consumes_budget: 1,
+        failed_checks: "[]".to_owned(),
+        failure_kind: "merge_queue_rebounce".to_owned(),
+        before_commit_sha: Some(before_commit_sha.to_owned()),
+    });
+    let attempt = match insert_result {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to insert ci_remediations row (rebounce)",
+            );
+            None
+        }
+    };
+
+    let attempt_id = attempt.as_ref().map(|a| a.id.clone());
+
+    let task_result = work_db.mark_chore_blocked_ci_failure(
+        &candidate.work_item_id,
+        &candidate.pr_url,
+        attempt_id.as_deref(),
+    );
+    let task_transitioned = match task_result {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "ci_watch: rebounce WHERE guard missed; row already blocked or manually moved",
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to flip row to blocked: ci_failure (rebounce)",
+            );
+            return false;
+        }
+    };
+
+    if task_transitioned {
+        if attempt.is_some() {
+            if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "ci_watch: failed to increment ci_attempts_used (rebounce)",
+                );
+            }
+        }
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "blocked_ci_failure",
+            )
+            .await;
+        if let Some(attempt) = attempt.as_ref() {
+            match work_db.create_execution(CreateExecutionInput {
+                work_item_id: candidate.work_item_id.clone(),
+                kind: "ci_remediation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            }) {
+                Ok(_) => publisher.kick_scheduler(),
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        attempt_id = %attempt.id,
+                        ?err,
+                        "ci_watch: failed to create ci_remediation execution (rebounce)",
+                    );
+                }
+            }
+            publisher
+                .publish_frontend_event_on_product(
+                    &candidate.product_id,
+                    FrontendEvent::CiRemediationStarted {
+                        product_id: candidate.product_id.clone(),
+                        work_item_id: candidate.work_item_id.clone(),
+                        attempt_id: attempt.id.clone(),
+                        pr_url: candidate.pr_url.clone(),
+                        attempt_kind: attempt.attempt_kind.clone(),
+                    },
+                )
+                .await;
+        }
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            before_commit_sha,
+            head_sha_at_trigger = before_commit_sha,
+            "ci_watch: merge-queue rebounce detected; parent flipped to blocked: ci_failure",
         );
         true
     } else {
