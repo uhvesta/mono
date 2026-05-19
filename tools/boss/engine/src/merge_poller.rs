@@ -1248,6 +1248,13 @@ pub struct SweepOutcome {
     /// Number of `in_review` PRs flipped to `blocked: ci_failure` due to
     /// a merge-queue `FAILED_CHECKS` dequeue event detected in this sweep.
     pub merge_queue_rebounced: usize,
+    /// Number of stranded `ci_remediations` attempts (status `pending`,
+    /// no live execution) for which a fresh execution was re-emitted.
+    /// Covers the back-to-back dequeue scenario where two dequeue events
+    /// arrive in the same sweep: the first flips the task (consuming the
+    /// WHERE guard) and the second inserts a ci_remediations row but
+    /// cannot create an execution because the task is already blocked.
+    pub ci_remediation_redispatched: usize,
 }
 
 impl SweepOutcome {
@@ -1260,6 +1267,7 @@ impl SweepOutcome {
             + self.pr_recheck_recovered
             + self.conflict_redispatched
             + self.merge_queue_rebounced
+            + self.ci_remediation_redispatched
     }
 }
 
@@ -1334,11 +1342,22 @@ pub async fn run_one_pass(
             Vec::new()
         }
     };
+    let stranded_ci_attempts = match work_db.list_stranded_ci_remediation_attempts() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: failed to list stranded ci remediation attempts",
+            );
+            Vec::new()
+        }
+    };
     let total = in_review.len()
         + blocked_conflict.len()
         + blocked_ci.len()
         + pending_pr_recheck.len()
-        + stranded_attempts.len();
+        + stranded_attempts.len()
+        + stranded_ci_attempts.len();
     if total == 0 {
         return SweepOutcome::default();
     }
@@ -1348,6 +1367,7 @@ pub async fn run_one_pass(
         blocked_ci = blocked_ci.len(),
         pending_pr_recheck = pending_pr_recheck.len(),
         stranded_attempts = stranded_attempts.len(),
+        stranded_ci_attempts = stranded_ci_attempts.len(),
         "merge poller: sweep started",
     );
     let mut outcome = SweepOutcome::default();
@@ -1380,14 +1400,33 @@ pub async fn run_one_pass(
             outcome.conflict_redispatched += 1;
         }
     }
-    // Merge-queue rebounce pass: for every `in_review` PR, poll the
-    // GitHub timeline for `RemovedFromMergeQueueEvent` rows with
-    // `reason=FAILED_CHECKS`. This is a separate pass from the probe
-    // loop above — the probe covers per-PR CI and merge-conflict
-    // signals, while this pass specifically looks for queue dequeues.
+    // Rescue stranded ci_remediations attempts: `pending` rows with no live
+    // execution. These arise when two dequeue events land in the same sweep —
+    // the first flips the task (consuming the WHERE guard on
+    // `mark_chore_blocked_ci_failure`) and the second inserts a ci_remediations
+    // row but cannot create an execution. Re-emit a fresh execution so a worker
+    // is dispatched without waiting for the task to return to `in_review`.
+    for attempt in &stranded_ci_attempts {
+        if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
+            outcome.ci_remediation_redispatched += 1;
+        }
+    }
+    // Merge-queue rebounce pass: for every `in_review` PR and every
+    // `blocked: ci_failure` PR, poll the GitHub timeline for
+    // `RemovedFromMergeQueueEvent` rows with `reason=FAILED_CHECKS`.
+    // This is a separate pass from the probe loop above — the probe
+    // covers per-PR CI and merge-conflict signals, while this pass
+    // specifically looks for queue dequeues. Including `blocked_ci`
+    // candidates ensures that a second dequeue (on a PR already blocked
+    // by a prior dequeue) inserts a ci_remediations row so the stranded
+    // rescue above can dispatch an execution for it.
     // The `INSERT OR IGNORE` idempotency on `ci_remediations` ensures
     // that events already processed on a prior sweep are no-ops.
-    for candidate in &in_review {
+    let mut rebounce_seen = std::collections::HashSet::new();
+    for candidate in in_review.iter().chain(blocked_ci.iter()) {
+        if !rebounce_seen.insert(candidate.work_item_id.clone()) {
+            continue;
+        }
         check_merge_queue_rebounce(work_db, publisher, candidate, &mut outcome).await;
     }
     outcome
