@@ -185,6 +185,25 @@ rust_test(
     ),
 )
 
+rust_test(
+    name = "stop_engine_runtime_test",
+    srcs = ["tests/stop_engine_runtime.rs"],
+    edition = "2024",
+    size = "small",
+    timeout = "moderate",
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
 filegroup(
     name = "engine_srcs",
     srcs = glob(["src/**/*.rs"]),

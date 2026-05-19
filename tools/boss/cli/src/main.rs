@@ -1682,7 +1682,7 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_engine_command(command, &ctx).await
         }
-        Commands::Uninstall(args) => run_uninstall_command(args, &cli.global),
+        Commands::Uninstall(args) => run_uninstall_command(args, &cli.global).await,
     }
 }
 
@@ -2748,6 +2748,7 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
         }
         EngineCommand::Stop => {
             stop_engine(&ctx.discovery.pid_file_path)
+                .await
                 .map_err(|err| CliError::engine_unavailable(err.to_string()))?;
             print_entity(
                 ctx,
@@ -5701,7 +5702,7 @@ fn confirm_interactive(prompt: &str) -> bool {
     matches!(line.trim(), "y" | "Y")
 }
 
-fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Result<(), CliError> {
+async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Result<(), CliError> {
     let install_root = resolve_install_root()?;
     // True when no BOSS_INSTALL_ROOT override is in effect, meaning we are
     // operating on the canonical ~/Applications install. Only in that case
@@ -5764,7 +5765,7 @@ fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Result<(),
     if using_default_install_root {
         let pid_path = std::env::var("BOSS_ENGINE_PID_PATH")
             .unwrap_or_else(|_| boss_client::DEFAULT_PID_PATH.to_owned());
-        let _ = stop_engine(&pid_path);
+        let _ = stop_engine(&pid_path).await;
     } else {
         eprintln!(
             "note: not stopping engine: BOSS_INSTALL_ROOT is set; \

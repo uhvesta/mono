@@ -252,7 +252,11 @@ pub async fn ensure_engine_running(discovery: &Discovery) -> Result<()> {
 /// developer recovering from a wedged engine on a non-standard layout
 /// still has a recoverable kill switch; the everyday "restart engine"
 /// case always takes the RPC.
-pub fn stop_engine(pid_file_path: &str) -> Result<()> {
+///
+/// Async because the RPC path needs to share the caller's tokio
+/// runtime — building a nested runtime here panics with "Cannot
+/// start a runtime from within a runtime" (#720).
+pub async fn stop_engine(pid_file_path: &str) -> Result<()> {
     let Some(pid) = running_engine_pid(pid_file_path) else {
         return Ok(());
     };
@@ -261,7 +265,7 @@ pub fn stop_engine(pid_file_path: &str) -> Result<()> {
     // falls through to SIGTERM so the caller's "please make the
     // engine go away" still works on a host where the token file
     // never landed.
-    match try_shutdown_via_rpc() {
+    match try_shutdown_via_rpc().await {
         Ok(()) => {
             if let Some(owner) = read_pid_file(pid_file_path) {
                 if owner == pid {
@@ -302,10 +306,22 @@ pub fn stop_engine(pid_file_path: &str) -> Result<()> {
 /// the engine acknowledged `ShutdownAccepted`. Any failure (no token
 /// file, socket unreachable, token rejected, unexpected response) is
 /// surfaced as an `Err` so the caller can decide whether to fall back.
-fn try_shutdown_via_rpc() -> Result<()> {
+///
+/// Async because the caller (e.g. the `#[tokio::main]` CLI dispatch)
+/// already owns a tokio runtime — building a second runtime and
+/// calling `block_on` here panics with "Cannot start a runtime from
+/// within a runtime" (#720).
+async fn try_shutdown_via_rpc() -> Result<()> {
     let token_path = default_control_token_path()
         .ok_or_else(|| anyhow::anyhow!("could not resolve engine-control token path"))?;
-    let raw = std::fs::read_to_string(&token_path).with_context(|| {
+    try_shutdown_via_rpc_at(&token_path).await
+}
+
+/// Token-path-injected variant of [`try_shutdown_via_rpc`]. Kept
+/// separate so tests can drive the RPC without mutating the global
+/// `BOSS_ENGINE_CONTROL_TOKEN_PATH` env var.
+async fn try_shutdown_via_rpc_at(token_path: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(token_path).with_context(|| {
         format!(
             "failed to read engine-control token file {}",
             token_path.display()
@@ -314,26 +330,19 @@ fn try_shutdown_via_rpc() -> Result<()> {
     let parsed: ControlTokenFile = serde_json::from_str(&raw)
         .with_context(|| format!("malformed engine-control token file {}", token_path.display()))?;
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build temporary tokio runtime for shutdown RPC")?;
-
-    runtime.block_on(async move {
-        let mut client = BossClient::connect_socket(&parsed.socket_path).await?;
-        let event = client
-            .send_request(&FrontendRequest::Shutdown {
-                token: parsed.token.clone(),
-            })
-            .await?;
-        match event {
-            FrontendEvent::ShutdownAccepted => Ok(()),
-            FrontendEvent::ShutdownRejected { reason } => {
-                bail!("engine rejected shutdown rpc: {reason}");
-            }
-            other => bail!("unexpected response to Shutdown rpc: {:?}", other),
+    let mut client = BossClient::connect_socket(&parsed.socket_path).await?;
+    let event = client
+        .send_request(&FrontendRequest::Shutdown {
+            token: parsed.token.clone(),
+        })
+        .await?;
+    match event {
+        FrontendEvent::ShutdownAccepted => Ok(()),
+        FrontendEvent::ShutdownRejected { reason } => {
+            bail!("engine rejected shutdown rpc: {reason}");
         }
-    })
+        other => bail!("unexpected response to Shutdown rpc: {:?}", other),
+    }
 }
 
 /// Minimal on-disk view of the engine-control token file. Kept in
@@ -695,6 +704,36 @@ mod tests {
         assert_eq!(
             std::fs::canonicalize(&found).unwrap(),
             std::fs::canonicalize(tmp.path()).unwrap(),
+        );
+    }
+
+    /// Regression for #720: pre-fix, `try_shutdown_via_rpc` built a
+    /// `new_current_thread` runtime and called `block_on` inside it,
+    /// which panics when invoked from a thread that already drives a
+    /// tokio runtime (every caller — the CLI's `#[tokio::main]`).
+    ///
+    /// This test pins the function as `async` by calling it through
+    /// `.await` from a `#[tokio::test]` and verifying that it
+    /// returns an `Err` (because the socket is unreachable) instead
+    /// of panicking. With the bug present, the test panics inside
+    /// `block_on`; with the fix, it returns `Err`.
+    #[tokio::test]
+    async fn try_shutdown_via_rpc_at_does_not_panic_inside_tokio_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_path = tmp.path().join("engine-control.token");
+        let socket_path = tmp.path().join("unreachable.sock");
+        let token_json = serde_json::json!({
+            "token": "abcd0123",
+            "socket_path": socket_path.to_string_lossy(),
+        });
+        std::fs::write(&token_path, token_json.to_string()).unwrap();
+
+        let result = try_shutdown_via_rpc_at(&token_path).await;
+        let err = result.expect_err("connecting to a non-existent socket must fail");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to connect to engine socket"),
+            "expected socket connect failure, got: {chain}",
         );
     }
 
