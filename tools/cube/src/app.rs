@@ -159,6 +159,13 @@ const JJ_OP_DIVERGED_SIGNATURE: &str = "seems to be a sibling";
 /// missing `.jj/`, `jj git init --colocate` can recover the workspace.
 const JJ_NO_JJ_REPO_SIGNATURE: &str = "there is no jj repo";
 
+/// Stable substring jj prints from `jj bookmark track <name>@<remote>`
+/// when the named remote bookmark does not exist in the repo (e.g.
+/// asking it to track `main@origin` in a repo that uses `master`). Lets
+/// cube swallow this specific failure during the post-clone "promote
+/// the default branch" step without papering over other jj errors.
+const JJ_NO_REMOTE_BOOKMARK_SIGNATURE: &str = "no such remote bookmark";
+
 impl CubeError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -556,8 +563,75 @@ fn materialize_repo_source_if_missing(
                 source.display().to_string(),
             ],
         })?;
+        track_remote_bookmarks(runner, source)?;
     }
     Ok(())
+}
+
+/// Promote `main@origin` and `master@origin` to local tracking
+/// bookmarks. `jj git clone` only creates remote bookmarks, so a fresh
+/// clone has no local `main`/`master` for the lease's `jj new <main>`
+/// step to resolve. We deliberately track only these two default-branch
+/// names rather than every `*@origin` ref — large repos can carry
+/// hundreds of long-lived feature/release/`gh-readonly-queue/*` refs
+/// that would otherwise pollute the local bookmark namespace and slow
+/// down `jj log` / `jj bookmark list` in every leased workspace.
+///
+/// "No such remote bookmark" is tolerated per-branch (most repos use
+/// either `main` or `master`, not both). Other errors from `jj` are
+/// propagated so a broken jj install, network failure mid-clone, or
+/// permission error doesn't get silently swallowed. If neither bookmark
+/// exists at all, the clone is unusable for cube's lease flow and we
+/// surface a hard error rather than letting the caller stumble into
+/// `jj new <missing>` later. Idempotent: re-tracking an already-tracked
+/// bookmark is a no-op.
+fn track_remote_bookmarks(runner: &dyn CommandRunner, repo_path: &Path) -> Result<()> {
+    let mut tracked_any = false;
+    for branch in ["main", "master"] {
+        let result = runner.run(&CommandInvocation {
+            cwd: repo_path.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec![
+                "bookmark".to_string(),
+                "track".to_string(),
+                format!("{branch}@origin"),
+            ],
+        });
+        match result {
+            Ok(_) => tracked_any = true,
+            Err(err) if is_no_such_remote_bookmark(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if !tracked_any {
+        return Err(CubeError::SetupStepFailed {
+            step: "track_remote_bookmarks".to_string(),
+            error: format!(
+                "fresh clone at `{}` has neither `main@origin` nor `master@origin`; \
+                 cube cannot promote a default branch to local tracking",
+                repo_path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Returns `true` when the error is `jj bookmark track`'s "no such
+/// remote bookmark" diagnostic — meaning the named `<branch>@origin`
+/// does not exist in this freshly-cloned repo. Distinct from "jj is
+/// broken / clone hasn't finished / network died" failures, which must
+/// propagate so callers don't silently misinterpret them as the repo
+/// simply not using that default-branch name.
+fn is_no_such_remote_bookmark(err: &CubeError) -> bool {
+    let CubeError::CommandFailed { program, stderr, .. } = err else {
+        return false;
+    };
+    if program != "jj" {
+        return false;
+    }
+    stderr
+        .to_lowercase()
+        .contains(JJ_NO_REMOTE_BOOKMARK_SIGNATURE)
 }
 
 /// Returns true when the given origin URL identifies a multiproduct repo.
@@ -1589,6 +1663,7 @@ fn auto_create_workspace(
             workspace_path.display().to_string(),
         ],
     })?;
+    track_remote_bookmarks(runner, &workspace_path)?;
 
     Ok(crate::metadata::WorkspaceCandidate {
         workspace_id,
@@ -3006,17 +3081,31 @@ mod tests {
         ]);
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
-        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
-            defaults.repo_root.clone(),
-            "jj",
-            &[
-                "git",
-                "clone",
-                "git@github.com:spinyfin/mono.git",
-                &source_path.display().to_string(),
-            ],
-            "",
-        )]);
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "git@github.com:spinyfin/mono.git",
+                    &source_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
 
         let ensure = Cli::parse_from([
             "cube",
@@ -3041,17 +3130,31 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let defaults = repo_ensure_defaults(&tempdir);
         let source_path = defaults.repo_root.join("mono");
-        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
-            defaults.repo_root.clone(),
-            "jj",
-            &[
-                "git",
-                "clone",
-                "git@github.com:spinyfin/mono.git",
-                &source_path.display().to_string(),
-            ],
-            "",
-        )]);
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "git@github.com:spinyfin/mono.git",
+                    &source_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
 
         let ensure = Cli::parse_from([
             "cube",
@@ -3177,17 +3280,31 @@ mod tests {
         let source_path = defaults.repo_root.join("myrepo");
         let origin = "git@github.com:linkedin-sandbox/myrepo.git";
 
-        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
-            defaults.repo_root.clone(),
-            "jj",
-            &[
-                "git",
-                "clone",
-                origin,
-                &source_path.display().to_string(),
-            ],
-            "",
-        )]);
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    origin,
+                    &source_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
 
         let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
         let result = run_with_context(
@@ -3210,17 +3327,31 @@ mod tests {
         let source_path = defaults.repo_root.join("frontend-api");
         let origin = "org-127256988@github.com:linkedin-multiproduct/frontend-api.git";
 
-        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
-            defaults.repo_root.clone(),
-            "jj",
-            &[
-                "git",
-                "clone",
-                origin,
-                &source_path.display().to_string(),
-            ],
-            "",
-        )]);
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    origin,
+                    &source_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
 
         let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
         let result = run_with_context(
@@ -3804,6 +3935,17 @@ mod tests {
                 "",
             )
             .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -3831,6 +3973,410 @@ mod tests {
         assert_eq!(result.payload["workspace"]["state"], "leased");
         assert_eq!(result.payload["workspace"]["task"], "auto-create demo");
         assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
+        runner.assert_exhausted();
+    }
+
+    /// Regression for spinyfin/mono#696. A fresh `jj git clone` only
+    /// populates `<branch>@origin` (remote) bookmarks; there is no
+    /// local `main`/`master` for `jj new <main>` to resolve. The lease
+    /// must promote those remote bookmarks to local tracking right
+    /// after cloning. The expectation here pins the two specific
+    /// `jj bookmark track <name>@origin` calls (one for `main`, one
+    /// for `master`) between clone and reset — exercising the
+    /// `--main-branch master` shape where `main@origin` doesn't exist
+    /// in the remote and the per-branch error must be swallowed.
+    /// `workspace_lease_tracks_main_origin_after_fresh_clone` covers
+    /// the reverse `--main-branch main` shape.
+    #[test]
+    fn workspace_lease_tracks_master_origin_after_fresh_clone() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "legacy",
+            "--origin",
+            "git@github.com:spinyfin/legacy.git",
+            "--main-branch",
+            "master",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "legacy-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let new_path = workspace_root.join("legacy-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/legacy.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+                "",
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "master"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "fee1dead",
+            ),
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "legacy",
+            "--task",
+            "fresh-clone master default",
+        ]);
+        let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "legacy-agent-001"
+        );
+        assert_eq!(result.payload["workspace"]["state"], "leased");
+        runner.assert_exhausted();
+    }
+
+    /// Counterpart to `workspace_lease_tracks_master_origin_after_fresh_clone`:
+    /// the same two-call sequence (`bookmark track main@origin`,
+    /// `bookmark track master@origin`) but for a repo whose default
+    /// branch is `main`. Pins that `master@origin` not existing in the
+    /// remote is swallowed, not propagated. This is the common case in
+    /// modern repos.
+    #[test]
+    fn workspace_lease_tracks_main_origin_after_fresh_clone() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--main-branch",
+            "main",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let new_path = workspace_root.join("mono-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "cafef00d",
+            ),
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "fresh-clone main default",
+        ]);
+        let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-001"
+        );
+        assert_eq!(result.payload["workspace"]["state"], "leased");
+        runner.assert_exhausted();
+    }
+
+    /// Pins that cube does NOT promote remote bookmarks other than
+    /// `main`/`master` after a fresh clone. Real repos accumulate
+    /// long-lived `feature/*`, `release/*`, and
+    /// `gh-readonly-queue/*` remote refs; tracking all of them
+    /// pollutes the local bookmark namespace and slows
+    /// `jj log` / `jj bookmark list` in every leased workspace. The
+    /// FakeRunner's strict call-sequence match enforces this: any
+    /// stray `bookmark track <other>@origin` invocation would fail
+    /// the assertion. If cube ever regresses to `glob:*@origin` (or
+    /// to tracking individual non-default branches), this test fails.
+    #[test]
+    fn workspace_lease_does_not_track_non_default_origin_bookmarks() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let new_path = workspace_root.join("mono-agent-001");
+        // Pretend the remote has many extra bookmarks (feature/foo,
+        // release/1.0, gh-readonly-queue/main/...). The test enforces
+        // its expectation negatively: only `main@origin` and
+        // `master@origin` may be tracked. Any other `bookmark track`
+        // call would crash FakeRunner with "unexpected command".
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "ba5eba11",
+            ),
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "no extra bookmark tracking",
+        ]);
+        run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+        runner.assert_exhausted();
+    }
+
+    /// If a freshly-cloned repo has neither `main@origin` nor
+    /// `master@origin`, cube cannot promote any default branch to
+    /// local tracking. Lease must hard-fail with a setup-step error
+    /// rather than silently proceeding into `jj new <missing>` later
+    /// (which would surface as a confusing unrelated jj error).
+    #[test]
+    fn workspace_lease_errors_when_no_default_origin_bookmark_exists() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "weird",
+            "--origin",
+            "git@github.com:spinyfin/weird.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "weird-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let new_path = workspace_root.join("weird-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/weird.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "weird",
+            "--task",
+            "no default branch",
+        ]);
+        let err = run_with_dependencies(lease, Some(&database_path), &runner)
+            .expect_err("lease should fail when neither default branch is present");
+        match err {
+            CubeError::SetupStepFailed { step, error } => {
+                assert_eq!(step, "track_remote_bookmarks");
+                assert!(
+                    error.contains("main@origin") && error.contains("master@origin"),
+                    "error message should name both expected branches: {error}"
+                );
+            }
+            other => panic!("expected SetupStepFailed, got {other:?}"),
+        }
+        runner.assert_exhausted();
+    }
+
+    /// If `jj bookmark track main@origin` fails with anything other
+    /// than "no such remote bookmark" (e.g. jj is broken, network
+    /// failure mid-clone), cube must propagate the error rather than
+    /// swallowing it. Pins the precision of the error-tolerance
+    /// classifier: only the bookmark-doesn't-exist case is benign.
+    #[test]
+    fn workspace_lease_propagates_unrelated_track_failure() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
+
+        let new_path = workspace_root.join("mono-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &new_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(new_path.clone()),
+            ExpectedCommand {
+                cwd: new_path.clone(),
+                program: "jj".to_string(),
+                args: vec![
+                    "bookmark".to_string(),
+                    "track".to_string(),
+                    "main@origin".to_string(),
+                ],
+                result: Err(CubeError::CommandFailed {
+                    program: "jj".to_string(),
+                    args: vec![
+                        "bookmark".to_string(),
+                        "track".to_string(),
+                        "main@origin".to_string(),
+                    ],
+                    status: Some(2),
+                    stderr: "Error: Failed to load repo: some unrelated jj failure".to_string(),
+                }),
+                creates_dir: None,
+            },
+        ]);
+
+        let lease = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "track failure propagates",
+        ]);
+        let err = run_with_dependencies(lease, Some(&database_path), &runner)
+            .expect_err("lease should propagate non-NoSuchRemoteBookmark failures");
+        match err {
+            CubeError::CommandFailed { program, stderr, .. } => {
+                assert_eq!(program, "jj");
+                assert!(stderr.contains("unrelated jj failure"), "stderr={stderr}");
+            }
+            other => panic!("expected CommandFailed, got {other:?}"),
+        }
         runner.assert_exhausted();
     }
 
@@ -3891,6 +4437,17 @@ mod tests {
                 "",
             )
             .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -5692,6 +6249,17 @@ mod tests {
                 "",
             )
             .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -7939,6 +8507,17 @@ steps:
                 "",
             )
             .creating_dir(new_path.clone()),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
@@ -8317,6 +8896,28 @@ steps:
                              which seems to be a sibling of the working copy's operation \
                              17fb914fb03f"
                         .to_string(),
+                }),
+                creates_dir: None,
+            }
+        }
+
+        /// Build an expectation that simulates `jj bookmark track
+        /// <name>@origin` failing because the named remote bookmark
+        /// does not exist in the repo. Matches `JJ_NO_REMOTE_BOOKMARK_SIGNATURE`
+        /// and is the expected outcome for whichever of `main@origin` /
+        /// `master@origin` this repo does not use.
+        fn no_such_remote_bookmark(cwd: PathBuf, program: &str, args: &[&str]) -> Self {
+            let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            let bookmark = args_owned.last().cloned().unwrap_or_default();
+            Self {
+                cwd,
+                program: program.to_string(),
+                args: args_owned.clone(),
+                result: Err(CubeError::CommandFailed {
+                    program: program.to_string(),
+                    args: args_owned,
+                    status: Some(1),
+                    stderr: format!("Error: No such remote bookmark: {bookmark}"),
                 }),
                 creates_dir: None,
             }
