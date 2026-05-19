@@ -1662,6 +1662,8 @@ struct WorkBoardCardView: View {
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .accessibilityLabel("T\(id)")
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     if let extRef = externalRefLink {
                         ExternalRefLinkView(presentation: extRef)
@@ -3073,6 +3075,8 @@ private struct ExternalRefLinkView: View {
             .accessibilityLabel(presentation.isStale
                 ? "Upstream issue (stale): \(presentation.label)"
                 : "Open upstream issue: \(presentation.label)")
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
     }
 }
 
