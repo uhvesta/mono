@@ -63,8 +63,11 @@ struct ContentView: View {
             // `workErrorMessage` in `ChatViewModel.handle`.
             VStack(spacing: 0) {
                 if !model.isConnected && model.hasConnectedOnce {
-                    EngineUnreachableBanner()
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                    EngineUnreachableBanner(
+                        isRestarting: model.isRestartingEngine,
+                        onRestart: { model.restartEngine() }
+                    )
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 // Connection is up but the engine reports degraded
                 // config (currently: missing ANTHROPIC_API_KEY).
@@ -3706,22 +3709,47 @@ private class ResizeDividerView: NSView {
 /// modal that re-popped every dismissal during a reconnect storm (see
 /// `ChatViewModel.handle` for the matching transport-error suppression
 /// path).
+///
+/// Carries a "Restart engine" affordance so a stale or hung engine
+/// process can be recovered without a shell `pkill` (issue #697). The
+/// button drives `ChatViewModel.restartEngine()`, which terminates the
+/// engine via the token-auth shutdown RPC (falling back to SIGTERM/
+/// SIGKILL when the socket is dead) and relaunches it; the reconnect
+/// loop picks the new socket up automatically.
 private struct EngineUnreachableBanner: View {
+    let isRestarting: Bool
+    let onRestart: () -> Void
+
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.white)
-            Text("Boss engine is unreachable — reconnecting…")
+            Text(headlineText)
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.white)
             Spacer(minLength: 0)
+            Button(action: onRestart) {
+                Text(isRestarting ? "Restarting…" : "Restart engine")
+                    .font(.callout.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(.white)
+            .disabled(isRestarting)
+            .help("Terminate the unresponsive engine and start a fresh one.")
+            .accessibilityHint("Terminates the unresponsive engine and starts a fresh one.")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
         .background(Color.red.opacity(0.85))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Boss engine is unreachable. Reconnecting.")
+        .accessibilityElement(children: .contain)
+    }
+
+    private var headlineText: String {
+        isRestarting
+            ? "Restarting Boss engine…"
+            : "Boss engine is unreachable — reconnecting…"
     }
 }
 
