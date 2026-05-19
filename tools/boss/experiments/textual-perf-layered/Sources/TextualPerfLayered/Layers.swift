@@ -2,16 +2,18 @@ import Foundation
 import SwiftUI
 import Textual
 
-// Shared GeometryReader that publishes the StructuredText's measured
-// height into `StructuredTextHeightKey`. The outer `LayerPane` listens
-// for the first non-zero value to compute `parse_end duration_ms`.
-private struct HeightProbe: View {
-    var body: some View {
-        GeometryReader { geo in
-            Color.clear.preference(
-                key: StructuredTextHeightKey.self,
-                value: geo.size.height
-            )
+// Adds a GeometryReader to measure height and propagate StructuredTextHeightKey
+// preference up to the parent LayerPane. Using overlay ensures the preference
+// properly bubbles up the view hierarchy, unlike .background().
+private extension View {
+    func publishHeight() -> some View {
+        self.overlay(alignment: .topLeading) {
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: StructuredTextHeightKey.self,
+                    value: geo.size.height
+                )
+            }
         }
     }
 }
@@ -27,7 +29,7 @@ struct L0_TextualOnly: View {
         ScrollView {
             StructuredText(markdown: source)
                 .padding()
-                .background(HeightProbe())
+                .publishHeight()
         }
     }
 }
@@ -45,7 +47,7 @@ struct L1_BossMarkdown: View {
             StructuredText(markdown: source)
                 .bossMarkdown()
                 .padding()
-                .background(HeightProbe())
+                .publishHeight()
         }
     }
 }
@@ -71,7 +73,7 @@ struct L2_BossWrappers: View {
                     .bossMarkdown()
                     .textual.textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(HeightProbe())
+                    .publishHeight()
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
@@ -188,7 +190,7 @@ private struct MarkdownViewerStub: View {
                     .bossMarkdown()
                     .textual.textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(HeightProbe())
+                    .publishHeight()
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
