@@ -1243,6 +1243,19 @@ struct TaskIdArg {
 struct TaskUpdateArgs {
     id: String,
 
+    /// Resolve a friendly short id (`T42`, `42`, `#42`) against this product
+    /// (slug or id). Ignored when the selector already embeds a product slug
+    /// (`boss/42`) or when the selector is a primary id.
+    #[arg(long)]
+    product: Option<String>,
+
+    /// Resolve a friendly short id against the product that owns this project.
+    /// Accepts a typed project id (`project_…`) to infer the product
+    /// automatically. Combined with `--product` when passing a slug; ignored
+    /// for primary ids.
+    #[arg(long)]
+    project: Option<String>,
+
     #[arg(long)]
     name: Option<String>,
 
@@ -2645,7 +2658,13 @@ async fn run_update_leaf(
         &patch,
         "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --autostart, or --blocked-reason",
     )?;
-    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
+    // Resolve the product from --product or --project (typed project id infers its product).
+    let product_hint = match (args.product, args.project) {
+        (Some(prod), _) => Some(prod),
+        (None, Some(proj)) => product_id_from_typed_selector(client, &proj).await?,
+        (None, None) => None,
+    };
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, product_hint).await?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Updated {label}"), &item, None, false);
