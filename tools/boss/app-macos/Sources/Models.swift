@@ -1465,6 +1465,24 @@ struct EngineSetting: Identifiable, Hashable {
     let enabled: Bool
 }
 
+/// One UI-actionable engine-health issue, decoded from an
+/// `engine_health_result` response. Mirrors
+/// `boss_protocol::EngineHealthIssue` one-for-one. Drives the
+/// chrome-level banner and the Settings-pane warning that flag
+/// missing/invalid engine config — introduced after #699 where a
+/// missing `ANTHROPIC_API_KEY` silently broke summarization with no
+/// UI affordance.
+struct EngineHealthIssue: Identifiable, Hashable {
+    /// Stable lowercase snake_case kind id. Used as the `Identifiable`
+    /// key so SwiftUI animations are stable across snapshots.
+    var id: String { kind }
+    let kind: String
+    /// `"error"` or `"warning"` — drives banner color / icon.
+    let severity: String
+    let title: String
+    let body: String
+}
+
 /// Snapshot of one engine feature flag, decoded from a
 /// `feature_flags_list` response. Mirrors the engine's
 /// `boss_protocol::FeatureFlagSnapshot` one-for-one.

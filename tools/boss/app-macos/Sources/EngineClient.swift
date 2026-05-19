@@ -185,6 +185,13 @@ enum EngineEvent {
     /// will see it immediately. The debug pane uses this as the
     /// "reload confirmed" signal to render the toggle as committed.
     case featureFlagSet(name: String, enabled: Bool)
+    /// Response to `get_engine_health` — a snapshot of the engine's
+    /// user-visible configuration health (currently
+    /// `ANTHROPIC_API_KEY` presence). Empty `issues` means healthy;
+    /// any element drives the top-of-window banner and the Settings
+    /// pane warning. Introduced after #699 where a missing API key
+    /// silently broke summarization with no UI affordance.
+    case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue])
     /// Response to `get_settings` — snapshot of every per-installation
     /// setting and its current value. Drives the Settings window.
     case settingsList(settings: [EngineSetting])
@@ -299,6 +306,16 @@ final class EngineClient: @unchecked Sendable {
     /// reflects what the engine has persisted.
     func sendGetSettings() {
         sendLine(["type": "get_settings"])
+    }
+
+    /// Ask the engine for its user-visible configuration health.
+    /// Called once at session-start (after `connected`) so the
+    /// top-of-window banner surfaces a missing `ANTHROPIC_API_KEY`
+    /// before the user notices summaries never appear (#699). Cheap
+    /// — the engine just reads `Option::is_some` on the agent-config
+    /// key; no IO.
+    func sendGetEngineHealth() {
+        sendLine(["type": "get_engine_health"])
     }
 
     /// Set one per-installation setting. Engine persists to
@@ -1091,6 +1108,12 @@ final class EngineClient: @unchecked Sendable {
                 if !name.isEmpty {
                     emit(.featureFlagSet(name: name, enabled: enabled))
                 }
+            case "engine_health_result":
+                let report = payload["report"] as? [String: Any] ?? [:]
+                let apiKeyPresent = (report["anthropic_api_key_present"] as? NSNumber)?.boolValue ?? false
+                let rawIssues = report["issues"] as? [[String: Any]] ?? []
+                let issues = rawIssues.compactMap(parseEngineHealthIssue)
+                emit(.engineHealthResult(apiKeyPresent: apiKeyPresent, issues: issues))
             case "settings_list":
                 let raw = payload["settings"] as? [[String: Any]] ?? []
                 let settings = raw.compactMap(parseEngineSetting)
@@ -1454,6 +1477,19 @@ final class EngineClient: @unchecked Sendable {
             defaultEnabled: defaultEnabled,
             enabled: enabled
         )
+    }
+
+    private func parseEngineHealthIssue(_ payload: [String: Any]) -> EngineHealthIssue? {
+        guard
+            let kind = payload["kind"] as? String,
+            !kind.isEmpty,
+            let severity = payload["severity"] as? String,
+            let title = payload["title"] as? String,
+            let body = payload["body"] as? String
+        else {
+            return nil
+        }
+        return EngineHealthIssue(kind: kind, severity: severity, title: title, body: body)
     }
 
     private func parseEngineSetting(_ payload: [String: Any]) -> EngineSetting? {

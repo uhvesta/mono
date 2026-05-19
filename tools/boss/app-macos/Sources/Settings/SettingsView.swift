@@ -15,6 +15,10 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Workers", systemImage: "person.2")
                 }
+            EngineConfigPane()
+                .tabItem {
+                    Label("Engine", systemImage: "gearshape")
+                }
             FeatureFlagsViewer()
                 .tabItem {
                     Label("Feature Flags", systemImage: "flag")
@@ -23,8 +27,74 @@ struct SettingsView: View {
         .environmentObject(chatModel)
         .onAppear {
             chatModel.refreshSettings()
+            // Engine health is fetched on every reconnect, but the
+            // user may open Settings against a long-lived session
+            // where the API-key state changed (a restart with a new
+            // env var). Re-poll on appear so the pane shows the
+            // current truth, not a snapshot from minutes ago.
+            chatModel.refreshEngineHealth()
         }
         .frame(minWidth: 560, minHeight: 360)
+    }
+}
+
+/// "Engine" pane — engine-side configuration health.
+/// Renders the same issues the chrome banner shows, plus the raw
+/// `ANTHROPIC_API_KEY` presence bit so the user can confirm at a
+/// glance the engine sees the env var.
+private struct EngineConfigPane: View {
+    @EnvironmentObject private var chatModel: ChatViewModel
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(spacing: 6) {
+                    Image(systemName: chatModel.engineAnthropicApiKeyPresent
+                          ? "checkmark.circle.fill"
+                          : "exclamationmark.triangle.fill")
+                        .foregroundStyle(chatModel.engineAnthropicApiKeyPresent ? .green : .orange)
+                    Text("ANTHROPIC_API_KEY")
+                        .font(.body.weight(.medium))
+                    Spacer()
+                    Text(chatModel.engineAnthropicApiKeyPresent ? "Detected" : "Not set")
+                        .foregroundStyle(.secondary)
+                }
+                if !chatModel.engineAnthropicApiKeyPresent {
+                    Text("Live worker summaries and pane summarization are disabled until ANTHROPIC_API_KEY is exported in the environment Boss launches its engine from. Set the variable in your shell startup file, then quit and relaunch Boss.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } header: {
+                Text("Required Configuration")
+            }
+
+            if !chatModel.engineHealthIssues.isEmpty {
+                Section {
+                    ForEach(chatModel.engineHealthIssues) { issue in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Image(systemName: issue.severity == "error"
+                                      ? "exclamationmark.octagon.fill"
+                                      : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(issue.severity == "error" ? .red : .orange)
+                                Text(issue.title)
+                                    .font(.body.weight(.medium))
+                            }
+                            Text(issue.body)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } header: {
+                    Text("Health Issues")
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
     }
 }
 
