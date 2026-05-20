@@ -1768,6 +1768,87 @@ mod tests {
         assert!(matches!(err, TrackerError::ConfigInvalid(_)), "{err:?}");
     }
 
+    // ── add_label: request-body shape (regression guard for T630) ────────────
+    //
+    // This test asserts on the actual JSON body passed to rest_post, not just
+    // the Rust-side data structure. A regression to `-f labels=tracked` (sending
+    // a bare string) would make this test fail even if all higher-level tests pass.
+
+    /// A GhRunner that records every body passed to rest_post and always returns Ok.
+    struct CapturingGhRunner {
+        post_bodies: std::sync::Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl CapturingGhRunner {
+        fn new() -> (Self, std::sync::Arc<Mutex<Vec<serde_json::Value>>>) {
+            let bodies = std::sync::Arc::new(Mutex::new(Vec::new()));
+            (Self { post_bodies: bodies.clone() }, bodies)
+        }
+    }
+
+    #[async_trait]
+    impl GhRunner for CapturingGhRunner {
+        async fn graphql(
+            &self,
+            _query: &str,
+            _vars: &[(&str, &str)],
+        ) -> std::result::Result<Value, GhRunnerError> {
+            unimplemented!("CapturingGhRunner only supports rest_post")
+        }
+
+        async fn rest_get(
+            &self,
+            _path: &str,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            unimplemented!("CapturingGhRunner only supports rest_post")
+        }
+
+        async fn rest_patch(
+            &self,
+            _path: &str,
+            _fields: &[(&str, &str)],
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            unimplemented!("CapturingGhRunner only supports rest_post")
+        }
+
+        async fn rest_post(
+            &self,
+            _path: &str,
+            body: &serde_json::Value,
+        ) -> std::result::Result<GhResponse, GhRunnerError> {
+            self.post_bodies.lock().unwrap().push(body.clone());
+            Ok(GhResponse { body: json!([{"name": "tracked"}]) })
+        }
+    }
+
+    #[tokio::test]
+    async fn add_label_request_body_sends_labels_as_json_array_not_string() {
+        // Regression guard for T630: the GitHub labels API requires `labels`
+        // to be a JSON array. Using `-f labels=tracked` with `gh api` sends
+        // the value as a bare string, causing HTTP 422. This test checks the
+        // actual body the code sends, not just the Rust-level data structure.
+        let (runner, bodies) = CapturingGhRunner::new();
+        let tracker = GitHubTracker::with_runner(runner);
+        tracker
+            .add_label(&github_ctx(), &issue_ref(560), "tracked")
+            .await
+            .expect("add_label should succeed");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "exactly one POST should be made");
+        let body = &bodies[0];
+        assert!(
+            body["labels"].is_array(),
+            "labels must be a JSON array, got: {}",
+            body["labels"]
+        );
+        assert_eq!(
+            body["labels"],
+            json!(["tracked"]),
+            "labels array must contain exactly 'tracked'"
+        );
+    }
+
     // ── parse_iso8601 ──────────────────────────────────────────────────────────
 
     #[test]

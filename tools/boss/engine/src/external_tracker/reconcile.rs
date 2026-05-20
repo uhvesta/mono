@@ -379,6 +379,13 @@ struct InProgressCandidate {
     upstream_ref: UpstreamRef,
 }
 
+/// Carries intent to call `add_label` (Behavior 7 retry) for an already-imported
+/// item that is missing the `tracked` label upstream.
+struct LabelCandidate {
+    work_item_id: String,
+    upstream_ref: UpstreamRef,
+}
+
 async fn process_product(
     work_db: &WorkDb,
     tracker: &dyn ExternalTracker,
@@ -477,6 +484,7 @@ async fn process_product(
 
     let mut close_candidates: Vec<CloseCandidate> = Vec::new();
     let mut in_progress_candidates: Vec<InProgressCandidate> = Vec::new();
+    let mut label_candidates: Vec<LabelCandidate> = Vec::new();
 
     // ── 3. Reconcile each upstream item ───────────────────────────────────────
     for item in &upstream_items {
@@ -492,6 +500,7 @@ async fn process_product(
                     &in_progress_column,
                     &mut close_candidates,
                     &mut in_progress_candidates,
+                    &mut label_candidates,
                     outcome,
                     metrics,
                     product_id,
@@ -532,6 +541,7 @@ async fn process_product(
                                     &in_progress_column,
                                     &mut close_candidates,
                                     &mut in_progress_candidates,
+                                    &mut label_candidates,
                                     outcome,
                                     metrics,
                                     product_id,
@@ -744,6 +754,35 @@ async fn process_product(
             }
         }
     }
+
+    // ── 7. Retroactively attach `tracked` label (Behavior 7 retry) ───────────
+    // Items whose initial label-add failed (e.g. due to the T630 string-not-array
+    // bug) are re-attempted on every reconcile pass until the label is confirmed
+    // present in the upstream fetch. Cap at 20 to match other budgets.
+    const LABEL_BUDGET: usize = 20;
+    for candidate in label_candidates.into_iter().take(LABEL_BUDGET) {
+        match tracker.add_label(ctx, &candidate.upstream_ref, TRACKED_LABEL).await {
+            Ok(()) => {
+                TRACKED_LABEL_ATTACH_SUCCEEDED.inc(metrics);
+                outcome.tracked_label_attach_succeeded += 1;
+                info!(
+                    work_item_id = %candidate.work_item_id,
+                    canonical_id = %candidate.upstream_ref.canonical_id,
+                    "Behavior 7: tracked label attached (reconcile retry)"
+                );
+            }
+            Err(e) => {
+                TRACKED_LABEL_ATTACH_FAILED.inc(metrics);
+                outcome.tracked_label_attach_failed += 1;
+                warn!(
+                    work_item_id = %candidate.work_item_id,
+                    canonical_id = %candidate.upstream_ref.canonical_id,
+                    error = %e,
+                    "Behavior 7: add_label failed on reconcile retry; will retry next tick"
+                );
+            }
+        }
+    }
 }
 
 // ── Per-item helpers ──────────────────────────────────────────────────────────
@@ -760,6 +799,9 @@ async fn process_product(
 /// - **Behavior 3** (reverse-close, opt-in): if upstream is `Open`, boss is
 ///   `done`, no merged PR drove the transition, and `reverse_close=true` in
 ///   the product config, queue a `close_issue` call.
+/// - **Behavior 7** (tracked-label retry): if the `tracked` label is absent
+///   upstream, queue an `add_label` call so the label converges even when
+///   the initial import-time attach failed.
 /// - Always bumps `external_ref_synced_at`.
 async fn reconcile_existing(
     work_db: &WorkDb,
@@ -769,6 +811,7 @@ async fn reconcile_existing(
     in_progress_column: &str,
     close_candidates: &mut Vec<CloseCandidate>,
     in_progress_candidates: &mut Vec<InProgressCandidate>,
+    label_candidates: &mut Vec<LabelCandidate>,
     outcome: &mut PassOutcome,
     metrics: &Registry,
     product_id: &str,
@@ -888,6 +931,16 @@ async fn reconcile_existing(
                 }
             }
         }
+    }
+
+    // Behavior 7 (retry): if the upstream item doesn't carry the `tracked`
+    // label, queue a label-add so the label converges on the next pass.
+    // This catches items whose initial import-time add_label failed.
+    if !upstream.labels.iter().any(|l| l == TRACKED_LABEL) {
+        label_candidates.push(LabelCandidate {
+            work_item_id: work_item_id.clone(),
+            upstream_ref: upstream.upstream_ref.clone(),
+        });
     }
 
     // Bump synced_at every successful reconcile.
@@ -1497,18 +1550,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_label_not_called_for_existing_bound_item() {
-        // A subsequent reconcile pass over an item we already imported must
-        // NOT re-attach the label — that would clobber the user's intent if
-        // they had removed it manually.
+    async fn reconcile_retries_tracked_label_when_missing_on_existing_item() {
+        // Behavior 7 retry: an already-imported item whose upstream fetch shows
+        // no `tracked` label must trigger add_label on each reconcile pass until
+        // the label is confirmed present. This handles the backfill case where
+        // the initial import-time add_label failed.
         let db = in_memory_db();
         let product = setup_product_with_tracker(&db);
 
-        // Seed a Boss chore already bound to upstream spy#54.
         let chore = db
             .create_chore(CreateChoreInput {
                 product_id: product.id.clone(),
-                name: "Already bound".to_owned(),
+                name: "Already bound, label missing".to_owned(),
                 description: None,
                 autostart: false,
                 priority: None,
@@ -1522,7 +1575,50 @@ mod tests {
         db.set_external_ref(&chore.id, "spy", "spy#54", &json!({ "issue_number": 54 }))
             .expect("set_external_ref");
 
+        // open_item has no labels — tracked label is missing upstream.
         let tracker = SpyTracker::new(vec![open_item(54, "Already bound issue")]);
+        let registry = spy_registry(tracker.clone());
+        let metrics = Registry::new();
+        register_metrics(&metrics);
+
+        let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub()).await;
+
+        assert_eq!(outcome.tracked_label_attach_succeeded, 1,
+            "reconcile should attach tracked label when it is missing");
+        assert_eq!(
+            tracker.add_label_calls(),
+            vec![("spy#54".to_owned(), "tracked".to_owned())],
+            "add_label must be called once with (canonical_id, 'tracked')"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_label_not_called_when_already_present_on_existing_item() {
+        // If the upstream fetch shows `tracked` is already present, the
+        // reconciler must not call add_label again (avoid redundant API calls).
+        let db = in_memory_db();
+        let product = setup_product_with_tracker(&db);
+
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already labeled".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .expect("create chore");
+        db.set_external_ref(&chore.id, "spy", "spy#55", &json!({ "issue_number": 55 }))
+            .expect("set_external_ref");
+
+        let mut item = open_item(55, "Already labeled issue");
+        item.labels.push("tracked".to_owned());
+        let tracker = SpyTracker::new(vec![item]);
         let registry = spy_registry(tracker.clone());
         let metrics = Registry::new();
         register_metrics(&metrics);
@@ -1531,7 +1627,7 @@ mod tests {
 
         assert!(
             tracker.add_label_calls().is_empty(),
-            "add_label must not fire on a reconcile-only pass"
+            "add_label must not be called when 'tracked' is already confirmed upstream"
         );
     }
 
