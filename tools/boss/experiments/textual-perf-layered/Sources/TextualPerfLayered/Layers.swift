@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import Textual
@@ -285,5 +286,245 @@ extension EnvironmentValues {
     var stubCommentFlashText: String? {
         get { self[StubCommentFlashTextKey.self] }
         set { self[StubCommentFlashTextKey.self] = newValue }
+    }
+}
+
+// MARK: - L6–L9 stubs
+
+// MARK: ChatViewModelStub (L6+)
+
+/// Passive stub mirroring ChatViewModel's @Published surface. Has ~20
+/// @Published vars covering the main structural properties that views
+/// read from the injected chatModel EnvironmentObject in production.
+/// No timer — this is the "dead environment" baseline for L6.
+///
+/// Mirrors: tools/boss/app-macos/Sources/ChatViewModel.swift
+@MainActor
+final class ChatViewModelStub: ObservableObject {
+    @Published var navigationMode: Int = 0
+    @Published var isConnected: Bool = true
+    @Published var hasConnectedOnce: Bool = true
+    @Published var products: [String] = []
+    @Published var selectedWorkProductID: String? = nil
+    @Published var selectedProjectFilterIDs: Set<String> = []
+    @Published var includeChores: Bool = true
+    @Published var showBlockedOnly: Bool = false
+    @Published var showArchivedProjects: Bool = false
+    @Published var selectedWorkCardID: String? = nil
+    @Published var revealHighlightID: String? = nil
+    @Published var pendingWorkCreateRequest: Bool = false
+    @Published var pendingWorkEditRequest: Bool = false
+    @Published var workErrorMessage: String? = nil
+    @Published var workSearchText: String = ""
+    @Published var isBossPanelCollapsed: Bool = false
+    @Published var bossPanelWidth: CGFloat = 380
+    @Published var liveStatusDisabledSlotIDs: Set<Int> = []
+    @Published var engineHealthIssues: [String] = []
+    @Published var featureFlags: [String] = []
+}
+
+// MARK: SiblingPublisherStub (L7+)
+
+/// Publishes objectWillChange on a ~500 ms timer. Mirrors the combined
+/// publish cadence of production's kanban view-models, live-status pollers,
+/// and engine-subscription Combine graph that fire while the design-doc
+/// window is open. Start/stop are idempotent and safe to call repeatedly.
+@MainActor
+final class SiblingPublisherStub: ObservableObject {
+    @Published var tickCount: Int = 0
+
+    private var publishTask: Task<Void, Never>?
+
+    func start() {
+        guard publishTask == nil else { return }
+        publishTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                self?.tickCount += 1
+            }
+        }
+    }
+
+    func stop() {
+        publishTask?.cancel()
+        publishTask = nil
+    }
+}
+
+// MARK: ExtraViewModelStub (L9)
+
+/// Additional ObservableObject stubs mirroring ContentView's other
+/// @StateObject instances: WorkersWorkspaceModel and BossPaneModel in
+/// production. Each fires objectWillChange on its own timer so L9 has
+/// multiple independent publish sources — the full multi-publisher
+/// load present in the production scene tree.
+@MainActor
+final class ExtraViewModelStub: ObservableObject {
+    @Published var workerCount: Int = 0
+    @Published var bossIsExpanded: Bool = true
+    @Published var bossWidth: CGFloat = 380
+
+    private var publishTask: Task<Void, Never>?
+
+    func start() {
+        guard publishTask == nil else { return }
+        publishTask = Task { [weak self] in
+            var tick = 0
+            while !Task.isCancelled {
+                // Workers model fires every ~700 ms; Boss pane fires every ~1 s.
+                // Interleave at ~350 ms to approximate combined cadence.
+                try? await Task.sleep(for: .milliseconds(350))
+                tick += 1
+                if tick % 2 == 0 { self?.workerCount = tick / 2 }
+                else { self?.bossIsExpanded = tick.isMultiple(of: 3) }
+            }
+        }
+    }
+
+    func stop() {
+        publishTask?.cancel()
+        publishTask = nil
+    }
+}
+
+// MARK: EventMonitorManager (L8+)
+
+/// Manages local NSEvent monitors matching CommentLayer.installMonitors().
+/// Three monitors: keyDown, rightMouseDown, leftMouseUp — all pass events
+/// through unchanged. Stored nonisolated(unsafe) matching CommentLayer's
+/// own pattern. Removed in deinit as a safety net; callers should also
+/// call remove() on disappear to avoid any cross-layer leakage.
+final class EventMonitorManager {
+    nonisolated(unsafe) private var keyMonitor: Any?
+    nonisolated(unsafe) private var rightClickMonitor: Any?
+    nonisolated(unsafe) private var mouseUpMonitor: Any?
+
+    func install() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { $0 }
+        rightClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { $0 }
+        mouseUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { $0 }
+    }
+
+    func remove() {
+        [keyMonitor, rightClickMonitor, mouseUpMonitor].compactMap { $0 }.forEach {
+            NSEvent.removeMonitor($0)
+        }
+        keyMonitor = nil
+        rightClickMonitor = nil
+        mouseUpMonitor = nil
+    }
+
+    deinit { remove() }
+}
+
+// MARK: - L6 · + WindowGroup EnvironmentObject
+
+/// Adds a passive ChatViewModelStub as an @EnvironmentObject — mirroring
+/// production's async-markdown-viewer Window scene receiving chatModel
+/// via .environmentObject(chatModel) from BossMacApp. Reading
+/// `envStub.isConnected` in body ensures SwiftUI creates the subscription;
+/// since the stub never publishes, any difference from L5 isolates the
+/// cost of the EnvironmentObject subscription graph itself.
+struct L6_WindowGroupEnvObj: View {
+    let source: String
+    @EnvironmentObject private var envStub: ChatViewModelStub
+
+    var body: some View {
+        // Read one property so SwiftUI creates the subscription to
+        // envStub.objectWillChange. The value is unused visually.
+        let _ = envStub.isConnected
+        L5_BossAsyncFetch(source: source)
+    }
+}
+
+// MARK: - L7 · + sibling publisher
+
+/// Adds a SiblingPublisherStub that fires objectWillChange every ~500 ms
+/// while this layer is visible — mirroring the kanban view-models and
+/// live-status pollers that publish alongside the design-doc Window in
+/// production. L7 = L6 + active sibling publishing. The `tickCount`
+/// read in body ensures SwiftUI re-evaluates this view on every tick.
+struct L7_SiblingPublisher: View {
+    let source: String
+    @EnvironmentObject private var envStub: ChatViewModelStub
+    @EnvironmentObject private var sibling: SiblingPublisherStub
+
+    var body: some View {
+        let _ = envStub.isConnected
+        let _ = sibling.tickCount
+        L5_BossAsyncFetch(source: source)
+            .onAppear { sibling.start() }
+            .onDisappear { sibling.stop() }
+    }
+}
+
+// MARK: - L8 · + NSEvent monitors
+
+/// Adds the three local NSEvent monitors that production's CommentLayer
+/// installs on appear (keyDown, rightMouseDown, leftMouseUp). L8 = L7 +
+/// active monitors. Handlers are pass-through no-ops. Monitors are
+/// unregistered on disappear via EventMonitorManager.remove() and its
+/// deinit safety net, so no monitor leaks across layer switches.
+struct L8_EventMonitor: View {
+    let source: String
+    @EnvironmentObject private var envStub: ChatViewModelStub
+    @EnvironmentObject private var sibling: SiblingPublisherStub
+
+    // Class-based manager so monitor tokens survive body re-evaluations.
+    @StateObject private var monitors = _EventMonitorHost()
+
+    var body: some View {
+        let _ = envStub.isConnected
+        let _ = sibling.tickCount
+        L5_BossAsyncFetch(source: source)
+            .onAppear {
+                sibling.start()
+                monitors.manager.install()
+            }
+            .onDisappear {
+                sibling.stop()
+                monitors.manager.remove()
+            }
+    }
+}
+
+/// ObservableObject wrapper around EventMonitorManager so it can be
+/// stored as a @StateObject (EventMonitorManager is not Observable).
+@MainActor
+private final class _EventMonitorHost: ObservableObject {
+    let manager = EventMonitorManager()
+}
+
+// MARK: - L9 · Full production scaffold
+
+/// Adds ExtraViewModelStub (mirroring WorkersWorkspaceModel + BossPaneModel)
+/// on top of L8 — completing the set of simultaneously-active observables
+/// present in production while the design-doc window renders. L9 = L8 +
+/// extra publishers at a ~350 ms cadence. If L9 reproduces but L8 does
+/// not, the combined publish load (not any single publisher) is the cause.
+struct L9_FullScaffold: View {
+    let source: String
+    @EnvironmentObject private var envStub: ChatViewModelStub
+    @EnvironmentObject private var sibling: SiblingPublisherStub
+    @EnvironmentObject private var extra: ExtraViewModelStub
+
+    @StateObject private var monitors = _EventMonitorHost()
+
+    var body: some View {
+        let _ = envStub.isConnected
+        let _ = sibling.tickCount
+        let _ = extra.workerCount
+        L5_BossAsyncFetch(source: source)
+            .onAppear {
+                sibling.start()
+                extra.start()
+                monitors.manager.install()
+            }
+            .onDisappear {
+                sibling.stop()
+                extra.stop()
+                monitors.manager.remove()
+            }
     }
 }

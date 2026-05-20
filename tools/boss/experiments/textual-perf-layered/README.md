@@ -41,8 +41,22 @@ The doc is *not* duplicated into this experiment's Resources folder — keeping 
 | L3    | `.withComments()` stub                                | HStack-wrap, `@StateObject` rebuild surface, environment injection                     |
 | L4    | view-model `.loading` → `.loaded` flip                | view-model rebuild on `renderContentID` UUID change                                    |
 | L5    | view-model + async fetch                              | spinner → content transition cost                                                      |
+| L6    | passive `ChatViewModelStub` as `@EnvironmentObject`   | cost of EnvironmentObject subscription graph without any active publishing             |
+| L7    | L6 + `SiblingPublisherStub` firing every ~500 ms      | sibling-publisher invalidation cascade forcing design-doc body re-evaluation           |
+| L8    | L7 + local NSEvent monitors (keyDown, rightMouseDown, leftMouseUp) | event-monitor overhead on main-thread availability during render               |
+| L9    | L8 + `ExtraViewModelStub` at ~350 ms cadence          | combined publish load from all active observers (full production scene complement)     |
 
 The comments stub (L3+) is intentionally a `@Published`-surface lookalike without NSEvent monitors. Adding global event monitors from a benchmark rig is hazardous (they leak across runs and intercept other apps' shortcuts), and the monitors don't fire during render — they only fire on user key/right-click events. If the rig's L3 shows the slowness, the cause is in the wrapper structure, not the monitors.
+
+### L6–L9: what each layer simulates
+
+**L6 — passive EnvironmentObject**: In production, `BossMacApp` creates `@StateObject private var chatModel = ChatViewModel(...)` and injects it via `.environmentObject(chatModel)` on the scene. The async-markdown-viewer `Window` scene receives `chatModel` as an `@EnvironmentObject`. `ChatViewModelStub` has ~20 `@Published` properties (matching the structural shape of `ChatViewModel`) but never publishes — so L6 = L5 + "is there a large EnvironmentObject in the tree at all?"
+
+**L7 — active sibling publisher**: `SiblingPublisherStub.start()` fires a Task that increments `tickCount` every ~500 ms. This approximates the combined publish cadence of ChatViewModel (engine events), the kanban view-models (task/project updates), and the live-status pollers observed during earlier sessions (kanban resolve spiked from ~170 ms → 1,427 ms alongside the 38 s render). L7 = L6 + "do sibling objectWillChange events cascade into this view?"
+
+**L8 — NSEvent monitors**: Installs the three local monitors that `CommentLayer.installMonitors()` registers on appear: `.keyDown`, `.rightMouseDown`, `.leftMouseUp`. All handlers pass events through unchanged. Production's monitors run the `captureInteractionAnchor` / `shouldConsumeKeyEvent` paths on every event; the rig's are no-ops. L8 = L7 + "does the event-loop interception cost affect main-thread availability?"
+
+**L9 — full scaffold**: Adds `ExtraViewModelStub` (publishing every ~350 ms) on top of L8, mirroring `WorkersWorkspaceModel` and `BossPaneModel` from `ContentView`'s other `@StateObject` declarations. L9 = L8 + "does the total combined publish load across all active observers reproduce the wall?"
 
 ## Reading the output
 

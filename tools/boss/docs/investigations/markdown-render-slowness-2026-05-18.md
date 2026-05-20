@@ -88,9 +88,63 @@ Each picker click logs `phase=parse_start layer=Ln` and, on first non-zero layou
 
 The expected outcome is that one specific layer crosses from milliseconds into seconds — that's the offender. If two adjacent layers both jump, the wrapper added by the *first* is the cause (the second is just inheriting the cost).
 
+## L1–L5 bisection result (2026-05-19)
+
+**None of L1–L5 reproduced the wall.** Bisection run 2026-05-19 02:04–02:05Z (rig PID 26591, mono-agent-003, sample doc `tools/boss/docs/designs/installable-distribution-package-for-boss.md`, 47 KB):
+
+All six layers (L0–L5) rendered in human-imperceptible time (~1–3s click-to-click gaps including human reaction time, no layer pauses for tens of seconds). The same wrappers applied in the production Boss app produced a 38-second `phase=render duration_ms=37982` event in `com.boss.app:DesignDocTiming` earlier the same session.
+
+**Caveat:** `parse_end / duration_ms` instrumentation was broken at time of bisection (T635). The "no layer is slow" conclusion is from human-eyeball wall-clock plus click-cadence timestamps, not from numeric durations. Land T635 before interpreting L6+ numbers if hard evidence is needed.
+
+**Implication:** The slowness does not live in any of the Boss-side view wrappers alone. The cause is an interaction between those wrappers and something further up the production scene tree — most likely one of the app-level observables that publish continuously while the window is open.
+
+## L6–L9 hypothesis ladder (extension, added 2026-05-19)
+
+Added layers L6–L9 to `tools/boss/experiments/textual-perf-layered/` to bisect the production scene tree above L5. Each layer adds exactly one production element that is absent from the standalone rig.
+
+### 7. Passive ChatViewModel EnvironmentObject in the tree **(MEDIUM)**
+
+In production, `BossMacApp` injects `ChatViewModel` as an `@EnvironmentObject` on the async-markdown-viewer `Window` scene. The rig (L0–L5) has no such environment injection. `ChatViewModel` has ~50 `@Published` properties; simply being in the environment means every view that declares `@EnvironmentObject var model: ChatViewModel` is subscribed to `model.objectWillChange`. If the design-doc render path reads `chatModel` anywhere (directly or through intermediate views), every publish during the render could trigger body re-evaluation.
+
+Layer **L6** tests this: adds a `ChatViewModelStub` (20 `@Published` vars, no timer) as `@EnvironmentObject`. If L6 is slow, the subscription chain itself is the cost. If L6 matches L5, proceed to L7.
+
+### 8. Sibling publisher firing during render **(HIGH)**
+
+Earlier in the same session that produced the 38 s wall, we observed a kanban resolve spike from ~170 ms → 1,427 ms. This indicates main-thread starvation: the kanban resolver was also trying to run while the markdown window was rendering. The causal arrow may run in both directions — starvation from the kanban resolver delays the render, *and* objectWillChange publishes from the resolver's `@Published` properties could force the markdown view's body to re-evaluate mid-render.
+
+`ChatViewModel` in production receives engine events continuously — task-runtime updates, worker state changes, live-status probes — every few hundred milliseconds. Any of these fires `objectWillChange` on the shared `chatModel`, which propagates to every subscribed view including any that are mid-layout.
+
+Layer **L7** tests this: `SiblingPublisherStub` fires `objectWillChange` every ~500 ms while L7 is displayed. If L7 is slow and L6 is not, the *active* publishing cadence (not the EnvironmentObject graph itself) is the culprit.
+
+### 9. NSEvent monitors blocking the event loop **(MEDIUM)**
+
+`CommentLayer.installMonitors()` registers three local monitors: `.keyDown`, `.rightMouseDown`, `.leftMouseUp`. These run on the main thread for every matching event delivered to the app — not just to the markdown window. During a 38-second render, any user mouse movement or accidental key press would fire these closures synchronously on the main thread, potentially adding latency to layout passes that are already running there.
+
+Layer **L8** tests this: installs identical pass-through monitors (no-op handlers) while L8 is displayed, unregisters on disappear. If L8 is slow and L7 is not, the event-monitor overhead is the culprit.
+
+### 10. Combined publish load from all active observers **(MEDIUM)**
+
+Production's `ContentView` has `@StateObject private var workersWorkspace = WorkersWorkspaceModel()` and `@StateObject private var bossPane = BossPaneModel()` alongside `@EnvironmentObject private var model: ChatViewModel`. These three observables each fire independently. The combined objectWillChange cadence may be fast enough to saturate SwiftUI's diffing pass and prevent the layout engine from making forward progress on the markdown tree.
+
+Layer **L9** tests this: adds `ExtraViewModelStub` publishing every ~350 ms on top of L8, approximating the WorkersWorkspaceModel + BossPaneModel combined cadence. If L9 is slow and L8 is not, it is the total combined publish load — not any single publisher — that reproduces the wall.
+
+### Next bisection run
+
+```sh
+cd tools/boss/experiments/textual-perf-layered
+swift run textualperflayered
+# in another terminal:
+log stream --predicate 'subsystem == "com.boss.textualperf"' --level info
+```
+
+Pick each layer in sequence, L6 → L7 → L8 → L9. Capture 3+ samples per layer. The first layer that crosses from milliseconds into seconds is the offender.
+
+If none of L6–L9 reproduces the wall, the cause is something not captured by the rig — likely full AppDelegate registration (NSApplicationDelegateAdaptor), GhosttyKit terminal views active in the same NSWindow, or a side-effect of the `NavigationSplitView` that wraps `ContentView` in production. File as a follow-up with a description of what L9 measured.
+
 ## Open questions
 
 - Does **L1** alone reproduce the slowness, or is it L2 / L3 that crosses? The static review can't distinguish — only the rig measurements can.
 - Does the slowness depend on Designs-tab state (e.g. how many products/projects are loaded) or is it intrinsic to the single doc? The rig is standalone, so if it reproduces, the cause is local.
 - Is there a feedback loop between `.withComments()` rebuilding and `parseVersion` bumping? The rig's L3 stub has no NSEvent monitors, which means it captures the rebuild path without the keyboard-event path; if Boss is slower than rig-L3, that gap implicates the monitors or something else only present in Boss.
-- If none of L1–L5 reproduces the 129 s, then the cause is *not* in any single wrapper — likely an interaction between the wrappers and some app-level environment value Boss injects further up the tree. Next step: bisect by adding Boss's top-level scene wiring (`@EnvironmentObject ChatViewModel`, `.openWindow(...)` plumbing) on top of L5.
+- **New (L6–L9):** Does the sibling publisher need to be firing at the exact moment the markdown tree first lays out, or does any publish at any time during the ~38 s window reproduce the wall? The rig fires every 500 ms unconditionally; production fires on engine events which may be bursty.
+- **New (L6–L9):** Is the slowness only reproducible when the Designs tab is active and the kanban view is also rendering? If so, none of L6–L9 will reproduce it standalone, and the fix must target the interaction between the kanban and the markdown renderer specifically.

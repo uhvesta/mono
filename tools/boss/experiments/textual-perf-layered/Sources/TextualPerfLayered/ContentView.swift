@@ -45,6 +45,35 @@ enum Layer: String, CaseIterable, Identifiable {
     /// thrash between the spinner and the rendered doc.
     case bossAsyncFetch
 
+    /// L6: Add a passive stub of ChatViewModel's @EnvironmentObject.
+    /// Production's async-markdown-viewer Window scene receives chatModel
+    /// via .environmentObject(chatModel). Tests whether the mere presence
+    /// of a large EnvironmentObject in the tree — with ~20 @Published
+    /// properties but no active publishing — changes render cost.
+    case windowGroupEnvObj
+
+    /// L7: Add a SiblingPublisherStub that publishes every ~500 ms on
+    /// top of L6. Mirrors ChatViewModel / kanban view-model / live-status
+    /// poller publish events observed in production alongside the
+    /// design-doc render. Tests if sibling-publisher objectWillChange
+    /// events cascade into the design-doc body's re-evaluation.
+    case siblingPublisher
+
+    /// L8: Add local NSEvent monitors (keyDown, rightMouseDown,
+    /// leftMouseUp) on top of L7. Mirrors CommentLayer.installMonitors()
+    /// in production. All handlers pass events through unchanged;
+    /// monitors are unregistered on disappear to prevent leakage.
+    /// Tests whether the event-processing overhead affects main-thread
+    /// availability during the markdown render.
+    case eventMonitor
+
+    /// L9: Add additional ObservableObject stubs mirroring ContentView's
+    /// @StateObject members (WorkersWorkspaceModel, BossPaneModel) on top
+    /// of L8, each publishing on a separate timer. Tests whether the full
+    /// set of simultaneously-active observers in production is responsible
+    /// for the slowness via combined invalidation load.
+    case fullScaffold
+
     var id: String { rawValue }
 
     var label: String {
@@ -55,6 +84,10 @@ enum Layer: String, CaseIterable, Identifiable {
         case .bossWithComments: "L3 · + .withComments()"
         case .bossViewModel: "L4 · + view-model"
         case .bossAsyncFetch: "L5 · + async fetch"
+        case .windowGroupEnvObj: "L6 · + env object"
+        case .siblingPublisher: "L7 · + sibling pub"
+        case .eventMonitor: "L8 · + event monitors"
+        case .fullScaffold: "L9 · + full scaffold"
         }
     }
 
@@ -66,6 +99,10 @@ enum Layer: String, CaseIterable, Identifiable {
         case .bossWithComments: "L3"
         case .bossViewModel: "L4"
         case .bossAsyncFetch: "L5"
+        case .windowGroupEnvObj: "L6"
+        case .siblingPublisher: "L7"
+        case .eventMonitor: "L8"
+        case .fullScaffold: "L9"
         }
     }
 }
@@ -83,6 +120,12 @@ struct StructuredTextHeightKey: PreferenceKey {
 struct ContentView: View {
     @State private var selected: Layer = .textualOnly
     @State private var sample: SampleSource = SampleSource.load()
+
+    // Stubs for L6+: created once and injected into the whole layer pane
+    // so each layer can declare only the @EnvironmentObjects it needs.
+    @StateObject private var chatStub = ChatViewModelStub()
+    @StateObject private var siblingPublisher = SiblingPublisherStub()
+    @StateObject private var extraStub = ExtraViewModelStub()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -104,6 +147,12 @@ struct ContentView: View {
             Divider()
 
             LayerPane(layer: selected, source: sample.text)
+                // Inject all stubs so each layer can subscribe selectively
+                // by declaring @EnvironmentObject. L0–L5 never read them,
+                // so they incur no subscription cost.
+                .environmentObject(chatStub)
+                .environmentObject(siblingPublisher)
+                .environmentObject(extraStub)
                 .id(selected)
         }
         .frame(minWidth: 800, minHeight: 600)
@@ -136,6 +185,14 @@ struct LayerPane: View {
                 L4_BossViewModel(source: source)
             case .bossAsyncFetch:
                 L5_BossAsyncFetch(source: source)
+            case .windowGroupEnvObj:
+                L6_WindowGroupEnvObj(source: source)
+            case .siblingPublisher:
+                L7_SiblingPublisher(source: source)
+            case .eventMonitor:
+                L8_EventMonitor(source: source)
+            case .fullScaffold:
+                L9_FullScaffold(source: source)
             }
         }
         .onPreferenceChange(StructuredTextHeightKey.self) { h in
