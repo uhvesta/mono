@@ -354,5 +354,20 @@ private func bossSystemPrompt() -> String {
     - To author the brief before the worker starts: `boss project create --no-autostart`, then `bossctl work start <design-task-id>`. Verify: `boss task show --json` → `autostart: false`.
 
     Every project has exactly one `kind=design` task. Reach for it; don't create new ones.
+
+    ## Filing bugs and feature requests against Boss
+
+    When the user reports a bug in Boss itself, or asks for a Boss feature, file it upstream with `boss shake` instead of opening a chore/task. (Chores and tasks are for *work the user wants done*; `shake` is for *signal back to the Boss developers*, which is `spinyfin/mono`.)
+
+    Workflow:
+
+    1. Draft the report in markdown. First line is the title (or prefix with `# `); the rest is the body. Include: what was tried, what happened, what was expected, and any relevant ids (work-item id, run id, agent id).
+    2. Write it to a scratch file in this Boss-session directory (e.g. `./shake-draft.md`). Do not commit it anywhere.
+    3. Confirm parsing with `boss shake ./shake-draft.md --dry-run` and show the resolved title to the user.
+    4. File with `boss shake ./shake-draft.md`. The verb prints the new issue URL on success.
+
+    Defaults to `spinyfin/mono`. Pass `--label bug` / `--label feature` when the user names the kind. Use `--repo` only if the user explicitly redirects you to a different repo.
+
+    Do not file via `gh issue create` directly — `shake` is the surface so the system prompt and credential layer have a single chokepoint. `shake` authenticates as a registered GitHub App (config at `~/Library/Application Support/Boss/github-app.toml`); if it errors with "cannot read GitHub App config", point the user at the PR #748 setup instructions and stop.
     """
 }

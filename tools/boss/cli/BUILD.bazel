@@ -6,6 +6,12 @@ exports_files(["Cargo.toml"])
 rust_binary(
     name = "boss",
     srcs = glob(["src/**/*.rs"]),
+    # `boss shake`'s github_app module loads embedded RSA test fixtures
+    # via `include_str!("../tests/fixtures/…")` inside #[cfg(test)]
+    # blocks. The fixtures aren't reachable from a non-test build, but
+    # `include_str!` is parsed unconditionally — Bazel needs them
+    # staged in the sandbox or the binary fails to compile.
+    compile_data = glob(["tests/fixtures/**"]),
     visibility = [
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/installer:__pkg__",
@@ -109,6 +115,23 @@ rust_test(
 rust_test(
     name = "uninstall_test",
     srcs = ["tests/uninstall.rs"],
+    edition = "2024",
+    data = [":boss"],
+    deps = [] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+# End-to-end coverage for `boss shake` (the "file a bug against Boss"
+# verb). Uses --dry-run so no `gh` call is made and no real issue is filed.
+rust_test(
+    name = "shake_test",
+    srcs = ["tests/shake.rs"],
     edition = "2024",
     data = [":boss"],
     deps = [] + all_crate_deps(

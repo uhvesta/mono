@@ -22,6 +22,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;
 
+mod github_app;
 mod repo_resolution;
 
 #[derive(Debug, Parser)]
@@ -106,6 +107,27 @@ enum Commands {
     /// lifecycle (stopping the default pid file would kill the host
     /// engine instead of any sandbox engine).
     Uninstall(UninstallArgs),
+    /// File a bug or feature request against Boss itself.
+    ///
+    /// Reads a markdown bug report from the given FILE (or stdin if FILE
+    /// is `-`) and opens a GitHub issue against `spinyfin/mono` — the
+    /// upstream repo where Boss is developed.
+    ///
+    /// The first non-blank line of the file is taken as the issue title.
+    /// If it begins with `# ` (a markdown H1) the marker is stripped.
+    /// The remainder of the file becomes the issue body. Pass `--title`
+    /// to override; in that case the entire file body is used verbatim.
+    ///
+    /// Credentials: authenticates as a registered GitHub App. Reads
+    /// `~/Library/Application Support/Boss/github-app.toml` (override
+    /// path with `BOSS_GITHUB_APP_CONFIG`), signs a short-lived JWT
+    /// with the App's private key, swaps it for an installation access
+    /// token, then files via the REST API. See PR #748 for the
+    /// one-time setup instructions. `boss shake` deliberately does NOT
+    /// fall back to `gh issue create` — the user's corporate
+    /// environment has a non-standard `gh` install that would silently
+    /// mask failures.
+    Shake(ShakeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -368,6 +390,33 @@ impl From<DependDirectionArg> for DependencyDirection {
             DependDirectionArg::Both => DependencyDirection::Both,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct ShakeArgs {
+    /// Path to the markdown bug report. Use `-` to read from stdin.
+    file: String,
+
+    /// Override the issue title. When set, the entire FILE contents are
+    /// used as the body and no title is extracted from the first line.
+    #[arg(long)]
+    title: Option<String>,
+
+    /// Target repo (`owner/repo`). Defaults to `spinyfin/mono`. Mainly a
+    /// hook for tests / sandbox runs against a scratch repo.
+    #[arg(long, default_value = "spinyfin/mono")]
+    repo: String,
+
+    /// Add a GitHub label to the issue. Pass multiple times to add
+    /// multiple labels. The labels must already exist on the target
+    /// repo or `gh issue create` will reject the call.
+    #[arg(long = "label")]
+    labels: Vec<String>,
+
+    /// Print the parsed title and body without filing the issue. Useful
+    /// for verifying that the file parses the way you expect.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1772,6 +1821,7 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
             run_engine_command(command, &ctx).await
         }
         Commands::Uninstall(args) => run_uninstall_command(args, &cli.global).await,
+        Commands::Shake(args) => run_shake_command(args, &cli.global).await,
     }
 }
 
@@ -6028,6 +6078,120 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
 
     Ok(())
 }
+
+/// Split a bug-report blob into a `(title, body)` pair.
+///
+/// The first non-blank line is the title (with a leading `# ` stripped
+/// so a markdown H1 also works as the report heading). The remainder of
+/// the file — minus the blank lines that immediately follow the title —
+/// becomes the body. An empty blob is rejected by the caller; here we
+/// just trust the input has at least one non-blank line.
+fn split_shake_report(blob: &str) -> Option<(String, String)> {
+    let mut lines = blob.lines();
+    let title_line = lines.by_ref().find(|line| !line.trim().is_empty())?;
+    let title = title_line
+        .trim_start()
+        .strip_prefix("# ")
+        .unwrap_or(title_line)
+        .trim()
+        .to_owned();
+    if title.is_empty() {
+        return None;
+    }
+
+    let mut body_lines: Vec<&str> = lines.collect();
+    while body_lines.first().is_some_and(|line| line.trim().is_empty()) {
+        body_lines.remove(0);
+    }
+    while body_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        body_lines.pop();
+    }
+    let body = body_lines.join("\n");
+
+    Some((title, body))
+}
+
+async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), CliError> {
+    let blob = if args.file == "-" {
+        let mut s = String::new();
+        io::stdin()
+            .read_to_string(&mut s)
+            .map_err(|e| CliError::internal(anyhow::anyhow!("read stdin: {e}")))?;
+        s
+    } else {
+        std::fs::read_to_string(&args.file).map_err(|e| {
+            CliError::usage(format!("cannot read bug report {}: {e}", args.file))
+        })?
+    };
+
+    let (title, body) = if let Some(explicit_title) = args.title.as_deref() {
+        let title = explicit_title.trim();
+        if title.is_empty() {
+            return Err(CliError::usage("--title cannot be blank".to_owned()));
+        }
+        (title.to_owned(), blob.trim_end_matches('\n').to_owned())
+    } else {
+        split_shake_report(&blob).ok_or_else(|| {
+            CliError::usage(
+                "bug report is empty — need at least one non-blank line for a title".to_owned(),
+            )
+        })?
+    };
+
+    if args.dry_run {
+        if flags.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "dry_run",
+                    "repo": args.repo,
+                    "title": title,
+                    "body": body,
+                    "labels": args.labels,
+                })
+            );
+        } else {
+            println!("repo:  {}", args.repo);
+            println!("title: {title}");
+            if !args.labels.is_empty() {
+                println!("labels: {}", args.labels.join(", "));
+            }
+            println!("---");
+            println!("{body}");
+        }
+        return Ok(());
+    }
+
+    let cfg_path = github_app::config_path().map_err(CliError::internal)?;
+    let cfg = github_app::load_config(&cfg_path).map_err(|e| CliError::application(e.to_string()))?;
+    let api_base = std::env::var("BOSS_GITHUB_API_BASE")
+        .unwrap_or_else(|_| github_app::DEFAULT_API_BASE.to_owned());
+
+    let issue = github_app::file_issue(&cfg, &api_base, &args.repo, &title, &body, &args.labels)
+        .await
+        .map_err(|e| CliError::application(format!("{e:#}")))?;
+
+    if flags.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "filed",
+                "repo": args.repo,
+                "url": issue.html_url,
+                "number": issue.number,
+                "title": title,
+            })
+        );
+    } else {
+        println!(
+            "filed issue against {}: {} (#{})",
+            args.repo, issue.html_url, issue.number
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -6038,7 +6202,7 @@ mod tests {
         RepoSelector, TaskCommand, classify_bind_pr, decide_open_design_action,
         ensure_explicit_product_matches, expect_leaf_work_item, format_project_design_doc_line,
         format_repo_line, is_typed_work_item_id, pick_by_index, short_name_for,
-        validate_github_pr_url,
+        split_shake_report, validate_github_pr_url,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -7282,5 +7446,40 @@ mod tests {
         let msg = format!("{err:?}");
         assert!(msg.contains("mono"), "{msg}");
         assert!(msg.contains("prod_1"), "{msg}");
+    }
+
+    #[test]
+    fn shake_report_takes_first_line_as_title() {
+        let (title, body) = split_shake_report("Engine wedges on close\n\nrepro: …").unwrap();
+        assert_eq!(title, "Engine wedges on close");
+        assert_eq!(body, "repro: …");
+    }
+
+    #[test]
+    fn shake_report_strips_h1_marker_from_title() {
+        let (title, body) =
+            split_shake_report("# Engine wedges on close\n\nrepro: …\nstep two\n").unwrap();
+        assert_eq!(title, "Engine wedges on close");
+        assert_eq!(body, "repro: …\nstep two");
+    }
+
+    #[test]
+    fn shake_report_skips_leading_blank_lines() {
+        let (title, body) = split_shake_report("\n\n  \nFirst line is title\nbody here").unwrap();
+        assert_eq!(title, "First line is title");
+        assert_eq!(body, "body here");
+    }
+
+    #[test]
+    fn shake_report_single_line_has_empty_body() {
+        let (title, body) = split_shake_report("Only the title").unwrap();
+        assert_eq!(title, "Only the title");
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn shake_report_rejects_blank_blob() {
+        assert!(split_shake_report("").is_none());
+        assert!(split_shake_report("\n\n  \n").is_none());
     }
 }
