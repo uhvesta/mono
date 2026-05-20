@@ -2472,6 +2472,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -3318,6 +3319,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -3552,6 +3554,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -4176,6 +4179,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -4399,6 +4403,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let description_with_pr_refs = "\
@@ -4537,6 +4542,7 @@ PR #379. PR #379.";
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         // Description points at PR #379 repeatedly as prior art. The

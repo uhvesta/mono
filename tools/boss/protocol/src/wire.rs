@@ -4,13 +4,14 @@ use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
     AddDependencyInput, CiBudgetSnapshot, CiRemediation, ConflictResolution,
-    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateManyChoresInput,
-    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput,
-    DependencyFilter, EngineAttemptListEntry, LinkExternalRefInput, ListDependenciesInput, Product,
-    Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
-    WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch, WorkRun,
+    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRunInput, CreateTaskInput, DependencyFilter, EngineAttemptListEntry,
+    LinkExternalRefInput, ListDependenciesInput, Product, Project, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task, TaskRuntime, WorkAttentionItem,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -395,6 +396,23 @@ pub enum FrontendRequest {
     /// see [`crate::LiveStatusDebugReport`]. Wired through to
     /// `bossctl live-status debug`. Read-only; no side effects.
     DebugLiveStatusPipeline,
+    /// Create a `kind = 'investigation'` task. Parallel to
+    /// `CreateChore` but uses `investigation` kind and supports an
+    /// optional `project_id`. Workers dispatched against investigation
+    /// tasks receive a doc-output prelude and open PRs against the
+    /// product's `docs_repo` or `BOSS_USER_DOCS_REPO`.
+    CreateInvestigation {
+        #[serde(flatten)]
+        input: CreateInvestigationInput,
+    },
+    /// Set (or clear) the investigation-doc pointer on a task. Persists
+    /// the three `tasks.investigation_doc_*` columns per
+    /// [`SetTaskInvestigationDocInput`]'s semantics and replies with the
+    /// updated `Task` row wrapped in a `WorkItemUpdated` event.
+    SetTaskInvestigationDoc {
+        #[serde(flatten)]
+        input: SetTaskInvestigationDocInput,
+    },
     /// Set (or clear) a project's design-doc pointer. Persists the
     /// three `projects.design_doc_*` columns per
     /// [`SetProjectDesignDocInput`]'s semantics and replies with the

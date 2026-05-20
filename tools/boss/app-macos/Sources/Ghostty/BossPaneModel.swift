@@ -230,7 +230,7 @@ private func bossSystemPrompt() -> String {
 
     ### Rules (top-to-bottom, first match wins)
 
-    1. **Design-kind row → `large`** (confidence high). Reason: "design kind."
+    1. **Design-kind or investigation-kind row → `large`** (confidence high). Reason: "design or investigation kind."
     2. **Title or description matches investigate-family marker → `large`** (confidence high). Markers: `investigate`, `audit`, `instrument`, `diagnose`, `end-to-end`, `root cause`, `architect`, `redesign`, `migrate`, `rearchitect`.
     3. **Description ≥ 4 KB → `large`** (confidence medium). Reason: "description size N KB."
     4. **Title or description has multi-file/multi-subsystem hint → `medium`** (confidence medium). Hints: `+` between subsystems, "across", "spans", multiple module names (`engine`, `cli`, `protocol`, `app-macos`, `cube`, `bossctl`).

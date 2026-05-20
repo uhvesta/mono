@@ -116,6 +116,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             },
         })
         .await?
@@ -863,6 +864,7 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             },
         })
         .await?
@@ -974,6 +976,7 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             },
         })
         .await?
@@ -1066,6 +1069,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             },
         })
         .await?
@@ -1320,6 +1324,7 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             },
         })
         .await?
@@ -1415,6 +1420,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         description: None,
         repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
         design_repo: None,
+        docs_repo: None,
     })?;
     let chore = work_db.create_chore(CreateChoreInput {
         product_id: product.id.clone(),
@@ -1750,6 +1756,7 @@ async fn seed_two_conflict_resolutions(
         description: None,
         repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
         design_repo: None,
+        docs_repo: None,
     })?;
     let chore = work_db.create_chore(CreateChoreInput {
         product_id: product.id.clone(),

@@ -195,7 +195,7 @@ impl WorkDb {
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo
+            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo
              FROM products
              ORDER BY name COLLATE NOCASE ASC",
         )?;
@@ -213,11 +213,12 @@ impl WorkDb {
         let description = input.description.unwrap_or_default();
         let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
         let design_repo = canonicalize_repo_remote_url(input.design_repo);
+        let docs_repo = canonicalize_repo_remote_url(input.docs_repo);
 
         tx.execute(
-            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, design_repo)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL, ?7)",
-            params![id, input.name, slug, description, repo_remote_url, now, design_repo],
+            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, design_repo, docs_repo)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL, ?7, ?8)",
+            params![id, input.name, slug, description, repo_remote_url, now, design_repo, docs_repo],
         )?;
 
         let product = query_product(&tx, &id)?
@@ -303,6 +304,73 @@ impl WorkDb {
         let chore = insert_chore_in_tx(&tx, input)?;
         tx.commit()?;
         Ok(chore)
+    }
+
+    /// Create a `kind = 'investigation'` task. Parallel to `create_chore`
+    /// but uses the `investigation` kind and supports an optional `project_id`.
+    pub fn create_investigation(
+        &self,
+        input: boss_protocol::CreateInvestigationInput,
+    ) -> Result<Task> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let task = insert_investigation_in_tx(&tx, input)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    /// Set (or clear) the investigation-doc pointer on a
+    /// `kind = 'investigation'` task. Stores the `(repo, branch, path)`
+    /// triple so the kanban affordance can construct a GitHub URL at
+    /// render time without a separate resolution RPC.
+    pub fn set_task_investigation_doc(
+        &self,
+        input: boss_protocol::SetTaskInvestigationDocInput,
+    ) -> Result<Task> {
+        let conn = self.connect()?;
+        let task = query_task(&conn, &input.task_id)?
+            .with_context(|| format!("unknown task: {}", input.task_id))?;
+        if task.kind != "investigation" {
+            bail!(
+                "task {} has kind '{}'; set-investigation-doc only applies to kind='investigation'",
+                input.task_id,
+                task.kind
+            );
+        }
+        let now = now_string();
+        if input.unset {
+            conn.execute(
+                "UPDATE tasks
+                 SET investigation_doc_path = NULL,
+                     investigation_doc_repo_remote_url = NULL,
+                     investigation_doc_branch = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![input.task_id, now],
+            )?;
+        } else {
+            let path = match input.investigation_doc_path.as_deref().map(str::trim) {
+                None | Some("") => bail!("investigation_doc_path must be non-empty (use unset=true to clear)"),
+                Some(p) => p.to_owned(),
+            };
+            let repo = input
+                .investigation_doc_repo_remote_url
+                .filter(|s| !s.is_empty());
+            let branch = input
+                .investigation_doc_branch
+                .filter(|s| !s.is_empty());
+            conn.execute(
+                "UPDATE tasks
+                 SET investigation_doc_path = ?2,
+                     investigation_doc_repo_remote_url = ?3,
+                     investigation_doc_branch = ?4,
+                     updated_at = ?5
+                 WHERE id = ?1",
+                params![input.task_id, path, repo, branch, now],
+            )?;
+        }
+        query_task(&conn, &input.task_id)?
+            .with_context(|| format!("missing task after update: {}", input.task_id))
     }
 
     /// Create a chore and immediately bind it to an upstream tracker reference
@@ -1563,6 +1631,19 @@ impl WorkDb {
                         )?;
                     }
                 }
+                // Investigation tasks dispatch independently (no project
+                // dependency chain) — each produces one standalone doc PR.
+                "investigation" => {
+                    if task_accepts_execution(&task) {
+                        reconcile_work_item_execution(
+                            &tx,
+                            &mut result,
+                            &task.id,
+                            "investigation_implementation",
+                            "ready",
+                        )?;
+                    }
+                }
                 "project_task" | "design" => {
                     if let Some(project_id) = &task.project_id {
                         project_tasks
@@ -2479,23 +2560,23 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
-            let rows = stmt.query_map([product_id], map_task_with_external_ref)?;
+            let rows = stmt.query_map([product_id], map_task_with_external_ref_and_investigation_doc)?;
             collect_rows(rows)?
         };
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
             )?;
-            let rows = stmt.query_map([product_id], map_task_with_external_ref)?;
+            let rows = stmt.query_map([product_id], map_task_with_external_ref_and_investigation_doc)?;
             collect_rows(rows)?
         };
 
@@ -2652,7 +2733,7 @@ impl WorkDb {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
                  FROM tasks
-                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design', 'investigation') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map(params![product_id, project_id], map_task)?;
@@ -2661,7 +2742,7 @@ impl WorkDb {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ('project_task', 'design') AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([product_id], map_task)?;
@@ -3230,6 +3311,8 @@ impl WorkDb {
         migrate_products_ci_attempt_budget(&conn)?;
         migrate_products_dispatch_preamble(&conn)?;
         migrate_products_design_repo(&conn)?;
+        migrate_products_docs_repo(&conn)?;
+        migrate_tasks_investigation_doc_columns(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
         migrate_null_redundant_task_repo_remote_urls(&conn)?;
@@ -3673,7 +3756,7 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind IN ('chore', 'project_task', 'design')
+             WHERE kind IN ('chore', 'project_task', 'design', 'investigation')
                AND status = 'in_review'
                AND pr_url IS NOT NULL
                AND pr_url != ''
@@ -3717,7 +3800,7 @@ impl WorkDb {
                AND we.workspace_path IS NOT NULL
                AND we.workspace_path != ''
                AND t.deleted_at IS NULL
-               AND t.kind IN ('chore', 'project_task', 'design')
+               AND t.kind IN ('chore', 'project_task', 'design', 'investigation')
                AND t.status = 'active'
                AND (t.pr_url IS NULL OR t.pr_url = '')
              ORDER BY we.created_at ASC",
@@ -3840,7 +3923,7 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind IN ('chore', 'project_task', 'design')
+             WHERE kind IN ('chore', 'project_task', 'design', 'investigation')
                AND status = 'blocked'
                AND blocked_reason = 'merge_conflict'
                AND pr_url IS NOT NULL
@@ -3969,7 +4052,7 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind IN ('chore', 'project_task', 'design')
+             WHERE kind IN ('chore', 'project_task', 'design', 'investigation')
                AND status = 'blocked'
                AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
                AND pr_url IS NOT NULL
@@ -6395,6 +6478,7 @@ fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         description: row.get(3)?,
         repo_remote_url: row.get(4)?,
         design_repo: row.get::<_, Option<String>>(12)?.filter(|s| !s.is_empty()),
+        docs_repo: row.get::<_, Option<String>>(13)?.filter(|s| !s.is_empty()),
         status: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
@@ -6487,6 +6571,9 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // T1 schema columns; populated by T8 WorkDb methods when the migration
         // has run. Until then the protocol field carries None.
         external_ref: None,
+        investigation_doc_path: None,
+        investigation_doc_repo_remote_url: None,
+        investigation_doc_branch: None,
     })
 }
 
@@ -6527,6 +6614,18 @@ fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
             unbound_at: row.get(34)?,
         });
     }
+    Ok(task)
+}
+
+/// Like [`map_task_with_external_ref`] but also reads columns 35–37
+/// carrying the investigation-doc pointer fields. Used in
+/// `get_work_tree` where the SELECT explicitly includes those columns.
+fn map_task_with_external_ref_and_investigation_doc(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task_with_external_ref(row)?;
+    task.investigation_doc_path = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
+    task.investigation_doc_repo_remote_url =
+        row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
+    task.investigation_doc_branch = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
@@ -6965,6 +7064,48 @@ fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
 }
 
+/// Insert a `kind = 'investigation'` task. Mirrors `insert_chore_in_tx`
+/// but uses `investigation` kind and accepts an optional `project_id`.
+/// The repo stored on the task row is the investigation deliverable repo
+/// (product `docs_repo` or `BOSS_USER_DOCS_REPO`), not the product's
+/// code repo — `enforce_task_repo_invariant` is NOT called so the
+/// override can point at a docs-only repo without triggering the
+/// same-product check.
+fn insert_investigation_in_tx(
+    conn: &Connection,
+    input: boss_protocol::CreateInvestigationInput,
+) -> Result<Task> {
+    ensure_product_exists(conn, &input.product_id)?;
+    if let Some(ref pid) = input.project_id {
+        ensure_project_belongs_to_product(conn, pid, &input.product_id)?;
+    }
+    if !input.force_duplicate {
+        if let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
+            return Err(anyhow::Error::new(dup));
+        }
+    }
+    let id = next_id("task");
+    let now = now_string();
+    let description = input.description.unwrap_or_default();
+    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
+    let priority = normalize_priority(input.priority.as_deref())?;
+    let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "investigation");
+    let repo_remote_url = input.repo_remote_url.filter(|s| !s.is_empty());
+    let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
+    let model_override = normalize_model_override(input.model_override);
+    let short_id = allocate_short_id(conn, &input.product_id)?;
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, short_id)
+         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            id, input.product_id, input.project_id, input.name, description, now,
+            autostart_value, priority, created_via, repo_remote_url,
+            effort_level, model_override, short_id
+        ],
+    )?;
+    query_task(conn, &id)?.with_context(|| format!("missing investigation after insert: {id}"))
+}
+
 /// Trim and reduce an empty model slug to `None`. The CLI uses
 /// `--model ""` to clear a stored override on update verbs; the
 /// engine treats the same shape consistently on create so callers
@@ -7100,7 +7241,7 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
 
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
-        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo
+        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo
          FROM products
          WHERE id = ?1",
         [id],
@@ -7995,6 +8136,41 @@ fn migrate_products_dispatch_preamble(conn: &Connection) -> Result<()> {
 fn migrate_products_design_repo(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "products", "design_repo")? {
         conn.execute("ALTER TABLE products ADD COLUMN design_repo TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add `products.docs_repo` — per-product target repo for
+/// `kind = 'investigation'` deliverables. `NULL` → fall through to
+/// `BOSS_USER_DOCS_REPO` env var at dispatch time.
+fn migrate_products_docs_repo(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "docs_repo")? {
+        conn.execute("ALTER TABLE products ADD COLUMN docs_repo TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add the three `tasks.investigation_doc_*` pointer columns that
+/// store the investigation deliverable's `(repo, branch, path)` triple
+/// set by the worker after opening the doc PR.
+fn migrate_tasks_investigation_doc_columns(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "investigation_doc_path")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN investigation_doc_path TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "tasks", "investigation_doc_repo_remote_url")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN investigation_doc_repo_remote_url TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "tasks", "investigation_doc_branch")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN investigation_doc_branch TEXT",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -9171,6 +9347,21 @@ pub(crate) fn resolve_repo_for_work_item(
             return Ok(Some(url.to_owned()));
         }
     }
+    if kind == "investigation" {
+        // Investigation deliverables go to the product's docs_repo; if
+        // unset the worker falls back to BOSS_USER_DOCS_REPO (resolved
+        // at spawn time by the dispatcher). Returning None here is
+        // intentional: the dispatcher's repo-unresolved attention item
+        // path surfaces it to the coordinator for manual correction.
+        if let Some(url) = product.docs_repo.as_deref().filter(|s| !s.is_empty()) {
+            return Ok(Some(url.to_owned()));
+        }
+        if let Ok(user_docs) = std::env::var("BOSS_USER_DOCS_REPO") {
+            if !user_docs.is_empty() {
+                return Ok(Some(user_docs));
+            }
+        }
+    }
     Ok(product.repo_remote_url)
 }
 
@@ -10105,6 +10296,7 @@ mod tests {
                 description: Some("desc".to_owned()),
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -10176,6 +10368,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -10241,6 +10434,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -10318,6 +10512,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -10363,6 +10558,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore_idle = db
@@ -10458,6 +10654,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -10532,6 +10729,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let prereq = db
@@ -10577,6 +10775,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let other_prereq = db
@@ -10700,6 +10899,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -10769,6 +10969,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -10878,6 +11079,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -10938,6 +11140,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -11042,6 +11245,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -11125,6 +11329,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -11202,6 +11407,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11257,6 +11463,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -11330,6 +11537,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -11395,6 +11603,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -11454,6 +11663,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11645,6 +11855,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11717,6 +11928,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11797,6 +12009,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11875,6 +12088,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11926,6 +12140,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -11986,6 +12201,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12045,6 +12261,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12111,6 +12328,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -12230,6 +12448,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -12388,6 +12607,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12458,6 +12678,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12540,6 +12761,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12655,6 +12877,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12727,6 +12950,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12781,6 +13005,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12869,6 +13094,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -12946,6 +13172,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13007,6 +13234,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let _todo_chore = db
@@ -13066,6 +13294,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13149,6 +13378,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13204,6 +13434,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13250,6 +13481,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13310,6 +13542,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -13374,6 +13607,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -13420,6 +13654,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -13467,6 +13702,7 @@ mod tests {
                     description: None,
                     repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                     design_repo: None,
+                    docs_repo: None,
                 })
                 .unwrap();
             let project = db
@@ -13520,6 +13756,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13576,6 +13813,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13754,6 +13992,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let mut chore_ids = Vec::new();
@@ -13818,6 +14057,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let prereq = db
@@ -13893,6 +14133,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -13960,6 +14201,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -14057,6 +14299,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -14165,6 +14408,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -14221,6 +14465,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -14345,6 +14590,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/alpha.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let p2 = db
@@ -14353,6 +14599,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/beta.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -14410,6 +14657,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -14475,6 +14723,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -14548,6 +14797,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -14621,6 +14871,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let dependent = db
@@ -14738,6 +14989,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let dependent = db
@@ -14838,6 +15090,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -14910,6 +15163,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -14999,6 +15253,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -15062,6 +15317,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -15133,6 +15389,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let a = db
@@ -15201,6 +15458,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let prereq = db
@@ -15436,6 +15694,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -15808,6 +16067,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.invalid:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16181,6 +16441,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let budget: i64 = conn
@@ -16248,6 +16509,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16458,6 +16720,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -16740,6 +17003,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let refs = db
@@ -17066,6 +17330,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -17150,6 +17415,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -17220,6 +17486,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -17328,6 +17595,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -17386,6 +17654,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -17755,6 +18024,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -17885,6 +18155,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -18317,6 +18588,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -18419,6 +18691,7 @@ mod tests {
                 description: None,
                 repo_remote_url: product_repo.map(str::to_owned),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -18561,6 +18834,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+                docs_repo: None,
             })
             .unwrap();
         // Project creation seeds a `kind = 'design'` task.
@@ -18632,6 +18906,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -18680,6 +18955,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -18732,6 +19008,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+                docs_repo: None,
             })
             .unwrap();
         assert_eq!(
@@ -18805,6 +19082,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         assert!(product.default_model.is_none());
@@ -18840,6 +19118,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18874,6 +19153,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -18942,6 +19222,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19004,6 +19285,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         assert!(product.default_model.is_none());
@@ -19052,6 +19334,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19159,6 +19442,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19232,6 +19516,7 @@ mod tests {
             description: None,
             repo_remote_url: Some("git@example.com:foo.git".to_owned()),
             design_repo: None,
+            docs_repo: None,
         }).unwrap();
         let project = db.create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -19329,6 +19614,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:concurrent.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -19406,6 +19692,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let flunge = db
@@ -19414,6 +19701,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:flunge.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -19563,6 +19851,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:boss.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19617,6 +19906,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let other_manual_id = next_id("task");
@@ -19644,6 +19934,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -19694,6 +19985,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -19748,6 +20040,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -19783,6 +20076,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
 
@@ -19822,6 +20116,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -19887,6 +20182,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -19948,6 +20244,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -20014,6 +20311,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore_a = db
@@ -20158,6 +20456,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -20217,6 +20516,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -20311,6 +20611,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -20418,6 +20719,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db

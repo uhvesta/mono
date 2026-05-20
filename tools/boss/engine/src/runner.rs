@@ -701,6 +701,9 @@ fn compose_execution_prompt(
         "project_design" => {
             prompt.push_str(&compose_design_directive(parent_project));
         }
+        "investigation_implementation" => {
+            prompt.push_str(&compose_investigation_directive(work_item));
+        }
         "task_implementation" | "chore_implementation" => {
             prompt.push_str(
                 "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n",
@@ -714,7 +717,7 @@ fn compose_execution_prompt(
     }
     if matches!(
         execution.kind.as_str(),
-        "task_implementation" | "chore_implementation" | "project_design"
+        "task_implementation" | "chore_implementation" | "project_design" | "investigation_implementation"
     ) {
         // Acceptance criterion: the engine watches for a PR URL on the
         // run's branch when claude stops. If the worker stops without
@@ -784,6 +787,38 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("  - **Chosen approach** — the design itself, with enough detail that a follow-up implementation task can be filed against it.\n");
     out.push_str("  - **Risks / open questions** — anything the author wants a human reviewer to land on before implementation starts.\n");
     out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up work items the human files after the design is approved.\n");
+    out
+}
+
+/// Directive block for `kind = 'investigation'` tasks. States the
+/// deliverable shape (one markdown doc, PR only, no code) and the
+/// repo routing rules so the worker doesn't need to infer them.
+///
+/// Key divergence from design tasks:
+/// - Destination repo is the product's `docs_repo` (or
+///   `BOSS_USER_DOCS_REPO`) — NOT the product's code repo.
+/// - No section template: free-form markdown. The investigation brief
+///   drives the structure.
+/// - PR is mandatory even on the user's personal docs repo. The
+///   direct-push shortcut in the user's CLAUDE.md does NOT apply here:
+///   the PR review window is the user's opportunity to edit the doc
+///   before it is saved for posterity. Always open a PR.
+/// - After opening the PR, record the doc pointer with
+///   `boss task set-investigation-doc` so the kanban affordance can
+///   link to the doc.
+fn compose_investigation_directive(work_item: &WorkItem) -> String {
+    let task_id = work_item_id(work_item);
+    let mut out = String::new();
+    out.push_str("Expected outcome for this run:\n");
+    out.push_str("- the deliverable is a **markdown document**, not code. Do not edit source code, build files, or anything other than the investigation doc.\n");
+    out.push_str("- the PR for this run contains **only the markdown doc** (one new file). If you find yourself touching `.rs`, `.ts`, `.swift`, build files, or anything else, stop — you are out of scope.\n");
+    out.push_str("- choose a filename that reflects the topic (e.g. `docs/investigations/my-topic.md`). Use an `investigations/` subdirectory if one exists in the repo, or create it.\n");
+    out.push_str("- open a PR with the doc regardless of which repo it lands in. Do NOT push directly to `main` even on the user's personal docs repo (e.g. `brianduff/docs`). The PR is the user's edit window.\n");
+    out.push_str("- after the PR is open, register the doc pointer so the kanban card shows the doc affordance:\n");
+    out.push_str(&format!(
+        "  `boss task set-investigation-doc --task {task_id} --path <repo-relative-path> --branch <pr-branch>`\n"
+    ));
+    out.push_str("- investigations do not touch code. If the description asks for both research and a code change, write only the investigation doc and note the follow-up code changes at the end of the doc for the user to file separately.\n");
     out
 }
 
@@ -1409,6 +1444,9 @@ mod conflict_resolution_prompt_tests {
             pr_state_polled_at: None,
             merge_queue_state: None,
             external_ref: None,
+            investigation_doc_path: None,
+            investigation_doc_repo_remote_url: None,
+            investigation_doc_branch: None,
         })
     }
 
@@ -1661,6 +1699,9 @@ mod compose_prompt_tests {
             pr_state_polled_at: None,
             merge_queue_state: None,
             external_ref: None,
+            investigation_doc_path: None,
+            investigation_doc_repo_remote_url: None,
+            investigation_doc_branch: None,
         })
     }
 
@@ -2135,6 +2176,9 @@ mod pane_spawn_tests {
             pr_state_polled_at: None,
             merge_queue_state: None,
             external_ref: None,
+            investigation_doc_path: None,
+            investigation_doc_repo_remote_url: None,
+            investigation_doc_branch: None,
         })
     }
 
@@ -2304,6 +2348,7 @@ mod pane_spawn_tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         if let Some(model) = product_default_model {
@@ -2632,6 +2677,7 @@ mod pane_spawn_tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = work_db
@@ -2868,6 +2914,7 @@ mod pane_spawn_tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = work_db
@@ -2967,6 +3014,7 @@ mod pane_spawn_tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = work_db
@@ -3102,6 +3150,7 @@ mod pane_spawn_tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = work_db
