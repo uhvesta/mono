@@ -9,13 +9,14 @@ use boss_client::{
 };
 use boss_protocol::{
     AddDependencyInput, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
-    CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent, FrontendRequest,
-    LinkExternalRefInput, ListDependenciesInput, Product, Project, ProjectDesignDocState,
-    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, WorkExecution,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
+    DependencyFilter, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
+    FrontendRequest, LinkExternalRefInput, ListDependenciesInput, Product, Project,
+    ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
+    ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
+    SetTaskInvestigationDocInput, Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -257,6 +258,20 @@ enum TaskCommand {
     /// reappears. Other fields are unaffected.
     #[command(name = "unlink-external")]
     UnlinkExternal(TaskIdArg),
+    /// Create a `kind = 'investigation'` task. The worker that runs
+    /// this task is given a doc-output prelude: deliverable is a single
+    /// markdown file committed via PR to the product's `docs_repo` (or
+    /// `BOSS_USER_DOCS_REPO`). No code changes.
+    #[command(name = "create-investigation")]
+    CreateInvestigation(InvestigationCreateArgs),
+    /// Set (or clear) the investigation-doc pointer on a
+    /// `kind = 'investigation'` task so the kanban card shows a doc
+    /// affordance linking to the produced markdown file.
+    ///
+    /// Workers call this after opening the doc PR:
+    ///   boss task set-investigation-doc --task <id> --path <path> --branch <branch>
+    #[command(name = "set-investigation-doc")]
+    SetInvestigationDoc(SetInvestigationDocArgs),
 }
 
 /// Subcommands under `boss chore ...`. Kind-agnostic verbs here are
@@ -1099,6 +1114,67 @@ struct ChoreCreateArgs {
     force_duplicate: bool,
 }
 
+/// Args for `boss task create-investigation`.
+#[derive(Debug, Args)]
+struct InvestigationCreateArgs {
+    #[arg(long)]
+    product: Option<String>,
+
+    /// Optional project scope. Investigation appears under the project
+    /// on the kanban when set.
+    #[arg(long)]
+    project: Option<String>,
+
+    #[arg(long)]
+    name: Option<String>,
+
+    #[arg(long)]
+    description: Option<String>,
+
+    #[arg(long)]
+    priority: Option<TaskPriority>,
+
+    /// Repo URL for the investigation deliverable. Omit to resolve from
+    /// the product's `docs_repo` or `BOSS_USER_DOCS_REPO`.
+    #[arg(long = "repo")]
+    repo_remote_url: Option<String>,
+
+    #[arg(long, value_enum)]
+    effort: Option<EffortLevelArg>,
+
+    #[arg(long, value_name = "SLUG")]
+    model: Option<String>,
+
+    #[arg(long = "force-duplicate", default_value_t = false)]
+    force_duplicate: bool,
+}
+
+/// Args for `boss task set-investigation-doc`.
+#[derive(Debug, Args)]
+struct SetInvestigationDocArgs {
+    /// Task id (`task_<hex>` or `T<short>`) of the investigation task.
+    #[arg(long)]
+    task: Option<String>,
+
+    /// Repo-relative path to the markdown file (e.g.
+    /// `docs/investigations/my-topic.md`).
+    #[arg(long)]
+    path: Option<String>,
+
+    /// Remote URL of the repo hosting the doc. Omit to inherit the
+    /// product's `docs_repo`.
+    #[arg(long)]
+    repo: Option<String>,
+
+    /// PR branch name. Set this to the branch the doc PR was opened on.
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Clear all three pointer columns (path, repo, branch).
+    #[arg(long, default_value_t = false)]
+    unset: bool,
+}
+
 /// Args for `boss task create-many`. The CLI reads a JSON array of
 /// item objects from `--from-file <path>` (use `-` for stdin) and
 /// fans them out into a single batched engine request. Top-level
@@ -1863,6 +1939,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     description,
                     repo_remote_url,
                     design_repo,
+                    docs_repo: None,
                 },
             )
             .await?;
@@ -2414,6 +2491,12 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         TaskCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
         TaskCommand::UnlinkExternal(args) => run_unlink_external(&mut client, ctx, args).await,
         TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,
+        TaskCommand::CreateInvestigation(args) => {
+            run_create_investigation(&mut client, ctx, args).await
+        }
+        TaskCommand::SetInvestigationDoc(args) => {
+            run_set_investigation_doc(&mut client, ctx, args).await
+        }
     }
 }
 
@@ -3828,6 +3911,122 @@ async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Resul
         }
         other => Err(unexpected_event("chore create", &other)),
     }
+}
+
+async fn create_investigation(
+    client: &mut BossClient,
+    input: CreateInvestigationInput,
+) -> Result<Task, CliError> {
+    match client
+        .send_request(&FrontendRequest::CreateInvestigation { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemCreated { item } => expect_task(item),
+        FrontendEvent::WorkItemDuplicateBlocked {
+            existing_id,
+            existing_short_id,
+            name,
+            age_secs,
+        } => Err(CliError::conflict(format!(
+            "An investigation named {name:?} was created {age_secs}s ago as T{existing_short_id} \
+             ({existing_id}); pass --force-duplicate to create another."
+        ))),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("investigation create", &other)),
+    }
+}
+
+async fn set_task_investigation_doc(
+    client: &mut BossClient,
+    input: SetTaskInvestigationDocInput,
+) -> Result<Task, CliError> {
+    match client
+        .send_request(&FrontendRequest::SetTaskInvestigationDoc { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_task(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("task set-investigation-doc", &other)),
+    }
+}
+
+async fn run_create_investigation(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: InvestigationCreateArgs,
+) -> Result<(), CliError> {
+    let product = resolve_product_inferable(
+        client,
+        args.product,
+        args.project.as_deref(),
+        ctx,
+    )
+    .await?;
+    let project_id = if let Some(proj) = args.project {
+        let project = resolve_project(client, &product.id, Some(proj), ctx).await?;
+        Some(project.id)
+    } else {
+        None
+    };
+    let name = required_text(args.name, "Investigation name", ctx)?;
+    let description = optional_text(args.description, "Description", ctx)?;
+    let task = create_investigation(
+        client,
+        CreateInvestigationInput {
+            product_id: product.id,
+            project_id,
+            name: name.clone(),
+            description,
+            autostart: !ctx.no_autostart,
+            priority: args.priority.map(|p| p.as_str().to_owned()),
+            created_via: Some("cli".to_owned()),
+            repo_remote_url: args.repo_remote_url,
+            effort_level: args.effort.map(boss_protocol::EffortLevel::from),
+            model_override: args.model,
+            force_duplicate: args.force_duplicate,
+        },
+    )
+    .await?;
+    print_entity(ctx, &serde_json::json!({ "task": task }), || {
+        if !ctx.quiet {
+            println!("created investigation T{}: {}", task.short_id.unwrap_or(0), name);
+        }
+    });
+    Ok(())
+}
+
+async fn run_set_investigation_doc(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: SetInvestigationDocArgs,
+) -> Result<(), CliError> {
+    let task_raw = required_text(args.task, "Task id", ctx)?;
+    let task_id = resolve_selector_to_primary_id(client, ctx, &task_raw, None).await?;
+    let unset = args.unset;
+    let input = SetTaskInvestigationDocInput {
+        task_id,
+        investigation_doc_path: args.path,
+        investigation_doc_repo_remote_url: args.repo,
+        investigation_doc_branch: args.branch,
+        unset,
+    };
+    let task = set_task_investigation_doc(client, input).await?;
+    print_entity(ctx, &serde_json::json!({ "task": task }), || {
+        if !ctx.quiet {
+            if unset {
+                println!("cleared investigation-doc pointer on T{}", task.short_id.unwrap_or(0));
+            } else {
+                println!("set investigation-doc pointer on T{}", task.short_id.unwrap_or(0));
+            }
+        }
+    });
+    Ok(())
 }
 
 async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
@@ -5956,6 +6155,9 @@ mod tests {
             merge_queue_state: None,
             short_id: None,
             external_ref: None,
+            investigation_doc_path: None,
+            investigation_doc_repo_remote_url: None,
+            investigation_doc_branch: None,
         }
     }
 
@@ -5981,6 +6183,7 @@ mod tests {
             description: String::new(),
             repo_remote_url: None,
             design_repo: None,
+            docs_repo: None,
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -6022,6 +6225,7 @@ mod tests {
             description: String::new(),
             repo_remote_url: repo.map(str::to_owned),
             design_repo: None,
+            docs_repo: None,
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -7086,6 +7290,7 @@ mod tests {
             description: String::new(),
             repo_remote_url: None,
             design_repo: None,
+            docs_repo: None,
             status: "active".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),

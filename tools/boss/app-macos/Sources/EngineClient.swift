@@ -1272,7 +1272,10 @@ final class EngineClient: @unchecked Sendable {
             reviewRequiredDetail: payload["review_required_detail"] as? String,
             prStatePolledAt: payload["pr_state_polled_at"] as? String,
             mergeQueueState: payload["merge_queue_state"] as? String,
-            externalRef: parseExternalRef(payload["external_ref"])
+            externalRef: parseExternalRef(payload["external_ref"]),
+            investigationDocPath: payload["investigation_doc_path"] as? String,
+            investigationDocRepoRemoteUrl: payload["investigation_doc_repo_remote_url"] as? String,
+            investigationDocBranch: payload["investigation_doc_branch"] as? String
         )
     }
 

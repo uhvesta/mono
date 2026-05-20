@@ -1712,6 +1712,18 @@ struct WorkBoardCardView: View {
                         .buttonStyle(.plain)
                         .help(presentation.tooltip)
                     }
+                    if task.kind == "investigation",
+                       let webURL = task.investigationDocWebURL,
+                       let url = URL(string: webURL) {
+                        Link(destination: url) {
+                            Image(systemName: "doc.text")
+                                .font(.caption)
+                                .foregroundStyle(Color.secondary)
+                                .accessibilityLabel("Open investigation doc")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open investigation doc: \(webURL)")
+                    }
                 }
             }
 
@@ -1896,6 +1908,10 @@ struct ProjectDesignDocAffordancePresentation: Equatable {
     /// SCP form on macOS but treats `git@github.com` as the scheme
     /// and leaves `path` empty, so the scheme check below routes
     /// scheme-less inputs through the colon-split branch.
+    static func repoSlug(from repoURL: String) -> String {
+        repoBasename(from: repoURL)
+    }
+
     private static func repoBasename(from repoURL: String) -> String {
         if let url = URL(string: repoURL), url.host != nil {
             let parts = url.path

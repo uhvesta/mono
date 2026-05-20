@@ -434,6 +434,7 @@ mod tests {
             description: None,
             repo_remote_url: Some("https://github.com/test/repo".to_owned()),
             design_repo: None,
+            docs_repo: None,
         })
         .unwrap()
         .id

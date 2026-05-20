@@ -153,6 +153,7 @@ async fn project_show_infers_product_from_typed_id() -> Result<()> {
             description: None,
             repo_remote_url: None,
             design_repo: None,
+            docs_repo: None,
         },
     )
     .await?;
@@ -200,6 +201,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
             description: None,
             repo_remote_url: Some("git@example.com:boss.git".to_owned()),
             design_repo: None,
+            docs_repo: None,
         },
     )
     .await?;
@@ -268,6 +270,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
             description: None,
             repo_remote_url: None,
             design_repo: None,
+            docs_repo: None,
         },
     )
     .await?;
@@ -278,6 +281,7 @@ async fn project_show_rejects_disagreeing_explicit_product() -> Result<()> {
             description: None,
             repo_remote_url: None,
             design_repo: None,
+            docs_repo: None,
         },
     )
     .await?;

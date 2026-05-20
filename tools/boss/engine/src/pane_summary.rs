@@ -464,6 +464,9 @@ mod tests {
             pr_state_polled_at: None,
             merge_queue_state: None,
             external_ref: None,
+            investigation_doc_path: None,
+            investigation_doc_repo_remote_url: None,
+            investigation_doc_branch: None,
         })
     }
 

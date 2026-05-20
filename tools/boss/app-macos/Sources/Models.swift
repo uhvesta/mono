@@ -499,9 +499,34 @@ struct WorkTask: Identifiable, Hashable {
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil
+    /// Repo-relative path to the markdown doc produced by an investigation
+    /// worker. `nil` until the worker calls `boss task set-investigation-doc`.
+    /// Only meaningful on `kind == "investigation"` rows.
+    var investigationDocPath: String? = nil
+    /// Remote URL of the repo hosting the investigation doc. `nil` means
+    /// "resolve from product docs_repo or BOSS_USER_DOCS_REPO at set time."
+    var investigationDocRepoRemoteUrl: String? = nil
+    /// PR branch the investigation doc was opened on. Used to construct the
+    /// in-review GitHub URL while the PR is open.
+    var investigationDocBranch: String? = nil
 
     var isChore: Bool {
         kind == "chore"
+    }
+
+    /// GitHub web URL for the investigation doc, derived at render time
+    /// from the stored `(repo, branch, path)` pointer. Returns `nil`
+    /// when the pointer is not yet set or the repo URL can't be parsed.
+    /// Uses `investigationDocBranch` while the PR is open; falls back to
+    /// `"main"` after merge (branch field cleared by future tooling).
+    var investigationDocWebURL: String? {
+        guard let path = investigationDocPath, !path.isEmpty,
+              let repo = investigationDocRepoRemoteUrl, !repo.isEmpty else {
+            return nil
+        }
+        let branch = investigationDocBranch ?? "main"
+        let slug = ProjectDesignDocAffordancePresentation.repoSlug(from: repo)
+        return "https://github.com/\(slug)/blob/\(branch)/\(path)"
     }
 }
 

@@ -5751,6 +5751,68 @@ async fn handle_frontend_connection(
                     FrontendEvent::PrReconcilersKicked { kicked: true },
                 );
             }
+            FrontendRequest::CreateInvestigation { input } => {
+                match work_db.create_investigation(input) {
+                    Ok(task) => {
+                        let item = WorkItem::Task(task);
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "investigation_created",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemCreated { item },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::SetTaskInvestigationDoc { input } => {
+                match work_db.set_task_investigation_doc(input) {
+                    Ok(task) => {
+                        let item = WorkItem::Task(task);
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "task_investigation_doc_set",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemUpdated { item },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
             FrontendRequest::SetProjectDesignDoc { input } => {
                 match work_db.set_project_design_doc(input) {
                     Ok(project) => {
@@ -8919,6 +8981,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9121,6 +9184,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9246,6 +9310,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9368,6 +9433,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9483,6 +9549,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9607,6 +9674,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9703,6 +9771,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -9883,6 +9952,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -10033,6 +10103,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -10160,6 +10231,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -10284,6 +10356,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -10369,6 +10442,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = server_state
@@ -10671,6 +10745,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:test/test.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db
@@ -10776,6 +10851,7 @@ mod tests {
                 description: None,
                 repo_remote_url: None,
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let item = WorkItem::Product(product_item);

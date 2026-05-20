@@ -92,6 +92,7 @@ async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> 
         description: None,
         repo_remote_url: Some("git@github.com:test/boss.git".to_owned()),
         design_repo: None,
+        docs_repo: None,
     };
     match client
         .send_request(&FrontendRequest::CreateProduct { input })

@@ -2177,6 +2177,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let project = db
@@ -2223,6 +2224,7 @@ mod tests {
                 description: None,
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
+                docs_repo: None,
             })
             .unwrap();
         let chore = db

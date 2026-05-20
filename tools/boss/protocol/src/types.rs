@@ -16,6 +16,13 @@ pub struct Product {
     /// `repo_remote_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_repo: Option<String>,
+    /// Optional repo where `kind = 'investigation'` task deliverables
+    /// (markdown docs) are filed. When set, investigation workers open
+    /// PRs against this repo instead of the user-level fallback
+    /// (`BOSS_USER_DOCS_REPO`). Stored canonicalised, same as
+    /// `repo_remote_url`. `None` → fall through to user-level default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_repo: Option<String>,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
@@ -337,6 +344,24 @@ pub struct Task {
     /// when the upstream item leaves the product's configured scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<WorkItemExternalRef>,
+    /// Repo-relative path to the markdown doc produced by an
+    /// `investigation` worker (e.g. `docs/investigations/foo.md`).
+    /// `None` until the worker sets the pointer via
+    /// `boss task set-investigation-doc`. Only meaningful on
+    /// `kind = 'investigation'` rows; ignored on all other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_doc_path: Option<String>,
+    /// Remote URL of the repo that hosts the investigation doc. `None`
+    /// means "resolve from product `docs_repo` or `BOSS_USER_DOCS_REPO`
+    /// at set time." Stored canonicalised (same form as `repo_remote_url`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_doc_repo_remote_url: Option<String>,
+    /// Branch the investigation doc PR was opened against. `None` until
+    /// the worker sets the pointer. Used to construct the in-review
+    /// GitHub URL `…/blob/{branch}/{path}` while the PR is open; after
+    /// merge the UI falls back to `main`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_doc_branch: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -923,6 +948,10 @@ pub struct CreateProductInput {
     /// tasks resolve through the standard chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_repo: Option<String>,
+    /// See [`Product::docs_repo`]. `None` → fall through to
+    /// `BOSS_USER_DOCS_REPO` for investigation deliverables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1028,6 +1057,63 @@ pub struct CreateChoreInput {
     /// See [`CreateTaskInput::force_duplicate`].
     #[serde(default)]
     pub force_duplicate: bool,
+}
+
+/// Input for `boss task create --kind investigation`. Parallel to
+/// [`CreateChoreInput`] but adds `project_id` (investigation tasks
+/// are product-level work items optionally scoped to a project) and
+/// uses `kind = 'investigation'` on insert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInvestigationInput {
+    pub product_id: String,
+    /// Optional project scope. When set, the investigation appears
+    /// under the project on the kanban. `None` → product-level only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// See [`CreateChoreInput::autostart`].
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
+    /// Per-task repo override for the investigation deliverable. `None`
+    /// → resolve from product `docs_repo`, then `BOSS_USER_DOCS_REPO`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<EffortLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    #[serde(default)]
+    pub force_duplicate: bool,
+}
+
+/// Set (or clear) the investigation-doc pointer on a
+/// `kind = 'investigation'` task. Parallel to
+/// [`SetProjectDesignDocInput`] but lives on the task row rather than
+/// the project, because investigations are task-level deliverables.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetTaskInvestigationDocInput {
+    pub task_id: String,
+    /// Repo-relative path to the markdown file (e.g.
+    /// `docs/investigations/my-topic.md`). Setting `Some("")` is
+    /// rejected — use `unset = true` to clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_doc_path: Option<String>,
+    /// Remote URL of the hosting repo. `None` → inherit from the
+    /// product's `docs_repo` or `BOSS_USER_DOCS_REPO` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_doc_repo_remote_url: Option<String>,
+    /// PR branch name. `None` → infer from the task's `pr_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_doc_branch: Option<String>,
+    /// When `true`, clear all three pointer columns (set to NULL).
+    #[serde(default)]
+    pub unset: bool,
 }
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved
