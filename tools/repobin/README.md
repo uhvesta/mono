@@ -73,29 +73,44 @@ version: 1
 tools:
   boss:
     repo: git@github.com:spinyfin/mono.git
+    sha: 4baa8fa5e7b2c1d09a3f6b8c2e1d4f7a9b5c3e8d  # optional: pin to a specific commit
   cube:
     repo: git@github.com:spinyfin/mono.git
+    # no sha → always tracks HEAD
 ```
 
-The yaml only carries the repo URL — the canonical Bazel target lives in the
-target repo's `REPOBIN.toml` and is read from the cached checkout after
-refresh, so renaming a target in the source repo automatically takes effect
-on the next default-mode invocation.
+The yaml only carries the repo URL and an optional commit SHA — the canonical
+Bazel target lives in the target repo's `REPOBIN.toml` and is read from the
+cached checkout after refresh, so renaming a target in the source repo
+automatically takes effect on the next default-mode invocation.
+
+**Pinning a tool to a specific SHA** (`sha:` field): when present, repobin
+checks out exactly that commit before building, rather than following HEAD.
+Both full (40-char) and abbreviated (short) hex SHAs are accepted. The pinned
+checkout is stored in a separate cache slot from the HEAD-tracking checkout, so
+pinned and unpinned builds of the same tool never share build artefacts. If the
+requested SHA is not reachable in the remote (typo, GC'd commit, etc.), repobin
+fails with a clear error naming the tool and the offending `repobin.yaml`;
+there is no silent fall-back to HEAD. Remove `sha:` or leave it unset to return
+to the default HEAD-tracking behaviour.
 
 `repobin install` writes this file automatically by recording each local
 tool's name against `git remote get-url origin`. Re-installing from another
 repo merges new entries; existing entries are kept. Pass `--no-defaults` to
-skip writing the file.
+skip writing the file. Note: `repobin install` does not write `sha:` entries;
+edit the file by hand when you want to pin a tool.
 
 In default mode the configured repo is shallow-cloned into the cache and the
 build runs from that clone (using the target declared in
-`<checkout>/REPOBIN.toml`). The routine head/cached/default-mode dispatch is
-silent; genuine errors (failed clone, failed cache write, etc.) still surface
-on stderr. Set `REPOBIN_VERBOSE=1` to print a one-line notice on every
-default-mode dispatch:
+`<checkout>/REPOBIN.toml`). Pinned tools use a full clone so any commit is
+reachable. The routine head/cached/default-mode dispatch is silent; genuine
+errors (failed clone, failed cache write, etc.) still surface on stderr. Set
+`REPOBIN_VERBOSE=1` to print a one-line notice on every default-mode dispatch,
+which distinguishes pinned from floating:
 
 ```text
-repobin: running `boss` from git@github.com:spinyfin/mono.git @ 1a2b3c4 (cloned; default mode — not in a configured workspace)
+repobin: running `boss` from git@github.com:spinyfin/mono.git @ 4baa8fa (pinned; default mode — not in a configured workspace)
+repobin: running `cube` from git@github.com:spinyfin/mono.git @ 7a8b9c0 (cached; default mode — not in a configured workspace)
 ```
 
 When the underlying tool is invoked with `--json`, the notice is suppressed on
@@ -103,9 +118,10 @@ both stdout and stderr regardless of `REPOBIN_VERBOSE`, so
 `boss --json … 2>&1 | jq` parses cleanly.
 
 The cache lives at `$XDG_CACHE_HOME/repobin/repos/<slug>-<hash>/checkout` (or
-`~/.cache/repobin/repos/...`). Subsequent invocations reuse that checkout: a
-`fetch_stamp` gates whether to refresh (default 5 min, override with
-`REPOBIN_DEFAULTS_TTL_SECS`). Past the gate, `repobin` runs `git ls-remote
+`~/.cache/repobin/repos/...`) for HEAD-tracking tools, and
+`<slug>-<hash>/pinned/checkout` for pinned tools. Subsequent invocations reuse
+the checkout: a `fetch_stamp` gates whether to refresh (default 5 min, override
+with `REPOBIN_DEFAULTS_TTL_SECS`). Past the gate, `repobin` runs `git ls-remote
 origin HEAD`; if the remote sha differs from the local sha, it
 `fetch --depth=1 origin HEAD` + `reset --hard FETCH_HEAD`. Concurrent
 invocations serialise on a per-cache `flock`. Override the cache root via

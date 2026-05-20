@@ -173,6 +173,15 @@ pub enum RepobinError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "sha `{sha}` for tool `{tool}` is unreachable — check the `sha:` entry in `{}`",
+        defaults_path.display()
+    )]
+    PinnedShaUnreachable {
+        tool: String,
+        sha: String,
+        defaults_path: PathBuf,
+    },
     #[error("failed to exec `{}`", path.display())]
     ExecTool {
         path: PathBuf,
@@ -383,10 +392,18 @@ fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
     let cache_root = cache_root_from_env()?;
     let cache = RepoCache::for_url(&cache_root, &tool.repo);
     let lock = cache.lock()?;
-    let outcome = lock.ensure_up_to_date()?;
+    let (outcome, checkout) = if let Some(sha) = &tool.sha {
+        let outcome = lock.ensure_at_sha(sha, tool_name, &loaded.path)?;
+        let checkout = lock.cache().pinned_checkout_dir();
+        (outcome, checkout)
+    } else {
+        let outcome = lock.ensure_up_to_date()?;
+        let checkout = lock.cache().checkout.clone();
+        (outcome, checkout)
+    };
     print_default_notice(tool_name, &tool.repo, &outcome, forwarded_args);
 
-    let cached_repo_config = load_repo_config(&lock.cache().checkout)?;
+    let cached_repo_config = load_repo_config(&checkout)?;
     let plan = prepare_dispatch_from_repo_config(
         bazel,
         cached_repo_config,
@@ -597,6 +614,7 @@ mod tests {
             "cube".to_string(),
             DefaultsTool {
                 repo: "https://example.com/x.git".to_string(),
+                sha: None,
             },
         );
         write_defaults(

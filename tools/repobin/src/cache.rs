@@ -45,6 +45,10 @@ impl RepoCache {
         }
     }
 
+    pub fn pinned_checkout_dir(&self) -> PathBuf {
+        self.dir.join("pinned").join("checkout")
+    }
+
     pub fn lock(self) -> Result<RepoCacheLock, RepobinError> {
         fs::create_dir_all(&self.dir).map_err(|source| RepobinError::CreateCacheDir {
             path: self.dir.clone(),
@@ -82,12 +86,16 @@ pub enum EnsureOutcome {
     Cloned { head: String },
     Updated { head: String },
     Cached { head: String, refreshed: bool },
+    Pinned { head: String },
 }
 
 impl EnsureOutcome {
     pub fn head(&self) -> &str {
         match self {
-            Self::Cloned { head } | Self::Updated { head } | Self::Cached { head, .. } => head,
+            Self::Cloned { head }
+            | Self::Updated { head }
+            | Self::Cached { head, .. }
+            | Self::Pinned { head } => head,
         }
     }
 
@@ -99,6 +107,7 @@ impl EnsureOutcome {
             Self::Cached {
                 refreshed: false, ..
             } => "cached",
+            Self::Pinned { .. } => "pinned",
         }
     }
 }
@@ -137,6 +146,76 @@ impl RepoCacheLock {
         let head = read_head(&self.cache.checkout)?;
         self.update_fetch_stamp()?;
         Ok(EnsureOutcome::Updated { head })
+    }
+
+    pub fn ensure_at_sha(
+        &self,
+        sha: &str,
+        tool_name: &str,
+        defaults_path: &Path,
+    ) -> Result<EnsureOutcome, RepobinError> {
+        let pinned_dir = self.cache.dir.join("pinned");
+        let pinned_checkout = pinned_dir.join("checkout");
+
+        fs::create_dir_all(&pinned_dir).map_err(|source| RepobinError::CreateCacheDir {
+            path: pinned_dir.clone(),
+            source,
+        })?;
+
+        // Reuse existing pinned checkout if it is already at the requested SHA.
+        if pinned_checkout.join(".git").is_dir() {
+            if let Ok(current) = read_head(&pinned_checkout) {
+                if sha_matches(&current, sha) {
+                    return Ok(EnsureOutcome::Pinned { head: current });
+                }
+            }
+            // Wrong SHA or unreadable — remove and reclone.
+            fs::remove_dir_all(&pinned_checkout).map_err(|source| {
+                RepobinError::WriteCacheMetadata {
+                    path: pinned_checkout.clone(),
+                    source,
+                }
+            })?;
+        }
+
+        // Full clone so any reachable SHA is available.
+        self.clone_full(&pinned_checkout)?;
+
+        if !sha_reachable(&pinned_checkout, sha) {
+            let _ = fs::remove_dir_all(&pinned_checkout);
+            return Err(RepobinError::PinnedShaUnreachable {
+                tool: tool_name.to_string(),
+                sha: sha.to_string(),
+                defaults_path: defaults_path.to_path_buf(),
+            });
+        }
+
+        checkout_sha(&pinned_checkout, sha)?;
+        let head = read_head(&pinned_checkout)?;
+        Ok(EnsureOutcome::Pinned { head })
+    }
+
+    fn clone_full(&self, checkout: &Path) -> Result<(), RepobinError> {
+        let output = Command::new("git")
+            .arg("clone")
+            .arg(&self.cache.url)
+            .arg(checkout)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|source| RepobinError::SpawnGit {
+                action: "clone".to_string(),
+                source,
+            })?;
+        forward_to_stderr(&output.stdout);
+        forward_to_stderr(&output.stderr);
+        if !output.status.success() {
+            return Err(RepobinError::GitFailed {
+                action: format!("clone {}", self.cache.url),
+                status: output.status.code(),
+            });
+        }
+        Ok(())
     }
 
     fn clone_initial(&self) -> Result<(), RepobinError> {
@@ -312,6 +391,49 @@ fn forward_to_stderr(buf: &[u8]) {
     let _ = io::stderr().write_all(buf);
 }
 
+fn sha_matches(full_sha: &str, pin: &str) -> bool {
+    let (longer, shorter) = if full_sha.len() >= pin.len() {
+        (full_sha, pin)
+    } else {
+        (pin, full_sha)
+    };
+    longer.starts_with(shorter)
+}
+
+fn sha_reachable(checkout: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e"])
+        .arg(format!("{sha}^{{commit}}"))
+        .current_dir(checkout)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn checkout_sha(checkout: &Path, sha: &str) -> Result<(), RepobinError> {
+    let output = Command::new("git")
+        .args(["checkout", "--detach", sha])
+        .current_dir(checkout)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|source| RepobinError::SpawnGit {
+            action: "checkout".to_string(),
+            source,
+        })?;
+    forward_to_stderr(&output.stdout);
+    forward_to_stderr(&output.stderr);
+    if !output.status.success() {
+        return Err(RepobinError::GitFailed {
+            action: format!("checkout --detach {sha}"),
+            status: output.status.code(),
+        });
+    }
+    Ok(())
+}
+
 fn repo_dir_name(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
@@ -482,6 +604,180 @@ mod tests {
         assert!(
             matches!(outcome, EnsureOutcome::Updated { .. }),
             "expected Updated after remote advanced, got {outcome:?}"
+        );
+    }
+
+    fn make_remote_with_commits(temp: &TempDir) -> (std::path::PathBuf, Vec<String>) {
+        use std::process::Command;
+
+        let remote = temp.path().join("remote.git");
+        let work = temp.path().join("work");
+
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["clone"])
+            .arg(&remote)
+            .arg(&work)
+            .output()
+            .unwrap();
+
+        let mut shas = Vec::new();
+        for (i, msg) in ["commit-a", "commit-b", "commit-c"].iter().enumerate() {
+            std::fs::write(work.join(format!("file{i}.txt")), msg).unwrap();
+            Command::new("git")
+                .args(["-c", "user.email=t@t.com", "-c", "user.name=T"])
+                .args(["add", "."])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            Command::new("git")
+                .args(["-c", "user.email=t@t.com", "-c", "user.name=T"])
+                .args(["commit", "-m", msg])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            let sha_out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            shas.push(
+                String::from_utf8_lossy(&sha_out.stdout)
+                    .trim()
+                    .to_string(),
+            );
+            Command::new("git")
+                .args(["push", "origin", "HEAD:main"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+        }
+        (remote, shas)
+    }
+
+    #[test]
+    fn pinned_sha_checkout_is_distinct_from_head_checkout() {
+        let temp = TempDir::new().unwrap();
+        let (remote, shas) = make_remote_with_commits(&temp);
+
+        let cache_root = temp.path().join("cache");
+        let url = format!("file://{}", remote.display());
+        let cache = RepoCache::for_url(&cache_root, &url);
+
+        // HEAD checkout (floating).
+        let lock = cache.lock().unwrap();
+        let head_outcome = lock.ensure_up_to_date().unwrap();
+        assert!(matches!(head_outcome, EnsureOutcome::Cloned { .. }));
+        let head_checkout = lock.cache().checkout.clone();
+
+        // Pinned checkout at sha[0].
+        let pin_outcome = lock
+            .ensure_at_sha(&shas[0], "mytool", std::path::Path::new("test.yaml"))
+            .unwrap();
+        assert!(
+            matches!(pin_outcome, EnsureOutcome::Pinned { .. }),
+            "expected Pinned, got {pin_outcome:?}"
+        );
+        let pinned_checkout = lock.cache().pinned_checkout_dir();
+
+        // The two checkouts must be at different paths (distinct cache slots).
+        assert_ne!(
+            head_checkout, pinned_checkout,
+            "pinned and HEAD checkouts must be separate"
+        );
+
+        // Pinned checkout must be at sha[0].
+        let pinned_sha = super::read_head(&pinned_checkout).unwrap();
+        assert!(
+            super::sha_matches(&pinned_sha, &shas[0]),
+            "pinned checkout should be at sha[0]={}, got {pinned_sha}",
+            &shas[0]
+        );
+    }
+
+    // Acceptance test: pinned → unpinned → pinned-different-SHA yields right binary each time.
+    #[test]
+    fn pinned_then_unpinned_then_pinned_different_sha() {
+        let temp = TempDir::new().unwrap();
+        let (remote, shas) = make_remote_with_commits(&temp);
+
+        let cache_root = temp.path().join("cache");
+        let url = format!("file://{}", remote.display());
+        let cache = RepoCache::for_url(&cache_root, &url);
+
+        let dummy_yaml = std::path::Path::new("repobin.yaml");
+
+        // 1. Pin to sha[0].
+        let lock = cache.clone().lock().unwrap();
+        let outcome = lock.ensure_at_sha(&shas[0], "mytool", dummy_yaml).unwrap();
+        assert!(matches!(outcome, EnsureOutcome::Pinned { .. }));
+        let pinned_sha = super::read_head(&lock.cache().pinned_checkout_dir()).unwrap();
+        assert!(
+            super::sha_matches(&pinned_sha, &shas[0]),
+            "step 1: expected sha[0]={}, got {pinned_sha}",
+            shas[0]
+        );
+        drop(lock);
+
+        // 2. Floating HEAD (sha[2] is HEAD after all 3 pushes).
+        let lock = cache.clone().lock().unwrap();
+        let stamp = lock.cache().dir.join("fetch_stamp");
+        let _ = std::fs::remove_file(&stamp);
+        let outcome = lock.ensure_up_to_date().unwrap();
+        assert!(
+            matches!(outcome, EnsureOutcome::Cloned { .. } | EnsureOutcome::Cached { .. } | EnsureOutcome::Updated { .. }),
+            "unexpected outcome: {outcome:?}"
+        );
+        let head_sha = super::read_head(&lock.cache().checkout).unwrap();
+        assert!(
+            super::sha_matches(&head_sha, &shas[2]),
+            "step 2: expected sha[2]={}, got {head_sha}",
+            shas[2]
+        );
+        drop(lock);
+
+        // 3. Pin to sha[1].
+        let lock = cache.clone().lock().unwrap();
+        let outcome = lock.ensure_at_sha(&shas[1], "mytool", dummy_yaml).unwrap();
+        assert!(matches!(outcome, EnsureOutcome::Pinned { .. }));
+        let pinned_sha = super::read_head(&lock.cache().pinned_checkout_dir()).unwrap();
+        assert!(
+            super::sha_matches(&pinned_sha, &shas[1]),
+            "step 3: expected sha[1]={}, got {pinned_sha}",
+            shas[1]
+        );
+
+        // HEAD checkout must still be at sha[2].
+        let head_sha_final = super::read_head(&lock.cache().checkout).unwrap();
+        assert!(
+            super::sha_matches(&head_sha_final, &shas[2]),
+            "head checkout should still be sha[2]={}, got {head_sha_final}",
+            shas[2]
+        );
+    }
+
+    #[test]
+    fn invalid_sha_returns_unreachable_error() {
+        let temp = TempDir::new().unwrap();
+        let (remote, _) = make_remote_with_commits(&temp);
+
+        let cache_root = temp.path().join("cache");
+        let url = format!("file://{}", remote.display());
+        let cache = RepoCache::for_url(&cache_root, &url);
+
+        let lock = cache.lock().unwrap();
+        let result = lock.ensure_at_sha(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "mytool",
+            std::path::Path::new("repobin.yaml"),
+        );
+        assert!(
+            matches!(result, Err(crate::app::RepobinError::PinnedShaUnreachable { .. })),
+            "expected PinnedShaUnreachable, got {result:?}"
         );
     }
 }
