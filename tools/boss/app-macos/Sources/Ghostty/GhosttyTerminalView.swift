@@ -82,6 +82,19 @@ final class GhosttyTerminalHostView: NSView {
         qos: .userInitiated
     )
 
+    /// `@Sendable`-safe wrapper around a libghostty surface pointer so
+    /// the dispatched focus call can capture it without producing a
+    /// Swift 6 strict-concurrency warning. `ghostty_surface_t` is
+    /// `void*` (UnsafeMutableRawPointer), which is intentionally not
+    /// `Sendable`; the unchecked conformance is correct here because
+    /// libghostty's surface pointer is opaque, immutable for the
+    /// lifetime of the host view, and serial-queue dispatch already
+    /// provides the required happens-before ordering between
+    /// `ghostty_surface_set_focus` calls.
+    private struct SurfaceBox: @unchecked Sendable {
+        let surface: ghostty_surface_t
+    }
+
     init(runtime: GhosttyRuntime, session: TerminalPaneSession, launchSpec: TerminalLaunchSpec) {
         self.runtime = runtime
         self.session = session
@@ -207,8 +220,9 @@ final class GhosttyTerminalHostView: NSView {
         let accepted = super.becomeFirstResponder()
         if accepted, let surface {
             // Dispatch off the main thread — see focusQueue doc-comment above.
+            let box = SurfaceBox(surface: surface)
             Self.focusQueue.async {
-                ghostty_surface_set_focus(surface, true)
+                ghostty_surface_set_focus(box.surface, true)
             }
         }
         return accepted
@@ -218,8 +232,9 @@ final class GhosttyTerminalHostView: NSView {
         let accepted = super.resignFirstResponder()
         if accepted, let surface {
             // Dispatch off the main thread for symmetry with becomeFirstResponder.
+            let box = SurfaceBox(surface: surface)
             Self.focusQueue.async {
-                ghostty_surface_set_focus(surface, false)
+                ghostty_surface_set_focus(box.surface, false)
             }
         }
         return accepted
