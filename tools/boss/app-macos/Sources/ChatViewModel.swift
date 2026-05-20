@@ -467,6 +467,21 @@ final class ChatViewModel: ObservableObject {
         return computed
     }
 
+    /// Repo names (lowercased) that resolve to more than one org across
+    /// the currently visible card set's PR URLs. Drives the board-local
+    /// disambiguation rule for kanban PR-link labels: a repo name in
+    /// this set must render as `org/repo#n`; everything else can drop
+    /// to the bare `repo#n`. Cached on the same lifetime as
+    /// [[visibleWorkItems]] — invalidated by [[invalidateWorkCache]].
+    var ambiguousVisibleRepoNames: Set<String> {
+        if let cached = cachedAmbiguousRepoNames {
+            return cached
+        }
+        let computed = ambiguousPRRepoNames(in: visibleWorkItems)
+        cachedAmbiguousRepoNames = computed
+        return computed
+    }
+
     private func computeVisibleWorkItems() -> [WorkTask] {
         guard let productID = currentSelectedProductID else { return [] }
 
@@ -2080,11 +2095,13 @@ final class ChatViewModel: ObservableObject {
     private var cachedVisibleItems: [WorkTask]?
     private var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
     private var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
+    private var cachedAmbiguousRepoNames: Set<String>?
 
     private func invalidateWorkCache() {
         cachedVisibleItems = nil
         cachedItemsByColumn.removeAll(keepingCapacity: true)
         cachedSectionsByColumn.removeAll(keepingCapacity: true)
+        cachedAmbiguousRepoNames = nil
     }
 
     /// Bucket completed tasks by recency for the Done lane:

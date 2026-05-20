@@ -1416,7 +1416,8 @@ private struct WorkBoardCardItem: View {
                     reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
                     mergeQueueState: column == .review ? task.mergeQueueState : nil,
-                    externalRefLink: externalRefLink
+                    externalRefLink: externalRefLink,
+                    ambiguousRepoNames: model.ambiguousVisibleRepoNames
                 )
             }
             .buttonStyle(.plain)
@@ -1598,6 +1599,12 @@ struct WorkBoardCardView: View {
     /// strikethrough so the history is preserved but the staleness is
     /// communicated at a glance.
     var externalRefLink: ExternalRefLinkPresentation? = nil
+    /// Repo names whose bare-`repo#n` PR label would be ambiguous on
+    /// the current board — see
+    /// [[ChatViewModel.ambiguousVisibleRepoNames]]. Threaded into
+    /// `PRURLLink` so a card's PR link can drop the org prefix when
+    /// its repo is unique among visible cards.
+    var ambiguousRepoNames: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1722,7 +1729,11 @@ struct WorkBoardCardView: View {
                     } else if let ciState = ciRequiredState {
                         PrCiIndicator(state: ciState, detail: ciRequiredDetail)
                     }
-                    PRURLLink(urlString: prURL, font: .caption)
+                    PRURLLink(
+                        urlString: prURL,
+                        font: .caption,
+                        ambiguousRepoNames: ambiguousRepoNames
+                    )
                     Spacer(minLength: 0)
                 }
             }
@@ -2486,9 +2497,20 @@ private struct WorkDependencyRowView: View {
 private struct PRURLLink: View {
     let urlString: String
     let font: Font
+    /// Board-local disambiguation key from
+    /// [[ChatViewModel.ambiguousVisibleRepoNames]]. When set, the label
+    /// shortens to `repo#n` for repos not in the set and falls back to
+    /// `org/repo#n` for repos that *are*. Pass `nil` to force the full
+    /// `org/repo#n` form unconditionally — that's what the detail
+    /// popover does, since the popover is the "tooltip-like" surface
+    /// the design calls out as always-full.
+    var ambiguousRepoNames: Set<String>? = nil
 
     var body: some View {
-        let label = shortLabel(for: urlString) ?? urlString
+        let label = pullRequestLinkLabel(
+            for: urlString,
+            ambiguousRepoNames: ambiguousRepoNames
+        ) ?? urlString
         if let url = URL(string: urlString), url.scheme != nil {
             Link(destination: url) {
                 Text(label)
@@ -2500,7 +2522,7 @@ private struct PRURLLink: View {
             }
             .buttonStyle(.plain)
             .pointerStyle(.link)
-            .help(urlString)
+            .help(tooltip)
         } else {
             Text(label)
                 .font(font)
@@ -2509,24 +2531,15 @@ private struct PRURLLink: View {
         }
     }
 
-    private func shortLabel(for urlString: String) -> String? {
-        guard let url = URL(string: urlString),
-              let host = url.host?.lowercased(),
-              host == "github.com" || host == "www.github.com"
-        else {
-            return nil
+    /// Tooltip surfaces the unambiguous `org/repo#n` form (or, if the
+    /// URL isn't a recognisable GitHub PR, the raw URL) so a user who
+    /// hovered to verify gets the disambiguating context the shortened
+    /// label may have dropped.
+    private var tooltip: String {
+        if let full = pullRequestLinkLabel(for: urlString, ambiguousRepoNames: nil) {
+            return "\(full)\n\(urlString)"
         }
-        let parts = url.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-        guard parts.count == 4,
-              parts[2] == "pull",
-              !parts[0].isEmpty,
-              !parts[1].isEmpty,
-              !parts[3].isEmpty,
-              parts[3].allSatisfy(\.isNumber)
-        else {
-            return nil
-        }
-        return "\(parts[0])/\(parts[1])#\(parts[3])"
+        return urlString
     }
 }
 

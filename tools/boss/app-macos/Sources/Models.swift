@@ -857,6 +857,74 @@ func shortRepoName(for repoURL: String) -> String {
     return lastSegment
 }
 
+/// Parsed `(org, repo, number)` triple for a GitHub PR URL like
+/// `https://github.com/<org>/<repo>/pull/<n>`. Returns `nil` for any
+/// other host or shape — the caller falls back to the raw URL string.
+/// Used both by the kanban PR-link label renderer and by the
+/// board-local ambiguity detector that decides whether to expand
+/// `repo#n` back to `org/repo#n`.
+func parseGitHubPRURL(_ urlString: String) -> (org: String, repo: String, number: String)? {
+    guard let url = URL(string: urlString),
+          let host = url.host?.lowercased(),
+          host == "github.com" || host == "www.github.com"
+    else {
+        return nil
+    }
+    let parts = url.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    guard parts.count == 4,
+          parts[2] == "pull",
+          !parts[0].isEmpty,
+          !parts[1].isEmpty,
+          !parts[3].isEmpty,
+          parts[3].allSatisfy(\.isNumber)
+    else {
+        return nil
+    }
+    return (org: parts[0], repo: parts[1], number: parts[3])
+}
+
+/// Repo names (lowercased) that appear with two or more distinct orgs
+/// across the supplied card set's PR URLs. A name in this set means
+/// `repo#n` alone is ambiguous on the current board, so the kanban
+/// must fall back to the full `org/repo#n` label for that PR.
+///
+/// Non-GitHub PR URLs and cards without a PR URL are ignored — they
+/// can never collide on a repo-name basis.
+func ambiguousPRRepoNames(in cards: [WorkTask]) -> Set<String> {
+    var orgsByRepo: [String: Set<String>] = [:]
+    for task in cards {
+        guard let prURL = task.prURL,
+              let parsed = parseGitHubPRURL(prURL)
+        else { continue }
+        let repoKey = parsed.repo.lowercased()
+        let orgKey = parsed.org.lowercased()
+        orgsByRepo[repoKey, default: []].insert(orgKey)
+    }
+    return Set(orgsByRepo.compactMap { $0.value.count > 1 ? $0.key : nil })
+}
+
+/// Label to display for a PR URL on a kanban card.
+///
+/// - Returns `nil` when `urlString` isn't a parseable GitHub PR URL —
+///   the caller should fall back to the raw URL string.
+/// - Returns `repo#n` when the repo name is unambiguous across the
+///   supplied `ambiguousRepoNames` set (the board-local disambiguation
+///   key from [[ambiguousPRRepoNames(in:)]]).
+/// - Returns `org/repo#n` when the repo name *is* in that set, or when
+///   the set is `nil` (caller wants the always-full form, e.g. for the
+///   detail popover and the hover tooltip).
+func pullRequestLinkLabel(
+    for urlString: String,
+    ambiguousRepoNames: Set<String>?
+) -> String? {
+    guard let parsed = parseGitHubPRURL(urlString) else { return nil }
+    if let ambiguous = ambiguousRepoNames,
+       !ambiguous.contains(parsed.repo.lowercased()) {
+        return "\(parsed.repo)#\(parsed.number)"
+    }
+    return "\(parsed.org)/\(parsed.repo)#\(parsed.number)"
+}
+
 /// How the kanban should surface the repo for a product, derived from
 /// the work item description for "macOS: kanban card repo chip" and
 /// design Q7. Single-repo mode lifts one chip to the product header;
