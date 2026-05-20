@@ -1884,7 +1884,7 @@ impl WorkerCompletionHandler {
         };
         let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id) {
             Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-                task.pr_url.filter(|s| !s.is_empty())
+                crate::runner::task_bound_pr_url(&task).map(|s| s.to_owned())
             }
             Ok(_) => None,
             Err(err) => {
@@ -1993,7 +1993,7 @@ impl WorkerCompletionHandler {
         };
         let bound_pr_url = match work_item {
             WorkItem::Task(task) | WorkItem::Chore(task) => {
-                match task.pr_url.filter(|s| !s.is_empty()) {
+                match crate::runner::task_bound_pr_url(&task).map(str::to_owned) {
                     Some(url) => url,
                     None => return ShaDeltaGateOutcome::Inapplicable,
                 }
