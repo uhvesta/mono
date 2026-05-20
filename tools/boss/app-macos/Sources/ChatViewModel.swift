@@ -295,14 +295,14 @@ final class ChatViewModel: ObservableObject {
     let asyncMarkdownViewerVM = AsyncMarkdownViewerViewModel()
 
     /// Indirection for fetching raw markdown content from a URL.
-    /// Production default hits `URLSession.shared`; tests inject a stub
-    /// so the affordance tests never make live network calls.
+    /// Production default routes through [[GitHubContentFetcher]] so
+    /// the request authenticates as the user's active `gh` session and
+    /// works for private repos. An unauthenticated `URLSession` fetch
+    /// against `raw.githubusercontent.com` returns 404 for any private
+    /// repo (issue #732), so this path must never reach `URLSession`.
+    /// Tests inject a stub so the affordance tests never shell out.
     var rawContentFetcher: (URL) async throws -> String = { url in
-        let (data, _) = try await URLSession.shared.data(from: url)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw URLError(.cannotDecodeContentData)
-        }
-        return text
+        try await GitHubContentFetcher.fetch(url)
     }
 
     /// Toggle the live-status summarizer for `slotId`. Sends the
