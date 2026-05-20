@@ -431,43 +431,18 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_task(id: &str, name: &str, description: &str) -> WorkItem {
-        WorkItem::Task(Task {
-            id: id.to_owned(),
-            product_id: "prod-1".to_owned(),
-            project_id: None,
-            kind: "task".to_owned(),
-            name: name.to_owned(),
-            description: description.to_owned(),
-            status: "active".to_owned(),
-            ordinal: None,
-            pr_url: None,
-            deleted_at: None,
-            created_at: "2026-01-01T00:00:00Z".to_owned(),
-            updated_at: "2026-01-01T00:00:00Z".to_owned(),
-            autostart: true,
-            last_status_actor: "human".to_owned(),
-            priority: "medium".to_owned(),
-            created_via: "unknown".to_owned(),
-            repo_remote_url: None,
-            blocked_reason: None,
-            blocked_attempt_id: None,
-            effort_level: None,
-            model_override: None,
-            ci_attempt_budget: None,
-            ci_attempts_used: 0,
-            short_id: None,
-            blocked_signals: Vec::new(),
-            ci_required_state: None,
-            ci_required_detail: None,
-            review_required_state: None,
-            review_required_detail: None,
-            pr_state_polled_at: None,
-            merge_queue_state: None,
-            external_ref: None,
-            investigation_doc_path: None,
-            investigation_doc_repo_remote_url: None,
-            investigation_doc_branch: None,
-        })
+        WorkItem::Task(
+            Task::builder()
+                .id(id)
+                .product_id("prod-1")
+                .kind("task")
+                .name(name)
+                .description(description)
+                .status("active")
+                .created_at("2026-01-01T00:00:00Z")
+                .updated_at("2026-01-01T00:00:00Z")
+                .build(),
+        )
     }
 
     #[test]

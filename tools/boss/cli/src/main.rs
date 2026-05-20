@@ -6122,43 +6122,16 @@ mod tests {
     }
 
     fn dummy_task(id: &str, kind: &str) -> Task {
-        Task {
-            id: id.to_owned(),
-            product_id: "prod_1".to_owned(),
-            project_id: None,
-            kind: kind.to_owned(),
-            name: "n".to_owned(),
-            description: String::new(),
-            status: "todo".to_owned(),
-            ordinal: None,
-            pr_url: None,
-            deleted_at: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            autostart: true,
-            last_status_actor: "human".to_owned(),
-            priority: "medium".to_owned(),
-            created_via: "unknown".to_owned(),
-            repo_remote_url: None,
-            blocked_reason: None,
-            blocked_attempt_id: None,
-            effort_level: None,
-            model_override: None,
-            ci_attempt_budget: None,
-            ci_attempts_used: 0,
-            blocked_signals: vec![],
-            ci_required_state: None,
-            ci_required_detail: None,
-            review_required_state: None,
-            review_required_detail: None,
-            pr_state_polled_at: None,
-            merge_queue_state: None,
-            short_id: None,
-            external_ref: None,
-            investigation_doc_path: None,
-            investigation_doc_repo_remote_url: None,
-            investigation_doc_branch: None,
-        }
+        Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind(kind)
+            .name("n")
+            .description("")
+            .status("todo")
+            .created_at("")
+            .updated_at("")
+            .build()
     }
 
     #[test]
@@ -6176,41 +6149,28 @@ mod tests {
 
     #[test]
     fn expect_leaf_rejects_product_and_project() {
-        let product = Product {
-            id: "prod_1".to_owned(),
-            name: "n".to_owned(),
-            slug: "n".to_owned(),
-            description: String::new(),
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            status: "active".to_owned(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            default_model: None,
-            dispatch_preamble: None,
-            external_tracker_kind: None,
-            external_tracker_config: None,
-        };
+        let product = Product::builder()
+            .id("prod_1")
+            .name("n")
+            .slug("n")
+            .description("")
+            .status("active")
+            .created_at("")
+            .updated_at("")
+            .build();
         assert!(expect_leaf_work_item(WorkItem::Product(product)).is_err());
 
-        let project = Project {
-            id: "proj_1".to_owned(),
-            product_id: "prod_1".to_owned(),
-            name: "n".to_owned(),
-            slug: "n".to_owned(),
-            description: String::new(),
-            goal: String::new(),
-            status: "planned".to_owned(),
-            priority: "medium".to_owned(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            last_status_actor: "human".to_owned(),
-            design_doc_repo_remote_url: None,
-            design_doc_branch: None,
-            design_doc_path: None,
-            short_id: None,
-        };
+        let project = Project::builder()
+            .id("proj_1")
+            .product_id("prod_1")
+            .name("n")
+            .slug("n")
+            .description("")
+            .goal("")
+            .status("planned")
+            .created_at("")
+            .updated_at("")
+            .build();
         assert!(expect_leaf_work_item(WorkItem::Project(project)).is_err());
     }
 
@@ -6218,22 +6178,16 @@ mod tests {
     /// with `repo_remote_url` set or unset and a fixed slug so the
     /// inherited-line text is predictable.
     fn dummy_product(slug: &str, repo: Option<&str>) -> Product {
-        Product {
-            id: "prod_1".to_owned(),
-            name: slug.to_owned(),
-            slug: slug.to_owned(),
-            description: String::new(),
-            repo_remote_url: repo.map(str::to_owned),
-            design_repo: None,
-            docs_repo: None,
-            status: "active".to_owned(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            default_model: None,
-            dispatch_preamble: None,
-            external_tracker_kind: None,
-            external_tracker_config: None,
-        }
+        Product::builder()
+            .id("prod_1")
+            .name(slug)
+            .slug(slug)
+            .description("")
+            .maybe_repo_remote_url(repo)
+            .status("active")
+            .created_at("")
+            .updated_at("")
+            .build()
     }
 
     /// Golden output: a work item with its own non-empty
@@ -7283,22 +7237,15 @@ mod tests {
     }
 
     fn product_with_id(id: &str, slug: &str) -> Product {
-        Product {
-            id: id.to_owned(),
-            name: slug.to_owned(),
-            slug: slug.to_owned(),
-            description: String::new(),
-            repo_remote_url: None,
-            design_repo: None,
-            docs_repo: None,
-            status: "active".to_owned(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            default_model: None,
-            dispatch_preamble: None,
-            external_tracker_kind: None,
-            external_tracker_config: None,
-        }
+        Product::builder()
+            .id(id)
+            .name(slug)
+            .slug(slug)
+            .description("")
+            .status("active")
+            .created_at("")
+            .updated_at("")
+            .build()
     }
 
     #[test]

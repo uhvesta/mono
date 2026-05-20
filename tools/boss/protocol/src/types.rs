@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct Product {
     pub id: String,
     pub name: String,
@@ -119,6 +121,8 @@ impl std::str::FromStr for EffortLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct Project {
     pub id: String,
     /// Per-product short id allocated at insert time. Always `Some` after the
@@ -132,6 +136,7 @@ pub struct Project {
     pub description: String,
     pub goal: String,
     pub status: String,
+    #[builder(default = default_priority())]
     pub priority: String,
     pub created_at: String,
     pub updated_at: String,
@@ -146,6 +151,7 @@ pub struct Project {
     /// The auto-unblock path only flips a `blocked` row back to `todo`
     /// when this is `'engine'` — manual and Boss-driven blocks stick.
     #[serde(default = "default_human_actor")]
+    #[builder(default = default_human_actor())]
     pub last_status_actor: String,
     /// Repo URL the project's design doc lives in. `None` → inherit
     /// from the project's product (`products.repo_remote_url`). Set
@@ -196,6 +202,8 @@ pub struct WorkItemExternalRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct Task {
     pub id: String,
     /// Per-product short id allocated at insert time. Always `Some` after the
@@ -219,16 +227,19 @@ pub struct Task {
     /// Existing rows from before this column was introduced default
     /// to `true` so legacy callers keep their old auto-start behavior.
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub autostart: bool,
     /// Who made the most recent status change — `'human'`, `'boss'`,
     /// or `'engine'`. See `Project.last_status_actor` for full semantics.
     #[serde(default = "default_human_actor")]
+    #[builder(default = default_human_actor())]
     pub last_status_actor: String,
     /// One of `low` / `medium` / `high`. Mirrors `Project.priority`
     /// exactly so kanban surfaces can render every work-item kind with
     /// the same vocabulary. Existing rows from before this column was
     /// introduced default to `medium`.
     #[serde(default = "default_priority")]
+    #[builder(default = default_priority())]
     pub priority: String,
     /// The surface that filed this row — `cli`, `bossctl`, `mac_app`,
     /// `engine_auto`, or `unknown`. Stamped at insert time and never
@@ -236,6 +247,7 @@ pub struct Task {
     /// column (the migration default); fresh writes always carry one
     /// of the other values.
     #[serde(default = "default_unknown_created_via")]
+    #[builder(default = default_unknown_created_via())]
     pub created_via: String,
     /// Per-work-item repo override. `None` → inherit from the parent
     /// `Product.repo_remote_url`. Stored as a canonical remote URL
@@ -286,6 +298,7 @@ pub struct Task {
     /// count. Existing rows from before this column was introduced
     /// default to 0.
     #[serde(default)]
+    #[builder(default)]
     pub ci_attempts_used: i64,
     /// Every active block reason currently in flight on this work
     /// item — the multi-signal companion to the scalar
@@ -297,6 +310,7 @@ pub struct Task {
     /// §Q2 priority order. Existing rows from before this column was
     /// introduced default to an empty list.
     #[serde(default)]
+    #[builder(default)]
     pub blocked_signals: Vec<BlockedSignal>,
     /// Aggregate state of required CI checks at last poll. Three terminal
     /// values: `"in_progress"` (at least one required check is still
@@ -423,6 +437,8 @@ pub fn is_known_created_via(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkExecution {
     pub id: String,
     pub work_item_id: String,
@@ -434,6 +450,7 @@ pub struct WorkExecution {
     pub cube_workspace_id: Option<String>,
     pub workspace_path: Option<String>,
     #[serde(default)]
+    #[builder(default)]
     pub priority: i64,
     pub preferred_workspace_id: Option<String>,
     pub created_at: String,
@@ -444,6 +461,7 @@ pub struct WorkExecution {
     /// engine retries up to N times before marking the execution `failed`
     /// permanently. Reset to 0 on a fresh `ready` execution.
     #[serde(default)]
+    #[builder(default)]
     pub pre_start_failure_count: i64,
     /// Unix epoch seconds (as a string) before which this `ready`
     /// execution must not be dispatched. `None` means dispatchable

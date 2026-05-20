@@ -452,43 +452,18 @@ mod tests {
     }
 
     fn task_with_repo(id: &str, repo: Option<&str>, updated_at: &str) -> Task {
-        Task {
-            id: id.to_owned(),
-            product_id: "prod_1".to_owned(),
-            project_id: None,
-            kind: "chore".to_owned(),
-            name: "x".to_owned(),
-            description: String::new(),
-            status: "todo".to_owned(),
-            ordinal: None,
-            pr_url: None,
-            deleted_at: None,
-            created_at: updated_at.to_owned(),
-            updated_at: updated_at.to_owned(),
-            autostart: true,
-            last_status_actor: "human".to_owned(),
-            priority: "medium".to_owned(),
-            created_via: "cli".to_owned(),
-            repo_remote_url: repo.map(str::to_owned),
-            blocked_reason: None,
-            blocked_attempt_id: None,
-            effort_level: None,
-            model_override: None,
-            ci_attempt_budget: None,
-            ci_attempts_used: 0,
-            blocked_signals: vec![],
-            ci_required_state: None,
-            ci_required_detail: None,
-            review_required_state: None,
-            review_required_detail: None,
-            pr_state_polled_at: None,
-            merge_queue_state: None,
-            short_id: None,
-            external_ref: None,
-            investigation_doc_path: None,
-            investigation_doc_repo_remote_url: None,
-            investigation_doc_branch: None,
-        }
+        Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind("chore")
+            .name("x")
+            .description("")
+            .status("todo")
+            .created_at(updated_at)
+            .updated_at(updated_at)
+            .created_via("cli")
+            .maybe_repo_remote_url(repo)
+            .build()
     }
 
     #[test]

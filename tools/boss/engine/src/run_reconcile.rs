@@ -321,26 +321,19 @@ mod tests {
     }
 
     fn execution(id: &str, lease_id: &str, workspace_id: &str) -> WorkExecution {
-        WorkExecution {
-            id: id.to_owned(),
-            work_item_id: format!("task-{id}"),
-            kind: "chore_implementation".to_owned(),
-            status: "running".to_owned(),
-            repo_remote_url: "git@example.com:foo.git".to_owned(),
-            cube_repo_id: Some("foo".to_owned()),
-            cube_lease_id: Some(lease_id.to_owned()),
-            cube_workspace_id: Some(workspace_id.to_owned()),
-            workspace_path: Some(format!("/tmp/{workspace_id}")),
-            priority: 0,
-            preferred_workspace_id: None,
-            created_at: "2026-05-07T00:00:00Z".to_owned(),
-            started_at: Some("2026-05-07T00:00:00Z".to_owned()),
-            finished_at: None,
-            pre_start_failure_count: 0,
-            dispatch_not_before: None,
-            pr_url: None,
-            pr_head_before: None,
-        }
+        WorkExecution::builder()
+            .id(id)
+            .work_item_id(format!("task-{id}"))
+            .kind("chore_implementation")
+            .status("running")
+            .repo_remote_url("git@example.com:foo.git")
+            .cube_repo_id("foo")
+            .cube_lease_id(lease_id)
+            .cube_workspace_id(workspace_id)
+            .workspace_path(format!("/tmp/{workspace_id}"))
+            .created_at("2026-05-07T00:00:00Z")
+            .started_at("2026-05-07T00:00:00Z")
+            .build()
     }
 
     fn workspace(

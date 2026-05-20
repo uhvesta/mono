@@ -1388,66 +1388,40 @@ mod conflict_resolution_prompt_tests {
     use boss_protocol::WorkExecution;
 
     fn sample_execution() -> WorkExecution {
-        WorkExecution {
-            id: "exec-cr-1".into(),
-            work_item_id: "task_1".into(),
-            kind: "conflict_resolution".into(),
-            status: "running".into(),
-            repo_remote_url: "git@example.invalid:foo/bar.git".into(),
-            cube_repo_id: Some("foo".into()),
-            cube_lease_id: Some("lease-1".into()),
-            cube_workspace_id: Some("ws-1".into()),
-            workspace_path: Some("/tmp/workspace".into()),
-            priority: 0,
-            preferred_workspace_id: None,
-            created_at: "1700000000".into(),
-            started_at: Some("1700000010".into()),
-            finished_at: None,
-            pre_start_failure_count: 0,
-            dispatch_not_before: None,
-            pr_url: None,
-            pr_head_before: None,
-        }
+        WorkExecution::builder()
+            .id("exec-cr-1")
+            .work_item_id("task_1")
+            .kind("conflict_resolution")
+            .status("running")
+            .repo_remote_url("git@example.invalid:foo/bar.git")
+            .cube_repo_id("foo")
+            .cube_lease_id("lease-1")
+            .cube_workspace_id("ws-1")
+            .workspace_path("/tmp/workspace")
+            .created_at("1700000000")
+            .started_at("1700000010")
+            .build()
     }
 
     fn sample_work_item() -> WorkItem {
-        WorkItem::Chore(crate::work::Task {
-            id: "task_1".into(),
-            product_id: "prod_1".into(),
-            project_id: None,
-            kind: "chore".into(),
-            name: "Some in-review chore".into(),
-            description: String::new(),
-            status: "blocked".into(),
-            ordinal: None,
-            pr_url: Some("https://github.com/foo/bar/pull/42".into()),
-            deleted_at: None,
-            created_at: "1700000000".into(),
-            updated_at: "1700000000".into(),
-            autostart: false,
-            last_status_actor: "engine".into(),
-            priority: "medium".into(),
-            created_via: "engine_auto".into(),
-            repo_remote_url: None,
-            blocked_reason: Some("merge_conflict".into()),
-            blocked_attempt_id: Some("crz_x".into()),
-            effort_level: None,
-            model_override: None,
-            ci_attempt_budget: None,
-            ci_attempts_used: 0,
-            short_id: None,
-            blocked_signals: Vec::new(),
-            ci_required_state: None,
-            ci_required_detail: None,
-            review_required_state: None,
-            review_required_detail: None,
-            pr_state_polled_at: None,
-            merge_queue_state: None,
-            external_ref: None,
-            investigation_doc_path: None,
-            investigation_doc_repo_remote_url: None,
-            investigation_doc_branch: None,
-        })
+        WorkItem::Chore(
+            crate::work::Task::builder()
+                .id("task_1")
+                .product_id("prod_1")
+                .kind("chore")
+                .name("Some in-review chore")
+                .description("")
+                .status("blocked")
+                .pr_url("https://github.com/foo/bar/pull/42")
+                .created_at("1700000000")
+                .updated_at("1700000000")
+                .autostart(false)
+                .last_status_actor("engine")
+                .created_via("engine_auto")
+                .blocked_reason("merge_conflict")
+                .blocked_attempt_id("crz_x")
+                .build(),
+        )
     }
 
     fn attempt_with_diagnosis(diag_json: Option<String>) -> ConflictResolution {
@@ -1643,66 +1617,31 @@ mod compose_prompt_tests {
     use crate::work::Task;
 
     fn base_execution() -> WorkExecution {
-        WorkExecution {
-            id: "exec_abc123_01".into(),
-            work_item_id: "task-1".into(),
-            kind: "chore_implementation".into(),
-            status: "pending".into(),
-            repo_remote_url: "git@github.com:org/repo.git".into(),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: Some("/tmp/workspace".into()),
-            priority: 0,
-            preferred_workspace_id: None,
-            created_at: "2026-05-15T00:00:00Z".into(),
-            started_at: None,
-            finished_at: None,
-            pre_start_failure_count: 0,
-            dispatch_not_before: None,
-            pr_url: None,
-            pr_head_before: None,
-        }
+        WorkExecution::builder()
+            .id("exec_abc123_01")
+            .work_item_id("task-1")
+            .kind("chore_implementation")
+            .status("pending")
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
     }
 
     fn chore_without_pr() -> WorkItem {
-        WorkItem::Chore(Task {
-            id: "task-1".into(),
-            product_id: "prod-1".into(),
-            project_id: None,
-            kind: "chore".into(),
-            name: "Fix the thing".into(),
-            description: "Description here.".into(),
-            status: "todo".into(),
-            ordinal: None,
-            pr_url: None,
-            deleted_at: None,
-            created_at: "2026-05-15T00:00:00Z".into(),
-            updated_at: "2026-05-15T00:00:00Z".into(),
-            autostart: false,
-            last_status_actor: "human".into(),
-            priority: "medium".into(),
-            created_via: "unknown".into(),
-            repo_remote_url: None,
-            blocked_reason: None,
-            blocked_attempt_id: None,
-            effort_level: None,
-            model_override: None,
-            ci_attempt_budget: None,
-            ci_attempts_used: 0,
-            short_id: None,
-            blocked_signals: Vec::new(),
-            ci_required_state: None,
-            ci_required_detail: None,
-            review_required_state: None,
-            review_required_detail: None,
-            pr_state_polled_at: None,
-            merge_queue_state: None,
-            external_ref: None,
-            investigation_doc_path: None,
-            investigation_doc_repo_remote_url: None,
-            investigation_doc_branch: None,
-        })
+        WorkItem::Chore(
+            Task::builder()
+                .id("task-1")
+                .product_id("prod-1")
+                .kind("chore")
+                .name("Fix the thing")
+                .description("Description here.")
+                .status("todo")
+                .created_at("2026-05-15T00:00:00Z")
+                .updated_at("2026-05-15T00:00:00Z")
+                .autostart(false)
+                .build(),
+        )
     }
 
     fn chore_with_pr(pr_url: &str) -> WorkItem {
@@ -1995,23 +1934,19 @@ mod compose_prompt_tests {
 
     #[test]
     fn work_item_pr_url_returns_none_for_project() {
-        let project = WorkItem::Project(crate::work::Project {
-            id: "proj-1".into(),
-            short_id: None,
-            product_id: "prod-1".into(),
-            name: "My Project".into(),
-            description: String::new(),
-            goal: String::new(),
-            status: "active".into(),
-            slug: "my-project".into(),
-            priority: "medium".into(),
-            last_status_actor: "human".into(),
-            created_at: "2026-05-15T00:00:00Z".into(),
-            updated_at: "2026-05-15T00:00:00Z".into(),
-            design_doc_repo_remote_url: None,
-            design_doc_branch: None,
-            design_doc_path: None,
-        });
+        let project = WorkItem::Project(
+            crate::work::Project::builder()
+                .id("proj-1")
+                .product_id("prod-1")
+                .name("My Project")
+                .description("")
+                .goal("")
+                .status("active")
+                .slug("my-project")
+                .created_at("2026-05-15T00:00:00Z")
+                .updated_at("2026-05-15T00:00:00Z")
+                .build(),
+        );
         assert!(work_item_pr_url(&project).is_none());
     }
 
@@ -2120,66 +2055,34 @@ mod pane_spawn_tests {
     }
 
     fn sample_execution(workspace_path: &Path) -> WorkExecution {
-        WorkExecution {
-            id: "exec-test-1".into(),
-            work_item_id: "task-1".into(),
-            kind: "chore_implementation".into(),
-            status: "running".into(),
-            repo_remote_url: "git@example.com:foo.git".into(),
-            cube_repo_id: Some("foo".into()),
-            cube_lease_id: Some("lease-1".into()),
-            cube_workspace_id: Some("foo-agent-001".into()),
-            workspace_path: Some(workspace_path.display().to_string()),
-            priority: 0,
-            preferred_workspace_id: None,
-            created_at: "2026-05-06T20:00:00Z".into(),
-            started_at: Some("2026-05-06T20:00:00Z".into()),
-            finished_at: None,
-            pre_start_failure_count: 0,
-            dispatch_not_before: None,
-            pr_url: None,
-            pr_head_before: None,
-        }
+        WorkExecution::builder()
+            .id("exec-test-1")
+            .work_item_id("task-1")
+            .kind("chore_implementation")
+            .status("running")
+            .repo_remote_url("git@example.com:foo.git")
+            .cube_repo_id("foo")
+            .cube_lease_id("lease-1")
+            .cube_workspace_id("foo-agent-001")
+            .workspace_path(workspace_path.display().to_string())
+            .created_at("2026-05-06T20:00:00Z")
+            .started_at("2026-05-06T20:00:00Z")
+            .build()
     }
 
     fn sample_chore() -> WorkItem {
-        WorkItem::Chore(Task {
-            id: "task-1".into(),
-            product_id: "prod-1".into(),
-            project_id: None,
-            kind: "chore".into(),
-            name: "Improve top header (agent card) styling".into(),
-            description: "The gray header at the top is too cramped.".into(),
-            status: "todo".into(),
-            ordinal: None,
-            pr_url: None,
-            deleted_at: None,
-            created_at: "2026-05-06T20:00:00Z".into(),
-            updated_at: "2026-05-06T20:00:00Z".into(),
-            autostart: true,
-            last_status_actor: "human".into(),
-            priority: "medium".into(),
-            created_via: "unknown".to_owned(),
-            repo_remote_url: None,
-            blocked_reason: None,
-            blocked_attempt_id: None,
-            effort_level: None,
-            model_override: None,
-            ci_attempt_budget: None,
-            ci_attempts_used: 0,
-            short_id: None,
-            blocked_signals: Vec::new(),
-            ci_required_state: None,
-            ci_required_detail: None,
-            review_required_state: None,
-            review_required_detail: None,
-            pr_state_polled_at: None,
-            merge_queue_state: None,
-            external_ref: None,
-            investigation_doc_path: None,
-            investigation_doc_repo_remote_url: None,
-            investigation_doc_branch: None,
-        })
+        WorkItem::Chore(
+            Task::builder()
+                .id("task-1")
+                .product_id("prod-1")
+                .kind("chore")
+                .name("Improve top header (agent card) styling")
+                .description("The gray header at the top is too cramped.")
+                .status("todo")
+                .created_at("2026-05-06T20:00:00Z")
+                .updated_at("2026-05-06T20:00:00Z")
+                .build(),
+        )
     }
 
     /// Build a runner already bound to a `CapturingSpawner` and drive a

@@ -22,6 +22,7 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0.97"
 async-trait = "0.1.86"
+bon = "3.9.1"
 clap = "4.5.39"
 flate2 = "1.1.5"
 fs4 = "0.13"
