@@ -132,7 +132,7 @@ The prompt addendum is explicitly **additive and secondary** to the native effor
 
 | Level | Default model | `claude --effort` | Prompt addendum |
 |---|---|---|---|
-| `trivial` | `claude-haiku-4-5-20251001` | `low` | none — direct execution |
+| `trivial` | `claude-sonnet-4-6` | `low` | none — direct execution |
 | `small` | `claude-sonnet-4-6` | `medium` | none |
 | `medium` | `claude-sonnet-4-6` | `high` | "Sketch a brief plan before you start editing." |
 | `large` | `claude-opus-4-7` | `xhigh` | "Begin with a written plan. Identify the files you expect to touch and the order you'll touch them in. Confirm the approach against the work item's description before writing code." |
@@ -140,8 +140,8 @@ The prompt addendum is explicitly **additive and secondary** to the native effor
 
 A few notes on the table:
 
-- **The effort mapping follows Claude's published guidance.** The Claude docs recommend `medium` as the Sonnet 4.6 default and `xhigh` as the Opus 4.7 starting point for coding/agentic work; the table aligns with that. `trivial → low` matches Claude's "simpler tasks, lowest cost" use case for Haiku.
-- **Model defaults bracket the price/latency curve.** Haiku for `trivial`, Sonnet for the middle, Opus for `large` and `max`. The boundary between `small` and `medium` is on Sonnet specifically because the difference there is *effort + prompt*, not model class.
+- **The effort mapping follows Claude's published guidance.** The Claude docs recommend `medium` as the Sonnet 4.6 default and `xhigh` as the Opus 4.7 starting point for coding/agentic work; the table aligns with that. `trivial → low` keeps the spend floor low even though the model is now Sonnet.
+- **Model defaults bracket the price/latency curve.** Sonnet from `trivial` through `medium`, Opus for `large` and `max`. `trivial` originally mapped to Haiku, but Haiku on some CLI builds doesn't honour `--permission-mode auto` / `--dangerously-skip-permissions`, so the dispatcher prompted for every individual tool call. Sonnet is the cheapest model that runs unattended through the worker dispatcher; the cheap one-sentence summarizer (`live_status.rs`) still uses Haiku because it's a direct API call, not a worker spawn. The boundary between `trivial`/`small`/`medium` lives in `--effort` and the prompt addendum, not in model class.
 - **`max` and `large` share a model and prompt addendum** — they diverge only on the effort value. That captures the intent of `max`: "treat this as a `large` row but explicitly authorize Claude to spend up to its maximum reasoning depth."
 - **Prompt addenda are concatenated to the existing spawn prompt** in the path that writes `.claude/initial-prompt.txt` (currently `runner.rs:272`). They are not template-replacements of the existing prompt — the existing prompt's task-implementation framing stays. If a level's addendum is `none`, the prompt is byte-identical to today.
 
@@ -172,7 +172,7 @@ The CLI surface autocompletes against the short aliases; the column stores whate
 When the dispatcher picks the model for a worker, it resolves in this order, taking the first non-empty value:
 
 1. **`tasks.model_override`** — explicit per-row override.
-2. **Effort-level default** — `trivial → haiku`, `small / medium → sonnet`, `large / max → opus` (per Q2).
+2. **Effort-level default** — `trivial / small / medium → sonnet`, `large / max → opus` (per Q2). (Trivial originally mapped to Haiku; superseded because Haiku in the worker CLI prompts for every tool call.)
 3. **Product default** — `products.default_model` (new column, nullable). Lets a product owner say "default everything on this product to Sonnet."
 4. **Engine default** — whatever `claude` resolves to with no `--model` flag (currently Opus 4.7).
 

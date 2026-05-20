@@ -41,10 +41,18 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 
 /// Default model slug for a given effort level, used when the row
 /// has no explicit `model_override` (design §Q3 step 2).
+///
+/// `trivial` originally mapped to Haiku 4.5, but Haiku doesn't honour
+/// `--permission-mode auto` or `--dangerously-skip-permissions` on the
+/// corp-laptop CLI build, so trivial worker spawns ended up prompting
+/// for every individual tool call. Sonnet is the next-cheapest model
+/// that runs through the same dispatcher unattended, so trivial rows
+/// fall back to Sonnet here. Direct-API summarization
+/// (see [`crate::live_status::SUMMARY_MODEL`]) still uses Haiku — that
+/// path doesn't go through the worker CLI.
 pub fn default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
-        EffortLevel::Trivial => "claude-haiku-4-5-20251001",
-        EffortLevel::Small | EffortLevel::Medium => "claude-sonnet-4-6",
+        EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "claude-sonnet-4-6",
         EffortLevel::Large | EffortLevel::Max => "claude-opus-4-7",
     }
 }
@@ -374,7 +382,7 @@ mod tests {
     #[test]
     fn effort_level_alone_picks_level_default_model() {
         let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
-        assert_eq!(trivial.model, "claude-haiku-4-5-20251001");
+        assert_eq!(trivial.model, "claude-sonnet-4-6");
         assert_eq!(trivial.claude_effort, Some("low"));
         assert_eq!(trivial.prompt_addendum, None);
 
@@ -448,11 +456,11 @@ mod tests {
 
     #[test]
     fn trivial_invocation_includes_both_flags() {
-        // Haiku is non-Opus → --dangerously-skip-permissions (default/personal laptop).
+        // Sonnet is non-Opus → --dangerously-skip-permissions (default/personal laptop).
         let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
         assert_eq!(
             cfg.claude_invocation(false),
-            "claude --model claude-haiku-4-5-20251001 --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model claude-sonnet-4-6 --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 

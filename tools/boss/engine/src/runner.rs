@@ -2437,10 +2437,13 @@ mod pane_spawn_tests {
     }
 
     /// Smoke test for the design-spec acceptance criterion: a
-    /// `trivial` row dispatches with `--model claude-haiku-4-5-20251001
-    /// --effort low` and no prompt addendum.
+    /// `trivial` row dispatches with `--model claude-sonnet-4-6
+    /// --effort low` and no prompt addendum. (Trivial originally
+    /// mapped to Haiku, but Haiku doesn't honour the unattended-permission
+    /// flags on every CLI build, so trivial rows now fall through to
+    /// Sonnet — see [`crate::effort::default_model_for_level`].)
     #[tokio::test]
-    async fn trivial_row_spawn_uses_haiku_at_low_effort() {
+    async fn trivial_row_spawn_uses_sonnet_at_low_effort() {
         let workspace = TempDir::new().unwrap();
         let chore_input = CreateChoreInput {
             product_id: String::new(),
@@ -2462,8 +2465,8 @@ mod pane_spawn_tests {
         assert!(
             input
                 .initial_input
-                .contains("--model claude-haiku-4-5-20251001"),
-            "trivial row must spawn Haiku, got: {:?}",
+                .contains("--model claude-sonnet-4-6"),
+            "trivial row must spawn Sonnet, got: {:?}",
             input.initial_input,
         );
         assert!(
@@ -2473,12 +2476,12 @@ mod pane_spawn_tests {
         );
         assert!(
             input.initial_input.contains("--dangerously-skip-permissions"),
-            "trivial row (Haiku, non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
+            "trivial row (Sonnet, non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
             input.initial_input,
         );
         assert!(
             !input.initial_input.contains("--permission-mode"),
-            "trivial row (Haiku, non-Opus) must NOT carry --permission-mode, got: {:?}",
+            "trivial row (Sonnet, non-Opus) must NOT carry --permission-mode, got: {:?}",
             input.initial_input,
         );
 
@@ -2717,7 +2720,7 @@ mod pane_spawn_tests {
             .expect("PaneSpawnRunner should always populate spawn_config");
         assert_eq!(spawn.effort_level, Some(EffortLevel::Trivial));
         assert_eq!(spawn.claude_effort, Some("low"));
-        assert_eq!(spawn.model, "claude-haiku-4-5-20251001");
+        assert_eq!(spawn.model, "claude-sonnet-4-6");
         assert_eq!(spawn.prompt_addendum, None);
     }
 
