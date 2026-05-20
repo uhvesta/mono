@@ -359,6 +359,15 @@ final class EngineProcessController: @unchecked Sendable {
         // misbehaving shell init could hang the app or print garbage). Extra
         // segments that don't exist on a given machine are ignored by the kernel.
         env["PATH"] = augmentedPATH(current: env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        // If the user pasted an ANTHROPIC_API_KEY into Settings → Engine,
+        // override whatever the launchd parent inherited so the Settings
+        // value always wins (work item #735). When no Settings value is
+        // stored, leave the inherited env entry untouched so a shell
+        // `export ANTHROPIC_API_KEY=…` followed by `boss` from a terminal
+        // continues to work for users who prefer that path.
+        if let stored = APIKeyStore.readAnthropicApiKey() {
+            env["ANTHROPIC_API_KEY"] = stored
+        }
         proc.environment = env
         proc.standardOutput = Pipe()
         proc.standardError = Pipe()
