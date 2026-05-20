@@ -28,13 +28,13 @@ pub struct GitHubConfig {
     pub reverse_close: bool,
     /// Name of the GitHub Projects V2 "Status" single-select option to use
     /// when a linked Boss task moves to the active (Doing) state.
-    /// Defaults to `"In progress"` when absent.
+    /// Defaults to `"In Progress"` when absent.
     pub in_progress_column: Option<String>,
 }
 
 impl GitHubConfig {
     fn in_progress_column_name(&self) -> &str {
-        self.in_progress_column.as_deref().unwrap_or("In progress")
+        self.in_progress_column.as_deref().unwrap_or("In Progress")
     }
 }
 
@@ -1569,14 +1569,14 @@ mod tests {
     async fn fetch_items_parses_project_status_from_field_values() {
         let mut fake = FakeGhRunner::new();
         fake.push_graphql_ok(graphql_page(
-            vec![open_issue_node_with_status("id1", 1, "Issue 1", "In progress")],
+            vec![open_issue_node_with_status("id1", 1, "Issue 1", "In Progress")],
             false,
             "c",
         ));
         let tracker = GitHubTracker::with_runner(fake);
         let items = tracker.fetch_items(&github_ctx()).await.expect("fetch_items");
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].project_status.as_deref(), Some("In progress"));
+        assert_eq!(items[0].project_status.as_deref(), Some("In Progress"));
     }
 
     #[tokio::test]
@@ -1615,7 +1615,7 @@ mod tests {
         fake.push_graphql_ok(project_metadata_response(
             "PVT_project1",
             "PVTSSF_field1",
-            &[("opt_todo", "Todo"), ("opt_wip", "In progress"), ("opt_done", "Done")],
+            &[("opt_todo", "Todo"), ("opt_wip", "In Progress"), ("opt_done", "Done")],
         ));
         fake.push_graphql_ok(set_field_mutation_ok("PVTI_item1"));
 
@@ -1657,7 +1657,7 @@ mod tests {
     #[tokio::test]
     async fn set_project_status_returns_config_invalid_when_option_not_found() {
         let mut fake = FakeGhRunner::new();
-        // The Status field exists but has no "In progress" option.
+        // The Status field exists but has no "In Progress" option.
         fake.push_graphql_ok(project_metadata_response(
             "PVT_project1",
             "PVTSSF_field1",

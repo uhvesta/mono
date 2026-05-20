@@ -397,7 +397,7 @@ async fn process_product(
 ) {
     let reverse_close = ctx.config["reverse_close"].as_bool().unwrap_or(false);
     let in_progress_column =
-        ctx.config["in_progress_column"].as_str().unwrap_or("In progress").to_owned();
+        ctx.config["in_progress_column"].as_str().unwrap_or("In Progress").to_owned();
 
     // ── 1. Fetch upstream items ───────────────────────────────────────────────
     let upstream_items = match tracker.fetch_items(ctx).await {
@@ -2538,7 +2538,7 @@ mod tests {
         assert_eq!(calls, vec!["spy#30"], "set_project_status called for spy#30");
     }
 
-    /// Behavior 6 is idempotent: if the upstream item is already "In progress",
+    /// Behavior 6 is idempotent: if the upstream item is already "In Progress",
     /// set_project_status must NOT be called.
     #[tokio::test]
     async fn set_project_status_skipped_when_already_in_progress() {
@@ -2548,8 +2548,8 @@ mod tests {
         let chore = seed_active_chore(&db, &product.id, "spy#31", 31);
         assert_eq!(chore.status, "active");
 
-        // Upstream already at "In progress".
-        let item = open_item_with_project_status(31, "Issue 31", "In progress");
+        // Upstream already at "In Progress".
+        let item = open_item_with_project_status(31, "Issue 31", "In Progress");
         let tracker = SpyTracker::new(vec![item]);
         let registry = spy_registry(Arc::clone(&tracker));
         let metrics = Registry::new();
