@@ -39,7 +39,10 @@ use serde::Serialize;
 
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
-use crate::work::{CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck, WorkDb};
+use crate::work::{
+    CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck,
+    StrandedCiRemediationAttempt, WorkDb,
+};
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
 /// has `conclusion ∈ {STARTUP_FAILURE, CANCELLED}` (engine-discernible
@@ -1041,6 +1044,57 @@ fn provider_str(p: crate::merge_poller::CiProvider) -> &'static str {
     }
 }
 
+/// Re-emit a fresh `ci_remediation` execution for a stranded attempt.
+///
+/// Called from `merge_poller::run_one_pass` for every row returned by
+/// [`WorkDb::list_stranded_ci_remediation_attempts`]. A stranded row is
+/// a `ci_remediations` row that is `pending` but has no live execution —
+/// the canonical cause is two merge-queue dequeue events in the same sweep
+/// where the first flips the task (consuming the `status='in_review'`
+/// WHERE guard on `mark_chore_blocked_ci_failure`) and the second
+/// inserts a ci_remediations row but cannot create an execution.
+///
+/// Returns `true` when an execution was successfully created.
+pub async fn rescue_stranded_ci_remediation_attempt(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    attempt: &StrandedCiRemediationAttempt,
+) -> bool {
+    match work_db.create_execution(CreateExecutionInput {
+        work_item_id: attempt.work_item_id.clone(),
+        kind: "ci_remediation".to_owned(),
+        status: Some("ready".to_owned()),
+        repo_remote_url: None,
+        cube_repo_id: None,
+        cube_lease_id: None,
+        cube_workspace_id: None,
+        workspace_path: None,
+        priority: None,
+        preferred_workspace_id: None,
+        started_at: None,
+        finished_at: None,
+    }) {
+        Ok(_) => {
+            publisher.kick_scheduler();
+            tracing::info!(
+                work_item_id = %attempt.work_item_id,
+                attempt_id = %attempt.attempt_id,
+                pr_url = %attempt.pr_url,
+                "ci_watch: re-dispatched execution for stranded pending ci_remediation attempt",
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %attempt.work_item_id,
+                attempt_id = %attempt.attempt_id,
+                ?err,
+                "ci_watch: failed to re-emit execution for stranded ci_remediation attempt",
+            );
+            false
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2149,5 +2203,214 @@ mod tests {
 
         let (status, _) = chore_state(&db, &chore);
         assert_eq!(status, "in_review");
+    }
+
+    // ----- Back-to-back dequeue regression (T628 / PR #718 06:51Z miss) -----
+
+    /// Reproducer for T628: a PR that was dequeued, manually re-queued,
+    /// and dequeued again must end up with a parked `ci_remediation`
+    /// execution for the second dequeue's SHA — without requiring the
+    /// first dequeue's worker to have completed.
+    ///
+    /// Sequence:
+    ///   1. Chore in_review; first dequeue (SHA_1) detected → blocked, EXEC-1 created.
+    ///   2. Worker marks SHA_1 succeeded_via_rebase (human re-queued the PR).
+    ///   3. on_ci_resolved clears the block → chore back to in_review.
+    ///   4. Next sweep sees both SHA_1 and SHA_2 in the timeline:
+    ///      - SHA_1: INSERT IGNORED (key exists, row terminal) → attempt=None;
+    ///               mark_chore_blocked_ci_failure succeeds (chore in_review) →
+    ///               chore blocked, but NO execution (attempt is None).
+    ///      - SHA_2: INSERT succeeds → attempt=Some; mark_chore_blocked_ci_failure
+    ///               WHERE-guard misses (chore already blocked) → no execution.
+    ///   5. Stranded rescue finds SHA_2 row (pending, no live execution) and
+    ///      creates EXEC-2.
+    ///
+    /// Detection must not require a live worker on the chore.
+    #[tokio::test]
+    async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/718";
+        let (product, chore) = make_in_review(&db, "C-t628-backtoback", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Step 1: first dequeue (SHA_1) → chore flips to blocked, EXEC-1 parked.
+        let first = on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature"),
+            None,
+            "sha-merge-1",
+            &[],
+        )
+        .await;
+        assert!(first, "first rebounce must flip chore to ci_failure");
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM work_executions
+                      WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                    rusqlite::params![&chore],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "exactly one execution after first dequeue");
+        }
+
+        // Step 2: worker claims EXEC-1 (transitions work_executions to 'succeeded')
+        // and marks SHA_1 as succeeded_via_rebase (PR re-queued by human).
+        let sha1_attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("sha1 attempt row");
+        db.mark_ci_remediation_succeeded_via_rebase(&sha1_attempt.id)
+            .unwrap()
+            .expect("succeeded_via_rebase update");
+        // Simulate the worker finishing its execution so EXEC-1 is terminal.
+        // In production the coordinator does this; for the test we update directly.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'succeeded'
+                  WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                rusqlite::params![&chore],
+            )
+            .unwrap();
+        }
+
+        // Step 3: on_ci_resolved clears the block → chore in_review again.
+        let cleared = on_ci_resolved(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(cleared, "on_ci_resolved must clear the block after SHA_1 is terminal");
+        let (status, _) = chore_state(&db, &chore);
+        assert_eq!(status, "in_review");
+
+        // Step 4a: next sweep replays SHA_1 — INSERT is ignored (key exists, row
+        // terminal). attempt=None → task flips (WHERE guard matches) but NO execution.
+        let sha1_replay = on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature"),
+            None,
+            "sha-merge-1",
+            &[],
+        )
+        .await;
+        // The chore was in_review so mark_chore_blocked_ci_failure succeeds, returning true.
+        assert!(sha1_replay, "sha1 replay must flip chore (INSERT ignored, task_transitioned=true)");
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
+        // No new execution created because attempt was None.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM work_executions
+                      WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                    rusqlite::params![&chore],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            // Still only the original EXEC-1 (from step 1, now terminal).
+            assert_eq!(n, 1, "sha1 replay must not create a second execution");
+        }
+
+        // Step 4b: same sweep also sees SHA_2 — INSERT succeeds (new key), but
+        // mark_chore_blocked_ci_failure WHERE-guard misses (chore already blocked).
+        let sha2_detect = on_merge_queue_rebounce_detected(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            Some("feature"),
+            None,
+            "sha-merge-2",
+            &[],
+        )
+        .await;
+        assert!(
+            !sha2_detect,
+            "sha2 detection must return false — task already blocked, WHERE guard missed"
+        );
+        // SHA_2's ci_remediations row must exist as pending.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let pending: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ci_remediations
+                      WHERE work_item_id = ?1 AND head_sha_at_trigger = 'sha-merge-2'
+                        AND status = 'pending'",
+                    rusqlite::params![&chore],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending, 1, "sha2 ci_remediations row must be pending");
+        }
+        // Still no new execution — SHA_2's row is stranded.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let exec_n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM work_executions
+                      WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                    rusqlite::params![&chore],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exec_n, 1, "sha2 detection must not create an execution");
+        }
+
+        // Step 5: stranded rescue detects SHA_2's pending row and dispatches EXEC-2.
+        let stranded = db.list_stranded_ci_remediation_attempts().unwrap();
+        assert_eq!(
+            stranded.len(),
+            1,
+            "exactly one stranded ci_remediation attempt (SHA_2)"
+        );
+        assert_eq!(stranded[0].work_item_id, chore);
+
+        let rescued = rescue_stranded_ci_remediation_attempt(
+            &db,
+            pub_.as_ref(),
+            &stranded[0],
+        )
+        .await;
+        assert!(rescued, "stranded SHA_2 attempt must be rescued with a new execution");
+
+        // After rescue: EXEC-2 exists and chore is still blocked.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let exec_n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM work_executions
+                      WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                    rusqlite::params![&chore],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exec_n, 2, "after rescue, two ci_remediation executions exist");
+        }
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
+
+        // Sanity: no further stranded attempts — the rescue created a live execution.
+        let stranded_after = db.list_stranded_ci_remediation_attempts().unwrap();
+        assert!(
+            stranded_after.is_empty(),
+            "no stranded attempts after rescue creates a live execution"
+        );
     }
 }

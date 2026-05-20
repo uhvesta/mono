@@ -3903,6 +3903,54 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// CI-remediation attempts that are stranded: the parent task is
+    /// `blocked: ci_failure`, the `ci_remediations` row is `pending`,
+    /// and no live execution (`kind='ci_remediation'` AND
+    /// `status IN ('ready','running','waiting_human')`) exists for that
+    /// `work_item_id`. This occurs when two merge-queue dequeue events
+    /// land in the same sweep: the first flips the task (consuming the
+    /// `status='in_review'` WHERE guard on `mark_chore_blocked_ci_failure`)
+    /// and the second inserts a new `ci_remediations` row but cannot flip
+    /// the task again, leaving the row without an executor. The merge
+    /// poller's recovery sweep re-emits a fresh execution request for
+    /// each stranded row so a worker is dispatched.
+    ///
+    /// `ci_failure_exhausted` rows are excluded — the budget is spent and
+    /// those tasks must not be automatically re-dispatched.
+    pub fn list_stranded_ci_remediation_attempts(
+        &self,
+    ) -> Result<Vec<StrandedCiRemediationAttempt>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT cr.id, cr.work_item_id, cr.product_id, cr.pr_url
+             FROM ci_remediations cr
+             WHERE cr.status = 'pending'
+               AND EXISTS (
+                   SELECT 1 FROM tasks t
+                   WHERE t.id = cr.work_item_id
+                     AND t.status = 'blocked'
+                     AND t.blocked_reason = 'ci_failure'
+                     AND t.deleted_at IS NULL
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_executions we
+                   WHERE we.work_item_id = cr.work_item_id
+                     AND we.kind = 'ci_remediation'
+                     AND we.status IN ('ready', 'running', 'waiting_human')
+               )
+             ORDER BY cr.created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StrandedCiRemediationAttempt {
+                attempt_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                product_id: row.get(2)?,
+                pr_url: row.get(3)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Chores and project_tasks the engine has flagged with either
     /// `blocked: ci_failure` or `blocked: ci_failure_exhausted`. The
     /// merge poller iterates this list alongside the in_review and
@@ -6300,6 +6348,24 @@ pub struct StoredExternalRef {
 /// 'pending'` filter) — the churn guard or a human owns that path.
 #[derive(Debug, Clone)]
 pub struct StrandedConflictAttempt {
+    pub attempt_id: String,
+    pub work_item_id: String,
+    pub product_id: String,
+    pub pr_url: String,
+}
+
+/// A `ci_remediations` row that is `pending` but has no live execution
+/// (`kind='ci_remediation'` with status in `'ready'`, `'running'`, or
+/// `'waiting_human'`). This arises when two merge-queue dequeue events
+/// arrive in the same sweep: the first flips the task to
+/// `blocked: ci_failure` (consuming the `status='in_review'` WHERE
+/// guard) and the second inserts its own `ci_remediations` row but
+/// cannot flip the task again — leaving the row orphaned with no
+/// executor. The merge poller's stranded-attempt sweep rescues these
+/// by re-emitting a fresh execution request so a worker is dispatched
+/// without waiting for the task to return to `in_review`.
+#[derive(Debug, Clone)]
+pub struct StrandedCiRemediationAttempt {
     pub attempt_id: String,
     pub work_item_id: String,
     pub product_id: String,
