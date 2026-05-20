@@ -18,6 +18,8 @@ pub struct DefaultsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DefaultsTool {
     pub repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,17 @@ impl DefaultsConfig {
                 return Err(RepobinError::InvalidDefaults(format!(
                     "tool `{name}` must declare a non-empty repo URL"
                 )));
+            }
+            if let Some(sha) = &tool.sha {
+                let sha = sha.trim();
+                if sha.is_empty()
+                    || sha.len() > 40
+                    || !sha.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    return Err(RepobinError::InvalidDefaults(format!(
+                        "tool `{name}` has an invalid sha `{sha}` — must be a hex string of 1–40 characters"
+                    )));
+                }
             }
         }
         Ok(())
@@ -138,6 +151,7 @@ mod tests {
             "boss".to_string(),
             DefaultsTool {
                 repo: "https://example.com/mono.git".to_string(),
+                sha: None,
             },
         );
         let config = DefaultsConfig { version: 1, tools };
@@ -149,6 +163,57 @@ mod tests {
 
         let loaded = load_defaults_at(&path).unwrap().unwrap();
         assert_eq!(loaded.config, config);
+    }
+
+    #[test]
+    fn round_trips_sha_field() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("repobin.yaml");
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "boss".to_string(),
+            DefaultsTool {
+                repo: "https://example.com/mono.git".to_string(),
+                sha: Some("4baa8fa5e7b2c1d09a3f6b8c2e1d4f7a9b5c3e8d".to_string()),
+            },
+        );
+        tools.insert(
+            "cube".to_string(),
+            DefaultsTool {
+                repo: "https://example.com/mono.git".to_string(),
+                sha: None,
+            },
+        );
+        let config = DefaultsConfig { version: 1, tools };
+        write_defaults(&path, &config).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("4baa8fa5e7b2c1d09a3f6b8c2e1d4f7a9b5c3e8d"));
+        assert!(!raw.contains("sha: ~"), "None sha must be omitted");
+
+        let loaded = load_defaults_at(&path).unwrap().unwrap();
+        assert_eq!(loaded.config, config);
+    }
+
+    #[test]
+    fn accepts_short_sha() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("repobin.yaml");
+        fs::write(&path, "version: 1\ntools:\n  boss:\n    repo: https://x.git\n    sha: \"4baa8fa\"\n").unwrap();
+        let loaded = load_defaults_at(&path).unwrap().unwrap();
+        assert_eq!(loaded.config.tools["boss"].sha.as_deref(), Some("4baa8fa"));
+    }
+
+    #[test]
+    fn rejects_invalid_sha() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("repobin.yaml");
+        fs::write(&path, "version: 1\ntools:\n  boss:\n    repo: https://x.git\n    sha: \"not-hex!\"\n").unwrap();
+        let err = load_defaults_at(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid sha"),
+            "got error: {err}"
+        );
     }
 
     #[test]

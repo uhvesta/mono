@@ -105,6 +105,7 @@ fn merge_defaults(
             name.clone(),
             DefaultsTool {
                 repo: repo_url.to_string(),
+                sha: None,
             },
         );
     }
@@ -356,6 +357,7 @@ mod tests {
             "leftover".to_string(),
             DefaultsTool {
                 repo: "https://example.com/other.git".to_string(),
+                sha: None,
             },
         );
         let preexisting = DefaultsConfig { version: 1, tools };
