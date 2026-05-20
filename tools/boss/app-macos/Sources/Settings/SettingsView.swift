@@ -41,9 +41,30 @@ struct SettingsView: View {
 /// "Engine" pane — engine-side configuration health.
 /// Renders the same issues the chrome banner shows, plus the raw
 /// `ANTHROPIC_API_KEY` presence bit so the user can confirm at a
-/// glance the engine sees the env var.
+/// glance the engine sees the env var. Also surfaces the
+/// Keychain-backed override added in #735 so launching from
+/// Finder/Spotlight no longer requires a launchd plist or shell-
+/// inherited env.
 private struct EngineConfigPane: View {
     @EnvironmentObject private var chatModel: ChatViewModel
+
+    /// SecureField draft — never persisted, never inspected by other
+    /// state. Cleared on save so a typed-then-cancelled value doesn't
+    /// linger in memory longer than the pane is open.
+    @State private var apiKeyDraft: String = ""
+
+    /// Mirror of `APIKeyStore.readAnthropicApiKey() != nil` so the UI
+    /// can render "stored" / "not stored" without re-querying the
+    /// Keychain on every redraw. Refreshed on appear and after every
+    /// save / clear.
+    @State private var hasStoredApiKey: Bool = APIKeyStore.readAnthropicApiKey() != nil
+
+    /// User-visible error message from the last save / clear attempt.
+    /// `nil` means the last action succeeded (or none has happened).
+    @State private var apiKeyError: String?
+
+    /// Transient status line shown after a successful save / clear.
+    @State private var apiKeyStatus: String?
 
     var body: some View {
         Form {
@@ -56,15 +77,57 @@ private struct EngineConfigPane: View {
                     Text("ANTHROPIC_API_KEY")
                         .font(.body.weight(.medium))
                     Spacer()
-                    Text(chatModel.engineAnthropicApiKeyPresent ? "Detected" : "Not set")
+                    Text(engineKeyStatusLabel)
                         .foregroundStyle(.secondary)
                 }
                 if !chatModel.engineAnthropicApiKeyPresent {
-                    Text("Live worker summaries and pane summarization are disabled until ANTHROPIC_API_KEY is exported in the environment Boss launches its engine from. Set the variable in your shell startup file, then quit and relaunch Boss.")
+                    Text("Live worker summaries and pane summarization are disabled until ANTHROPIC_API_KEY is available to the engine. Paste a key below to store it in the macOS Keychain, or export the variable in your shell startup file and relaunch Boss.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    SecureField("sk-ant-…", text: $apiKeyDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(chatModel.isRestartingEngine)
+                    HStack(spacing: 8) {
+                        Button(hasStoredApiKey ? "Save & restart engine" : "Save") {
+                            saveApiKey()
+                        }
+                        .disabled(apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || chatModel.isRestartingEngine)
+                        if hasStoredApiKey {
+                            Button("Clear stored key") {
+                                clearApiKey()
+                            }
+                            .disabled(chatModel.isRestartingEngine)
+                        }
+                        if chatModel.isRestartingEngine {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Restarting engine…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text("Stored in the macOS Keychain (service \(APIKeyStore.service)). The Settings value overrides any ANTHROPIC_API_KEY in the engine's inherited environment. Saving restarts the engine so the new value takes effect.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let apiKeyError {
+                        Text(apiKeyError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if let apiKeyStatus {
+                        Text(apiKeyStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.top, 4)
             } header: {
                 Text("Required Configuration")
             }
@@ -95,6 +158,62 @@ private struct EngineConfigPane: View {
         }
         .formStyle(.grouped)
         .padding()
+        .onAppear {
+            // Refresh the Keychain-backed state on every appear so the
+            // "Stored" indicator reflects edits that happened outside
+            // this pane (another session, manual Keychain Access edit).
+            hasStoredApiKey = APIKeyStore.readAnthropicApiKey() != nil
+        }
+    }
+
+    /// Combined label for the presence row. Distinguishes "the engine
+    /// currently sees a key" (the runtime truth) from "we have a key
+    /// stored that will be applied at the next engine launch" (the
+    /// Settings truth). The two diverge for a brief window after Save
+    /// while the engine is restarting.
+    private var engineKeyStatusLabel: String {
+        if chatModel.engineAnthropicApiKeyPresent {
+            return hasStoredApiKey ? "Detected (from Settings)" : "Detected"
+        }
+        return hasStoredApiKey ? "Stored — restart engine to apply" : "Not set"
+    }
+
+    private func saveApiKey() {
+        let trimmed = apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            apiKeyError = "API key cannot be empty."
+            apiKeyStatus = nil
+            return
+        }
+        do {
+            try APIKeyStore.saveAnthropicApiKey(trimmed)
+            apiKeyDraft = ""
+            hasStoredApiKey = true
+            apiKeyError = nil
+            apiKeyStatus = "Saved. Restarting engine to apply…"
+            // Bounce the engine so the freshly-stored key is injected
+            // into its env on the next spawn (see
+            // EngineProcessController.launchDetached).
+            chatModel.restartEngine()
+        } catch {
+            apiKeyError = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            apiKeyStatus = nil
+        }
+    }
+
+    private func clearApiKey() {
+        do {
+            try APIKeyStore.clearAnthropicApiKey()
+            hasStoredApiKey = false
+            apiKeyError = nil
+            apiKeyStatus = "Cleared. Restarting engine so summarization falls back to env / disabled."
+            chatModel.restartEngine()
+        } catch {
+            apiKeyError = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            apiKeyStatus = nil
+        }
     }
 }
 
