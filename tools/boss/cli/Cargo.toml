@@ -9,11 +9,15 @@ boss-client = { path = "../client" }
 boss-protocol = { path = "../protocol" }
 clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
+reqwest = { workspace = true, features = ["json"] }
+rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+toml = { workspace = true }
 
 [dev-dependencies]
 boss-engine = { path = "../engine" }
 tempfile = { workspace = true }
-
+wiremock = { workspace = true }
