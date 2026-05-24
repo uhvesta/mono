@@ -63,3 +63,21 @@ steps:
     notify:
       - github_commit_status:
           context: "buildkite/mono/bazel-test"
+
+  # Post-merge only: build Boss.app with shake credentials embedded and
+  # publish a GitHub Release tagged boss-v1.0.N.  Skipped on PR branches and
+  # on merges that don't touch tools/boss/.
+  # Credentials are read from Buildkite's secret store; see:
+  #   tools/boss/docs/buildkite-shake-secrets-setup.md
+  - label: ":rocket: boss-release"
+    key: "boss-release"
+    if: build.branch == "main"
+    command: ".buildkite/steps/boss-release.sh"
+    depends_on: "bazel-test"
+    agents:
+      queue: "macos-arm64"
+    retry:
+      automatic: false
+    notify:
+      - github_commit_status:
+          context: "buildkite/mono/boss-release"
