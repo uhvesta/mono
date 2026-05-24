@@ -1661,75 +1661,92 @@ struct WorkBoardCardView: View {
             }
 
             if hasFooterContent {
-                HStack {
-                    PriorityChip(priority: WorkPriority.parse(task.priority))
-                    if let projectName, !projectName.isEmpty {
-                        WorkStatusBadge(text: projectName)
-                    }
-                    if isResolvingConflicts {
-                        ResolvingConflictsBadge()
-                    } else if isRemediatingCI {
-                        ResolvingCIFailureBadge()
-                    } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
-                        WorkStatusBadge(text: blockedText)
-                    }
-                    if isAutoBlocked {
-                        Image(systemName: "link")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.orange)
-                            .help(autoBlockTooltip)
-                            .accessibilityLabel("Auto-blocked by dependencies")
-                            .accessibilityValue(autoBlockTooltip)
-                    }
-                    if showsConflictClearedBadge {
-                        ConflictClearedBadge()
-                    }
-                    if showsCIAutoFixedBadge && ciFailureBadge == nil {
-                        CIAutoFixedBadge()
-                    }
-                    if let ciFailureBadge, !isRemediatingCI {
-                        CIFailureChip(badge: ciFailureBadge)
-                    }
-                    if let repoChip {
-                        RepoChipView(presentation: repoChip)
-                    }
-                    Spacer(minLength: 0)
-                    if let id = task.shortID {
-                        Text("T\(id)")
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("T\(id)")
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    if let extRef = externalRefLink {
-                        ExternalRefLinkView(presentation: extRef)
-                    }
-                    if task.kind == "design",
-                       let state = designDocState,
-                       let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
-                        Button {
-                            onOpenDesignDoc?()
-                        } label: {
-                            Image(systemName: presentation.systemImage)
-                                .font(.caption)
-                                .foregroundStyle(presentation.tint)
-                                .accessibilityLabel(presentation.accessibilityLabel)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        PriorityChip(priority: WorkPriority.parse(task.priority))
+                        if let projectName, !projectName.isEmpty {
+                            WorkStatusBadge(text: projectName)
                         }
-                        .buttonStyle(.plain)
-                        .help(presentation.tooltip)
-                    }
-                    if task.kind == "investigation",
-                       let webURL = task.investigationDocWebURL,
-                       let url = URL(string: webURL) {
-                        Link(destination: url) {
-                            Image(systemName: "doc.text")
-                                .font(.caption)
-                                .foregroundStyle(Color.secondary)
-                                .accessibilityLabel("Open investigation doc")
+                        if isResolvingConflicts {
+                            ResolvingConflictsBadge()
+                        } else if isRemediatingCI {
+                            ResolvingCIFailureBadge()
+                        } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
+                            WorkStatusBadge(text: blockedText)
                         }
-                        .buttonStyle(.plain)
-                        .help("Open investigation doc: \(webURL)")
+                        if isAutoBlocked {
+                            Image(systemName: "link")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.orange)
+                                .help(autoBlockTooltip)
+                                .accessibilityLabel("Auto-blocked by dependencies")
+                                .accessibilityValue(autoBlockTooltip)
+                        }
+                        if !stacksStatusBadges {
+                            if showsConflictClearedBadge {
+                                ConflictClearedBadge()
+                            }
+                            if showsCIAutoFixedBadge && ciFailureBadge == nil {
+                                CIAutoFixedBadge()
+                            }
+                            if let ciFailureBadge, !isRemediatingCI {
+                                CIFailureChip(badge: ciFailureBadge)
+                            }
+                        }
+                        if let repoChip {
+                            RepoChipView(presentation: repoChip)
+                        }
+                        Spacer(minLength: 0)
+                        if let id = task.shortID {
+                            Text("T\(id)")
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .accessibilityLabel("T\(id)")
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        if let extRef = externalRefLink {
+                            ExternalRefLinkView(presentation: extRef)
+                        }
+                        if task.kind == "design",
+                           let state = designDocState,
+                           let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+                            Button {
+                                onOpenDesignDoc?()
+                            } label: {
+                                Image(systemName: presentation.systemImage)
+                                    .font(.caption)
+                                    .foregroundStyle(presentation.tint)
+                                    .accessibilityLabel(presentation.accessibilityLabel)
+                            }
+                            .buttonStyle(.plain)
+                            .help(presentation.tooltip)
+                        }
+                        if task.kind == "investigation",
+                           let webURL = task.investigationDocWebURL,
+                           let url = URL(string: webURL) {
+                            Link(destination: url) {
+                                Image(systemName: "doc.text")
+                                    .font(.caption)
+                                    .foregroundStyle(Color.secondary)
+                                    .accessibilityLabel("Open investigation doc")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open investigation doc: \(webURL)")
+                        }
+                    }
+                    if stacksStatusBadges {
+                        HStack(spacing: 6) {
+                            if showsConflictClearedBadge {
+                                ConflictClearedBadge()
+                            }
+                            if showsCIAutoFixedBadge && ciFailureBadge == nil {
+                                CIAutoFixedBadge()
+                            }
+                            if let ciFailureBadge, !isRemediatingCI {
+                                CIFailureChip(badge: ciFailureBadge)
+                            }
+                        }
                     }
                 }
             }
@@ -1778,6 +1795,18 @@ struct WorkBoardCardView: View {
     private var hasFooterContent: Bool {
         true
     }
+
+    /// Number of transient status badges (conflict cleared, ci auto-fixed,
+    /// ci failure) that are currently visible on this card.
+    private var statusBadgeCount: Int {
+        (showsConflictClearedBadge ? 1 : 0)
+        + (showsCIAutoFixedBadge && ciFailureBadge == nil ? 1 : 0)
+        + (ciFailureBadge != nil && !isRemediatingCI ? 1 : 0)
+    }
+
+    /// When true, status badges overflow a single footer row and must be
+    /// pushed to a dedicated second row so the short_id is never clipped.
+    private var stacksStatusBadges: Bool { statusBadgeCount >= 2 }
 
     /// Tooltip body for the chain badge. Mirrors the CLI `show`
     /// output's prereq list so a hover tells the reader the same
@@ -3157,10 +3186,6 @@ private struct ConflictClearedBadge: View {
         }
         .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(Color.green)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(Color.green.opacity(0.12))
-        .clipShape(Capsule())
         .help("The engine cleared a merge conflict on this PR within the last 24 hours.")
         .accessibilityLabel("Conflict cleared by the engine")
     }
@@ -3173,7 +3198,7 @@ private struct ConflictClearedBadge: View {
 private struct CIAutoFixedBadge: View {
     var body: some View {
         HStack(spacing: 3) {
-            Image(systemName: "checkmark.seal.fill")
+            Image(systemName: "checkmark.circle.fill")
                 .font(.caption2.weight(.semibold))
             Text("ci auto-fixed")
                 .font(.caption.weight(.semibold))
@@ -3181,10 +3206,6 @@ private struct CIAutoFixedBadge: View {
         }
         .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(Color.green)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(Color.green.opacity(0.12))
-        .clipShape(Capsule())
         .help("The engine auto-fixed a CI failure on this PR within the last 24 hours.")
         .accessibilityLabel("CI auto-fixed by the engine")
     }
@@ -3244,10 +3265,6 @@ private struct CIFailureChip: View {
         }
         .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(color)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(color.opacity(0.14))
-        .clipShape(Capsule())
         .help(tooltip)
         .accessibilityLabel(tooltip)
     }
