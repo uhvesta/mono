@@ -205,6 +205,17 @@ enum ProjectCommand {
     /// emits the resolved target without opening it.
     #[command(name = "open-design")]
     OpenDesign(ProjectOpenDesignArgs),
+    /// Batch-scan every project's design-doc pointer and print the
+    /// ones that need attention. Surfaces three failure modes: the
+    /// resolver itself returning `Broken` (e.g. path set but no repo
+    /// to resolve against); pointers that resolve cleanly but whose
+    /// file is missing in the leased workspace (stale-on-rename, the
+    /// common case); and — opt-in via `--include-unverified` —
+    /// pointers we could not check because no workspace is leased for
+    /// the doc's repo. Exits non-zero when any broken entries are
+    /// found so the verb is usable from CI.
+    #[command(name = "lint-design-docs")]
+    LintDesignDocs(ProjectLintDesignDocsArgs),
     /// Manage dependency edges (`A depends on B` ⇒ B gates A).
     Depend {
         #[command(subcommand)]
@@ -1028,6 +1039,38 @@ struct ProjectOpenDesignArgs {
     /// instead. Combine with `--web` to print the web URL.
     #[arg(long)]
     print: bool,
+}
+
+/// Args for `boss project lint-design-docs`. Scans all products by
+/// default; `--product` narrows to a single product. The two opt-in
+/// flags expand the report beyond hard breakage: `--include-missing`
+/// adds projects that never had a pointer set, and
+/// `--include-unverified` adds resolved pointers whose file we could
+/// not stat because no cube workspace is currently leased for the
+/// doc's repo.
+#[derive(Debug, Clone, Args)]
+struct ProjectLintDesignDocsArgs {
+    /// Restrict the scan to a single product (slug or id). Omit to
+    /// scan every product the engine knows about.
+    #[arg(long)]
+    product: Option<String>,
+
+    /// Also list projects whose `design_doc_path` is unset. By
+    /// default the lint focuses on broken pointers — projects with
+    /// no pointer are a *missing* affordance, not a stale one, and
+    /// most callers don't want them in the report.
+    #[arg(long)]
+    include_missing: bool,
+
+    /// Also list pointers we could not verify locally. A pointer is
+    /// "unverified" when the resolver returns `Resolved` but no cube
+    /// workspace is leased for the doc's repo, so we can't stat the
+    /// file. These are *not* counted as broken (the file might
+    /// exist), but surfacing them is useful when running the lint
+    /// against work-environment pointers that live in unleased
+    /// docs-only repos.
+    #[arg(long)]
+    include_unverified: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2412,6 +2455,62 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 action.launch()?;
             }
             Ok(())
+        }
+        ProjectCommand::LintDesignDocs(args) => {
+            let products = match args.product {
+                Some(selector) => vec![resolve_product(&mut client, Some(selector), ctx).await?],
+                None => list_products(&mut client).await?,
+            };
+            let mut entries: Vec<LintDesignDocEntry> = Vec::new();
+            for product in &products {
+                let projects = list_projects(&mut client, &product.id, None).await?;
+                for project in projects {
+                    let state = if project.design_doc_path.is_some() {
+                        Some(
+                            resolve_project_design_doc(&mut client, &project.id)
+                                .await?
+                                .state,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(entry) = classify_lint_finding(
+                        product,
+                        &project,
+                        state.as_ref(),
+                        check_design_doc_file_exists,
+                        args.include_missing,
+                        args.include_unverified,
+                    ) {
+                        entries.push(entry);
+                    }
+                }
+            }
+            entries.sort_by(|a, b| {
+                a.product_slug
+                    .cmp(&b.product_slug)
+                    .then_with(|| a.project_slug.cmp(&b.project_slug))
+            });
+            let broken_count = entries
+                .iter()
+                .filter(|entry| entry.severity == LintSeverity::Broken)
+                .count();
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "entries": entries,
+                    "scanned_products": products.iter().map(|p| &p.id).collect::<Vec<_>>(),
+                    "broken_count": broken_count,
+                }),
+                || print_lint_design_docs_table(&entries),
+            )?;
+            if broken_count > 0 {
+                Err(CliError::application(format!(
+                    "{broken_count} project(s) have broken design-doc pointers"
+                )))
+            } else {
+                Ok(())
+            }
         }
         ProjectCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
     }
@@ -5751,6 +5850,264 @@ fn print_project_details(title: &str, project: &Project, parent_product: Option<
     }
 }
 
+/// Severity classification for `boss project lint-design-docs`.
+/// `Broken` entries drive the verb's non-zero exit code so the lint
+/// is usable from CI; `Missing` / `Unverified` are advisory only and
+/// only appear when the matching `--include-…` flag is passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LintSeverity {
+    /// The resolver returned `Broken`, or the resolved path doesn't
+    /// exist on disk in the leased workspace.
+    Broken,
+    /// No pointer set on the project at all. Advisory; only included
+    /// when `--include-missing` is passed.
+    Missing,
+    /// Resolver returned `Resolved` but no workspace was leased for
+    /// the repo, so the file's existence couldn't be confirmed.
+    /// Advisory; only included when `--include-unverified` is passed.
+    Unverified,
+}
+
+/// One row in the `lint-design-docs` report. Carries enough state for
+/// the human to act on the finding without re-resolving: project id
+/// + slug for identification, product slug for the grouping context,
+/// the current pointer fields (so the user can see what's set), the
+/// reason the finding fired, and a copy-pasteable `suggested_fix`
+/// CLI invocation.
+#[derive(Debug, Clone, Serialize)]
+struct LintDesignDocEntry {
+    project_id: String,
+    project_slug: String,
+    project_name: String,
+    product_id: String,
+    product_slug: String,
+    severity: LintSeverity,
+    /// Current `design_doc_path` value on the project row, if any.
+    design_doc_path: Option<String>,
+    /// Current `design_doc_repo_remote_url` override, if any. `None`
+    /// means the project inherits from `product.repo_remote_url`.
+    design_doc_repo_remote_url: Option<String>,
+    /// Current `design_doc_branch` override, if any. `None` means the
+    /// branch falls back to `"main"`.
+    design_doc_branch: Option<String>,
+    /// Human-readable explanation of why this entry was flagged. The
+    /// table renderer prints this verbatim; the JSON form carries it
+    /// for programmatic consumers.
+    reason: String,
+    /// A `boss project ...` invocation the user can run to repair the
+    /// finding. For `Broken` / `Missing` it's a `set-design-doc`
+    /// template with the project selector pre-filled; the user fills
+    /// in the new path. For `Unverified` it's `open-design --print
+    /// --web` so the user can manually confirm the doc still exists.
+    suggested_fix: String,
+}
+
+/// Pure classifier used by `boss project lint-design-docs`. Returns
+/// `None` when the project is healthy (or its finding doesn't match
+/// the caller's `--include-…` flags); returns `Some(entry)` when the
+/// project should appear in the lint report. `file_check` is the
+/// filesystem-probe callback (typically [`check_design_doc_file_exists`],
+/// stubbed in unit tests).
+fn classify_lint_finding<F>(
+    product: &Product,
+    project: &Project,
+    state: Option<&ProjectDesignDocState>,
+    file_check: F,
+    include_missing: bool,
+    include_unverified: bool,
+) -> Option<LintDesignDocEntry>
+where
+    F: FnOnce(&str, &str) -> bool,
+{
+    let selector = format!("{}/{}", product.slug, project.slug);
+    match state {
+        None => {
+            // `design_doc_path` is NULL — project has no pointer.
+            if !include_missing {
+                return None;
+            }
+            Some(LintDesignDocEntry {
+                project_id: project.id.clone(),
+                project_slug: project.slug.clone(),
+                project_name: project.name.clone(),
+                product_id: product.id.clone(),
+                product_slug: product.slug.clone(),
+                severity: LintSeverity::Missing,
+                design_doc_path: None,
+                design_doc_repo_remote_url: None,
+                design_doc_branch: None,
+                reason: "no design-doc pointer set".to_owned(),
+                suggested_fix: format!(
+                    "boss project set-design-doc {selector} --path <repo-relative-path>"
+                ),
+            })
+        }
+        Some(ProjectDesignDocState::NotSet) => {
+            // Should be unreachable when the caller only resolves
+            // projects with `design_doc_path` set — but treat it as
+            // equivalent to the `None` arm for robustness.
+            if !include_missing {
+                return None;
+            }
+            Some(LintDesignDocEntry {
+                project_id: project.id.clone(),
+                project_slug: project.slug.clone(),
+                project_name: project.name.clone(),
+                product_id: product.id.clone(),
+                product_slug: product.slug.clone(),
+                severity: LintSeverity::Missing,
+                design_doc_path: None,
+                design_doc_repo_remote_url: None,
+                design_doc_branch: None,
+                reason: "no design-doc pointer set".to_owned(),
+                suggested_fix: format!(
+                    "boss project set-design-doc {selector} --path <repo-relative-path>"
+                ),
+            })
+        }
+        Some(ProjectDesignDocState::Broken { reason }) => Some(LintDesignDocEntry {
+            project_id: project.id.clone(),
+            project_slug: project.slug.clone(),
+            project_name: project.name.clone(),
+            product_id: product.id.clone(),
+            product_slug: product.slug.clone(),
+            severity: LintSeverity::Broken,
+            design_doc_path: project.design_doc_path.clone(),
+            design_doc_repo_remote_url: project.design_doc_repo_remote_url.clone(),
+            design_doc_branch: project.design_doc_branch.clone(),
+            reason: reason.clone(),
+            suggested_fix: format!(
+                "boss project set-design-doc {selector} --path <p> --repo <repo-url>"
+            ),
+        }),
+        Some(ProjectDesignDocState::Resolved {
+            resolved,
+            workspace_path,
+            ..
+        }) => match workspace_path.as_deref() {
+            Some(workspace) => {
+                if file_check(workspace, &resolved.path) {
+                    None
+                } else {
+                    Some(LintDesignDocEntry {
+                        project_id: project.id.clone(),
+                        project_slug: project.slug.clone(),
+                        project_name: project.name.clone(),
+                        product_id: product.id.clone(),
+                        product_slug: product.slug.clone(),
+                        severity: LintSeverity::Broken,
+                        design_doc_path: Some(resolved.path.clone()),
+                        design_doc_repo_remote_url: project.design_doc_repo_remote_url.clone(),
+                        design_doc_branch: project.design_doc_branch.clone(),
+                        reason: format!(
+                            "file not found at {}/{} (pointer may be stale after a rename)",
+                            workspace, resolved.path,
+                        ),
+                        suggested_fix: format!(
+                            "boss project set-design-doc {selector} --path <new-path>"
+                        ),
+                    })
+                }
+            }
+            None => {
+                if !include_unverified {
+                    return None;
+                }
+                Some(LintDesignDocEntry {
+                    project_id: project.id.clone(),
+                    project_slug: project.slug.clone(),
+                    project_name: project.name.clone(),
+                    product_id: product.id.clone(),
+                    product_slug: product.slug.clone(),
+                    severity: LintSeverity::Unverified,
+                    design_doc_path: Some(resolved.path.clone()),
+                    design_doc_repo_remote_url: project.design_doc_repo_remote_url.clone(),
+                    design_doc_branch: project.design_doc_branch.clone(),
+                    reason: format!(
+                        "no leased workspace for {} — cannot verify file exists",
+                        resolved.repo_remote_url,
+                    ),
+                    suggested_fix: format!("boss project open-design {selector} --print --web"),
+                })
+            }
+        },
+    }
+}
+
+/// Filesystem probe used by the real CLI handler — `true` when the
+/// resolved doc exists as a regular file inside the leased
+/// workspace. Symlinks resolve through; broken symlinks return
+/// `false`. The pure classifier takes this as an injectable callback
+/// so the unit tests don't have to touch disk.
+fn check_design_doc_file_exists(workspace_path: &str, repo_relative_path: &str) -> bool {
+    PathBuf::from(workspace_path).join(repo_relative_path).is_file()
+}
+
+fn print_lint_design_docs_table(entries: &[LintDesignDocEntry]) {
+    if entries.is_empty() {
+        println!("No design-doc pointer issues found.");
+        return;
+    }
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["SEVERITY", "PROJECT", "PATH", "REASON"]);
+    for entry in entries {
+        table.add_row(vec![
+            lint_severity_label(entry.severity).to_owned(),
+            format!("{}/{}", entry.product_slug, entry.project_slug),
+            entry.design_doc_path.clone().unwrap_or_default(),
+            entry.reason.clone(),
+        ]);
+    }
+    println!("{table}");
+    println!();
+    println!("Suggested fixes:");
+    for entry in entries {
+        println!(
+            "  [{}] {}/{}: {}",
+            lint_severity_label(entry.severity),
+            entry.product_slug,
+            entry.project_slug,
+            entry.suggested_fix,
+        );
+    }
+    println!();
+    println!("{}", lint_summary_line(entries));
+}
+
+fn lint_severity_label(severity: LintSeverity) -> &'static str {
+    match severity {
+        LintSeverity::Broken => "broken",
+        LintSeverity::Missing => "missing",
+        LintSeverity::Unverified => "unverified",
+    }
+}
+
+/// One-line tally of the lint findings, broken down by severity, for
+/// the human report footer (the JSON form already carries
+/// `broken_count`). Only severities actually present are listed, so a
+/// run that surfaces nothing but stale pointers reads "2 finding(s): 2
+/// broken" rather than padding the line with zero counts. Callers
+/// invoke this only when `entries` is non-empty — the empty case is
+/// handled earlier with a dedicated "no issues" message.
+fn lint_summary_line(entries: &[LintDesignDocEntry]) -> String {
+    let count = |severity| entries.iter().filter(|e| e.severity == severity).count();
+    let parts: Vec<String> = [
+        (LintSeverity::Broken, "broken"),
+        (LintSeverity::Missing, "missing"),
+        (LintSeverity::Unverified, "unverified"),
+    ]
+    .into_iter()
+    .filter_map(|(severity, label)| match count(severity) {
+        0 => None,
+        n => Some(format!("{n} {label}")),
+    })
+    .collect();
+    format!("{} finding(s): {}", entries.len(), parts.join(", "))
+}
+
 /// Format the "Design doc:" line appended by `boss project show` /
 /// `boss project set-design-doc`. `None` means "no line should be
 /// emitted" — used by `Show` so the unset case stays silent rather
@@ -6194,12 +6551,12 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, EffortLevelArg, MoveTarget,
-        OpenDesignAction, ProductCommand, ProductStatus, ProjectCommand, ProjectStatus,
-        RepoSelector, TaskCommand, classify_bind_pr, decide_open_design_action,
-        ensure_explicit_product_matches, expect_leaf_work_item, format_project_design_doc_line,
-        format_repo_line, is_typed_work_item_id, pick_by_index, short_name_for,
-        split_shake_report, validate_github_pr_url,
+        BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity,
+        MoveTarget, OpenDesignAction, ProductCommand, ProductStatus, ProjectCommand,
+        ProjectStatus, RepoSelector, TaskCommand, classify_bind_pr, classify_lint_finding,
+        decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
+        format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
+        pick_by_index, short_name_for, split_shake_report, validate_github_pr_url,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -6992,6 +7349,282 @@ mod tests {
         let line = format_project_design_doc_line(&state).expect("broken → line");
         assert!(line.contains("(broken)"));
         assert!(line.contains("no repo"));
+    }
+
+    fn lint_product() -> Product {
+        Product::builder()
+            .id("prod_1")
+            .name("Boss")
+            .slug("boss")
+            .description("")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .status("active")
+            .created_at("")
+            .updated_at("")
+            .build()
+    }
+
+    fn lint_project(slug: &str, path: Option<&str>) -> Project {
+        Project {
+            id: format!("proj_{slug}"),
+            product_id: "prod_1".to_owned(),
+            name: slug.to_owned(),
+            slug: slug.to_owned(),
+            description: String::new(),
+            goal: String::new(),
+            status: "planned".to_owned(),
+            priority: "medium".to_owned(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_status_actor: "human".to_owned(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: None,
+            design_doc_path: path.map(str::to_owned),
+            short_id: None,
+        }
+    }
+
+    /// A resolved pointer with a leased workspace whose file exists
+    /// on disk is healthy — the lint produces no entry.
+    #[test]
+    fn lint_skips_resolved_pointer_with_existing_file() {
+        let product = lint_product();
+        let project = lint_project("alpha", Some("tools/boss/docs/designs/alpha.md"));
+        let state = ProjectDesignDocState::Resolved {
+            resolved: ResolvedDesignDoc {
+                repo_remote_url: "git@github.com:spinyfin/mono.git".to_owned(),
+                branch: "main".to_owned(),
+                path: "tools/boss/docs/designs/alpha.md".to_owned(),
+                kind: ResolvedDesignDocKind::SameProduct {
+                    product_id: "prod_1".into(),
+                },
+            },
+            workspace_path: Some("/tmp/mono-agent-007".to_owned()),
+            web_url: "https://example.test/blob/main/x.md".to_owned(),
+            raw_content_url: None,
+        };
+        let entry = classify_lint_finding(&product, &project, Some(&state), |_, _| true, false, false);
+        assert!(entry.is_none(), "healthy pointer must not appear in lint");
+    }
+
+    /// A resolved pointer whose file is missing in the leased
+    /// workspace is the canonical stale-on-rename case. Always
+    /// flagged as `Broken`, regardless of opt-in flags.
+    #[test]
+    fn lint_flags_resolved_pointer_with_missing_file_as_broken() {
+        let product = lint_product();
+        let project = lint_project("alpha", Some("tools/boss/docs/designs/alpha-renamed.md"));
+        let state = ProjectDesignDocState::Resolved {
+            resolved: ResolvedDesignDoc {
+                repo_remote_url: "git@github.com:spinyfin/mono.git".to_owned(),
+                branch: "main".to_owned(),
+                path: "tools/boss/docs/designs/alpha-renamed.md".to_owned(),
+                kind: ResolvedDesignDocKind::SameProduct {
+                    product_id: "prod_1".into(),
+                },
+            },
+            workspace_path: Some("/tmp/mono-agent-007".to_owned()),
+            web_url: "https://example.test/blob/main/x.md".to_owned(),
+            raw_content_url: None,
+        };
+        let entry = classify_lint_finding(
+            &product,
+            &project,
+            Some(&state),
+            |_, _| false,
+            /*include_missing*/ false,
+            /*include_unverified*/ false,
+        )
+        .expect("missing file must surface as a lint entry");
+        assert_eq!(entry.severity, LintSeverity::Broken);
+        assert!(entry.reason.contains("file not found"), "reason: {}", entry.reason);
+        assert!(
+            entry.suggested_fix.contains("boss project set-design-doc boss/alpha"),
+            "fix template should pre-fill product/project selector: {}",
+            entry.suggested_fix,
+        );
+    }
+
+    /// The resolver's own `Broken` state — typically "path set but no
+    /// repo to resolve against" — is always reported, no flags
+    /// required.
+    #[test]
+    fn lint_flags_resolver_broken_state() {
+        let product = lint_product();
+        let project = lint_project("alpha", Some("designs/alpha.md"));
+        let state = ProjectDesignDocState::Broken {
+            reason: "no repo to resolve against".to_owned(),
+        };
+        let entry = classify_lint_finding(&product, &project, Some(&state), |_, _| true, false, false)
+            .expect("broken resolver state must surface");
+        assert_eq!(entry.severity, LintSeverity::Broken);
+        assert!(entry.reason.contains("no repo"));
+    }
+
+    /// A resolved pointer with no leased workspace can't be probed.
+    /// Default behaviour: silently skip (we can't confirm it's
+    /// broken). With `--include-unverified`: surface as `Unverified`.
+    #[test]
+    fn lint_skips_unverified_pointer_by_default() {
+        let product = lint_product();
+        let project = lint_project("alpha", Some("designs/alpha.md"));
+        let state = ProjectDesignDocState::Resolved {
+            resolved: ResolvedDesignDoc {
+                repo_remote_url: "https://github.com/myorg/wiki.git".to_owned(),
+                branch: "main".to_owned(),
+                path: "designs/alpha.md".to_owned(),
+                kind: ResolvedDesignDocKind::External,
+            },
+            workspace_path: None,
+            web_url: "https://example.test/blob/main/x.md".to_owned(),
+            raw_content_url: None,
+        };
+        // The file_check callback must NOT be invoked when there's
+        // no workspace — assert that by panicking from it.
+        let entry = classify_lint_finding(
+            &product,
+            &project,
+            Some(&state),
+            |_, _| panic!("file_check must not run when no workspace is leased"),
+            /*include_missing*/ false,
+            /*include_unverified*/ false,
+        );
+        assert!(entry.is_none(), "unverified pointers are skipped by default");
+    }
+
+    #[test]
+    fn lint_includes_unverified_when_flag_set() {
+        let product = lint_product();
+        let project = lint_project("alpha", Some("designs/alpha.md"));
+        let state = ProjectDesignDocState::Resolved {
+            resolved: ResolvedDesignDoc {
+                repo_remote_url: "https://github.com/myorg/wiki.git".to_owned(),
+                branch: "main".to_owned(),
+                path: "designs/alpha.md".to_owned(),
+                kind: ResolvedDesignDocKind::External,
+            },
+            workspace_path: None,
+            web_url: "https://example.test/blob/main/x.md".to_owned(),
+            raw_content_url: None,
+        };
+        let entry = classify_lint_finding(
+            &product,
+            &project,
+            Some(&state),
+            |_, _| true,
+            false,
+            /*include_unverified*/ true,
+        )
+        .expect("--include-unverified must surface unverified pointers");
+        assert_eq!(entry.severity, LintSeverity::Unverified);
+        assert!(entry.reason.contains("no leased workspace"));
+    }
+
+    /// Projects with no pointer set are silently skipped unless
+    /// `--include-missing` is on; then they surface as `Missing`
+    /// (advisory, not counted as broken for the exit code).
+    #[test]
+    fn lint_skips_missing_pointer_by_default() {
+        let product = lint_product();
+        let project = lint_project("alpha", None);
+        let entry = classify_lint_finding(&product, &project, None, |_, _| true, false, false);
+        assert!(entry.is_none(), "missing pointers are skipped by default");
+    }
+
+    #[test]
+    fn lint_includes_missing_when_flag_set() {
+        let product = lint_product();
+        let project = lint_project("alpha", None);
+        let entry = classify_lint_finding(
+            &product,
+            &project,
+            None,
+            |_, _| true,
+            /*include_missing*/ true,
+            false,
+        )
+        .expect("--include-missing must surface unset pointers");
+        assert_eq!(entry.severity, LintSeverity::Missing);
+        assert!(entry.design_doc_path.is_none());
+        assert!(entry.suggested_fix.contains("set-design-doc boss/alpha"));
+    }
+
+    /// The footer tally lists each present severity with its count and
+    /// omits severities with no findings.
+    #[test]
+    fn lint_summary_line_breaks_down_present_severities() {
+        let product = lint_product();
+        let broken = ProjectDesignDocState::Broken {
+            reason: "no repo".to_owned(),
+        };
+        let entries = vec![
+            classify_lint_finding(
+                &product,
+                &lint_project("a", Some("a.md")),
+                Some(&broken),
+                |_, _| true,
+                false,
+                false,
+            )
+            .unwrap(),
+            classify_lint_finding(
+                &product,
+                &lint_project("b", Some("b.md")),
+                Some(&broken),
+                |_, _| true,
+                false,
+                false,
+            )
+            .unwrap(),
+            classify_lint_finding(
+                &product,
+                &lint_project("c", None),
+                None,
+                |_, _| true,
+                true,
+                false,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(lint_summary_line(&entries), "3 finding(s): 2 broken, 1 missing");
+    }
+
+    #[test]
+    fn parses_project_lint_design_docs_defaults() {
+        let cli = Cli::parse_from(["boss", "project", "lint-design-docs"]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::LintDesignDocs(args),
+            } => {
+                assert!(args.product.is_none());
+                assert!(!args.include_missing);
+                assert!(!args.include_unverified);
+            }
+            _ => panic!("expected project lint-design-docs command"),
+        }
+    }
+
+    #[test]
+    fn parses_project_lint_design_docs_with_flags() {
+        let cli = Cli::parse_from([
+            "boss",
+            "project",
+            "lint-design-docs",
+            "--product",
+            "boss",
+            "--include-missing",
+            "--include-unverified",
+        ]);
+        match cli.command {
+            Commands::Project {
+                command: ProjectCommand::LintDesignDocs(args),
+            } => {
+                assert_eq!(args.product.as_deref(), Some("boss"));
+                assert!(args.include_missing);
+                assert!(args.include_unverified);
+            }
+            _ => panic!("expected project lint-design-docs command"),
+        }
     }
 
     #[test]
