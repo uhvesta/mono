@@ -9,3 +9,11 @@ build --experimental_disk_cache_gc_max_age=7d
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 
+# boss shake credentials: propagate the three env vars that embed the
+# GitHub App into the binary at compile time. Values must be set in your
+# shell (or via direnv) before running bazel build //tools/boss/cli:boss.
+# See tools/boss/cli/README.md for the one-time developer setup instructions.
+build --action_env=BOSS_SHAKE_APP_ID
+build --action_env=BOSS_SHAKE_INSTALLATION_ID
+build --action_env=BOSS_SHAKE_PRIVATE_KEY_PEM
+

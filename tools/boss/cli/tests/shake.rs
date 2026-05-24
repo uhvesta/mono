@@ -1,10 +1,8 @@
 //! End-to-end coverage for `boss shake` — the bug-report-against-Boss verb.
 //!
 //! `--dry-run` exercises the parse/dispatch path without hitting the
-//! GitHub API. The missing-config test exercises the failure mode the
-//! user will hit if they invoke `boss shake` before completing the
-//! one-time GitHub App setup documented in PR #748 — the error message
-//! must point them back at those instructions.
+//! GitHub API. The via-shake tests confirm the non-suppressible label
+//! is present in the payload regardless of CLI flags.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -93,34 +91,35 @@ fn shake_rejects_empty_report() {
     );
 }
 
-/// Missing GitHub App config → loud error that points the user at the
-/// setup instructions. This is the path real users will hit on their
-/// first non-dry-run `boss shake` before they've completed setup.
+/// Binary built without shake credentials → helpful error pointing at
+/// the developer setup README. This covers the "fresh clone without
+/// env vars" path; CI builds embed the credentials so this path only
+/// appears in local dev without the vars set.
 #[test]
-fn shake_without_app_config_points_at_setup_instructions() {
+fn shake_without_embedded_credentials_exits_with_readme_pointer() {
+    // This test only applies when the binary was built without
+    // credentials. If they are embedded, skip so we don't need a live
+    // GitHub App for the test suite.
+    if option_env!("BOSS_SHAKE_APP_ID").is_some() {
+        return;
+    }
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let report_path = tmp.path().join("bug.md");
     std::fs::write(&report_path, "Engine wedges on close\n\nrepro: …").expect("write report");
 
-    let missing_config = tmp.path().join("does-not-exist.toml");
-
     let output = Command::new(boss_binary())
-        .env("BOSS_GITHUB_APP_CONFIG", &missing_config)
         .args(["shake", report_path.to_str().unwrap()])
         .output()
         .expect("exec boss shake");
 
     assert!(
         !output.status.success(),
-        "expected non-zero exit when config is missing"
+        "expected non-zero exit when credentials are not embedded"
     );
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
-        stderr.contains("PR #748"),
-        "missing-config error should point at the setup instructions, got: {stderr}",
-    );
-    assert!(
-        stderr.contains("github-app.toml") || stderr.contains("does-not-exist.toml"),
-        "missing-config error should name the file it tried, got: {stderr}",
+        stderr.contains("README.md"),
+        "missing-credentials error should point at README.md, got: {stderr}"
     );
 }

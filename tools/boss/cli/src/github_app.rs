@@ -8,14 +8,11 @@
 //! for a short-lived installation access token, and use that token on
 //! the issue-create call.
 //!
-//! Setup is documented in the PR body for #748; in short the user
-//! registers a GitHub App, installs it on the target repo, and drops a
-//! `github-app.toml` at `~/Library/Application Support/Boss/` pointing
-//! at the App's downloaded private key. The verb fails loud with a
-//! pointer to those instructions if the config is missing or any field
-//! is still a placeholder.
+//! Credentials are embedded at build time from three env vars:
+//! `BOSS_SHAKE_APP_ID`, `BOSS_SHAKE_INSTALLATION_ID`, and
+//! `BOSS_SHAKE_PRIVATE_KEY_PEM`. See `tools/boss/cli/README.md` for
+//! the one-time developer setup instructions.
 
-use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,19 +20,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 
-/// Where the App config lives by default. The user can override with
-/// `BOSS_GITHUB_APP_CONFIG` (mainly for tests; an advanced user could
-/// also point it at a per-machine alt config).
-pub const DEFAULT_CONFIG_REL: &str = "Library/Application Support/Boss/github-app.toml";
-
 /// Default base URL for the GitHub REST API. Overridable via
 /// `BOSS_GITHUB_API_BASE` so tests can point at a wiremock instance.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 
-/// Sentinel placeholder string the user must replace before the
-/// config is usable. Documented in the PR body and in the error message
-/// the verb prints when a field still matches.
-pub const PLACEHOLDER: &str = "REPLACE_WITH_";
+/// Label added to every issue filed via `boss shake`. Unstrippable —
+/// present even when the user passes `--label` flags. Primary
+/// abuse-mitigation lever: issues can be bulk-filtered or cleaned by
+/// querying this label.
+const VIA_SHAKE_LABEL: &str = "via-shake";
 
 /// User-Agent on every GitHub API call. GitHub rejects calls without
 /// one; a stable string makes our traffic identifiable in audit logs.
@@ -45,12 +38,46 @@ const USER_AGENT: &str = "boss-shake";
 /// slack on both ends.
 const JWT_TTL_SECS: u64 = 9 * 60;
 
-/// Where to find App credentials.
-#[derive(Debug, Clone, Deserialize)]
+// Credentials embedded at compile time from environment variables.
+// Set BOSS_SHAKE_APP_ID, BOSS_SHAKE_INSTALLATION_ID, and
+// BOSS_SHAKE_PRIVATE_KEY_PEM before building. See tools/boss/cli/README.md.
+const EMBEDDED_APP_ID: Option<&str> = option_env!("BOSS_SHAKE_APP_ID");
+const EMBEDDED_INSTALLATION_ID: Option<&str> = option_env!("BOSS_SHAKE_INSTALLATION_ID");
+const EMBEDDED_PRIVATE_KEY_PEM: Option<&str> = option_env!("BOSS_SHAKE_PRIVATE_KEY_PEM");
+
+/// App credentials embedded at build time.
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub app_id: String,
     pub installation_id: String,
-    pub private_key_path: PathBuf,
+    /// Full PEM contents (RSA private key) embedded at compile time.
+    pub private_key_pem: String,
+}
+
+/// Load credentials that were embedded at build time. Fails if this
+/// binary was built without the three `BOSS_SHAKE_*` env vars set.
+/// See tools/boss/cli/README.md for developer setup instructions.
+pub fn embedded_config() -> Result<AppConfig> {
+    let app_id = EMBEDDED_APP_ID
+        .ok_or_else(|| anyhow!(
+            "this build was produced without shake credentials; \
+             see tools/boss/cli/README.md for developer setup instructions"
+        ))?;
+    let installation_id = EMBEDDED_INSTALLATION_ID
+        .ok_or_else(|| anyhow!(
+            "this build was produced without shake credentials; \
+             see tools/boss/cli/README.md for developer setup instructions"
+        ))?;
+    let private_key_pem = EMBEDDED_PRIVATE_KEY_PEM
+        .ok_or_else(|| anyhow!(
+            "this build was produced without shake credentials; \
+             see tools/boss/cli/README.md for developer setup instructions"
+        ))?;
+    Ok(AppConfig {
+        app_id: app_id.to_owned(),
+        installation_id: installation_id.to_owned(),
+        private_key_pem: private_key_pem.to_owned(),
+    })
 }
 
 /// Result of `POST /app/installations/{id}/access_tokens`.
@@ -75,52 +102,6 @@ struct CreateIssueBody<'a> {
 pub struct IssueResponse {
     pub html_url: String,
     pub number: u64,
-}
-
-/// Resolve the config file path, honoring the `BOSS_GITHUB_APP_CONFIG`
-/// override.
-pub fn config_path() -> Result<PathBuf> {
-    if let Ok(explicit) = std::env::var("BOSS_GITHUB_APP_CONFIG") {
-        return Ok(PathBuf::from(explicit));
-    }
-    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME is not set"))?;
-    Ok(PathBuf::from(home).join(DEFAULT_CONFIG_REL))
-}
-
-/// Load and validate the App config. Fails loud if the file is missing
-/// or any field still has a placeholder value — the user needs the
-/// error message to point them at the setup instructions.
-pub fn load_config(path: &Path) -> Result<AppConfig> {
-    let raw = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "cannot read GitHub App config at {}. See PR #748 for setup instructions.",
-            path.display()
-        )
-    })?;
-    let cfg: AppConfig = toml::from_str(&raw)
-        .with_context(|| format!("parse {} as TOML", path.display()))?;
-
-    if cfg.app_id.is_empty() || cfg.app_id.contains(PLACEHOLDER) {
-        bail!(
-            "{}: app_id is unset or still a placeholder. See PR #748 for setup instructions.",
-            path.display()
-        );
-    }
-    if cfg.installation_id.is_empty() || cfg.installation_id.contains(PLACEHOLDER) {
-        bail!(
-            "{}: installation_id is unset or still a placeholder. See PR #748 for setup instructions.",
-            path.display()
-        );
-    }
-    let key_path = cfg.private_key_path.to_string_lossy();
-    if key_path.is_empty() || key_path.contains(PLACEHOLDER) {
-        bail!(
-            "{}: private_key_path is unset or still a placeholder. See PR #748 for setup instructions.",
-            path.display()
-        );
-    }
-
-    Ok(cfg)
 }
 
 /// Mint a 9-minute JWT signed with the App's private key. GitHub
@@ -206,6 +187,18 @@ async fn fetch_installation_token(
     Ok(parsed.token)
 }
 
+/// Build the effective label list: user-supplied labels plus the
+/// mandatory `via-shake` label. The `via-shake` label is always
+/// present regardless of what the user passes; it is the primary
+/// abuse-mitigation lever on the GitHub side.
+pub fn build_labels(user_labels: &[String]) -> Vec<String> {
+    let mut labels: Vec<String> = user_labels.to_vec();
+    if !labels.iter().any(|l| l == VIA_SHAKE_LABEL) {
+        labels.push(VIA_SHAKE_LABEL.to_owned());
+    }
+    labels
+}
+
 /// Create an issue against `repo` (must be `owner/name`) using
 /// `token` as Bearer credentials.
 async fn create_issue(
@@ -222,10 +215,14 @@ async fn create_issue(
         api_base.trim_end_matches('/'),
         repo
     );
+    // Append a hidden attribution comment so the issue source is
+    // traceable even if the via-shake label is manually removed.
+    let attributed_body = format!("{body}\n\n<!-- via boss shake -->");
+    let effective_labels = build_labels(labels);
     let payload = CreateIssueBody {
         title,
-        body,
-        labels,
+        body: &attributed_body,
+        labels: &effective_labels,
     };
     let resp = client
         .post(&url)
@@ -248,10 +245,10 @@ async fn create_issue(
         .context("decode issue-create response")
 }
 
-/// Top-level entry point used by the CLI: read the App config, sign a
-/// JWT, swap it for an installation token, then file the issue. The
-/// `api_base` is parametrized so tests can point at a wiremock; the CLI
-/// caller passes [`DEFAULT_API_BASE`] (or whatever
+/// Top-level entry point used by the CLI: use the embedded App config,
+/// sign a JWT, swap it for an installation token, then file the issue.
+/// The `api_base` is parametrized so tests can point at a wiremock;
+/// the CLI caller passes [`DEFAULT_API_BASE`] (or whatever
 /// `BOSS_GITHUB_API_BASE` resolves to).
 pub async fn file_issue(
     config: &AppConfig,
@@ -261,13 +258,7 @@ pub async fn file_issue(
     body: &str,
     labels: &[String],
 ) -> Result<IssueResponse> {
-    let pem = std::fs::read(&config.private_key_path).with_context(|| {
-        format!(
-            "read GitHub App private key at {}",
-            config.private_key_path.display()
-        )
-    })?;
-    let jwt = build_jwt(&config.app_id, &pem)?;
+    let jwt = build_jwt(&config.app_id, config.private_key_pem.as_bytes())?;
     let client = http_client();
     let token = fetch_installation_token(api_base, &config.installation_id, &jwt, client).await?;
     create_issue(api_base, repo, title, body, labels, &token, client).await
@@ -277,7 +268,6 @@ pub async fn file_issue(
 mod tests {
     use super::*;
     use jsonwebtoken::{DecodingKey, Validation, decode};
-    use std::io::Write;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -287,24 +277,6 @@ mod tests {
     /// App download UI emits.
     const TEST_RSA_PEM: &str = include_str!("../tests/fixtures/github-app-private-key.pem");
     const TEST_RSA_PUBLIC_PEM: &str = include_str!("../tests/fixtures/github-app-public-key.pem");
-
-    fn write_config(dir: &Path, key_path: &Path) -> PathBuf {
-        let cfg_path = dir.join("github-app.toml");
-        let mut f = std::fs::File::create(&cfg_path).unwrap();
-        writeln!(
-            f,
-            "app_id = \"12345\"\ninstallation_id = \"67890\"\nprivate_key_path = \"{}\"",
-            key_path.display()
-        )
-        .unwrap();
-        cfg_path
-    }
-
-    fn write_private_key(dir: &Path) -> PathBuf {
-        let key_path = dir.join("private-key.pem");
-        std::fs::write(&key_path, TEST_RSA_PEM).unwrap();
-        key_path
-    }
 
     #[test]
     fn build_jwt_produces_decodable_rs256_token() {
@@ -338,66 +310,27 @@ mod tests {
     }
 
     #[test]
-    fn load_config_reads_valid_toml() {
-        let tmp = tempfile::tempdir().unwrap();
-        let key = write_private_key(tmp.path());
-        let cfg_path = write_config(tmp.path(), &key);
+    fn build_labels_always_includes_via_shake() {
+        // With no user labels.
+        let labels = build_labels(&[]);
+        assert!(labels.contains(&VIA_SHAKE_LABEL.to_owned()));
 
-        let cfg = load_config(&cfg_path).unwrap();
-        assert_eq!(cfg.app_id, "12345");
-        assert_eq!(cfg.installation_id, "67890");
-        assert_eq!(cfg.private_key_path, key);
+        // With user labels, via-shake is still present.
+        let labels = build_labels(&["bug".to_string(), "feature".to_string()]);
+        assert!(labels.contains(&VIA_SHAKE_LABEL.to_owned()));
+        assert!(labels.contains(&"bug".to_string()));
+
+        // Passing via-shake explicitly doesn't duplicate it.
+        let labels = build_labels(&[VIA_SHAKE_LABEL.to_owned()]);
+        assert_eq!(labels.iter().filter(|l| *l == VIA_SHAKE_LABEL).count(), 1);
     }
 
-    #[test]
-    fn load_config_rejects_missing_file() {
-        let err = load_config(Path::new("/definitely/not/here/github-app.toml")).unwrap_err();
-        assert!(
-            err.to_string().contains("PR #748"),
-            "error should point at setup instructions: {err}"
-        );
-    }
-
-    #[test]
-    fn load_config_rejects_placeholder_app_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let key = write_private_key(tmp.path());
-        let cfg_path = tmp.path().join("github-app.toml");
-        std::fs::write(
-            &cfg_path,
-            format!(
-                "app_id = \"REPLACE_WITH_APP_ID\"\ninstallation_id = \"67890\"\nprivate_key_path = \"{}\"",
-                key.display()
-            ),
-        )
-        .unwrap();
-
-        let err = load_config(&cfg_path).unwrap_err();
-        assert!(
-            err.to_string().contains("app_id") && err.to_string().contains("placeholder"),
-            "error should call out the placeholder: {err}"
-        );
-    }
-
-    #[test]
-    fn load_config_rejects_placeholder_installation_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let key = write_private_key(tmp.path());
-        let cfg_path = tmp.path().join("github-app.toml");
-        std::fs::write(
-            &cfg_path,
-            format!(
-                "app_id = \"12345\"\ninstallation_id = \"REPLACE_WITH_INSTALLATION_ID\"\nprivate_key_path = \"{}\"",
-                key.display()
-            ),
-        )
-        .unwrap();
-
-        let err = load_config(&cfg_path).unwrap_err();
-        assert!(
-            err.to_string().contains("installation_id"),
-            "error should call out installation_id: {err}"
-        );
+    fn make_test_config() -> AppConfig {
+        AppConfig {
+            app_id: "42".into(),
+            installation_id: "67890".into(),
+            private_key_pem: TEST_RSA_PEM.to_owned(),
+        }
     }
 
     #[tokio::test]
@@ -429,13 +362,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let key_path = write_private_key(tmp.path());
-        let cfg = AppConfig {
-            app_id: "42".into(),
-            installation_id: "67890".into(),
-            private_key_path: key_path,
-        };
+        let cfg = make_test_config();
 
         let resp = file_issue(
             &cfg,
@@ -452,6 +379,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_issue_always_sends_via_shake_label() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/app/installations/67890/access_tokens"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"token": "v1.token"})),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/repos/spinyfin/mono/issues"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "html_url": "https://github.com/spinyfin/mono/issues/1",
+                "number": 1,
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = make_test_config();
+        file_issue(
+            &cfg,
+            &server.uri(),
+            "spinyfin/mono",
+            "title",
+            "body",
+            &["bug".to_string()],
+        )
+        .await
+        .expect("file_issue should succeed against the mock");
+
+        // Inspect the captured request body to assert via-shake is present.
+        let requests = server.received_requests().await.unwrap();
+        let issue_req = requests
+            .iter()
+            .find(|r| r.url.path().ends_with("/issues"))
+            .expect("issue-create request was not captured");
+        let body: serde_json::Value =
+            serde_json::from_slice(&issue_req.body).expect("issue body is JSON");
+        let labels = body["labels"].as_array().expect("labels is an array");
+        let label_strs: Vec<&str> = labels
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            label_strs.contains(&"via-shake"),
+            "via-shake must be in the labels array; got: {label_strs:?}"
+        );
+        assert!(
+            label_strs.contains(&"bug"),
+            "user-supplied label 'bug' must be preserved; got: {label_strs:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn file_issue_surfaces_github_error_body() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -463,13 +447,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let key_path = write_private_key(tmp.path());
-        let cfg = AppConfig {
-            app_id: "42".into(),
-            installation_id: "67890".into(),
-            private_key_path: key_path,
-        };
+        let cfg = make_test_config();
 
         let err = file_issue(&cfg, &server.uri(), "spinyfin/mono", "t", "b", &[])
             .await

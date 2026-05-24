@@ -118,13 +118,11 @@ enum Commands {
     /// The remainder of the file becomes the issue body. Pass `--title`
     /// to override; in that case the entire file body is used verbatim.
     ///
-    /// Credentials: authenticates as a registered GitHub App. Reads
-    /// `~/Library/Application Support/Boss/github-app.toml` (override
-    /// path with `BOSS_GITHUB_APP_CONFIG`), signs a short-lived JWT
+    /// Credentials: authenticates as a registered GitHub App using
+    /// credentials embedded at build time. Signs a short-lived JWT
     /// with the App's private key, swaps it for an installation access
-    /// token, then files via the REST API. See PR #748 for the
-    /// one-time setup instructions. `boss shake` deliberately does NOT
-    /// fall back to `gh issue create` — the user's corporate
+    /// token, then files via the REST API. `boss shake` deliberately
+    /// does NOT fall back to `gh issue create` — the user's corporate
     /// environment has a non-standard `gh` install that would silently
     /// mask failures.
     Shake(ShakeArgs),
@@ -6162,8 +6160,7 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
         return Ok(());
     }
 
-    let cfg_path = github_app::config_path().map_err(CliError::internal)?;
-    let cfg = github_app::load_config(&cfg_path).map_err(|e| CliError::application(e.to_string()))?;
+    let cfg = github_app::embedded_config().map_err(|e| CliError::application(e.to_string()))?;
     let api_base = std::env::var("BOSS_GITHUB_API_BASE")
         .unwrap_or_else(|_| github_app::DEFAULT_API_BASE.to_owned());
 
