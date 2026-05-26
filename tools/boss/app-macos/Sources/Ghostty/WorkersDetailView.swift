@@ -258,12 +258,18 @@ private struct WorkerSlotView: View {
         if let live = liveState?.liveStatus,
            !live.isEmpty
         {
-            Text(live)
-                .font(.caption2)
-                .foregroundStyle(liveStatusColor)
-                .lineLimit(1)
-                .help(slot.runId ?? "")
-                .accessibilityLabel("Live status: \(live)")
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                WorkerWaitingIndicator(
+                    activity: liveState?.activity,
+                    lastEventAt: liveState?.lastEventAt
+                )
+                Text(live)
+                    .font(.caption2)
+                    .foregroundStyle(liveStatusColor)
+                    .lineLimit(1)
+                    .help(slot.runId ?? "")
+                    .accessibilityLabel("Live status: \(live)")
+            }
         } else if let runId = slot.runId {
             Text(runId)
                 .font(.caption2)
@@ -278,15 +284,15 @@ private struct WorkerSlotView: View {
         }
     }
 
-    /// Match the Doing-card colour mapping (Q4): red for errored
-    /// runs, accent for "waiting for input", tertiary for idle,
-    /// `.secondary` while working.
+    /// Match the Doing-card colour mapping: red for errored runs,
+    /// tertiary for idle, `.secondary` otherwise. `waitingForInput`
+    /// is no longer tinted accent-blue — it surfaces the explicit
+    /// `WorkerWaitingIndicator` icon + tooltip in `slotSubtitle`
+    /// instead, so the meaning is not carried by hue alone.
     private var liveStatusColor: Color {
         switch liveState?.activity {
         case .errored:
             return .red
-        case .waitingForInput:
-            return .accentColor
         case .idle:
             return Color(nsColor: .tertiaryLabelColor)
         default:
