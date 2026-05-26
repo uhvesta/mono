@@ -2420,6 +2420,32 @@ impl ExecutionCoordinator {
                                 })),
                             )
                             .await;
+                        // Clear the card out of `active`. The run is
+                        // already recorded `failed` and the workspace
+                        // released, but the work item itself stays
+                        // `active` — so the kanban keeps the green
+                        // "Doing" card and the orphan-active sweep
+                        // re-dispatches the same doomed spawn every
+                        // cycle. Demote it back to To-Do so the failure
+                        // (already surfaced as a `pane_spawn_failed`
+                        // attention item) is recoverable rather than a
+                        // silent green-flicker strand.
+                        match self
+                            .work_db
+                            .demote_active_work_item_to_todo(&execution.work_item_id)
+                        {
+                            Ok(true) => tracing::info!(
+                                execution_id = %execution.id,
+                                work_item_id = %execution.work_item_id,
+                                "demoted work item to todo after pane-spawn failure",
+                            ),
+                            Ok(false) => {}
+                            Err(demote_err) => tracing::error!(
+                                ?demote_err,
+                                work_item_id = %execution.work_item_id,
+                                "failed to demote work item out of active after pane-spawn failure",
+                            ),
+                        }
                         self.publisher
                             .publish(
                                 &execution.id,

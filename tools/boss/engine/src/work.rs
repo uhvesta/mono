@@ -627,6 +627,36 @@ impl WorkDb {
         Ok(healed)
     }
 
+    /// Demote a single `active` work item back to `todo` after its
+    /// dispatch failed before a worker ever came up (e.g. the worker
+    /// pane could not be spawned because no app session was registered,
+    /// libghostty IPC dropped, or the slot was busy). Without this the
+    /// card is stranded in the Doing column behind a dead execution and
+    /// the orphan-active sweep keeps re-dispatching the same doomed
+    /// spawn every cycle. Demoting it surfaces the failure as a return
+    /// to To-Do so the human can retry deliberately.
+    ///
+    /// Guarded on `status = 'active'` so a concurrent move to
+    /// `done`/`archived`/`blocked` is never stomped. Stamps
+    /// `last_status_actor = 'engine'` (same as `heal_ghost_active_chores`)
+    /// so the kanban attributes the demote to the engine, not the human
+    /// who last touched the row. Returns `true` if a row was demoted.
+    pub fn demote_active_work_item_to_todo(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let updated = conn.execute(
+            "UPDATE tasks
+             SET status = 'todo',
+                 last_status_actor = 'engine',
+                 updated_at = ?2
+             WHERE id = ?1
+               AND status = 'active'
+               AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Re-issue `RequestExecution` for every non-deleted task / chore
     /// whose status is `active` but whose latest execution is terminal
     /// (or which has no execution). This is the engine-startup
@@ -13573,6 +13603,81 @@ mod tests {
             msg.contains("terminal"),
             "expected terminal-status error, got: {msg}",
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A pane-spawn failure must pull the card out of `active` and back
+    /// to `todo`, stamping `last_status_actor = 'engine'`. Without it
+    /// the card is stranded green in Doing and the orphan-active sweep
+    /// re-dispatches the same doomed spawn every cycle. The guard must
+    /// only fire on `active` rows (never stomping a `done`/`blocked`
+    /// move) and report whether it demoted anything.
+    #[test]
+    fn demote_active_work_item_to_todo_resets_active_card() {
+        let path = temp_db_path("demote-active-to-todo");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Stuck in Doing".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        // Human dragged it to Doing → active, stamped 'human'.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.force_last_status_actor_for_test(&chore.id, "human").unwrap();
+
+        let status_and_actor = |db: &WorkDb| match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => (t.status, t.last_status_actor),
+            other => panic!("expected chore, got {other:?}"),
+        };
+
+        // First demote returns true and resets to todo + engine actor.
+        assert!(db.demote_active_work_item_to_todo(&chore.id).unwrap());
+        let (status, actor) = status_and_actor(&db);
+        assert_eq!(status, "todo");
+        assert_eq!(actor, "engine");
+
+        // Idempotent: a second demote finds no `active` row → false,
+        // and does not touch the now-`todo` row.
+        assert!(!db.demote_active_work_item_to_todo(&chore.id).unwrap());
+        assert_eq!(status_and_actor(&db).0, "todo");
+
+        // Guard: a `done` card is never stomped back to todo.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!db.demote_active_work_item_to_todo(&chore.id).unwrap());
+        assert_eq!(status_and_actor(&db).0, "done");
 
         let _ = std::fs::remove_file(path);
     }
