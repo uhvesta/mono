@@ -2356,6 +2356,26 @@ impl WorkDb {
     }
 
     #[cfg(test)]
+    pub fn force_execution_status_for_test(&self, work_item_id: &str, status: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET status = ?2 WHERE work_item_id = ?1",
+            params![work_item_id, status],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn force_task_status_for_test(&self, task_id: &str, status: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks SET status = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![task_id, status],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn force_started_at_for_test(&self, execution_id: &str, epoch_secs: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
@@ -3049,6 +3069,55 @@ impl WorkDb {
         let unblocked = maybe_engine_unblock_dependent(&tx, work_item_id, &now)?;
         tx.commit()?;
         Ok(unblocked)
+    }
+
+    /// Recovery sweep: find `todo, autostart=true` tasks whose latest execution
+    /// is `waiting_dependency` (or absent) and whose gating prereqs are all
+    /// satisfied, then promote those executions to `ready`. Returns the ids of
+    /// tasks that were recovered.
+    ///
+    /// This handles tasks that got stuck after an auto-unblock (Part B
+    /// recovery): the auto-unblock transitions `blocked` → `todo` and creates a
+    /// `ready` execution atomically, but tasks unblocked before that fix landed
+    /// may still have a stale `waiting_dependency` execution with no one to
+    /// promote it.
+    pub fn promote_todo_autostart_stuck_executions(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let candidates: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM tasks
+                 WHERE status = 'todo' AND autostart = 1 AND deleted_at IS NULL
+                 ORDER BY updated_at ASC, id ASC",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut promoted = Vec::new();
+        for work_item_id in candidates {
+            if !deps::gating_prereqs_for(&tx, &work_item_id)?.is_empty() {
+                continue;
+            }
+            let needs_promotion = match query_latest_execution_for_work_item(&tx, &work_item_id)? {
+                Some(exec) => exec.status == "waiting_dependency",
+                None => true,
+            };
+            if !needs_promotion {
+                continue;
+            }
+            let kind = execution_kind_for_work_item(&tx, &work_item_id)?;
+            let mut result = ExecutionReconcileResult::default();
+            reconcile_work_item_execution(&tx, &mut result, &work_item_id, &kind, "ready")?;
+            if !result.created.is_empty() || !result.updated.is_empty() {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    "dep-unblock sweep: promoted stuck todo execution to ready",
+                );
+                promoted.push(work_item_id);
+            }
+        }
+        tx.commit()?;
+        Ok(promoted)
     }
 
     /// Return the prerequisites and/or dependents of a single work
@@ -10326,6 +10395,18 @@ fn maybe_engine_unblock_dependent(
         dependent_id,
         "engine: auto-unblocked dependent — all gating prereqs satisfied",
     );
+    // Atomically create or promote the execution to `ready` so the
+    // coordinator can dispatch this task on the next kick. Without
+    // this, the `waiting_dependency` execution that was created when
+    // the chore was first blocked would never be promoted to `ready`
+    // unless an external event (frontend request, reconciler kick)
+    // happened to trigger `reconcile_product_executions`. Only applies
+    // to task_ ids; projects don't have `work_executions` rows.
+    if dependent_id.starts_with("task_") {
+        let kind = execution_kind_for_work_item(conn, dependent_id)?;
+        let mut reconcile_result = ExecutionReconcileResult::default();
+        reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, &kind, "ready")?;
+    }
     Ok(true)
 }
 
@@ -15090,6 +15171,83 @@ mod tests {
         };
         assert_eq!(t.status, "todo");
         assert_eq!(t.last_status_actor, "engine");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Auto-unblock creates a `ready` execution atomically. After a
+    /// prereq goes `done` and the cascade flips a dependent to `todo`,
+    /// the dependent must have a `ready` execution so the coordinator
+    /// can dispatch it on the next kick without a separate reconcile call.
+    #[test]
+    fn auto_unblock_creates_ready_execution() {
+        let path = temp_db_path("auto-unblock-creates-ready-exec");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:boss.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "prereq".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let dep = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "dependent".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: dep.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // dep is now blocked; mark prereq done via the normal cascade path.
+        db.update_work_item(
+            &prereq.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let dep_after = db.get_work_item(&dep.id).unwrap();
+        let WorkItem::Chore(t) = dep_after else { panic!() };
+        assert_eq!(t.status, "todo", "dependent must be unblocked to todo");
+
+        // Key assertion: the execution must be `ready` so the coordinator
+        // can dispatch it on the next kick — no external reconcile needed.
+        let executions = db.list_executions(Some(&dep.id)).unwrap();
+        assert_eq!(executions.len(), 1, "must have exactly one execution");
+        assert_eq!(
+            executions[0].status, "ready",
+            "auto-unblock must promote execution to ready so coordinator can dispatch"
+        );
         let _ = std::fs::remove_file(path);
     }
 

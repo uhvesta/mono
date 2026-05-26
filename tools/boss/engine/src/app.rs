@@ -2551,10 +2551,12 @@ pub async fn serve(
     // landing, or if the engine was offline at transition time. The
     // sweeper recovers those cases within one interval (≤30 s).
     // See dep_unblock_sweep.rs for the full incident trace.
+    let coord_for_dep_unblock = server_state.execution_coordinator.clone();
     let _dep_unblock_handle = crate::dep_unblock_sweep::spawn_loop(
         server_state.work_db.clone(),
         Duration::from_secs(crate::dep_unblock_sweep::DEP_UNBLOCK_SWEEP_INTERVAL_SECS),
         server_state.metrics.clone(),
+        Arc::new(move || coord_for_dep_unblock.kick()),
     );
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded

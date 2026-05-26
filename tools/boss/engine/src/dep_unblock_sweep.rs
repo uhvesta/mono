@@ -73,15 +73,24 @@ pub struct DepUnblockSweepOutcome {
     /// Seconds since `updated_at` for the longest-stale evaluated row.
     /// Zero when `rows_evaluated == 0`.
     pub longest_stale_secs: u64,
+    /// Number of `todo, autostart=true` tasks whose stuck
+    /// `waiting_dependency` execution was promoted to `ready` (Part B
+    /// recovery sweep).
+    pub rows_stuck_promoted: usize,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so items blocked before engine boot are
 /// recovered without waiting for the first interval.
+///
+/// `kick_fn` is called whenever the sweep does any work (unblocks or
+/// promotes a stuck execution) so the coordinator scheduler is woken
+/// and picks up the newly-ready executions immediately.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     interval: Duration,
     metrics: Arc<Registry>,
+    kick_fn: Arc<dyn Fn() + Send + Sync>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -90,9 +99,13 @@ pub fn spawn_loop(
             tracing::info!(
                 rows_evaluated = outcome.rows_evaluated,
                 rows_unblocked = outcome.rows_unblocked,
+                rows_stuck_promoted = outcome.rows_stuck_promoted,
                 longest_stale_secs = outcome.longest_stale_secs,
                 "dep-unblock sweep: pass complete",
             );
+            if outcome.rows_unblocked > 0 || outcome.rows_stuck_promoted > 0 {
+                kick_fn();
+            }
             tokio::time::sleep(interval).await;
         }
     })
@@ -144,6 +157,22 @@ pub async fn run_one_pass(work_db: &WorkDb) -> DepUnblockSweepOutcome {
         }
     }
 
+    // Part B recovery: find `todo, autostart=true` tasks stuck with a
+    // `waiting_dependency` execution (or no execution at all) despite
+    // having no gating prereqs, and promote their execution to `ready`.
+    // This recovers tasks that were auto-unblocked before the event-path
+    // fix landed — their status is already `todo` but the execution was
+    // never promoted, so the coordinator never saw them.
+    match work_db.promote_todo_autostart_stuck_executions() {
+        Ok(promoted) if !promoted.is_empty() => {
+            outcome.rows_stuck_promoted = promoted.len();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(?err, "dep-unblock sweep: failed to promote stuck executions; skipping");
+        }
+    }
+
     outcome
 }
 
@@ -187,6 +216,23 @@ mod tests {
             model_override: None,
             created_via: None,
             autostart: true,
+            force_duplicate: false,
+        })
+        .unwrap()
+        .id
+    }
+
+    fn create_chore_no_autostart(db: &WorkDb, product_id: &str, name: &str) -> String {
+        db.create_chore(CreateChoreInput {
+            product_id: product_id.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            repo_remote_url: None,
+            priority: None,
+            effort_level: None,
+            model_override: None,
+            created_via: None,
+            autostart: false,
             force_duplicate: false,
         })
         .unwrap()
@@ -367,5 +413,107 @@ mod tests {
             "human-blocked items must not appear in candidates",
         );
         assert_eq!(outcome.rows_unblocked, 0);
+    }
+
+    /// When a task is auto-unblocked via the sweep, `rows_unblocked` is set so the
+    /// caller (spawn_loop) knows to fire kick_fn.
+    #[tokio::test]
+    async fn sweep_reports_unblock_in_outcome() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let prereq_id = create_chore(&db, &product_id, "prereq");
+        let dep_id = create_chore(&db, &product_id, "dependent");
+
+        db.add_dependency(AddDependencyInput {
+            dependent: dep_id.clone(),
+            prerequisite: prereq_id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        db.mark_task_done_for_test_no_cascade(&prereq_id).unwrap();
+
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+
+        assert_eq!(outcome.rows_unblocked, 1, "outcome must record the unblock so spawn_loop can kick");
+    }
+
+    /// Part B recovery: a `todo, autostart=true` task with a `waiting_dependency`
+    /// execution and no gating prereqs must be promoted to `ready` by the sweep.
+    /// This covers the T664 regression where auto-unblock wrote `todo` but the
+    /// execution was never promoted.
+    #[tokio::test]
+    async fn sweep_promotes_stuck_todo_waiting_dependency_execution() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let prereq_id = create_chore(&db, &product_id, "prereq");
+        let dep_id = create_chore(&db, &product_id, "dependent");
+
+        db.add_dependency(AddDependencyInput {
+            dependent: dep_id.clone(),
+            prerequisite: prereq_id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Prereq goes to done via the cascade (normal path), which now also
+        // creates a `ready` execution for dep. Simulate the pre-fix state
+        // by manually demoting the execution back to `waiting_dependency`.
+        db.update_work_item(
+            &prereq_id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // dep should now be `todo` with a `ready` execution (post-fix normal path).
+        // Simulate the pre-fix stuck state: dep is `todo`, execution is `waiting_dependency`.
+        db.force_execution_status_for_test(&dep_id, "waiting_dependency").unwrap();
+
+        let executions_before = db.list_executions(Some(&dep_id)).unwrap();
+        assert_eq!(executions_before.len(), 1);
+        assert_eq!(executions_before[0].status, "waiting_dependency", "setup check");
+
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+
+        assert_eq!(outcome.rows_stuck_promoted, 1, "sweep must promote the stuck execution");
+
+        let executions_after = db.list_executions(Some(&dep_id)).unwrap();
+        assert_eq!(executions_after.len(), 1);
+        assert_eq!(executions_after[0].status, "ready", "execution must be promoted to ready");
+    }
+
+    /// Part B: sweep must NOT promote a `todo` task that still has gating prereqs.
+    #[tokio::test]
+    async fn sweep_does_not_promote_still_gated_todo_task() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        // prereq has autostart=false so it won't appear in the promote scan
+        // (which only scans autostart=1 tasks). This isolates the assertion to
+        // dep only.
+        let prereq_id = create_chore_no_autostart(&db, &product_id, "prereq");
+        let dep_id = create_chore(&db, &product_id, "dependent");
+
+        db.add_dependency(AddDependencyInput {
+            dependent: dep_id.clone(),
+            prerequisite: prereq_id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // dep is `blocked` (prereq not done). Directly force it to `todo` in
+        // the DB (bypassing the gating check) to simulate a hypothetical stuck
+        // state. The sweep must NOT promote the execution because gating
+        // prereqs remain.
+        db.force_task_status_for_test(&dep_id, "todo").unwrap();
+
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+
+        assert_eq!(outcome.rows_stuck_promoted, 0, "must not promote while prereq is still todo");
     }
 }

@@ -2017,6 +2017,11 @@ async fn mark_merged(
     publisher
         .publish_work_item_changed(&candidate.product_id, &updated.id, "pr_merged")
         .await;
+    // Kick the scheduler so any auto-unblocked dependents (whose
+    // executions were just promoted to `ready` by the dep cascade)
+    // are dispatched promptly rather than waiting for the next
+    // external event or reconciler tick.
+    publisher.kick_scheduler();
     tracing::info!(
         work_item_id = %updated.id,
         kind = %updated.kind,
