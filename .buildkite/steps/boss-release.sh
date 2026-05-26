@@ -179,7 +179,7 @@ log "[boss-release] creating GitHub Release ${VERSION}"
 gh release create "${VERSION}" \
   --repo spinyfin/mono \
   --title "Boss ${VERSION#boss-v}" \
-  --notes "Initial release"
+  --generate-notes
 
 log "[boss-release] uploading asset with retry"
 UPLOAD_OK=0
@@ -196,9 +196,5 @@ done
 if (( UPLOAD_OK != 1 )); then
   die "release ${VERSION} created but asset upload failed after 3 attempts; manually upload via 'gh release upload ${VERSION} <path>' or delete the empty release with 'gh release delete ${VERSION}'"
 fi
-
-log "[boss-release] generating release notes"
-gh release edit "${VERSION}" --repo spinyfin/mono --generate-notes || \
-  echo "[boss-release] WARNING: --generate-notes failed (release + asset still good); regenerate with 'gh release edit ${VERSION} --generate-notes'"
 
 log "[boss-release] done — release ${VERSION} published"
