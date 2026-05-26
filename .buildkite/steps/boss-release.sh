@@ -79,7 +79,7 @@ Set these in the Buildkite secrets store or in Pipeline Settings → Environment
 See tools/boss/docs/buildkite-shake-secrets-setup.md for step-by-step instructions."
 fi
 
-echo "[boss-release] credentials loaded (APP_ID=${BOSS_SHAKE_APP_ID})"
+echo "[boss-release] credentials loaded (APP_ID=[REDACTED])"
 
 # ── GhosttyKit stub ───────────────────────────────────────────────────────────
 # rules_swift_package_manager runs `swift package describe` during Bazel
@@ -170,6 +170,37 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 
 cp "${ZIP_PATH}" "${WORK_DIR}/${ARTIFACT}"
 echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
+
+# ── smoke test: verify shake credentials are embedded in the binary ───────────
+# File a live test issue against spinyfin/mono using the just-built boss binary,
+# confirm it succeeds (proves credentials are embedded), then delete it.
+# Runs before the GitHub Release is created so a credential failure aborts the
+# release rather than producing a published-but-broken artifact.
+
+log "[boss-release] smoke test: verifying embedded shake credentials"
+BOSS_BIN=$(bazel cquery --output=files //tools/boss/cli:boss -c opt 2>/dev/null | head -1)
+[[ -x "${BOSS_BIN}" ]] || die "boss binary not found for smoke test (cquery returned: '${BOSS_BIN}')"
+
+SMOKE_MD="${WORK_DIR}/smoke.md"
+cat > "${SMOKE_MD}" << 'SMOKE_EOF'
+[boss-shake smoke test] release pipeline credential verification
+
+Automatically filed by the boss-release BK step to verify that embedded GitHub
+App credentials work in the just-built binary. Deleted immediately after creation.
+SMOKE_EOF
+
+SHAKE_OUT=$("${BOSS_BIN}" shake --json "${SMOKE_MD}" 2>&1) || true
+ISSUE_NUM=$(printf '%s' "${SHAKE_OUT}" | jq -r '.number // empty' 2>/dev/null || true)
+if [[ -z "${ISSUE_NUM}" ]]; then
+  die "smoke test FAILED — boss shake did not return an issue number.
+Output: ${SHAKE_OUT}
+This means the just-built binary does not have shake credentials embedded.
+Check that the three BOSS_SHAKE_* secrets are set in the BK pipeline and that
+.bazelrc propagates them via --action_env."
+fi
+echo "[boss-release] smoke test passed: filed test issue #${ISSUE_NUM}"
+gh issue delete "${ISSUE_NUM}" --repo spinyfin/mono --yes
+echo "[boss-release] smoke test issue #${ISSUE_NUM} deleted"
 
 # ── create GitHub Release ─────────────────────────────────────────────────────
 # Split into three independent steps to isolate failure modes and enable
