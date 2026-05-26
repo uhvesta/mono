@@ -51,6 +51,13 @@ swift_library(
 macos_application(
     name = "Boss",
     bundle_id = "dev.spinyfin.bossmacapp",
+    # Ad-hoc dev-build signatures embed this so APIKeyStore can use the
+    # data-protection keychain (keychain-access-groups membership) instead
+    # of the legacy interactive-ACL keychain, which re-prompts on every
+    # launch when the cdhash changes between rebuilds. Release builds are
+    # re-signed by installer/release.sh with the matching group in
+    # installer/entitlements/app.entitlements.
+    entitlements = "Boss.entitlements",
     infoplists = ["Info.plist"],
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_lib"],
