@@ -11,15 +11,5 @@
          See design doc §Q2 for the validation plan. -->
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
-    <!-- Stable data-protection keychain access group so APIKeyStore reads
-         the Anthropic API key without the legacy interactive password
-         dialog. Must match tools/boss/app-macos/Boss.entitlements (the
-         dev-build entitlements) so a stored key stays readable across
-         ad-hoc and Developer ID signatures. Bare (no $(TeamIdentifierPrefix))
-         to match the dev build, which has no team identifier to substitute. -->
-    <key>keychain-access-groups</key>
-    <array>
-        <string>dev.spinyfin.bossmacapp</string>
-    </array>
 </dict>
 </plist>
