@@ -215,8 +215,8 @@ private struct DesignRendererMarkdownContent: View {
     let source: String
     let baseURL: URL?
 
-    @Environment(\.commentedTexts) private var commentedTexts
-    @Environment(\.commentFlashText) private var commentFlashText
+    @Environment(\.commentedAnchors) private var commentedAnchors
+    @Environment(\.commentFlashAnchor) private var commentFlashAnchor
     /// Monotonically-increasing counter bumped whenever the highlight state
     /// changes. Used as the `.id()` for `StructuredText` to force a fresh
     /// parse when comments are added/removed or the flash text changes.
@@ -228,17 +228,17 @@ private struct DesignRendererMarkdownContent: View {
             .textual.textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .id(parseVersion)
-            .onChange(of: commentedTexts) { _, _ in parseVersion &+= 1 }
-            .onChange(of: commentFlashText) { _, _ in parseVersion &+= 1 }
+            .onChange(of: commentedAnchors) { _, _ in parseVersion &+= 1 }
+            .onChange(of: commentFlashAnchor) { _, _ in parseVersion &+= 1 }
     }
 
     private var markdownParser: any MarkupParser {
-        if commentedTexts.isEmpty && commentFlashText == nil {
+        if commentedAnchors.isEmpty && commentFlashAnchor == nil {
             return AttributedStringMarkdownParser.markdown(baseURL: baseURL)
         }
         return HighlightingMarkdownParser(
-            highlightedTexts: commentedTexts,
-            flashingText: commentFlashText,
+            highlightedAnchors: commentedAnchors,
+            flashingAnchor: commentFlashAnchor,
             baseURL: baseURL
         )
     }

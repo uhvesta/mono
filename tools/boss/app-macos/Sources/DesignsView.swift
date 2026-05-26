@@ -497,8 +497,8 @@ private struct MarkdownViewerScrollContent: View {
     /// per-stage spans.
     let clickStartTime: Date?
 
-    @Environment(\.commentedTexts) private var commentedTexts
-    @Environment(\.commentFlashText) private var commentFlashText
+    @Environment(\.commentedAnchors) private var commentedAnchors
+    @Environment(\.commentFlashAnchor) private var commentFlashAnchor
     @State private var parseStartTime: Date? = nil
     @State private var parseLogged = false
     /// Monotonically-increasing counter bumped whenever the highlight state
@@ -526,8 +526,8 @@ private struct MarkdownViewerScrollContent: View {
                     // A monotonic counter is used instead of a hashValue-based key to avoid
                     // hash collisions and guarantee a new identity on every comment update.
                     .id(parseVersion)
-                    .onChange(of: commentedTexts) { _, _ in parseVersion &+= 1 }
-                    .onChange(of: commentFlashText) { _, _ in parseVersion &+= 1 }
+                    .onChange(of: commentedAnchors) { _, _ in parseVersion &+= 1 }
+                    .onChange(of: commentFlashAnchor) { _, _ in parseVersion &+= 1 }
                     .background(
                         GeometryReader { geo in
                             Color.clear.preference(
@@ -564,12 +564,12 @@ private struct MarkdownViewerScrollContent: View {
     }
 
     private var markdownParser: any MarkupParser {
-        if commentedTexts.isEmpty && commentFlashText == nil {
+        if commentedAnchors.isEmpty && commentFlashAnchor == nil {
             return AttributedStringMarkdownParser.markdown()
         }
         return HighlightingMarkdownParser(
-            highlightedTexts: commentedTexts,
-            flashingText: commentFlashText
+            highlightedAnchors: commentedAnchors,
+            flashingAnchor: commentFlashAnchor
         )
     }
 }

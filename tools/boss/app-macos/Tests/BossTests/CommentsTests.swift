@@ -19,16 +19,31 @@ final class CommentLayerTests: XCTestCase {
     func testCommentModelEquality() {
         let id = UUID()
         let date = Date()
-        let a = Comment(id: id, quotedText: "hello", body: "world", createdAt: date)
-        let b = Comment(id: id, quotedText: "hello", body: "world", createdAt: date)
+        let a = Comment(id: id, quotedText: "hello", occurrenceIndex: 0, body: "world", createdAt: date)
+        let b = Comment(id: id, quotedText: "hello", occurrenceIndex: 0, body: "world", createdAt: date)
         XCTAssertEqual(a, b)
     }
 
     func testCommentModelIdentityDiffersForDifferentIDs() {
         let date = Date()
-        let a = Comment(id: UUID(), quotedText: "x", body: "y", createdAt: date)
-        let b = Comment(id: UUID(), quotedText: "x", body: "y", createdAt: date)
+        let a = Comment(id: UUID(), quotedText: "x", occurrenceIndex: 0, body: "y", createdAt: date)
+        let b = Comment(id: UUID(), quotedText: "x", occurrenceIndex: 0, body: "y", createdAt: date)
         XCTAssertNotEqual(a, b)
+    }
+
+    func testCommentAnchorEquality() {
+        let a = CommentAnchor(quotedText: "foo", occurrenceIndex: 1)
+        let b = CommentAnchor(quotedText: "foo", occurrenceIndex: 1)
+        let c = CommentAnchor(quotedText: "foo", occurrenceIndex: 2)
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, c)
+    }
+
+    func testCommentAnchorReflectsOccurrenceIndex() {
+        let date = Date()
+        let c = Comment(id: UUID(), quotedText: "rename", occurrenceIndex: 1, body: "note", createdAt: date)
+        XCTAssertEqual(c.anchor.quotedText, "rename")
+        XCTAssertEqual(c.anchor.occurrenceIndex, 1)
     }
 
     // MARK: - CommentLayer (in-memory state)
@@ -133,7 +148,7 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertGreaterThan(hosting.fittingSize.height, 0)
     }
 
-    // MARK: - HighlightingMarkdownParser: multi-comment correctness
+    // MARK: - HighlightingMarkdownParser: single-occurrence correctness
 
     /// Returns true if the run containing the character at `charOffset` in `plain`
     /// has a non-nil backgroundColor attribute in the attributed string.
@@ -150,7 +165,10 @@ final class CommentLayerTests: XCTestCase {
     /// comment's text received a highlight while the second was silently skipped.
     func testHighlightingParserHighlightsBothCommentedTexts() throws {
         let source = "The fox jumped over the lazy dog and the cat sat quietly."
-        let parser = HighlightingMarkdownParser(highlightedTexts: ["fox", "cat"])
+        let parser = HighlightingMarkdownParser(highlightedAnchors: [
+            CommentAnchor(quotedText: "fox", occurrenceIndex: 0),
+            CommentAnchor(quotedText: "cat", occurrenceIndex: 0),
+        ])
         let result = try parser.attributedString(for: source)
         let plain = String(result.characters)
 
@@ -173,25 +191,102 @@ final class CommentLayerTests: XCTestCase {
         )
     }
 
-    /// Verifies that multiple occurrences of the same quoted text are each highlighted.
-    func testHighlightingParserHighlightsMultipleOccurrences() throws {
+    /// A comment anchored to occurrenceIndex=0 of a repeated word highlights only the
+    /// FIRST occurrence; the second must NOT be highlighted.
+    func testHighlightingParserHighlightsOnlyFirstOccurrence() throws {
         let source = "alpha beta alpha gamma"
-        let parser = HighlightingMarkdownParser(highlightedTexts: ["alpha"])
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(quotedText: "alpha", occurrenceIndex: 0)]
+        )
         let result = try parser.attributedString(for: source)
         let plain = String(result.characters)
 
-        var searchStart = plain.startIndex
-        var occurrenceCount = 0
-        while let range = plain.range(of: "alpha", range: searchStart..<plain.endIndex) {
-            let offset = plain.distance(from: plain.startIndex, to: range.lowerBound)
-            XCTAssertTrue(
-                isHighlighted(at: offset, in: result),
-                "Occurrence of 'alpha' at character offset \(offset) must be highlighted"
-            )
-            occurrenceCount += 1
-            searchStart = range.upperBound
+        // First occurrence: should be highlighted.
+        guard let firstRange = plain.range(of: "alpha") else {
+            return XCTFail("'alpha' not found")
         }
-        XCTAssertEqual(occurrenceCount, 2, "Expected exactly two 'alpha' occurrences")
+        let firstOffset = plain.distance(from: plain.startIndex, to: firstRange.lowerBound)
+        XCTAssertTrue(
+            isHighlighted(at: firstOffset, in: result),
+            "First 'alpha' (occurrenceIndex=0) must be highlighted"
+        )
+
+        // Second occurrence: must NOT be highlighted.
+        guard let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex) else {
+            return XCTFail("Second 'alpha' not found")
+        }
+        let secondOffset = plain.distance(from: plain.startIndex, to: secondRange.lowerBound)
+        XCTAssertFalse(
+            isHighlighted(at: secondOffset, in: result),
+            "Second 'alpha' must NOT be highlighted when only occurrenceIndex=0 is anchored"
+        )
+    }
+
+    /// A comment anchored to occurrenceIndex=1 of a repeated word highlights only the
+    /// SECOND occurrence; the first must NOT be highlighted.
+    func testHighlightingParserHighlightsOnlySecondOccurrence() throws {
+        let source = "alpha beta alpha gamma"
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(quotedText: "alpha", occurrenceIndex: 1)]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+
+        guard let firstRange = plain.range(of: "alpha") else { return XCTFail("'alpha' not found") }
+        let firstOffset = plain.distance(from: plain.startIndex, to: firstRange.lowerBound)
+        XCTAssertFalse(
+            isHighlighted(at: firstOffset, in: result),
+            "First 'alpha' must NOT be highlighted when only occurrenceIndex=1 is anchored"
+        )
+
+        guard let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex) else {
+            return XCTFail("Second 'alpha' not found")
+        }
+        let secondOffset = plain.distance(from: plain.startIndex, to: secondRange.lowerBound)
+        XCTAssertTrue(
+            isHighlighted(at: secondOffset, in: result),
+            "Second 'alpha' (occurrenceIndex=1) must be highlighted"
+        )
+    }
+
+    /// Two anchors on two different occurrences of the same word each highlight their
+    /// respective instance (both are highlighted, but through independent anchors).
+    func testHighlightingParserTwoAnchorsHighlightBothOccurrences() throws {
+        let source = "alpha beta alpha gamma"
+        let parser = HighlightingMarkdownParser(highlightedAnchors: [
+            CommentAnchor(quotedText: "alpha", occurrenceIndex: 0),
+            CommentAnchor(quotedText: "alpha", occurrenceIndex: 1),
+        ])
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+
+        guard let firstRange = plain.range(of: "alpha") else { return XCTFail("'alpha' not found") }
+        let firstOffset = plain.distance(from: plain.startIndex, to: firstRange.lowerBound)
+        XCTAssertTrue(isHighlighted(at: firstOffset, in: result), "First 'alpha' must be highlighted")
+
+        guard let secondRange = plain.range(of: "alpha", range: firstRange.upperBound..<plain.endIndex) else {
+            return XCTFail("Second 'alpha' not found")
+        }
+        let secondOffset = plain.distance(from: plain.startIndex, to: secondRange.lowerBound)
+        XCTAssertTrue(isHighlighted(at: secondOffset, in: result), "Second 'alpha' must be highlighted")
+    }
+
+    /// An anchor whose occurrenceIndex exceeds the number of matches applies no highlight
+    /// (silent no-op; safer than highlighting the wrong span after a doc edit).
+    func testHighlightingParserOutOfRangeOccurrenceIndexIsNoOp() throws {
+        let source = "alpha beta gamma"
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(quotedText: "alpha", occurrenceIndex: 5)]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+
+        guard let alphaRange = plain.range(of: "alpha") else { return XCTFail("'alpha' not found") }
+        let alphaOffset = plain.distance(from: plain.startIndex, to: alphaRange.lowerBound)
+        XCTAssertFalse(
+            isHighlighted(at: alphaOffset, in: result),
+            "Out-of-range occurrenceIndex must not highlight anything"
+        )
     }
 
     // MARK: - View: highlight overlay placeholder compiles and renders

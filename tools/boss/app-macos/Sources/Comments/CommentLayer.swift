@@ -26,8 +26,14 @@ final class CommentLayer: NSObject, ObservableObject {
     @Published var pendingQuotedText: String = ""
     /// Character that seeded the form via type-to-comment entry path.
     @Published var pendingFirstChar: Character? = nil
-    /// Quoted text of the comment just clicked in the sidebar; clears after the flash.
-    @Published var flashingText: String? = nil
+    /// Anchor of the comment just clicked in the sidebar; clears after the flash.
+    @Published var flashingAnchor: CommentAnchor? = nil
+
+    /// Occurrence index computed at selection time; consumed by addComment().
+    private var pendingOccurrenceIndex: Int = 0
+    /// Text that precedes the selection in the Textual NSTextInteractionView path,
+    /// captured at mouseUp. Used to count prior occurrences of the quoted text.
+    private var anchorTextBeforeSelection: String? = nil
 
     // NSEvent monitor tokens; stored nonisolated(unsafe) because the opaque Any
     // tokens are installed/removed only on the main actor.
@@ -108,6 +114,7 @@ final class CommentLayer: NSObject, ObservableObject {
         activePopover?.close()
         anchorInteractionScreenPoint = nil
         anchorInteractionView = nil
+        anchorTextBeforeSelection = nil
     }
 
     /// Single coordinate-bridge between an NSEvent's window-space location and a target
@@ -151,6 +158,26 @@ final class CommentLayer: NSObject, ObservableObject {
         anchorInteractionScreenPoint = screenOrigin
         anchorInteractionView = responder
         anchorLog.info("captureInteractionAnchor: stored screen anchor \(NSStringFromPoint(screenOrigin)) responder=\(NSStringFromClass(type(of: responder))) bounds=\(NSStringFromRect(responder.bounds))")
+
+        // Capture the text that precedes the selection so requestNewComment() can
+        // compute which occurrence of the quoted text the user has selected.
+        // NSTextInteractionView (Textual's first responder) conforms to NSTextInputClient,
+        // which exposes selectedRange() and attributedSubstring(forProposedRange:actualRange:).
+        // If the cast fails on a future AppKit version the fallback is occurrenceIndex=0.
+        anchorTextBeforeSelection = nil
+        if let inputClient = responder as? NSTextInputClient {
+            let selRange = inputClient.selectedRange()
+            if selRange.location != NSNotFound, selRange.length > 0 {
+                if selRange.location == 0 {
+                    anchorTextBeforeSelection = ""
+                } else {
+                    let beforeRange = NSRange(location: 0, length: selRange.location)
+                    anchorTextBeforeSelection = inputClient
+                        .attributedSubstring(forProposedRange: beforeRange, actualRange: nil)?
+                        .string
+                }
+            }
+        }
     }
 
     /// Called by NotificationCenter on the main thread when any NSTextView changes selection.
@@ -167,6 +194,7 @@ final class CommentLayer: NSObject, ObservableObject {
             // Textual interaction anchor so the NSTextView path runs in resolveAnchor().
             self.anchorInteractionScreenPoint = nil
             self.anchorInteractionView = nil
+            self.anchorTextBeforeSelection = nil
             if let tv = textView {
                 let range = tv.selectedRange()
                 anchorLog.info("textViewSelectionDidChange: NSTextView \(NSStringFromClass(type(of: tv))) range=\(NSStringFromRange(range))")
@@ -178,6 +206,7 @@ final class CommentLayer: NSObject, ObservableObject {
 
     func requestNewComment(firstChar: Character? = nil) {
         pendingQuotedText = captureCurrentSelection() ?? ""
+        pendingOccurrenceIndex = computeOccurrenceIndex(for: pendingQuotedText)
         pendingFirstChar = firstChar
 
         guard let (posRect, posView) = resolveAnchor() else {
@@ -208,6 +237,7 @@ final class CommentLayer: NSObject, ObservableObject {
         let comment = Comment(
             id: UUID(),
             quotedText: quoted,
+            occurrenceIndex: pendingOccurrenceIndex,
             body: body.trimmingCharacters(in: .whitespacesAndNewlines),
             createdAt: Date()
         )
@@ -216,6 +246,7 @@ final class CommentLayer: NSObject, ObservableObject {
         activePopover = nil
         isShowingPopover = false
         pendingQuotedText = ""
+        pendingOccurrenceIndex = 0
         pendingFirstChar = nil
     }
 
@@ -230,15 +261,70 @@ final class CommentLayer: NSObject, ObservableObject {
     // MARK: - Click-to-jump
 
     func jumpTo(_ comment: Comment) {
-        let text = comment.quotedText
-        flashingText = text
+        let anchor = comment.anchor
+        flashingAnchor = anchor
         Task {
             try? await Task.sleep(for: .milliseconds(900))
-            if flashingText == text { flashingText = nil }
+            if flashingAnchor == anchor { flashingAnchor = nil }
         }
     }
 
     // MARK: - Selection helpers
+
+    /// Returns the 0-based occurrence index of `quotedText` that the user had selected.
+    ///
+    /// NSTextView path: reads the current selectedRange() directly — the selection is still
+    /// live at this call site (inside requestNewComment, before the popover opens).
+    ///
+    /// Textual NSTextInteractionView path: uses `anchorTextBeforeSelection`, which was
+    /// captured at mouseUp time via NSTextInputClient. Counts occurrences of `quotedText`
+    /// in the prefix to get the index of the selected occurrence.
+    ///
+    /// Falls back to 0 when position information is unavailable (e.g. Textual's
+    /// NSTextInteractionView does not expose NSTextInputClient on the current OS version).
+    private func computeOccurrenceIndex(for quotedText: String) -> Int {
+        guard !quotedText.isEmpty else { return 0 }
+
+        // NSTextView path (header text fields and other non-Textual text views).
+        if let tv = anchorTextView {
+            let range = tv.selectedRange()
+            if range.length > 0, range.location != NSNotFound {
+                return countPriorOccurrences(of: quotedText, beforeNSOffset: range.location, in: tv.string)
+            }
+        }
+
+        // Textual NSTextInteractionView path — pre-captured text before the selection.
+        if let textBefore = anchorTextBeforeSelection {
+            return countOccurrencesIn(prefix: textBefore, of: quotedText)
+        }
+
+        return 0
+    }
+
+    /// Counts occurrences of `text` that end strictly before `offset` (UTF-16) in `fullText`.
+    private func countPriorOccurrences(of text: String, beforeNSOffset offset: Int, in fullText: String) -> Int {
+        let nsText = fullText as NSString
+        var count = 0
+        var from = 0
+        while from < offset {
+            let found = nsText.range(of: text, options: [], range: NSRange(location: from, length: offset - from))
+            if found.location == NSNotFound { break }
+            count += 1
+            from = found.location + found.length
+        }
+        return count
+    }
+
+    /// Counts non-overlapping occurrences of `text` in `prefix` (Swift string, Unicode-safe).
+    private func countOccurrencesIn(prefix: String, of text: String) -> Int {
+        var count = 0
+        var from = prefix.startIndex
+        while let range = prefix.range(of: text, range: from..<prefix.endIndex) {
+            count += 1
+            from = range.upperBound
+        }
+        return count
+    }
 
     /// Non-destructively checks whether the current first responder has a text selection
     /// by asking it to validate the "Copy" UI item. Textual's NSTextInteractionView
@@ -394,9 +480,11 @@ extension CommentLayer: NSPopoverDelegate {
             self.isShowingPopover = false
             self.pendingFirstChar = nil
             self.pendingQuotedText = ""
+            self.pendingOccurrenceIndex = 0
             self.activePopover = nil
             self.anchorInteractionScreenPoint = nil
             self.anchorInteractionView = nil
+            self.anchorTextBeforeSelection = nil
         }
     }
 }
@@ -427,13 +515,13 @@ struct WithCommentsModifier: ViewModifier {
     @StateObject private var layer = CommentLayer()
 
     func body(content: Content) -> some View {
-        let commentedTexts = layer.comments.map(\.quotedText).filter { !$0.isEmpty }
-        let flashingText = layer.flashingText
+        let commentedAnchors = layer.comments.map(\.anchor).filter { !$0.quotedText.isEmpty }
+        let flashingAnchor = layer.flashingAnchor
 
         HStack(spacing: 0) {
             content
-                .environment(\.commentedTexts, commentedTexts)
-                .environment(\.commentFlashText, flashingText)
+                .environment(\.commentedAnchors, commentedAnchors)
+                .environment(\.commentFlashAnchor, flashingAnchor)
 
             if !layer.comments.isEmpty {
                 Divider()
@@ -482,22 +570,22 @@ extension View {
 
 // MARK: - Environment keys
 
-private struct CommentedTextsKey: EnvironmentKey {
-    static var defaultValue: [String] { [] }
+private struct CommentedAnchorsKey: EnvironmentKey {
+    static var defaultValue: [CommentAnchor] { [] }
 }
 
-private struct CommentFlashTextKey: EnvironmentKey {
-    static var defaultValue: String? { nil }
+private struct CommentFlashAnchorKey: EnvironmentKey {
+    static var defaultValue: CommentAnchor? { nil }
 }
 
 extension EnvironmentValues {
-    var commentedTexts: [String] {
-        get { self[CommentedTextsKey.self] }
-        set { self[CommentedTextsKey.self] = newValue }
+    var commentedAnchors: [CommentAnchor] {
+        get { self[CommentedAnchorsKey.self] }
+        set { self[CommentedAnchorsKey.self] = newValue }
     }
 
-    var commentFlashText: String? {
-        get { self[CommentFlashTextKey.self] }
-        set { self[CommentFlashTextKey.self] = newValue }
+    var commentFlashAnchor: CommentAnchor? {
+        get { self[CommentFlashAnchorKey.self] }
+        set { self[CommentFlashAnchorKey.self] = newValue }
     }
 }
