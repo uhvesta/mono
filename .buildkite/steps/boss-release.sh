@@ -164,21 +164,34 @@ PLIST_EOF
 fi
 
 # ── build Boss.app (optimised, credentials embedded) ─────────────────────────
-# .bazelrc already declares --action_env for all three BOSS_SHAKE_* vars so
-# Bazel uses a different cache key from the credential-free mac-app-build step.
+# Credentials are passed via --define so rules_rust includes them in the rustc
+# compile action's cache key + env (option_env! reads them at compile time);
+# --action_env alone does not affect the rustc action.
+#
+# CRITICAL: the build flags below (especially -c opt) change the output
+# directory bazel-out is configured into. The path-discovery cquery MUST use
+# the IDENTICAL flag set, otherwise it resolves a different configuration's
+# output dir — specifically the credential-free `fastbuild` Boss.zip left
+# behind by the mac-app-build step (`bazel build //tools/boss/app-macos/...`,
+# no -c opt, no creds) — and the smoke test ends up verifying the wrong binary.
+# That mismatch is exactly what made every prior fix attempt "pass locally" but
+# fail in CI: the credentials were embedded correctly in the opt artifact, but
+# the smoke test extracted the fastbuild one. Keep BUILD_FLAGS the single
+# source of truth shared by both invocations.
+BUILD_FLAGS=(
+  -c opt
+  --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID"
+  --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID"
+  --define=BOSS_SHAKE_PRIVATE_KEY_PEM="$BOSS_SHAKE_PRIVATE_KEY_PEM"
+)
 
 log "[boss-release] building //tools/boss/app-macos:Boss (opt)"
-# Pass credentials via --define so rules_rust includes them in the rustc
-# compile action's cache key (--action_env alone does not affect it).
-bazel build -c opt \
-  --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID" \
-  --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID" \
-  --define=BOSS_SHAKE_PRIVATE_KEY_PEM="$BOSS_SHAKE_PRIVATE_KEY_PEM" \
-  //tools/boss/app-macos:Boss
+bazel build "${BUILD_FLAGS[@]}" //tools/boss/app-macos:Boss
 
-# Discover the actual zip output path via cquery (defensive against rule changes).
+# Discover the actual zip output path via cquery, using the SAME BUILD_FLAGS so
+# the resolved path matches the configuration we just built (see note above).
 log "[boss-release] discovering Boss.zip output path"
-ZIP_PATH=$(bazel cquery --output=files //tools/boss/app-macos:Boss 2>/dev/null | grep -E '\.zip$' | head -1)
+ZIP_PATH=$(bazel cquery "${BUILD_FLAGS[@]}" --output=files //tools/boss/app-macos:Boss 2>/dev/null | grep -E '\.zip$' | head -1)
 
 if [[ -z "${ZIP_PATH}" ]]; then
   die "Unable to discover Boss.zip path via cquery. Contents of bazel-bin/tools/boss/app-macos/:
@@ -248,9 +261,12 @@ ISSUE_NUM=$(printf '%s' "${SHAKE_OUT}" | jq -r '.number // empty' 2>/dev/null ||
 if [[ -z "${ISSUE_NUM}" ]]; then
   die "smoke test FAILED — boss shake did not return an issue number.
 Output: ${SHAKE_OUT}
-This means the just-built binary does not have shake credentials embedded.
-Check that the three BOSS_SHAKE_* secrets are set in the BK pipeline and that
-.bazelrc propagates them via --action_env."
+The extracted binary (from ${ZIP_PATH}) does not have shake credentials embedded.
+Check, in order: (1) the three BOSS_SHAKE_* secrets are set/non-empty in the BK
+pipeline; (2) ZIP_PATH above resolves to a '-opt-' output dir, NOT '-fastbuild-'
+— if it shows fastbuild, the discovery cquery and the build are using different
+flags and the smoke test is verifying the credential-free mac-app-build artifact;
+(3) the rust_binary embeds the values via rustc_env/option_env! (tools/boss/cli)."
 fi
 echo "[boss-release] smoke test passed: filed test issue #${ISSUE_NUM}"
 gh issue delete "${ISSUE_NUM}" --repo spinyfin/mono --yes
