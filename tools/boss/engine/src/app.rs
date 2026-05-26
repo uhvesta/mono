@@ -349,9 +349,17 @@ struct ServerState {
     work_revision: Arc<AtomicU64>,
     /// Pid of the process the engine trusts as the macOS app — must
     /// match a session's `peer_pid` for `RegisterAppSession` to
-    /// succeed. `None` only in tests; production sets this from
-    /// `getppid()` at startup.
-    app_pid: Option<libc::pid_t>,
+    /// succeed. `None` only in tests; production seeds this from
+    /// `BOSS_APP_PID` at startup.
+    ///
+    /// Interior-mutable because the app can restart against a surviving
+    /// engine (same-version relaunch — the engine correctly stays up).
+    /// The relaunched app has a new pid, so the trust root must be
+    /// re-pinned to it on re-registration; otherwise the stale pid
+    /// rejects every `RegisterAppSession` and engine→app RPCs
+    /// (`SpawnWorkerPane`, reveal) die. See `register_app_session`'s
+    /// caller and `current_app_pid`/`set_app_pid`.
+    app_pid: StdMutex<Option<libc::pid_t>>,
     /// Pid of the Boss session's shell, set by the app via
     /// `RegisterBossSession` once the Boss libghostty pane has spawned.
     /// Used as the second trust root: a peer whose process tree
@@ -842,7 +850,7 @@ impl ServerState {
                 anthropic_api_key,
                 next_session_id: AtomicU64::new(1),
                 work_revision,
-                app_pid,
+                app_pid: StdMutex::new(app_pid),
                 boss_pid: StdMutex::new(None),
                 pending_probes: StdMutex::new(HashMap::new()),
                 in_flight_probes: StdMutex::new(HashMap::new()),
@@ -1261,6 +1269,20 @@ impl ServerState {
         *self.boss_pid.lock().expect("boss_pid mutex poisoned")
     }
 
+    /// The pid currently trusted as the macOS app (the `RegisterAppSession`
+    /// / RPC-auth trust root). `None` in test mode (no trust root).
+    pub fn current_app_pid(&self) -> Option<libc::pid_t> {
+        *self.app_pid.lock().expect("app_pid mutex poisoned")
+    }
+
+    /// Re-pin the app trust root. Called when a relaunched app
+    /// re-registers against a surviving engine with a new pid — the
+    /// old pid belongs to a now-dead process, so the live app becomes
+    /// the trust root for subsequent engine↔app RPC authorization.
+    fn set_app_pid(&self, pid: libc::pid_t) {
+        *self.app_pid.lock().expect("app_pid mutex poisoned") = Some(pid);
+    }
+
     /// Push probe text onto the queue for `run_id`, mint a fresh
     /// `probe_id`, and return it so the caller can correlate the
     /// queued probe with the eventual `FrontendEvent::ProbeReplied`
@@ -1400,7 +1422,7 @@ impl ServerState {
         if matches!(tier, RpcTier::User) {
             return true;
         }
-        let app_pid = self.app_pid;
+        let app_pid = self.current_app_pid();
         let boss_pid = self.current_boss_pid();
         if app_pid.is_none() && boss_pid.is_none() {
             // No trust roots are configured at all — treat as
@@ -2740,6 +2762,52 @@ fn is_descendant_of_any(pid: libc::pid_t, trust_roots: &[libc::pid_t]) -> bool {
         }
     }
     false
+}
+
+/// Whether `pid` names a live process. Implemented with `kill(pid, 0)`,
+/// which delivers no signal but performs the existence + permission
+/// check: `Ok` means the process exists, `EPERM` means it exists but is
+/// owned by another user (still alive), and `ESRCH` means no such
+/// process. Used by `RegisterAppSession` to decide whether a stale app
+/// trust root can be superseded by a relaunched app — only when the old
+/// app process is genuinely gone.
+fn pid_is_alive(pid: libc::pid_t) -> bool {
+    // Reject pid <= 0: `kill(0, _)` targets the caller's process group
+    // and `kill(-pid, _)` a process group, neither of which is the
+    // single-process liveness probe we want — interpreting their result
+    // as "alive" would be wrong.
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 performs no action beyond the
+    // existence/permission probe; we only read `errno` on failure.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Decide whether a `RegisterAppSession` from `peer_pid` should be
+/// trusted, given the currently-pinned app trust root `current_app_pid`
+/// and the engine's own pid. Extracted from the connection handler so
+/// the trust transitions (matching pid, engine-ancestor, dead-old-app
+/// reattach) are unit-testable. See the call site for the rationale of
+/// each branch.
+fn register_app_session_trust_ok(
+    current_app_pid: Option<libc::pid_t>,
+    peer_pid: Option<libc::pid_t>,
+    engine_pid: libc::pid_t,
+) -> bool {
+    match (current_app_pid, peer_pid) {
+        (None, _) => true, // tests / no-trust-root mode
+        (Some(expected), Some(observed)) => {
+            observed == expected
+                || is_descendant_of_any(engine_pid, &[observed])
+                || !pid_is_alive(expected)
+        }
+        (Some(_), None) => false,
+    }
 }
 
 /// Resolve the `last_status_actor` string for an RPC-driven status change.
@@ -4884,7 +4952,7 @@ async fn handle_frontend_connection(
                 }
             }
             FrontendRequest::RegisterAppSession => {
-                // Trust the peer if either:
+                // Trust the peer if any of:
                 //   (a) it matches the declared app pid exactly. The
                 //       engine reads `BOSS_APP_PID` at startup; the
                 //       macOS app sets this before spawning the engine
@@ -4895,19 +4963,31 @@ async fn handle_frontend_connection(
                 //       chain (covers direct-launch scenarios like
                 //       `swift run` where no daemonizing wrapper
                 //       exists).
+                //   (c) APP RESTART against a surviving engine: the
+                //       trusted app pid belongs to a now-dead process
+                //       and a fresh app instance is connecting. The
+                //       engine correctly stays up on a same-version
+                //       relaunch, so the relaunched app must be able to
+                //       re-attach its session — otherwise the stale pid
+                //       rejects `RegisterAppSession` forever, no
+                //       `app_session` is registered, and every
+                //       engine→app RPC (`SpawnWorkerPane`, reveal) dies
+                //       silently. This is the mirror of T351 (engine
+                //       restart re-attaching surviving panes): there the
+                //       app survives and the engine restarts; here the
+                //       engine survives and the app restarts. We require
+                //       the old pid to be genuinely dead so a second
+                //       live app can't hijack the trust root from the
+                //       real one.
                 let engine_pid = std::process::id() as libc::pid_t;
-                let trust_ok = match (server_state.app_pid, peer_pid) {
-                    (None, _) => true, // tests / no-trust-root mode
-                    (Some(expected), Some(observed)) => {
-                        observed == expected || is_descendant_of_any(engine_pid, &[observed])
-                    }
-                    (Some(_), None) => false,
-                };
+                let current_app_pid = server_state.current_app_pid();
+                let trust_ok =
+                    register_app_session_trust_ok(current_app_pid, peer_pid, engine_pid);
                 if !trust_ok {
                     tracing::warn!(
                         peer_pid = ?peer_pid,
                         engine_pid,
-                        expected_app_pid = ?server_state.app_pid,
+                        expected_app_pid = ?current_app_pid,
                         "register_app_session rejected: peer pid neither matches BOSS_APP_PID nor is an engine ancestor",
                     );
                     send_response(
@@ -4919,6 +4999,22 @@ async fn handle_frontend_connection(
                         },
                     );
                     continue;
+                }
+                // Re-pin the trust root to the (re)connecting app when it
+                // differs from the stale pid. Keeps RPC authorization
+                // (`SpawnWorkerPane`, BossOnly/AppOrBoss tiers) following
+                // the live app across restarts. Only when a real trust
+                // root was configured — test mode (`None`) stays
+                // permissive so unit tests aren't pinned to a live pid.
+                if let (Some(prior), Some(observed)) = (current_app_pid, peer_pid) {
+                    if prior != observed {
+                        server_state.set_app_pid(observed);
+                        tracing::info!(
+                            prior_app_pid = prior,
+                            new_app_pid = observed,
+                            "app session re-attached: trust root re-pinned to relaunched app",
+                        );
+                    }
                 }
                 server_state
                     .register_app_session(session_id.clone(), sink.clone())
@@ -8992,6 +9088,99 @@ mod tests {
             !server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
             "BossOnly must continue to reject worker-pane descendants",
         );
+    }
+
+    /// Spawn `/usr/bin/true`, wait for it to exit, and return its
+    /// (now-reaped, definitely-dead) pid. Used to exercise the
+    /// dead-old-app reattach branch without guessing an unused pid.
+    #[cfg(target_os = "macos")]
+    fn reaped_child_pid() -> libc::pid_t {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id() as libc::pid_t;
+        child.wait().expect("wait for child to exit");
+        pid
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pid_is_alive_true_for_self_false_for_reaped_child() {
+        let self_pid = std::process::id() as libc::pid_t;
+        assert!(pid_is_alive(self_pid), "the current process must read as alive");
+        assert!(!pid_is_alive(0), "pid 0 must never read as a live trust root");
+        assert!(!pid_is_alive(reaped_child_pid()), "a reaped child must read as dead");
+    }
+
+    #[test]
+    fn register_trust_permissive_without_trust_root() {
+        // Test / dev mode: no BOSS_APP_PID configured → any peer (even
+        // an unknown pid, or none) registers, matching the historical
+        // `(None, _) => true` behaviour relied on by unit tests.
+        let engine_pid = std::process::id() as libc::pid_t;
+        assert!(register_app_session_trust_ok(None, Some(4242), engine_pid));
+        assert!(register_app_session_trust_ok(None, None, engine_pid));
+    }
+
+    #[test]
+    fn register_trust_accepts_matching_pid_and_rejects_unknown_live_pid() {
+        let engine_pid = std::process::id() as libc::pid_t;
+        let self_pid = std::process::id() as libc::pid_t;
+        // Exact match against the pinned app pid → accept.
+        assert!(register_app_session_trust_ok(
+            Some(self_pid),
+            Some(self_pid),
+            engine_pid,
+        ));
+        // A *different* but still-live pid that is neither the trust
+        // root nor an engine ancestor must be rejected — this is the
+        // guard that stops a second live app hijacking the trust root.
+        // (self_pid is alive, so the dead-old-app branch can't fire.)
+        let other_live = if self_pid == 2 { 3 } else { 2 };
+        assert!(!register_app_session_trust_ok(
+            Some(self_pid),
+            Some(other_live),
+            engine_pid,
+        ));
+        // A connection with no observable peer pid against a real trust
+        // root is rejected.
+        assert!(!register_app_session_trust_ok(Some(self_pid), None, engine_pid));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn register_trust_accepts_relaunched_app_when_old_app_pid_is_dead() {
+        // The core reattach repro: the engine survived an app restart,
+        // so its pinned app pid belongs to a now-dead process, and the
+        // relaunched app connects with a fresh, unrelated pid. The new
+        // app must be trusted so it can re-register its session —
+        // otherwise every engine→app RPC (SpawnWorkerPane, reveal)
+        // dies with "no app session is registered". Mirror of T351.
+        let engine_pid = std::process::id() as libc::pid_t;
+        let dead_old_app = reaped_child_pid();
+        let new_app = std::process::id() as libc::pid_t; // a live, unrelated pid
+        assert_ne!(dead_old_app, new_app);
+        assert!(
+            register_app_session_trust_ok(Some(dead_old_app), Some(new_app), engine_pid),
+            "a relaunched app must reattach when the old app pid is dead",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn set_app_pid_repins_trust_root() {
+        // After a successful reattach the engine re-pins app_pid so RPC
+        // authorization (SpawnWorkerPane, BossOnly/AppOrBoss) follows the
+        // live app across the restart.
+        let server_state = server_state_with_app_pid(1);
+        assert_eq!(server_state.current_app_pid(), Some(1));
+        let self_pid = std::process::id() as libc::pid_t;
+        server_state.set_app_pid(self_pid);
+        assert_eq!(server_state.current_app_pid(), Some(self_pid));
+        // The re-pinned pid is now a valid BossOnly trust root (the test
+        // process is its own descendant), proving the auth gate reads
+        // the updated value.
+        assert!(server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)));
     }
 
     #[cfg(target_os = "macos")]
