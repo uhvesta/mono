@@ -1241,6 +1241,74 @@ impl WorkerCompletionHandler {
             .await
     }
 
+    /// PR-detection recheck for a terminal execution (status
+    /// `abandoned`, `completed`, or `failed`) whose task is still
+    /// `active` with no `pr_url`. This is the Bug B recovery path for
+    /// the double-spawn race: exec_A is abandoned by the orphan sweep,
+    /// exec_A's pane later pushes a PR, and the on-Stop hook returns
+    /// `AlreadyTerminal` because exec_A is already in a terminal status.
+    ///
+    /// Unlike [`Self::recheck_for_pr`] this method does **not** gate on
+    /// execution status and does **not** call
+    /// `record_worker_pr_completion` (which requires `running` /
+    /// `waiting_human`). Instead, on a `Fresh` PR detection, it calls
+    /// [`WorkDb::bind_pr_to_active_task_from_terminal_execution`] to
+    /// advance only the task row.
+    pub async fn recheck_for_pr_late(
+        &self,
+        candidate: &crate::work::LatePrCandidate,
+    ) -> StopOutcome {
+        let expected_branch = expected_branch_name(&candidate.execution_id);
+        let pr_status = match self
+            .pr_detector
+            .detect_pr(&candidate.repo_remote_url, &expected_branch)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id = %candidate.execution_id,
+                    expected_branch = %expected_branch,
+                    ?err,
+                    "pr-recheck-late: detector failed; will retry next sweep"
+                );
+                return StopOutcome::DetectorFailed;
+            }
+        };
+        let pr_url = match pr_status {
+            PrStatus::None | PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
+            PrStatus::Stale { url, reason } => {
+                return StopOutcome::StalePr { pr_url: url, reason }
+            }
+            PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
+            PrStatus::Fresh { url } | PrStatus::Merged { url } => url,
+        };
+        match self
+            .work_db
+            .bind_pr_to_active_task_from_terminal_execution(&candidate.work_item_id, &pr_url)
+        {
+            Ok(true) => {
+                tracing::info!(
+                    execution_id = %candidate.execution_id,
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %pr_url,
+                    "pr-recheck-late: bound late PR to active task (double-spawn recovery)",
+                );
+                StopOutcome::PrDetected { pr_url }
+            }
+            Ok(false) => StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %candidate.execution_id,
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "pr-recheck-late: DB update failed"
+                );
+                StopOutcome::DbError
+            }
+        }
+    }
+
     /// Common Fresh/Merged transition path shared by `on_stop_inner`
     /// and `recheck_for_pr`. Records the completion, releases the
     /// cube lease + pane, publishes invalidation events, and returns
@@ -5683,5 +5751,148 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             None,
             "no bound PR ⇒ no snapshot",
         );
+    }
+
+    // ── Bug B: recheck_for_pr_late ─────────────────────────────────────────
+
+    /// Build a WorkDb with a chore whose execution is `abandoned` and
+    /// `workspace_path` is still set (mirrors the double-spawn race where
+    /// exec_A is abandoned by the orphan sweep while its pane is running).
+    fn abandoned_execution_fixture() -> (Arc<WorkDb>, String, String, String) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss-late.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Late PR chore".into(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/workspaces/mono-agent-001",
+            )
+            .unwrap();
+        // Mirror the waiting_human state.
+        db.finish_execution_run(
+            &execution.id,
+            &run.id,
+            "waiting_human",
+            "completed",
+            Some("spawned pane"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // Simulate orphan sweep abandoning exec_A.
+        db.mark_execution_redundant(&execution.id).unwrap();
+        (db, product.id, chore.id, execution.id)
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_late_binds_pr_to_active_task() {
+        let (db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
+        let detector =
+            StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/42"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher, pane, probes);
+
+        let candidate = crate::work::LatePrCandidate {
+            execution_id: execution_id.clone(),
+            work_item_id: chore_id.clone(),
+            repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+        };
+        let outcome = handler.recheck_for_pr_late(&candidate).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { .. }),
+            "expected PrDetected, got {outcome:?}"
+        );
+        let task = match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(task.status, "in_review");
+        assert_eq!(
+            task.pr_url.as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/42")
+        );
+        // Execution itself stays abandoned — recheck_for_pr_late does not
+        // touch the execution row.
+        let exec = db.get_execution(&execution_id).unwrap();
+        assert_eq!(exec.status, "abandoned");
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_late_returns_awaiting_input_when_no_pr() {
+        let (db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
+        let detector = StubPrDetector::ok(None); // no PR found
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher, pane, probes);
+
+        let candidate = crate::work::LatePrCandidate {
+            execution_id: execution_id.clone(),
+            work_item_id: chore_id.clone(),
+            repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+        };
+        let outcome = handler.recheck_for_pr_late(&candidate).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::AwaitingInput),
+            "expected AwaitingInput when no PR found, got {outcome:?}"
+        );
+        // Chore stays active.
+        let task = match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(task.status, "active");
+        assert!(task.pr_url.is_none());
     }
 }

@@ -1387,6 +1387,51 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         worker_id: &str,
     ) -> Result<()> {
+        // Double-spawn guard (Bug A): if another execution for this
+        // work_item is already live (running or waiting_human), this
+        // execution is a redundant duplicate created by the orphan sweep
+        // racing with a still-active pane. Abandon it without spawning
+        // so "execution run completed" doesn't fire prematurely.
+        match self
+            .work_db
+            .get_live_execution_for_work_item(&execution.work_item_id, &execution.id)
+        {
+            Ok(Some(live)) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    live_execution_id = %live.id,
+                    work_item_id = %execution.work_item_id,
+                    "spawn_attempt: redundant — another execution is already live; deferring to that one",
+                );
+                if let Err(err) = self.work_db.mark_execution_redundant(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "spawn_attempt: failed to mark redundant execution abandoned",
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "redundant spawn: execution {} for work_item {} superseded by live execution {}",
+                    execution.id,
+                    execution.work_item_id,
+                    live.id,
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // Non-fatal: if the DB check fails, proceed with the
+                // spawn rather than blocking all dispatches. The worst
+                // case is the double-spawn race we're trying to prevent,
+                // which is the pre-existing behaviour.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: live-execution check failed — proceeding without dedup guard",
+                );
+            }
+        }
+
         let work_item = self
             .work_db
             .get_work_item(&execution.work_item_id)

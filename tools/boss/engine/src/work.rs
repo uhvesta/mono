@@ -934,6 +934,52 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Return the most recent `running` or `waiting_human` execution for
+    /// `work_item_id`, excluding `exclude_id`. Used by the double-spawn
+    /// guard in the coordinator: before spawning, if another execution is
+    /// already live, the new one is redundant and should be abandoned
+    /// without starting a worker.
+    pub fn get_live_execution_for_work_item(
+        &self,
+        work_item_id: &str,
+        exclude_id: &str,
+    ) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+             FROM work_executions
+             WHERE work_item_id = ?1
+               AND id != ?2
+               AND status IN ('running', 'waiting_human')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            rusqlite::params![work_item_id, exclude_id],
+            map_execution,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Mark an execution `abandoned` without touching any other
+    /// execution or task state. Used by the double-spawn guard to
+    /// discard a redundant `ready` execution before it ever reaches
+    /// `start_execution_run`.
+    pub fn mark_execution_redundant(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_string();
+        conn.execute(
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE id = ?1",
+            rusqlite::params![execution_id, now],
+        )?;
+        Ok(())
+    }
+
     /// Fetch a single project by id. Used by the runner when it
     /// composes the worker prompt for a `kind = 'design'` task —
     /// the design task itself is sparse, so the runner enriches the
@@ -3809,6 +3855,91 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Return recently-terminal executions whose task is still `active`
+    /// with no `pr_url`. These are candidates for the merge poller's
+    /// late-PR-detection sweep (Bug B): when a double-spawn race causes
+    /// exec_A to be abandoned before the real worker pushes its PR, the
+    /// on-Stop hook returns `AlreadyTerminal` and the normal
+    /// `list_executions_pending_pr_detection` query (which only watches
+    /// `waiting_human`) never picks the chore back up. This query fills
+    /// that gap by watching terminal executions that finished within the
+    /// last `lookback_secs` seconds.
+    ///
+    /// Only executions with `workspace_path` set are returned — the
+    /// absence of a workspace_path means the execution never reached the
+    /// pane-spawn stage and therefore never pushed a branch the detector
+    /// could find. Status `'cancelled'` and `'orphaned'` are excluded
+    /// because those arise from human or engine actions that pre-date
+    /// the pane-spawn lifecycle this sweep covers.
+    pub fn list_recently_terminal_executions_pending_pr_detection(
+        &self,
+        lookback_secs: u64,
+    ) -> Result<Vec<LatePrCandidate>> {
+        let conn = self.connect()?;
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(lookback_secs)
+            .to_string();
+        let mut stmt = conn.prepare(
+            "SELECT we.id, we.work_item_id, we.repo_remote_url
+             FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status IN ('abandoned', 'completed', 'failed')
+               AND we.workspace_path IS NOT NULL
+               AND we.workspace_path != ''
+               AND we.finished_at IS NOT NULL
+               AND CAST(we.finished_at AS INTEGER) >= ?1
+               AND t.deleted_at IS NULL
+               AND t.kind IN ('chore', 'project_task', 'design', 'investigation')
+               AND t.status = 'active'
+               AND (t.pr_url IS NULL OR t.pr_url = '')
+             ORDER BY we.finished_at DESC, we.id DESC",
+        )?;
+        let rows = stmt.query_map([cutoff], |row| {
+            Ok(LatePrCandidate {
+                execution_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                repo_remote_url: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Transition a task from `active` to `in_review` by binding a
+    /// late-detected PR URL. Called by the merge poller's late-PR sweep
+    /// when the PR was pushed after the original execution became
+    /// terminal (double-spawn race). Unlike `record_worker_pr_completion`
+    /// this function does not gate on execution status — the execution is
+    /// already terminal; we only need to advance the task.
+    ///
+    /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
+    /// already past `active` (idempotent for concurrent sweeps).
+    pub fn bind_pr_to_active_task_from_terminal_execution(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 pr_url            = ?2,
+                 updated_at        = ?3,
+                 last_status_actor = 'engine',
+                 blocked_reason    = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status = 'active'
+               AND (pr_url IS NULL OR pr_url = '')",
+            params![work_item_id, pr_url, now],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
     /// Move the chore or project_task identified by `work_item_id`
     /// from `in_review` to `done`, recording `pr_url` (no-op if it
     /// was already set to the same value). Returns the updated task
@@ -6406,6 +6537,17 @@ pub struct PendingMergeCheck {
     pub work_item_id: String,
     pub product_id: String,
     pub pr_url: String,
+}
+
+/// One row from [`WorkDb::list_recently_terminal_executions_pending_pr_detection`]:
+/// a terminal execution whose task is still `active` with no `pr_url`. The merge
+/// poller's late-PR sweep uses this to recover chores that were orphan-swept
+/// while their worker pane was still running (double-spawn race — Bug B).
+#[derive(Debug, Clone)]
+pub struct LatePrCandidate {
+    pub execution_id: String,
+    pub work_item_id: String,
+    pub repo_remote_url: String,
 }
 
 /// Raw external-ref data as stored in the `tasks` table. Returned by
@@ -20776,5 +20918,262 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    // ── Bug A: double-spawn guard ───────────────────────────────────────────
+
+    fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String) {
+        let product = db
+            .create_product(CreateProductInput {
+                name: format!("Prod-{label}"),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: format!("Chore-{label}"),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let exec = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (exec, run) = db
+            .start_execution_run(
+                &exec.id,
+                "agent-1",
+                "repo-1",
+                "lease-1",
+                "ws-1",
+                "/workspaces/ws-1",
+            )
+            .unwrap();
+        db.finish_execution_run(
+            &exec.id,
+            &run.id,
+            "waiting_human",
+            "completed",
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        (product.id, chore.id, exec.id)
+    }
+
+    #[test]
+    fn get_live_execution_returns_waiting_human_execution_for_work_item() {
+        let db = WorkDb::open(temp_db_path("live-exec")).unwrap();
+        let (_, chore_id, exec_a_id) = make_waiting_human_chore(&db, "live-exec");
+
+        // A second ready execution for the same chore (as would be created by
+        // the orphan sweep).
+        let exec_b = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore_id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        // exec_b should see exec_a as live.
+        let live = db
+            .get_live_execution_for_work_item(&chore_id, &exec_b.id)
+            .unwrap();
+        assert!(live.is_some(), "exec_a should appear as live");
+        assert_eq!(live.unwrap().id, exec_a_id);
+    }
+
+    #[test]
+    fn get_live_execution_excludes_specified_id() {
+        let db = WorkDb::open(temp_db_path("live-exec-exclude")).unwrap();
+        let (_, chore_id, exec_a_id) = make_waiting_human_chore(&db, "live-exec-exclude");
+
+        // Querying with exec_a as the exclude_id should return None.
+        let live = db
+            .get_live_execution_for_work_item(&chore_id, &exec_a_id)
+            .unwrap();
+        assert!(
+            live.is_none(),
+            "should not return the excluded execution itself"
+        );
+    }
+
+    #[test]
+    fn get_live_execution_returns_none_when_all_executions_are_terminal() {
+        let db = WorkDb::open(temp_db_path("live-exec-terminal")).unwrap();
+        let (_, chore_id, exec_a_id) = make_waiting_human_chore(&db, "live-exec-terminal");
+
+        // Manually abandon exec_a.
+        db.mark_execution_redundant(&exec_a_id).unwrap();
+
+        let exec_b = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore_id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        let live = db
+            .get_live_execution_for_work_item(&chore_id, &exec_b.id)
+            .unwrap();
+        assert!(
+            live.is_none(),
+            "no live execution should remain after exec_a is abandoned"
+        );
+    }
+
+    #[test]
+    fn mark_execution_redundant_sets_status_abandoned() {
+        let db = WorkDb::open(temp_db_path("mark-redundant")).unwrap();
+        let (_, _, exec_a_id) = make_waiting_human_chore(&db, "mark-redundant");
+
+        db.mark_execution_redundant(&exec_a_id).unwrap();
+
+        let exec = db.get_execution(&exec_a_id).unwrap();
+        assert_eq!(exec.status, "abandoned");
+        assert!(exec.finished_at.is_some(), "finished_at must be set");
+    }
+
+    // ── Bug B: late PR detection ────────────────────────────────────────────
+
+    fn make_abandoned_chore_with_workspace(db: &WorkDb, label: &str) -> (String, String, String) {
+        let (product_id, chore_id, exec_id) = make_waiting_human_chore(db, label);
+        // Simulate the orphan sweep abandoning exec_a.
+        db.mark_execution_redundant(&exec_id).unwrap();
+        (product_id, chore_id, exec_id)
+    }
+
+    #[test]
+    fn list_recently_terminal_finds_abandoned_exec_for_active_chore() {
+        let db = WorkDb::open(temp_db_path("late-pr-list")).unwrap();
+        let (_, chore_id, exec_id) = make_abandoned_chore_with_workspace(&db, "late-pr-list");
+
+        let candidates = db
+            .list_recently_terminal_executions_pending_pr_detection(3600)
+            .unwrap();
+        assert_eq!(candidates.len(), 1, "should find one late PR candidate");
+        assert_eq!(candidates[0].execution_id, exec_id);
+        assert_eq!(candidates[0].work_item_id, chore_id);
+    }
+
+    #[test]
+    fn list_recently_terminal_excludes_chore_with_pr_url_already_set() {
+        let db = WorkDb::open(temp_db_path("late-pr-list-has-pr")).unwrap();
+        let (_, chore_id, _) = make_abandoned_chore_with_workspace(&db, "late-pr-list-has-pr");
+
+        // Manually bind a pr_url to the task.
+        db.update_work_item(
+            &chore_id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some("https://github.com/foo/bar/pull/1".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        let candidates = db
+            .list_recently_terminal_executions_pending_pr_detection(3600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "chore already has pr_url — should not appear as candidate"
+        );
+    }
+
+    #[test]
+    fn bind_pr_to_active_task_transitions_to_in_review() {
+        let db = WorkDb::open(temp_db_path("bind-pr-active")).unwrap();
+        let (_, chore_id, exec_id) = make_abandoned_chore_with_workspace(&db, "bind-pr-active");
+
+        let updated = db
+            .bind_pr_to_active_task_from_terminal_execution(
+                &chore_id,
+                "https://github.com/foo/bar/pull/99",
+            )
+            .unwrap();
+        assert!(updated, "should return true on first bind");
+
+        let task = match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore or task, got {other:?}"),
+        };
+        assert_eq!(task.status, "in_review");
+        assert_eq!(
+            task.pr_url.as_deref(),
+            Some("https://github.com/foo/bar/pull/99")
+        );
+
+        // Execution itself should still be abandoned (not touched by bind).
+        let exec = db.get_execution(&exec_id).unwrap();
+        assert_eq!(exec.status, "abandoned");
+    }
+
+    #[test]
+    fn bind_pr_to_active_task_is_idempotent_when_already_in_review() {
+        let db = WorkDb::open(temp_db_path("bind-pr-idempotent")).unwrap();
+        let (_, chore_id, _) =
+            make_abandoned_chore_with_workspace(&db, "bind-pr-idempotent");
+
+        let first = db
+            .bind_pr_to_active_task_from_terminal_execution(
+                &chore_id,
+                "https://github.com/foo/bar/pull/99",
+            )
+            .unwrap();
+        assert!(first);
+
+        let second = db
+            .bind_pr_to_active_task_from_terminal_execution(
+                &chore_id,
+                "https://github.com/foo/bar/pull/99",
+            )
+            .unwrap();
+        assert!(!second, "should return false when task is already past active");
     }
 }
