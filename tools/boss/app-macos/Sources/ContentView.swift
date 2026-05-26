@@ -1406,6 +1406,7 @@ private struct WorkBoardCardItem: View {
                     assignedSlotId: column == .doing ? liveState?.slotId : nil,
                     liveStatus: liveStatusForCard,
                     liveStatusActivity: isDispatchPending ? nil : (column == .doing ? liveState?.activity : nil),
+                    liveStatusLastEventAt: isDispatchPending ? nil : (column == .doing ? liveState?.lastEventAt : nil),
                     blockedBy: blockedBy,
                     isAutoBlocked: isAutoBlocked,
                     gatingPrereqs: gatingPrereqs,
@@ -1524,12 +1525,18 @@ struct WorkBoardCardView: View {
     /// `nil` collapses the row entirely so idle/blank states don't
     /// leave awkward whitespace.
     var liveStatus: String? = nil
-    /// Activity of the worker behind `liveStatus`, used to tint the
-    /// subtitle row per design Q4: `WaitingForInput` reads in the
-    /// accent colour to match the "needs human" pill, `Errored` reads
-    /// in red, `Idle` dims further than `.secondary`. The default
-    /// `nil` is treated as the plain `.secondary` colour.
+    /// Activity of the worker behind `liveStatus`. `WaitingForInput`
+    /// now surfaces a `WorkerWaitingIndicator` icon next to the
+    /// subtitle (rather than tinting the text accent-blue, which was
+    /// ambiguous and an accessibility problem); `Errored` reads in
+    /// red, `Idle` dims further than `.secondary`. The default `nil`
+    /// is treated as the plain `.secondary` colour.
     var liveStatusActivity: WorkerActivity? = nil
+    /// ISO-8601 `last_event_at` of the worker behind `liveStatus`,
+    /// passed straight through from `LiveWorkerState`. Feeds the
+    /// "No response for …" elapsed time in the waiting indicator's
+    /// tooltip. `nil` when there is no live worker or no event yet.
+    var liveStatusLastEventAt: String? = nil
     /// Comma-joined names of the prereqs currently gating this card.
     /// Non-nil only on `blocked` rows — the kanban surfaces these in
     /// the Backlog column with a lock + "Blocked by …" subtitle so the
@@ -1677,14 +1684,20 @@ struct WorkBoardCardView: View {
             }
 
             if let liveStatus, !liveStatus.isEmpty {
-                Text(liveStatus)
-                    .font(.caption)
-                    .foregroundStyle(liveStatusColor)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(liveStatus)
-                    .accessibilityLabel("Live status: \(liveStatus)")
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    WorkerWaitingIndicator(
+                        activity: liveStatusActivity,
+                        lastEventAt: liveStatusLastEventAt
+                    )
+                    Text(liveStatus)
+                        .font(.caption)
+                        .foregroundStyle(liveStatusColor)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .help(liveStatus)
+                        .accessibilityLabel("Live status: \(liveStatus)")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if hasFooterContent {
@@ -1867,17 +1880,16 @@ struct WorkBoardCardView: View {
         return "Gated by: \(summary)"
     }
 
-    /// Tint for the live-status subtitle row. Q4 of the design pairs
-    /// the colour with the activity dot: red for errored runs, the
-    /// accent colour when the worker is waiting on a human, a dimmer
-    /// grey when the worker is idle, and the normal `.secondary` grey
-    /// while the worker is actively working.
+    /// Tint for the live-status subtitle row. Red for errored runs, a
+    /// dimmer grey when the worker is idle, and the normal `.secondary`
+    /// grey otherwise. The `waitingForInput` case is intentionally
+    /// *not* tinted: it now carries its meaning via the explicit
+    /// `WorkerWaitingIndicator` icon + tooltip instead of an ambiguous
+    /// accent-blue subtitle (hue alone is an accessibility problem).
     private var liveStatusColor: Color {
         switch liveStatusActivity {
         case .errored:
             return .red
-        case .waitingForInput:
-            return .accentColor
         case .idle:
             return Color(nsColor: .tertiaryLabelColor)
         default:
