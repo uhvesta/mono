@@ -121,10 +121,17 @@ fi
 log "[boss-release] building //tools/boss/app-macos:Boss (opt)"
 bazel build -c opt //tools/boss/app-macos:Boss
 
-BAZEL_BIN=$(bazel info bazel-bin)
-APP_PATH="${BAZEL_BIN}/tools/boss/app-macos/Boss.app"
-[[ -d "${APP_PATH}" ]] || die "Boss.app not found at ${APP_PATH}"
-echo "[boss-release] Boss.app: ${APP_PATH}"
+# Discover the actual zip output path via cquery (defensive against rule changes).
+log "[boss-release] discovering Boss.zip output path"
+ZIP_PATH=$(bazel cquery --output=files //tools/boss/app-macos:Boss 2>/dev/null | grep -E '\.zip$' | head -1)
+
+if [[ -z "${ZIP_PATH}" ]]; then
+  die "Unable to discover Boss.zip path via cquery. Contents of bazel-bin/tools/boss/app-macos/:
+$(ls -la bazel-bin/tools/boss/app-macos/ 2>/dev/null || echo '(directory not found)')"
+fi
+
+[[ -f "${ZIP_PATH}" ]] || die "Boss.zip not found at discovered path: ${ZIP_PATH}"
+echo "[boss-release] Boss.zip: ${ZIP_PATH}"
 
 # ── compute next release version ─────────────────────────────────────────────
 # Tags match boss-v1.0.N (monorepo-prefixed, mirrors checkleft-v* convention).
@@ -147,17 +154,16 @@ VERSION="boss-v1.0.${NEXT_N}"
 ARTIFACT="Boss-1.0.${NEXT_N}.zip"
 echo "[boss-release] version: ${VERSION}  artifact: ${ARTIFACT}"
 
-# ── package the .app bundle ───────────────────────────────────────────────────
-# ditto preserves macOS-specific metadata (resource forks, xattrs) that a
-# plain `zip` would strip.  --sequesterRsrc moves resource forks into the
-# __MACOSX/ directory so they survive decompression on non-HFS+ volumes.
+# ── prepare the pre-zipped artifact ────────────────────────────────────────────
+# The macos_application rule pre-zips the bundle, so we just rename it to the
+# release version and prepare it for publication.
 
-log "[boss-release] packaging Boss.app → ${ARTIFACT}"
+log "[boss-release] preparing ${ARTIFACT}"
 WORK_DIR=$(mktemp -d -t boss-release)
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
-ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "${WORK_DIR}/${ARTIFACT}"
-echo "[boss-release] zip: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
+cp "${ZIP_PATH}" "${WORK_DIR}/${ARTIFACT}"
+echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
 
 # ── create GitHub Release ─────────────────────────────────────────────────────
 
