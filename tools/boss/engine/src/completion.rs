@@ -395,7 +395,7 @@ async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String
 
 /// Parse the PR number from a canonical GitHub PR URL
 /// (`https://github.com/<owner>/<repo>/pull/<N>`).
-fn pr_number_from_url(pr_url: &str) -> Option<u64> {
+pub(crate) fn pr_number_from_url(pr_url: &str) -> Option<u64> {
     pr_url.split('/').last()?.parse().ok()
 }
 
@@ -1952,7 +1952,19 @@ impl WorkerCompletionHandler {
         };
         let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id) {
             Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-                crate::runner::task_bound_pr_url(&task).map(|s| s.to_owned())
+                // For revision_implementation executions the task's own
+                // pr_url is always NULL (design: revision tasks don't own
+                // a PR).  Fall back to execution.pr_url, which is set to
+                // the chain root's PR URL at dispatch time.
+                crate::runner::task_bound_pr_url(&task)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        if execution.kind == "revision_implementation" {
+                            execution.pr_url.clone().filter(|u| !u.is_empty())
+                        } else {
+                            None
+                        }
+                    })
             }
             Ok(_) => None,
             Err(err) => {
@@ -2061,8 +2073,19 @@ impl WorkerCompletionHandler {
         };
         let bound_pr_url = match work_item {
             WorkItem::Task(task) | WorkItem::Chore(task) => {
-                match crate::runner::task_bound_pr_url(&task).map(str::to_owned) {
+                // Primary: the task's own pr_url (or embedded in description).
+                // Fallback for revision_implementation: use execution.pr_url
+                // (set to the chain root's PR URL at dispatch time), because
+                // revision tasks always have task.pr_url = NULL by design.
+                let from_task = crate::runner::task_bound_pr_url(&task).map(str::to_owned);
+                match from_task {
                     Some(url) => url,
+                    None if execution.kind == "revision_implementation" => {
+                        match execution.pr_url.clone().filter(|u| !u.is_empty()) {
+                            Some(url) => url,
+                            None => return ShaDeltaGateOutcome::Inapplicable,
+                        }
+                    }
                     None => return ShaDeltaGateOutcome::Inapplicable,
                 }
             }
@@ -2571,6 +2594,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 
@@ -3445,6 +3470,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (execution, run) = db
@@ -3684,6 +3711,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (execution, run) = db
@@ -4278,6 +4307,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         // `start_execution_run` flips the row to `running`. Do not
@@ -4509,6 +4540,8 @@ PR #379. PR #379.";
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (execution, run) = db
@@ -4646,6 +4679,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (execution, run) = db
@@ -4998,6 +5033,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (exec2, run2) = db
@@ -5053,6 +5090,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (exec3, run3) = db
@@ -5800,6 +5839,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (execution, run) = db

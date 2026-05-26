@@ -1709,6 +1709,17 @@ impl WorkDb {
                         )?;
                     }
                 }
+                // Revision tasks dispatch independently like investigations.
+                // Each pushes a new commit to the *parent's* existing PR
+                // branch rather than opening a new PR.  The gate checks
+                // the chain root's status first (cached): if the parent PR
+                // has already merged (chain root is `done`), the revision
+                // is auto-blocked here rather than dispatched.
+                "revision" => {
+                    if task_accepts_execution(&task) {
+                        reconcile_revision_execution(&tx, &mut result, &task)?;
+                    }
+                }
                 "project_task" | "design" => {
                     if let Some(project_id) = &task.project_id {
                         project_tasks
@@ -3820,6 +3831,13 @@ impl WorkDb {
             WorkerPrCompletionTarget::InReview => "in_review".to_owned(),
             WorkerPrCompletionTarget::Done => "done".to_owned(),
         };
+        // Revision tasks do not own a PR — their `pr_url` must stay NULL.
+        // The parent (chain root) task's `pr_url` is the source of truth.
+        let pr_url_for_task: Option<&str> = if task.kind == "revision" {
+            task.pr_url.as_deref()
+        } else {
+            Some(pr_url)
+        };
         tx.execute(
             "UPDATE tasks
              SET status             = ?2,
@@ -3829,7 +3847,7 @@ impl WorkDb {
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL
              WHERE id = ?1",
-            params![task.id, new_status, pr_url, now],
+            params![task.id, new_status, pr_url_for_task, now],
         )?;
 
         if new_status != task.status {
@@ -3940,7 +3958,7 @@ impl WorkDb {
                AND we.workspace_path IS NOT NULL
                AND we.workspace_path != ''
                AND t.deleted_at IS NULL
-               AND t.kind IN ('chore', 'project_task', 'design', 'investigation')
+               AND t.kind IN ('chore', 'project_task', 'design', 'investigation', 'revision')
                AND t.status = 'active'
                AND (t.pr_url IS NULL OR t.pr_url = '')
              ORDER BY we.created_at ASC",
@@ -4073,6 +4091,10 @@ impl WorkDb {
             params![task.id, pr_url, now],
         )?;
         cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
+        // OQ7: when a chain root reaches `done`, flip any `in_review`
+        // revisions on it to `done` as well.  A revision's deliverable
+        // (the commit) rode the parent PR to its terminal state.
+        flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
         let updated = query_task(&tx, work_item_id)?
             .with_context(|| format!("unknown task after update: {work_item_id}"))?;
         tx.commit()?;
@@ -7700,13 +7722,15 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
     let preferred_workspace_id = normalize_optional_text(input.preferred_workspace_id);
     let started_at = normalize_optional_text(input.started_at);
     let finished_at = normalize_optional_text(input.finished_at);
+    let prefer_is_soft: i64 = if input.prefer_is_soft { 1 } else { 0 };
+    let pr_url = normalize_optional_text(input.pr_url);
 
     conn.execute(
         "INSERT INTO work_executions (
             id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-            created_at, started_at, finished_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            created_at, started_at, finished_at, prefer_is_soft, pr_url
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             id,
             input.work_item_id,
@@ -7722,6 +7746,8 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
             now,
             started_at,
             finished_at,
+            prefer_is_soft,
+            pr_url,
         ],
     )?;
 
@@ -8146,6 +8172,73 @@ pub(crate) fn chain_root(conn: &Connection, task_id: &str) -> Result<String> {
         }
     }
     Ok(last_resolved)
+}
+
+/// Flip every `in_review` revision whose chain root is `chain_root_id`
+/// to `done`.  Called from `mark_chore_pr_merged` so that when the
+/// parent PR merges all in-review revisions finish in the same
+/// transaction (per OQ7: done == parent PR merged or closed).
+///
+/// The revision's own `pr_url` is intentionally left `NULL` — the chain
+/// root's `pr_url` is the source of truth for the PR that delivered the
+/// revision's commit.
+fn flip_in_review_revisions_to_done(
+    conn: &Connection,
+    chain_root_id: &str,
+    now: &str,
+) -> Result<()> {
+    // Find all revisions whose immediate `parent_task_id` chain leads to
+    // `chain_root_id`.  Because chains are short (typically 1-3 deep) and
+    // bounded by `MAX_CHAIN_DEPTH = 64`, we collect all revision IDs
+    // belonging to this chain root and bulk-update them.
+    let revision_ids = collect_chain_revision_ids(conn, chain_root_id)?;
+    if revision_ids.is_empty() {
+        return Ok(());
+    }
+    for rev_id in &revision_ids {
+        conn.execute(
+            "UPDATE tasks
+             SET status            = 'done',
+                 updated_at        = ?2,
+                 last_status_actor = 'engine',
+                 blocked_reason    = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1
+               AND kind = 'revision'
+               AND status = 'in_review'
+               AND deleted_at IS NULL",
+            params![rev_id, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Collect the ids of every revision task in the chain rooted at
+/// `chain_root_id`, using BFS over `parent_task_id`.
+fn collect_chain_revision_ids(conn: &Connection, chain_root_id: &str) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut frontier = vec![chain_root_id.to_owned()];
+    for _ in 0..64 {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next_frontier = Vec::new();
+        for parent_id in &frontier {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id FROM tasks WHERE parent_task_id = ?1 AND kind = 'revision' AND deleted_at IS NULL",
+            )?;
+            let children: Vec<String> = stmt
+                .query_map([parent_id], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for child in children {
+                ids.push(child.clone());
+                next_frontier.push(child);
+            }
+        }
+        frontier = next_frontier;
+    }
+    Ok(ids)
 }
 
 /// Add the `autostart` column to `tasks` for older databases. New
@@ -9558,12 +9651,188 @@ fn reconcile_work_item_execution(
                     preferred_workspace_id: None,
                     started_at: None,
                     finished_at: None,
+                    prefer_is_soft: false,
+                    pr_url: None,
                 },
             )?;
             result.created.push(created);
         }
     }
 
+    Ok(())
+}
+
+/// Look up the chain root's task for a revision (the first non-revision
+/// ancestor) and return it. Returns `None` if the chain root can't be
+/// resolved (broken parent link or missing task).
+fn get_chain_root_task(conn: &Connection, revision_id: &str) -> Result<Option<Task>> {
+    let root_id = chain_root(conn, revision_id)?;
+    if root_id == revision_id {
+        // chain_root didn't walk anywhere — either the task itself is the
+        // chain root (non-revision) or the parent link is missing. In
+        // both cases, there is no real parent PR to revise; skip.
+        return Ok(None);
+    }
+    query_task(conn, &root_id)
+}
+
+/// Return the `cube_workspace_id` from the most recent non-failed
+/// execution of `chain_root_id`. Used as the soft preferred workspace
+/// for revision dispatch — warmth only, never a hard requirement.
+fn preferred_workspace_for_chain_root(
+    conn: &Connection,
+    chain_root_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT cube_workspace_id
+         FROM work_executions
+         WHERE work_item_id = ?1
+           AND status NOT IN ('failed', 'cancelled', 'orphaned', 'abandoned')
+           AND cube_workspace_id IS NOT NULL
+           AND cube_workspace_id != ''
+         ORDER BY created_at DESC
+         LIMIT 1",
+        [chain_root_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|opt| opt.flatten())
+    .map_err(Into::into)
+}
+
+/// Dispatch arm for `kind = 'revision'` tasks.
+///
+/// Dispatch-time cached gate: if the chain root is already `done` (PR
+/// merged or closed before this reconcile tick), move the revision to
+/// `blocked` with a clear reason and surface a `WorkAttentionItem`.
+/// This catches the common case; the coordinator adds a live probe
+/// for the race window between poller ticks.
+///
+/// If the gate passes, create a `revision_implementation` execution
+/// with `prefer_is_soft = true` (soft cube-workspace preference) and
+/// `pr_url` set to the chain root's PR URL (so the SHA-delta gate can
+/// snapshot the parent PR's HEAD and detect when the revision worker
+/// contributes).
+fn reconcile_revision_execution(
+    conn: &Connection,
+    result: &mut ExecutionReconcileResult,
+    task: &Task,
+) -> Result<()> {
+    // Walk to the chain root.
+    let chain_root_task = match get_chain_root_task(conn, &task.id)? {
+        Some(t) => t,
+        None => {
+            // Broken parent link — the revision has no resolvable chain
+            // root.  Skip dispatch; this is surfaced elsewhere as a data
+            // integrity problem.
+            tracing::warn!(
+                task_id = %task.id,
+                "reconcile_revision: cannot resolve chain root; skipping dispatch",
+            );
+            return Ok(());
+        }
+    };
+
+    // Chain root must have an open PR for the revision to push to.
+    let parent_pr_url = match chain_root_task.pr_url.as_deref().filter(|u| !u.is_empty()) {
+        Some(u) => u.to_owned(),
+        None => {
+            // No PR yet — the parent hasn't been dispatched or hasn't
+            // opened a PR.  Stay in `todo` until the parent creates one.
+            tracing::debug!(
+                task_id = %task.id,
+                chain_root_id = %chain_root_task.id,
+                "reconcile_revision: chain root has no pr_url yet; deferring revision dispatch",
+            );
+            return Ok(());
+        }
+    };
+
+    // Cached dispatch-time gate: if the chain root is `done`, the PR has
+    // merged or been closed.  Auto-block the revision so it doesn't get
+    // dispatched into an already-merged branch.
+    if chain_root_task.status == "done" || chain_root_task.status == "archived" {
+        let now = now_string();
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET status = 'blocked',
+                 blocked_reason = 'parent_pr_closed',
+                 last_status_actor = 'engine',
+                 updated_at = ?2
+             WHERE id = ?1
+               AND status NOT IN ('blocked', 'done', 'archived')
+               AND deleted_at IS NULL",
+            params![task.id, now],
+        )?;
+        if rows_changed > 0 {
+            tracing::info!(
+                task_id = %task.id,
+                chain_root_id = %chain_root_task.id,
+                "reconcile_revision: chain root is done; blocked revision (parent PR closed/merged)",
+            );
+            // Surface as an attention item on the revision task.
+            let attn_id = next_id("attn");
+            conn.execute(
+                "INSERT INTO work_attention_items
+                     (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at)
+                 VALUES (?1, NULL, ?2, 'revision_parent_closed', 'open',
+                         'Parent PR closed before revision dispatched',
+                         'The parent task''s PR was merged or closed before this revision could be dispatched. File a new task if further changes are needed.',
+                         ?3)",
+                params![attn_id, task.id, now],
+            )?;
+        }
+        return Ok(());
+    }
+
+    // Gate passed.  Create or refresh the execution row.
+    let gated = !deps::gating_prereqs_for(conn, &task.id)?.is_empty();
+    let effective_status = if gated { "waiting_dependency" } else { "ready" };
+
+    match query_latest_execution_for_work_item(conn, &task.id)? {
+        Some(existing) if existing.kind == "revision_implementation"
+            && can_reconcile_execution_status(&existing.status)
+            && existing.status != effective_status =>
+        {
+            let updated = update_execution_status(conn, &existing.id, effective_status)?;
+            result.updated.push(updated);
+        }
+        Some(existing)
+            if existing.kind == "revision_implementation"
+                && can_reconcile_execution_status(&existing.status) =>
+        {
+            // Already in the right status — nothing to do.
+        }
+        _ => {
+            // No matching execution yet (or previous is terminal) — create one.
+            let Some(repo_remote_url) = resolve_repo_for_work_item(conn, &task.id)? else {
+                let label = repo_unresolved_kind_label(conn, &task.id)?;
+                record_repo_unresolved_attention(conn, &task.id, label)?;
+                return Ok(());
+            };
+            let preferred_workspace_id = preferred_workspace_for_chain_root(conn, &chain_root_task.id)?;
+            let created = insert_execution(
+                conn,
+                CreateExecutionInput {
+                    work_item_id: task.id.clone(),
+                    kind: "revision_implementation".to_owned(),
+                    status: Some(effective_status.to_owned()),
+                    repo_remote_url: Some(repo_remote_url),
+                    cube_repo_id: None,
+                    cube_lease_id: None,
+                    cube_workspace_id: None,
+                    workspace_path: None,
+                    priority: None,
+                    preferred_workspace_id,
+                    started_at: None,
+                    finished_at: None,
+                    prefer_is_soft: true,
+                    pr_url: Some(parent_pr_url),
+                },
+            )?;
+            result.created.push(created);
+        }
+    }
     Ok(())
 }
 
@@ -9782,6 +10051,8 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             preferred_workspace_id,
             started_at: None,
             finished_at: None,
+            prefer_is_soft: false,
+            pr_url: None,
         },
     )
 }
@@ -11601,6 +11872,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         assert_eq!(
@@ -11686,6 +11959,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap_err();
         assert!(
@@ -11708,6 +11983,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         assert_eq!(
@@ -12283,6 +12560,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 
@@ -12475,6 +12754,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         // Drive the chore into the Doing column by starting the run —
@@ -12548,6 +12829,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         // The worker opened a PR before the human asked to cancel.
@@ -12639,6 +12922,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 
@@ -14753,6 +15038,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 
@@ -14821,6 +15108,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 
@@ -14919,6 +15208,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 
@@ -19127,6 +19418,8 @@ mod tests {
             preferred_workspace_id: None,
             started_at: None,
             finished_at: None,
+            prefer_is_soft: false,
+            pr_url: None,
         })
         .unwrap()
     }
@@ -21484,6 +21777,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let (exec, run) = db
@@ -21531,6 +21826,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 
@@ -21579,6 +21876,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
 

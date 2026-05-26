@@ -83,6 +83,8 @@ pub fn backfill_orphaned_executions(
             preferred_workspace_id: None,
             started_at: None,
             finished_at: None,
+            prefer_is_soft: false,
+            pr_url: None,
         }) {
             Ok(_) => {
                 backfilled += 1;
@@ -391,6 +393,8 @@ pub async fn on_conflict_detected(
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             }) {
                 Ok(_) => publisher.kick_scheduler(),
                 Err(err) => {
@@ -631,6 +635,8 @@ pub async fn rescue_stranded_attempt(
         preferred_workspace_id: None,
         started_at: None,
         finished_at: None,
+        prefer_is_soft: false,
+        pr_url: None,
     }) {
         Ok(_) => {
             publisher.kick_scheduler();

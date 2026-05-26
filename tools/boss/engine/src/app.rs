@@ -11030,6 +11030,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         let item = db

@@ -429,6 +429,8 @@ pub async fn on_ci_failure_detected(
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             }) {
                 Ok(_) => publisher.kick_scheduler(),
                 Err(err) => {
@@ -711,6 +713,8 @@ pub async fn on_merge_queue_rebounce_detected(
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             }) {
                 Ok(_) => publisher.kick_scheduler(),
                 Err(err) => {
@@ -1073,6 +1077,8 @@ pub async fn rescue_stranded_ci_remediation_attempt(
         preferred_workspace_id: None,
         started_at: None,
         finished_at: None,
+        prefer_is_soft: false,
+        pr_url: None,
     }) {
         Ok(_) => {
             publisher.kick_scheduler();

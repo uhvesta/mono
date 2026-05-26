@@ -1227,6 +1227,16 @@ pub struct CreateExecutionInput {
     pub preferred_workspace_id: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// When true, the cube lease fallback degrades silently to any free
+    /// workspace if the preferred workspace is gone or leased. Used for
+    /// `revision_implementation` executions where warmth is a hint only.
+    #[serde(default)]
+    pub prefer_is_soft: bool,
+    /// PR URL to bind to this execution row at creation time. For
+    /// `revision_implementation` this is the chain root's `pr_url` so
+    /// the SHA-delta gate can snapshot and verify the parent PR HEAD.
+    #[serde(default)]
+    pub pr_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

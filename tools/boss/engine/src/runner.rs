@@ -704,6 +704,9 @@ fn compose_execution_prompt(
         "investigation_implementation" => {
             prompt.push_str(&compose_investigation_directive(work_item));
         }
+        "revision_implementation" => {
+            prompt.push_str(&compose_revision_directive(execution, work_item));
+        }
         "task_implementation" | "chore_implementation" => {
             prompt.push_str(
                 "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n",
@@ -819,6 +822,69 @@ fn compose_investigation_directive(work_item: &WorkItem) -> String {
         "  `boss task set-investigation-doc --task {task_id} --path <repo-relative-path> --branch <pr-branch>`\n"
     ));
     out.push_str("- investigations do not touch code. If the description asks for both research and a code change, write only the investigation doc and note the follow-up code changes at the end of the doc for the user to file separately.\n");
+    out
+}
+
+/// Directive block for `kind = 'revision'` tasks.
+///
+/// A revision's deliverable is a NEW COMMIT on an EXISTING pull request —
+/// the PR owned by the parent task's chain root.  The revision worker must
+/// NOT open a new PR.  The parent's PR URL is carried in
+/// `execution.pr_url` (set at dispatch time).
+fn compose_revision_directive(
+    execution: &crate::work::WorkExecution,
+    work_item: &WorkItem,
+) -> String {
+    let description = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
+        _ => String::new(),
+    };
+    let parent_pr_url = execution.pr_url.as_deref().unwrap_or("(unknown)");
+    let pr_number = crate::completion::pr_number_from_url(parent_pr_url)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+
+    let mut out = String::new();
+    out.push_str("Expected outcome for this run:\n");
+    out.push_str("- This is a **REVISION** task. Your deliverable is a NEW COMMIT on an EXISTING pull request. Do NOT open a new PR. Do NOT create a `boss/exec_*` bookmark.\n");
+    out.push_str(&format!(
+        "- The parent PR is #{pr_number} at {parent_pr_url}.\n"
+    ));
+    out.push_str(&format!(
+        "- What this revision should change: {description}\n"
+    ));
+    out.push('\n');
+    out.push_str("Steps:\n");
+    out.push_str("1. `jj git fetch`   # the parent branch lives on GitHub; sync before editing.\n");
+    out.push_str(&format!(
+        "2. `GIT_DIR=.jj/repo/store/git gh pr checkout {pr_number}`   # checks out the parent PR branch.\n"
+    ));
+    out.push_str("3. Make the requested change.\n");
+    out.push_str("4. `jj describe -m \"<short message describing the revision>\"`\n");
+    out.push_str("   Then identify the parent branch name from `jj log` and advance it:\n");
+    out.push_str("   `jj bookmark set <parent-branch-name> -r @`\n");
+    out.push_str(&format!(
+        "5. `GIT_DIR=.jj/repo/store/git jj git push -b <parent-branch-name>`   # NO --allow-new; the branch already exists.\n"
+    ));
+    out.push_str(&format!(
+        "6. Confirm the new commit is on the PR: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`\n"
+    ));
+    out.push_str(&format!(
+        "7. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
+    ));
+    out.push('\n');
+    out.push_str("Constraints:\n");
+    out.push_str("- Do NOT run `gh pr create` — this revision has no PR of its own.\n");
+    out.push_str("- Do NOT create a `boss/exec_*` bookmark — push to the existing parent branch.\n");
+    out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, stop and explain.\n");
+    out.push('\n');
+    out.push_str(&format!(
+        "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
+         - Push your commit to the parent branch (see step 5 above). Do NOT open a new PR.\n\
+         - Confirm the parent PR shows your new commit with `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`.\n\
+         - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
+         - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, stop and explain.\n"
+    ));
     out
 }
 

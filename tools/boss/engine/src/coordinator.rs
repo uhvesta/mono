@@ -1867,7 +1867,12 @@ impl ExecutionCoordinator {
         task: &str,
     ) -> Result<CubeWorkspaceLease> {
         let prefer = execution.preferred_workspace_id.as_deref();
-        let fallback_policy = if prefer.is_none() {
+        // Soft-prefer (OQ5): revision_implementation executions set
+        // prefer_is_soft = true so a missing or leased preferred workspace
+        // degrades silently to any free workspace rather than failing hard.
+        // Orphan-resume executions use the hard "none" policy (prefer_is_soft
+        // = false) because their state lives only in that specific workspace.
+        let fallback_policy = if prefer.is_none() || execution.prefer_is_soft {
             "any_free"
         } else {
             "none"
@@ -1952,10 +1957,13 @@ impl ExecutionCoordinator {
         };
 
         // Fallback only kicks in when the first attempt had no workspace
-        // preference. With `prefer = Some(id)` the caller needs that
-        // specific workspace (resuming prior state); silently landing on
-        // a different workspace would lose continuity.
-        if prefer.is_some() {
+        // preference, OR when prefer_is_soft is true (revision_implementation
+        // uses a soft prefer for cache warmth only — losing the preferred
+        // workspace is a non-event, not a continuity failure).
+        // With a hard prefer (prefer set + prefer_is_soft = false), the
+        // caller needs that specific workspace (orphan-resume); silently
+        // landing elsewhere would lose local commit state.
+        if prefer.is_some() && !execution.prefer_is_soft {
             CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
             return Err(first_err);
         }
@@ -5784,6 +5792,8 @@ mod tests {
                 preferred_workspace_id: None,
                 started_at: None,
                 finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
             })
             .unwrap();
         db.start_execution_run(
@@ -6137,6 +6147,8 @@ mod tests {
             preferred_workspace_id: None,
             started_at: None,
             finished_at: None,
+            prefer_is_soft: false,
+            pr_url: None,
         })
         .unwrap();
 
@@ -6240,6 +6252,8 @@ mod tests {
             preferred_workspace_id: None,
             started_at: None,
             finished_at: None,
+            prefer_is_soft: false,
+            pr_url: None,
         })
         .unwrap();
 
