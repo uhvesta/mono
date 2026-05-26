@@ -461,6 +461,14 @@ struct ShakeArgs {
     #[arg(long = "label")]
     labels: Vec<String>,
 
+    /// GitHub Project V2 node ID to associate the filed issue with.
+    /// The issue is added to this project via the `addProjectV2ItemById`
+    /// GraphQL mutation immediately after creation. Pass an empty string
+    /// (`--github-project ""`) to skip project association.
+    /// Defaults to spinyfin Project #1 ("Boss").
+    #[arg(long, default_value = github_app::DEFAULT_PROJECT_NODE_ID)]
+    github_project: String,
+
     /// Print the parsed title and body without filing the issue. Useful
     /// for verifying that the file parses the way you expect.
     #[arg(long)]
@@ -6636,6 +6644,7 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
                     "title": title,
                     "body": body,
                     "labels": args.labels,
+                    "github_project": args.github_project,
                 })
             );
         } else {
@@ -6643,6 +6652,9 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
             println!("title: {title}");
             if !args.labels.is_empty() {
                 println!("labels: {}", args.labels.join(", "));
+            }
+            if !args.github_project.is_empty() {
+                println!("github-project: {}", args.github_project);
             }
             println!("---");
             println!("{body}");
@@ -6657,6 +6669,20 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
     let issue = github_app::file_issue(&cfg, &api_base, &args.repo, &title, &body, &args.labels)
         .await
         .map_err(|e| CliError::application(format!("{e:#}")))?;
+
+    // Associate the new issue with the configured GitHub Project so the
+    // Boss importer (which scopes to that project) can reconcile it.
+    // Skip if the caller explicitly passed an empty project node ID.
+    if !args.github_project.is_empty() {
+        github_app::add_issue_to_project_with_embedded_token(
+            &cfg,
+            &api_base,
+            &args.github_project,
+            &issue.node_id,
+        )
+        .await
+        .map_err(|e| CliError::application(format!("add issue to project: {e:#}")))?;
+    }
 
     if flags.json {
         println!(

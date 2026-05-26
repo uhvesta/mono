@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
 /// `BOSS_GITHUB_API_BASE` so tests can point at a wiremock instance.
 pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 
+/// Node ID for spinyfin Project #1 ("Boss").
+/// https://github.com/orgs/spinyfin/projects/1
+/// Used as the default target project when `boss shake` files an issue.
+pub const DEFAULT_PROJECT_NODE_ID: &str = "PVT_kwDOAvvvSM4BX0pJ";
+
 /// Label added to every issue filed via `boss shake`. Unstrippable —
 /// present even when the user passes `--label` flags. Primary
 /// abuse-mitigation lever: issues can be bulk-filtered or cleaned by
@@ -100,12 +105,13 @@ struct CreateIssueBody<'a> {
 }
 
 /// Subset of the create-issue response we surface back to the caller.
-/// The full response carries dozens of fields; we only need the URL
-/// and the issue number for the success message.
+/// The full response carries dozens of fields; we only need the URL,
+/// issue number, and node_id (for project association via GraphQL).
 #[derive(Debug, Deserialize)]
 pub struct IssueResponse {
     pub html_url: String,
     pub number: u64,
+    pub node_id: String,
 }
 
 /// Mint a 9-minute JWT signed with the App's private key. GitHub
@@ -249,6 +255,93 @@ async fn create_issue(
         .context("decode issue-create response")
 }
 
+/// Request body for the GitHub GraphQL endpoint.
+#[derive(Debug, Serialize)]
+struct GraphqlRequest<'a> {
+    query: &'a str,
+    variables: serde_json::Value,
+}
+
+/// Top-level wrapper around a GraphQL response. GitHub returns HTTP 200
+/// even for mutation errors; the real outcome is in `errors`.
+#[derive(Debug, Deserialize)]
+struct GraphqlResponse {
+    errors: Option<Vec<GraphqlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlError {
+    message: String,
+}
+
+/// Add a GitHub issue (identified by its node id) to a GitHub Project V2
+/// (identified by its project node id) via the `addProjectV2ItemById`
+/// GraphQL mutation.
+///
+/// Returns an error when:
+/// - the HTTP request fails,
+/// - GitHub returns a non-2xx status, or
+/// - the response body contains a GraphQL `errors` array (e.g. the
+///   GitHub App is missing the Projects read/write scope — GitHub
+///   surfaces "Resource not accessible by integration" in that case).
+pub async fn add_issue_to_project(
+    api_base: &str,
+    project_node_id: &str,
+    issue_node_id: &str,
+    token: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    let url = format!("{}/graphql", api_base.trim_end_matches('/'));
+    let payload = GraphqlRequest {
+        query: "mutation AddToProject($projectId: ID!, $contentId: ID!) { \
+                  addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) { \
+                    item { id } \
+                  } \
+                }",
+        variables: serde_json::json!({
+            "projectId": project_node_id,
+            "contentId": issue_node_id,
+        }),
+    };
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!(
+            "add-to-project returned {status}: {body}\n\
+             hint: confirm the GitHub App has Projects read/write permission"
+        );
+    }
+
+    let parsed: GraphqlResponse = resp
+        .json()
+        .await
+        .context("decode add-to-project GraphQL response")?;
+
+    if let Some(errors) = parsed.errors {
+        if !errors.is_empty() {
+            let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+            bail!(
+                "add-to-project GraphQL mutation failed: {}\n\
+                 hint: confirm the GitHub App has Projects read/write permission",
+                messages.join("; ")
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Top-level entry point used by the CLI: use the embedded App config,
 /// sign a JWT, swap it for an installation token, then file the issue.
 /// The `api_base` is parametrized so tests can point at a wiremock;
@@ -266,6 +359,21 @@ pub async fn file_issue(
     let client = http_client();
     let token = fetch_installation_token(api_base, &config.installation_id, &jwt, client).await?;
     create_issue(api_base, repo, title, body, labels, &token, client).await
+}
+
+/// Top-level entry point for adding an issue to a GitHub Project V2.
+/// Signs a JWT, exchanges it for an installation token, and calls
+/// [`add_issue_to_project`].
+pub async fn add_issue_to_project_with_embedded_token(
+    config: &AppConfig,
+    api_base: &str,
+    project_node_id: &str,
+    issue_node_id: &str,
+) -> Result<()> {
+    let jwt = build_jwt(&config.app_id, config.private_key_pem.as_bytes())?;
+    let client = http_client();
+    let token = fetch_installation_token(api_base, &config.installation_id, &jwt, client).await?;
+    add_issue_to_project(api_base, project_node_id, issue_node_id, &token, client).await
 }
 
 #[cfg(test)]
@@ -354,7 +462,7 @@ mod tests {
             .await;
 
         // Capture: matches the issue-create endpoint with the
-        // installation token. Returns a canned issue URL.
+        // installation token. Returns a canned issue URL + node_id.
         Mock::given(method("POST"))
             .and(path("/repos/spinyfin/mono/issues"))
             .and(header("authorization", "Bearer v1.installation-token"))
@@ -362,6 +470,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "html_url": "https://github.com/spinyfin/mono/issues/9999",
                 "number": 9999,
+                "node_id": "I_kwDOAvvvSM4BX0pJ",
             })))
             .mount(&server)
             .await;
@@ -380,6 +489,7 @@ mod tests {
         .expect("file_issue should succeed against the mock");
         assert_eq!(resp.number, 9999);
         assert_eq!(resp.html_url, "https://github.com/spinyfin/mono/issues/9999");
+        assert_eq!(resp.node_id, "I_kwDOAvvvSM4BX0pJ");
     }
 
     #[tokio::test]
@@ -400,6 +510,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "html_url": "https://github.com/spinyfin/mono/issues/1",
                 "number": 1,
+                "node_id": "I_kwDOAvvvSM4BX0pJ",
             })))
             .mount(&server)
             .await;
@@ -460,6 +571,126 @@ mod tests {
         assert!(
             msg.contains("401") && msg.contains("Bad credentials"),
             "error should surface github's 401 body: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_issue_to_project_succeeds_on_200_with_no_errors() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(header("user-agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "addProjectV2ItemById": {
+                        "item": { "id": "PVTI_lADOAvvvSM4BX0pJ" }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        add_issue_to_project(
+            &server.uri(),
+            "PVT_kwDOAvvvSM4BX0pJ",
+            "I_kwDOAvvvSM4BX0pJ",
+            "v1.test-token",
+            &client,
+        )
+        .await
+        .expect("add_issue_to_project should succeed");
+
+        // Verify the mutation sent the right variables.
+        let requests = server.received_requests().await.unwrap();
+        let req = requests
+            .iter()
+            .find(|r| r.url.path() == "/graphql")
+            .expect("graphql request was not captured");
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("request body is JSON");
+        assert_eq!(
+            body["variables"]["projectId"],
+            "PVT_kwDOAvvvSM4BX0pJ",
+            "projectId variable must match"
+        );
+        assert_eq!(
+            body["variables"]["contentId"],
+            "I_kwDOAvvvSM4BX0pJ",
+            "contentId variable must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_issue_to_project_surfaces_graphql_errors() {
+        let server = MockServer::start().await;
+
+        // GitHub returns HTTP 200 even when the mutation fails.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errors": [
+                    { "message": "Resource not accessible by integration" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = add_issue_to_project(
+            &server.uri(),
+            "PVT_kwDOAvvvSM4BX0pJ",
+            "I_kwDOAvvvSM4BX0pJ",
+            "v1.test-token",
+            &client,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Resource not accessible by integration"),
+            "error should include the GraphQL error message: {msg}"
+        );
+        assert!(
+            msg.contains("Projects read/write permission"),
+            "error should hint about missing permission: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_issue_to_project_surfaces_http_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("{\"message\":\"Forbidden\"}"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = add_issue_to_project(
+            &server.uri(),
+            "PVT_kwDOAvvvSM4BX0pJ",
+            "I_kwDOAvvvSM4BX0pJ",
+            "v1.test-token",
+            &client,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("403"),
+            "error should surface HTTP 403: {msg}"
+        );
+        assert!(
+            msg.contains("Projects read/write permission"),
+            "error should hint about missing permission: {msg}"
         );
     }
 }
