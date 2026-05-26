@@ -22,6 +22,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;
 
+mod buildkite_release;
 mod github_app;
 mod repo_resolution;
 
@@ -126,6 +127,20 @@ enum Commands {
     /// environment has a non-standard `gh` install that would silently
     /// mask failures.
     Shake(ShakeArgs),
+    /// Trigger a Boss release build via the configured Buildkite pipeline.
+    ///
+    /// Posts a new build to the `flunge/mono` Buildkite pipeline
+    /// (branch=main) and prints the URL of the triggered build so you
+    /// can follow progress in the BK UI. Exits immediately after
+    /// triggering — does not wait for the build to complete.
+    ///
+    /// The triggered build runs the boss-release step regardless of
+    /// whether there are Boss-affecting changes since the last tag
+    /// (manual trigger overrides change-detection).
+    ///
+    /// Reads BK_API_TOKEN from the environment. See
+    /// tools/boss/docs/buildkite-release-setup.md for provisioning.
+    Release,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1863,6 +1878,7 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
         }
         Commands::Uninstall(args) => run_uninstall_command(args, &cli.global).await,
         Commands::Shake(args) => run_shake_command(args, &cli.global).await,
+        Commands::Release => run_release_command(&cli.global).await,
     }
 }
 
@@ -6541,6 +6557,46 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
             "filed issue against {}: {} (#{})",
             args.repo, issue.html_url, issue.number
         );
+    }
+
+    Ok(())
+}
+
+async fn run_release_command(flags: &GlobalFlags) -> Result<(), CliError> {
+    let token = std::env::var("BK_API_TOKEN").map_err(|_| {
+        CliError::application(
+            "BK_API_TOKEN is not set. See tools/boss/docs/buildkite-release-setup.md \
+             for provisioning instructions."
+                .to_owned(),
+        )
+    })?;
+
+    if token.is_empty() {
+        return Err(CliError::application(
+            "BK_API_TOKEN is set but empty. See tools/boss/docs/buildkite-release-setup.md \
+             for provisioning instructions."
+                .to_owned(),
+        ));
+    }
+
+    let api_base = std::env::var("BOSS_BK_API_BASE")
+        .unwrap_or_else(|_| buildkite_release::DEFAULT_API_BASE.to_owned());
+
+    let build = buildkite_release::trigger_release_build(&api_base, &token)
+        .await
+        .map_err(|e| CliError::application(format!("{e:#}")))?;
+
+    if flags.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "triggered",
+                "build_url": build.web_url,
+                "build_number": build.number,
+            })
+        );
+    } else {
+        println!("triggered release build #{}: {}", build.number, build.web_url);
     }
 
     Ok(())

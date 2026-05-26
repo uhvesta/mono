@@ -23,30 +23,47 @@ log "[boss-release] starting"
 echo "[boss-release] agent: $(uname -a)"
 echo "[boss-release] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-# ── guard: skip if no Boss-affecting changes ──────────────────────────────────
-# Only publish a release when the merge actually touched the Boss source tree or
-# the release pipeline itself. A merge that only modifies checkleft, CI infra,
-# docs, etc. should not produce a new Boss release.
+# ── guard: skip if no Boss-affecting changes (cron path) ─────────────────────
+# For scheduled (cron) builds, only publish a release when there are
+# Boss-affecting changes since the last boss-v* tag. A cron run with no Boss
+# changes exits 0 silently.
 #
-# Paths that trigger a release:
+# For manual triggers (BUILDKITE_SOURCE == "ui" or "api"), skip change
+# detection entirely — the operator explicitly asked for a release.
+#
+# Paths that count as Boss-affecting:
 #   - tools/boss/** — the binary's source code
-#   - .buildkite/steps/boss-release.sh — the release script itself, so fixes can be validated
-#   - .buildkite/pipeline.yml — the release wiring, so pipeline changes can be validated
-#
-# Note: this guard does NOT cover shared crates outside tools/boss/ — if such a
-# dependency changes without a corresponding tools/boss/ change, the release is
-# skipped and the next in-scope Boss merge will pick up the transitive change.
+#   - .buildkite/steps/boss-release.sh — the release script itself
+#   - .buildkite/pipeline.yml — the release wiring
 
-log "[boss-release] checking for Boss-affecting changes"
-TOUCHED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
-BOSS_TOUCHED=$(echo "${TOUCHED}" | grep -E "^(tools/boss/|\.buildkite/steps/boss-release\.sh|\.buildkite/pipeline\.yml)" || true)
+BUILDKITE_SOURCE="${BUILDKITE_SOURCE:-}"
 
-if [[ -z "${BOSS_TOUCHED}" ]]; then
-  TOUCHED_SUMMARY=$(echo "${TOUCHED}" | tr '\n' ' ')
-  echo "release step skipped: no Boss-affecting changes in this merge (touched: ${TOUCHED_SUMMARY})"
-  exit 0
+if [[ "${BUILDKITE_SOURCE}" == "ui" || "${BUILDKITE_SOURCE}" == "api" ]]; then
+  echo "[boss-release] manual trigger via ${BUILDKITE_SOURCE}; skipping change-detection"
+else
+  log "[boss-release] checking for Boss-affecting changes since last tag"
+  LAST_TAG=$(gh release list --repo spinyfin/mono --limit 200 --json tagName \
+    --jq '[.[] | select(.tagName | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tagName' 2>/dev/null || true)
+
+  if [[ -z "${LAST_TAG}" ]]; then
+    echo "[boss-release] no previous boss-v* tag found; proceeding with first release"
+  else
+    LAST_SHA=$(git rev-list -n 1 "${LAST_TAG}" 2>/dev/null || true)
+    if [[ -z "${LAST_SHA}" ]]; then
+      echo "[boss-release] could not resolve tag ${LAST_TAG} to a SHA; proceeding"
+    else
+      TOUCHED=$(git diff --name-only "${LAST_SHA}..HEAD" 2>/dev/null || true)
+      BOSS_TOUCHED=$(echo "${TOUCHED}" | grep -E "^(tools/boss/|\.buildkite/steps/boss-release\.sh|\.buildkite/pipeline\.yml)" || true)
+
+      if [[ -z "${BOSS_TOUCHED}" ]]; then
+        TOUCHED_SUMMARY=$(echo "${TOUCHED}" | tr '\n' ' ')
+        echo "release step skipped: no Boss-affecting changes since ${LAST_TAG} (touched: ${TOUCHED_SUMMARY})"
+        exit 0
+      fi
+      echo "[boss-release] Boss-affecting changes detected since ${LAST_TAG}; proceeding"
+    fi
+  fi
 fi
-echo "[boss-release] Boss-affecting changes detected, proceeding"
 
 # ── read secrets ──────────────────────────────────────────────────────────────
 

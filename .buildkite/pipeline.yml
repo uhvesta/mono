@@ -64,14 +64,16 @@ steps:
       - github_commit_status:
           context: "buildkite/mono/bazel-test"
 
-  # Post-merge only: build Boss.app with shake credentials embedded and
-  # publish a GitHub Release tagged boss-v1.0.N.  Skipped on PR branches and
-  # on merges that don't touch tools/boss/.
+  # Scheduled/manual only: build Boss.app with shake credentials embedded and
+  # publish a GitHub Release tagged boss-v1.0.N.  Fires on hourly cron runs
+  # and on manual triggers (BK UI, API, or `boss release` CLI); skipped on
+  # per-merge webhook builds.  The script itself detects whether Boss-affecting
+  # changes exist since the last tag and exits 0 silently when nothing to do.
   # Credentials are read from Buildkite's secret store; see:
-  #   tools/boss/docs/buildkite-shake-secrets-setup.md
+  #   tools/boss/docs/buildkite-release-setup.md
   - label: ":rocket: boss-release"
     key: "boss-release"
-    if: build.branch == "main"
+    if: build.branch == "main" && (build.source == "schedule" || build.source == "ui" || build.source == "api")
     command: ".buildkite/steps/boss-release.sh"
     depends_on: "bazel-test"
     agents:
