@@ -522,6 +522,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 work_item_binding,
                 model: spawn_config.model.clone(),
                 draft_pr_mode: spawner.draft_pr_mode(),
+                execution_kind: execution.kind.clone(),
             },
             StdDuration::from_secs(30),
         )

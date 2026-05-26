@@ -63,6 +63,10 @@ pub struct WorkerSetupInput {
     /// `--draft` when running `gh pr create`. Omitted when `false`
     /// so workers on default installs see no behaviour change.
     pub draft_pr_mode: bool,
+    /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
+    /// Used to install kind-specific hook guards — currently a PreToolUse deny
+    /// for `gh pr create` on `revision_implementation` executions.
+    pub execution_kind: String,
 }
 
 /// Render the worker-facing CLAUDE.md.
@@ -218,6 +222,35 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
         ],
     });
 
+    // For revision_implementation, add a PreToolUse guard that blocks
+    // any `gh pr create` invocation. Revision workers push commits to
+    // an existing PR; opening a new PR violates the one-PR-per-task
+    // invariant. The guard is a small inline Python script that reads
+    // the tool_input JSON from stdin and blocks if the command matches
+    // `gh pr create` (tolerant of GIT_DIR=... prefixes and flags).
+    let mut pre_tool_use_hooks = vec![hook.clone()];
+    if input.execution_kind == "revision_implementation" {
+        let guard_command = concat!(
+            "python3 -c \"",
+            "import json,sys,re; ",
+            "inp=json.load(sys.stdin); ",
+            "cmd=inp.get('tool_input',{}).get('command',''); ",
+            r#"m=re.search(r'(?:^|\s|;|\||&|GIT_DIR=\S+\s+)gh\s+pr\s+create\b',cmd); "#,
+            "msg='Revision tasks push commits to the existing parent PR; they must not open a new PR. Use jj git push to update the existing PR instead.'; ",
+            "print(json.dumps({'decision':'block','reason':msg}) if m else json.dumps({'decision':'approve'})); ",
+            "\""
+        );
+        pre_tool_use_hooks.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": guard_command,
+                }
+            ],
+        }));
+    }
+
     serde_json::json!({
         // Auto mode for the worker pane. The engine's worker prompt
         // already instructs claude not to ask for human permission,
@@ -251,7 +284,7 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
         "hooks": {
             "SessionStart":     [hook.clone()],
             "UserPromptSubmit": [hook.clone()],
-            "PreToolUse":       [hook.clone()],
+            "PreToolUse":       pre_tool_use_hooks,
             "PostToolUse":      [hook.clone()],
             "Stop":             [hook.clone()],
             "Notification":     [hook.clone()],
@@ -481,6 +514,7 @@ mod tests {
                 "/Users/brianduff/Library/Application Support/Boss/bin/boss-event",
             ),
             draft_pr_mode: false,
+            execution_kind: "chore_implementation".into(),
         }
     }
 
@@ -755,6 +789,7 @@ mod tests {
             events_socket_path: PathBuf::from("/tmp/events.sock"),
             boss_event_path: PathBuf::from("/tmp/boss-event"),
             draft_pr_mode: false,
+            execution_kind: "chore_implementation".into(),
         };
 
         let written = write_workspace_files(&input).unwrap();
@@ -841,6 +876,7 @@ mod tests {
             events_socket_path: PathBuf::from("/tmp/events.sock"),
             boss_event_path: PathBuf::from("/tmp/boss-event"),
             draft_pr_mode: false,
+            execution_kind: "chore_implementation".into(),
         };
 
         write_workspace_files(&input).unwrap();
@@ -976,6 +1012,7 @@ mod tests {
                 "/old/bazel-bin/tools/boss/event-shim/boss-event",
             ),
             draft_pr_mode: false,
+            execution_kind: "chore_implementation".into(),
         };
         write_workspace_files(&input).unwrap();
 
@@ -1013,5 +1050,58 @@ mod tests {
         let new_path = PathBuf::from("/stable/boss-event");
         // Should not panic even if .claude/settings.json doesn't exist.
         heal_worker_settings_json(&[dir.path().to_path_buf()], &new_path);
+    }
+
+    #[test]
+    fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
+        let mut input = sample_input();
+        input.execution_kind = "revision_implementation".into();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let pre = parsed["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse must be an array");
+        // Must have 2 entries: the standard shim hook + the guard.
+        assert_eq!(
+            pre.len(),
+            2,
+            "revision_implementation PreToolUse must have 2 hooks, got {pre:?}",
+        );
+        // Second entry must be a Bash matcher.
+        assert_eq!(
+            pre[1]["matcher"],
+            serde_json::Value::String("Bash".into()),
+            "second PreToolUse hook must match 'Bash'",
+        );
+        // Guard command must reference the deny decision and gh pr create.
+        let guard_cmd = pre[1]["hooks"][0]["command"].as_str().unwrap_or("");
+        assert!(
+            guard_cmd.contains("gh") && guard_cmd.contains("pr") && guard_cmd.contains("create"),
+            "guard command must inspect gh pr create: {guard_cmd}",
+        );
+        assert!(
+            guard_cmd.contains("block"),
+            "guard command must produce a block decision: {guard_cmd}",
+        );
+    }
+
+    #[test]
+    fn chore_implementation_has_no_extra_pre_tool_use_guard() {
+        let input = sample_input(); // execution_kind: "chore_implementation"
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let pre = parsed["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse must be an array");
+        assert_eq!(
+            pre.len(),
+            1,
+            "chore_implementation PreToolUse must have exactly 1 hook (no extra guard), got {pre:?}",
+        );
+        assert_eq!(
+            pre[0]["matcher"],
+            serde_json::Value::String("*".into()),
+            "chore_implementation's sole PreToolUse hook must be the catch-all shim",
+        );
     }
 }

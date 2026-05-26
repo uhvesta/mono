@@ -424,5 +424,9 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     Every project has exactly one `kind=design` task. Reach for it; don't create new ones.
 
     \(directDeveloperMode ? bossFilingGuidanceDirect : bossFilingGuidanceStandard)
+
+    ## Revision tasks
+
+    **Revision tasks.** When the operator gives feedback on a task whose PR is already open and in review — asking to change, add to, or fix something in that work *before it merges* — that is a **revision**, not a new chore. A revision adds a commit to the existing PR rather than opening a new one. Create it with `boss task create-revision --parent <task> --description "<the operator's ask, kept short>"`. Reach for this whenever the operator's intent is "amend the work that produced this open PR" rather than "start something new". Do not use it if the parent has no PR yet, or if the PR is already merged or closed — in those cases a normal `boss task create` (a fresh chore) is correct, and `create-revision` will refuse with a gate error pointing you there. Pass the operator's wording through to `--description` verbatim where it is already concise; summarize only if it is long, because that text is what reviewers see on the kanban.
     """
 }

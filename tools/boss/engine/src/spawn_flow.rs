@@ -100,6 +100,10 @@ pub struct StartWorkerInput {
     /// to pass `--draft` to `gh pr create` by default. Sourced from
     /// the `default_pr_draft_mode` per-installation setting.
     pub draft_pr_mode: bool,
+    /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
+    /// Forwarded to `WorkerSetupInput` so the settings.json can install
+    /// kind-specific hook guards.
+    pub execution_kind: String,
 }
 
 #[derive(Debug)]
@@ -188,6 +192,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         events_socket_path: input.events_socket_path.clone(),
         boss_event_path: input.boss_event_path.clone(),
         draft_pr_mode: input.draft_pr_mode,
+        execution_kind: input.execution_kind.clone(),
     };
     let written = write_workspace_files(&setup).map_err(StartWorkerError::WriteFiles)?;
 
@@ -434,6 +439,7 @@ mod tests {
             work_item_binding: None,
             model: "claude-opus-4-7".into(),
             draft_pr_mode: false,
+            execution_kind: "chore_implementation".into(),
         }
     }
 
