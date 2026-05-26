@@ -6,12 +6,12 @@ use crate::types::{
     AddDependencyInput, CiBudgetSnapshot, CiRemediation, ConflictResolution,
     CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRunInput, CreateTaskInput, DependencyFilter, EngineAttemptListEntry,
-    LinkExternalRefInput, ListDependenciesInput, Product, Project, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task, TaskRuntime, WorkAttentionItem,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch, WorkRun,
+    CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
+    EngineAttemptListEntry, LinkExternalRefInput, ListDependenciesInput, Product, Project,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task,
+    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -404,6 +404,16 @@ pub enum FrontendRequest {
     CreateInvestigation {
         #[serde(flatten)]
         input: CreateInvestigationInput,
+    },
+    /// Create a `kind = 'revision'` task bound to an existing parent task
+    /// whose PR is open and unmerged. The worker's deliverable is a new
+    /// commit on the parent's PR branch — no new PR is opened. Mirrors
+    /// `CreateInvestigation` in structure; gate enforcement and dispatch
+    /// are implemented in Phase 2 and Phase 3 respectively. Ships dark in
+    /// Phase 1: the wire type is parseable but no kind is dispatchable yet.
+    CreateRevision {
+        #[serde(flatten)]
+        input: CreateRevisionInput,
     },
     /// Set (or clear) the investigation-doc pointer on a task. Persists
     /// the three `tasks.investigation_doc_*` columns per

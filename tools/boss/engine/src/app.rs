@@ -5957,6 +5957,19 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+            // Ships dark (Phase 1). The wire type is registered so the
+            // protocol can carry it across protocol versions, but dispatch
+            // is not implemented until Phase 2. Respond with a WorkError so
+            // callers get an actionable message rather than a silent hang.
+            FrontendRequest::CreateRevision { .. } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: "CreateRevision is not yet implemented (Phase 2)".to_owned(),
+                    },
+                );
+            }
             FrontendRequest::SetTaskInvestigationDoc { input } => {
                 match work_db.set_task_investigation_doc(input) {
                     Ok(task) => {
