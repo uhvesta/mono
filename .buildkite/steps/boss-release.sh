@@ -195,8 +195,13 @@ echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
 # release rather than producing a published-but-broken artifact.
 
 log "[boss-release] smoke test: verifying embedded shake credentials"
-BOSS_BIN=$(bazel cquery --output=files //tools/boss/cli:boss -c opt 2>/dev/null | head -1)
-[[ -x "${BOSS_BIN}" ]] || die "boss binary not found for smoke test (cquery returned: '${BOSS_BIN}')"
+SMOKE_DIR=$(mktemp -d -t boss-smoke)
+trap 'rm -rf "${SMOKE_DIR}"' RETURN
+ditto -x -k "${WORK_DIR}/${ARTIFACT}" "${SMOKE_DIR}/extracted"
+BOSS_BIN="${SMOKE_DIR}/extracted/Boss.app/Contents/Resources/bin/boss"
+[[ -x "${BOSS_BIN}" ]] || die "boss binary not found in shipped artifact at expected path: ${BOSS_BIN}
+Contents of extracted Boss.app/Contents/Resources/bin/:
+$(ls -la "${SMOKE_DIR}/extracted/Boss.app/Contents/Resources/bin/" 2>/dev/null || echo '(directory not found)')"
 
 SMOKE_MD="${WORK_DIR}/smoke.md"
 cat > "${SMOKE_MD}" << 'SMOKE_EOF'
