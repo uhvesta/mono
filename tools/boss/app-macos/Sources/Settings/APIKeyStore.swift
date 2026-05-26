@@ -15,6 +15,17 @@ import Security
 /// env, overriding any inherited `ANTHROPIC_API_KEY`. With no stored
 /// value the engine inherits whatever the user exported in their
 /// shell, preserving the pre-#735 behaviour.
+///
+/// Storage backend: the *data-protection* keychain (every query passes
+/// `kSecUseDataProtectionKeychain`). The legacy file-based keychain
+/// authorizes reads via an interactive ACL tied to the calling app's
+/// code signature; ad-hoc dev builds re-sign with a fresh cdhash on
+/// every rebuild, so "Always Allow" never sticks and macOS re-prompts
+/// on each launch and Settings open. Data-protection items are gated by
+/// keychain-access-group membership (declared in `Boss.entitlements` /
+/// `installer/entitlements/app.entitlements`) and never raise a dialog.
+/// Note: a key stored under the pre-migration legacy keychain is not
+/// visible here — the user re-enters it once in Settings.
 enum APIKeyStore {
     /// Service identifier for every keychain item this app owns.
     /// Distinct from `CFBundleIdentifier` so a future "second secret"
@@ -40,6 +51,15 @@ enum APIKeyStore {
             kSecAttrAccount as String: anthropicApiKeyAccount,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            // Use the data-protection keychain rather than the legacy
+            // file-based one. Legacy items gate reads on an interactive
+            // ACL bound to the app's code signature, so ad-hoc dev builds
+            // (whose cdhash changes every rebuild) re-trigger the
+            // "Boss wants to use your confidential information" dialog on
+            // every launch even after "Always Allow". Data-protection
+            // items are gated by keychain-access-group membership instead,
+            // so no password dialog is ever raised. See Boss.entitlements.
+            kSecUseDataProtectionKeychain as String: true,
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
@@ -70,6 +90,7 @@ enum APIKeyStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: anthropicApiKeyAccount,
+            kSecUseDataProtectionKeychain as String: true,
         ]
         let attributesToUpdate: [String: Any] = [
             kSecValueData as String: data,
@@ -103,6 +124,7 @@ enum APIKeyStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: anthropicApiKeyAccount,
+            kSecUseDataProtectionKeychain as String: true,
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
