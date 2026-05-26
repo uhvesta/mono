@@ -7,7 +7,7 @@
 #
 # Only triggered on the main branch (see pipeline.yml `if:` condition).
 # Skips (exit 0) when the merge does not touch anything under tools/boss/.
-# Does NOT retry on failure — a botched release is worse than a missing one.
+# Retries the asset upload step on transient failures; the release record is created first.
 #
 # Secret sources (in priority order):
 #   1. Env var already set (Pipeline Settings → Environment Variables).
@@ -172,12 +172,33 @@ cp "${ZIP_PATH}" "${WORK_DIR}/${ARTIFACT}"
 echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
 
 # ── create GitHub Release ─────────────────────────────────────────────────────
+# Split into three independent steps to isolate failure modes and enable
+# selective retry on the (flaky) asset-upload step.
 
 log "[boss-release] creating GitHub Release ${VERSION}"
 gh release create "${VERSION}" \
   --repo spinyfin/mono \
   --title "Boss ${VERSION#boss-v}" \
-  --generate-notes \
-  "${WORK_DIR}/${ARTIFACT}"
+  --notes "Initial release"
+
+log "[boss-release] uploading asset with retry"
+UPLOAD_OK=0
+for attempt in 1 2 3; do
+  if gh release upload "${VERSION}" "${WORK_DIR}/${ARTIFACT}" \
+      --repo spinyfin/mono --clobber; then
+    UPLOAD_OK=1
+    break
+  fi
+  echo "[boss-release] upload attempt ${attempt} failed; sleeping $((attempt * 15))s before retry"
+  sleep $((attempt * 15))
+done
+
+if (( UPLOAD_OK != 1 )); then
+  die "release ${VERSION} created but asset upload failed after 3 attempts; manually upload via 'gh release upload ${VERSION} <path>' or delete the empty release with 'gh release delete ${VERSION}'"
+fi
+
+log "[boss-release] generating release notes"
+gh release edit "${VERSION}" --repo spinyfin/mono --generate-notes || \
+  echo "[boss-release] WARNING: --generate-notes failed (release + asset still good); regenerate with 'gh release edit ${VERSION} --generate-notes'"
 
 log "[boss-release] done — release ${VERSION} published"
