@@ -431,15 +431,21 @@ enum HostsTagAction {
     },
 }
 
-fn bossctl_version_string() -> String {
-    let sha = option_env!("BOSS_GIT_SHA").unwrap_or("unknown");
-    let time = option_env!("BOSS_BUILD_TIME").unwrap_or("unknown");
-    format!("bossctl 0+{sha} built {time}")
+// Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+// BOSS_BUILD_INFO_RS is set to an absolute path by:
+//   - Bazel: via compile_data + $(execpath) in rustc_env (stamped release value)
+//   - Cargo: via build.rs pointing to src/build_info_default.rs ("unknown" fallback)
+mod build_info_stamp {
+    include!(env!("BOSS_BUILD_INFO_RS"));
+}
+
+fn bossctl_version_string() -> &'static str {
+    build_info_stamp::BOSS_VERSION
 }
 
 fn main() -> ExitCode {
     // Intercept --version/-V before Cli::parse() so we print the
-    // canonical "bossctl 0+<sha> built <time>" format (design doc Q7).
+    // canonical version string.
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(|s| s.as_str()) == Some("--version")
         || argv.get(1).map(|s| s.as_str()) == Some("-V")

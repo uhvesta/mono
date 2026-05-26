@@ -18,6 +18,18 @@ struct BossMacApp: App {
         .defaultSize(width: 1060, height: 680)
         .commands {
             TextEditingCommands()
+            // Show BossFullVersion (e.g. "1.0.4-dev-f3be785") in the About panel
+            // rather than CFBundleShortVersionString (numeric-only — plisttool
+            // enforces Apple's format requirement for that key).
+            CommandGroup(replacing: .appInfo) {
+                Button("About Boss") {
+                    let full = Bundle.main.object(forInfoDictionaryKey: "BossFullVersion")
+                        as? String ?? Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                        .applicationVersion: full,
+                    ])
+                }
+            }
             CommandGroup(after: .windowList) {
                 Divider()
                 LogViewerCommand()

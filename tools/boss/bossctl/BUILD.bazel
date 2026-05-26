@@ -5,6 +5,17 @@ rust_binary(
     name = "bossctl",
     srcs = ["src/main.rs"],
     edition = "2024",
+    compile_data = [
+        # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+        # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
+        "//tools/boss/installer:build_info_rs",
+    ],
+    rustc_env = {
+        # Absolute path to the generated build-info constants file.
+        # rules_rust prefixes $(execpath) values with ${pwd} and resolves
+        # them to absolute filesystem paths before invoking rustc.
+        "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
+    },
     visibility = ["//visibility:public"],
     deps = [
         "//tools/boss/client",

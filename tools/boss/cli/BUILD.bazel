@@ -11,7 +11,12 @@ rust_binary(
     # blocks. The fixtures aren't reachable from a non-test build, but
     # `include_str!` is parsed unconditionally — Bazel needs them
     # staged in the sandbox or the binary fails to compile.
-    compile_data = glob(["tests/fixtures/**"]),
+    compile_data = glob(["tests/fixtures/**"]) + [
+        # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+        # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
+        # rules_rust expands $(execpath ...) to an absolute path at compile time.
+        "//tools/boss/installer:build_info_rs",
+    ],
     # rules_rust does NOT propagate --action_env into the rustc compile
     # action's cache key or environment. Use rustc_env + --define so that
     # the cache key changes when the credential values change and rustc
@@ -21,6 +26,10 @@ rust_binary(
         "BOSS_SHAKE_APP_ID": "$(BOSS_SHAKE_APP_ID)",
         "BOSS_SHAKE_INSTALLATION_ID": "$(BOSS_SHAKE_INSTALLATION_ID)",
         "BOSS_SHAKE_PRIVATE_KEY_PEM": "$(BOSS_SHAKE_PRIVATE_KEY_PEM)",
+        # Absolute path to the generated build-info constants file.
+        # rules_rust prefixes $(execpath) values with ${pwd} and resolves
+        # them to absolute filesystem paths before invoking rustc.
+        "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
     },
     visibility = [
         "//tools/boss/app-macos:__pkg__",

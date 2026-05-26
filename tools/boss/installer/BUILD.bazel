@@ -48,9 +48,10 @@ boss_pkg_unsigned(
     scripts = ":installer_scripts",
 )
 
-# Stamped Rust constants file.  Chore 3 wires this into engine_lib / boss /
-# bossctl so --version output reflects the build SHA (design doc Q4 Phase 2,
-# Q7).  This target only produces the plumbing; the wiring lands in chore 3.
+# Stamped Rust constants file consumed by engine_lib, boss, and bossctl.
+# Emits BOSS_VERSION (from git tags), BOSS_GIT_SHA, and BOSS_BUILD_TIME.
+# Each binary's BUILD rule adds this target to compile_data and references
+# it via $(execpath) in rustc_env → include!(env!("BOSS_BUILD_INFO_RS")).
 build_info_rs(
     name = "build_info_rs",
     out = "build_info_generated.rs",

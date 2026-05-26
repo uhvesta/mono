@@ -2,41 +2,21 @@
 //!
 //! The live-status debug verb surfaces these so a stale-binary
 //! problem ("you merged the fix but rebuilt this morning's engine?")
-//! is immediately visible without guessing. We deliberately do NOT
-//! add a Cargo build script — Bazel is the canonical build for this
-//! repo and threading stamping through it is a separate piece of
-//! work. Instead we lean on four signals, in order of usefulness:
+//! is immediately visible without guessing.
 //!
-//! 1. `BOSS_ENGINE_GIT_SHA` — opt-in compile-time env var, set when
-//!    the build environment knows the SHA (`BOSS_ENGINE_GIT_SHA=$(git
-//!    rev-parse --short HEAD) cargo build …` or the equivalent bazel
-//!    stamp). Empty / unset falls through.
-//! 2. `BOSS_ENGINE_BUILD_TIME` — opt-in compile-time env var with the
-//!    build timestamp in ISO-8601 UTC.
-//! 3. The engine binary's filesystem mtime, evaluated at startup.
-//!    Imperfect (a rebuild that produces a bit-identical binary may
-//!    not bump it on every platform; running through `bazel run` from
-//!    a stale cache shows the cache hit's mtime) but vastly better
-//!    than nothing.
-//! 4. **Binary content fingerprint** — short SHA-256 of the engine
+//! Version information (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME) is
+//! stamped at Bazel build time via workspace-status.sh + build_info_rs
+//! genrule, then threaded through compile_data + $(execpath) in rustc_env.
+//! Cargo builds fall back to "unknown" via build.rs.
+//!
+//! Additionally, two runtime signals help identify the running binary:
+//!
+//! 1. The engine binary's filesystem mtime, evaluated at startup.
+//! 2. **Binary content fingerprint** — short SHA-256 of the engine
 //!    binary's bytes, computed once at first call to
-//!    [`binary_fingerprint`]. Survives a bazel cache hit that
-//!    doesn't bump mtime: two identical binaries produce the same
-//!    fingerprint, a rebuild that actually changes any code
-//!    produces a different one. This is the unambiguous "am I
-//!    running the binary I think I am?" signal — `(1)` and `(2)`
-//!    can both lie when the build environment doesn't stamp them.
-//!
-//! The CARGO_PKG_VERSION fallback is included so even a build with
-//! none of the above produces something other than "unknown".
-//!
-//! Follow-up tracked in PR body: the Bazel `rust_binary` rule should
-//! be extended to thread `BOSS_ENGINE_GIT_SHA` and
-//! `BOSS_ENGINE_BUILD_TIME` via a workspace-status command, at which
-//! point `git_sha()` will stop returning "unknown" for the canonical
-//! release engine path. Until then, the runtime fingerprint covers
-//! the operationally-important question ("is this the binary I
-//! shipped?").
+//!    [`binary_fingerprint`]. Survives a Bazel cache hit that doesn't
+//!    bump mtime. This is the unambiguous "am I running the binary I
+//!    think I am?" signal — version constants can lie on uncached builds.
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,43 +25,36 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+// Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+// BOSS_BUILD_INFO_RS is set to an absolute path by:
+//   - Bazel: via compile_data + $(execpath) in rustc_env (stamped release value)
+//   - Cargo: via build.rs pointing to src/build_info_default.rs ("unknown" fallback)
+mod build_info_stamp {
+    include!(env!("BOSS_BUILD_INFO_RS"));
+}
+
 /// Format the canonical `--version` string for a bundled Boss binary.
 ///
-/// Output: `<name> 0+<sha> built <time>`, e.g.
-/// `boss-engine 0+abc1234 built 2026-05-12T11:14:02Z`.
-///
-/// The leading `0` is a placeholder major version per the design doc Q7:
-/// "until we cut a real v1.0 release with a versioning policy, every
-/// artifact is '0+<sha>'."
-///
-/// TODO(chore-1): switch sha/time to the genrule-linked constants once
-/// the workspace-status.sh + `build_info_rs` genrule from chore 1 lands.
-/// Until then, the values are "unknown" unless the build environment
-/// stamps BOSS_ENGINE_GIT_SHA / BOSS_ENGINE_BUILD_TIME.
+/// Output: `<name> <version>`, e.g. `boss-engine 1.0.4-dev-f3be785`.
 pub fn version_string(binary_name: &str) -> String {
-    format!("{binary_name} 0+{} built {}", git_sha(), build_time())
+    format!("{binary_name} {}", build_info_stamp::BOSS_VERSION)
 }
 
 /// Short git SHA the engine binary was built from, baked at compile
-/// time. Returns `"unknown"` when the build environment did not
-/// stamp `BOSS_ENGINE_GIT_SHA`.
+/// time. Returns `"unknown"` when the build environment did not stamp.
 pub fn git_sha() -> &'static str {
-    match option_env!("BOSS_ENGINE_GIT_SHA") {
-        Some(s) if !s.is_empty() => s,
-        _ => "unknown",
-    }
+    build_info_stamp::BOSS_GIT_SHA
 }
 
-/// Best-effort build timestamp string. Prefers the
-/// `BOSS_ENGINE_BUILD_TIME` env var captured at compile time; falls
-/// back to the binary mtime sampled at first call.
+/// Best-effort build timestamp string. Uses the stamped BOSS_BUILD_TIME
+/// constant when available; falls back to the binary mtime sampled at
+/// first call.
 pub fn build_time() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| {
-        if let Some(t) = option_env!("BOSS_ENGINE_BUILD_TIME") {
-            if !t.is_empty() {
-                return t.to_owned();
-            }
+        let stamped = build_info_stamp::BOSS_BUILD_TIME;
+        if !stamped.is_empty() && stamped != "unknown" {
+            return stamped.to_owned();
         }
         binary_mtime_iso8601().unwrap_or_else(|| {
             format!("unknown (CARGO_PKG_VERSION {})", env!("CARGO_PKG_VERSION"))

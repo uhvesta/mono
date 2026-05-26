@@ -1,5 +1,6 @@
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application", "macos_unit_test")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+load("//tools/boss/installer:pkg.bzl", "boss_short_version_plist")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -48,10 +49,21 @@ swift_library(
     testonly = True,
 )
 
+# Stamps CFBundleShortVersionString (full version, e.g. "1.0.4-dev-f3be785") and
+# CFBundleVersion (numeric-only, e.g. "1.0.4") from workspace-status.sh stable keys.
+# Both keys are in one plist to ensure our values are the final word — using
+# apple_bundle_version alongside infoplists caused apple_bundle_version's version
+# provider to be merged after infoplists, silently overriding CFBundleShortVersionString.
+boss_short_version_plist(
+    name = "boss_version_plist",
+    out = "BossVersion.plist",
+    visibility = ["//visibility:private"],
+)
+
 macos_application(
     name = "Boss",
     bundle_id = "dev.spinyfin.bossmacapp",
-    infoplists = ["Info.plist"],
+    infoplists = ["Info.plist", ":boss_version_plist"],
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_lib"],
     # Bundle the engine and the Boss CLIs into Contents/Resources/bin/ so that

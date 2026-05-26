@@ -1,10 +1,15 @@
 """
 Starlark rules for building the Boss installer artifacts.
 
-Defines three rules:
-  boss_pkg_payload  — extracts Boss.app.zip into a staged payload directory
-  boss_pkg_unsigned — runs pkgbuild to produce Boss-<sha>.pkg (unsigned)
-  build_info_rs     — emits a Rust source file with stamped build constants
+Defines four rules:
+  boss_pkg_payload        — extracts Boss.app.zip into a staged payload directory
+  boss_pkg_unsigned       — runs pkgbuild to produce Boss-<sha>.pkg (unsigned)
+  build_info_rs           — emits a Rust source file with stamped build constants
+  boss_short_version_plist — emits a plist fragment with both CFBundleShortVersionString
+                             (full STABLE_BOSS_VERSION, e.g. "1.0.4-dev-f3be785") and
+                             CFBundleVersion (numeric STABLE_BOSS_BASE_VERSION, e.g.
+                             "1.0.4") so the About panel shows the full version while
+                             keeping CFBundleVersion Apple-compliant.
 """
 
 # ── boss_pkg_payload ──────────────────────────────────────────────────────────
@@ -155,20 +160,25 @@ def _build_info_rs_impl(ctx):
     # ctx.info_file is the non-volatile status file (stable-status.txt)
     info_file = ctx.info_file
 
-    # Read STABLE_BOSS_GIT_SHA and STABLE_BOSS_BUILD_TIME from stable-status.txt
-    # and emit a Rust source file with pub constants.  Chore 3 wires these
-    # constants into the binaries' --version output.
+    # Read STABLE_BOSS_VERSION, STABLE_BOSS_GIT_SHA, and STABLE_BOSS_BUILD_TIME
+    # from stable-status.txt and emit a Rust source file with pub constants.
+    # BOSS_VERSION is the primary version string (e.g. "1.0.4" or
+    # "1.0.4-dev-f3be785") derived from git tags by workspace-status.sh.
     command = (
         "set -euo pipefail\n" +
+        "VERSION=$(grep STABLE_BOSS_VERSION " + info_file.path +
+        " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "SHA=$(grep STABLE_BOSS_GIT_SHA " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "BUILD_TIME=$(grep STABLE_BOSS_BUILD_TIME " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
+        "[ -z \"$VERSION\" ] && VERSION=unknown\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
         "[ -z \"$BUILD_TIME\" ] && BUILD_TIME=unknown\n" +
-        "printf 'pub const BOSS_GIT_SHA: &str = \"%s\";\\n" +
+        "printf 'pub const BOSS_VERSION: &str = \"%s\";\\n" +
+        "pub const BOSS_GIT_SHA: &str = \"%s\";\\n" +
         "pub const BOSS_BUILD_TIME: &str = \"%s\";\\n' " +
-        "\"$SHA\" \"$BUILD_TIME\" > " + output.path + "\n"
+        "\"$VERSION\" \"$SHA\" \"$BUILD_TIME\" > " + output.path + "\n"
     )
 
     ctx.actions.run_shell(
@@ -193,10 +203,78 @@ build_info_rs = rule(
 Generates a Rust source file containing stamped build constants.
 
 Emits:
+  pub const BOSS_VERSION: &str = "<semver>";
   pub const BOSS_GIT_SHA: &str = "<sha>";
   pub const BOSS_BUILD_TIME: &str = "<iso8601>";
 
-Chore 3 (app + engine resolution path) will add a dependency on this target
-from engine_lib, boss, and bossctl to wire --version output.
+BOSS_VERSION is the primary user-visible version string derived from git tags
+by workspace-status.sh (e.g. "1.0.4" on a release tag or "1.0.4-dev-f3be785"
+on a dev build). Consumed by engine_lib, boss, and bossctl for --version output.
+""",
+)
+
+# ── boss_short_version_plist ──────────────────────────────────────────────────
+
+def _boss_short_version_plist_impl(ctx):
+    """Emits a plist fragment with both version keys stamped from workspace status."""
+    output = ctx.actions.declare_file(ctx.attr.out)
+    info_file = ctx.info_file
+
+    # Read STABLE_BOSS_VERSION (full, e.g. "1.0.4-dev-f3be785") and
+    # STABLE_BOSS_BASE_VERSION (numeric-only, e.g. "1.0.4") from stable-status.txt.
+    #
+    # CFBundleVersion and CFBundleShortVersionString must be period-separated
+    # non-negative integers (plisttool enforces Apple's requirement). The full
+    # version including the "-dev-<sha>" suffix goes in the custom BossFullVersion
+    # key; the macOS app reads it via Bundle.main and passes it to
+    # orderFrontStandardAboutPanel(options:) so the About panel shows the complete
+    # version string. When not stamped, fallbacks are "0.0.0" / "dev" respectively.
+    command = (
+        "set -euo pipefail\n" +
+        "V=$(grep STABLE_BOSS_VERSION " + info_file.path +
+        " | cut -d' ' -f2 2>/dev/null || true)\n" +
+        "B=$(grep STABLE_BOSS_BASE_VERSION " + info_file.path +
+        " | cut -d' ' -f2 2>/dev/null || true)\n" +
+        "[ -z \"$V\" ] && V=dev\n" +
+        "[ -z \"$B\" ] && B=0.0.0\n" +
+        "printf '<?xml version=\"1.0\" encoding=\"UTF-8\"?>\\n" +
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"" +
+        " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\\n" +
+        "<plist version=\"1.0\"><dict>\\n" +
+        "<key>CFBundleShortVersionString</key><string>%s</string>\\n" +
+        "<key>CFBundleVersion</key><string>%s</string>\\n" +
+        "<key>BossFullVersion</key><string>%s</string>\\n" +
+        "</dict></plist>\\n' \"$B\" \"$B\" \"$V\" > " + output.path + "\n"
+    )
+
+    ctx.actions.run_shell(
+        inputs = [info_file],
+        outputs = [output],
+        command = command,
+        mnemonic = "BossShortVersionPlist",
+        progress_message = "Generating Boss version plist",
+    )
+
+    return [DefaultInfo(files = depset([output]))]
+
+boss_short_version_plist = rule(
+    implementation = _boss_short_version_plist_impl,
+    attrs = {
+        "out": attr.string(
+            mandatory = True,
+            doc = "Output filename for the generated plist fragment.",
+        ),
+    },
+    doc = """
+Generates a minimal Info.plist fragment with version keys stamped from stable-status.txt:
+  CFBundleShortVersionString = STABLE_BOSS_BASE_VERSION (e.g. "1.0.4")  — numeric only
+  CFBundleVersion            = STABLE_BOSS_BASE_VERSION (e.g. "1.0.4")  — numeric only
+  BossFullVersion            = STABLE_BOSS_VERSION      (e.g. "1.0.4-dev-f3be785")
+
+CFBundleVersion and CFBundleShortVersionString must be numeric-only (plisttool enforces
+Apple's requirement). The full version including the "-dev-<sha>" dev suffix goes in
+BossFullVersion (custom key, not validated); the macOS app reads it at runtime and
+passes it to orderFrontStandardAboutPanel(options:) so the About panel shows the
+complete version string on dev builds.
 """,
 )

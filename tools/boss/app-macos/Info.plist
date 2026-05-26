@@ -16,14 +16,9 @@
     <string>Boss</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <!-- Version strings must be dot-separated integers per Apple guidelines.
-         The human-readable "0+<sha>" format lives in BossBuildVersion below.
-         CFBundleShortVersionString stamping with the git SHA is an open
-         question deferred to chore 3 (see design doc Q7 / Open Questions). -->
-    <key>CFBundleShortVersionString</key>
-    <string>0.0</string>
-    <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <!-- CFBundleVersion and CFBundleShortVersionString are stamped by boss_version_plist
+         in BUILD.bazel via STABLE_BOSS_BASE_VERSION and STABLE_BOSS_VERSION from
+         workspace-status.sh. Fallbacks: "0.0.0" / "dev" when not stamped. -->
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>NSPrincipalClass</key>
