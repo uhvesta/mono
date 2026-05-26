@@ -10,6 +10,7 @@ use boss_client::{
 use boss_protocol::{
     AddDependencyInput, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
     CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateRevisionInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
     DependencyFilter, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
     FrontendRequest, LinkExternalRefInput, ListDependenciesInput, Product, Project,
@@ -318,6 +319,13 @@ enum TaskCommand {
     ///   boss task set-investigation-doc --task <id> --path <path> --branch <branch>
     #[command(name = "set-investigation-doc")]
     SetInvestigationDoc(SetInvestigationDocArgs),
+    /// Create a `kind = 'revision'` task targeting an existing open PR.
+    /// The worker's deliverable is a new commit on the *parent task's*
+    /// existing PR branch — no new PR is opened. Gated: the parent task
+    /// must have an open, unmerged PR; the gate fires against the chain
+    /// root's PR even when `--parent` itself is a revision.
+    #[command(name = "create-revision")]
+    CreateRevision(RevisionCreateArgs),
 }
 
 /// Subcommands under `boss chore ...`. Kind-agnostic verbs here are
@@ -1243,6 +1251,35 @@ struct InvestigationCreateArgs {
     /// the product's `docs_repo` or `BOSS_USER_DOCS_REPO`.
     #[arg(long = "repo")]
     repo_remote_url: Option<String>,
+
+    #[arg(long, value_enum)]
+    effort: Option<EffortLevelArg>,
+
+    #[arg(long, value_name = "SLUG")]
+    model: Option<String>,
+
+    #[arg(long = "force-duplicate", default_value_t = false)]
+    force_duplicate: bool,
+}
+
+/// Args for `boss task create-revision`.
+#[derive(Debug, Args)]
+struct RevisionCreateArgs {
+    /// The parent task whose PR this revision will commit to. Accepts
+    /// `T<n>` short ids (e.g. `T651`) or full `task_<hex>` ids.
+    /// May itself be a revision task; the gate is evaluated against
+    /// the chain root's PR.
+    #[arg(long)]
+    parent: String,
+
+    /// The operator's verbatim ask. Kept short — rendered on the
+    /// Review-lane affordance so reviewers can see what each new
+    /// commit was for.
+    #[arg(long)]
+    description: String,
+
+    #[arg(long)]
+    priority: Option<TaskPriority>,
 
     #[arg(long, value_enum)]
     effort: Option<EffortLevelArg>,
@@ -2659,6 +2696,9 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         }
         TaskCommand::SetInvestigationDoc(args) => {
             run_set_investigation_doc(&mut client, ctx, args).await
+        }
+        TaskCommand::CreateRevision(args) => {
+            run_create_revision(&mut client, ctx, args).await
         }
     }
 }
@@ -4159,6 +4199,60 @@ async fn run_create_investigation(
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
         if !ctx.quiet {
             println!("created investigation T{}: {}", task.short_id.unwrap_or(0), name);
+        }
+    });
+    Ok(())
+}
+
+async fn create_revision_rpc(
+    client: &mut BossClient,
+    input: CreateRevisionInput,
+) -> Result<Task, CliError> {
+    match client
+        .send_request(&FrontendRequest::CreateRevision { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemCreated { item } => expect_task(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("revision create", &other)),
+    }
+}
+
+async fn run_create_revision(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: RevisionCreateArgs,
+) -> Result<(), CliError> {
+    // Resolve the --parent selector to a full task id before sending to
+    // the engine, since the engine's CreateRevision RPC requires a full id.
+    let parent_id = resolve_selector_to_primary_id(client, ctx, &args.parent, None).await?;
+    let description = args.description.trim().to_owned();
+    if description.is_empty() {
+        return Err(CliError::usage("--description must be non-empty"));
+    }
+    let task = create_revision_rpc(
+        client,
+        CreateRevisionInput {
+            parent_task_id: parent_id,
+            description: description.clone(),
+            priority: args.priority.map(|p| p.as_str().to_owned()),
+            effort_level: args.effort.map(boss_protocol::EffortLevel::from),
+            model_override: args.model,
+            force_duplicate: args.force_duplicate,
+            created_via: Some(boss_protocol::CREATED_VIA_CLI.to_owned()),
+        },
+    )
+    .await?;
+    print_entity(ctx, &serde_json::json!({ "task": task }), || {
+        if !ctx.quiet {
+            println!(
+                "created revision T{}: {}",
+                task.short_id.unwrap_or(0),
+                description
+            );
         }
     });
     Ok(())

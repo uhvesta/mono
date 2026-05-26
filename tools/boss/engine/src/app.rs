@@ -32,7 +32,7 @@ use crate::protocol::{
     TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic,
     work_product_topic,
 };
-use crate::work::{DuplicateTaskError, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
+use crate::work::{DuplicateTaskError, GhPrStateChecker, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
@@ -5957,18 +5957,36 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
-            // Ships dark (Phase 1). The wire type is registered so the
-            // protocol can carry it across protocol versions, but dispatch
-            // is not implemented until Phase 2. Respond with a WorkError so
-            // callers get an actionable message rather than a silent hang.
-            FrontendRequest::CreateRevision { .. } => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: "CreateRevision is not yet implemented (Phase 2)".to_owned(),
-                    },
-                );
+            FrontendRequest::CreateRevision { input } => {
+                match work_db.create_revision(input, &GhPrStateChecker) {
+                    Ok(task) => {
+                        let item = WorkItem::Task(task);
+                        let product_id = work_item_product_id(&item);
+                        let revision = publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "revision_created",
+                            Some(product_id),
+                            vec![work_item_id(&item)],
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::WorkItemCreated { item },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
             }
             FrontendRequest::SetTaskInvestigationDoc { input } => {
                 match work_db.set_task_investigation_doc(input) {

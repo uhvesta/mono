@@ -59,7 +59,7 @@ pub use boss_protocol::{
     AddDependencyInput, BlockedSignal, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN,
     CiBudgetSnapshot, CiRemediation, ConflictResolution, CreateAttentionItemInput,
     CreateChoreInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRunInput, CreateTaskInput, DependencyDirection,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyDirection,
     DependencyEdge, DependencyFilter, EffortLevel, EngineAttemptListEntry,
     ExecutionReconcileResult, ListDependenciesInput, Product, Project, ProjectDesignDocState,
     RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc,
@@ -315,6 +315,25 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let task = insert_investigation_in_tx(&tx, input)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    /// Create a `kind = 'revision'` task bound to an existing parent task.
+    /// Runs the create-time gate (`assert_parent_revisable`) to confirm the
+    /// chain root's PR is open and unmerged before inserting.
+    ///
+    /// `pr_checker` supplies the live PR state for chains where the cached
+    /// DB state alone cannot distinguish open from closed-unmerged. Pass
+    /// `&GhPrStateChecker` in production; pass `&FakePrStateChecker` in tests.
+    pub fn create_revision(
+        &self,
+        input: CreateRevisionInput,
+        pr_checker: &dyn PrStateChecker,
+    ) -> Result<Task> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = assert_parent_revisable_and_insert(&tx, input, pr_checker)?;
         tx.commit()?;
         Ok(task)
     }
@@ -7255,6 +7274,256 @@ fn insert_investigation_in_tx(
         ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing investigation after insert: {id}"))
+}
+
+/// Trait for checking the live state of a GitHub PR URL.
+///
+/// Injected into `create_revision` so the gate can distinguish "open"
+/// from "closed without merging" without hardcoding a `gh` call, which
+/// would make unit tests depend on GitHub access. Production wires in
+/// [`GhPrStateChecker`]; tests pass [`FakePrStateChecker`].
+pub trait PrStateChecker: Send + Sync {
+    /// Return the live lifecycle state of the given PR URL.
+    fn check(&self, pr_url: &str) -> Result<PrOpenState>;
+}
+
+/// Lifecycle state returned by [`PrStateChecker::check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrOpenState {
+    Open,
+    Merged,
+    ClosedUnmerged,
+}
+
+/// Production implementation: shells out to `gh pr view`.
+pub struct GhPrStateChecker;
+
+impl PrStateChecker for GhPrStateChecker {
+    fn check(&self, pr_url: &str) -> Result<PrOpenState> {
+        let output = std::process::Command::new("gh")
+            .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
+            .output()
+            .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("`gh pr view` failed for {pr_url}: {stderr}");
+        }
+        let body = String::from_utf8_lossy(&output.stdout);
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
+        let state = v["state"].as_str().unwrap_or("").to_ascii_uppercase();
+        match state.as_str() {
+            "MERGED" => Ok(PrOpenState::Merged),
+            "CLOSED" => Ok(PrOpenState::ClosedUnmerged),
+            _ => Ok(PrOpenState::Open),
+        }
+    }
+}
+
+/// Test double: returns a preset state for known PR URLs.
+#[cfg(test)]
+pub struct FakePrStateChecker {
+    pub states: std::collections::HashMap<String, PrOpenState>,
+    pub default: PrOpenState,
+}
+
+#[cfg(test)]
+impl FakePrStateChecker {
+    pub fn always(state: PrOpenState) -> Self {
+        Self { states: Default::default(), default: state }
+    }
+    pub fn with(mut self, url: &str, state: PrOpenState) -> Self {
+        self.states.insert(url.to_owned(), state);
+        self
+    }
+}
+
+#[cfg(test)]
+impl PrStateChecker for FakePrStateChecker {
+    fn check(&self, pr_url: &str) -> Result<PrOpenState> {
+        Ok(self.states.get(pr_url).cloned().unwrap_or(self.default.clone()))
+    }
+}
+
+/// Errors produced by the create-time revision gate.
+#[derive(Debug, thiserror::Error)]
+pub enum RevisionGateError {
+    #[error(
+        "T{short_id} has no PR yet; a revision targets an existing open PR. \
+         Wait for T{short_id} to reach review, or file a normal follow-up chore."
+    )]
+    NoPr { short_id: i64 },
+
+    #[error(
+        "T{short_id}'s PR (#{pr_number}) is already merged; revisions only apply to \
+         open, unmerged PRs. File a new chore against main instead."
+    )]
+    Merged { short_id: i64, pr_number: i64 },
+
+    #[error(
+        "T{short_id}'s PR (#{pr_number}) is closed without merging; \
+         there is no open PR to revise."
+    )]
+    ClosedUnmerged { short_id: i64, pr_number: i64 },
+}
+
+impl RevisionGateError {
+    fn no_pr(task: &Task) -> Self {
+        Self::NoPr { short_id: task.short_id.unwrap_or(0) }
+    }
+    fn merged(task: &Task, pr_url: &str) -> Self {
+        use crate::merge_poller::parse_pr_number;
+        Self::Merged {
+            short_id: task.short_id.unwrap_or(0),
+            pr_number: parse_pr_number(pr_url).unwrap_or(0),
+        }
+    }
+    fn closed(task: &Task, pr_url: &str) -> Self {
+        use crate::merge_poller::parse_pr_number;
+        Self::ClosedUnmerged {
+            short_id: task.short_id.unwrap_or(0),
+            pr_number: parse_pr_number(pr_url).unwrap_or(0),
+        }
+    }
+}
+
+/// Run the create-time gate and, on success, insert a `kind = 'revision'`
+/// task row atomically. This is the single point of truth for the invariant
+/// "kind = revision ⇒ parent_task_id IS NOT NULL AND chain root has an open PR".
+///
+/// Gate order (per revision-tasks.md §Q4):
+/// 1. Resolve `input.parent_task_id` to a real task; walk to chain root.
+/// 2. If chain root has no `pr_url` → [`RevisionGateError::NoPr`].
+/// 3. If chain root `status == "done"` → [`RevisionGateError::Merged`] (PR merged = task done).
+/// 4. Otherwise call `pr_checker.check(pr_url)` for the live state:
+///    `Merged` → merged error; `ClosedUnmerged` → closed error; `Open` → insert.
+fn assert_parent_revisable_and_insert(
+    conn: &Connection,
+    input: CreateRevisionInput,
+    pr_checker: &dyn PrStateChecker,
+) -> Result<Task> {
+    // ── 1. Resolve parent and chain root ────────────────────────────────────
+    let parent_id = resolve_task_id_from_selector(conn, &input.parent_task_id)?;
+    let root_id = chain_root(conn, &parent_id)?;
+    let root = query_task(conn, &root_id)?
+        .with_context(|| format!("chain root {root_id} not found"))?;
+
+    // ── 2. No PR → reject ───────────────────────────────────────────────────
+    let pr_url = match &root.pr_url {
+        None => return Err(anyhow::Error::new(RevisionGateError::no_pr(&root))),
+        Some(url) => url.clone(),
+    };
+
+    // ── 3. Cached: task done → PR merged ────────────────────────────────────
+    if root.status == "done" {
+        return Err(anyhow::Error::new(RevisionGateError::merged(&root, &pr_url)));
+    }
+
+    // ── 4. Live probe for Open vs ClosedUnmerged ────────────────────────────
+    match pr_checker.check(&pr_url)? {
+        PrOpenState::Merged => {
+            return Err(anyhow::Error::new(RevisionGateError::merged(&root, &pr_url)));
+        }
+        PrOpenState::ClosedUnmerged => {
+            return Err(anyhow::Error::new(RevisionGateError::closed(&root, &pr_url)));
+        }
+        PrOpenState::Open => {}
+    }
+
+    // ── 5. Insert revision ──────────────────────────────────────────────────
+    insert_revision_in_tx(conn, input, &parent_id, &root)
+}
+
+/// Resolve a caller-supplied task selector (full `task_<hex>` id, `T<n>`
+/// short id, or bare primary id) to the primary `tasks.id`. For now only
+/// full ids are supported; short-id resolution requires the product scope
+/// which the engine RPC can carry. Extended when needed.
+fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -> Result<String> {
+    let trimmed = selector.trim();
+    // Full typed id
+    if trimmed.starts_with("task_") {
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL)",
+            [trimmed],
+            |r| r.get::<_, i64>(0),
+        )?;
+        if exists == 0 {
+            bail!("unknown task: {trimmed}");
+        }
+        return Ok(trimmed.to_owned());
+    }
+    bail!(
+        "unsupported selector {trimmed:?}; pass the full task id (task_<hex>). \
+         Short-id (T<n>) resolution is done by the CLI before sending the RPC."
+    )
+}
+
+/// Insert a `kind = 'revision'` task row. Called only after the gate passes.
+///
+/// `parent_id` is the immediate parent (may itself be a revision).
+/// `root` is the chain root task (non-revision ancestor that owns the PR).
+fn insert_revision_in_tx(
+    conn: &Connection,
+    input: CreateRevisionInput,
+    parent_id: &str,
+    root: &Task,
+) -> Result<Task> {
+    let id = next_id("task");
+    let now = now_string();
+    let description = input.description.trim().to_owned();
+    if description.is_empty() {
+        bail!("revision description must be non-empty");
+    }
+    let priority = normalize_priority(input.priority.as_deref())?;
+    let effort_level = input
+        .effort_level
+        .map(|l| l.as_str().to_owned())
+        .or_else(|| Some("small".to_owned())); // revision-tasks.md §Q7: default small
+    let model_override = normalize_model_override(input.model_override);
+    let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "revision");
+    // Inherit product and project from the chain root.
+    // repo_remote_url is intentionally NOT copied to the revision row —
+    // revisions always target the same repo as the chain root and the
+    // dispatch flow resolves the repo from the chain root at spawn time.
+    // Copying it here would trigger the per-task override invariant check
+    // when the product already carries the same URL.
+    let product_id = &root.product_id;
+    let project_id = root.project_id.as_deref();
+    let short_id = allocate_short_id(conn, product_id)?;
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
+         pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
+         effort_level, model_override, short_id, parent_task_id) \
+         VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, 1, ?7, ?8, \
+         ?9, ?10, ?11, ?12)",
+        params![
+            id,
+            product_id,
+            project_id,
+            description, // revision tasks use description as the name/title too
+            description,
+            now,
+            priority,
+            created_via,
+            effort_level,
+            model_override,
+            short_id,
+            parent_id,
+        ],
+    )?;
+    // query_task uses map_task which does not include parent_task_id (it is only
+    // populated by the wider map_task_with_external_ref_and_investigation_doc).
+    // For the revision row we need parent_task_id in the returned Task so callers
+    // can verify the linkage, so we read it with an inline SELECT.
+    let mut task = query_task(conn, &id)?.with_context(|| format!("missing revision after insert: {id}"))?;
+    task.parent_task_id = conn
+        .query_row(
+            "SELECT parent_task_id FROM tasks WHERE id = ?1",
+            [&id],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .filter(|s| !s.is_empty());
+    Ok(task)
 }
 
 /// Trim and reduce an empty model slug to `None`. The CLI uses
@@ -21587,6 +21856,219 @@ mod tests {
         assert_eq!(
             root2, chore_id,
             "soft-deleted intermediate parent: chain_root must still reach the chore"
+        );
+    }
+
+    // ── Revision tasks Phase 2: CLI create-revision gate + insert ──────────
+
+    /// Helper: create a chore and set its pr_url (to simulate "in review").
+    fn make_in_review_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.to_owned(),
+                name: "Chore for revision tests".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None, // inherits from product
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![chore.id, pr_url],
+        )
+        .unwrap();
+        chore.id
+    }
+
+    /// Helper: create a chore whose status is `done` (simulates merged PR).
+    fn make_done_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
+        let id = make_in_review_chore(db, product_id, pr_url);
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+        id
+    }
+
+    /// Helper: build a minimal `CreateRevisionInput` for the given parent id.
+    fn revision_input(parent_id: &str) -> CreateRevisionInput {
+        CreateRevisionInput {
+            parent_task_id: parent_id.to_owned(),
+            description: "test revision ask".to_owned(),
+            priority: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+            created_via: None,
+        }
+    }
+
+    #[test]
+    fn create_revision_succeeds_for_open_pr() {
+        let db = WorkDb::open(temp_db_path("revision-create-open")).unwrap();
+        let product_id = make_revision_product(&db, "open");
+        let pr_url = "https://github.com/spinyfin/mono/pull/42";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        assert_eq!(revision.kind, "revision");
+        assert_eq!(revision.parent_task_id.as_deref(), Some(parent_id.as_str()));
+        assert_eq!(revision.product_id, product_id);
+        assert_eq!(revision.status, "todo");
+        assert!(revision.pr_url.is_none(), "revision must not inherit parent pr_url");
+    }
+
+    #[test]
+    fn create_revision_errors_when_parent_has_no_pr() {
+        let db = WorkDb::open(temp_db_path("revision-create-no-pr")).unwrap();
+        let product_id = make_revision_product(&db, "nopr");
+        let parent_id = make_chore_root(&db, &product_id, "no-pr");
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let err = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has no PR yet"),
+            "expected 'has no PR yet' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_revision_errors_when_parent_pr_merged_via_cached_status() {
+        let db = WorkDb::open(temp_db_path("revision-create-merged-cached")).unwrap();
+        let product_id = make_revision_product(&db, "merged-cached");
+        let pr_url = "https://github.com/spinyfin/mono/pull/99";
+        let parent_id = make_done_chore(&db, &product_id, pr_url);
+
+        // Probe would return Open, but the cached status='done' gate fires first.
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let err = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already merged"),
+            "expected 'already merged' in: {msg}"
+        );
+        assert!(
+            msg.contains("#99"),
+            "expected PR number in error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_revision_errors_when_pr_merged_via_live_probe() {
+        let db = WorkDb::open(temp_db_path("revision-create-merged-probe")).unwrap();
+        let product_id = make_revision_product(&db, "merged-probe");
+        let pr_url = "https://github.com/spinyfin/mono/pull/101";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        // Live probe says merged (race: PR merged after cache was last updated).
+        let checker = FakePrStateChecker::always(PrOpenState::Merged);
+        let err = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already merged"),
+            "expected 'already merged' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_revision_errors_when_pr_closed_unmerged() {
+        let db = WorkDb::open(temp_db_path("revision-create-closed")).unwrap();
+        let product_id = make_revision_product(&db, "closed");
+        let pr_url = "https://github.com/spinyfin/mono/pull/77";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        // Live probe says closed without merging.
+        let checker = FakePrStateChecker::always(PrOpenState::ClosedUnmerged);
+        let err = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("closed without merging"),
+            "expected 'closed without merging' in: {msg}"
+        );
+        assert!(
+            msg.contains("#77"),
+            "expected PR number in error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_revision_of_revision_gates_against_chain_root() {
+        let db = WorkDb::open(temp_db_path("revision-of-revision")).unwrap();
+        let product_id = make_revision_product(&db, "ror");
+        let pr_url = "https://github.com/spinyfin/mono/pull/55";
+        let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        // R1: revision of the root chore.
+        let checker_open = FakePrStateChecker::always(PrOpenState::Open);
+        let r1 = db
+            .create_revision(revision_input(&root_id), &checker_open)
+            .unwrap();
+        assert_eq!(r1.kind, "revision");
+
+        // R2: revision of R1 — gate should resolve to root's PR.
+        let r2 = db
+            .create_revision(revision_input(&r1.id), &checker_open)
+            .unwrap();
+        assert_eq!(r2.kind, "revision");
+        assert_eq!(r2.parent_task_id.as_deref(), Some(r1.id.as_str()));
+
+        // Now simulate the root's PR being closed; revising R1 should fail.
+        let checker_closed = FakePrStateChecker::always(PrOpenState::ClosedUnmerged);
+        let err = db
+            .create_revision(revision_input(&r1.id), &checker_closed)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("closed without merging"),
+            "revision-of-revision gate must check chain root PR; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_revision_inherits_product_and_project_from_root() {
+        let db = WorkDb::open(temp_db_path("revision-inherit")).unwrap();
+        let product_id = make_revision_product(&db, "inherit");
+        let pr_url = "https://github.com/spinyfin/mono/pull/200";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        assert_eq!(
+            revision.product_id, product_id,
+            "revision must inherit product_id from chain root"
+        );
+        assert_eq!(
+            revision.effort_level,
+            Some(boss_protocol::EffortLevel::Small),
+            "revision must default to small effort per §Q7"
         );
     }
 }
