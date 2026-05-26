@@ -52,7 +52,7 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
-use crate::work::{PendingMergeCheck, WorkDb};
+use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
 use boss_protocol;
 
 /// Review-gating state of a PR at probe time. Derived from
@@ -128,6 +128,11 @@ crate::register_counter!(
     "merge_poller.merge_queue_rebounced",
     "PRs flipped to blocked:ci_failure due to a merge-queue FAILED_CHECKS dequeue in one sweep."
 );
+crate::register_counter!(
+    LATE_PR_RECOVERED,
+    "merge_poller.late_pr_recovered",
+    "Late PRs bound to active tasks from terminal executions (double-spawn recovery) in one sweep."
+);
 
 /// Register all merge-poller counter handles with `registry`. Called
 /// from [`crate::metrics::init_all`] at engine startup.
@@ -139,6 +144,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&CONFLICT_REDISPATCHED);
     registry.register_counter(&PR_RECHECK_UNRESOLVED);
     registry.register_counter(&MERGE_QUEUE_REBOUNCED);
+    registry.register_counter(&LATE_PR_RECOVERED);
 }
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -1255,6 +1261,13 @@ pub struct SweepOutcome {
     /// WHERE guard) and the second inserts a ci_remediations row but
     /// cannot create an execution because the task is already blocked.
     pub ci_remediation_redispatched: usize,
+    /// Number of terminal executions (abandoned/completed/failed within
+    /// the lookback window) whose task was still `active` with no `pr_url`
+    /// but now has a detectable PR. These arise from the double-spawn race
+    /// (Bug B): exec_A was abandoned while its pane was still running, and
+    /// the normal `pending_pr_recheck` sweep (which only watches
+    /// `waiting_human`) cannot recover them.
+    pub late_pr_recovered: usize,
 }
 
 impl SweepOutcome {
@@ -1268,6 +1281,7 @@ impl SweepOutcome {
             + self.conflict_redispatched
             + self.merge_queue_rebounced
             + self.ci_remediation_redispatched
+            + self.late_pr_recovered
     }
 }
 
@@ -1352,12 +1366,33 @@ pub async fn run_one_pass(
             Vec::new()
         }
     };
+    // Late-PR candidates (Bug B recovery): terminal executions within
+    // the last 60 min whose task is still `active` with no `pr_url`.
+    // These arise from the double-spawn race where the orphan sweep
+    // abandons exec_A while its pane is still running. The normal
+    // `pending_pr_recheck` sweep (which only watches `waiting_human`)
+    // cannot recover them; this sweep fills the gap.
+    let late_pr_candidates: Vec<LatePrCandidate> = if completion_handler.is_some() {
+        match work_db.list_recently_terminal_executions_pending_pr_detection(3600) {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "merge poller: failed to list late PR candidates",
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let total = in_review.len()
         + blocked_conflict.len()
         + blocked_ci.len()
         + pending_pr_recheck.len()
         + stranded_attempts.len()
-        + stranded_ci_attempts.len();
+        + stranded_ci_attempts.len()
+        + late_pr_candidates.len();
     if total == 0 {
         return SweepOutcome::default();
     }
@@ -1368,6 +1403,7 @@ pub async fn run_one_pass(
         pending_pr_recheck = pending_pr_recheck.len(),
         stranded_attempts = stranded_attempts.len(),
         stranded_ci_attempts = stranded_ci_attempts.len(),
+        late_pr_candidates = late_pr_candidates.len(),
         "merge poller: sweep started",
     );
     let mut outcome = SweepOutcome::default();
@@ -1409,6 +1445,13 @@ pub async fn run_one_pass(
     for attempt in &stranded_ci_attempts {
         if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
             outcome.ci_remediation_redispatched += 1;
+        }
+    }
+    // Late-PR sweep (Bug B): recover terminal executions whose pane
+    // pushed a PR after the execution was marked abandoned.
+    if let Some(handler) = completion_handler {
+        for candidate in &late_pr_candidates {
+            sweep_late_pr(handler, candidate, &mut outcome).await;
         }
     }
     // Merge-queue rebounce pass: for every `in_review` PR and every
@@ -1493,6 +1536,49 @@ async fn sweep_pending_pr(
         // is still alive, or the human flipped the
         // `detect_pr_cold_fallback` feature flag OFF (AI #5). No log
         // on these: they're not stuck-worker indicators.
+        StopOutcome::AlreadyTerminal
+        | StopOutcome::UnknownExecution
+        | StopOutcome::NoWorkspace
+        | StopOutcome::RunningNoStagedPr
+        | StopOutcome::FallbackDisabledByFlag
+        | StopOutcome::DbError => {}
+    }
+}
+
+/// Run late-PR detection against a terminal execution (abandoned /
+/// completed / failed within the recent lookback window) whose task is
+/// still `active` with no `pr_url`. Delegates to
+/// [`WorkerCompletionHandler::recheck_for_pr_late`], which bypasses the
+/// `AlreadyTerminal` gate and calls
+/// [`WorkDb::bind_pr_to_active_task_from_terminal_execution`] directly
+/// on a positive detection result.
+async fn sweep_late_pr(
+    handler: &WorkerCompletionHandler,
+    candidate: &LatePrCandidate,
+    outcome: &mut SweepOutcome,
+) {
+    match handler.recheck_for_pr_late(candidate).await {
+        StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
+            outcome.late_pr_recovered += 1;
+            tracing::info!(
+                execution_id = %candidate.execution_id,
+                work_item_id = %candidate.work_item_id,
+                pr_url = %pr_url,
+                "merge poller: late PR bound to active task (double-spawn recovery)",
+            );
+        }
+        // No PR yet or stale — retry next sweep, no log spam.
+        StopOutcome::AwaitingInput
+        | StopOutcome::StalePr { .. }
+        | StopOutcome::EmptyDiffPr { .. }
+        | StopOutcome::DetectorFailed => {
+            tracing::debug!(
+                execution_id = %candidate.execution_id,
+                work_item_id = %candidate.work_item_id,
+                "merge poller: late-PR recheck did not resolve — will retry next sweep",
+            );
+        }
+        // Genuinely silent: execution/task moved on between list and recheck.
         StopOutcome::AlreadyTerminal
         | StopOutcome::UnknownExecution
         | StopOutcome::NoWorkspace
@@ -2020,6 +2106,7 @@ pub fn spawn_loop(
             CONFLICT_REDISPATCHED.inc_by(&metrics, outcome.conflict_redispatched as u64);
             PR_RECHECK_UNRESOLVED.inc_by(&metrics, outcome.pr_recheck_unresolved as u64);
             MERGE_QUEUE_REBOUNCED.inc_by(&metrics, outcome.merge_queue_rebounced as u64);
+            LATE_PR_RECOVERED.inc_by(&metrics, outcome.late_pr_recovered as u64);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -2031,6 +2118,7 @@ pub fn spawn_loop(
                     pr_recheck_recovered = outcome.pr_recheck_recovered,
                     pr_recheck_unresolved = outcome.pr_recheck_unresolved,
                     merge_queue_rebounced = outcome.merge_queue_rebounced,
+                    late_pr_recovered = outcome.late_pr_recovered,
                     "merge poller: sweep transitions",
                 );
             }
@@ -2078,10 +2166,14 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::coordinator::ExecutionPublisher;
+    use crate::completion::{PrDetector, PrStatus, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser};
+    use crate::coordinator::{
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
+        CubeWorkspaceStatus, ExecutionPublisher,
+    };
     use crate::work::{
-        ConflictResolutionInsertInput, CreateChoreInput, CreateProductInput, CreateProjectInput,
-        CreateTaskInput, WorkDb, WorkItem, WorkItemPatch,
+        ConflictResolutionInsertInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
+        CreateProjectInput, CreateTaskInput, WorkDb, WorkItem, WorkItemPatch,
     };
 
     struct StubProbe {
@@ -4882,5 +4974,206 @@ mod tests {
         // Attempt succeeded.
         let after = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
         assert_eq!(after.status, "succeeded");
+    }
+
+    // ── Bug B: late PR recovery ─────────────────────────────────────────────
+
+    struct FixedPrDetector(Option<String>);
+
+    #[async_trait]
+    impl PrDetector for FixedPrDetector {
+        async fn detect_pr(
+            &self,
+            _repo_remote_url: &str,
+            _expected_branch: &str,
+        ) -> Result<PrStatus> {
+            Ok(match &self.0 {
+                Some(url) => PrStatus::Fresh { url: url.clone() },
+                None => PrStatus::None,
+            })
+        }
+    }
+
+    struct NoopPaneReleaser;
+
+    #[async_trait]
+    impl WorkerPaneReleaser for NoopPaneReleaser {
+        async fn release_pane(&self, _run_id: &str) {}
+    }
+
+    struct NoopProbeQueuer;
+
+    impl ProbeQueuer for NoopProbeQueuer {
+        fn queue_probe(&self, _run_id: &str, _text: &str) {}
+    }
+
+    struct NoopCubeClient;
+
+    #[async_trait]
+    impl CubeClient for NoopCubeClient {
+        async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
+            unreachable!()
+        }
+        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>) -> Result<CubeWorkspaceLease> {
+            unreachable!()
+        }
+        async fn create_change(&self, _: &std::path::PathBuf, _: &str) -> Result<CubeChangeHandle> {
+            unreachable!()
+        }
+        async fn release_workspace(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn workspace_status(&self, _: &std::path::Path) -> Result<CubeWorkspaceStatus> {
+            unreachable!()
+        }
+        async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+            Ok(Vec::new())
+        }
+        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn make_abandoned_chore_with_workspace(db: &WorkDb, name: &str) -> (String, String, String) {
+        let product = db
+            .create_product(CreateProductInput {
+                name: format!("Prod-{name}"),
+                description: None,
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: name.into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let exec = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+        let (exec, run) = db
+            .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")
+            .unwrap();
+        db.finish_execution_run(
+            &exec.id, &run.id, "waiting_human", "completed", None, None, false, None,
+        )
+        .unwrap();
+        // Simulate orphan sweep abandoning exec_A.
+        db.mark_execution_redundant(&exec.id).unwrap();
+        (product.id, chore.id, exec.id)
+    }
+
+    #[tokio::test]
+    async fn run_one_pass_recovers_late_pr_for_abandoned_execution() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (_, chore_id, _exec_id) =
+            make_abandoned_chore_with_workspace(&db, "late-pr-sweep-chore");
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let detector = Arc::new(FixedPrDetector(Some(
+            "https://github.com/foo/bar/pull/77".into(),
+        )));
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            Arc::new(NoopCubeClient),
+            publisher.clone(),
+            Arc::new(NoopPaneReleaser),
+            Arc::new(NoopProbeQueuer),
+        );
+
+        let outcome = run_one_pass(
+            db.as_ref(),
+            probe.as_ref(),
+            publisher.as_ref(),
+            None,
+            Some(&handler),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.late_pr_recovered, 1,
+            "expected one late PR recovery, got: {outcome:?}",
+        );
+
+        let task = match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(task.status, "in_review");
+        assert_eq!(
+            task.pr_url.as_deref(),
+            Some("https://github.com/foo/bar/pull/77")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_pass_does_not_query_late_pr_candidates_without_handler() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let (_product_id, chore_id, _exec_id) =
+            make_abandoned_chore_with_workspace(&db, "late-pr-no-handler");
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Passing completion_handler = None; late-PR sweep should be skipped.
+        // Also seed the in_review list so total > 0 and the sweep actually runs.
+        let pr_url = "https://github.com/foo/bar/pull/78";
+        db.update_work_item(
+            &chore_id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        probe.set(pr_url, PrLifecycleState::Open(OpenPrStatus::clean()));
+
+        let outcome = run_one_pass(
+            db.as_ref(),
+            probe.as_ref(),
+            publisher.as_ref(),
+            None,
+            None, // no handler
+        )
+        .await;
+
+        assert_eq!(
+            outcome.late_pr_recovered, 0,
+            "late_pr_recovered must be 0 when no handler is wired",
+        );
     }
 }
