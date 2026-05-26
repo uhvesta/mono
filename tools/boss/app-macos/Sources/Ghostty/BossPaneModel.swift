@@ -104,7 +104,7 @@ final class BossPaneModel: ObservableObject {
         let claudeMd = bossSession.appendingPathComponent("CLAUDE.md")
         // Always rewrite so iterations on the prompt take effect on
         // the next Boss-session start without manually clearing files.
-        try? bossSystemPrompt().write(to: claudeMd, atomically: true, encoding: .utf8)
+        try? bossSystemPrompt(directDeveloperMode: readDirectDeveloperMode()).write(to: claudeMd, atomically: true, encoding: .utf8)
 
         // Auto-mode allowlist for the Boss session. Without these,
         // Claude Code's auto-mode classifier blocks the Boss from
@@ -149,7 +149,75 @@ private func bossSettingsLocalJson() -> String {
     """
 }
 
-private func bossSystemPrompt() -> String {
+/// Reads `coordinator.direct_developer_mode` from the engine settings.toml on disk.
+/// Returns false when the file is absent, unreadable, or the key is not set to true.
+/// Called at Boss-session startup so the right filing guidance lands in CLAUDE.md.
+private func readDirectDeveloperMode() -> Bool {
+    let fm = FileManager.default
+    guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+        return false
+    }
+    let settingsPath = appSupport.appendingPathComponent("Boss/settings.toml")
+    guard let contents = try? String(contentsOf: settingsPath, encoding: .utf8) else {
+        return false
+    }
+    let key = "coordinator.direct_developer_mode"
+    for line in contents.components(separatedBy: .newlines) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        // The TOML serializer quotes keys that contain dots, producing:
+        //   "coordinator.direct_developer_mode" = true
+        guard trimmed.contains(key),
+              let eqIdx = trimmed.firstIndex(of: "=") else { continue }
+        let rhs = trimmed[trimmed.index(after: eqIdx)...].trimmingCharacters(in: .whitespaces)
+        return rhs.hasPrefix("true")
+    }
+    return false
+}
+
+// The "Filing bugs and feature requests against Boss" section injected into the
+// coordinator system prompt. Two variants are kept in sync here; bossSystemPrompt
+// selects between them based on the coordinator.direct_developer_mode setting.
+
+/// Default (flag off): file Boss bugs/features via `boss shake` → GitHub issue.
+private let bossFilingGuidanceStandard = """
+    ## Filing bugs and feature requests against Boss
+
+    When the user reports a bug in Boss itself, or asks for a Boss feature, file it upstream with `boss shake` instead of opening a chore/task. (Chores and tasks are for *work the user wants done*; `shake` is for *signal back to the Boss developers*, which is `spinyfin/mono`.)
+
+    Workflow:
+
+    1. Draft the report in markdown. First line is the title (or prefix with `# `); the rest is the body. Include: what was tried, what happened, what was expected, and any relevant ids (work-item id, run id, agent id).
+    2. Write it to a scratch file in this Boss-session directory (e.g. `./shake-draft.md`). Do not commit it anywhere.
+    3. Confirm parsing with `boss shake ./shake-draft.md --dry-run` and show the resolved title to the user.
+    4. File with `boss shake ./shake-draft.md`. The verb prints the new issue URL on success.
+
+    Defaults to `spinyfin/mono`. Pass `--label bug` / `--label feature` when the user names the kind. Use `--repo` only if the user explicitly redirects you to a different repo.
+
+    Do not file via `gh issue create` directly — `shake` is the surface so the system prompt and credential layer have a single chokepoint. `shake` authenticates as a registered GitHub App (config at `~/Library/Application Support/Boss/github-app.toml`); if it errors with "cannot read GitHub App config", point the user at the PR #748 setup instructions and stop.
+    """
+
+/// Direct developer mode (flag on): file Boss bugs/features as chores against the Boss product.
+/// `boss shake` is retained only when the user explicitly requests a GitHub issue.
+private let bossFilingGuidanceDirect = """
+    ## Filing bugs and feature requests against Boss
+
+    **Direct Boss developer mode is active.** When the user reports a bug in Boss or requests a Boss feature, file it as a chore against the Boss product (via `boss chore create`) instead of a GitHub issue. This is the correct path when you are developing Boss with Boss.
+
+    Workflow:
+
+    1. Find the Boss product: `boss product list --json` — identify the product named "Boss" (or equivalent).
+    2. Create the chore: `boss chore create --product <id> --name "…" --description "$(cat <<'EOF'\\n…\\nEOF)" --effort <level>`.
+    3. Append an `[effort-classification]` audit line to the description per the effort-estimation rules.
+    4. Confirm the short_id and name to the user.
+
+    **Exception:** if the user explicitly asks to file a GitHub issue instead, use `boss shake`:
+
+    1. Draft the report in markdown; write to `./shake-draft.md`.
+    2. Confirm with `boss shake ./shake-draft.md --dry-run` and show the resolved title.
+    3. File with `boss shake ./shake-draft.md`.
+    """
+
+private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     """
     # The Boss
 
@@ -355,19 +423,6 @@ private func bossSystemPrompt() -> String {
 
     Every project has exactly one `kind=design` task. Reach for it; don't create new ones.
 
-    ## Filing bugs and feature requests against Boss
-
-    When the user reports a bug in Boss itself, or asks for a Boss feature, file it upstream with `boss shake` instead of opening a chore/task. (Chores and tasks are for *work the user wants done*; `shake` is for *signal back to the Boss developers*, which is `spinyfin/mono`.)
-
-    Workflow:
-
-    1. Draft the report in markdown. First line is the title (or prefix with `# `); the rest is the body. Include: what was tried, what happened, what was expected, and any relevant ids (work-item id, run id, agent id).
-    2. Write it to a scratch file in this Boss-session directory (e.g. `./shake-draft.md`). Do not commit it anywhere.
-    3. Confirm parsing with `boss shake ./shake-draft.md --dry-run` and show the resolved title to the user.
-    4. File with `boss shake ./shake-draft.md`. The verb prints the new issue URL on success.
-
-    Defaults to `spinyfin/mono`. Pass `--label bug` / `--label feature` when the user names the kind. Use `--repo` only if the user explicitly redirects you to a different repo.
-
-    Do not file via `gh issue create` directly — `shake` is the surface so the system prompt and credential layer have a single chokepoint. `shake` authenticates as a registered GitHub App (config at `~/Library/Application Support/Boss/github-app.toml`); if it errors with "cannot read GitHub App config", point the user at the PR #748 setup instructions and stop.
+    \(directDeveloperMode ? bossFilingGuidanceDirect : bossFilingGuidanceStandard)
     """
 }

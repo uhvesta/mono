@@ -44,6 +44,17 @@ pub const REGISTRY: &[SettingSpec] = &[
         description: "Permission mode for Sonnet/Haiku workers. Disabled (default): --dangerously-skip-permissions. Enabled: --permission-mode auto.",
         default_enabled: false,
     },
+    SettingSpec {
+        key: "coordinator.direct_developer_mode",
+        // false (default) = coordinator uses 'boss shake' for Boss bugs/features
+        //                   (files a GitHub issue in spinyfin/mono).
+        // true            = coordinator prefers filing a chore against the Boss
+        //                   product directly; 'boss shake' is used only when the
+        //                   user explicitly requests a GitHub issue.
+        // Intended for the machine where Boss is actively developed using Boss.
+        description: "Coordinator files Boss bugs/features as chores against the Boss product instead of GitHub issues. Use on a machine where you develop Boss with Boss.",
+        default_enabled: false,
+    },
 ];
 
 /// Wire/display snapshot of one setting's current state.
@@ -274,6 +285,26 @@ mod tests {
         let store = make_store(&tmp);
         store.load().unwrap();
         assert!(!store.is_enabled("workers.non_opus_permission_mode"));
+    }
+
+    #[test]
+    fn direct_developer_mode_defaults_to_false() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(!store.is_enabled("coordinator.direct_developer_mode"));
+    }
+
+    #[test]
+    fn direct_developer_mode_can_be_toggled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        store.set("coordinator.direct_developer_mode", true).unwrap();
+        assert!(store.is_enabled("coordinator.direct_developer_mode"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("coordinator.direct_developer_mode"));
     }
 
     #[test]

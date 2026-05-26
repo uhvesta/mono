@@ -229,6 +229,10 @@ private struct WorkerSettingsPane: View {
         chatModel.engineSettings.first { $0.key == "workers.non_opus_permission_mode" }
     }
 
+    private var coordinatorSettings: [EngineSetting] {
+        chatModel.engineSettings.filter { $0.key == "coordinator.direct_developer_mode" }
+    }
+
     var body: some View {
         Form {
             if chatModel.engineSettings.isEmpty {
@@ -254,6 +258,17 @@ private struct WorkerSettingsPane: View {
                         }
                     } header: {
                         Text("Workers")
+                    }
+                }
+                if !coordinatorSettings.isEmpty {
+                    Section {
+                        ForEach(coordinatorSettings) { setting in
+                            SettingToggleRow(setting: setting) { enabled in
+                                chatModel.setEngineSetting(key: setting.key, enabled: enabled)
+                            }
+                        }
+                    } header: {
+                        Text("Coordinator")
                     }
                 }
             }
@@ -288,6 +303,8 @@ private struct SettingToggleRow: View {
         switch key {
         case "default_pr_draft_mode":
             return "Default new PRs to draft mode"
+        case "coordinator.direct_developer_mode":
+            return "Direct Boss developer mode"
         default:
             return key
         }
