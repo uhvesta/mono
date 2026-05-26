@@ -870,7 +870,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, prefer_is_soft
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -883,7 +883,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -919,7 +919,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -949,7 +949,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -1599,7 +1599,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
              FROM work_executions
              WHERE status = 'ready'
                AND (dispatch_not_before IS NULL
@@ -1625,7 +1625,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -2606,9 +2606,9 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch, parent_task_id
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation') AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation', 'revision') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([product_id], map_task_with_external_ref_and_investigation_doc)?;
@@ -2617,7 +2617,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch, parent_task_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -3395,6 +3395,12 @@ impl WorkDb {
         crate::host_registry::migrate_work_runs_host_columns(&conn)?;
         crate::host_registry::ensure_local_host(&conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(&conn)?;
+        // Revision tasks (Phase 1): parent linkage column + index on tasks,
+        // and soft-prefer signal on work_executions. Ships dark — the
+        // `revision` kind is parseable but not yet dispatchable.
+        // Design: tools/boss/docs/designs/revision-tasks.md
+        migrate_tasks_parent_task_id_column(&conn)?;
+        migrate_work_executions_prefer_is_soft(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '12')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -6234,7 +6240,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -6716,6 +6722,7 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         investigation_doc_path: None,
         investigation_doc_repo_remote_url: None,
         investigation_doc_branch: None,
+        parent_task_id: None,
     })
 }
 
@@ -6759,15 +6766,16 @@ fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(task)
 }
 
-/// Like [`map_task_with_external_ref`] but also reads columns 35–37
-/// carrying the investigation-doc pointer fields. Used in
-/// `get_work_tree` where the SELECT explicitly includes those columns.
+/// Like [`map_task_with_external_ref`] but also reads columns 35–38
+/// carrying the investigation-doc pointer fields and `parent_task_id`.
+/// Used in `get_work_tree` where the SELECT explicitly includes those columns.
 fn map_task_with_external_ref_and_investigation_doc(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref(row)?;
     task.investigation_doc_path = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
     task.investigation_doc_repo_remote_url =
         row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
     task.investigation_doc_branch = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
+    task.parent_task_id = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
@@ -6791,6 +6799,7 @@ fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         dispatch_not_before: row.get(15)?,
         pr_url: row.get(16)?,
         pr_head_before: row.get(17)?,
+        prefer_is_soft: row.get::<_, i64>(18)? != 0,
     })
 }
 
@@ -7423,7 +7432,7 @@ fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>>
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
          FROM work_executions
          WHERE id = ?1",
         [id],
@@ -7587,6 +7596,45 @@ fn migrate_work_executions_pr_head_before(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add `tasks.parent_task_id` — the soft FK that ties a `revision` task
+/// to the task whose PR it targets — and the accompanying index so the
+/// coordinator can walk the chain efficiently. Mirrors the
+/// `migrate_tasks_investigation_doc_columns` pattern: `table_has_column`
+/// guard makes this idempotent across re-opens. No CHECK constraint; the
+/// "kind = revision ⇒ parent_task_id IS NOT NULL" invariant is enforced
+/// in `insert_revision_in_tx` (Phase 2). Existing non-revision rows default
+/// to `NULL` with no backfill — that is the correct value for them.
+fn migrate_tasks_parent_task_id_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "parent_task_id")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id
+             ON tasks(parent_task_id);",
+    )?;
+    Ok(())
+}
+
+/// Add `work_executions.prefer_is_soft` — a boolean signal (stored as
+/// INTEGER 0/1 per SQLite convention) that tells the coordinator's
+/// `lease_workspace_with_fallback` to treat `preferred_workspace_id` as a
+/// warmth hint rather than a hard requirement. Set `true` (1) for
+/// `revision_implementation` executions; defaults to `false` (0) for all
+/// existing rows, preserving the hard-prefer semantics used by orphan-resume.
+/// See design § OQ5 and `revision-tasks.md`.
+fn migrate_work_executions_prefer_is_soft(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "prefer_is_soft")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN prefer_is_soft INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Canonicalize all timestamp columns to Unix epoch seconds (decimal
 /// string). Older rows in some databases hold ISO 8601 strings (e.g.
 /// `2026-05-07T18:55:45.000Z`) from a pre-canonical write path; this
@@ -7711,6 +7759,55 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+/// Walk `tasks.parent_task_id` from `task_id` to find the originating
+/// non-revision task (the "chain root") — the task that owns the PR.
+///
+/// Revision tasks form chains: a revision of a revision is allowed (OQ2),
+/// and all revisions in a chain share the chain root's PR. This helper
+/// returns the ID of the first ancestor whose `kind` is not `'revision'`.
+///
+/// **Broken-parent handling**: if a row's `parent_task_id` points to a
+/// task that no longer exists (soft-deleted or missing), walking stops at
+/// the deepest reachable ancestor rather than returning an error. The
+/// caller receives the last successfully-resolved ID, which is the closest
+/// meaningful root we have. This matches the design doc (R8 mitigation).
+///
+/// **Cycle guard**: the walk is bounded by `MAX_CHAIN_DEPTH` to prevent an
+/// infinite loop if the data is corrupt. Hitting the cap is treated as a
+/// broken-parent condition — the deepest reached ID is returned.
+pub(crate) fn chain_root(conn: &Connection, task_id: &str) -> Result<String> {
+    const MAX_CHAIN_DEPTH: usize = 64;
+    // `last_resolved` tracks the most recent ID that was successfully found
+    // in the DB. We advance it only after a successful lookup so that if the
+    // next candidate is missing we can return the last good one.
+    let mut last_resolved = task_id.to_owned();
+    let mut next = Some(task_id.to_owned());
+    for _ in 0..MAX_CHAIN_DEPTH {
+        let candidate = match next.take() {
+            Some(id) => id,
+            None => break,
+        };
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT kind, parent_task_id FROM tasks WHERE id = ?1",
+                params![candidate],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => break, // candidate not found; return last_resolved
+            Some((kind, parent_id)) => {
+                last_resolved = candidate;
+                if kind != "revision" || parent_id.is_none() {
+                    break; // reached a non-revision or a revision with no parent
+                }
+                next = parent_id;
+            }
+        }
+    }
+    Ok(last_resolved)
 }
 
 /// Add the `autostart` column to `tasks` for older databases. New
@@ -9057,7 +9154,7 @@ fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
@@ -21175,5 +21272,321 @@ mod tests {
             )
             .unwrap();
         assert!(!second, "should return false when task is already past active");
+    }
+
+    // ── Revision tasks Phase 1: schema + chain_root ────────────────────────
+
+    /// Helper: create a minimal product for revision tests.
+    fn make_revision_product(db: &WorkDb, label: &str) -> String {
+        db.create_product(CreateProductInput {
+            name: format!("Boss-{label}"),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+        })
+        .unwrap()
+        .id
+    }
+
+    /// Helper: create a chore (non-revision root) and return its id.
+    fn make_chore_root(db: &WorkDb, product_id: &str, label: &str) -> String {
+        db.create_chore(CreateChoreInput {
+            product_id: product_id.to_owned(),
+            name: format!("Root chore {label}"),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap()
+        .id
+    }
+
+    /// Helper: directly INSERT a revision task row (kind = 'revision') with
+    /// the given parent_task_id. Phase 2 will add `insert_revision_in_tx`;
+    /// for Phase 1 tests we bypass the API to keep the test self-contained.
+    fn insert_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str) -> String {
+        let conn = db.connect().unwrap();
+        let id = next_id("task");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+             VALUES (?1, ?2, 'revision', 'Test revision', '', 'todo', ?3, ?3, ?4)",
+            rusqlite::params![id, product_id, now, parent_task_id],
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn fresh_db_has_parent_task_id_column_and_index() {
+        let db = WorkDb::open(temp_db_path("revision-schema-fresh")).unwrap();
+        let conn = db.connect().unwrap();
+
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(
+            cols.contains(&"parent_task_id".to_owned()),
+            "tasks table must have parent_task_id column after fresh init; columns = {cols:?}"
+        );
+
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_tasks_parent_task_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_exists, 1,
+            "idx_tasks_parent_task_id must exist after fresh init"
+        );
+    }
+
+    #[test]
+    fn fresh_db_has_prefer_is_soft_column() {
+        let db = WorkDb::open(temp_db_path("revision-schema-exec")).unwrap();
+        let conn = db.connect().unwrap();
+
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(work_executions)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(
+            cols.contains(&"prefer_is_soft".to_owned()),
+            "work_executions must have prefer_is_soft after fresh init; columns = {cols:?}"
+        );
+    }
+
+    #[test]
+    fn upgrade_from_schema_without_revision_columns_yields_same_shape() {
+        let path = disk_db_path("revision-schema-upgrade");
+
+        // Build a pre-revision schema that is missing the two new columns.
+        // The tasks table must include all columns present before the revision
+        // migration (including `deleted_at` which is referenced by the existing
+        // index DDL in the init batch). work_executions must include all
+        // pre-revision columns but lack `prefer_is_soft`. Migrations are
+        // idempotent; opening via WorkDb::open must successfully apply just the
+        // two new migrations without touching the existing data shape.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            // tasks: full legacy schema (matches the CREATE TABLE IF NOT EXISTS
+            // DDL in WorkDb init) but without parent_task_id.  Columns referenced
+            // by existing indexes (product_id, kind, deleted_at, project_id,
+            // ordinal) must all be present so those index DDLs succeed.
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL,
+                project_id TEXT,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                ordinal INTEGER,
+                pr_url TEXT,
+                deleted_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                autostart INTEGER NOT NULL DEFAULT 1,
+                priority TEXT NOT NULL DEFAULT 'medium',
+                repo_remote_url TEXT,
+                created_via TEXT NOT NULL DEFAULT 'unknown',
+                effort_level TEXT,
+                model_override TEXT,
+                ci_attempt_budget INTEGER,
+                ci_attempts_used INTEGER NOT NULL DEFAULT 0,
+                external_ref_kind TEXT,
+                external_ref_canonical_id TEXT,
+                external_ref_raw TEXT,
+                external_ref_synced_at TEXT,
+                external_ref_unbound_at TEXT,
+                investigation_doc_path TEXT,
+                investigation_doc_repo_remote_url TEXT,
+                investigation_doc_branch TEXT
+                -- parent_task_id intentionally absent
+             );
+             CREATE TABLE work_executions (
+                id TEXT PRIMARY KEY,
+                work_item_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                repo_remote_url TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                cube_repo_id TEXT,
+                cube_lease_id TEXT,
+                cube_workspace_id TEXT,
+                workspace_path TEXT,
+                priority INTEGER NOT NULL DEFAULT 0,
+                preferred_workspace_id TEXT,
+                pre_start_failure_count INTEGER NOT NULL DEFAULT 0,
+                dispatch_not_before TEXT,
+                pr_url TEXT,
+                pr_head_before TEXT
+                -- prefer_is_soft intentionally absent
+             );
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening through WorkDb::open runs all migrations including the new ones.
+        let db = WorkDb::open(path.clone()).unwrap();
+        let conn = db.connect().unwrap();
+
+        let task_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(
+            task_cols.contains(&"parent_task_id".to_owned()),
+            "upgraded tasks table must gain parent_task_id; columns = {task_cols:?}"
+        );
+
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_tasks_parent_task_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_exists, 1,
+            "idx_tasks_parent_task_id must exist after upgrade"
+        );
+
+        let exec_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(work_executions)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert!(
+            exec_cols.contains(&"prefer_is_soft".to_owned()),
+            "upgraded work_executions must gain prefer_is_soft; columns = {exec_cols:?}"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn chain_root_returns_self_for_non_revision_task() {
+        let db = WorkDb::open(temp_db_path("chain-root-self")).unwrap();
+        let product_id = make_revision_product(&db, "chain-root-self");
+        let chore_id = make_chore_root(&db, &product_id, "self");
+        let conn = db.connect().unwrap();
+        let root = chain_root(&conn, &chore_id).unwrap();
+        assert_eq!(
+            root, chore_id,
+            "chain_root of a non-revision task must return itself"
+        );
+    }
+
+    #[test]
+    fn chain_root_walks_single_link() {
+        let db = WorkDb::open(temp_db_path("chain-root-single")).unwrap();
+        let product_id = make_revision_product(&db, "chain-root-single");
+        let chore_id = make_chore_root(&db, &product_id, "root");
+        let revision_id = insert_revision_row(&db, &product_id, &chore_id);
+
+        let conn = db.connect().unwrap();
+        let root = chain_root(&conn, &revision_id).unwrap();
+        assert_eq!(
+            root, chore_id,
+            "chain_root of a single-link revision must return the parent chore"
+        );
+    }
+
+    #[test]
+    fn chain_root_walks_multi_link_chain() {
+        let db = WorkDb::open(temp_db_path("chain-root-multi")).unwrap();
+        let product_id = make_revision_product(&db, "chain-root-multi");
+        let chore_id = make_chore_root(&db, &product_id, "root");
+        // R1 → chore
+        let r1_id = insert_revision_row(&db, &product_id, &chore_id);
+        // R2 → R1 (revision of a revision, flat continuation per OQ2)
+        let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+        // R3 → R2
+        let r3_id = insert_revision_row(&db, &product_id, &r2_id);
+
+        let conn = db.connect().unwrap();
+        for (label, id) in [("R1", &r1_id), ("R2", &r2_id), ("R3", &r3_id)] {
+            let root = chain_root(&conn, id).unwrap();
+            assert_eq!(
+                root, chore_id,
+                "{label}: chain_root must reach the originating non-revision task"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_root_handles_broken_parent_gracefully() {
+        let db = WorkDb::open(temp_db_path("chain-root-broken")).unwrap();
+        let product_id = make_revision_product(&db, "chain-root-broken");
+        let chore_id = make_chore_root(&db, &product_id, "root");
+        // R1 points at a real chore (so it has a valid root).
+        let r1_id = insert_revision_row(&db, &product_id, &chore_id);
+        // R2 → R1 (valid link)
+        let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+        // Now soft-delete R1 to simulate a broken intermediate parent.
+        db.connect().unwrap().execute(
+            "UPDATE tasks SET deleted_at = ?1 WHERE id = ?2",
+            rusqlite::params![now_string(), r1_id],
+        ).unwrap();
+        // R2's parent (R1) is still in the table (soft-deleted), but R1's
+        // parent (chore) exists. chain_root should still reach chore because
+        // the walk queries the row even when deleted_at is set.
+        // (Broken-parent = the row is completely missing, not just deleted.)
+        // So let's also test with a genuinely missing parent: insert a
+        // revision whose parent_task_id refers to a non-existent id.
+        let orphan_id = {
+            let conn = db.connect().unwrap();
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 VALUES (?1, ?2, 'revision', 'orphan', '', 'todo', ?3, ?3, 'nonexistent-parent-id')",
+                rusqlite::params![id, product_id, now],
+            ).unwrap();
+            id
+        };
+        let conn = db.connect().unwrap();
+        // Walking from orphan: parent 'nonexistent-parent-id' is missing →
+        // stop immediately; chain_root returns the orphan itself (deepest reachable).
+        let root = chain_root(&conn, &orphan_id).unwrap();
+        assert_eq!(
+            root, orphan_id,
+            "broken-parent: chain_root must return the deepest reachable id (the revision itself)"
+        );
+
+        // R2 still walks through the soft-deleted R1 to the chore
+        // (soft-deleted rows are still in the table; the walk doesn't filter on deleted_at).
+        let root2 = chain_root(&conn, &r2_id).unwrap();
+        assert_eq!(
+            root2, chore_id,
+            "soft-deleted intermediate parent: chain_root must still reach the chore"
+        );
     }
 }

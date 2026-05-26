@@ -376,6 +376,12 @@ pub struct Task {
     /// merge the UI falls back to `main`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation_doc_branch: Option<String>,
+    /// Soft FK to the `tasks.id` whose PR this revision targets. `None`
+    /// for every non-`revision` row. Required (app-enforced) when
+    /// `kind = 'revision'`; never set by `ALTER TABLE … ADD COLUMN`
+    /// backfill, so pre-revision rows carry `NULL` as expected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -486,6 +492,17 @@ pub struct WorkExecution {
     /// predate this column.
     #[serde(default)]
     pub pr_head_before: Option<String>,
+    /// When `true`, the cube workspace preference (`preferred_workspace_id`)
+    /// is treated as a warmth hint only: if the preferred workspace is
+    /// unavailable or busy, the coordinator falls back silently to any free
+    /// workspace rather than failing terminally. Set `true` for
+    /// `revision_implementation` executions (warmth ≠ correctness; the
+    /// branch is always recoverable via `jj git fetch`). Pre-revision rows
+    /// default to `false`, preserving the existing hard-prefer semantics
+    /// used by orphan-resume.
+    #[serde(default)]
+    #[builder(default)]
+    pub prefer_is_soft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1132,6 +1149,49 @@ pub struct SetTaskInvestigationDocInput {
     /// When `true`, clear all three pointer columns (set to NULL).
     #[serde(default)]
     pub unset: bool,
+}
+
+/// Input for `boss task create-revision`. Creates a `kind = 'revision'`
+/// task bound to an existing parent task whose PR is open and unmerged.
+/// The worker's deliverable is a new commit on the *parent's* PR branch —
+/// no new PR is opened. The `parent_task_id` field is required; the engine
+/// enforces "kind = revision ⇒ parent_task_id IS NOT NULL" in
+/// `insert_revision_in_tx` (Phase 2). `product_id` and `project_id` are
+/// inherited from the parent at create time; `repo_remote_url` is likewise
+/// inherited so the revision always targets the parent's repo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRevisionInput {
+    /// The task whose PR this revision will commit to. Must refer to a task
+    /// (or chain of revisions) with an open, unmerged PR. May itself be a
+    /// `revision` — the gate is evaluated against the chain root's PR.
+    pub parent_task_id: String,
+    /// The operator's verbatim ask, kept short. Rendered on the
+    /// Review-lane rollup affordance so reviewers can see what each
+    /// new commit was for; long descriptions are truncated in the UI.
+    pub description: String,
+    /// One of `low` / `medium` / `high`. Omitted → inherits from the
+    /// parent task's priority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// Effort estimate. Omitted → defaults to `small` (revisions are
+    /// typically narrow; the heuristic can escalate on signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<EffortLevel>,
+    /// Explicit model slug override. `None` → resolve per design §Q3
+    /// precedence (same as other task kinds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Bypass the recent-duplicate guard. See
+    /// [`CreateTaskInput::force_duplicate`].
+    #[serde(default)]
+    pub force_duplicate: bool,
+    /// Surface that filed this revision — `"operator"` for Source A
+    /// (direct boss-operator feedback); `"pr-comment:<repo>#<pr>:<cid>"`
+    /// for Source B (deferred comment-triage UI). Stored in
+    /// `tasks.created_via`; the `(repo, pr#, comment-id)` pointer is
+    /// carried verbatim here rather than mirrored into separate columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
 }
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved
