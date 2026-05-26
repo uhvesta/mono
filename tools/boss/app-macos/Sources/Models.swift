@@ -509,6 +509,15 @@ struct WorkTask: Identifiable, Hashable {
     /// PR branch the investigation doc was opened on. Used to construct the
     /// in-review GitHub URL while the PR is open.
     var investigationDocBranch: String? = nil
+    /// Soft FK to the parent task for `kind == "revision"` rows. `nil`
+    /// for non-revision rows. Mirrors `Task.parent_task_id` on the wire.
+    var parentTaskId: String? = nil
+    /// Engine-computed R-number for revision tasks (1-based, chain-root-scoped).
+    /// `nil` for non-revision rows. Mirrors the derived `revision_seq` field.
+    var revisionSeq: Int? = nil
+    /// Denormalized parent chain-root PR URL for fast revision card rendering.
+    /// `nil` for non-revision rows. Mirrors `revision_parent_pr_url` on the wire.
+    var revisionParentPrUrl: String? = nil
 
     var isChore: Bool {
         kind == "chore"

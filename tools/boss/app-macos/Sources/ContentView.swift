@@ -1387,6 +1387,12 @@ private struct WorkBoardCardItem: View {
         let designDocState: ProjectDesignDocState? = designDocProject
             .map { model.designDocStateByProjectID[$0.id] ?? .notSet }
         let externalRefLink = ExternalRefLinkPresentation.forTask(task)
+        let inReviewRevisions: [WorkTask] = column == .review
+            ? model.inReviewRevisions(forParentTaskID: task.id)
+            : []
+        let parentShortID: Int? = task.kind == "revision"
+            ? task.parentTaskId.flatMap { model.workTask(withID: $0)?.shortID }
+            : nil
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
@@ -1417,7 +1423,9 @@ private struct WorkBoardCardItem: View {
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
                     mergeQueueState: column == .review ? task.mergeQueueState : nil,
                     externalRefLink: externalRefLink,
-                    ambiguousRepoNames: model.ambiguousVisibleRepoNames
+                    ambiguousRepoNames: model.ambiguousVisibleRepoNames,
+                    inReviewRevisions: inReviewRevisions,
+                    parentShortID: parentShortID
                 )
             }
             .buttonStyle(.plain)
@@ -1605,9 +1613,28 @@ struct WorkBoardCardView: View {
     /// `PRURLLink` so a card's PR link can drop the org prefix when
     /// its repo is unique among visible cards.
     var ambiguousRepoNames: Set<String> = []
+    /// In-review revisions to display as rollup lines on this card's
+    /// Review-lane footer. Empty for non-Review cards and parent tasks
+    /// with no in-review revisions. Ordered by `revisionSeq`.
+    var inReviewRevisions: [WorkTask] = []
+    /// Short ID of the parent task, used to render "revises T<n>" on
+    /// revision cards in Backlog/Doing. `nil` for non-revision tasks
+    /// and revision tasks whose parent can't be resolved.
+    var parentShortID: Int? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if task.kind == "revision", let seq = task.revisionSeq {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    RevisionBadge(seq: seq)
+                    if let parentID = parentShortID {
+                        Text("revises T\(parentID)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
             HStack(alignment: .top, spacing: 6) {
                 if let activityState {
                     AgentActivityDot(state: activityState)
@@ -1773,6 +1800,25 @@ struct WorkBoardCardView: View {
                     Spacer(minLength: 0)
                 }
             }
+
+            if task.kind == "revision", let prURL = task.revisionParentPrUrl, !prURL.isEmpty {
+                HStack(alignment: .center, spacing: 6) {
+                    PRURLLink(
+                        urlString: prURL,
+                        font: .caption,
+                        ambiguousRepoNames: ambiguousRepoNames
+                    )
+                    Spacer(minLength: 0)
+                }
+            }
+
+            if !inReviewRevisions.isEmpty {
+                Divider()
+                    .padding(.vertical, 2)
+                ForEach(inReviewRevisions) { revision in
+                    RevisionRollupLine(revision: revision)
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -1857,6 +1903,64 @@ struct WorkBoardCardView: View {
             return .orange
         }
         return Color(nsColor: .separatorColor)
+    }
+}
+
+/// The `⟳ R<n>` chip rendered on revision cards in Backlog/Doing.
+/// Uses the accent color so the chip reads as an affordance rather than
+/// metadata text, and clearly signals "this is a revision" at a glance.
+private struct RevisionBadge: View {
+    let seq: Int
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text("⟳")
+                .font(.caption.weight(.semibold))
+            Text("R\(seq)")
+                .font(.system(.caption, design: .monospaced).weight(.semibold))
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Color.accentColor.opacity(0.75), in: Capsule())
+        .accessibilityLabel("Revision \(seq)")
+    }
+}
+
+/// One rollup line in a Review-lane parent card for an in-review revision.
+/// Shows `⟳ R<n>  <description truncated>  ↗` linking to the parent PR.
+private struct RevisionRollupLine: View {
+    let revision: WorkTask
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            if let seq = revision.revisionSeq {
+                Text("⟳ R\(seq)")
+                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            Text(revision.name)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+            if let prURL = revision.revisionParentPrUrl,
+               let url = URL(string: prURL) {
+                Link(destination: url) {
+                    Image(systemName: "arrow.up.right")
+                        .font(.caption2)
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("Revision \(revision.revisionSeq.map { "R\($0)" } ?? ""): \(revision.name)")
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel({
+            let seqLabel = revision.revisionSeq.map { "Revision \($0)" } ?? "Revision"
+            return "\(seqLabel): \(revision.name)"
+        }())
     }
 }
 

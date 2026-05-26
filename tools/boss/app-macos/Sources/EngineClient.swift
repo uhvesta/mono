@@ -1275,7 +1275,10 @@ final class EngineClient: @unchecked Sendable {
             externalRef: parseExternalRef(payload["external_ref"]),
             investigationDocPath: payload["investigation_doc_path"] as? String,
             investigationDocRepoRemoteUrl: payload["investigation_doc_repo_remote_url"] as? String,
-            investigationDocBranch: payload["investigation_doc_branch"] as? String
+            investigationDocBranch: payload["investigation_doc_branch"] as? String,
+            parentTaskId: payload["parent_task_id"] as? String,
+            revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,
+            revisionParentPrUrl: payload["revision_parent_pr_url"] as? String
         )
     }
 

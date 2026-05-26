@@ -1847,6 +1847,27 @@ final class ChatViewModel: ObservableObject {
         return nil
     }
 
+    /// Look up any task or chore by id. Used by the kanban to resolve
+    /// the parent task for revision card chrome.
+    func workTask(withID id: String) -> WorkTask? {
+        task(withID: id)
+    }
+
+    /// All `kind == "revision"` tasks whose `parentTaskId` matches the
+    /// supplied id AND whose status is `"in_review"`. Used by the Review-
+    /// lane parent card to render per-revision rollup lines.
+    func inReviewRevisions(forParentTaskID parentID: String) -> [WorkTask] {
+        var result: [WorkTask] = []
+        for tasks in tasksByProjectID.values {
+            result.append(contentsOf: tasks.filter {
+                $0.kind == "revision"
+                    && $0.parentTaskId == parentID
+                    && $0.status == "in_review"
+            })
+        }
+        return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+    }
+
     private func productID(for nodeID: WorkNodeID?) -> String? {
         switch nodeID {
         case .product(let productID):
@@ -2047,9 +2068,15 @@ final class ChatViewModel: ObservableObject {
         if let cached = cachedItemsByColumn[column] {
             return cached
         }
-        let items = visibleWorkItems
+        var items = visibleWorkItems
             .filter { effectiveBoardColumn(for: $0) == column }
             .sorted(by: boardTaskSort)
+        // In-review revisions don't appear as standalone cards in the Review
+        // column — they roll up as single lines on the parent task's card.
+        // They are still visible in Backlog/Doing as distinct cards.
+        if column == .review {
+            items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
+        }
         cachedItemsByColumn[column] = items
         return items
     }
