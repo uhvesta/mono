@@ -7809,9 +7809,16 @@ fn insert_revision_in_tx(
     let product_id = &root.product_id;
     let project_id = root.project_id.as_deref();
     let short_id = allocate_short_id(conn, product_id)?;
-    // `name` is the compact one-line card title derived from the first
-    // non-empty line of `description`. `description` retains the full text.
-    let name = revision_name_from_description(&description);
+    // `name` is the compact one-line card title. When the coordinator supplies
+    // `input.name`, use it verbatim (after trimming); otherwise fall back to
+    // deriving the name from the first non-empty line of `description`.
+    let name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| revision_name_from_description(&description));
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
@@ -23169,6 +23176,7 @@ mod tests {
         CreateRevisionInput {
             parent_task_id: parent_id.to_owned(),
             description: "test revision ask".to_owned(),
+            name: None,
             priority: None,
             effort_level: None,
             model_override: None,
@@ -23426,6 +23434,33 @@ mod tests {
         let desc = "First line\r\nSecond line";
         // Rust `str::lines()` strips \r\n correctly.
         assert_eq!(revision_name_from_description(desc), "First line");
+    }
+
+    #[test]
+    fn create_revision_uses_explicit_name_over_description_fallback() {
+        let db = WorkDb::open(temp_db_path("revision-explicit-name")).unwrap();
+        let product_id = make_revision_product(&db, "explicit-name");
+        let pr_url = "https://github.com/spinyfin/mono/pull/99";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let explicit_name = "Fix missing version number in release builds";
+        let task = db.create_revision(
+            CreateRevisionInput {
+                parent_task_id: parent_id,
+                description: "I also don't see the version number in /release/ builds created by the buildkite release pipeline.".to_owned(),
+                name: Some(explicit_name.to_owned()),
+                priority: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+                created_via: None,
+            },
+            &checker,
+        ).unwrap();
+
+        assert_eq!(task.name, explicit_name,
+            "revision should use the coordinator-supplied name, not the fallback from description");
     }
 
     // ── attach_revision_projections ─────────────────────────────────────────

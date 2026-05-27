@@ -1177,10 +1177,17 @@ pub struct CreateRevisionInput {
     /// (or chain of revisions) with an open, unmerged PR. May itself be a
     /// `revision` — the gate is evaluated against the chain root's PR.
     pub parent_task_id: String,
-    /// The operator's verbatim ask, kept short. Rendered on the
-    /// Review-lane rollup affordance so reviewers can see what each
-    /// new commit was for; long descriptions are truncated in the UI.
+    /// The operator's verbatim ask. Stored as the task's `description` and
+    /// shown in the Review-lane rollup affordance so reviewers can see what
+    /// each new commit was for.
     pub description: String,
+    /// Short summary title for the revision card (1–10 words). When the
+    /// coordinator supplies this, it is used verbatim as `tasks.name`;
+    /// when absent the engine falls back to deriving a name from the first
+    /// line of `description` (legacy behaviour, preserved for callers that
+    /// pre-date this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// One of `low` / `medium` / `high`. Omitted → inherits from the
     /// parent task's priority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
