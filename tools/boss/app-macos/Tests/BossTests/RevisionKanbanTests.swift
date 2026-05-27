@@ -165,6 +165,65 @@ final class RevisionKanbanTests: XCTestCase {
         XCTAssertNil(model.workTask(withID: "nonexistent_id"))
     }
 
+    // MARK: chore-parented revisions (issue #789)
+    //
+    // A revision inherits its project from the chain root, so a chore-parented
+    // revision has no project_id. The work-tree reception used to drop every
+    // project-less task, making such revisions invisible everywhere in the
+    // kanban. These tests drive the real reception path (`applyEventForTest`)
+    // to prove they now survive and render.
+
+    func testChoreParentedRevisionSurvivesReceptionAsDoingCard() {
+        let model = makeModel()
+        let chore = makeChore(id: "chore_c19", status: "active")
+        // Mirrors the repro: a todo, autostart revision (→ Doing).
+        let revision = makeChoreParentedRevision(
+            id: "task_t29", status: "todo", seq: 1, parentID: chore.id, autostart: true
+        )
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+
+        XCTAssertEqual(
+            model.productLevelRevisionsByProductID["prod_test"]?.map(\.id),
+            [revision.id],
+            "chore-parented revision must be retained in the product-level bucket"
+        )
+        XCTAssertTrue(
+            model.workItems(in: .doing).contains { $0.id == revision.id },
+            "chore-parented revision must render as a standalone Doing card"
+        )
+    }
+
+    func testChoreParentedInReviewRevisionRollsUpUnderChore() {
+        let model = makeModel()
+        let chore = makeChore(id: "chore_c19", status: "in_review")
+        let revision = makeChoreParentedRevision(
+            id: "task_t29", status: "in_review", seq: 1, parentID: chore.id
+        )
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+
+        let rollup = model.inReviewRevisions(forParentTaskID: chore.id)
+        XCTAssertEqual(rollup.map(\.id), [revision.id],
+                       "in-review chore-parented revision must roll up under its parent chore")
+
+        let reviewItems = model.workItems(in: .review)
+        XCTAssertTrue(reviewItems.contains { $0.id == chore.id },
+                      "parent chore must appear in Review")
+        XCTAssertFalse(reviewItems.contains { $0.id == revision.id },
+                       "in-review revision must not also appear as a standalone Review card")
+    }
+
+    func testWorkTaskWithIDFindsChoreParentedRevision() {
+        let model = makeModel()
+        let chore = makeChore(id: "chore_c19", status: "in_review")
+        let revision = makeChoreParentedRevision(
+            id: "task_t29", status: "todo", seq: 1, parentID: chore.id
+        )
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+
+        XCTAssertEqual(model.workTask(withID: revision.id)?.id, revision.id,
+                       "workTask(withID:) must resolve a chore-parented revision")
+    }
+
     // MARK: - WorkTask fields
 
     func testRevisionFieldsDefaultToNil() {
@@ -232,6 +291,80 @@ final class RevisionKanbanTests: XCTestCase {
         )
     }
 
+    /// A chore (kind = "chore"), which has no project — the chain root in the
+    /// issue #789 repro.
+    private func makeChore(id: String, status: String) -> WorkTask {
+        WorkTask(
+            id: id,
+            productID: "prod_test",
+            projectID: nil,
+            kind: "chore",
+            name: "Chore \(id)",
+            description: "Chore description",
+            status: status,
+            priority: "medium",
+            ordinal: nil,
+            prURL: status == "in_review" ? "https://github.com/org/repo/pull/250" : nil,
+            deletedAt: nil,
+            createdAt: "2026-05-26T00:00:00Z",
+            updatedAt: "2026-05-26T00:00:00Z"
+        )
+    }
+
+    /// A revision whose parent is a chore: it inherits the chore's (absent)
+    /// project, so `projectID` is nil — the shape the reception path used to
+    /// drop.
+    private func makeChoreParentedRevision(
+        id: String,
+        status: String,
+        seq: Int,
+        parentID: String,
+        autostart: Bool = false
+    ) -> WorkTask {
+        WorkTask(
+            id: id,
+            productID: "prod_test",
+            projectID: nil,
+            kind: "revision",
+            name: "Revision \(seq) description",
+            description: "Detailed revision intent",
+            status: status,
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-26T00:00:00Z",
+            updatedAt: "2026-05-26T00:00:00Z",
+            autostart: autostart,
+            parentTaskId: parentID,
+            revisionSeq: seq,
+            revisionParentPrUrl: "https://github.com/org/repo/pull/250"
+        )
+    }
+
+    private func makeWorkTreeEvent(
+        tasks: [WorkTask] = [],
+        chores: [WorkTask] = []
+    ) -> EngineEvent {
+        .workTree(
+            product: WorkProduct(
+                id: "prod_test",
+                name: "Test Product",
+                slug: "test",
+                description: "",
+                repoRemoteURL: nil,
+                status: "active",
+                createdAt: "2026-05-26T00:00:00Z",
+                updatedAt: "2026-05-26T00:00:00Z"
+            ),
+            projects: [],
+            tasks: tasks,
+            chores: chores,
+            taskRuntimes: [],
+            dependencies: []
+        )
+    }
+
     private func makeModel() -> ChatViewModel {
         let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
         model.products = [
@@ -263,6 +396,9 @@ final class RevisionKanbanTests: XCTestCase {
             ]
         ]
         model.selectedWorkProductID = "prod_test"
+        // Chores (and chore-parented revisions) are gated on this; pin it on so
+        // tests don't depend on the machine's persisted UserDefaults value.
+        model.includeChores = true
         return model
     }
 }

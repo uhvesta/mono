@@ -2819,11 +2819,11 @@ impl WorkDb {
         let conn = self.connect()?;
         if let Some(task) = conn
             .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, parent_task_id
                  FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
                 params![product_id, short_id],
-                map_task,
+                map_task_with_parent,
             )
             .optional()?
         {
@@ -6866,6 +6866,20 @@ fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+/// Like [`map_task`] but also reads a trailing `parent_task_id` column
+/// (index 30, i.e. appended right after `merge_queue_state`). Used by the
+/// narrow single-row lookups (`query_task`, `get_work_item_by_short_id`)
+/// that back `boss task show` / `boss chore show`, so a revision's parent
+/// linkage is present in that projection instead of always coming back
+/// `null`. The wider `map_task_with_external_ref_and_investigation_doc`
+/// variant populates `parent_task_id` from a different column index
+/// (38); this helper is only for the 30-column SELECT + one extra column.
+fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task(row)?;
+    task.parent_task_id = row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
 /// Derives the canonical browser URL from an external-ref kind and
 /// canonical_id at read time. For GitHub (`kind="github"`) the
 /// canonical_id encodes `"owner/repo#number"`, which maps to
@@ -7632,19 +7646,11 @@ fn insert_revision_in_tx(
             parent_id,
         ],
     )?;
-    // query_task uses map_task which does not include parent_task_id (it is only
-    // populated by the wider map_task_with_external_ref_and_investigation_doc).
-    // For the revision row we need parent_task_id in the returned Task so callers
-    // can verify the linkage, so we read it with an inline SELECT.
-    let mut task = query_task(conn, &id)?.with_context(|| format!("missing revision after insert: {id}"))?;
-    task.parent_task_id = conn
-        .query_row(
-            "SELECT parent_task_id FROM tasks WHERE id = ?1",
-            [&id],
-            |row| row.get::<_, Option<String>>(0),
-        )?
-        .filter(|s| !s.is_empty());
-    Ok(task)
+    // `query_task` reads the trailing `parent_task_id` column (via
+    // `map_task_with_parent`), so the returned revision row already carries
+    // its parent linkage — callers (`create-revision --json`) can verify it
+    // without a second lookup.
+    query_task(conn, &id)?.with_context(|| format!("missing revision after insert: {id}"))
 }
 
 /// Trim and reduce an empty model slug to `None`. The CLI uses
@@ -7811,11 +7817,11 @@ fn query_project(conn: &Connection, id: &str) -> Result<Option<Project>> {
 
 fn query_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
     conn.query_row(
-        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
+        "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, parent_task_id
          FROM tasks
          WHERE id = ?1",
         [id],
-        map_task,
+        map_task_with_parent,
     )
     .optional()
     .map_err(Into::into)
@@ -22631,6 +22637,52 @@ mod tests {
             revision.effort_level,
             Some(boss_protocol::EffortLevel::Small),
             "revision must default to small effort per §Q7"
+        );
+    }
+
+    #[test]
+    fn task_show_projection_includes_parent_task_id_for_revision() {
+        // Regression (issue #789): `boss task show <revision>` reads the row
+        // through `query_task` / `get_work_item_by_short_id`, which used
+        // `map_task` and always returned `parent_task_id = None` — so the CLI
+        // could not confirm a revision's parent linkage even though
+        // `create-revision --json` had returned it. Both the primary-id and
+        // the short-id lookup must now surface `parent_task_id`.
+        let db = WorkDb::open(temp_db_path("revision-show-parent")).unwrap();
+        let product_id = make_revision_product(&db, "show-parent");
+        let pr_url = "https://github.com/spinyfin/mono/pull/250";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+        let short_id = revision.short_id.expect("revision must have a short_id");
+
+        // `boss task show <full-id>` path.
+        let by_id = match db.get_work_item(&revision.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected Task/Chore, got {other:?}"),
+        };
+        assert_eq!(
+            by_id.parent_task_id.as_deref(),
+            Some(parent_id.as_str()),
+            "get_work_item must surface the revision's parent_task_id"
+        );
+
+        // `boss task show T<n>` (short-id) path.
+        let by_short = match db
+            .get_work_item_by_short_id(&product_id, short_id)
+            .unwrap()
+            .expect("revision must be resolvable by short id")
+        {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected Task/Chore, got {other:?}"),
+        };
+        assert_eq!(
+            by_short.parent_task_id.as_deref(),
+            Some(parent_id.as_str()),
+            "get_work_item_by_short_id must surface the revision's parent_task_id"
         );
     }
 }

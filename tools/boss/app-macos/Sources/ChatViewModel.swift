@@ -35,6 +35,16 @@ final class ChatViewModel: ObservableObject {
     @Published var choresByProductID: [String: [WorkTask]] = [:] {
         didSet { invalidateWorkCache() }
     }
+    /// Revisions whose chain root is a chore. A revision inherits its
+    /// `project_id` from the chain root (`insert_revision_in_tx`), so a
+    /// chore-parented revision has none and cannot live in
+    /// `tasksByProjectID`. Keyed by product so these rows still render as
+    /// standalone Backlog/Doing cards and roll up under the parent chore's
+    /// Review card. Without this bucket they were silently dropped at
+    /// work-tree reception and invisible in the kanban (issue #789).
+    @Published var productLevelRevisionsByProductID: [String: [WorkTask]] = [:] {
+        didSet { invalidateWorkCache() }
+    }
     @Published var taskRuntimesByID: [String: WorkTaskRuntime] = [:]
     /// Dependency edges keyed by product. Refreshed whenever the engine
     /// pushes a fresh `WorkTree` for that product. The kanban joins
@@ -495,6 +505,11 @@ final class ChatViewModel: ObservableObject {
         }
         if includeChores && projectFilter.isEmpty {
             items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
+            // Chore-parented revisions have no project of their own; surface
+            // them with the chores so their Backlog/Doing cards appear. The
+            // in-review ones are rolled up under the parent and filtered out
+            // of the Review column by `workItems(in:)`.
+            items.append(contentsOf: (productLevelRevisionsByProductID[productID] ?? []).sorted(by: taskSort))
         }
 
         if showBlockedOnly {
@@ -1532,8 +1547,17 @@ final class ChatViewModel: ObservableObject {
             tasksByProjectID = tasksByProjectID.filter { _, existingTasks in
                 existingTasks.first?.productID != product.id
             }
+            var productLevelRevisions: [WorkTask] = []
             for task in tasks {
-                guard let projectID = task.projectID else { continue }
+                guard let projectID = task.projectID else {
+                    // A chore-parented revision inherits no project_id; keep it
+                    // in the product-level revision bucket rather than dropping
+                    // it, so it stays reachable in the kanban (issue #789).
+                    if task.kind == "revision" {
+                        productLevelRevisions.append(task)
+                    }
+                    continue
+                }
                 tasksByProjectID[projectID, default: []].append(task)
             }
             for (projectID, projectTasks) in tasksByProjectID where
@@ -1541,6 +1565,7 @@ final class ChatViewModel: ObservableObject {
                 tasksByProjectID[projectID] = projectTasks.sorted(by: taskSort)
             }
             choresByProductID[product.id] = chores.sorted(by: taskSort)
+            productLevelRevisionsByProductID[product.id] = productLevelRevisions.sorted(by: taskSort)
             mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
             dependenciesByProductID[product.id] = dependencies
             seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
@@ -1844,6 +1869,14 @@ final class ChatViewModel: ObservableObject {
                 return chore
             }
         }
+        // Chore-parented revisions are not in either bucket above; they live
+        // in the product-level revision bucket (issue #789). Search it so the
+        // revision card's parent lookup and other id resolution find them.
+        for revisions in productLevelRevisionsByProductID.values {
+            if let revision = revisions.first(where: { $0.id == id }) {
+                return revision
+            }
+        }
         return nil
     }
 
@@ -1857,13 +1890,21 @@ final class ChatViewModel: ObservableObject {
     /// supplied id AND whose status is `"in_review"`. Used by the Review-
     /// lane parent card to render per-revision rollup lines.
     func inReviewRevisions(forParentTaskID parentID: String) -> [WorkTask] {
+        let matches: (WorkTask) -> Bool = {
+            $0.kind == "revision"
+                && $0.parentTaskId == parentID
+                && $0.status == "in_review"
+        }
         var result: [WorkTask] = []
+        // Project-task-parented revisions live under their project; chore-
+        // parented ones live in the product-level bucket. Search both so the
+        // parent's Review card rolls up every in-review revision regardless of
+        // whether the chain root is a project_task or a chore (issue #789).
         for tasks in tasksByProjectID.values {
-            result.append(contentsOf: tasks.filter {
-                $0.kind == "revision"
-                    && $0.parentTaskId == parentID
-                    && $0.status == "in_review"
-            })
+            result.append(contentsOf: tasks.filter(matches))
+        }
+        for revisions in productLevelRevisionsByProductID.values {
+            result.append(contentsOf: revisions.filter(matches))
         }
         return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
     }
