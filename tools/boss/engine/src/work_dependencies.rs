@@ -238,12 +238,58 @@ fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemDependency> {
 /// not perpetually gate downstream work). The function is on `id`
 /// prefix because `tasks.kind` is not visible to callers that walk
 /// the edge table.
+///
+/// This is the default (non-revision-aware) form. For a
+/// revision-specific gate check, use
+/// [`status_satisfies_for_dependent`] instead.
 pub fn status_satisfies(work_item_id: &str, status: &str) -> bool {
     if work_item_id.starts_with("proj_") {
         matches!(status, "done" | "archived")
     } else {
         status == "done"
     }
+}
+
+/// Whether `prereq_status` counts as a satisfied prerequisite when
+/// the *dependent* has kind `dependent_kind`.
+///
+/// The rule is revision-specific: a `revision` task becomes runnable
+/// exactly when its prerequisite (the parent task or a preceding
+/// revision) reaches `in_review` — the PR is open, work is
+/// quiescent, and the revision's job is to add a commit to that PR.
+/// Waiting for `done` (merged) is a hard deadlock because by the
+/// time the PR merges the revision can no longer push to it.
+///
+/// For all non-revision dependents the standard rules apply: task
+/// prereqs satisfy on `done`; project prereqs satisfy on
+/// `done`/`archived`.
+pub fn status_satisfies_for_dependent(
+    prereq_id: &str,
+    prereq_status: &str,
+    dependent_kind: Option<&str>,
+) -> bool {
+    if dependent_kind == Some("revision") && prereq_status == "in_review" {
+        return true;
+    }
+    status_satisfies(prereq_id, prereq_status)
+}
+
+/// Look up the `kind` column for a task row. Returns `None` for
+/// project ids, unknown ids, and soft-deleted rows.
+pub fn lookup_work_item_kind(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<String>> {
+    if !work_item_id.starts_with("task_") {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT kind FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+        params![work_item_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Look up the current status of a work item in either `tasks` or
@@ -282,16 +328,23 @@ pub fn lookup_work_item_status(
 /// — `blocks` edges whose prereq has not reached a satisfied
 /// status. Used by both the dispatcher (to demote a gated dependent
 /// to `waiting_dependency`) and the auto-block / unblock path.
+///
+/// The satisfaction check is revision-aware: for `kind = 'revision'`
+/// dependents a prerequisite also satisfies when it reaches
+/// `in_review` (the PR is open and the revision can push to it).
+/// For all other dependents the standard `done`/`archived` rules
+/// apply.
 pub fn gating_prereqs_for(
     conn: &Connection,
     work_item_id: &str,
 ) -> Result<Vec<String>> {
+    let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;
     let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
     let mut gating = Vec::new();
     for edge in edges {
         let status = lookup_work_item_status(conn, &edge.prerequisite_id)?;
         match status {
-            Some(s) if status_satisfies(&edge.prerequisite_id, &s) => {}
+            Some(s) if status_satisfies_for_dependent(&edge.prerequisite_id, &s, dependent_kind.as_deref()) => {}
             _ => gating.push(edge.prerequisite_id),
         }
     }
@@ -387,5 +440,57 @@ mod tests {
         let dependents_of_a = dependents_of(&conn, "task_a", Some(RELATION_BLOCKS)).unwrap();
         assert_eq!(dependents_of_a.len(), 1);
         assert_eq!(dependents_of_a[0].dependent_id, "task_d");
+    }
+
+    // ── status_satisfies_for_dependent / revision-gate semantics ────────────
+
+    /// A non-revision dependent still requires `done` from a task prereq;
+    /// `in_review` must NOT satisfy it.
+    #[test]
+    fn in_review_does_not_satisfy_non_revision_dependent() {
+        assert!(
+            !status_satisfies_for_dependent("task_prereq", "in_review", Some("chore")),
+            "chore dependent: in_review must NOT satisfy"
+        );
+        assert!(
+            !status_satisfies_for_dependent("task_prereq", "in_review", None),
+            "no kind: in_review must NOT satisfy"
+        );
+        assert!(
+            status_satisfies_for_dependent("task_prereq", "done", Some("chore")),
+            "chore dependent: done must satisfy"
+        );
+    }
+
+    /// A revision dependent must unblock when its prerequisite reaches
+    /// `in_review`; it must also accept `done` (merged) as satisfying.
+    #[test]
+    fn in_review_satisfies_revision_dependent() {
+        assert!(
+            status_satisfies_for_dependent("task_prereq", "in_review", Some("revision")),
+            "revision dependent: in_review must satisfy"
+        );
+        assert!(
+            status_satisfies_for_dependent("task_prereq", "done", Some("revision")),
+            "revision dependent: done must also satisfy"
+        );
+        assert!(
+            !status_satisfies_for_dependent("task_prereq", "todo", Some("revision")),
+            "revision dependent: todo must NOT satisfy"
+        );
+        assert!(
+            !status_satisfies_for_dependent("task_prereq", "active", Some("revision")),
+            "revision dependent: active must NOT satisfy"
+        );
+    }
+
+    /// Projects satisfy on `done` or `archived`; the revision rule only
+    /// applies to task prereqs (project `in_review` does not exist in the
+    /// status machine, but guard anyway).
+    #[test]
+    fn project_prereq_satisfies_on_done_or_archived() {
+        assert!(status_satisfies_for_dependent("proj_x", "done", Some("revision")));
+        assert!(status_satisfies_for_dependent("proj_x", "archived", Some("revision")));
+        assert!(!status_satisfies_for_dependent("proj_x", "active", Some("revision")));
     }
 }
