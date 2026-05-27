@@ -4252,6 +4252,38 @@ async fn create_revision_rpc(
     }
 }
 
+/// Resolve a `--parent` selector for `create-revision` to a primary task id.
+///
+/// Unlike the generic [`resolve_selector_to_primary_id`], this variant does
+/// not require a product context: `T<n>` short ids are globally unique, so
+/// we pass them straight to `GetWorkItem` which resolves them DB-globally
+/// (via `get_work_item_resolving_short_id` in the engine). This is the only
+/// product-free resolution we allow here; `#42` / `42` bare forms still need
+/// a product and are rejected with a helpful message.
+async fn resolve_create_revision_parent(
+    client: &mut BossClient,
+    selector: &str,
+) -> Result<String, CliError> {
+    match parse_work_item_selector(selector) {
+        // T-form short ids are globally unique — pass the friendly form
+        // straight to GetWorkItem; the engine resolves it without a product.
+        WorkItemSelector::ShortId(_) => {
+            let item = get_work_item(client, selector).await?;
+            Ok(work_item_primary_id(&item).to_owned())
+        }
+        // Already a primary id or opaque slug — pass through unchanged.
+        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => Ok(id),
+        // Cross-product slug form (boss/42) — also unambiguous.
+        WorkItemSelector::ProductShortId { .. } => {
+            // Shouldn't normally appear given the --parent doc, but handle it
+            // via the standard resolution with an empty product context.
+            // This will fail clearly if the product slug can't be resolved.
+            let item = get_work_item(client, selector).await?;
+            Ok(work_item_primary_id(&item).to_owned())
+        }
+    }
+}
+
 async fn run_create_revision(
     client: &mut BossClient,
     ctx: &RunContext,
@@ -4259,7 +4291,9 @@ async fn run_create_revision(
 ) -> Result<(), CliError> {
     // Resolve the --parent selector to a full task id before sending to
     // the engine, since the engine's CreateRevision RPC requires a full id.
-    let parent_id = resolve_selector_to_primary_id(client, ctx, &args.parent, None).await?;
+    // We use a product-free resolver here: T<n> short ids are globally unique
+    // so no --product flag is needed (or accepted) for create-revision.
+    let parent_id = resolve_create_revision_parent(client, &args.parent).await?;
     let description = args.description.trim().to_owned();
     if description.is_empty() {
         return Err(CliError::usage("--description must be non-empty"));
