@@ -1397,7 +1397,9 @@ private struct WorkBoardCardItem: View {
         let externalRefLink = ExternalRefLinkPresentation.forTask(task)
         let inReviewRevisions: [WorkTask] = column == .review
             ? model.inReviewRevisions(forParentTaskID: task.id)
-            : []
+            : column == .done
+                ? model.doneRevisions(forParentTaskID: task.id)
+                : []
         let parentShortID: Int? = task.kind == "revision"
             ? task.parentTaskId.flatMap { model.workTask(withID: $0)?.shortID }
             : nil
@@ -1643,9 +1645,10 @@ struct WorkBoardCardView: View {
     /// `PRURLLink` so a card's PR link can drop the org prefix when
     /// its repo is unique among visible cards.
     var ambiguousRepoNames: Set<String> = []
-    /// In-review revisions to display as rollup lines on this card's
-    /// Review-lane footer. Empty for non-Review cards and parent tasks
-    /// with no in-review revisions. Ordered by `revisionSeq`.
+    /// Revisions to display as rollup lines on this card's footer. Populated
+    /// in the Review lane (in-review revisions) and the Done lane (done
+    /// revisions). Empty for Backlog/Doing cards and parent tasks with no
+    /// nested revisions. Ordered by `revisionSeq`.
     var inReviewRevisions: [WorkTask] = []
     /// Short ID of the parent task, used to render "revises T<n>" on
     /// revision cards in Backlog/Doing. `nil` for non-revision tasks

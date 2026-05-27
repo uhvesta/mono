@@ -268,6 +268,69 @@ final class RevisionKanbanTests: XCTestCase {
                        "workTask(withID:) must resolve a chore-parented revision")
     }
 
+    // MARK: Done-lane revision rollup
+
+    func testDoneRevisionSuppressedFromDoneColumn() {
+        let model = makeModel()
+        let parent = makeParent(status: "done")
+        let revision = makeRevision(status: "done", seq: 1, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, revision]]
+
+        let doneItems = model.workItems(in: .done)
+        XCTAssertTrue(
+            doneItems.contains(where: { $0.id == parent.id }),
+            "parent must appear in Done"
+        )
+        XCTAssertFalse(
+            doneItems.contains(where: { $0.id == revision.id }),
+            "done revision must NOT appear as a standalone card in Done"
+        )
+    }
+
+    func testDoneRevisionsReturnedForParent() {
+        let model = makeModel()
+        let parent = makeParent(status: "done")
+        let r1 = makeRevision(status: "done", seq: 1, parentID: parent.id)
+        let r2 = makeRevision(status: "done", seq: 2, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, r1, r2]]
+
+        let revisions = model.doneRevisions(forParentTaskID: parent.id)
+        XCTAssertEqual(revisions.count, 2)
+        XCTAssertEqual(revisions[0].id, r1.id, "R1 should come first (ordered by seq)")
+        XCTAssertEqual(revisions[1].id, r2.id, "R2 should come second")
+    }
+
+    func testDoneRevisionsExcludesNonDone() {
+        let model = makeModel()
+        let parent = makeParent(status: "done")
+        let r1 = makeRevision(status: "done", seq: 1, parentID: parent.id)
+        let r2 = makeRevision(status: "in_review", seq: 2, parentID: parent.id)
+        model.tasksByProjectID = ["proj_1": [parent, r1, r2]]
+
+        let revisions = model.doneRevisions(forParentTaskID: parent.id)
+        XCTAssertEqual(revisions.count, 1)
+        XCTAssertEqual(revisions[0].id, r1.id, "only done revisions should appear")
+    }
+
+    func testChoreParentedDoneRevisionRollsUpUnderChore() {
+        let model = makeModel()
+        let chore = makeChore(id: "chore_c20", status: "done")
+        let revision = makeChoreParentedRevision(
+            id: "task_t30", status: "done", seq: 1, parentID: chore.id
+        )
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [revision], chores: [chore]))
+
+        let rollup = model.doneRevisions(forParentTaskID: chore.id)
+        XCTAssertEqual(rollup.map(\.id), [revision.id],
+                       "done chore-parented revision must roll up under its parent chore")
+
+        let doneItems = model.workItems(in: .done)
+        XCTAssertTrue(doneItems.contains { $0.id == chore.id },
+                      "parent chore must appear in Done")
+        XCTAssertFalse(doneItems.contains { $0.id == revision.id },
+                       "done revision must not also appear as a standalone Done card")
+    }
+
     // MARK: - WorkTask fields
 
     func testRevisionFieldsDefaultToNil() {

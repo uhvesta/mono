@@ -1915,6 +1915,25 @@ final class ChatViewModel: ObservableObject {
         return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
     }
 
+    /// All `kind == "revision"` tasks whose `parentTaskId` matches the
+    /// supplied id AND whose status is `"done"`. Used by the Done-lane
+    /// parent card to render per-revision rollup lines.
+    func doneRevisions(forParentTaskID parentID: String) -> [WorkTask] {
+        let matches: (WorkTask) -> Bool = {
+            $0.kind == "revision"
+                && $0.parentTaskId == parentID
+                && $0.status == "done"
+        }
+        var result: [WorkTask] = []
+        for tasks in tasksByProjectID.values {
+            result.append(contentsOf: tasks.filter(matches))
+        }
+        for revisions in productLevelRevisionsByProductID.values {
+            result.append(contentsOf: revisions.filter(matches))
+        }
+        return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+    }
+
     private func productID(for nodeID: WorkNodeID?) -> String? {
         switch nodeID {
         case .product(let productID):
@@ -2118,11 +2137,14 @@ final class ChatViewModel: ObservableObject {
         var items = visibleWorkItems
             .filter { effectiveBoardColumn(for: $0) == column }
             .sorted(by: boardTaskSort)
-        // In-review revisions don't appear as standalone cards in the Review
-        // column — they roll up as single lines on the parent task's card.
+        // Revisions don't appear as standalone cards in Review or Done — they
+        // roll up as single lines on the parent task's card in both lanes.
         // They are still visible in Backlog/Doing as distinct cards.
         if column == .review {
             items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
+        }
+        if column == .done {
+            items = items.filter { !($0.kind == "revision" && $0.status == "done") }
         }
         cachedItemsByColumn[column] = items
         return items
