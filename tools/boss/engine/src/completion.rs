@@ -1910,6 +1910,64 @@ impl WorkerCompletionHandler {
         }
     }
 
+    /// Explicit human-initiated stop (`bossctl agents stop`). Unlike
+    /// the normal `on_stop` hook path — which probes for a PR and
+    /// waits for the worker to respond — this path is used when the
+    /// operator wants the worker dead *now*. The differences:
+    ///
+    /// 1. Cancels the execution atomically in the DB (so the orphan
+    ///    sweep and `reconcile_active_dispatch` don't re-dispatch the
+    ///    work item the moment the pane is released and the worker
+    ///    pool slot is freed).
+    /// 2. Demotes the task from `active` → `todo` so the kanban
+    ///    card moves back to the Backlog column instead of sitting
+    ///    in Doing with no live worker.
+    /// 3. Publishes a `work_item_changed` event so the UI and
+    ///    downstream subscribers see the status transition.
+    /// 4. Then calls `force_release` to kill the pane and free
+    ///    the cube workspace.
+    ///
+    /// Idempotent: a second call for the same execution is a no-op
+    /// at both the DB and the cube-release layers.
+    pub async fn force_stop_execution(&self, execution_id: &str) {
+        let (exec_cancelled, task_demoted) = match self
+            .work_db
+            .cancel_running_execution_and_demote_task(execution_id)
+        {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "force_stop: failed to cancel execution / demote task — proceeding to release",
+                );
+                (false, false)
+            }
+        };
+
+        if exec_cancelled || task_demoted {
+            tracing::info!(
+                execution_id,
+                exec_cancelled,
+                task_demoted,
+                "force_stop: cancelled execution and demoted task",
+            );
+            // Publish work-item-changed so the UI refreshes. Requires
+            // looking up the execution's work_item_id + product_id.
+            if let Ok(execution) = self.work_db.get_execution(execution_id) {
+                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                    let product_id = work_item_product_id(&work_item);
+                    let wid = work_item_id(&work_item);
+                    self.publisher
+                        .publish_work_item_changed(&product_id, &wid, "worker_force_stopped")
+                        .await;
+                }
+            }
+        }
+
+        self.force_release(execution_id).await;
+    }
+
     /// Publish the more specific "stopped without a PR" signal so the
     /// frontend can paint a distinct activity icon (the live-state
     /// chore picks this up). Falls back to the same status string as
