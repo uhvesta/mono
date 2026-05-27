@@ -199,78 +199,161 @@ final class GhosttyRuntime: @unchecked Sendable {
     }
 
     fileprivate static func action(target: ghostty_target_s, action: ghostty_action_s) -> Bool {
-        // Handle synchronously on the calling thread.
+        // Two-phase handling: *resolve* now (on whatever thread libghostty
+        // called us from), *apply* later (on the main runloop).
         //
         // The `action` struct contains raw C pointers into memory
-        // libghostty owns (e.g. `set_title.title`, `pwd.pwd`). Those
-        // pointers are valid only for the duration of this callback —
-        // libghostty's `performPreAction` in `apprt/embedded.zig`
-        // literally `alloc.free()`s previous values when a follow-up
-        // action arrives. Deferring handling onto the main queue (the
-        // previous behaviour) let the pointers go stale before
-        // `handleAction` deref'd them, producing
-        // `EXC_BAD_ACCESS / EXC_ARM_DA_ALIGN` crashes inside
-        // `String(cString:)` — confirmed by minidump symbolication
-        // pointing at GhosttyRuntime.swift:170.
+        // libghostty owns (e.g. `set_title.title`, `pwd.pwd`, `open_url.url`).
+        // Those pointers are valid only for the duration of this callback —
+        // libghostty's `performPreAction` in `apprt/embedded.zig` literally
+        // `alloc.free()`s previous values when a follow-up action arrives.
+        // The previous code deferred the *whole* action onto the main queue,
+        // which let the pointers go stale before they were deref'd, producing
+        // `EXC_BAD_ACCESS / EXC_ARM_DA_ALIGN` crashes inside `String(cString:)`
+        // (fixed in PR #209 by switching to synchronous handling). So we
+        // still read every pointer synchronously here — `resolve` copies the
+        // C strings into owned Swift `String`s and resolves the target host
+        // view before this callback returns. The deferred `apply` closure
+        // touches *no* libghostty memory, so the stale-pointer hazard cannot
+        // recur.
         //
-        // libghostty invokes this from the macOS main runloop (it
-        // dispatches surface actions inline from the same thread that
-        // drives the NSView event handlers), so `MainActor.assumeIsolated`
-        // is safe to call directly. This matches upstream Ghostty.app's
-        // own `Ghostty.App.swift` which handles every action
-        // synchronously for the same lifetime reason.
-        MainActor.assumeIsolated {
-            handleAction(target: target, action: action)
+        // Why defer `apply` at all, rather than handle inline as PR #209 did:
+        //
+        //  1. Off-main safety. libghostty *normally* invokes this from the
+        //     macOS main runloop, but "normally" is not "always": a surface
+        //     action delivered from a background (renderer / IO) thread would
+        //     make a blind `MainActor.assumeIsolated` trip the fatal
+        //     libdispatch main-thread assertion and `abort()` the process —
+        //     issue #799, observed on background thread `114b158` during a
+        //     Metal-renderer storm. Hopping to main *synchronously* would
+        //     avoid the abort but risks deadlock (the renderer thread can be
+        //     blocked inside a `ghostty_surface_*` call the main thread is
+        //     simultaneously driving). An async hop is safe on any thread.
+        //
+        //  2. No publishing from within view updates. `apply` mutates
+        //     `@Published` state on the pane's `TerminalPaneSession`. libghostty
+        //     re-enters this callback synchronously from inside the
+        //     `ghostty_surface_*` calls that `GhosttyTerminalView.updateNSView`
+        //     makes during the SwiftUI view-update pass; mutating observed
+        //     state there is the "Publishing changes from within view updates"
+        //     violation (issue #799's runaway warning storm). Deferring the
+        //     mutation to a fresh main-runloop turn moves it out of the update
+        //     pass. Ordering is preserved: actions apply FIFO on the main queue.
+        let resolved = resolve(target: target, action: action)
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                apply(resolved)
+            }
         }
         return true
     }
 
-    @MainActor
-    private static func handleAction(target: ghostty_target_s, action: ghostty_action_s) {
-        switch action.tag {
+    /// A surface action resolved into owned Swift values on the calling
+    /// thread, so `apply` can run on a later main-runloop turn without
+    /// dereferencing libghostty-owned pointers that are freed the moment
+    /// this callback returns.
+    ///
+    /// `@unchecked Sendable`: the only reference it carries is a
+    /// `GhosttyTerminalHostView` (an NSView), created and torn down on the
+    /// main thread and kept alive for the app's lifetime; it is only ever
+    /// read back inside `apply`, which runs on the main actor. The C
+    /// payloads (sizes, color, mouse shape) are plain scalar structs.
+    private struct ResolvedAction: @unchecked Sendable {
+        enum Kind {
+            case setTitle(String)
+            case setWorkingDirectory(String)
+            case rendererHealth(Bool)
+            case mouseShape(ghostty_action_mouse_shape_e)
+            case mouseVisibility(Bool)
+            case initialSize(ghostty_action_initial_size_s)
+            case cellSize(ghostty_action_cell_size_s)
+            case colorChange(ghostty_action_color_change_s)
+            case ringBell
+            case openURL(String)
+            case childExited(UInt32)
+            case ignored
+        }
+
+        let host: GhosttyTerminalHostView?
+        let kind: Kind
+    }
+
+    /// Reads every libghostty-owned pointer in `action` into owned Swift
+    /// values. Safe to call from any thread — it only reads memory that is
+    /// live for the duration of the action callback and touches no
+    /// main-actor state.
+    private static func resolve(target: ghostty_target_s, action: ghostty_action_s) -> ResolvedAction {
+        let host = hostView(for: target)
+        let kind: ResolvedAction.Kind = switch action.tag {
         case GHOSTTY_ACTION_SET_TITLE:
-            hostView(for: target)?.session.setTitle(string(action.action.set_title.title))
-
+            .setTitle(string(action.action.set_title.title))
         case GHOSTTY_ACTION_PWD:
-            hostView(for: target)?.session.workingDirectory = string(action.action.pwd.pwd)
-
+            .setWorkingDirectory(string(action.action.pwd.pwd))
         case GHOSTTY_ACTION_RENDERER_HEALTH:
-            hostView(for: target)?.session.rendererHealthy =
-                action.action.renderer_health == GHOSTTY_RENDERER_HEALTH_HEALTHY
-
+            .rendererHealth(action.action.renderer_health == GHOSTTY_RENDERER_HEALTH_HEALTHY)
         case GHOSTTY_ACTION_MOUSE_SHAPE:
-            hostView(for: target)?.setCursorShape(action.action.mouse_shape)
-
+            .mouseShape(action.action.mouse_shape)
         case GHOSTTY_ACTION_MOUSE_VISIBILITY:
-            hostView(for: target)?.setCursorVisible(
-                action.action.mouse_visibility == GHOSTTY_MOUSE_VISIBLE
-            )
-
+            .mouseVisibility(action.action.mouse_visibility == GHOSTTY_MOUSE_VISIBLE)
         case GHOSTTY_ACTION_INITIAL_SIZE:
-            hostView(for: target)?.applyInitialSize(action.action.initial_size)
-
+            .initialSize(action.action.initial_size)
         case GHOSTTY_ACTION_CELL_SIZE:
-            hostView(for: target)?.setCellSize(action.action.cell_size)
-
+            .cellSize(action.action.cell_size)
         case GHOSTTY_ACTION_COLOR_CHANGE:
-            hostView(for: target)?.applyColorChange(action.action.color_change)
-
+            .colorChange(action.action.color_change)
         case GHOSTTY_ACTION_RING_BELL:
+            .ringBell
+        case GHOSTTY_ACTION_OPEN_URL:
+            .openURL(string(action.action.open_url.url))
+        case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
+            .childExited(action.action.child_exited.exit_code)
+        default:
+            .ignored
+        }
+        return ResolvedAction(host: host, kind: kind)
+    }
+
+    @MainActor
+    private static func apply(_ resolved: ResolvedAction) {
+        switch resolved.kind {
+        case .setTitle(let title):
+            resolved.host?.session.setTitle(title)
+
+        case .setWorkingDirectory(let pwd):
+            resolved.host?.session.workingDirectory = pwd
+
+        case .rendererHealth(let healthy):
+            resolved.host?.session.rendererHealthy = healthy
+
+        case .mouseShape(let shape):
+            resolved.host?.setCursorShape(shape)
+
+        case .mouseVisibility(let visible):
+            resolved.host?.setCursorVisible(visible)
+
+        case .initialSize(let size):
+            resolved.host?.applyInitialSize(size)
+
+        case .cellSize(let size):
+            resolved.host?.setCellSize(size)
+
+        case .colorChange(let change):
+            resolved.host?.applyColorChange(change)
+
+        case .ringBell:
             NSSound.beep()
 
-        case GHOSTTY_ACTION_OPEN_URL:
-            let raw = string(action.action.open_url.url)
+        case .openURL(let raw):
             if let url = URL(string: raw), url.scheme != nil {
                 NSWorkspace.shared.open(url)
             } else {
                 NSWorkspace.shared.open(URL(fileURLWithPath: raw))
             }
 
-        case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
-            let exitCode = action.action.child_exited.exit_code
-            hostView(for: target)?.session.statusMessage = "Command exited (\(exitCode))"
+        case .childExited(let exitCode):
+            resolved.host?.session.statusMessage = "Command exited (\(exitCode))"
 
-        default:
+        case .ignored:
             break
         }
     }
