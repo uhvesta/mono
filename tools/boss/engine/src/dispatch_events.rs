@@ -114,6 +114,18 @@ pub enum Stage {
     /// operators can distinguish "slot claimed but PID dead" from
     /// "slot not claimed at all."
     DeadPidReconcile,
+    /// A dispatch *trigger* loop (orphan-active sweep, startup
+    /// reconcile, worker-release rescan, kanban drag) evaluated whether
+    /// a work item needs a fresh dispatch. Emitted UPSTREAM of
+    /// `request_recorded` — `request_recorded` only ever fires once the
+    /// scheduler has already decided to dispatch, so the decision that
+    /// *produced* the request was previously invisible. The `details`
+    /// object carries the loop name, the predicate it keyed off, and —
+    /// critically — the live execution the loop found (or failed to
+    /// account for) so a re-dispatch storm can be traced back to the
+    /// loop that re-fired despite a healthy live run. See
+    /// `task_18b347260cd7da80_e` (the R693 re-dispatch storm).
+    DispatchDecision,
 }
 
 impl Stage {
@@ -132,6 +144,7 @@ impl Stage {
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
             Stage::DeadPidReconcile => "dead_pid_reconcile",
+            Stage::DispatchDecision => "dispatch_decision",
         }
     }
 }

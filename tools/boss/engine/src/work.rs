@@ -9773,7 +9773,28 @@ fn collect_task_runtimes(
 }
 
 fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Result<TaskRuntime> {
-    let execution = query_latest_execution_for_work_item(conn, work_item_id)?;
+    let latest = query_latest_execution_for_work_item(conn, work_item_id)?;
+    // `current_execution_id` (the operator-facing label for
+    // `TaskRuntime.execution_id`) and the kanban card must follow the
+    // execution a worker is actually attached to. A re-dispatch storm
+    // leaves a newer *terminal* execution (the stalled duplicate)
+    // shadowing the live run — keying off the plain latest row then
+    // detaches the card from the live worker (R693 showed up idle under
+    // "No Project" while La Forge was actively working it). When the
+    // latest row is not itself live, prefer a live (running /
+    // waiting_human) execution. Steady state — the latest row IS the
+    // live run — skips the extra lookup.
+    let latest_is_live = latest
+        .as_ref()
+        .map(|e| execution_status_is_live(&e.status))
+        .unwrap_or(false);
+    let execution = if latest_is_live {
+        latest
+    } else if let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? {
+        Some(live)
+    } else {
+        latest
+    };
     let (execution_status, run_status, execution_id, current_run_id) =
         if let Some(execution) = execution {
             let latest_run = query_latest_run(conn, &execution.id)?;
@@ -9819,6 +9840,37 @@ fn query_latest_execution_for_work_item(
                 pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
          FROM work_executions
          WHERE work_item_id = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        [work_item_id],
+        map_execution,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Most-recent execution for `work_item_id` whose DB status is *live* —
+/// a worker may currently be attached. Unlike
+/// [`query_latest_execution_for_work_item`], the result is NOT shadowed
+/// by a newer terminal row: a re-dispatch storm produces stalled
+/// duplicates that get abandoned/orphaned (terminal) ON TOP of the one
+/// genuinely-live run, so "latest by created_at" points at the phantom
+/// while the live execution sits one row down. Callers that need to
+/// answer "is this work item already being worked?" must key off this,
+/// not the latest row. Mirrors the status set of the method
+/// [`WorkDb::get_live_execution_for_work_item`].
+fn query_live_execution_for_work_item(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkExecution>> {
+    conn.query_row(
+        "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at,
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+         FROM work_executions
+         WHERE work_item_id = ?1
+           AND status IN ('running', 'waiting_human')
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
         [work_item_id],
@@ -10139,7 +10191,31 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         bail!("{}", repo_unresolved_attention_body(&work_item_id, label));
     }
 
-    if let Some(existing) = query_latest_execution_for_work_item(conn, &work_item_id)? {
+    // Idempotency / re-dispatch-storm guard.
+    //
+    // The execution that governs whether this work item needs a *new*
+    // dispatch is the one a worker may actually be attached to — i.e.
+    // the most recent execution in a *live* DB status (`running` /
+    // `waiting_human`). Keying off the plain "latest execution" is the
+    // defect behind the R693 storm (`task_18b347260cd7da80_e`): once an
+    // earlier re-dispatch stalled and was abandoned/orphaned, that
+    // *terminal* row is newer than the genuinely-live run and shadows
+    // it. `query_latest_execution_for_work_item` then returns the
+    // terminal phantom, `execution_status_is_terminal` short-circuits
+    // the guard below, and we insert yet another `ready` row that claims
+    // a worker and stalls — the loop repeats every sweep.
+    //
+    // Preferring the live execution closes that loop: a work item with a
+    // live execution is evaluated against THAT execution (and the
+    // caller's runtime `is_live` oracle), not the phantom. When no live
+    // execution exists we fall back to the latest row, preserving the
+    // prior behaviour for `ready` / `waiting_dependency` / terminal-only
+    // histories.
+    let latest = query_latest_execution_for_work_item(conn, &work_item_id)?;
+    let live = query_live_execution_for_work_item(conn, &work_item_id)?;
+    let governing = live.clone().or_else(|| latest.clone());
+
+    if let Some(existing) = governing {
         if !execution_status_is_terminal(&existing.status) {
             // Existing non-terminal row. Two cases:
             //   - is_live=true: a worker is genuinely attached to the
@@ -10155,7 +10231,27 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             //         the ci_failure retry design for the full invariant set.
             //       * any other kind: abandon and fall through to insert a
             //         fresh ready row, which is the normal re-dispatch path.
+            //
+            // Decision-point instrumentation (re-dispatch storm
+            // visibility): every dispatch trigger funnels through here,
+            // so a structured log at each branch makes "why did the
+            // scheduler conclude this work item needs dispatch?"
+            // diagnosable for ALL loops (orphan sweep, startup
+            // reconcile, worker-release rescan, kanban drag) without
+            // each having to instrument itself.
+            let latest_id = latest.as_ref().map(|e| e.id.clone());
+            let live_id = live.as_ref().map(|e| e.id.clone());
             if is_live(&existing.id) {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    governing_execution_id = %existing.id,
+                    governing_status = %existing.status,
+                    latest_execution_id = ?latest_id,
+                    live_execution_id = ?live_id,
+                    decision = "reuse_live",
+                    "dispatch_decision: work item already has a live execution — \
+                     returning it, no new dispatch",
+                );
                 let next_status = if existing.status == "waiting_dependency" {
                     "ready".to_owned()
                 } else {
@@ -10176,6 +10272,16 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 return query_execution(conn, &existing.id)?
                     .with_context(|| format!("unknown execution: {}", existing.id));
             } else if existing.kind == "ci_remediation" {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    governing_execution_id = %existing.id,
+                    governing_status = %existing.status,
+                    latest_execution_id = ?latest_id,
+                    live_execution_id = ?live_id,
+                    decision = "requeue_ci_remediation",
+                    "dispatch_decision: governing ci_remediation execution not live — \
+                     re-queuing the existing branch instead of redoing the chore",
+                );
                 // Stale ci_remediation — re-queue it for retry.
                 //
                 // For the `bossctl work start` path the task may still be
@@ -10249,6 +10355,16 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 return query_execution(conn, &existing.id)?
                     .with_context(|| format!("unknown execution: {}", existing.id));
             } else {
+                tracing::info!(
+                    work_item_id = %work_item_id,
+                    governing_execution_id = %existing.id,
+                    governing_status = %existing.status,
+                    latest_execution_id = ?latest_id,
+                    live_execution_id = ?live_id,
+                    decision = "abandon_stale_and_redispatch",
+                    "dispatch_decision: governing execution not live (worker gone) — \
+                     abandoning it and creating a fresh ready execution",
+                );
                 let now = now_string();
                 conn.execute(
                     "UPDATE work_executions
@@ -10258,7 +10374,22 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                     params![existing.id, now],
                 )?;
             }
+        } else {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                governing_execution_id = %existing.id,
+                governing_status = %existing.status,
+                decision = "create_fresh_after_terminal",
+                "dispatch_decision: most recent execution is terminal and no live \
+                 execution exists — creating a fresh ready execution",
+            );
         }
+    } else {
+        tracing::info!(
+            work_item_id = %work_item_id,
+            decision = "create_fresh_no_history",
+            "dispatch_decision: no prior execution — creating the first ready execution",
+        );
     }
 
     let _ = product_id_for_work_item(conn, &work_item_id)?;
@@ -10338,6 +10469,14 @@ fn execution_status_is_terminal(status: &str) -> bool {
         status,
         "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
     )
+}
+
+/// A *live* execution status: a worker may currently be attached and
+/// driving it. Mirrors the status filter in
+/// [`query_live_execution_for_work_item`] and
+/// [`WorkDb::get_live_execution_for_work_item`]; keep the three in sync.
+fn execution_status_is_live(status: &str) -> bool {
+    matches!(status, "running" | "waiting_human")
 }
 
 fn task_accepts_execution(task: &Task) -> bool {
@@ -13979,6 +14118,222 @@ mod tests {
             db.is_ci_failure_suppressed(&chore.id, "sha-abc123").unwrap(),
             "suppression row must be keyed on the ci_remediations head sha",
         );
+    }
+
+    /// Re-dispatch storm guard (`task_18b347260cd7da80_e`). A work item
+    /// whose genuinely-live `running` execution is shadowed by a NEWER
+    /// terminal execution (a prior re-dispatch that stalled and was
+    /// orphaned) must NOT get a fresh dispatch. The idempotency check
+    /// must key off the live execution, not the latest-by-created_at
+    /// row — otherwise every sweep spawns another duplicate that claims
+    /// a worker and stalls.
+    #[test]
+    fn request_execution_suppressed_when_older_execution_is_live() {
+        let path = temp_db_path("redispatch-storm-suppress");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "R693".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // The live run (La Forge): created first, so it is the OLDER row.
+        let live = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("running".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        // A stalled re-dispatch that was orphaned: NEWER, terminal,
+        // shadows `live` as the latest-by-created_at row.
+        let phantom = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("orphaned".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        // Sanity: the phantom is the latest row (the trap).
+        assert_eq!(
+            query_latest_execution_for_work_item(&db.connect().unwrap(), &chore.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            phantom.id,
+            "test setup: newer terminal execution must shadow the live one",
+        );
+
+        // The live execution is genuinely claimed by a worker.
+        let result = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: chore.id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |exec_id| exec_id == live.id,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.id, live.id,
+            "must return the live execution, not spawn a duplicate",
+        );
+        assert_eq!(result.status, "running");
+        let count: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM work_executions WHERE work_item_id = ?1",
+                [&chore.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "no new execution may be created");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Counterpart to the storm-suppression test: when the live-status
+    /// execution is NOT actually claimed by a worker (the worker died
+    /// with the DB still saying `running`), the dead row must be
+    /// abandoned and a fresh `ready` execution created. This is the
+    /// legitimate re-dispatch path the storm guard must not break.
+    #[test]
+    fn request_execution_redispatches_when_live_execution_not_claimed() {
+        let path = temp_db_path("redispatch-storm-deadworker");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "dead-worker".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let dead = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("running".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let result = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: chore.id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| false,
+            )
+            .unwrap();
+
+        assert_eq!(result.status, "ready", "a fresh ready execution must be created");
+        assert_ne!(result.id, dead.id, "must not reuse the dead execution");
+        let dead_after = query_execution(&db.connect().unwrap(), &dead.id).unwrap().unwrap();
+        assert_eq!(
+            dead_after.status, "abandoned",
+            "the un-claimed live-status row must be abandoned",
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Detachment fix (`task_18b347260cd7da80_e`). `current_execution_id`
+    /// (`TaskRuntime.execution_id`) and the kanban card must follow the
+    /// live worker, not a newer terminal phantom left behind by a
+    /// re-dispatch storm.
+    #[test]
+    fn task_runtime_follows_live_execution_not_newer_terminal() {
+        let path = temp_db_path("runtime-follows-live");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "R693".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let live = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("running".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        // Newer terminal phantom that detaches the card under the bug.
+        db.create_execution(CreateExecutionInput {
+            work_item_id: chore.id.clone(),
+            kind: "chore_implementation".to_owned(),
+            status: Some("orphaned".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let runtime = db.get_task_runtime(&chore.id).unwrap();
+        assert_eq!(
+            runtime.execution_id.as_deref(),
+            Some(live.id.as_str()),
+            "runtime must point at the live execution, not the newer phantom",
+        );
+        assert_eq!(runtime.execution_status.as_deref(), Some("running"));
+        let _ = std::fs::remove_file(path);
     }
 
     /// Reaping a running execution stamps it `orphaned` (terminal),

@@ -159,6 +159,49 @@ pub async fn run_one_pass(
             continue;
         }
 
+        // Decision-point instrumentation (re-dispatch storm visibility).
+        //
+        // This sweep is the prime recurring re-dispatcher, so when a
+        // candidate already has a *live* execution (running /
+        // waiting_human) we record exactly what the sweep keyed off
+        // BEFORE acting: the live execution it found and whether the
+        // worker pool still claims it. The two outcomes are the whole
+        // diagnosis:
+        //   - live_execution_claimed = true  → the guard in
+        //     `request_execution_with_live_check` returns the live row
+        //     and we skip (no redispatch). The event is the proof the
+        //     storm was suppressed.
+        //   - live_execution_claimed = false → the pool no longer claims
+        //     the live run even though its DB status is non-terminal.
+        //     THIS is the smoking gun for "scheduler re-fired despite a
+        //     healthy live run" — previously invisible because the
+        //     dispatch pipeline only records from `request_recorded` on.
+        // Only emitted when a live execution exists; a candidate with no
+        // live execution is a legitimate orphan whose redispatch is
+        // already covered by `orphan_active_redispatch`.
+        let live_execution = work_db
+            .get_live_execution_for_work_item(&work_item_id, "")
+            .ok()
+            .flatten();
+        if let Some(live) = &live_execution {
+            let live_claimed = claimed.contains(&live.id);
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::DispatchDecision, Outcome::Ok, &live.id)
+                        .with_work_item(&work_item_id)
+                        .with_details(serde_json::json!({
+                            "loop": "orphan_active_sweep",
+                            "predicate": "tasks.status='active' AND no ready execution AND \
+                                          updated_at age >= ORPHAN_MIN_AGE_SECS",
+                            "live_execution_id": live.id,
+                            "live_execution_status": live.status,
+                            "live_execution_claimed": live_claimed,
+                            "recent_terminal_executions": recent_terminal,
+                        })),
+                )
+                .await;
+        }
+
         // Request a fresh execution. The `is_live` closure treats an
         // execution as live only if a worker slot currently claims it.
         // A non-terminal execution that is NOT claimed means the worker
