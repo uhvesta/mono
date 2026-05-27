@@ -34,6 +34,7 @@ struct BossMacApp: App {
                 Divider()
                 LogViewerCommand()
                 MetricsCommand()
+                UIStallsCommand()
             }
         }
 
@@ -93,6 +94,11 @@ struct BossMacApp: App {
         }
         .environmentObject(chatModel)
         .defaultSize(width: 720, height: 520)
+
+        Window("UI Stalls", id: "ui-stalls") {
+            UIStallsViewer()
+        }
+        .defaultSize(width: 720, height: 520)
     }
 }
 
@@ -149,6 +155,25 @@ private struct MetricsCommand: View {
     }
 }
 
+private struct UIStallsCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.uiStalls.visible") private var isOpen = false
+
+    var body: some View {
+        Button("UI Stalls") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "ui-stalls")
+            } else {
+                isOpen = true
+                openWindow(id: "ui-stalls")
+            }
+        }
+        .keyboardShortcut("u", modifiers: [.command, .shift])
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set by BossMacApp once the main window has appeared. Nil only in the
@@ -165,6 +190,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // bringing back the manual NSWindow setup #417 removed.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+
+        // Start the main-thread hang watchdog. Captures the main thread's
+        // Mach port here (we are on the main thread), then runs a
+        // background watchdog that records a stall + backtrace whenever
+        // the main queue goes unresponsive. Surfaced via the "UI Stalls"
+        // window (Cmd-Shift-U). See [[MainThreadStallMonitor]].
+        MainThreadStallMonitor.shared.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
