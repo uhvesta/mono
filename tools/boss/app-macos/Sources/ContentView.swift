@@ -1424,6 +1424,7 @@ private struct WorkBoardCardItem: View {
                     ciFailureBadge: model.ciFailureBadge(forPR: task.prURL),
                     isResolvingConflicts: isResolvingConflicts,
                     isRemediatingCI: isRemediatingCI,
+                    isFrontierHighlighted: isFrontierHighlighted,
                     designDocState: designDocState,
                     onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } },
                     ciRequiredState: column == .review ? (task.ciRequiredState ?? "in_progress") : nil,
@@ -1452,7 +1453,7 @@ private struct WorkBoardCardItem: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(
-                        Color.orange.opacity(isFrontierHighlighted ? 0.7 : 0),
+                        Color.green.opacity(isFrontierHighlighted ? 0.7 : 0),
                         lineWidth: 2
                     )
                     .animation(.easeInOut(duration: 0.15), value: isFrontierHighlighted)
@@ -1602,6 +1603,9 @@ struct WorkBoardCardView: View {
     /// [[isResolvingConflicts]]; suppresses orange chrome and renders the
     /// `"resolving CI failure"` badge instead.
     var isRemediatingCI: Bool = false
+    /// True when this card is a prerequisite frontier card for a
+    /// currently-hovered Dependency badge. Drives the green card background.
+    var isFrontierHighlighted: Bool = false
     /// Resolved design-doc state for the parent project. Non-nil only
     /// for `kind=design` tasks whose parent project has populated
     /// `design_doc_*` columns. `nil` hides the affordance entirely.
@@ -1938,6 +1942,9 @@ struct WorkBoardCardView: View {
     private var cardBackground: Color {
         if isSelected {
             return Color.accentColor.opacity(0.08)
+        }
+        if isFrontierHighlighted {
+            return Color.green.opacity(0.07)
         }
         if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
             return Color.orange.opacity(0.08)
