@@ -7578,6 +7578,54 @@ impl RevisionGateError {
     }
 }
 
+/// Return the id of the most-recently-created non-done revision that is a
+/// descendant of `root_id`, or `None` when the chain has no prior active
+/// revision.
+///
+/// This is used by [`assert_parent_revisable_and_insert`] to find the
+/// "tail" of the revision chain so the new revision can be automatically
+/// gated on it, serialising back-to-back revisions targeting the same PR.
+///
+/// "Active" = status is not `'done'` (includes `todo`, `blocked`,
+/// `in_progress`, `in_review`).  A done revision is already finished and
+/// cannot race with the new one, so it does not need to gate it.
+///
+/// The recursive CTE walks `parent_task_id` links one level at a time,
+/// starting from direct children of `root_id`.  Depth is capped at 64 by
+/// the CTE's `UNION ALL` termination condition (no infinite loop in
+/// well-formed data; the engine never creates cycles).
+fn find_latest_active_revision_in_chain(
+    conn: &Connection,
+    root_id: &str,
+) -> Result<Option<String>> {
+    let id: Option<String> = conn
+        .query_row(
+            "WITH RECURSIVE chain(id) AS (
+                SELECT id
+                FROM tasks
+                WHERE parent_task_id = ?1
+                  AND kind = 'revision'
+                  AND deleted_at IS NULL
+              UNION ALL
+                SELECT t.id
+                FROM tasks t
+                JOIN chain c ON t.parent_task_id = c.id
+                WHERE t.kind = 'revision'
+                  AND t.deleted_at IS NULL
+            )
+            SELECT c.id
+            FROM chain c
+            JOIN tasks t ON t.id = c.id
+            WHERE t.status != 'done'
+            ORDER BY c.id DESC
+            LIMIT 1",
+            params![root_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
 /// Run the create-time gate and, on success, insert a `kind = 'revision'`
 /// task row atomically. This is the single point of truth for the invariant
 /// "kind = revision ⇒ parent_task_id IS NOT NULL AND chain root has an open PR".
@@ -7621,8 +7669,30 @@ fn assert_parent_revisable_and_insert(
         PrOpenState::Open => {}
     }
 
-    // ── 5. Insert revision ──────────────────────────────────────────────────
-    insert_revision_in_tx(conn, input, &parent_id, &root)
+    // ── 5. Find chain tail for auto-sequencing ──────────────────────────────
+    // Snapshot the latest non-done revision for this chain root *before*
+    // inserting the new one.  The new revision will be gated on this tail
+    // so that back-to-back revisions targeting the same PR always execute
+    // one-after-another rather than racing as concurrent workers.
+    let chain_tail_id = find_latest_active_revision_in_chain(conn, &root_id)?;
+
+    // ── 6. Insert revision ──────────────────────────────────────────────────
+    let now = now_string();
+    let new_revision = insert_revision_in_tx(conn, input, &parent_id, &root)?;
+
+    // ── 7. Auto-gate: block new revision on chain tail ───────────────────────
+    // When a prior unfinished revision exists, the new one must wait for it
+    // before the dispatcher can run it.  This prevents two workers from
+    // committing to the same PR branch simultaneously.
+    if let Some(tail_id) = chain_tail_id {
+        deps::insert_edge(conn, &new_revision.id, &tail_id, RELATION_BLOCKS, &now)?;
+        maybe_engine_block_dependent(conn, &new_revision.id, &now)?;
+        // Re-read the row so the caller sees the updated status.
+        return query_task(conn, &new_revision.id)?
+            .with_context(|| format!("missing revision after auto-block: {}", new_revision.id));
+    }
+
+    Ok(new_revision)
 }
 
 /// Resolve a caller-supplied task selector (full `task_<hex>` id, `T<n>`
@@ -23577,6 +23647,139 @@ mod tests {
         };
         assert_eq!(seq(&r1.id), Some(1), "r1 must be R1");
         assert_eq!(seq(&r2.id), Some(2), "r2 must be R2");
+    }
+
+    // ── auto-gate: new revision blocks on prior active revision ─────────────
+
+    /// First revision on a PR has no prior sibling → no dependency edge.
+    #[test]
+    fn create_revision_first_has_no_auto_dep() {
+        let db = WorkDb::open(temp_db_path("rev-auto-dep-first")).unwrap();
+        let product_id = make_revision_product(&db, "auto-dep-first");
+        let pr_url = "https://github.com/spinyfin/mono/pull/900";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let r1 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        // R1 has no prior revision — status must still be `todo`.
+        assert_eq!(r1.status, "todo", "first revision must stay todo (no auto-block)");
+
+        // No dependency edges at all.
+        let conn = db.connect().unwrap();
+        let prereqs =
+            crate::work_dependencies::prerequisites_of(&conn, &r1.id, Some("blocks")).unwrap();
+        assert!(prereqs.is_empty(), "first revision must have no prerequisite edges");
+    }
+
+    /// Second revision on the same PR must be auto-gated on the first.
+    #[test]
+    fn create_revision_second_auto_blocks_on_first() {
+        let db = WorkDb::open(temp_db_path("rev-auto-dep-second")).unwrap();
+        let product_id = make_revision_product(&db, "auto-dep-second");
+        let pr_url = "https://github.com/spinyfin/mono/pull/901";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let r1 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+        let r2 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        // R2 must be blocked because R1 is still active.
+        assert_eq!(
+            r2.status, "blocked",
+            "second revision must be auto-blocked by first"
+        );
+
+        // R2 must have a blocks prerequisite on R1.
+        let conn = db.connect().unwrap();
+        let prereqs =
+            crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
+        assert_eq!(prereqs.len(), 1, "r2 must have exactly one prerequisite");
+        assert_eq!(
+            prereqs[0].prerequisite_id, r1.id,
+            "r2's prerequisite must be r1"
+        );
+    }
+
+    /// Third revision auto-gates on the second (the most-recent active
+    /// tail), not the first.
+    #[test]
+    fn create_revision_third_auto_blocks_on_second() {
+        let db = WorkDb::open(temp_db_path("rev-auto-dep-third")).unwrap();
+        let product_id = make_revision_product(&db, "auto-dep-third");
+        let pr_url = "https://github.com/spinyfin/mono/pull/902";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let r1 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+        let r2 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+        let r3 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        let prereqs =
+            crate::work_dependencies::prerequisites_of(&conn, &r3.id, Some("blocks")).unwrap();
+        assert_eq!(prereqs.len(), 1, "r3 must have exactly one prerequisite");
+        assert_eq!(
+            prereqs[0].prerequisite_id, r2.id,
+            "r3's prerequisite must be r2 (the most-recent active revision)"
+        );
+        // r1 is not a direct prerequisite of r3
+        assert!(
+            prereqs.iter().all(|e| e.prerequisite_id != r1.id),
+            "r3 must not directly gate on r1"
+        );
+    }
+
+    /// When R1 is done, R2 must not be auto-gated on it (done revisions
+    /// cannot race with the new one).
+    #[test]
+    fn create_revision_skips_done_revision_as_tail() {
+        let db = WorkDb::open(temp_db_path("rev-auto-dep-done-skip")).unwrap();
+        let product_id = make_revision_product(&db, "auto-dep-done-skip");
+        let pr_url = "https://github.com/spinyfin/mono/pull/903";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let r1 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        // Mark R1 done.
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![r1.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        // R2 filed after R1 is done — no active tail → R2 stays todo.
+        let r2 = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+        assert_eq!(
+            r2.status, "todo",
+            "second revision must stay todo when the only prior revision is done"
+        );
+        let conn = db.connect().unwrap();
+        let prereqs =
+            crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
+        assert!(
+            prereqs.is_empty(),
+            "no prerequisite edge when prior revision is done"
+        );
     }
 
     // ── block_pending_revisions_on_parent_close / parent-PR-merged invalidation ─
