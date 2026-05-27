@@ -111,7 +111,7 @@ private struct EngineConfigPane: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    Text("Stored in the macOS Keychain (service \(APIKeyStore.service)). The Settings value overrides any ANTHROPIC_API_KEY in the engine's inherited environment. Saving restarts the engine so the new value takes effect.")
+                    Text("Stored in the macOS Keychain on signed release builds, or a private file under Application Support on ad-hoc dev builds (service \(APIKeyStore.service)). The Settings value overrides any ANTHROPIC_API_KEY in the engine's inherited environment. Saving restarts the engine so the new value takes effect.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

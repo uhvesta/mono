@@ -11,5 +11,21 @@
          See design doc §Q2 for the validation plan. -->
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
+    <!-- Stable data-protection keychain access group so APIKeyStore reads
+         the Anthropic API key without the legacy interactive password
+         dialog (issue #784). RELEASE ONLY: this is an Apple *restricted*
+         entitlement, so it must NOT be added to the ad-hoc dev build
+         (there is deliberately no tools/boss/app-macos/Boss.entitlements) —
+         AMFI SIGKILLs an ad-hoc binary that carries it at exec, which is
+         exactly why c4e15f51 was reverted in #786. Developer ID-signed
+         release builds (re-signed here by release.sh) carry it safely;
+         ad-hoc dev builds fall back to a 0600 file (see APIKeyStore). Bare
+         access group (no $(TeamIdentifierPrefix)); declaring exactly one
+         group makes it the default, so APIKeyStore needs no explicit
+         kSecAttrAccessGroup. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>dev.spinyfin.bossmacapp</string>
+    </array>
 </dict>
 </plist>
