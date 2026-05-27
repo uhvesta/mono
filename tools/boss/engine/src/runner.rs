@@ -532,6 +532,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 model: spawn_config.model.clone(),
                 draft_pr_mode: spawner.draft_pr_mode(),
                 execution_kind: execution.kind.clone(),
+                task_kind: work_item_task_kind(work_item).map(str::to_owned),
             },
             StdDuration::from_secs(30),
         )
@@ -1460,6 +1461,16 @@ fn work_item_id(work_item: &WorkItem) -> &str {
         WorkItem::Product(product) => &product.id,
         WorkItem::Project(project) => &project.id,
         WorkItem::Task(task) | WorkItem::Chore(task) => &task.id,
+    }
+}
+
+/// Return the task `kind` string (e.g. `"revision"`, `"chore"`) for task
+/// work items. Returns `None` for products and projects, which have no
+/// task-kind concept.
+fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
+    match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => Some(&task.kind),
+        WorkItem::Product(_) | WorkItem::Project(_) => None,
     }
 }
 

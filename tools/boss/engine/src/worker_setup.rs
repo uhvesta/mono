@@ -86,6 +86,14 @@ pub struct WorkerSetupInput {
     /// Used to install kind-specific hook guards — currently a PreToolUse deny
     /// for `gh pr create` on `revision_implementation` executions.
     pub execution_kind: String,
+    /// Task kind from the underlying work item (e.g. `"revision"`, `"chore"`).
+    /// `None` for non-task work items (products, projects).
+    ///
+    /// Defense-in-depth: the `gh pr create` guard is keyed off the task kind
+    /// in ADDITION to the execution kind, so a mis-derived execution kind
+    /// (e.g. a revision re-dispatched as `task_implementation` due to a bug)
+    /// still cannot open a new PR.
+    pub task_kind: Option<String>,
 }
 
 /// Render the worker-facing CLAUDE.md.
@@ -242,14 +250,21 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
         ],
     });
 
-    // For revision_implementation, add a PreToolUse guard that blocks
-    // any `gh pr create` invocation. Revision workers push commits to
-    // an existing PR; opening a new PR violates the one-PR-per-task
+    // For revision tasks, add a PreToolUse guard that blocks any
+    // `gh pr create` invocation. Revision workers push commits to an
+    // existing PR; opening a new PR violates the one-PR-per-task
     // invariant. The guard is a small inline Python script that reads
     // the tool_input JSON from stdin and blocks if the command matches
     // `gh pr create` (tolerant of GIT_DIR=... prefixes and flags).
+    //
+    // Defense-in-depth: the guard fires when EITHER the execution kind
+    // is `revision_implementation` OR the task kind is `revision`.
+    // This ensures a mis-derived execution kind (e.g. revision
+    // re-dispatched as `task_implementation`) still cannot open a PR.
     let mut pre_tool_use_hooks = vec![hook.clone()];
-    if input.execution_kind == "revision_implementation" {
+    let is_revision = input.execution_kind == "revision_implementation"
+        || input.task_kind.as_deref() == Some("revision");
+    if is_revision {
         let guard_command = concat!(
             "python3 -c \"",
             "import json,sys,re; ",
@@ -596,6 +611,7 @@ mod tests {
             ),
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
+            task_kind: Some("chore".into()),
         }
     }
 
@@ -871,6 +887,7 @@ mod tests {
             boss_event_path: PathBuf::from("/tmp/boss-event"),
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
+            task_kind: Some("chore".into()),
         };
 
         let written = write_workspace_files(&input).unwrap();
@@ -979,6 +996,7 @@ mod tests {
             boss_event_path: PathBuf::from("/tmp/boss-event"),
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
+            task_kind: Some("chore".into()),
         };
 
         write_workspace_files(&input).unwrap();
@@ -1116,6 +1134,7 @@ mod tests {
             ),
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
+            task_kind: Some("chore".into()),
         };
         let settings_file = settings_dir.path().join("mono-agent-heal.json");
         std::fs::write(&settings_file, render_settings_json(&input)).unwrap();
@@ -1207,6 +1226,36 @@ mod tests {
             pre[0]["matcher"],
             serde_json::Value::String("*".into()),
             "chore_implementation's sole PreToolUse hook must be the catch-all shim",
+        );
+    }
+
+    /// Defense-in-depth: even if `execution_kind` is wrong (e.g. a revision
+    /// re-dispatched as `task_implementation` due to a bug), the guard fires
+    /// as long as `task_kind == "revision"`.  This ensures the structural
+    /// invariant holds regardless of execution-kind derivation errors.
+    #[test]
+    fn revision_task_kind_adds_gh_pr_create_guard_even_with_wrong_execution_kind() {
+        let mut input = sample_input();
+        // Simulate the bug scenario: execution_kind was mis-derived as
+        // task_implementation but the task itself is a revision.
+        input.execution_kind = "task_implementation".into();
+        input.task_kind = Some("revision".into());
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let pre = parsed["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse must be an array");
+
+        assert_eq!(
+            pre.len(),
+            2,
+            "revision task_kind must add the guard even when execution_kind is wrong, got {pre:?}",
+        );
+        let guard_cmd = pre[1]["hooks"][0]["command"].as_str().unwrap_or("");
+        assert!(
+            guard_cmd.contains("block"),
+            "guard must produce a block decision: {guard_cmd}",
         );
     }
 }

@@ -10622,6 +10622,25 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     }
 
     let _ = product_id_for_work_item(conn, &work_item_id)?;
+
+    // For revision tasks, look up the chain root's PR URL so the worker
+    // knows which existing PR branch to push commits to.  Without this the
+    // revision prelude in the worker prompt has no PR URL to reference and
+    // the worker would have to guess — or, worse, open a new orphan PR.
+    //
+    // The orphan-sweep re-dispatch path is the primary caller here: when a
+    // revision task was already `active` and its worker crashed, we need to
+    // re-create the execution with the same `pr_url` the original dispatch
+    // carried.  The chain root's `pr_url` is the authoritative source
+    // because revision tasks themselves never own a `pr_url` column value.
+    let revision_pr_url: Option<String> = if kind == "revision_implementation" {
+        get_chain_root_task(conn, &work_item_id)?
+            .and_then(|t| t.pr_url)
+            .filter(|u| !u.is_empty())
+    } else {
+        None
+    };
+
     insert_execution(
         conn,
         CreateExecutionInput {
@@ -10643,7 +10662,7 @@ fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             started_at: None,
             finished_at: None,
             prefer_is_soft: false,
-            pr_url: None,
+            pr_url: revision_pr_url,
         },
     )
 }
@@ -10666,6 +10685,7 @@ fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str) -> Result
             match task.kind.as_str() {
                 "chore" => "chore_implementation".to_owned(),
                 "design" => "project_design".to_owned(),
+                "revision" => "revision_implementation".to_owned(),
                 _ => "task_implementation".to_owned(),
             }
         }
@@ -24459,5 +24479,122 @@ mod tests {
             active.is_empty(),
             "chain with no revisions must yield empty vec"
         );
+    }
+
+    // ── Revision dispatch via request_execution ───────────────────────────
+
+    /// Regression: T701-style bug where `request_execution` (used by the
+    /// orphan sweep and kanban drag) produced `task_implementation` for
+    /// `kind=revision` tasks instead of `revision_implementation`.
+    ///
+    /// After the fix:
+    ///   - `execution.kind` must be `"revision_implementation"`
+    ///   - `execution.pr_url` must be set to the chain-root's PR URL
+    ///
+    /// The orphan sweep re-dispatch path then produces the same shape as the
+    /// steady-state `reconcile_revision_execution` path so the worker prompt
+    /// gets the correct revision prelude and cannot open a new PR.
+    #[test]
+    fn request_execution_for_revision_task_produces_revision_implementation_kind() {
+        let db = WorkDb::open(temp_db_path("req-exec-revision-kind")).unwrap();
+        let product_id = make_revision_product(&db, "req-exec-kind");
+        let pr_url = "https://github.com/spinyfin/mono/pull/818";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        // Insert a revision task manually (direct insert, as in chain_root tests).
+        let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+
+        let exec = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: revision_id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            exec.kind, "revision_implementation",
+            "request_execution must produce revision_implementation for kind=revision tasks, got {:?}",
+            exec.kind,
+        );
+        assert_eq!(
+            exec.pr_url.as_deref(),
+            Some(pr_url),
+            "revision execution must carry the chain-root's PR URL so the worker knows which branch to push to",
+        );
+        assert_eq!(exec.status, "ready");
+    }
+
+    /// Regression: re-dispatch of a revision task (orphan-sweep path) must
+    /// still produce `revision_implementation` kind and the correct `pr_url`.
+    ///
+    /// Scenario: the first execution was `revision_implementation` and is now
+    /// `abandoned` (simulating a worker crash).  A subsequent call to
+    /// `request_execution` creates a new `ready` execution.
+    #[test]
+    fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url() {
+        let db = WorkDb::open(temp_db_path("req-exec-revision-redispatch")).unwrap();
+        let product_id = make_revision_product(&db, "req-exec-redispatch");
+        let pr_url = "https://github.com/spinyfin/mono/pull/818";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+        let revision_id = insert_revision_row(&db, &product_id, &parent_id);
+
+        // First dispatch.
+        let first_exec = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: revision_id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(first_exec.kind, "revision_implementation");
+        assert_eq!(first_exec.pr_url.as_deref(), Some(pr_url));
+
+        // Simulate worker crash: mark the execution as abandoned.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+                rusqlite::params![first_exec.id],
+            )
+            .unwrap();
+
+        // Re-dispatch (mimics orphan sweep calling request_execution_with_live_check
+        // with is_live returning false for the abandoned execution).
+        let second_exec = db
+            .request_execution_with_live_check(
+                RequestExecutionInput {
+                    work_item_id: revision_id.clone(),
+                    priority: None,
+                    preferred_workspace_id: None,
+                    force: false,
+                },
+                |_| false,
+            )
+            .unwrap();
+
+        assert_ne!(
+            second_exec.id, first_exec.id,
+            "re-dispatch must create a fresh execution row",
+        );
+        assert_eq!(
+            second_exec.kind, "revision_implementation",
+            "re-dispatched revision must still be revision_implementation, got {:?}",
+            second_exec.kind,
+        );
+        assert_eq!(
+            second_exec.pr_url.as_deref(),
+            Some(pr_url),
+            "re-dispatched revision must carry the chain-root's PR URL",
+        );
+        assert_eq!(second_exec.status, "ready");
     }
 }

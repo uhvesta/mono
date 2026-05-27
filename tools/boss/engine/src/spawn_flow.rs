@@ -108,6 +108,10 @@ pub struct StartWorkerInput {
     /// Forwarded to `WorkerSetupInput` so the worker settings file can
     /// install kind-specific hook guards.
     pub execution_kind: String,
+    /// Task kind from the underlying work item (e.g. `"revision"`, `"chore"`).
+    /// `None` for non-task work items (products, projects).
+    /// Forwarded to `WorkerSetupInput` for defense-in-depth guard checks.
+    pub task_kind: Option<String>,
 }
 
 #[derive(Debug)]
@@ -198,6 +202,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         boss_event_path: input.boss_event_path.clone(),
         draft_pr_mode: input.draft_pr_mode,
         execution_kind: input.execution_kind.clone(),
+        task_kind: input.task_kind.clone(),
     };
     let written = write_workspace_files(&setup).map_err(StartWorkerError::WriteFiles)?;
 
@@ -447,6 +452,7 @@ mod tests {
             model: "claude-opus-4-7".into(),
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
+            task_kind: Some("chore".into()),
         }
     }
 
