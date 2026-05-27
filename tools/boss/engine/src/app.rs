@@ -1537,6 +1537,19 @@ impl ServerState {
     }
 }
 
+/// Enable the transient-recovery sweep to nudge a live idle worker via
+/// the same `SendToPane` path that `bossctl agents send` uses.
+/// `Arc<ServerState>` can then be coerced to `Arc<dyn WorkerNudger>`.
+#[async_trait]
+impl crate::transient_recovery::WorkerNudger for ServerState {
+    async fn nudge_worker(&self, run_id: &str, text: String) -> Result<(), String> {
+        self.send_input_to_worker(run_id, text)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 struct BrokerExecutionPublisher {
     topic_broker: Arc<TopicBroker>,
     work_revision: Arc<AtomicU64>,
@@ -2536,6 +2549,7 @@ pub async fn serve(
         server_state.live_worker_states.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
+        Arc::clone(&server_state) as Arc<dyn crate::transient_recovery::WorkerNudger>,
         crate::transient_recovery::DEFAULT_INTERVAL,
     );
 

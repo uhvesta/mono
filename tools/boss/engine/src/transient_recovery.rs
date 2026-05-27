@@ -15,14 +15,17 @@
 //! path can't see it (no PR, no clean finish). Before this module a
 //! human had to notice and restart the run (the Yar/T678 incident).
 //!
-//! ## Design: engine-owned, transcript as ground truth
+//! ## Design: nudge-first, orphan+respawn as fallback
 //!
-//! This is reconciliation, not a nudge — a wedged worker is not a live
-//! agent you can poke, so recovery means restarting/resuming the run.
-//! That is the engine's job (the coordinator only acts on prompts and
-//! can't watch a process between turns). The sweep mirrors
-//! [`crate::dead_pid_sweep`] / [`crate::orphan_sweep`]: it runs every
-//! [`DEFAULT_INTERVAL`] and fires once on boot.
+//! On a transient API error the worker's `claude` process stays alive
+//! at its REPL — it printed the error, ended the turn, and returned to
+//! its prompt. For this alive-but-idle case the cheap first recovery is
+//! a runtime nudge ("your previous turn ended on a transient API error;
+//! please retry the last step") injected via the same channel as
+//! `bossctl agents send`. Full orphan+respawn (spawn a fresh `claude`
+//! process on the same workspace) is reserved for cases where the
+//! worker is actually dead, the nudge did not clear the error by the
+//! next sweep, or the error is permanent.
 //!
 //! Each pass, for every non-actively-working worker slot whose backing
 //! execution is old enough ([`RECOVERY_GRACE_SECS`]):
@@ -38,14 +41,20 @@
 //!      ([`crate::transient_error::classify_claude_error`]) and apply
 //!      the bounded-retry policy
 //!      ([`crate::transient_error::RecoveryPolicy`]).
-//!   3. **Resume** (transient, under the cap): orphan the dead
-//!      execution and insert a fresh `ready` one that prefers the same
-//!      cube workspace (so `--prefer` re-leases it and the in-progress
-//!      jj branch is not lost), carrying an incremented
+//!   3. **Nudge** (transient, under cap, worker alive and idle, not
+//!      already nudged this session): send a runtime message into the
+//!      existing `claude` REPL asking it to retry. If the nudge fails
+//!      (send error, unknown slot, etc.) fall through to orphan+respawn.
+//!      On the next sweep if the error is still the last entry,
+//!      increment the attempt counter and proceed to orphan+respawn.
+//!   4. **Resume** (transient, under the cap, not nudgeable): orphan the
+//!      dead execution and insert a fresh `ready` one that prefers the
+//!      same cube workspace (so `--prefer` re-leases it and the
+//!      in-progress jj branch is not lost), carrying an incremented
 //!      `transient_failure_count` and a `dispatch_not_before` backoff.
 //!      The runner's existing startup-recovery prompt then directs the
 //!      new worker to resume the prior branch.
-//!   4. **Escalate** (permanent / unrecognised / retry cap reached):
+//!   5. **Escalate** (permanent / unrecognised / retry cap reached):
 //!      raise a `WorkAttentionItem` and stop. The orphan-active sweep
 //!      excludes work items with an open recovery attention item
 //!      (`list_orphan_active_candidates`), so a non-retryable failure is
@@ -57,11 +66,16 @@
 //! [`crate::transient_error::RecoveryPolicy`]; after the cap the sweep
 //! escalates instead of resuming. The incremented
 //! `transient_failure_count` is carried across resume executions, so the
-//! cap holds across the whole chain, not per-execution.
+//! cap holds across the whole chain, not per-execution. A nudge does NOT
+//! consume a retry slot — the orphan+respawn cap stays at 3 — but each
+//! execution only gets one nudge attempt per engine session before the
+//! sweep falls back to orphan+respawn.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use boss_protocol::{WorkItemPatch, WorkerActivity};
@@ -95,9 +109,32 @@ const TRANSCRIPT_TAIL_MAX_BYTES: u64 = 256 * 1024;
 /// dispatch event or attention item.
 const ERROR_CLIP_BYTES: usize = 240;
 
+/// Inject text into a live worker's REPL without tearing it down.
+/// The recovery sweep uses this to nudge an idle-but-wedged worker
+/// before falling back to the heavier orphan+respawn path.
+#[async_trait]
+pub trait WorkerNudger: Send + Sync {
+    async fn nudge_worker(&self, run_id: &str, text: String) -> Result<(), String>;
+}
+
+/// No-op nudger used in tests and contexts without an app session.
+/// Always returns `Err`, which causes the sweep to fall through to
+/// the orphan+respawn path — preserving pre-nudge test behaviour.
+pub struct NoopWorkerNudger;
+
+#[async_trait]
+impl WorkerNudger for NoopWorkerNudger {
+    async fn nudge_worker(&self, _run_id: &str, _text: String) -> Result<(), String> {
+        Err("no nudger configured".into())
+    }
+}
+
 /// Counts from one pass; logged at `info` when anything happened.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TransientRecoveryOutcome {
+    /// Workers sent a runtime nudge (alive-idle path).
+    pub nudged: usize,
+    /// Workers orphaned and re-queued via the full orphan+respawn path.
     pub resumed: usize,
     pub escalated: usize,
     pub grace_skipped: usize,
@@ -106,7 +143,7 @@ pub struct TransientRecoveryOutcome {
 
 impl TransientRecoveryOutcome {
     fn has_activity(&self) -> bool {
-        self.resumed > 0 || self.escalated > 0
+        self.nudged > 0 || self.resumed > 0 || self.escalated > 0
     }
 }
 
@@ -117,10 +154,17 @@ pub fn spawn_loop(
     live_states: Arc<LiveWorkerStateRegistry>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
+    nudger: Arc<dyn WorkerNudger>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let policy = RecoveryPolicy::default();
     tokio::spawn(async move {
+        // Execution IDs that received a runtime nudge this engine session.
+        // On the next sweep pass, if the error is still present, we skip
+        // the nudge and fall through to orphan+respawn. Keyed by the
+        // original execution ID (not the replacement), so stale entries
+        // from completed/orphaned executions are harmless.
+        let mut nudged_executions: HashSet<String> = HashSet::new();
         loop {
             let now = current_epoch_s();
             let outcome = run_one_pass(
@@ -129,11 +173,14 @@ pub fn spawn_loop(
                 coordinator.clone(),
                 dispatch_events.as_ref(),
                 &policy,
+                nudger.as_ref(),
+                &mut nudged_executions,
                 now,
             )
             .await;
             if outcome.has_activity() {
                 tracing::info!(
+                    nudged = outcome.nudged,
                     resumed = outcome.resumed,
                     escalated = outcome.escalated,
                     "transient-recovery sweep: pass complete",
@@ -146,12 +193,19 @@ pub fn spawn_loop(
 
 /// Run a single recovery pass. `now_epoch_secs` is injected so tests
 /// can pin the clock for the grace guard.
+///
+/// `nudger` is used to send a runtime message into a live idle worker's
+/// REPL instead of tearing it down. `nudged_executions` persists across
+/// calls (owned by the spawn loop) so the sweep knows which executions
+/// have already been nudged and should proceed to orphan+respawn.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     policy: &RecoveryPolicy,
+    nudger: &dyn WorkerNudger,
+    nudged_executions: &mut HashSet<String>,
     now_epoch_secs: i64,
 ) -> TransientRecoveryOutcome {
     let mut outcome = TransientRecoveryOutcome::default();
@@ -223,6 +277,58 @@ pub async fn run_one_pass(
 
         match decision {
             RecoveryDecision::Resume { attempt, backoff } => {
+                // Prefer a cheap runtime nudge when the worker is alive
+                // and idle. Only nudge once per execution per engine
+                // session: if it didn't clear the error by the next
+                // sweep, fall through to orphan+respawn.
+                let already_nudged = nudged_executions.remove(&execution_id);
+                let try_nudge =
+                    !already_nudged && state.activity == WorkerActivity::Idle;
+
+                if try_nudge {
+                    let msg = format!(
+                        "Your previous turn ended on a transient Claude API error. \
+                         Please retry the last step.\n\nError: {clipped}\n"
+                    );
+                    match nudger.nudge_worker(&execution_id, msg).await {
+                        Ok(()) => {
+                            nudged_executions.insert(execution_id.clone());
+                            tracing::info!(
+                                execution_id,
+                                work_item_id = %work_item_id,
+                                error = %clipped,
+                                "transient-recovery: nudged live idle worker; will re-check next sweep",
+                            );
+                            dispatch_events
+                                .emit(
+                                    DispatchEvent::new(
+                                        Stage::TransientRecoveryNudge,
+                                        Outcome::Ok,
+                                        &execution_id,
+                                    )
+                                    .with_work_item(&work_item_id)
+                                    .with_details(serde_json::json!({
+                                        "error": clipped,
+                                        "class": "transient",
+                                    })),
+                                )
+                                .await;
+                            outcome.nudged += 1;
+                            continue; // leave slot and execution intact
+                        }
+                        Err(nudge_err) => {
+                            tracing::info!(
+                                execution_id,
+                                work_item_id = %work_item_id,
+                                nudge_err,
+                                "transient-recovery: nudge not available; falling back to orphan+respawn",
+                            );
+                            // Fall through to the orphan+respawn path below.
+                        }
+                    }
+                }
+
+                // --- Orphan+respawn path ---
                 let dispatch_not_before = now_epoch_secs + backoff.as_secs() as i64;
                 let reason = format!(
                     "transient Claude API error (auto-resume attempt {attempt}/{max}): {clipped}",
@@ -494,6 +600,7 @@ pub fn current_epoch_s() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::io::Write;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -567,6 +674,32 @@ mod tests {
             _cube_change_id: Option<&str>,
         ) -> Result<RunOutcome> {
             unimplemented!()
+        }
+    }
+
+    /// Records which run_ids were nudged. Used to assert nudge behaviour
+    /// without needing a real app session.
+    struct RecordingNudger {
+        nudged: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingNudger {
+        fn new() -> Self {
+            Self {
+                nudged: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn nudged_ids(&self) -> Vec<String> {
+            self.nudged.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkerNudger for RecordingNudger {
+        async fn nudge_worker(&self, run_id: &str, _text: String) -> Result<(), String> {
+            self.nudged.lock().await.push(run_id.to_owned());
+            Ok(())
         }
     }
 
@@ -716,7 +849,116 @@ mod tests {
     // ─── tests ────────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn transient_error_nudges_live_idle_worker() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&exec_id, None)
+            .await
+            .unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let nudger = RecordingNudger::new();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut nudged = HashSet::new();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live,
+            coordinator.clone(),
+            sink.as_ref(),
+            &RecoveryPolicy::default(),
+            &nudger,
+            &mut nudged,
+            now(),
+        )
+        .await;
+
+        // First pass: should nudge, not orphan+respawn.
+        assert_eq!(outcome.nudged, 1, "alive idle worker should be nudged first");
+        assert_eq!(outcome.resumed, 0, "should not orphan+respawn on first nudge");
+        assert_eq!(outcome.escalated, 0);
+        assert!(nudged.contains(&exec_id), "execution should be in nudged set");
+        assert_eq!(nudger.nudged_ids().await, vec![exec_id.clone()]);
+
+        // Execution is still running (not orphaned).
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, "running");
+
+        // One transient_recovery_nudge dispatch event.
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "transient_recovery_nudge");
+        assert_eq!(events[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn nudged_worker_still_stalled_falls_back_to_orphan_respawn() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&exec_id, None)
+            .await
+            .unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        // Pre-populate nudged set to simulate a prior-pass nudge.
+        let mut nudged = HashSet::new();
+        nudged.insert(exec_id.clone());
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live,
+            coordinator.clone(),
+            sink.as_ref(),
+            &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut nudged,
+            now(),
+        )
+        .await;
+
+        // Second pass: nudge already tried, error still present → orphan+respawn.
+        assert_eq!(outcome.resumed, 1, "second pass should orphan+respawn");
+        assert_eq!(outcome.nudged, 0);
+        assert!(!nudged.contains(&exec_id), "id removed from nudged set on orphan+respawn");
+
+        let execs = db.list_executions(Some(&work_item_id)).unwrap();
+        let dead = execs.iter().find(|e| e.id == exec_id).unwrap();
+        assert_eq!(dead.status, "orphaned");
+        let fresh = execs
+            .iter()
+            .find(|e| e.id != exec_id && e.status == "ready")
+            .expect("expected a fresh ready execution");
+        assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-007"));
+        assert_eq!(fresh.transient_failure_count, 1);
+
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stage, "transient_recovery");
+    }
+
+    #[tokio::test]
     async fn transient_error_resumes_on_same_workspace() {
+        // NoopWorkerNudger always fails → falls through to orphan+respawn.
+        // Exercises the pre-nudge behaviour for contexts where nudge is unavailable.
         let (dir, db) = open_db();
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id);
@@ -726,9 +968,6 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        // Register the live slot against whatever pool slot the (random)
-        // claim picked, so state.slot_id matches the claimed worker —
-        // exactly the invariant the coordinator maintains in production.
         let worker_id = coordinator
             .worker_pool()
             .claim_worker(&dead_id, None)
@@ -744,15 +983,15 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
             now(),
         )
         .await;
 
-        assert_eq!(outcome.resumed, 1, "transient error should resume");
+        assert_eq!(outcome.resumed, 1, "noop nudger falls through to orphan+respawn");
         assert_eq!(outcome.escalated, 0);
 
-        // Dead execution orphaned; a fresh ready execution prefers the
-        // same workspace and carries an incremented failure count.
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         let dead = execs.iter().find(|e| e.id == dead_id).unwrap();
         assert_eq!(dead.status, "orphaned");
@@ -767,11 +1006,9 @@ mod tests {
             "resume must be deferred by a backoff window",
         );
 
-        // Pool slot freed for re-dispatch.
         let claimed = coordinator.worker_pool().claimed_execution_ids().await;
         assert!(!claimed.contains(&dead_id));
 
-        // Observable: a transient_recovery dispatch event with attempt 1/3.
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "transient_recovery");
@@ -789,9 +1026,6 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        // Register the live slot against whatever pool slot the (random)
-        // claim picked, so state.slot_id matches the claimed worker —
-        // exactly the invariant the coordinator maintains in production.
         let worker_id = coordinator
             .worker_pool()
             .claim_worker(&dead_id, None)
@@ -807,6 +1041,8 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
             now(),
         )
         .await;
@@ -814,19 +1050,16 @@ mod tests {
         assert_eq!(outcome.escalated, 1, "permanent error should escalate");
         assert_eq!(outcome.resumed, 0, "permanent error must NOT resume");
 
-        // No fresh ready execution.
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         assert!(
             !execs.iter().any(|e| e.id != dead_id && e.status == "ready"),
             "permanent error must not create a resume execution",
         );
-        // Open attention item raised, of the permanent-error kind.
         let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
         assert_eq!(attn.len(), 1);
         assert_eq!(attn[0].kind, ATTENTION_KIND_RECOVERY_PERMANENT);
         assert_eq!(attn[0].status, "open");
 
-        // And the orphan-active sweep must now EXCLUDE this item.
         let candidates = db.list_orphan_active_candidates(0).unwrap();
         assert!(
             !candidates.contains(&work_item_id),
@@ -850,9 +1083,6 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        // Register the live slot against whatever pool slot the (random)
-        // claim picked, so state.slot_id matches the claimed worker —
-        // exactly the invariant the coordinator maintains in production.
         let worker_id = coordinator
             .worker_pool()
             .claim_worker(&dead_id, None)
@@ -868,6 +1098,8 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
             now(),
         )
         .await;
@@ -891,9 +1123,6 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        // Register the live slot against whatever pool slot the (random)
-        // claim picked, so state.slot_id matches the claimed worker —
-        // exactly the invariant the coordinator maintains in production.
         let worker_id = coordinator
             .worker_pool()
             .claim_worker(&dead_id, None)
@@ -909,6 +1138,8 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
             now(),
         )
         .await;
@@ -916,7 +1147,6 @@ mod tests {
         assert_eq!(outcome.resumed, 0);
         assert_eq!(outcome.escalated, 0);
         assert_eq!(outcome.no_error_skipped, 1);
-        // Execution untouched, slot still claimed.
         assert_eq!(db.get_execution(&dead_id).unwrap().status, "running");
         assert!(sink.events().await.is_empty());
     }
@@ -963,6 +1193,8 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
             now(),
         )
         .await;
@@ -1011,6 +1243,8 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             &RecoveryPolicy::default(),
+            &NoopWorkerNudger,
+            &mut HashSet::new(),
             now(),
         )
         .await;

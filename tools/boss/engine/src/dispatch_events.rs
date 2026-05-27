@@ -138,6 +138,13 @@ pub enum Stage {
     /// non-retryable (permanent / unrecognised) or the retry cap was
     /// reached. The `details` object carries the escalation `reason`.
     TransientRecoveryExhausted,
+    /// The transient-recovery sweep sent a runtime nudge to a live idle
+    /// worker rather than tearing it down. The worker's `claude` process
+    /// is still alive at its REPL and can receive input; a nudge is
+    /// cheaper than orphan+respawn. If the nudge does not clear the error
+    /// by the next sweep the sweep falls back to the normal
+    /// orphan+respawn path.
+    TransientRecoveryNudge,
 }
 
 impl Stage {
@@ -159,6 +166,7 @@ impl Stage {
             Stage::DispatchDecision => "dispatch_decision",
             Stage::TransientRecovery => "transient_recovery",
             Stage::TransientRecoveryExhausted => "transient_recovery_exhausted",
+            Stage::TransientRecoveryNudge => "transient_recovery_nudge",
         }
     }
 }
