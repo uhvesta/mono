@@ -1296,11 +1296,19 @@ struct RevisionCreateArgs {
     #[arg(long)]
     parent: String,
 
-    /// The operator's verbatim ask. Kept short — rendered on the
-    /// Review-lane affordance so reviewers can see what each new
-    /// commit was for.
+    /// The operator's verbatim ask. Stored as the task description and
+    /// shown in the Review-lane rollup affordance so reviewers can see what
+    /// each new commit was for.
     #[arg(long)]
     description: String,
+
+    /// Concise summary title for the revision card (1–10 words). When
+    /// provided by the coordinator, this becomes the card title displayed
+    /// on the kanban; the verbatim ask stays in `--description`. Omit to
+    /// let the engine derive the title from the first line of the
+    /// description (legacy behaviour).
+    #[arg(long)]
+    name: Option<String>,
 
     #[arg(long)]
     priority: Option<TaskPriority>,
@@ -4298,11 +4306,13 @@ async fn run_create_revision(
     if description.is_empty() {
         return Err(CliError::usage("--description must be non-empty"));
     }
+    let name = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
     let task = create_revision_rpc(
         client,
         CreateRevisionInput {
             parent_task_id: parent_id,
             description: description.clone(),
+            name,
             priority: args.priority.map(|p| p.as_str().to_owned()),
             effort_level: args.effort.map(boss_protocol::EffortLevel::from),
             model_override: args.model,
