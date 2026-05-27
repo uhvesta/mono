@@ -10,10 +10,12 @@
 //!
 //! - [`on_design_pr_detected`] — fired when `tasks.pr_url` is set for
 //!   a `kind=design` task (the `in_review` transition). Populates the
-//!   project's design-doc pointer when it is unset. If it is already
-//!   set, updates only `design_doc_branch` to the PR head branch so the
-//!   resolved URL correctly points to the file on the PR branch rather
-//!   than `main` (where the file does not exist yet).
+//!   project's design-doc pointer when it is unset, or updates only
+//!   `design_doc_branch` when it is already set. Uses the PR's **head**
+//!   branch (e.g. `boss/exec_*`) so the viewer can fetch the doc while
+//!   the PR is still open. The `raw_content_url` builder percent-encodes
+//!   `/` as `%2F` in the `?ref=` query param so slashed branch names
+//!   round-trip correctly through the Swift URL parser.
 //! - [`on_design_pr_merged`] — fired when `mark_chore_pr_merged`
 //!   transitions a `kind=design` task to `done`. If the project
 //!   already has a path, only the branch is updated to the PR's base
@@ -35,7 +37,7 @@ struct PrScanResult {
     /// The single design-doc path found in the PR, or `None` if zero
     /// or multiple design docs were present.
     doc_path: Option<String>,
-    /// Head branch name (e.g. `design-boss-ci-buildkite`).
+    /// Head branch name (e.g. `boss/exec_18b07a506d2518d0_1b`).
     head_ref_name: Option<String>,
     /// Base branch name (e.g. `main`).
     base_ref_name: Option<String>,
@@ -45,10 +47,17 @@ struct PrScanResult {
 /// when the work item is `kind=design` with a `project_id`.
 ///
 /// Scans the PR's changed files for a design-doc markdown file under
-/// `tools/boss/docs/designs/`. On a single match, calls
-/// [`WorkDb::sync_project_design_doc_from_detector`] which populates
-/// the project's pointer only when it was previously `NULL` — existing
-/// human-set or previously-detected values are preserved.
+/// `tools/boss/docs/designs/`. On a single match, populates (or updates)
+/// the project's design-doc pointer using the PR's **head** branch so
+/// the in-app viewer can fetch the doc from the PR branch while the PR
+/// is still open. The `raw_content_url` builder percent-encodes `/` as
+/// `%2F` in `?ref=` so slashed branch names like `boss/exec_*` round-trip
+/// correctly through `parseRawContentURL` in the Swift app and reach
+/// the GitHub Contents API as a proper query parameter.
+///
+/// [`WorkDb::sync_project_design_doc_from_detector`] is used for the
+/// initial (pointer-is-NULL) case; it is a no-op when the path is already
+/// set, at which point only `design_doc_branch` is updated.
 pub async fn on_design_pr_detected(
     work_db: &WorkDb,
     task_id: &str,
@@ -64,6 +73,10 @@ pub async fn on_design_pr_detected(
         return;
     };
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
+    // Use the head branch (e.g. `boss/exec_*`) so the in-app viewer can
+    // fetch the doc from the PR branch while the PR is still open. The
+    // raw_content_url builder encodes `/` as `%2F` in `?ref=` so slashed
+    // branch names round-trip correctly through the Swift URL parser.
     let head_ref_name = scan.head_ref_name;
     let branch = head_ref_name.as_deref();
     match work_db.sync_project_design_doc_from_detector(
@@ -83,10 +96,9 @@ pub async fn on_design_pr_detected(
             );
         }
         Ok(false) => {
-            // Path was already set — the pointer is preserved, but we
-            // still update `design_doc_branch` to the PR head branch so
-            // the resolved web URL and raw-content URL point at the file
-            // on the PR branch (not at `main` where it doesn't exist yet).
+            // Path was already set — update design_doc_branch to the PR head
+            // branch so the in-app viewer fetches from the live PR branch
+            // while the PR is still open.
             if let Some(head_branch) = head_ref_name {
                 let input = SetProjectDesignDocInput {
                     project_id: project_id.to_owned(),
@@ -276,8 +288,9 @@ fn resolve_product_repo(work_db: &WorkDb, task_id: &str, product_id: &str) -> Op
 }
 
 /// Call `gh pr view <pr_url> --json files,headRefName,baseRefName` and
-/// parse the result. Returns `None` on tool failures; warnings are
-/// logged internally.
+/// parse the result. `head_ref_name` carries the PR branch for open PRs;
+/// `base_ref_name` carries the target branch used on merge. Returns `None`
+/// on tool failures; warnings are logged internally.
 async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult> {
     match do_scan_pr(pr_url).await {
         Ok(result) => Some(result),

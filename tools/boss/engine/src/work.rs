@@ -10576,8 +10576,18 @@ fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, path: &str) ->
     }
 }
 
-/// Build the GitHub raw-content URL for a design doc:
-/// `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>`.
+/// Build the GitHub raw-content URL for a design doc.
+///
+/// Format: `https://raw.githubusercontent.com/<owner>/<repo>/<path>?ref=<branch>`
+///
+/// The branch is carried in `?ref=` rather than embedded as URL path
+/// segments. Branch names like `boss/exec_*` contain `/`, which would be
+/// split into separate path components when the Swift app parses the URL —
+/// `segments[2]` would capture only `boss`, not `boss/exec_…`, causing
+/// the GitHub Contents API call to fail with 404. Percent-encoding the
+/// slash as `%2F` in the query parameter lets `URLComponents.queryItems`
+/// recover the full branch name on the Swift side.
+///
 /// Returns `None` when the repo URL can't be parsed as a github.com URL
 /// (e.g. an enterprise mirror or non-GitHub host) so callers know the
 /// raw-content fast path is unavailable and should fall back to the
@@ -10587,9 +10597,13 @@ fn render_design_doc_raw_content_url(
     branch: &str,
     path: &str,
 ) -> Option<String> {
+    // Percent-encode only `/` in branch names. Other characters legal in
+    // Git branch names (alphanumeric, `-`, `_`, `.`) are safe in a query
+    // string without encoding.
+    let encoded_ref = branch.replace('/', "%2F");
     crate::completion::parse_repo_slug(repo_remote_url)
         .ok()
-        .map(|slug| format!("https://raw.githubusercontent.com/{slug}/{branch}/{path}"))
+        .map(|slug| format!("https://raw.githubusercontent.com/{slug}/{path}?ref={encoded_ref}"))
 }
 
 /// Look up a product by `repo_remote_url`. Used by
@@ -19073,7 +19087,7 @@ mod tests {
         );
         assert_eq!(
             raw_content_url.as_deref(),
-            Some("https://raw.githubusercontent.com/spinyfin/mono/main/tools/boss/docs/designs/foo.md"),
+            Some("https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=main"),
         );
 
         let _ = std::fs::remove_file(path);
@@ -19133,7 +19147,7 @@ mod tests {
         );
         assert_eq!(
             raw_content_url.as_deref(),
-            Some("https://raw.githubusercontent.com/myorg/wiki/docs/designs/foo.md"),
+            Some("https://raw.githubusercontent.com/myorg/wiki/designs/foo.md?ref=docs"),
         );
 
         let _ = std::fs::remove_file(path);
@@ -19199,12 +19213,49 @@ mod tests {
 
         assert_eq!(
             raw_content_url.as_deref(),
-            Some("https://raw.githubusercontent.com/spinyfin/mono/design-boss-ci-buildkite/tools/boss/docs/designs/foo.md"),
+            Some("https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=design-boss-ci-buildkite"),
             "SSH remote URL must produce a raw_content_url on a non-main branch"
         );
         assert_eq!(
             web_url,
             "https://github.com/spinyfin/mono/blob/design-boss-ci-buildkite/tools/boss/docs/designs/foo.md",
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression for the root cause of the unmerged-PR rendering failure:
+    /// `boss/exec_*` branch names contain `/`, which URL path-component
+    /// splitting in the Swift app would split into separate segments,
+    /// causing the `gh api` call to resolve `ref=boss` (not the full
+    /// `boss/exec_*`) and return 404. The fix encodes `/` as `%2F` in
+    /// the `?ref=` query param so the full branch name is preserved.
+    #[test]
+    fn resolve_project_design_doc_raw_content_url_encodes_slashed_branch() {
+        let path = temp_db_path("resolve-raw-content-slashed-branch");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_, project) = seed_project_for_design_doc(&db);
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: project.id.clone(),
+            design_doc_repo_remote_url: None,
+            design_doc_branch: Some("boss/exec_18b07a506d2518d0_1b".to_owned()),
+            design_doc_path: Some("tools/boss/docs/designs/foo.md".to_owned()),
+            unset: false,
+        })
+        .unwrap();
+
+        let resolved = db
+            .resolve_project_design_doc(&project.id, |_| None)
+            .unwrap();
+        let ProjectDesignDocState::Resolved { raw_content_url, .. } = resolved.state else {
+            panic!("expected Resolved, got {:?}", resolved.state);
+        };
+
+        assert_eq!(
+            raw_content_url.as_deref(),
+            Some("https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=boss%2Fexec_18b07a506d2518d0_1b"),
+            "slashed branch must be %2F-encoded in the ?ref= query param"
         );
 
         let _ = std::fs::remove_file(path);

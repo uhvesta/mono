@@ -7,9 +7,44 @@ import XCTest
 /// `ChatViewModel.rawContentFetcher` so neither suite ever shells
 /// out during `bazel test`.
 final class GitHubContentFetcherTests: XCTestCase {
-    // MARK: - parseRawContentURL
+    // MARK: - parseRawContentURL (new format — ref in ?ref= query param)
 
-    func testParsesStandardRawContentURL() {
+    /// Primary format emitted by the engine (≥ #805 fix): branch in `?ref=`,
+    /// file path in URL path starting at segment 2. Supports slashed branch
+    /// names because `URLComponents.queryItems` decodes `%2F` back to `/`.
+    func testParsesNewFormatMainBranch() {
+        let url = URL(string: "https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=main")!
+        let parsed = GitHubContentFetcher.parseRawContentURL(url)
+        XCTAssertEqual(parsed?.owner, "spinyfin")
+        XCTAssertEqual(parsed?.repo, "mono")
+        XCTAssertEqual(parsed?.ref, "main")
+        XCTAssertEqual(parsed?.path, "tools/boss/docs/designs/foo.md")
+    }
+
+    /// Regression test for the core bug: a `boss/exec_*` branch name
+    /// contains `/`. The engine percent-encodes it as `%2F` in the query
+    /// string; `URLComponents` decodes it back to `/` so the full branch
+    /// name is preserved when the endpoint is constructed.
+    func testParsesSlashedRefFromQueryParam() {
+        let url = URL(string: "https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=boss%2Fexec_18b07a506d2518d0_1b")!
+        let parsed = GitHubContentFetcher.parseRawContentURL(url)
+        XCTAssertEqual(parsed?.owner, "spinyfin")
+        XCTAssertEqual(parsed?.repo, "mono")
+        XCTAssertEqual(parsed?.ref, "boss/exec_18b07a506d2518d0_1b")
+        XCTAssertEqual(parsed?.path, "tools/boss/docs/designs/foo.md")
+    }
+
+    func testParsesNewFormatNonMainBranch() {
+        let url = URL(string: "https://raw.githubusercontent.com/foo/bar/docs/x.md?ref=release-1.2")!
+        XCTAssertEqual(GitHubContentFetcher.parseRawContentURL(url)?.ref, "release-1.2")
+        XCTAssertEqual(GitHubContentFetcher.parseRawContentURL(url)?.path, "docs/x.md")
+    }
+
+    // MARK: - parseRawContentURL (old format — ref in path, backward compat)
+
+    /// Old-format URLs (engine before the #805 fix) have the branch as the
+    /// third path segment. These are accepted for backward compatibility.
+    func testParsesOldFormatStandardURL() {
         let url = URL(string: "https://raw.githubusercontent.com/foo/bar/main/docs/x.md")!
         let parsed = GitHubContentFetcher.parseRawContentURL(url)
         XCTAssertEqual(
@@ -23,22 +58,7 @@ final class GitHubContentFetcherTests: XCTestCase {
         )
     }
 
-    func testParsesNestedPath() {
-        let url = URL(string: "https://raw.githubusercontent.com/spinyfin/mono/main/tools/boss/docs/designs/foo.md")!
-        let parsed = GitHubContentFetcher.parseRawContentURL(url)
-        XCTAssertEqual(parsed?.owner, "spinyfin")
-        XCTAssertEqual(parsed?.repo, "mono")
-        XCTAssertEqual(parsed?.ref, "main")
-        XCTAssertEqual(parsed?.path, "tools/boss/docs/designs/foo.md")
-    }
-
-    /// Refs that look like branch names with no `/` round-trip cleanly
-    /// — these are the common case for merged docs (`main`) and for
-    /// tag/SHA refs.
-    func testParsesSimpleRefName() {
-        let url = URL(string: "https://raw.githubusercontent.com/foo/bar/release-1.2/docs/x.md")!
-        XCTAssertEqual(GitHubContentFetcher.parseRawContentURL(url)?.ref, "release-1.2")
-    }
+    // MARK: - parseRawContentURL (error cases)
 
     /// Wrong host returns `nil` so the caller can throw
     /// `unsupportedHost` instead of constructing a garbage endpoint.
@@ -48,6 +68,13 @@ final class GitHubContentFetcherTests: XCTestCase {
     }
 
     func testReturnsNilWhenPathHasTooFewSegments() {
+        // Old format needs ≥4 segments; new format needs ≥3. Two segments → nil.
+        let url = URL(string: "https://raw.githubusercontent.com/foo/bar")!
+        XCTAssertNil(GitHubContentFetcher.parseRawContentURL(url))
+    }
+
+    func testReturnsNilWhenOldFormatMissingPath() {
+        // Three segments with no ?ref= → old format → needs ≥4 → nil.
         let url = URL(string: "https://raw.githubusercontent.com/foo/bar/main")!
         XCTAssertNil(GitHubContentFetcher.parseRawContentURL(url))
     }
@@ -88,6 +115,26 @@ final class GitHubContentFetcherTests: XCTestCase {
         XCTAssertEqual(
             GitHubContentFetcher.contentsAPIEndpoint(for: ref),
             "/repos/spinyfin/mono/contents/tools/boss/docs/designs/foo.md?ref=main"
+        )
+    }
+
+    // MARK: - Full round-trip: new-format URL → parseRawContentURL → contentsAPIEndpoint
+
+    /// End-to-end: the engine emits a URL with `%2F`-encoded branch, the
+    /// parser recovers the full branch name, and the endpoint passes it
+    /// unencoded to `gh api` — matching what the task's proof confirms works:
+    /// `gh api repos/spinyfin/mono/contents/<doc>?ref=boss/exec_18b07a506d2518d0_1b → 200`.
+    func testRoundTripSlashedRefNewFormat() {
+        let rawURL = URL(string: "https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=boss%2Fexec_18b07a506d2518d0_1b")!
+        guard let parsed = GitHubContentFetcher.parseRawContentURL(rawURL) else {
+            XCTFail("parseRawContentURL returned nil for new-format slashed-ref URL")
+            return
+        }
+        let endpoint = GitHubContentFetcher.contentsAPIEndpoint(for: parsed)
+        XCTAssertEqual(
+            endpoint,
+            "/repos/spinyfin/mono/contents/tools/boss/docs/designs/foo.md?ref=boss/exec_18b07a506d2518d0_1b",
+            "endpoint must pass the unencoded branch name to gh api"
         )
     }
 

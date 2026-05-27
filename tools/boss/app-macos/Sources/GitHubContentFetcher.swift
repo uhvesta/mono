@@ -55,10 +55,9 @@ enum GitHubContentFetcher {
         }
     }
 
-    /// Components extracted from a `raw.githubusercontent.com` URL of
-    /// the shape `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<path...>`.
-    /// `ref` may be a branch (`main`), a tag, or a SHA; `path` can
-    /// itself contain `/` separators (e.g. `tools/boss/docs/x.md`).
+    /// Components extracted from a `raw.githubusercontent.com` URL.
+    /// `ref` may be a branch (`main`, `boss/exec_*`), a tag, or a SHA;
+    /// `path` can itself contain `/` separators (e.g. `tools/boss/docs/x.md`).
     struct RawContentRef: Equatable {
         var owner: String
         var repo: String
@@ -69,16 +68,44 @@ enum GitHubContentFetcher {
     /// Parse a GitHub raw-content URL. Returns `nil` for any URL that
     /// is not on the `raw.githubusercontent.com` host so callers can
     /// distinguish "wrong host" from "wrong shape".
+    ///
+    /// Two URL formats are accepted:
+    ///
+    /// - **New format** (engine ≥ #805 fix): the branch is in the `?ref=`
+    ///   query param and the path starts at segment 2. Slashes in the branch
+    ///   name are percent-encoded as `%2F` by the engine; `URLComponents`
+    ///   decodes them transparently.
+    ///   `https://raw.githubusercontent.com/<owner>/<repo>/<path>?ref=<branch>`
+    ///
+    /// - **Old format** (backward compat): the branch is segment 2 and the
+    ///   path starts at segment 3. Works for branch names without `/`; a
+    ///   slashed branch would be silently truncated to its first component.
+    ///   `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>`
     static func parseRawContentURL(_ url: URL) -> RawContentRef? {
         guard url.host?.lowercased() == "raw.githubusercontent.com" else {
             return nil
         }
         let segments = url.pathComponents.filter { $0 != "/" }
-        guard segments.count >= 4 else { return nil }
+        guard segments.count >= 3 else { return nil }
         let owner = segments[0]
         let repo = segments[1]
-        let ref = segments[2]
-        let path = segments[3...].joined(separator: "/")
+
+        // New format: branch in ?ref= query param (supports slashed branch names).
+        // Old format fallback: branch as segment[2] (no slash support, backward compat).
+        let ref: String
+        let path: String
+        if let queryRef = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "ref" })?
+            .value, !queryRef.isEmpty {
+            ref = queryRef
+            path = segments[2...].joined(separator: "/")
+        } else {
+            guard segments.count >= 4 else { return nil }
+            ref = segments[2]
+            path = segments[3...].joined(separator: "/")
+        }
+
         guard !owner.isEmpty, !repo.isEmpty, !ref.isEmpty, !path.isEmpty else {
             return nil
         }
