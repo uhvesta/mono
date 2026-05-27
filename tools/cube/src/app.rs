@@ -332,12 +332,26 @@ fn ensure_repo(
 
     let record = infer_repo_record_from_origin(origin, defaults)?;
     if let Some(existing) = store.get_repo(&record.repo)? {
-        // Treat two URLs as equivalent when they differ only in auth-identity
-        // prefix (e.g. `org-X@github.com:` vs `git@github.com:`). Corporate
-        // git configs rewrite remote URLs with an org-specific user prefix, so
-        // the stored origin and the incoming origin may not match exactly even
-        // when they point at the same repo.
-        if !origin_urls_equivalent(&existing.origin, origin) {
+        // The repo is already configured under this id, so we never need to
+        // synthesise an origin to clone with — `existing.origin` is the source
+        // of truth. Two arrival shapes are acceptable:
+        //
+        //   1. An equivalent URL. URLs are treated as equivalent when they
+        //      differ only in auth-identity prefix (e.g. `org-X@github.com:`
+        //      vs `git@github.com:`) or trailing `.git`. Corporate git configs
+        //      rewrite remotes with an org-specific user prefix, so the stored
+        //      and incoming origins may not match exactly even when they point
+        //      at the same repo.
+        //
+        //   2. A bare `owner/name` slug. Boss callers sometimes only carry the
+        //      product's `owner/name` slug, not the registered origin URL.
+        //      Rather than reconstruct an origin from the slug and assert on
+        //      that guess (which can never match an SSO-scoped SSH origin like
+        //      `org-127256988@github.com:...`), compare the slug against the
+        //      *registered* origin's path and treat a match as a no-op success.
+        let matches = origin_urls_equivalent(&existing.origin, origin)
+            || (is_bare_repo_slug(origin) && origin_path_matches_slug(&existing.origin, origin));
+        if !matches {
             return Err(CubeError::InvalidArgument(format!(
                 "repo `{}` is already configured for origin `{}`; cannot ensure `{origin}`",
                 existing.repo, existing.origin
@@ -449,6 +463,35 @@ fn origin_urls_equivalent(a: &str, b: &str) -> bool {
         // we never accidentally allow a mismatch.
         _ => a == b,
     }
+}
+
+/// Returns `true` when `origin` is a bare `owner/name` slug (e.g.
+/// `linkedin-multiproduct/dev-infra`) rather than a full clone URL. Such a
+/// slug has a `/` path separator but no scheme, host, or SSH `user@host:`
+/// prefix, so [`parse_origin`] cannot turn it into a real origin. Boss
+/// callers sometimes only carry the product's `owner/name` slug.
+fn is_bare_repo_slug(origin: &str) -> bool {
+    let s = origin.trim().trim_end_matches('/');
+    !s.is_empty()
+        && !s.contains(':')
+        && !s.contains('@')
+        && !s.starts_with('/')
+        && s.split('/').filter(|seg| !seg.is_empty()).count() >= 2
+        && parse_origin(s).is_none()
+}
+
+/// Returns `true` when a bare `owner/name` `slug` names the same repo as the
+/// registered `origin` URL — i.e. the slug equals the origin's parsed path
+/// (ignoring a trailing `.git`). This compares against the *registered*
+/// origin rather than synthesising one to assert with, so an "ensure" call
+/// that arrives with only a slug succeeds when (and only when) it actually
+/// refers to the configured repo.
+fn origin_path_matches_slug(origin: &str, slug: &str) -> bool {
+    let Some(parsed) = parse_origin(origin) else {
+        return false;
+    };
+    let slug = slug.trim().trim_end_matches('/').trim_end_matches(".git");
+    parsed.path == slug
 }
 
 fn normalize_origin(origin: &str) -> Result<String> {
@@ -2936,7 +2979,8 @@ mod tests {
 
     use super::{
         CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result, current_epoch_s,
-        origin_urls_equivalent, parse_origin, run_with_context, run_with_dependencies,
+        is_bare_repo_slug, origin_path_matches_slug, origin_urls_equivalent, parse_origin,
+        run_with_context, run_with_dependencies,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -3623,6 +3667,40 @@ mod tests {
         ));
     }
 
+    // --- is_bare_repo_slug / origin_path_matches_slug unit tests ---
+
+    #[test]
+    fn is_bare_repo_slug_accepts_owner_name() {
+        assert!(is_bare_repo_slug("linkedin-multiproduct/dev-infra"));
+        assert!(is_bare_repo_slug("foo/bar"));
+        // Trailing slash and `.git` are tolerated.
+        assert!(is_bare_repo_slug("foo/bar/"));
+    }
+
+    #[test]
+    fn is_bare_repo_slug_rejects_real_urls_and_single_segment() {
+        // Real clone URLs are not slugs.
+        assert!(!is_bare_repo_slug("git@github.com:foo/bar.git"));
+        assert!(!is_bare_repo_slug("https://github.com/foo/bar.git"));
+        assert!(!is_bare_repo_slug("ssh://org-1@github.com/foo/bar.git"));
+        // A single bare name has no `owner/` and is not a slug.
+        assert!(!is_bare_repo_slug("dev-infra"));
+        assert!(!is_bare_repo_slug(""));
+        // An absolute path is not a slug.
+        assert!(!is_bare_repo_slug("/foo/bar"));
+    }
+
+    #[test]
+    fn origin_path_matches_slug_compares_against_registered_origin() {
+        let origin = "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git";
+        assert!(origin_path_matches_slug(origin, "linkedin-multiproduct/dev-infra"));
+        assert!(origin_path_matches_slug(origin, "linkedin-multiproduct/dev-infra.git"));
+        // Different owner does not match.
+        assert!(!origin_path_matches_slug(origin, "some-other-org/dev-infra"));
+        // Same name, different owner is still a mismatch.
+        assert!(!origin_path_matches_slug(origin, "dev-infra"));
+    }
+
     #[test]
     fn repo_ensure_accepts_auth_prefixed_url_when_plain_stored() {
         let (tempdir, database_path) = with_database_path();
@@ -3830,6 +3908,101 @@ mod tests {
         assert!(matches!(err, CubeError::InvalidArgument(_)));
         let msg = err.to_string();
         assert!(msg.contains("cannot ensure"), "error: {msg}");
+    }
+
+    #[test]
+    fn repo_ensure_accepts_bare_slug_when_already_configured() {
+        // Reproduces issue #837: the repo is registered with an SSO-scoped
+        // SSH origin, but Boss ensures it with only the product's bare
+        // `owner/name` slug. Cube must not synthesise an origin from the slug
+        // and assert it matches — a slug that names the configured repo is a
+        // no-op success.
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("dev-infra")).expect("source dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "dev-infra",
+            "--origin",
+            "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "dev-infra-agent-",
+            "--source",
+            &defaults.repo_root.join("dev-infra").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "linkedin-multiproduct/dev-infra",
+        ]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            None,
+        )
+        .expect("ensure with a bare slug should succeed when the repo is configured");
+
+        assert_eq!(result.payload["repo_id"], "dev-infra");
+        // The registered origin — not the slug — is returned.
+        assert_eq!(
+            result.payload["repo"]["origin"],
+            "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git"
+        );
+    }
+
+    #[test]
+    fn repo_ensure_rejects_bare_slug_with_different_owner() {
+        // A slug whose owner differs from the registered origin's path is a
+        // genuine conflict, not a no-op — keep rejecting it.
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        std::fs::create_dir_all(defaults.repo_root.join("dev-infra")).expect("source dir");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "dev-infra",
+            "--origin",
+            "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "dev-infra-agent-",
+            "--source",
+            &defaults.repo_root.join("dev-infra").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "some-other-org/dev-infra",
+        ]);
+        let err = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            None,
+        )
+        .expect_err("ensure with a mismatched slug should fail");
+
+        assert!(matches!(err, CubeError::InvalidArgument(_)));
+        assert!(err.to_string().contains("cannot ensure"), "error: {err}");
     }
 
     #[test]
