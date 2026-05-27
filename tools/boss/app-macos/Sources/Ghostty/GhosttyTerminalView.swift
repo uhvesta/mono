@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import GhosttyKit
+import os
 
 private extension NSScreen {
     var ghosttyDisplayID: UInt32 {
@@ -75,6 +76,13 @@ final class GhosttyTerminalHostView: NSView {
     /// crashing the app we keep the pane in a surface-less placeholder
     /// state and retry when the display set changes (#800).
     private var screenObserver: NSObjectProtocol?
+
+    /// os_signpost interval state for an in-flight left-button selection
+    /// drag (mouseDown→mouseUp), plus the dropped-frame counter that runs
+    /// only for that span. See [[UISignpost]] / [[InteractionFrameCounter]]
+    /// — instrumentation for the pane-sluggishness shake.
+    private var dragSignpostState: OSSignpostIntervalState?
+    private let frameCounter = InteractionFrameCounter()
 
     private var lastSyncedBackingSize: CGSize = .zero
     private var lastSizeSyncTimestamp: TimeInterval = 0
@@ -341,6 +349,7 @@ final class GhosttyTerminalHostView: NSView {
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
         if accepted, let surface {
+            UISignpost.signposter.emitEvent(UISignpost.Name.focusSwitch, "become")
             // Dispatch off the main thread — see focusQueue doc-comment above.
             let box = SurfaceBox(surface: surface)
             Self.focusQueue.async {
@@ -353,6 +362,7 @@ final class GhosttyTerminalHostView: NSView {
     override func resignFirstResponder() -> Bool {
         let accepted = super.resignFirstResponder()
         if accepted, let surface {
+            UISignpost.signposter.emitEvent(UISignpost.Name.focusSwitch, "resign")
             // Dispatch off the main thread for symmetry with becomeFirstResponder.
             let box = SurfaceBox(surface: surface)
             Self.focusQueue.async {
@@ -418,6 +428,7 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        UISignpost.signposter.emitEvent(UISignpost.Name.mouseMove, "drag")
         sendMousePosition(event)
     }
 
@@ -431,11 +442,21 @@ final class GhosttyTerminalHostView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        // The left press→release span is the selection-drag interaction
+        // the shake flagged. Bracket it with a signpost interval and run
+        // the dropped-frame counter so a stuttery drag is measurable.
+        dragSignpostState = UISignpost.signposter.beginInterval(UISignpost.Name.selectionDrag)
+        frameCounter.begin(on: self)
         sendMouseButton(event, state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_LEFT)
     }
 
     override func mouseUp(with event: NSEvent) {
         sendMouseButton(event, state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_LEFT)
+        frameCounter.end(context: session.displayTitle)
+        if let dragSignpostState {
+            UISignpost.signposter.endInterval(UISignpost.Name.selectionDrag, dragSignpostState)
+            self.dragSignpostState = nil
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -466,6 +487,7 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        UISignpost.signposter.emitEvent(UISignpost.Name.keystroke)
         sendKey(event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
     }
 
@@ -514,7 +536,12 @@ final class GhosttyTerminalHostView: NSView {
 
         if target != lastSyncedBackingSize {
             lastSyncedBackingSize = target
+            // Reflowing the scrollback here is O(history) and runs on the
+            // main thread; signpost it so a long reflow lines up with any
+            // recorded stall in Instruments (pane-sluggishness shake).
+            let reflow = UISignpost.signposter.beginInterval(UISignpost.Name.geometryReflow)
             ghostty_surface_set_size(surface, UInt32(target.width), UInt32(target.height))
+            UISignpost.signposter.endInterval(UISignpost.Name.geometryReflow, reflow)
         }
 
         if let window {
