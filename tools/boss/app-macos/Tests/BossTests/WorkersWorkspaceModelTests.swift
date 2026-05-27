@@ -98,6 +98,44 @@ final class GhosttyTerminalHostSubmissionPlanTests: XCTestCase {
 }
 
 @MainActor
+final class GhosttyTerminalHostSurfaceFailureDiagnosticTests: XCTestCase {
+    func testDiagnosticReportsEveryControlledInput() {
+        // When `ghostty_surface_new` returns NULL the host view no
+        // longer `fatalError`s (issue #800 — a no-active-display
+        // condition crashed the whole app). The NULL path is now a
+        // logged, recoverable event, so the diagnostic block is the
+        // only signal that survives into the dev log / os_log. Pin its
+        // contract: every input we control must be reported, so a
+        // future libghostty-rejection is still debuggable from the log
+        // alone.
+        let diagnostic = GhosttyTerminalHostView.surfaceFailureDiagnostic(
+            appNonNil: true,
+            workingDirectory: "/tmp/workdir",
+            cwdExists: false,
+            isDirectory: false,
+            fontSize: 13,
+            scaleFactor: 2.0,
+            envVarCount: 3,
+            envSummary: "PATH=/usr/bin, TERM=xterm",
+            initialInputCount: 42
+        )
+
+        // Match label and value independently so the test pins the
+        // contract (every field is reported) without being brittle to
+        // the column-alignment whitespace.
+        XCTAssertTrue(diagnostic.contains("ghostty_surface_new returned NULL"))
+        XCTAssertTrue(diagnostic.contains("runtime.app != nil:"))
+        XCTAssertTrue(diagnostic.contains("workingDirectory:"))
+        XCTAssertTrue(diagnostic.contains("/tmp/workdir"))
+        XCTAssertTrue(diagnostic.contains("env_var_count:"))
+        XCTAssertTrue(diagnostic.contains("env (first 8):"))
+        XCTAssertTrue(diagnostic.contains("PATH=/usr/bin, TERM=xterm"))
+        XCTAssertTrue(diagnostic.contains("initialInput (chars):"))
+        XCTAssertTrue(diagnostic.contains("42"))
+    }
+}
+
+@MainActor
 final class WorkersWorkspaceModelFocusTests: XCTestCase {
     func testFocusUnknownSlotReturnsUnknownSlot() {
         let model = WorkersWorkspaceModel()
