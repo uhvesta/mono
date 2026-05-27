@@ -680,7 +680,18 @@ fn compose_execution_prompt(
     prompt.push_str(&format!("- execution kind: `{}`\n", execution.kind));
     prompt.push_str(&format!("- workspace: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("- work item: `{}`\n", work_item_name(work_item)));
-    if existing_pr_url.is_none() {
+    // The "expected branch name" line directs the worker to push to a fresh
+    // `boss/exec_<id>` bookmark and is correct only for executions that open
+    // their OWN PR. A revision's deliverable is a new commit on the parent
+    // PR's existing branch (see `compose_revision_directive`), so templating a
+    // `boss/exec_*` branch name here would directly contradict that block's
+    // "Do NOT create a `boss/exec_*` bookmark" instruction — and the revision
+    // exec id has no corresponding branch anyway, so pushing it would create a
+    // dangling branch no PR points at (issue #842). Omit the line for
+    // revisions and let the revision directive be the only word on branching.
+    // (`existing_pr_url` is the work item's PR; revisions carry the parent PR
+    // on `execution.pr_url`, so this guard is checked independently.)
+    if existing_pr_url.is_none() && execution.kind != "revision_implementation" {
         prompt.push_str(&format!(
             "- expected branch name: `{expected_branch}` — the engine reconstructs this from your execution id and uses it to find your PR. Push to this exact bookmark name.\n",
         ));
@@ -2470,6 +2481,58 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("## Pre-push build gate (Bazel workspace)"),
             "revision chores (the #804 offenders) must get the bazel gate:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn revision_prompt_omits_expected_branch_line() {
+        // Issue #842: the preamble "expected branch name" line directs the
+        // worker to push a fresh `boss/exec_*` bookmark, which directly
+        // contradicts the revision directive's "Do NOT create a
+        // `boss/exec_*` bookmark". A revision lands its commit on the
+        // parent PR's existing branch, so the line must be omitted.
+        let ws = tempfile::TempDir::new().unwrap();
+        let prompt = compose_execution_prompt(
+            &revision_execution("https://github.com/org/repo/pull/250"),
+            &chore_without_pr(),
+            None,
+            ws.path(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("expected branch name"),
+            "revision prompt must NOT template the expected-branch line (issue #842):\n{prompt}",
+        );
+        // The revision directive remains the only — and now uncontradicted —
+        // word on branching.
+        assert!(
+            prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+            "revision directive must still forbid creating a boss/exec_* bookmark:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn chore_prompt_keeps_expected_branch_line() {
+        // Guard the inverse: a fresh chore opens its own PR off a
+        // `boss/exec_<id>` branch, so it must still be told the
+        // engine-supplied branch name to push to.
+        let ws = tempfile::TempDir::new().unwrap();
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            ws.path(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("expected branch name"),
+            "a fresh chore must still receive the expected-branch line:\n{prompt}",
         );
     }
 
