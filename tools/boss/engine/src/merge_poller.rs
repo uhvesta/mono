@@ -133,6 +133,11 @@ crate::register_counter!(
     "merge_poller.late_pr_recovered",
     "Late PRs bound to active tasks from terminal executions (double-spawn recovery) in one sweep."
 );
+crate::register_counter!(
+    REVISION_INVALIDATED,
+    "merge_poller.revision_invalidated",
+    "Pending/active revision executions stopped because their parent PR merged or closed in one sweep."
+);
 
 /// Register all merge-poller counter handles with `registry`. Called
 /// from [`crate::metrics::init_all`] at engine startup.
@@ -145,6 +150,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&PR_RECHECK_UNRESOLVED);
     registry.register_counter(&MERGE_QUEUE_REBOUNCED);
     registry.register_counter(&LATE_PR_RECOVERED);
+    registry.register_counter(&REVISION_INVALIDATED);
 }
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -1268,6 +1274,12 @@ pub struct SweepOutcome {
     /// the normal `pending_pr_recheck` sweep (which only watches
     /// `waiting_human`) cannot recover them.
     pub late_pr_recovered: usize,
+    /// Number of in-flight revision executions stopped (force-released +
+    /// cancelled) because their parent PR merged or closed while they were
+    /// queued or running. Each stopped execution corresponds to a revision
+    /// task that was already blocked in the same DB transaction that
+    /// transitioned the parent to `done`.
+    pub revision_invalidated: usize,
 }
 
 impl SweepOutcome {
@@ -1282,6 +1294,7 @@ impl SweepOutcome {
             + self.merge_queue_rebounced
             + self.ci_remediation_redispatched
             + self.late_pr_recovered
+            + self.revision_invalidated
     }
 }
 
@@ -1419,7 +1432,7 @@ pub async fn run_one_pass(
         if !seen.insert(candidate.work_item_id.clone()) {
             continue;
         }
-        sweep_one(work_db, probe, publisher, cube_client, candidate, &mut outcome).await;
+        sweep_one(work_db, probe, publisher, cube_client, completion_handler, candidate, &mut outcome).await;
     }
     if let Some(handler) = completion_handler {
         for execution_id in &pending_pr_recheck {
@@ -1473,6 +1486,71 @@ pub async fn run_one_pass(
         check_merge_queue_rebounce(work_db, publisher, candidate, &mut outcome).await;
     }
     outcome
+}
+
+/// Stop every in-flight `revision_implementation` execution belonging to
+/// revisions of `chain_root_id` now that the parent PR has merged.
+///
+/// The DB transaction in `mark_chore_pr_merged` already blocked the
+/// revision tasks (via `block_pending_revisions_on_parent_close`).  This
+/// function handles the execution side: force-release each cube workspace
+/// lease so the slot is freed, then cancel the execution row so the
+/// dispatcher treats it as terminal.
+///
+/// When `completion_handler` is `None` (tests, cold-path wiring) this
+/// function is a no-op; the tasks are already blocked in the DB, and the
+/// scheduler will not redispatch them on the next reconcile cycle.
+async fn stop_active_revision_executions(
+    work_db: &WorkDb,
+    completion_handler: Option<&WorkerCompletionHandler>,
+    chain_root_id: &str,
+    outcome: &mut SweepOutcome,
+) {
+    let Some(handler) = completion_handler else {
+        return;
+    };
+    let executions = match work_db.list_active_revision_executions_for_chain(chain_root_id) {
+        Ok(execs) => execs,
+        Err(err) => {
+            tracing::warn!(
+                chain_root_id,
+                ?err,
+                "merge poller: failed to list active revision executions for chain; \
+                 revision tasks are already blocked but their leases may not be released",
+            );
+            return;
+        }
+    };
+    for execution in &executions {
+        tracing::info!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            chain_root_id,
+            "merge poller: stopping revision execution — parent PR merged",
+        );
+        // Release the pane and cube workspace lease without altering
+        // execution status (force_release does not change status).
+        handler.force_release(&execution.id).await;
+        // Now mark the execution terminal so the dispatcher won't try to
+        // re-schedule it.  `cancel_execution` resets task status to `todo`
+        // only when it's currently `active`; since the task is already
+        // `blocked` (set in the DB transaction), that guard won't fire.
+        match work_db.cancel_execution(&execution.id) {
+            Ok(_) => {
+                outcome.revision_invalidated += 1;
+            }
+            Err(err) => {
+                // The execution may have already moved to a terminal state
+                // (raced with the worker finishing, or a prior sweep).
+                // Log at debug — not a concern since the lease is released.
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "merge poller: cancel_execution failed for revision (may already be terminal)",
+                );
+            }
+        }
+    }
 }
 
 /// Re-run PR detection against an execution that the on-Stop hook
@@ -1639,6 +1717,7 @@ async fn sweep_one(
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
+    completion_handler: Option<&WorkerCompletionHandler>,
     candidate: &PendingMergeCheck,
     outcome: &mut SweepOutcome,
 ) {
@@ -1656,9 +1735,21 @@ async fn sweep_one(
     };
     match &probe_result.state {
         PrLifecycleState::Merged => {
-            if mark_merged(work_db, publisher, candidate, &probe_result).await {
+            if mark_merged(work_db, publisher, completion_handler, candidate, &probe_result).await {
                 outcome.merged += 1;
             }
+            // Invalidate any in-flight revision executions whose parent
+            // just merged.  `block_pending_revisions_on_parent_close`
+            // already ran inside `mark_chore_pr_merged`'s transaction;
+            // here we force-release their cube leases and mark them
+            // terminal so the scheduler doesn't try to redispatch.
+            stop_active_revision_executions(
+                work_db,
+                completion_handler,
+                &candidate.work_item_id,
+                outcome,
+            )
+            .await;
         }
         PrLifecycleState::Open(open) => {
             // Design §Q1: conflict pre-empts CI — the conflict-resolver
@@ -1998,6 +2089,7 @@ pub(crate) async fn update_pr_poll_state(
 async fn mark_merged(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
+    _completion_handler: Option<&WorkerCompletionHandler>,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {
@@ -2112,6 +2204,7 @@ pub fn spawn_loop(
             PR_RECHECK_UNRESOLVED.inc_by(&metrics, outcome.pr_recheck_unresolved as u64);
             MERGE_QUEUE_REBOUNCED.inc_by(&metrics, outcome.merge_queue_rebounced as u64);
             LATE_PR_RECOVERED.inc_by(&metrics, outcome.late_pr_recovered as u64);
+            REVISION_INVALIDATED.inc_by(&metrics, outcome.revision_invalidated as u64);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -2124,6 +2217,7 @@ pub fn spawn_loop(
                     pr_recheck_unresolved = outcome.pr_recheck_unresolved,
                     merge_queue_rebounced = outcome.merge_queue_rebounced,
                     late_pr_recovered = outcome.late_pr_recovered,
+                    revision_invalidated = outcome.revision_invalidated,
                     "merge poller: sweep transitions",
                 );
             }
