@@ -1684,6 +1684,40 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Return every non-terminal `revision_implementation` execution whose
+    /// task is a revision in the chain rooted at `chain_root_id`.  Used by
+    /// the merge poller to find in-flight revision workers to stop after
+    /// the parent PR merges.  Only executions that hold a cube workspace
+    /// lease are returned (same predicate as `list_in_flight_executions`).
+    pub fn list_active_revision_executions_for_chain(
+        &self,
+        chain_root_id: &str,
+    ) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let revision_ids = collect_chain_revision_ids(&conn, chain_root_id)?;
+        if revision_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut executions = Vec::new();
+        for rev_id in &revision_ids {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                        cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                        created_at, started_at, finished_at,
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                 FROM work_executions
+                 WHERE work_item_id = ?1
+                   AND kind = 'revision_implementation'
+                   AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                   AND cube_lease_id IS NOT NULL
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([rev_id], map_execution)?;
+            collect_rows(rows).map(|mut v| executions.append(&mut v))?;
+        }
+        Ok(executions)
+    }
+
     pub fn reconcile_product_executions(
         &self,
         product_id: &str,
@@ -4138,6 +4172,11 @@ impl WorkDb {
         // revisions on it to `done` as well.  A revision's deliverable
         // (the commit) rode the parent PR to its terminal state.
         flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
+        // Invalidation: any revision still in a pre-dispatch state
+        // (todo / active / waiting_dependency / blocked-for-another-reason)
+        // can never push to the merged PR.  Block them now so the
+        // scheduler stops dispatching them and the kanban shows why.
+        block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
         let updated = query_task(&tx, work_item_id)?
             .with_context(|| format!("unknown task after update: {work_item_id}"))?;
         tx.commit()?;
@@ -8470,6 +8509,64 @@ fn collect_chain_revision_ids(conn: &Connection, chain_root_id: &str) -> Result<
         frontier = next_frontier;
     }
     Ok(ids)
+}
+
+/// Block every revision in the chain whose status is still
+/// pre-dispatch (i.e. the worker never finished pushing a commit) when
+/// the parent PR merges or closes.  These revisions can no longer
+/// deliver to the parent PR's branch (it's gone), so they must not be
+/// dispatched.
+///
+/// Revisions already in `in_review` are handled by
+/// [`flip_in_review_revisions_to_done`] (their commit rode the PR to
+/// completion).  Revisions already `done`, `archived`, or
+/// `blocked: parent_pr_closed` are already in a terminal or equivalent
+/// state and are skipped.
+///
+/// Each newly blocked revision gets a `work_attention_items` row so
+/// the kanban card explains what happened and points the operator to
+/// `boss task create` for follow-up work.
+fn block_pending_revisions_on_parent_close(
+    conn: &Connection,
+    chain_root_id: &str,
+    now: &str,
+) -> Result<()> {
+    let revision_ids = collect_chain_revision_ids(conn, chain_root_id)?;
+    if revision_ids.is_empty() {
+        return Ok(());
+    }
+    for rev_id in &revision_ids {
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET status            = 'blocked',
+                 blocked_reason    = 'parent_pr_closed',
+                 last_status_actor = 'engine',
+                 updated_at        = ?2
+             WHERE id = ?1
+               AND kind = 'revision'
+               AND status NOT IN ('blocked', 'done', 'archived', 'in_review')
+               AND deleted_at IS NULL",
+            params![rev_id, now],
+        )?;
+        if rows_changed > 0 {
+            tracing::info!(
+                revision_id = %rev_id,
+                chain_root_id,
+                "block_pending_revisions: parent PR closed/merged; blocking revision",
+            );
+            let attn_id = next_id("attn");
+            conn.execute(
+                "INSERT INTO work_attention_items
+                     (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at)
+                 VALUES (?1, NULL, ?2, 'revision_parent_closed', 'open',
+                         'Parent PR merged while revision was pending',
+                         'The parent task''s PR was merged or closed before this revision could push its commit. The revision cannot be delivered. File a new chore (`boss task create`) to continue the work on the updated main branch.',
+                         ?3)",
+                params![attn_id, rev_id, now],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Add the `autostart` column to `tasks` for older databases. New
@@ -23480,5 +23577,192 @@ mod tests {
         };
         assert_eq!(seq(&r1.id), Some(1), "r1 must be R1");
         assert_eq!(seq(&r2.id), Some(2), "r2 must be R2");
+    }
+
+    // ── block_pending_revisions_on_parent_close / parent-PR-merged invalidation ─
+
+    /// When the parent PR merges, a `todo` revision must be blocked with
+    /// `parent_pr_closed` and an attention item surfaced.
+    #[test]
+    fn mark_chore_pr_merged_blocks_todo_revision() {
+        let db = WorkDb::open(temp_db_path("rev-invalidate-todo")).unwrap();
+        let product_id = make_revision_product(&db, "inv-todo");
+        let pr_url = "https://github.com/spinyfin/mono/pull/805";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+        assert_eq!(revision.status, "todo");
+
+        // Simulate the parent PR merging.
+        db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+        // The revision must now be blocked.
+        let rev_after = match db.get_work_item(&revision.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("unexpected variant: {other:?}"),
+        };
+        assert_eq!(
+            rev_after.status, "blocked",
+            "todo revision must be blocked after parent PR merges"
+        );
+        assert_eq!(
+            rev_after.blocked_reason.as_deref(),
+            Some("parent_pr_closed"),
+            "blocked_reason must be 'parent_pr_closed'"
+        );
+
+        // An attention item must be present for the revision.
+        let attn = db.list_attention_items_for_work_item(&revision.id).unwrap();
+        assert!(
+            attn.iter().any(|a| a.kind == "revision_parent_closed"),
+            "attention item 'revision_parent_closed' must be created for a blocked revision; got: {attn:?}",
+        );
+    }
+
+    /// A revision already in `in_review` must be flipped to `done` (not
+    /// `blocked`) — it delivered its commit before the parent merged.
+    #[test]
+    fn mark_chore_pr_merged_keeps_in_review_revision_done_not_blocked() {
+        let db = WorkDb::open(temp_db_path("rev-invalidate-in-review")).unwrap();
+        let product_id = make_revision_product(&db, "inv-ir");
+        let pr_url = "https://github.com/spinyfin/mono/pull/806";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        // Simulate the revision having pushed its commit and moved to in_review.
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+        let rev_after = match db.get_work_item(&revision.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("unexpected variant: {other:?}"),
+        };
+        assert_eq!(
+            rev_after.status, "done",
+            "in_review revision must become done (not blocked) when parent PR merges"
+        );
+    }
+
+    /// A revision already `done` must not be touched.
+    #[test]
+    fn mark_chore_pr_merged_does_not_re_block_done_revision() {
+        let db = WorkDb::open(temp_db_path("rev-invalidate-done")).unwrap();
+        let product_id = make_revision_product(&db, "inv-done");
+        let pr_url = "https://github.com/spinyfin/mono/pull/807";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id = ?1",
+            rusqlite::params![revision.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
+
+        let rev_after = match db.get_work_item(&revision.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("unexpected variant: {other:?}"),
+        };
+        assert_eq!(
+            rev_after.status, "done",
+            "already-done revision must not be touched"
+        );
+        assert_eq!(
+            rev_after.blocked_reason, None,
+            "done revision must not acquire a blocked_reason"
+        );
+    }
+
+    /// `list_active_revision_executions_for_chain` returns executions with a
+    /// cube lease but not ones that are already terminal.
+    #[test]
+    fn list_active_revision_executions_for_chain_returns_leased_only() {
+        let db = WorkDb::open(temp_db_path("rev-list-active-exec")).unwrap();
+        let product_id = make_revision_product(&db, "lare");
+        let pr_url = "https://github.com/spinyfin/mono/pull/808";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&parent_id), &checker)
+            .unwrap();
+
+        // Insert a running execution WITH a cube lease.
+        // Note: work_executions.priority is an i64 (0 = default); tasks.priority is TEXT.
+        let exec_id = next_id("exec");
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "INSERT INTO work_executions
+                 (id, work_item_id, kind, status, repo_remote_url, cube_lease_id,
+                  cube_workspace_id, workspace_path, priority, prefer_is_soft,
+                  created_at, started_at)
+             VALUES (?1, ?2, 'revision_implementation', 'running',
+                     'git@github.com:spinyfin/mono.git', 'lease-abc',
+                     'mono-agent-001', '/tmp/ws', 0, 0,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z')",
+            rusqlite::params![exec_id, revision.id],
+        )
+        .unwrap();
+
+        // Insert a terminal execution (cancelled) — must NOT be returned.
+        let exec_terminal = next_id("exec");
+        conn.execute(
+            "INSERT INTO work_executions
+                 (id, work_item_id, kind, status, repo_remote_url, cube_lease_id,
+                  cube_workspace_id, workspace_path, priority, prefer_is_soft,
+                  created_at, finished_at)
+             VALUES (?1, ?2, 'revision_implementation', 'cancelled',
+                     'git@github.com:spinyfin/mono.git', 'lease-old',
+                     'mono-agent-001', '/tmp/ws', 0, 0,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:05:00Z')",
+            rusqlite::params![exec_terminal, revision.id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let active = db
+            .list_active_revision_executions_for_chain(&parent_id)
+            .unwrap();
+        assert_eq!(active.len(), 1, "only the running leased execution must be returned");
+        assert_eq!(active[0].id, exec_id);
+    }
+
+    /// `list_active_revision_executions_for_chain` returns empty for a chain
+    /// root with no revisions.
+    #[test]
+    fn list_active_revision_executions_for_chain_empty_for_no_revisions() {
+        let db = WorkDb::open(temp_db_path("rev-list-exec-empty")).unwrap();
+        let product_id = make_revision_product(&db, "lare-empty");
+        let pr_url = "https://github.com/spinyfin/mono/pull/809";
+        let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+        let active = db
+            .list_active_revision_executions_for_chain(&parent_id)
+            .unwrap();
+        assert!(
+            active.is_empty(),
+            "chain with no revisions must yield empty vec"
+        );
     }
 }
