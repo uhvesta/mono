@@ -17,6 +17,6 @@ else
     CHECKLEFT_ARGS=(run --all)
 fi
 
-bazel run //tools/checkleft -- "${CHECKLEFT_ARGS[@]}"
+bazel run --config=ci-linux-disk-cache //tools/checkleft -- "${CHECKLEFT_ARGS[@]}"
 
 echo "[checks] ok"

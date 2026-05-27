@@ -10,6 +10,6 @@ set -euo pipefail
 echo "--- [bazel-test] starting"
 echo "[bazel-test] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-bazel test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/... -//tools/boss/experiments/...
+bazel test --config=ci-linux-disk-cache --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/... -//tools/boss/experiments/...
 
 echo "[bazel-test] ok"

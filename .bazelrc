@@ -1,7 +1,16 @@
 build --jobs=200
 build --disk_cache=~/.cache/bazelcache
+# Default GC limits — sized conservatively for macOS agents (disk-constrained).
 build --experimental_disk_cache_gc_max_size=30G
 build --experimental_disk_cache_gc_max_age=7d
+
+# Linux CI disk-cache GC config — less aggressive because Linux agents have
+# ~3 TB of disk.  2 TB cap leaves ~1 TB for the OS, working files, and other
+# toolchain artefacts; 30-day max-age keeps more cached Rust/Bazel outputs
+# between builds, reducing recompilation on cold caches.
+# Enable with --config=ci-linux-disk-cache on Linux Buildkite steps only.
+build:ci-linux-disk-cache --experimental_disk_cache_gc_max_size=2000G
+build:ci-linux-disk-cache --experimental_disk_cache_gc_max_age=30d
 
 # Always stamp builds with the git-derived version so that dev builds show a
 # meaningful version string (e.g. "1.0.9-dev-a58a932") in the About panel
