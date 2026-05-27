@@ -248,6 +248,143 @@ final class WorkDependencyKanbanTests: XCTestCase {
         XCTAssertNil(model.dragRefusalNotice)
     }
 
+    // MARK: - Dependency badge frontier
+
+    /// Phase 4 is blocked by Phase 2 (active, no gating prereqs).
+    /// The frontier for Phase 4 is exactly {Phase 2} — it is
+    /// reachable, unblocked, and open.
+    func testFrontierForDirectlyBlockedTask() {
+        let model = makeFixture()
+        guard let phase2 = model.taskByName("Phase 2"),
+              let phase4 = model.taskByName("Phase 4")
+        else {
+            XCTFail("expected fixture tasks"); return
+        }
+        let frontier = model.actionablePrereqFrontier(for: phase4.id)
+        XCTAssertEqual(frontier, [phase2.id])
+    }
+
+    /// Phase 1 is already done, so it is not open. The frontier for
+    /// a task blocked only by Phase 1 must be empty (nothing actionable).
+    func testFrontierExcludesTerminalPrereqs() {
+        let model = makeFixture()
+        guard let phase1 = model.taskByName("Phase 1") else {
+            XCTFail("expected fixture"); return
+        }
+        let productID = model.products.first?.id ?? "prod_test"
+        let projectID = model.projectsByProductID[productID]?.first?.id ?? "proj_test"
+        let staleBlocked = WorkTask(
+            id: "task_stale",
+            productID: productID,
+            projectID: projectID,
+            kind: "task",
+            name: "Stale Blocked",
+            description: "",
+            status: "blocked",
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "engine"
+        )
+        var tasks = model.tasksByProjectID[projectID] ?? []
+        tasks.append(staleBlocked)
+        model.tasksByProjectID[projectID] = tasks
+        model.dependenciesByProductID[productID, default: []].append(
+            WorkItemDependency(dependentID: staleBlocked.id, prerequisiteID: phase1.id, relation: "blocks")
+        )
+        let frontier = model.actionablePrereqFrontier(for: staleBlocked.id)
+        XCTAssertTrue(frontier.isEmpty, "frontier must be empty when the only prereq is already done")
+    }
+
+    /// Three-deep chain: Chore → A (blocked) → B (active, unblocked).
+    /// The frontier for Chore is {B} — A is blocked so it is not
+    /// actionable yet; B is the reachable leaf that is open and unblocked.
+    func testFrontierWalksThroughBlockedIntermediateNodes() {
+        let model = makeFixture()
+        let productID = model.products.first?.id ?? "prod_test"
+        let projectID = model.projectsByProductID[productID]?.first?.id ?? "proj_test"
+
+        let taskB = WorkTask(
+            id: "task_b",
+            productID: productID,
+            projectID: projectID,
+            kind: "task",
+            name: "Task B",
+            description: "",
+            status: "active",
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "human"
+        )
+        let taskA = WorkTask(
+            id: "task_a",
+            productID: productID,
+            projectID: projectID,
+            kind: "task",
+            name: "Task A",
+            description: "",
+            status: "blocked",
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "engine"
+        )
+        let chore = WorkTask(
+            id: "chore_c",
+            productID: productID,
+            projectID: nil,
+            kind: "chore",
+            name: "Chore C",
+            description: "",
+            status: "blocked",
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-05-08T00:00:00Z",
+            updatedAt: "2026-05-08T00:00:00Z",
+            lastStatusActor: "engine"
+        )
+        var tasks = model.tasksByProjectID[projectID] ?? []
+        tasks.append(contentsOf: [taskB, taskA])
+        model.tasksByProjectID[projectID] = tasks
+        model.choresByProductID[productID, default: []].append(chore)
+        model.dependenciesByProductID[productID, default: []] += [
+            WorkItemDependency(dependentID: taskA.id, prerequisiteID: taskB.id, relation: "blocks"),
+            WorkItemDependency(dependentID: chore.id, prerequisiteID: taskA.id, relation: "blocks"),
+        ]
+        let frontier = model.actionablePrereqFrontier(for: chore.id)
+        // Task A is blocked (not unblocked), so it is not in the frontier.
+        // Task B is active, unblocked — it is the actionable frontier.
+        XCTAssertEqual(frontier, [taskB.id])
+    }
+
+    /// `setDepBadgeHover` populates `depFrontierHighlightIDs` on enter
+    /// and clears it on leave (nil).
+    func testSetDepBadgeHoverPopulatesAndClearsHighlightSet() {
+        let model = makeFixture()
+        guard let phase2 = model.taskByName("Phase 2"),
+              let phase4 = model.taskByName("Phase 4")
+        else {
+            XCTFail("expected fixture tasks"); return
+        }
+        XCTAssertTrue(model.depFrontierHighlightIDs.isEmpty, "should start empty")
+        model.setDepBadgeHover(phase4.id)
+        XCTAssertEqual(model.depFrontierHighlightIDs, [phase2.id], "phase2 is the frontier for phase4")
+        model.setDepBadgeHover(nil)
+        XCTAssertTrue(model.depFrontierHighlightIDs.isEmpty, "should clear on nil")
+    }
+
     // MARK: - Fixture
 
     /// One product, one project, three tasks (Phase 1 done, Phase 2

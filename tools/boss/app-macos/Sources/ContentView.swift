@@ -803,10 +803,12 @@ struct ContentView: View {
     private func workSectionItems(_ items: [WorkTask], column: WorkBoardColumnKey) -> some View {
         let selectedID = model.selectedTask?.id
         let highlightID = model.revealHighlightID
+        let frontierIDs = model.depFrontierHighlightIDs
         VStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
                 let isSelected = selectedID == task.id
                 let isRevealed = highlightID == task.id
+                let isFrontierHighlighted = frontierIDs.contains(task.id)
                 WorkBoardCardItem(
                     task: task,
                     projectName: model.cardProjectBadge(for: task),
@@ -814,6 +816,7 @@ struct ContentView: View {
                     runtime: column == .doing ? model.taskRuntime(for: task.id) : nil,
                     isSelected: isSelected,
                     isRevealed: isRevealed,
+                    isFrontierHighlighted: isFrontierHighlighted,
                     model: model,
                     liveStates: model.liveWorkerStates
                 )
@@ -1312,6 +1315,11 @@ private struct WorkBoardCardItem: View {
     let runtime: WorkTaskRuntime?
     let isSelected: Bool
     var isRevealed: Bool = false
+    /// True when this card is part of the actionable prerequisite
+    /// frontier for a currently-hovered Dependency badge. Adds an
+    /// amber border overlay so the reader can see "what needs to happen
+    /// next" without opening the popover.
+    var isFrontierHighlighted: Bool = false
     @ObservedObject var model: ChatViewModel
     @ObservedObject var liveStates: LiveWorkerStateStore
 
@@ -1426,7 +1434,10 @@ private struct WorkBoardCardItem: View {
                     externalRefLink: externalRefLink,
                     ambiguousRepoNames: model.ambiguousVisibleRepoNames,
                     inReviewRevisions: inReviewRevisions,
-                    parentShortID: parentShortID
+                    parentShortID: parentShortID,
+                    onDepBadgeHover: { hovering in
+                        model.setDepBadgeHover(hovering ? task.id : nil)
+                    }
                 )
             }
             .buttonStyle(.plain)
@@ -1437,6 +1448,14 @@ private struct WorkBoardCardItem: View {
                         lineWidth: 3
                     )
                     .animation(.easeInOut(duration: 0.25), value: isRevealed)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        Color.orange.opacity(isFrontierHighlighted ? 0.7 : 0),
+                        lineWidth: 2
+                    )
+                    .animation(.easeInOut(duration: 0.15), value: isFrontierHighlighted)
             )
             .contextMenu {
                 if let id = task.shortID {
@@ -1628,6 +1647,11 @@ struct WorkBoardCardView: View {
     /// revision cards in Backlog/Doing. `nil` for non-revision tasks
     /// and revision tasks whose parent can't be resolved.
     var parentShortID: Int? = nil
+    /// Called with `true` when the pointer enters a Dependency badge
+    /// (the text badge or the chain link icon); `false` on exit.
+    /// `nil` when the card doesn't need to report badge hover (e.g.
+    /// in the Designs viewer).
+    var onDepBadgeHover: ((Bool) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1717,7 +1741,13 @@ struct WorkBoardCardView: View {
                         } else if isRemediatingCI {
                             ResolvingCIFailureBadge()
                         } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
+                            let isDependencyBadge = blockedText == WorkBlockedBadge.label(forReason: "dependency")
                             WorkStatusBadge(text: blockedText)
+                                .onHover { hovering in
+                                    if isDependencyBadge {
+                                        onDepBadgeHover?(hovering)
+                                    }
+                                }
                         }
                         if isAutoBlocked {
                             Image(systemName: "link")
@@ -1726,6 +1756,9 @@ struct WorkBoardCardView: View {
                                 .help(autoBlockTooltip)
                                 .accessibilityLabel("Auto-blocked by dependencies")
                                 .accessibilityValue(autoBlockTooltip)
+                                .onHover { hovering in
+                                    onDepBadgeHover?(hovering)
+                                }
                         }
                         if !stacksStatusBadges {
                             if showsConflictClearedBadge {

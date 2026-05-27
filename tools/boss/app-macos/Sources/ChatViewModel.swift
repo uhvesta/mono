@@ -75,6 +75,12 @@ final class ChatViewModel: ObservableObject {
     /// this to apply a transient border-glow overlay on the matching
     /// card.
     @Published var revealHighlightID: String?
+    /// Set of task IDs that should be highlighted as the actionable
+    /// prerequisite frontier when the pointer is over a Dependency
+    /// badge. Computed by `setDepBadgeHover`; cleared when the pointer
+    /// leaves the badge. Views observe this to apply a transient
+    /// amber border on every frontier card.
+    @Published private(set) var depFrontierHighlightIDs: Set<String> = []
     /// Task id that scroll views should bring into the visible area.
     /// Set by `revealWorkCard`; cleared after a short delay once the
     /// scroll has been triggered. Views observe this via `.onChange`
@@ -2414,6 +2420,68 @@ final class ChatViewModel: ObservableObject {
     /// while gated, regardless of who set the status last (Q4).
     func hasGatingPrereqs(_ task: WorkTask) -> Bool {
         !gatingPrereqs(for: task.id).isEmpty
+    }
+
+    // MARK: - Dependency badge hover / frontier highlight
+
+    /// Called when the pointer enters or leaves a Dependency badge on a
+    /// kanban card. On enter, computes the actionable prerequisite
+    /// frontier — the set of reachable, unblocked, open prerequisites —
+    /// and publishes them so every frontier card gets a transient
+    /// highlight. On leave (`nil`), clears the set.
+    func setDepBadgeHover(_ taskID: String?) {
+        guard let taskID else {
+            depFrontierHighlightIDs = []
+            return
+        }
+        depFrontierHighlightIDs = actionablePrereqFrontier(for: taskID)
+    }
+
+    /// Transitively walks the prerequisite DAG from `taskID` and
+    /// returns the IDs of every node that is:
+    ///   - reachable (transitively reachable through `blocks` edges),
+    ///   - unblocked (no incomplete prerequisites of its own), AND
+    ///   - open (not in a terminal / satisfied status).
+    ///
+    /// These are the "next actionable" items: completing them advances
+    /// the dependency frontier one step closer to unblocking the chore.
+    /// Deeper nodes that are still blocked themselves are traversed but
+    /// not added to the frontier (they aren't actionable yet); once they
+    /// unblock, the frontier advances through them automatically on the
+    /// next hover.
+    func actionablePrereqFrontier(for taskID: String) -> Set<String> {
+        guard let productID = task(withID: taskID)?.productID else { return [] }
+        let edges = dependenciesByProductID[productID] ?? []
+
+        var frontier: Set<String> = []
+        var visited: Set<String> = [taskID]
+        var queue: [String] = [taskID]
+
+        while !queue.isEmpty {
+            let current = queue.removeFirst()
+            let prereqIDs = edges
+                .filter { $0.dependentID == current && $0.relation == "blocks" }
+                .map { $0.prerequisiteID }
+
+            for prereqID in prereqIDs {
+                guard !visited.contains(prereqID) else { continue }
+                visited.insert(prereqID)
+
+                // Skip already-satisfied (terminal) items — they aren't open.
+                guard !isWorkItemSatisfied(prereqID) else { continue }
+
+                // An unblocked, open item is exactly what "actionable" means.
+                if gatingPrereqs(for: prereqID).isEmpty {
+                    frontier.insert(prereqID)
+                } else {
+                    // Still blocked itself — keep walking its prerequisites
+                    // so we can find the true frontier deeper in the DAG.
+                    queue.append(prereqID)
+                }
+            }
+        }
+
+        return frontier
     }
 
     private func workDependencyRow(forID id: String) -> WorkDependencyRow {
