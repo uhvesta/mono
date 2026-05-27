@@ -85,6 +85,7 @@ final class GhosttyTerminalHostView: NSView {
     private let frameCounter = InteractionFrameCounter()
 
     private var lastSyncedBackingSize: CGSize = .zero
+    private var lastAppliedContentScale: CGFloat = 0
     private var lastSizeSyncTimestamp: TimeInterval = 0
     private var pendingGeometrySync: DispatchWorkItem?
     /// Cap on how often we forward layout-driven size changes to
@@ -393,6 +394,22 @@ final class GhosttyTerminalHostView: NSView {
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+
+        // Core Animation uses layer.contentsScale to decide whether to upscale
+        // or downscale the layer contents during compositing. Without updating it
+        // here, moving the window to a different-DPI display leaves the compositor
+        // applying the wrong scale — the terminal content renders tiny/smooshed
+        // because the old scale factor freezes the layer geometry.
+        // Wrap in a CATransaction with animations disabled to suppress the implicit
+        // scale animation CoreAnimation would otherwise play.
+        // Ref: https://github.com/ghostty-org/ghostty/issues/2731
+        if let window {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer?.contentsScale = window.backingScaleFactor
+            CATransaction.commit()
+        }
+
         syncGeometry()
     }
 
@@ -534,21 +551,31 @@ final class GhosttyTerminalHostView: NSView {
             height: max(size.height, 1).rounded(.up)
         )
 
-        if target != lastSyncedBackingSize {
+        let currentScale = window?.backingScaleFactor ?? 1.0
+        let sizeChanged = target != lastSyncedBackingSize
+        let scaleChanged = currentScale != lastAppliedContentScale
+
+        if sizeChanged || scaleChanged {
             lastSyncedBackingSize = target
+            lastAppliedContentScale = currentScale
+
+            // Set content scale BEFORE set_size so libghostty uses the correct
+            // DPI when computing font metrics / cell geometry for the new layout.
+            // Without this ordering, a DPI change would reflow at the old scale
+            // and then receive a scale update with no subsequent reflow.
+            if let window {
+                ghostty_surface_set_content_scale(surface, window.backingScaleFactor, window.backingScaleFactor)
+                if let screen = window.screen {
+                    ghostty_surface_set_display_id(surface, screen.ghosttyDisplayID)
+                }
+            }
+
             // Reflowing the scrollback here is O(history) and runs on the
             // main thread; signpost it so a long reflow lines up with any
             // recorded stall in Instruments (pane-sluggishness shake).
             let reflow = UISignpost.signposter.beginInterval(UISignpost.Name.geometryReflow)
             ghostty_surface_set_size(surface, UInt32(target.width), UInt32(target.height))
             UISignpost.signposter.endInterval(UISignpost.Name.geometryReflow, reflow)
-        }
-
-        if let window {
-            ghostty_surface_set_content_scale(surface, window.backingScaleFactor, window.backingScaleFactor)
-            if let screen = window.screen {
-                ghostty_surface_set_display_id(surface, screen.ghosttyDisplayID)
-            }
         }
 
         lastSizeSyncTimestamp = timestamp
