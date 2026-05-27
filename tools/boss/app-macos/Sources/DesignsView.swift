@@ -574,6 +574,47 @@ private struct MarkdownViewerScrollContent: View {
     }
 }
 
+// MARK: - Window menu registration
+
+/// Zero-size `NSView` that, when inserted into a SwiftUI view hierarchy,
+/// accesses its hosting `NSWindow` and sets `isExcludedFromWindowsMenu =
+/// false`. SwiftUI's `Window` scene (single-instance utility windows)
+/// opts windows OUT of the auto-managed Window menu by default; inserting
+/// this view in the content tree reverses that so the window appears as a
+/// named, titled entry at the bottom of the menu — matching the behaviour
+/// of `WindowGroup`-backed windows.
+///
+/// The exclusion flag is re-applied in `updateNSView` (called on every
+/// SwiftUI layout pass) so it survives any NSWindow re-configuration
+/// SwiftUI performs internally. A deferred `DispatchQueue.main.async` is
+/// used in `makeNSView` because the view is not yet attached to a window
+/// at the point `makeNSView` is called; one runloop tick later it is.
+private struct WindowMenuRegistrar: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            view.window?.isExcludedFromWindowsMenu = false
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.window?.isExcludedFromWindowsMenu = false
+    }
+}
+
+private extension View {
+    /// Ensures the hosting NSWindow appears in the macOS Window menu.
+    ///
+    /// Apply to any view inside a SwiftUI `Window` scene whose window
+    /// should be navigable from the per-window list at the bottom of the
+    /// Window menu. (`WindowGroup`-backed windows are already registered
+    /// automatically; this modifier is only needed for `Window` scenes.)
+    func registeredInWindowMenu() -> some View {
+        background(WindowMenuRegistrar().frame(width: 0, height: 0))
+    }
+}
+
 /// Loading state for the `"async-markdown-viewer"` Window scene, which
 /// opens immediately on click and resolves content asynchronously.
 enum MarkdownDocLoadState {
@@ -629,51 +670,60 @@ struct AsyncMarkdownViewerView: View {
     @EnvironmentObject private var vm: AsyncMarkdownViewerViewModel
 
     var body: some View {
-        switch vm.state {
-        case .loading:
-            ProgressView("Loading…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .loaded(let title, let markdown):
-            MarkdownViewerView(
-                title: title,
-                source: markdown,
-                projectShortID: vm.pendingRenderProjectShortID ?? "",
-                clickStartTime: vm.clickStartTime
-            )
-            // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
-            // content load, so .onAppear fires even when the window is reused across
-            // documents (stable case identity would otherwise suppress it).
-            .id(vm.renderContentID)
-            .navigationTitle(title)
-            .onAppear {
-                if let start = vm.renderStartTime,
-                   let shortID = vm.pendingRenderProjectShortID {
-                    let ms = Int(Date().timeIntervalSince(start) * 1000)
-                    designDocTimingLog.info("phase=render project=\(shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
-                    vm.renderStartTime = nil
-                    vm.pendingRenderProjectShortID = nil
+        // Wrap in Group so `.registeredInWindowMenu()` is applied once
+        // at the top level rather than inside each case branch. The
+        // modifier inserts a zero-size NSViewRepresentable that marks the
+        // hosting NSWindow as included in the Window menu — necessary
+        // because SwiftUI's `Window` scene (unlike `WindowGroup`) sets
+        // `isExcludedFromWindowsMenu = true` on its NSWindow by default.
+        Group {
+            switch vm.state {
+            case .loading:
+                ProgressView("Loading…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .loaded(let title, let markdown):
+                MarkdownViewerView(
+                    title: title,
+                    source: markdown,
+                    projectShortID: vm.pendingRenderProjectShortID ?? "",
+                    clickStartTime: vm.clickStartTime
+                )
+                // .id() forces SwiftUI to destroy and recreate MarkdownViewerView on each
+                // content load, so .onAppear fires even when the window is reused across
+                // documents (stable case identity would otherwise suppress it).
+                .id(vm.renderContentID)
+                .navigationTitle(title)
+                .onAppear {
+                    if let start = vm.renderStartTime,
+                       let shortID = vm.pendingRenderProjectShortID {
+                        let ms = Int(Date().timeIntervalSince(start) * 1000)
+                        designDocTimingLog.info("phase=render project=\(shortID, privacy: .public) duration_ms=\(ms, privacy: .public)")
+                        vm.renderStartTime = nil
+                        vm.pendingRenderProjectShortID = nil
+                    }
+                    // clickStartTime is consumed by MarkdownViewerScrollContent's
+                    // layout-complete handler. It is not cleared here on purpose —
+                    // SwiftUI may rebuild AsyncMarkdownViewerView before layout
+                    // completes, and the next click re-stamps it.
                 }
-                // clickStartTime is consumed by MarkdownViewerScrollContent's
-                // layout-complete handler. It is not cleared here on purpose —
-                // SwiftUI may rebuild AsyncMarkdownViewerView before layout
-                // completes, and the next click re-stamps it.
+            case .failed(let title, let message):
+                VStack(spacing: 16) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.largeTitle)
+                        .foregroundStyle(.orange)
+                    Text("Failed to load \u{201C}\(title)\u{201D}")
+                        .font(.headline)
+                    Text(message)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationTitle(title)
             }
-        case .failed(let title, let message):
-            VStack(spacing: 16) {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.largeTitle)
-                    .foregroundStyle(.orange)
-                Text("Failed to load \u{201C}\(title)\u{201D}")
-                    .font(.headline)
-                Text(message)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-            .padding()
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .navigationTitle(title)
         }
+        .registeredInWindowMenu()
     }
 }
 
