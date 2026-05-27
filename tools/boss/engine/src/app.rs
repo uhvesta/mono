@@ -2344,34 +2344,21 @@ pub async fn serve(
         }
     };
 
-    // Heal existing worker settings.json files so pre-fix workers that
-    // already have a stale bazel-bin hook path get updated on next engine restart.
-    match server_state.cube_client.list_workspaces().await {
-        Ok(workspaces) => {
-            let workspace_paths: Vec<PathBuf> =
-                workspaces.iter().map(|w| w.workspace_path.clone()).collect();
-            if workspace_paths.is_empty() {
-                tracing::debug!("no workspaces to heal boss-event paths in");
-            } else {
-                tracing::info!(
-                    count = workspace_paths.len(),
-                    new_path = %stable_boss_event_path.display(),
-                    "healing boss-event path in worker settings.json files",
-                );
-                crate::worker_setup::heal_worker_settings_json(
-                    &workspace_paths,
-                    &stable_boss_event_path,
-                );
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "failed to list workspaces for boss-event path healing; \
-                 existing workers may have stale hook paths",
-            );
-        }
-    }
+    // Heal existing worker settings files so a worker whose baked hook
+    // path went stale (e.g. after a `bazel clean`) picks up the stable
+    // boss-event path on the next engine restart. The settings files
+    // live under the system temp dir, outside every workspace — see
+    // `worker_setup` module docs.
+    let worker_settings_dir = crate::worker_setup::worker_settings_dir();
+    tracing::info!(
+        dir = %worker_settings_dir.display(),
+        new_path = %stable_boss_event_path.display(),
+        "healing boss-event path in worker settings files",
+    );
+    crate::worker_setup::heal_worker_settings_json(
+        &worker_settings_dir,
+        &stable_boss_event_path,
+    );
 
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose

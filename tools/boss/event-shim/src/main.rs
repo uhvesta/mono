@@ -1,8 +1,8 @@
 //! `boss-event` — a thin stdin-to-Unix-socket shim invoked by claude
 //! hooks running inside a Boss-managed worker.
 //!
-//! Each claude hook is configured (via the engine's per-lease
-//! `settings.json` template) to spawn this binary, with the hook
+//! Each claude hook is configured (via the engine's per-worker
+//! settings-file template) to spawn this binary, with the hook
 //! payload arriving on stdin. The shim reads stdin to EOF, opens the
 //! engine's events socket at `$BOSS_EVENTS_SOCKET`, writes the
 //! payload, and exits.

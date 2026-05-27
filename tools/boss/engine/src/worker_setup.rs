@@ -1,28 +1,47 @@
-//! Per-lease worker config files written into a leased cube workspace
-//! before `claude` is spawned.
+//! Per-worker config the engine materializes before `claude` is spawned.
 //!
-//! The engine writes three files into `<workspace_path>/.claude/`:
+//! The engine writes two files into `<workspace_path>/.claude/`:
 //!
 //! - `CLAUDE.md` — a worker-facing system prompt that constrains the
 //!   claude session: jj-first VCS rules, do-not-touch-sibling-workspaces
 //!   advisory, lease lifecycle reminders, PR-required-for-task-work
 //!   reminder.
-//! - `settings.json` — claude hooks config that wires every hook event
-//!   (`SessionStart` … `SessionEnd`) to the `boss-event` shim binary, so
-//!   the engine's events socket sees a structured stream of worker
-//!   activity. Also pins `permissions.defaultMode` to `auto` so the
-//!   spawned claude session runs autonomously without blocking on
-//!   tool-use prompts, while still honoring the user's permission
-//!   `allow`/`deny` rules. Project-local `.claude/settings.json`
-//!   overrides the user's global default permission mode on a
-//!   per-key basis, so a user whose global setting is `default`
-//!   (interactive) still gets a worker that runs unattended.
 //! - `.gitignore` — single-pattern (`*`) gitignore that hides every
-//!   per-worker file the engine drops in `.claude/` (including the
-//!   `initial-prompt.txt` written by the runner) from `jj status` /
-//!   `git status`. Without this, workers regularly snapshot the engine
-//!   plumbing into their PRs. The pattern is self-excluding, so the
-//!   `.gitignore` itself doesn't show up either.
+//!   per-worker file the engine drops in `.claude/` (the `CLAUDE.md`
+//!   above and the `initial-prompt.txt` written by the runner) from
+//!   `jj status` / `git status`. Without this, workers regularly
+//!   snapshot the engine plumbing into their PRs. The pattern is
+//!   self-excluding, so the `.gitignore` itself doesn't show up either.
+//!
+//! and one file **outside every workspace**, under the per-user system
+//! temp dir (see [`worker_settings_path`]):
+//!
+//! - the worker *settings* file — claude hooks config that wires every
+//!   hook event (`SessionStart` … `SessionEnd`) to the `boss-event` shim
+//!   binary, so the engine's events socket sees a structured stream of
+//!   worker activity. Also pins `permissions.defaultMode` to `auto` and
+//!   carries the `deny` rules that fence the worker off from Boss's
+//!   runtime state. The engine points the spawned session at it with
+//!   `claude --settings <abs-path>`.
+//!
+//!   This file is deliberately **never** written into the workspace
+//!   tree — not as `.claude/settings.json`, not as
+//!   `.claude/settings.local.json`. Repos commonly check in a shared,
+//!   *tracked* `.claude/settings.json` (e.g. `deny` rules for generated
+//!   testdata). The `.gitignore` we drop in `.claude/` cannot hide an
+//!   already-tracked file, and we cannot assume any repo gitignores
+//!   `settings.local.json` either — so any file we drop in the
+//!   workspace risks being picked up by `jj git push` and shipped into
+//!   the worker's PR (clobbering the repo's shared policy and leaking
+//!   Boss-session ids / local Boss.app hook paths). Writing the settings
+//!   *outside* the workspace removes the VCS from the equation entirely.
+//!
+//!   `claude --settings <file>` loads the file as *additional* settings,
+//!   merged on top of (not replacing) the repo's own project
+//!   `.claude/settings.json`, so the repo's deny rules survive and the
+//!   worker still runs unattended with the engine's hooks. (Permission
+//!   mode is also forced via the `--permission-mode auto` CLI flag the
+//!   runner passes, so the worker runs autonomously regardless.)
 //!
 //! This module is just the renderers and a tiny `write_workspace_files()`
 //! helper. Call-sites in the worker spawn flow are wired separately.
@@ -38,7 +57,7 @@ use serde_json;
 #[derive(Debug, Clone)]
 pub struct WorkerSetupInput {
     /// Run id this spawn corresponds to. Baked into the hook command
-    /// in `settings.json` as a `BOSS_RUN_ID=<run_id>` inline-assignment
+    /// in the worker settings file as a `BOSS_RUN_ID=<run_id>` inline-assignment
     /// prefix so the `boss-event` shim always sees it on stdin's env,
     /// regardless of whether claude propagates the worker pane's env
     /// to its hook subprocess. The shim splices this into every hook
@@ -51,7 +70,7 @@ pub struct WorkerSetupInput {
     pub lease_id: String,
     /// Filesystem path of the leased workspace (the worker's cwd).
     pub workspace_path: PathBuf,
-    /// Engine events socket path; injected into `settings.json` via the
+    /// Engine events socket path; injected into the worker settings file via the
     /// `BOSS_EVENTS_SOCKET` env var so the shim knows where to connect.
     pub events_socket_path: PathBuf,
     /// Absolute path to the `boss-event` shim binary the engine will
@@ -179,9 +198,10 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     )
 }
 
-/// Render the worker-facing `settings.json`. Wires every claude hook
-/// event to the `boss-event` shim with absolute paths so the hook fires
-/// regardless of `PATH`.
+/// Render the worker settings file. Wires every claude hook event to
+/// the `boss-event` shim with absolute paths so the hook fires
+/// regardless of `PATH`. The engine points the session at this via
+/// `claude --settings`; it is written outside the workspace tree.
 pub fn render_settings_json(input: &WorkerSetupInput) -> String {
     let value = settings_value(input);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
@@ -353,20 +373,62 @@ fn shell_escape(value: &str) -> String {
 /// stop appearing in `jj status` / `git status`.
 const CLAUDE_DIR_GITIGNORE: &str = "*\n";
 
-/// Write CLAUDE.md, settings.json, and a self-excluding `.gitignore`
-/// under `<workspace>/.claude/`, creating the directory if needed.
-/// Caller is responsible for ensuring the workspace itself exists.
+/// Subdirectory (under the per-user system temp dir) that holds the
+/// worker settings files. Lives outside every workspace so the
+/// worker's `jj`/`git` never sees these files — see the module docs.
+const WORKER_SETTINGS_SUBDIR: &str = "boss-worker-settings";
+
+/// Directory holding all per-workspace worker settings files. The
+/// engine writes into it at spawn time and heals stale `boss-event`
+/// paths in it on restart ([`heal_worker_settings_json`]).
+///
+/// Rooted at the per-user system temp dir (`$TMPDIR` on macOS, a
+/// private per-user location), so the files are user-private and never
+/// inside a workspace tree.
+pub fn worker_settings_dir() -> PathBuf {
+    std::env::temp_dir().join(WORKER_SETTINGS_SUBDIR)
+}
+
+/// Absolute path to the worker settings file for `workspace_path`. The
+/// engine writes this file and points the worker's claude session at it
+/// via `claude --settings <path>`; nothing is written into the
+/// workspace tree itself.
+///
+/// Keyed by the workspace directory name (cube workspaces are uniquely
+/// named, e.g. `mono-agent-003`), so re-leasing a workspace overwrites
+/// the one file rather than accumulating one per lease.
+pub fn worker_settings_path(workspace_path: &Path) -> PathBuf {
+    let key = workspace_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "worker".to_owned());
+    worker_settings_dir().join(format!("{key}.json"))
+}
+
+/// Write `CLAUDE.md` and a self-excluding `.gitignore` under
+/// `<workspace>/.claude/`, and the worker settings file *outside* the
+/// workspace at [`worker_settings_path`]. Creates parent directories as
+/// needed. Caller is responsible for ensuring the workspace itself
+/// exists.
+///
+/// The settings file is never written into the workspace tree — see the
+/// module docs for why dropping session config into a VCS-visible path
+/// (`settings.json` or `settings.local.json`) is the bug this avoids.
 pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFiles> {
     let claude_dir = input.workspace_path.join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
 
     let claude_md_path = claude_dir.join("CLAUDE.md");
-    let settings_path = claude_dir.join("settings.json");
     let gitignore_path = claude_dir.join(".gitignore");
 
     std::fs::write(&claude_md_path, render_claude_md(input))?;
-    std::fs::write(&settings_path, render_settings_json(input))?;
     std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)?;
+
+    let settings_path = worker_settings_path(&input.workspace_path);
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&settings_path, render_settings_json(input))?;
 
     Ok(WrittenFiles {
         claude_md_path,
@@ -378,6 +440,9 @@ pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFile
 #[derive(Debug, Clone)]
 pub struct WrittenFiles {
     pub claude_md_path: PathBuf,
+    /// Absolute path to the worker settings file. Lives *outside* the
+    /// workspace (under [`worker_settings_dir`]); the runner threads it
+    /// into the spawn invocation as `claude --settings <path>`.
     pub settings_path: PathBuf,
     pub gitignore_path: PathBuf,
 }
@@ -418,18 +483,34 @@ pub(crate) fn heal_hook_command(command: &str, new_boss_event_path: &Path) -> St
     )
 }
 
-/// Walk all given worker workspace directories and update the boss-event
-/// shim path in each `.claude/settings.json` to `new_boss_event_path`.
-/// Errors and missing files per-workspace are logged but do not abort
-/// the sweep.
-pub fn heal_worker_settings_json(workspace_paths: &[PathBuf], new_boss_event_path: &Path) {
-    for workspace in workspace_paths {
-        let settings_path = workspace.join(".claude/settings.json");
+/// Walk every `*.json` file in `settings_dir` (the
+/// [`worker_settings_dir`]) and update the boss-event shim path in each
+/// to `new_boss_event_path`. A missing directory is a no-op; per-file
+/// errors are logged but do not abort the sweep.
+pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path) {
+    let entries = match std::fs::read_dir(settings_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            tracing::warn!(
+                dir = %settings_dir.display(),
+                ?err,
+                "failed to read worker settings dir for boss-event healing",
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let settings_path = entry.path();
+        if settings_path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
         match heal_single_settings_json(&settings_path, new_boss_event_path) {
             Ok(true) => {
                 tracing::info!(
                     settings = %settings_path.display(),
-                    "healed boss-event path in worker settings.json",
+                    "healed boss-event path in worker settings file",
                 );
             }
             Ok(false) => {}
@@ -437,7 +518,7 @@ pub fn heal_worker_settings_json(workspace_paths: &[PathBuf], new_boss_event_pat
                 tracing::warn!(
                     settings = %settings_path.display(),
                     ?err,
-                    "failed to heal boss-event path in worker settings.json",
+                    "failed to heal boss-event path in worker settings file",
                 );
             }
         }
@@ -809,9 +890,30 @@ mod tests {
         let claude_md_contents = std::fs::read_to_string(&written.claude_md_path).unwrap();
         assert!(claude_md_contents.contains("test-lease"));
 
-        // settings.json must be valid JSON on disk.
+        // The settings file must be valid JSON on disk.
         let settings_contents = std::fs::read_to_string(&written.settings_path).unwrap();
         let _: serde_json::Value = serde_json::from_str(&settings_contents).unwrap();
+
+        // Regression guard for the clobbered-`.claude/settings.json`
+        // bug: the engine must NEVER drop a settings file into the
+        // workspace tree (where `jj`/`git` could ship it). Neither the
+        // shared `settings.json` nor the local-override
+        // `settings.local.json` may exist under `.claude/`, and the
+        // settings file it does write must live outside the workspace.
+        let claude_dir = dir.path().join(".claude");
+        assert!(
+            !claude_dir.join("settings.json").exists(),
+            "engine must not write .claude/settings.json into the workspace",
+        );
+        assert!(
+            !claude_dir.join("settings.local.json").exists(),
+            "engine must not write .claude/settings.local.json into the workspace",
+        );
+        assert!(
+            !written.settings_path.starts_with(dir.path()),
+            "worker settings file must live outside the workspace tree, got: {}",
+            written.settings_path.display(),
+        );
 
         // The .gitignore must use the catch-all `*` pattern so every
         // engine-injected file in `.claude/` (including dotfiles and
@@ -1001,12 +1103,13 @@ mod tests {
 
     #[test]
     fn heal_worker_settings_json_updates_all_hook_events() {
-        let dir = TempDir::new().unwrap();
-        // Write a settings.json with a stale bazel-bin boss-event path.
+        // Stage a worker settings file (with a stale bazel-bin
+        // boss-event path) in a settings dir, then heal the whole dir.
+        let settings_dir = TempDir::new().unwrap();
         let input = WorkerSetupInput {
             run_id: "run-heal".into(),
             lease_id: "lease-heal".into(),
-            workspace_path: dir.path().to_path_buf(),
+            workspace_path: PathBuf::from("/some/workspace/mono-agent-heal"),
             events_socket_path: PathBuf::from("/tmp/events.sock"),
             boss_event_path: PathBuf::from(
                 "/old/bazel-bin/tools/boss/event-shim/boss-event",
@@ -1014,13 +1117,13 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
         };
-        write_workspace_files(&input).unwrap();
+        let settings_file = settings_dir.path().join("mono-agent-heal.json");
+        std::fs::write(&settings_file, render_settings_json(&input)).unwrap();
 
         let new_path = PathBuf::from("/stable/bin/boss-event");
-        heal_worker_settings_json(&[dir.path().to_path_buf()], &new_path);
+        heal_worker_settings_json(settings_dir.path(), &new_path);
 
-        let settings =
-            std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        let settings = std::fs::read_to_string(&settings_file).unwrap();
         // All seven hook events must now reference the stable path.
         for hook in [
             "SessionStart",
@@ -1038,18 +1141,20 @@ mod tests {
         }
         assert!(
             !settings.contains("/old/bazel-bin"),
-            "healed settings.json must not contain the old bazel-bin path: {settings}",
+            "healed settings file must not contain the old bazel-bin path: {settings}",
         );
-        // The settings.json must still be valid JSON.
+        // The settings file must still be valid JSON.
         let _: serde_json::Value = serde_json::from_str(&settings).unwrap();
     }
 
     #[test]
-    fn heal_worker_settings_json_skips_missing_settings_file() {
+    fn heal_worker_settings_json_skips_missing_settings_dir() {
         let dir = TempDir::new().unwrap();
         let new_path = PathBuf::from("/stable/boss-event");
-        // Should not panic even if .claude/settings.json doesn't exist.
-        heal_worker_settings_json(&[dir.path().to_path_buf()], &new_path);
+        // Missing directory must be a no-op, not a panic.
+        heal_worker_settings_json(&dir.path().join("does-not-exist"), &new_path);
+        // An existing-but-empty dir is also a no-op.
+        heal_worker_settings_json(dir.path(), &new_path);
     }
 
     #[test]

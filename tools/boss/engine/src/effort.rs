@@ -9,6 +9,8 @@
 //! that needs an effort-derived knob looks it up through this module
 //! rather than re-spelling the table.
 
+use std::path::Path;
+
 use boss_protocol::EffortLevel;
 
 /// Engine default Claude model slug used when neither
@@ -118,9 +120,19 @@ impl SpawnConfig {
     ///   laptop) → `--dangerously-skip-permissions`. `true` (corp laptop, where
     ///   dangerously-skip is forbidden) → `--permission-mode auto`.
     ///
+    /// `settings_path`, when `Some`, is added as `--settings <path>` so
+    /// claude loads the engine's worker hooks/deny rules from a file
+    /// *outside* the workspace (merged on top of the repo's own
+    /// `.claude/settings.json`). See [`crate::worker_setup`] for why
+    /// the settings never live in the workspace tree.
+    ///
     /// The trailing newline is what the pane treats as the user
     /// hitting return — match today's behaviour byte-for-byte.
-    pub fn claude_invocation(&self, non_opus_auto_mode: bool) -> String {
+    pub fn claude_invocation(
+        &self,
+        non_opus_auto_mode: bool,
+        settings_path: Option<&Path>,
+    ) -> String {
         let mut cmd = format!("claude --model {}", self.model);
         if let Some(effort) = self.claude_effort {
             cmd.push_str(" --effort ");
@@ -132,6 +144,12 @@ impl SpawnConfig {
             cmd.push_str(" --permission-mode auto");
         } else {
             cmd.push_str(" --dangerously-skip-permissions");
+        }
+        if let Some(settings) = settings_path {
+            // Single-quote the path so a `$TMPDIR` with spaces survives
+            // the pane's shell. Worker settings paths never contain a
+            // single quote, so naive single-quoting is sufficient.
+            cmd.push_str(&format!(" --settings '{}'", settings.display()));
         }
         cmd.push_str(" \"$(cat .claude/initial-prompt.txt)\"\n");
         cmd
@@ -449,8 +467,31 @@ mod tests {
         // carry --permission-mode auto (Opus) and no --effort.
         let cfg = resolve_spawn_config(None, None, None);
         assert_eq!(
-            cfg.claude_invocation(false),
+            cfg.claude_invocation(false, None),
             "claude --model claude-opus-4-7 --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
+        );
+    }
+
+    #[test]
+    fn settings_path_is_threaded_as_settings_flag_before_prompt() {
+        // When a worker settings path is supplied it must appear as
+        // `--settings '<path>'`, positioned before the trailing prompt
+        // arg so claude parses it as a flag, and single-quoted so a
+        // path with spaces survives the pane shell.
+        let cfg = resolve_spawn_config(None, None, None);
+        let path = Path::new("/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json");
+        let inv = cfg.claude_invocation(false, Some(path));
+        assert!(
+            inv.contains(
+                "--settings '/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json'"
+            ),
+            "expected single-quoted --settings flag, got: {inv:?}",
+        );
+        let settings_at = inv.find("--settings").expect("--settings present");
+        let prompt_at = inv.find("\"$(cat").expect("prompt arg present");
+        assert!(
+            settings_at < prompt_at,
+            "--settings must come before the positional prompt arg: {inv:?}",
         );
     }
 
@@ -459,7 +500,7 @@ mod tests {
         // Sonnet is non-Opus → --dangerously-skip-permissions (default/personal laptop).
         let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
         assert_eq!(
-            cfg.claude_invocation(false),
+            cfg.claude_invocation(false, None),
             "claude --model claude-sonnet-4-6 --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
@@ -469,7 +510,7 @@ mod tests {
         // model_override = "opus" → Opus family → --permission-mode auto.
         let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None);
         assert_eq!(
-            cfg.claude_invocation(false),
+            cfg.claude_invocation(false, None),
             "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
@@ -487,7 +528,7 @@ mod tests {
                     model: model.to_owned(),
                     prompt_addendum: None,
                 };
-                let inv = cfg.claude_invocation(non_opus_auto_mode);
+                let inv = cfg.claude_invocation(non_opus_auto_mode, None);
                 assert!(
                     inv.contains("--permission-mode auto"),
                     "Opus model {model:?} must carry --permission-mode auto, got: {inv:?}",
@@ -514,7 +555,7 @@ mod tests {
                 model: model.to_owned(),
                 prompt_addendum: None,
             };
-            let inv = cfg.claude_invocation(false);
+            let inv = cfg.claude_invocation(false, None);
             assert!(
                 inv.contains("--dangerously-skip-permissions"),
                 "Non-Opus model {model:?} with skip mode must carry --dangerously-skip-permissions, got: {inv:?}",
@@ -540,7 +581,7 @@ mod tests {
                 model: model.to_owned(),
                 prompt_addendum: None,
             };
-            let inv = cfg.claude_invocation(true);
+            let inv = cfg.claude_invocation(true, None);
             assert!(
                 inv.contains("--permission-mode auto"),
                 "Non-Opus model {model:?} with auto mode must carry --permission-mode auto, got: {inv:?}",

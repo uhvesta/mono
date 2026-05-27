@@ -473,9 +473,17 @@ impl ExecutionRunner for PaneSpawnRunner {
         // shell profile (or via `launchctl setenv`) causes every worker
         // spawn to show: "Auth conflict: Using ANTHROPIC_API_KEY instead of
         // Anthropic Console key."
+        // The worker's session settings (boss-event hooks, deny rules)
+        // live outside the workspace tree; point claude at them with
+        // `--settings`. `write_workspace_files` writes the same path.
+        let worker_settings_path =
+            crate::worker_setup::worker_settings_path(workspace_path);
         let initial_input = format!(
             "unset ANTHROPIC_API_KEY; {}",
-            spawn_config.claude_invocation(spawner.non_opus_auto_mode()),
+            spawn_config.claude_invocation(
+                spawner.non_opus_auto_mode(),
+                Some(&worker_settings_path),
+            ),
         );
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for
@@ -2811,13 +2819,18 @@ mod pane_spawn_tests {
             .unwrap();
         let input = spawner.spawn_input();
 
+        // The worker settings file lives outside the workspace; the
+        // engine points claude at it with `--settings '<abs-path>'`,
+        // positioned before the positional prompt arg.
+        let settings_path = crate::worker_setup::worker_settings_path(workspace.path());
         assert_eq!(
             input.initial_input,
             format!(
-                "unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
-                crate::effort::ENGINE_DEFAULT_MODEL
+                "unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+                crate::effort::ENGINE_DEFAULT_MODEL,
+                settings_path.display(),
             ),
-            "untagged row should spawn with the engine default model, --permission-mode auto (Opus), and no --effort",
+            "untagged row should spawn with the engine default model, --permission-mode auto (Opus), --settings <worker file>, and no --effort",
         );
 
         // No addendum prepended — the existing implementation framing
@@ -3635,7 +3648,14 @@ mod pane_spawn_tests {
 
         let workspace = TempDir::new().unwrap();
         let _spawner = run_once(&workspace).await.unwrap();
-        let settings_path = workspace.path().join(".claude").join("settings.json");
+        // The settings file lives outside the workspace tree, keyed by
+        // workspace name (see worker_setup); it must NOT be written into
+        // the workspace `.claude/`.
+        let settings_path = crate::worker_setup::worker_settings_path(workspace.path());
+        assert!(
+            !workspace.path().join(".claude").join("settings.json").exists(),
+            "engine must not write .claude/settings.json into the workspace",
+        );
         let settings = std::fs::read_to_string(&settings_path).unwrap();
 
         // Hooks must invoke an absolute path; the bare name
@@ -3644,12 +3664,12 @@ mod pane_spawn_tests {
         // PATH doesn't include the bazel-out directory.
         assert!(
             settings.contains("/opt/boss/bin/boss-event"),
-            "expected absolute boss-event path in settings.json, got: {}",
+            "expected absolute boss-event path in settings file, got: {}",
             settings,
         );
         assert!(
             !settings.contains("\"boss-event\"") || settings.contains("/opt/boss/bin/boss-event"),
-            "settings.json must not invoke `boss-event` as a bare name",
+            "settings file must not invoke `boss-event` as a bare name",
         );
 
         unsafe { std::env::remove_var("BOSS_EVENT_BIN") };

@@ -3,8 +3,9 @@
 //! Combines the pieces that need to fire when the engine starts a
 //! pane-hosted worker for a run:
 //!
-//! 1. Render and write `<workspace>/.claude/CLAUDE.md` and
-//!    `<workspace>/.claude/settings.json` from the templates in
+//! 1. Render and write `<workspace>/.claude/CLAUDE.md` (and a
+//!    self-excluding `.gitignore`) plus the worker settings file —
+//!    which lives *outside* the workspace tree — from the templates in
 //!    [`crate::worker_setup`].
 //! 2. Send `SpawnWorkerPane` to the registered app session via the
 //!    engine→app dispatch on `ServerState`.
@@ -78,7 +79,7 @@ pub struct StartWorkerInput {
     pub boss_event_path: PathBuf,
     pub initial_input: String,
     /// Extra env vars to thread to the worker on top of the ones the
-    /// settings.json template injects (`BOSS_EVENTS_SOCKET`,
+    /// worker settings template injects (`BOSS_EVENTS_SOCKET`,
     /// `BOSS_LEASE_ID`).
     pub extra_env: Vec<(String, String)>,
     /// Optional 2–4 word summary to display in the pane titlebar in
@@ -101,8 +102,8 @@ pub struct StartWorkerInput {
     /// the `default_pr_draft_mode` per-installation setting.
     pub draft_pr_mode: bool,
     /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
-    /// Forwarded to `WorkerSetupInput` so the settings.json can install
-    /// kind-specific hook guards.
+    /// Forwarded to `WorkerSetupInput` so the worker settings file can
+    /// install kind-specific hook guards.
     pub execution_kind: String,
 }
 
@@ -184,7 +185,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     input: StartWorkerInput,
     spawn_timeout: StdDuration,
 ) -> Result<StartedWorker, StartWorkerError> {
-    // 1. Write CLAUDE.md and settings.json into the workspace.
+    // 1. Write CLAUDE.md + .gitignore into the workspace and the worker
+    //    settings file outside it (see worker_setup module docs).
     let setup = WorkerSetupInput {
         run_id: input.run_id.clone(),
         lease_id: input.lease_id.clone(),

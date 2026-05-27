@@ -2,7 +2,7 @@
 //!
 //! Workers are fenced off from Boss's runtime state under
 //! `~/Library/Application Support/Boss/` via deny rules in their
-//! per-lease `settings.json` (see [`crate::worker_setup`]). Those
+//! per-worker settings file (see [`crate::worker_setup`]). Those
 //! deny rules are the *enforcement* — claude refuses the tool call.
 //! This module is the *audit*: an independent observer that watches
 //! every `PreToolUse` hook event the worker emits and writes an
@@ -11,7 +11,7 @@
 //!
 //! The two layers are complementary:
 //!
-//! - The settings.json deny rules can drift if a future claude-code
+//! - The settings-file deny rules can drift if a future claude-code
 //!   release changes its permission syntax or rule precedence; the
 //!   audit catches the breach attempt even if the harness silently
 //!   lets the call through.
