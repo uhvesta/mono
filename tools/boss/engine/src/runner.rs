@@ -706,7 +706,7 @@ fn compose_execution_prompt(
             prompt.push_str(&compose_investigation_directive(work_item));
         }
         "revision_implementation" => {
-            prompt.push_str(&compose_revision_directive(execution, work_item));
+            prompt.push_str(&compose_revision_directive(execution, work_item, workspace_path));
         }
         "task_implementation" | "chore_implementation" => {
             prompt.push_str(
@@ -717,6 +717,22 @@ fn compose_execution_prompt(
             prompt.push_str(
                 "Expected outcome for this run:\n- make concrete progress on the assigned work,\n- leave the workspace in a reviewable state,\n- stop with a concise review summary.\n",
             );
+        }
+    }
+    // Issue #804: code-touching implementation chores were pushing to PR
+    // branches without a local build, and CI repeatedly caught errors a
+    // local `bazel build`/`bazel test` of the touched targets would have
+    // surfaced. Inject a hard pre-push build gate, but only when the
+    // workspace is actually a Bazel workspace — non-Bazel repos
+    // (gradle/maven/npm/…) must not see irrelevant build instructions.
+    // Docs-only kinds (design/investigation) are excluded; revisions get
+    // the gate inside `compose_revision_directive`.
+    if matches!(
+        execution.kind.as_str(),
+        "task_implementation" | "chore_implementation"
+    ) {
+        if let Some(gate) = bazel_prepush_gate_block(workspace_path) {
+            prompt.push_str(&gate);
         }
     }
     if matches!(
@@ -765,6 +781,47 @@ fn compose_execution_prompt(
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
+}
+
+/// True when `workspace_path` is the root of a Bazel workspace — i.e. a
+/// `MODULE.bazel`, `WORKSPACE`, or `WORKSPACE.bazel` marker file sits at
+/// the root. Bazel ownership is what gates the pre-push build
+/// requirement (issue #804): many target repos are gradle/maven/npm/etc.
+/// and must not be told to run `bazel build`.
+fn is_bazel_workspace(workspace_path: &Path) -> bool {
+    ["MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel"]
+        .iter()
+        .any(|marker| workspace_path.join(marker).exists())
+}
+
+/// Pre-push build gate for Bazel workspaces (issue #804). Workers were
+/// pushing code-touching chores to PR branches without a local build,
+/// and CI repeatedly caught errors a local `bazel build`/`bazel test` of
+/// the touched targets would have surfaced (stale crate_universe
+/// lockfiles, gazelle validation, clippy `await_holding_lock`). The
+/// loose "please verify" prose in chore descriptions did not hold, so
+/// this states the requirement as a hard gate in the worker prompt.
+///
+/// Returns `None` for non-Bazel repos so the block is only injected when
+/// bazel actually owns the workspace.
+fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
+    if !is_bazel_workspace(workspace_path) {
+        return None;
+    }
+    Some(
+        "\n## Pre-push build gate (Bazel workspace)\n\
+         \n\
+         This repository is a Bazel workspace (a `MODULE.bazel`/`WORKSPACE` marker was found at the workspace root). Before you push a branch or update a PR with code changes, you MUST run a clean local build and test of what you touched and confirm both pass. \"I think it should work\" or \"the change looks correct\" is NOT a substitute for running the build — repeated rounds of CI breakage have come from workers skipping this step.\n\
+         \n\
+         Required before pushing:\n\
+         - `bazel build` every target you changed and `bazel test` their tests. Use `bazel query` to resolve the target labels covering the files you edited if you are unsure which they are.\n\
+         - If reverse dependencies are quick to enumerate, build them too so you don't break consumers: `bazel query 'rdeps(//..., <changed-target>)'`, then build the results.\n\
+         - If a CI workflow file exists (`.github/workflows/*.yml`), open it and mirror the exact bazel target set it builds/tests (these repos typically run `bazel build //...` or a curated rollup). Run that same command locally so your gate matches what CI will enforce.\n\
+         - Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests, no clippy/lint failures — before you push.\n\
+         \n\
+         If the build or tests fail and you cannot make them pass within this run, do NOT push red code. Emit an `[effort-escalation]` marker in your final response with the failing command and its error output, and stop. Escalating a blocker is correct; pushing a known-broken branch is not.\n"
+            .to_string(),
+    )
 }
 
 /// Directive block for the synthetic `kind = 'design'` task that the
@@ -835,6 +892,7 @@ fn compose_investigation_directive(work_item: &WorkItem) -> String {
 fn compose_revision_directive(
     execution: &crate::work::WorkExecution,
     work_item: &WorkItem,
+    workspace_path: &Path,
 ) -> String {
     let description = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
@@ -854,6 +912,12 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "- What this revision should change: {description}\n"
     ));
+    // Issue #804: revision chores (T30–T34 on PR #250) were the worst
+    // offenders for pushing red code. Apply the same pre-push build gate
+    // when the workspace is a Bazel workspace.
+    if let Some(gate) = bazel_prepush_gate_block(workspace_path) {
+        out.push_str(&gate);
+    }
     out.push('\n');
     out.push_str("Steps:\n");
     out.push_str("1. `jj git fetch`   # the parent branch lives on GitHub; sync before editing.\n");
@@ -2300,6 +2364,105 @@ mod compose_prompt_tests {
             prompt.contains("#235"),
             "resume block must surface the PR number:\n{prompt}",
         );
+    }
+
+    fn revision_execution(pr_url: &str) -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_rev_01")
+            .work_item_id("task-1")
+            .kind("revision_implementation")
+            .status("pending")
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .pr_url(pr_url)
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
+    }
+
+    /// Lay down a `MODULE.bazel` marker so `is_bazel_workspace` treats
+    /// the tempdir as a Bazel workspace (issue #804).
+    fn bazel_workspace() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("MODULE.bazel"), "module(name = \"x\")\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn bazel_gate_present_for_chore_on_bazel_workspace() {
+        let ws = bazel_workspace();
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            ws.path(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("## Pre-push build gate (Bazel workspace)"),
+            "bazel pre-push gate must fire for code chores on a Bazel workspace:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("bazel build") && prompt.contains("bazel test"),
+            "gate must require both bazel build and bazel test:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("[effort-escalation]"),
+            "gate must direct failures to an effort-escalation marker:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn bazel_gate_absent_on_non_bazel_workspace() {
+        // Empty tempdir — no MODULE.bazel / WORKSPACE marker.
+        let ws = tempfile::TempDir::new().unwrap();
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            ws.path(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("Pre-push build gate"),
+            "bazel gate must NOT fire on a non-Bazel repo:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn bazel_gate_present_for_revision_on_bazel_workspace() {
+        let ws = bazel_workspace();
+        let prompt = compose_execution_prompt(
+            &revision_execution("https://github.com/org/repo/pull/250"),
+            &chore_without_pr(),
+            None,
+            ws.path(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("## Pre-push build gate (Bazel workspace)"),
+            "revision chores (the #804 offenders) must get the bazel gate:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn bazel_gate_recognizes_workspace_marker_files() {
+        for marker in ["WORKSPACE", "WORKSPACE.bazel"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join(marker), "").unwrap();
+            assert!(
+                is_bazel_workspace(dir.path()),
+                "`{marker}` at the root must be recognized as a Bazel workspace",
+            );
+        }
     }
 }
 
