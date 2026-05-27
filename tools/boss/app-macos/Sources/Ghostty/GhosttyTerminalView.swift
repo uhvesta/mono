@@ -46,6 +46,16 @@ final class GhosttyTerminalHostView: NSView {
     private var cursorVisible = true
     private var backgroundColor = NSColor.black
     private var claudeMonitorTimer: Timer?
+    /// Token for the display-configuration observer installed only
+    /// while surface creation has failed. libghostty's
+    /// `ghostty_surface_new` returns NULL when the machine has no
+    /// active display (lid closed with no external monitor, all
+    /// monitors disconnected, display asleep) — the renderer's
+    /// `CVDisplayLinkCreateWithCGDisplays` rejects a display count of
+    /// 0. That is a transient/environmental condition, so instead of
+    /// crashing the app we keep the pane in a surface-less placeholder
+    /// state and retry when the display set changes (#800).
+    private var screenObserver: NSObjectProtocol?
 
     private var lastSyncedBackingSize: CGSize = .zero
     private var lastSizeSyncTimestamp: TimeInterval = 0
@@ -104,6 +114,42 @@ final class GhosttyTerminalHostView: NSView {
         wantsLayer = true
         layer?.backgroundColor = backgroundColor.cgColor
 
+        attemptSurfaceCreation()
+    }
+
+    /// Create the libghostty surface if we don't already have one, and
+    /// finalize the view on success. Idempotent: a no-op once `surface`
+    /// is set, so it is safe to call from `init`, the display-change
+    /// observer, and `viewDidMoveToWindow`.
+    ///
+    /// On failure we do **not** `fatalError` — a NULL surface is most
+    /// often the transient "no active display" condition (#800), which
+    /// must not take the whole app down. Instead we leave the pane in a
+    /// surface-less placeholder state (the view's black background) and
+    /// arm a display-change observer so the next display reconfiguration
+    /// retries.
+    private func attemptSurfaceCreation() {
+        guard surface == nil else { return }
+
+        guard let surface = makeSurface() else {
+            session.statusMessage = "Waiting for an active display…"
+            installScreenObserverIfNeeded()
+            return
+        }
+
+        self.surface = surface
+        removeScreenObserver()
+        session.statusMessage = nil
+        session.attach(hostView: self)
+        syncGeometry()
+        reconcileClaudeMonitor()
+    }
+
+    /// Build the surface config from `launchSpec` and call
+    /// `ghostty_surface_new`. Returns `nil` (after dumping a diagnostic
+    /// to stderr) when libghostty rejects the surface, rather than
+    /// trapping — see `attemptSurfaceCreation`.
+    private func makeSurface() -> ghostty_surface_t? {
         // Build env_vars: each `ghostty_env_var_s` holds borrowed C
         // pointers, so we strdup every string and free them after
         // ghostty_surface_new returns (ghostty copies during init).
@@ -145,38 +191,88 @@ final class GhosttyTerminalHostView: NSView {
             // libghostty's C API (as of 1.3.2) exposes no log callback and
             // ghostty_surface_new returns void* with no error code, so the
             // best we can do on failure is dump every input we control.
-            // Without this, the only visible signal is a Swift fatalError
-            // string and a Sentry minidump — neither of which tells us
-            // which precondition libghostty rejected. Print to stderr so
-            // it lands in the dev `swift run` log and in os_log for
-            // bundled installs.
+            // Without this, the only visible signal is a Sentry minidump,
+            // which doesn't tell us which precondition libghostty rejected.
+            // Print to stderr so it lands in the dev `swift run` log and in
+            // os_log for bundled installs.
             let fm = FileManager.default
             var isDir: ObjCBool = false
             let cwdExists = fm.fileExists(atPath: launchSpec.workingDirectory, isDirectory: &isDir)
-            let appNonNil = runtime.app != nil
             let envSummary = launchSpec.env.prefix(8)
                 .map { "\($0.0)=\($0.1.prefix(60))" }
                 .joined(separator: ", ")
-            FileHandle.standardError.write(Data("""
-            [GhosttyTerminalView] ghostty_surface_new returned NULL. Context:
-              runtime.app != nil:    \(appNonNil)
-              workingDirectory:      \(launchSpec.workingDirectory)
-                exists:              \(cwdExists)
-                isDirectory:         \(isDir.boolValue)
-              fontSize:              \(launchSpec.fontSize)
-              scale_factor:          \(NSScreen.main?.backingScaleFactor ?? 2.0)
-              env_var_count:         \(launchSpec.env.count)
-              env (first 8):         \(envSummary)
-              initialInput (chars):  \(launchSpec.initialInput.count)
-
-            """.utf8))
-            fatalError("ghostty_surface_new failed (see stderr above for context)")
+            let diagnostic = Self.surfaceFailureDiagnostic(
+                appNonNil: runtime.app != nil,
+                workingDirectory: launchSpec.workingDirectory,
+                cwdExists: cwdExists,
+                isDirectory: isDir.boolValue,
+                fontSize: launchSpec.fontSize,
+                scaleFactor: Double(NSScreen.main?.backingScaleFactor ?? 2.0),
+                envVarCount: launchSpec.env.count,
+                envSummary: envSummary,
+                initialInputCount: launchSpec.initialInput.count
+            )
+            FileHandle.standardError.write(Data(diagnostic.utf8))
+            return nil
         }
 
-        self.surface = surface
-        session.attach(hostView: self)
-        syncGeometry()
-        reconcileClaudeMonitor()
+        return surface
+    }
+
+    /// Multi-line diagnostic block dumped to stderr when
+    /// `ghostty_surface_new` returns NULL. Pure and `static` so the
+    /// failure-context contract is unit-testable without standing up a
+    /// libghostty surface.
+    static func surfaceFailureDiagnostic(
+        appNonNil: Bool,
+        workingDirectory: String,
+        cwdExists: Bool,
+        isDirectory: Bool,
+        fontSize: Float32,
+        scaleFactor: Double,
+        envVarCount: Int,
+        envSummary: String,
+        initialInputCount: Int
+    ) -> String {
+        """
+        [GhosttyTerminalView] ghostty_surface_new returned NULL. Context:
+          runtime.app != nil:    \(appNonNil)
+          workingDirectory:      \(workingDirectory)
+            exists:              \(cwdExists)
+            isDirectory:         \(isDirectory)
+          fontSize:              \(fontSize)
+          scale_factor:          \(scaleFactor)
+          env_var_count:         \(envVarCount)
+          env (first 8):         \(envSummary)
+          initialInput (chars):  \(initialInputCount)
+
+        """
+    }
+
+    /// Arm the display-reconfiguration observer (idempotent). Installed
+    /// only while we have no surface. `didChangeScreenParametersNotification`
+    /// fires when a display is connected/disconnected, woken, or the lid
+    /// is opened — exactly the events that flip the active-display count
+    /// back above 0 and let `ghostty_surface_new` succeed on retry.
+    private func installScreenObserverIfNeeded() {
+        guard screenObserver == nil else { return }
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // addObserver(queue: .main) guarantees main-thread delivery,
+            // so asserting MainActor isolation here is sound.
+            MainActor.assumeIsolated {
+                self?.attemptSurfaceCreation()
+            }
+        }
+    }
+
+    private func removeScreenObserver() {
+        guard let screenObserver else { return }
+        NotificationCenter.default.removeObserver(screenObserver)
+        self.screenObserver = nil
     }
 
     @available(*, unavailable)
@@ -196,6 +292,7 @@ final class GhosttyTerminalHostView: NSView {
     deinit {
         pendingGeometrySync?.cancel()
         claudeMonitorTimer?.invalidate()
+        removeScreenObserver()
         if let surface {
             // Drain any pending async focus call before freeing. focusQueue
             // is a serial background queue so sync'ing to it here cannot
@@ -242,6 +339,13 @@ final class GhosttyTerminalHostView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+
+        // If surface creation failed earlier (e.g. no active display at
+        // init time), gaining a window is a good moment to retry — the
+        // window carries a screen once one is available.
+        if surface == nil, window != nil {
+            attemptSurfaceCreation()
+        }
 
         reconcileClaudeMonitor()
         syncGeometry()
