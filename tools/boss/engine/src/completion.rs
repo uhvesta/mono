@@ -165,20 +165,33 @@ impl PrStatus {
     }
 }
 
+/// Default worker branch-name prefix when a product carries no
+/// `worker_branch_prefix` override. Preserves the historical
+/// `boss/exec_<id>` shape so existing setups are unchanged.
+pub const DEFAULT_WORKER_BRANCH_PREFIX: &str = "boss/";
+
 /// Engine-supplied branch name a worker must push to when opening
-/// the PR for an execution. Derived deterministically from
-/// `execution_id` so the detector can reconstruct the expected name
-/// from `state.db` alone — no local jj reads, no shared-store
-/// contamination.
+/// the PR for an execution. The shape is
+/// `<worker_branch_prefix>exec_<id>`: the `exec_<id>` suffix is
+/// derived deterministically from `execution_id` so the detector can
+/// reconstruct the expected name from `state.db` alone — no local jj
+/// reads, no shared-store contamination — and is the stable
+/// identifier every subsystem keys off. Only the leading prefix is
+/// configurable (per-product, via `Product::worker_branch_prefix`,
+/// frozen onto the execution row at spawn). `worker_branch_prefix` of
+/// `None` falls back to [`DEFAULT_WORKER_BRANCH_PREFIX`].
 ///
 /// See `tools/boss/docs/postmortems/incident-001-pr-fan-out.md` §5 for
 /// the rationale: a per-execution branch name gives the detector a
 /// signal that is unique by construction. Sibling workers in other
 /// cube workspaces have different execution IDs and therefore push
 /// to different branches, so a branch-keyed `gh pr list --head <name>`
-/// query cannot misattribute their PRs to this execution.
-pub fn expected_branch_name(execution_id: &str) -> String {
-    format!("boss/{execution_id}")
+/// query cannot misattribute their PRs to this execution. The
+/// configurable prefix does not weaken this: the `exec_<id>` suffix
+/// remains unique per execution regardless of prefix.
+pub fn expected_branch_name(worker_branch_prefix: Option<&str>, execution_id: &str) -> String {
+    let prefix = worker_branch_prefix.unwrap_or(DEFAULT_WORKER_BRANCH_PREFIX);
+    format!("{prefix}{execution_id}")
 }
 
 /// Probes GitHub for the PR opened against an engine-supplied branch
@@ -865,7 +878,8 @@ impl WorkerCompletionHandler {
         // and we fall through to `detect_pr` to reconstruct the URL
         // via the GitHub API.
         if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            let expected_branch = expected_branch_name(execution_id);
+            let expected_branch =
+                expected_branch_name(execution.worker_branch_prefix.as_deref(), execution_id);
             let repo_slug = parse_repo_slug(&execution.repo_remote_url);
             let branch_ok = match repo_slug {
                 Ok(ref slug) => {
@@ -1008,7 +1022,8 @@ impl WorkerCompletionHandler {
             return StopOutcome::FallbackDisabledByFlag;
         }
 
-        let expected_branch = expected_branch_name(&execution.id);
+        let expected_branch =
+            expected_branch_name(execution.worker_branch_prefix.as_deref(), &execution.id);
         PR_URL_CAPTURE_RECONSTRUCTION_HIT.inc(&self.metrics);
         let pr_status = match self
             .pr_detector
@@ -1112,7 +1127,8 @@ impl WorkerCompletionHandler {
         // invocation (e.g. reading a chore description that referenced
         // an old PR number) and must be discarded.
         if let Some(staged_url) = self.staged_pr_urls.get(execution_id) {
-            let expected_branch = expected_branch_name(execution_id);
+            let expected_branch =
+                expected_branch_name(execution.worker_branch_prefix.as_deref(), execution_id);
             let repo_slug = parse_repo_slug(&execution.repo_remote_url);
             let branch_ok = match repo_slug {
                 Ok(ref slug) => {
@@ -1208,7 +1224,8 @@ impl WorkerCompletionHandler {
             return StopOutcome::FallbackDisabledByFlag;
         }
 
-        let expected_branch = expected_branch_name(&execution.id);
+        let expected_branch =
+            expected_branch_name(execution.worker_branch_prefix.as_deref(), &execution.id);
         PR_URL_CAPTURE_RECONSTRUCTION_HIT.inc(&self.metrics);
         let pr_status = match self
             .pr_detector
@@ -1258,7 +1275,10 @@ impl WorkerCompletionHandler {
         &self,
         candidate: &crate::work::LatePrCandidate,
     ) -> StopOutcome {
-        let expected_branch = expected_branch_name(&candidate.execution_id);
+        let expected_branch = expected_branch_name(
+            candidate.worker_branch_prefix.as_deref(),
+            &candidate.execution_id,
+        );
         let pr_status = match self
             .pr_detector
             .detect_pr(&candidate.repo_remote_url, &expected_branch)
@@ -2622,6 +2642,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -2787,7 +2808,7 @@ mod tests {
             probes.clone(),
         )
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id)));
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(None, &execution_id)));
 
         let outcome = handler.on_stop(&execution_id).await;
         assert!(
@@ -2911,7 +2932,7 @@ mod tests {
             probes.clone(),
         )
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id)));
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(None, &execution_id)));
 
         // Detector intentionally returns Err — if recheck called it,
         // recheck would surface `DetectorFailed`. With the staged
@@ -3471,6 +3492,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3708,6 +3730,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4215,10 +4238,10 @@ mod tests {
     /// this execution's `gh pr list --head <branch>` query.
     #[test]
     fn expected_branch_name_is_deterministic_and_unique_per_execution() {
-        let a = expected_branch_name("exec_18af6057fe1514f8_3");
-        let b = expected_branch_name("exec_18af6057fe1514f8_3");
+        let a = expected_branch_name(None, "exec_18af6057fe1514f8_3");
+        let b = expected_branch_name(None, "exec_18af6057fe1514f8_3");
         assert_eq!(a, b, "branch name must be deterministic for a given execution id");
-        let other = expected_branch_name("exec_999999999999_4");
+        let other = expected_branch_name(None, "exec_999999999999_4");
         assert_ne!(
             a, other,
             "two distinct execution ids must produce distinct branch names — \
@@ -4230,6 +4253,28 @@ mod tests {
         assert!(
             a.contains("exec_18af6057fe1514f8_3"),
             "branch name must contain the execution id so the detector can re-derive it: {a}",
+        );
+    }
+
+    #[test]
+    fn expected_branch_name_default_prefix_is_boss() {
+        assert_eq!(
+            expected_branch_name(None, "exec_18af6057fe1514f8_3"),
+            "boss/exec_18af6057fe1514f8_3",
+            "no configured prefix must preserve the historical boss/ shape",
+        );
+    }
+
+    #[test]
+    fn expected_branch_name_honours_configured_prefix_keeping_exec_suffix() {
+        let branch = expected_branch_name(Some("bduff/"), "exec_18af6057fe1514f8_3");
+        assert_eq!(branch, "bduff/exec_18af6057fe1514f8_3");
+        // The exec id — the stable identifier every subsystem keys off —
+        // must remain embedded so the detector can still re-derive it
+        // regardless of the configured prefix.
+        assert!(
+            branch.contains("exec_18af6057fe1514f8_3"),
+            "configured prefix must not displace the exec_<id> suffix: {branch}",
         );
     }
 
@@ -4303,11 +4348,11 @@ mod tests {
              the fan-out bug from incident 001 was exactly the case where they got the same one",
         );
         assert!(
-            alice_url.contains(&expected_branch_name(&alice_exec)),
+            alice_url.contains(&expected_branch_name(None, &alice_exec)),
             "alice's bound URL must derive from her own execution id, got {alice_url}",
         );
         assert!(
-            bob_url.contains(&expected_branch_name(&bob_exec)),
+            bob_url.contains(&expected_branch_name(None, &bob_exec)),
             "bob's bound URL must derive from his own execution id, got {bob_url}",
         );
     }
@@ -4335,6 +4380,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4463,7 +4509,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].expected_branch,
-            expected_branch_name(&execution_id),
+            expected_branch_name(None, &execution_id),
             "detect_pr must be invoked with the execution's deterministic branch name",
         );
     }
@@ -4561,6 +4607,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let description_with_pr_refs = "\
@@ -4702,6 +4749,7 @@ PR #379. PR #379.";
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         // Description points at PR #379 repeatedly as prior art. The
@@ -5867,6 +5915,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -5943,6 +5992,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             execution_id: execution_id.clone(),
             work_item_id: chore_id.clone(),
             repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+            worker_branch_prefix: None,
         };
         let outcome = handler.recheck_for_pr_late(&candidate).await;
 
@@ -5979,6 +6029,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             execution_id: execution_id.clone(),
             work_item_id: chore_id.clone(),
             repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+            worker_branch_prefix: None,
         };
         let outcome = handler.recheck_for_pr_late(&candidate).await;
 

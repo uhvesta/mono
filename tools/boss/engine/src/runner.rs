@@ -351,7 +351,10 @@ impl ExecutionRunner for PaneSpawnRunner {
                 &execution.id,
             ) {
                 Ok(Some(prior)) => {
-                    let branch = crate::completion::expected_branch_name(&prior.id);
+                    let branch = crate::completion::expected_branch_name(
+                        prior.worker_branch_prefix.as_deref(),
+                        &prior.id,
+                    );
                     tracing::info!(
                         execution_id = %execution.id,
                         prior_execution_id = %prior.id,
@@ -651,7 +654,10 @@ fn compose_execution_prompt(
         // Direct the new worker to resume that branch rather than starting
         // from main — fall back cleanly if the branch doesn't exist on
         // the remote.
-        let expected_branch_new = crate::completion::expected_branch_name(&execution.id);
+        let expected_branch_new = crate::completion::expected_branch_name(
+            execution.worker_branch_prefix.as_deref(),
+            &execution.id,
+        );
         prompt.push_str(&format!(
             "## STARTUP RECOVERY\n\
              \n\
@@ -674,7 +680,10 @@ fn compose_execution_prompt(
         ));
     }
 
-    let expected_branch = crate::completion::expected_branch_name(&execution.id);
+    let expected_branch = crate::completion::expected_branch_name(
+        execution.worker_branch_prefix.as_deref(),
+        &execution.id,
+    );
     prompt.push_str("Execution context:\n");
     prompt.push_str(&format!("- execution id: `{}`\n", execution.id));
     prompt.push_str(&format!("- execution kind: `{}`\n", execution.kind));
@@ -2710,7 +2719,7 @@ mod pane_spawn_tests {
             workspace.path().join(".claude").join("initial-prompt.txt"),
         )
         .unwrap();
-        let expected_branch = crate::completion::expected_branch_name("exec-test-1");
+        let expected_branch = crate::completion::expected_branch_name(None, "exec-test-1");
         assert!(
             prompt.contains(&expected_branch),
             "prompt must name the engine-supplied branch `{expected_branch}`, got: {prompt}",
@@ -2773,6 +2782,7 @@ mod pane_spawn_tests {
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         if let Some(model) = product_default_model {
@@ -3110,6 +3120,7 @@ mod pane_spawn_tests {
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = work_db
@@ -3347,6 +3358,7 @@ mod pane_spawn_tests {
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = work_db
@@ -3447,6 +3459,7 @@ mod pane_spawn_tests {
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = work_db
@@ -3583,6 +3596,7 @@ mod pane_spawn_tests {
                 repo_remote_url: Some("git@example.com:foo.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = work_db

@@ -124,6 +124,7 @@ async fn bind_then_show_renders_external_tracker_block() -> Result<()> {
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;
@@ -196,6 +197,7 @@ async fn bind_with_reverse_close_flag_persists() -> Result<()> {
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;
@@ -239,6 +241,7 @@ async fn missing_org_for_github_is_rejected() -> Result<()> {
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;
@@ -278,6 +281,7 @@ async fn missing_kind_without_unset_is_rejected() -> Result<()> {
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;

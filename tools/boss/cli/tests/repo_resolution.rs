@@ -167,6 +167,7 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
             repo_remote_url: None,
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;
@@ -223,6 +224,7 @@ async fn chore_create_on_single_repo_product_stores_null_repo_remote_url() -> Re
             repo_remote_url: Some("git@github.com:foo/console.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;
@@ -263,6 +265,7 @@ async fn chore_create_no_input_with_no_resolution_errors_clearly() -> Result<()>
             repo_remote_url: None,
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;
@@ -310,6 +313,7 @@ async fn chore_create_explicit_repo_rejected_on_single_repo_product() -> Result<
             repo_remote_url: Some("git@github.com:foo/console.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;
@@ -358,6 +362,7 @@ async fn chore_create_explicit_repo_accepted_on_multi_repo_product() -> Result<(
             repo_remote_url: None,
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         },
     )
     .await?;

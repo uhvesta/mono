@@ -117,6 +117,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             },
         })
         .await?
@@ -865,6 +866,7 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             },
         })
         .await?
@@ -977,6 +979,7 @@ async fn kanban_drag_to_doing_is_idempotent_on_repeat() -> Result<()> {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             },
         })
         .await?
@@ -1070,6 +1073,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             },
         })
         .await?
@@ -1325,6 +1329,7 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             },
         })
         .await?
@@ -1421,6 +1426,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
         repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
         design_repo: None,
         docs_repo: None,
+        worker_branch_prefix: None,
     })?;
     let chore = work_db.create_chore(CreateChoreInput {
         product_id: product.id.clone(),
@@ -1757,6 +1763,7 @@ async fn seed_two_conflict_resolutions(
         repo_remote_url: Some("git@example.invalid:foo/bar.git".to_owned()),
         design_repo: None,
         docs_repo: None,
+        worker_branch_prefix: None,
     })?;
     let chore = work_db.create_chore(CreateChoreInput {
         product_id: product.id.clone(),

@@ -903,6 +903,15 @@ struct ProductCreateArgs {
     /// Per-task `--repo` overrides still win.
     #[arg(long = "design-repo")]
     design_repo: Option<String>,
+
+    /// Leading prefix for worker branch names on this product. Workers
+    /// push to `<prefix>exec_<id>`; only this prefix is configurable
+    /// (the `exec_<id>` suffix is fixed). Set it to satisfy orgs that
+    /// enforce per-developer branch prefixes via local hooks, e.g.
+    /// `--worker-branch-prefix bduff/`. Omit → engine default `boss/`.
+    /// A trailing `/` is added if you omit it.
+    #[arg(long = "worker-branch-prefix")]
+    worker_branch_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -933,6 +942,13 @@ struct ProductUpdateArgs {
     /// markers. Pass `""` to clear an existing preamble.
     #[arg(long)]
     dispatch_preamble: Option<String>,
+
+    /// Set or clear the leading prefix for worker branch names. Pass a
+    /// prefix to set it (e.g. `bduff/`), `""` to clear (→ engine
+    /// default `boss/`), or omit to leave unchanged. A trailing `/` is
+    /// added if you omit it. See `ProductCreateArgs::worker_branch_prefix`.
+    #[arg(long = "worker-branch-prefix")]
+    worker_branch_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2123,6 +2139,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     repo_remote_url,
                     design_repo,
                     docs_repo: None,
+                    worker_branch_prefix: args.worker_branch_prefix,
                 },
             )
             .await?;
@@ -2152,6 +2169,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 repo_remote_url: args.repo_remote_url,
                 design_repo: args.design_repo,
                 dispatch_preamble: args.dispatch_preamble,
+                worker_branch_prefix: args.worker_branch_prefix,
                 ..WorkItemPatch::default()
             };
             ensure_patch_present(
@@ -5595,6 +5613,7 @@ fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Result<(), CliE
         || patch.model_override.is_some()
         || patch.default_model.is_some()
         || patch.dispatch_preamble.is_some()
+        || patch.worker_branch_prefix.is_some()
         || patch.autostart.is_some()
         || patch.blocked_reason.is_some();
 
@@ -5948,6 +5967,9 @@ fn print_product_details(title: &str, product: &Product) {
     println!("Repo: {}", product.repo_remote_url.as_deref().unwrap_or(""));
     if let Some(design_repo) = product.design_repo.as_deref() {
         println!("Design repo: {design_repo}");
+    }
+    if let Some(prefix) = product.worker_branch_prefix.as_deref() {
+        println!("Worker branch prefix: {prefix}");
     }
     if let Some(model) = product.default_model.as_deref() {
         println!("Default model: {model}");
