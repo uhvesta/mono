@@ -32,17 +32,19 @@ import Security
 ///     `keychain-access-groups` is an Apple *restricted* entitlement and
 ///     AMFI SIGKILLs an ad-hoc binary that declares it at exec (#784 — the
 ///     reason c4e15f51 had to be reverted in #786). Without the
-///     entitlement the data-protection keychain returns
-///     `errSecMissingEntitlement`, so we fall back to a `0600` file under
-///     Application Support. A file's identity is stable across rebuilds,
-///     so unlike the legacy keychain it never re-prompts when the ad-hoc
-///     cdhash changes — and it never raises a dialog at all.
+///     entitlement, `SecItemAdd` / `SecItemUpdate` return
+///     `errSecMissingEntitlement` (-34018), so we fall back to a `0600`
+///     file under Application Support. A file's identity is stable across
+///     rebuilds, so unlike the legacy keychain it never re-prompts when
+///     the ad-hoc cdhash changes — and it never raises a dialog at all.
 ///
 /// Selection cannot be a compile-time flag: release builds are the *same*
 /// bazel binary re-signed by `installer/release.sh`, so the running
-/// process probes the data-protection keychain to discover whether it is
-/// entitled. The probe is dialog-free either way (the data-protection
-/// keychain has no interactive ACL).
+/// process checks the `keychain-access-groups` entitlement at runtime via
+/// `SecTaskCopyValueForEntitlement` to discover whether it is entitled.
+/// Note: a `SecItemCopyMatching` read-probe is NOT used here because it
+/// returns `errSecItemNotFound` on both entitled *and* unentitled processes
+/// when no item exists yet — it cannot distinguish dev from release builds.
 ///
 /// A key previously stored under the legacy keychain is not visible to
 /// either backend; the user re-enters it once in Settings (no
@@ -137,26 +139,23 @@ enum APIKeyStore {
     }
 
     /// `true` when the data-protection keychain is usable by this
-    /// process. A read for our item returns `errSecSuccess` or
-    /// `errSecItemNotFound` when the process has a keychain access group
-    /// (Developer ID release); an ad-hoc build lacking the
-    /// `keychain-access-groups` entitlement gets `errSecMissingEntitlement`
-    /// instead. Anything other than a clean success/not-found is treated
-    /// as "unavailable" and routed to the never-prompting file backend,
-    /// so an unexpected keychain error can never surface a dialog. The
-    /// probe never raises an interactive dialog because the
-    /// data-protection keychain has no ACL.
+    /// process. Detected by checking whether the `keychain-access-groups`
+    /// entitlement is present in the running process.
+    ///
+    /// A `SecItemCopyMatching` read-probe was used previously, but it
+    /// is unreliable: `SecItemCopyMatching` returns `errSecItemNotFound`
+    /// on both entitled *and* unentitled processes when no item exists,
+    /// so the probe cannot distinguish a Developer ID release build from
+    /// an ad-hoc dev build. `SecItemAdd` / `SecItemUpdate` do enforce the
+    /// entitlement and fail with `errSecMissingEntitlement` (-34018) on
+    /// ad-hoc builds — which is exactly the production bug this probe is
+    /// meant to prevent. Checking the entitlement directly is accurate
+    /// and involves no keychain I/O.
     private static func dataProtectionKeychainAvailable() -> Bool {
-        let probe: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: anthropicApiKeyAccount,
-            kSecUseDataProtectionKeychain as String: true,
-            kSecReturnData as String: false,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        let status = SecItemCopyMatching(probe as CFDictionary, nil)
-        return status == errSecSuccess || status == errSecItemNotFound
+        guard let task = SecTaskCreateFromSelf(nil) else { return false }
+        let value = SecTaskCopyValueForEntitlement(
+            task, "keychain-access-groups" as CFString, nil)
+        return value != nil
     }
 
     /// Default file-backend location: a `0600` file in the shared
