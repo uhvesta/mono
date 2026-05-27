@@ -124,6 +124,62 @@ fi
 
 echo "[boss-release] credentials loaded (APP_ID=[REDACTED])"
 
+# ── fetch tags so workspace-status.sh gets a git-derived version ──────────────
+# Buildkite clones are shallow by default and do not carry all remote tags.
+# tools/boss/installer/workspace-status.sh relies on `git describe --tags
+# --match "boss-v*"` to derive STABLE_BOSS_VERSION.  Without the tags that
+# command returns empty and the version falls back to "0.0.0-dev-<sha>".
+# Fetching all tags here guarantees the describe call works and means the
+# binary embeds the real release version string (see version-tag section below).
+log "[boss-release] fetching boss-v* tags for version stamping"
+git fetch --tags origin 2>/dev/null || true
+
+# ── compute next release version ─────────────────────────────────────────────
+# Tags match boss-v1.0.N (monorepo-prefixed, mirrors checkleft-v* convention).
+# If no matching release exists yet, start at boss-v1.0.0.
+#
+# IMPORTANT: this block is intentionally placed BEFORE the bazel build so that
+# the next-version tag can be pushed to the remote before Bazel runs
+# workspace-status.sh.  That lets `git describe --tags --match "boss-v*"
+# --exact-match` hit the tag and stamp the binary with the exact release
+# version (e.g. "1.0.5") rather than a dev suffix.
+
+log "[boss-release] computing next version"
+EXISTING_TAGS=$(gh release list --repo spinyfin/mono --limit 200 \
+  --json tagName --jq '.[].tagName' 2>/dev/null || true)
+
+MAX_N=-1
+while IFS= read -r tag; do
+  if [[ "${tag}" =~ ^boss-v1\.0\.([0-9]+)$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    if (( n > MAX_N )); then MAX_N="${n}"; fi
+  fi
+done <<< "${EXISTING_TAGS}"
+
+NEXT_N=$(( MAX_N + 1 ))
+VERSION="boss-v1.0.${NEXT_N}"
+ARTIFACT="Boss-1.0.${NEXT_N}.zip"
+echo "[boss-release] version: ${VERSION}  artifact: ${ARTIFACT}"
+
+# Push the release tag to the remote BEFORE building so that
+# workspace-status.sh can resolve it via `git describe --exact-match` and
+# stamp the binary with the clean "1.0.N" version string.
+# Register a trap so a failed build cleans up the leaked tag.
+TAG_PUSHED=0
+_cleanup_tag() {
+  if (( TAG_PUSHED == 1 )); then
+    echo "[boss-release] build failed after tagging — deleting remote tag ${VERSION}"
+    git push origin ":refs/tags/${VERSION}" 2>/dev/null || true
+    git tag -d "${VERSION}" 2>/dev/null || true
+  fi
+}
+trap '_cleanup_tag' ERR
+
+log "[boss-release] creating and pushing release tag ${VERSION} (before build)"
+git tag "${VERSION}" HEAD
+git push origin "refs/tags/${VERSION}"
+TAG_PUSHED=1
+
 # ── GhosttyKit stub ───────────────────────────────────────────────────────────
 # rules_swift_package_manager runs `swift package describe` during Bazel
 # analysis; the stub lets SPM parse the Package.swift manifest without
@@ -201,26 +257,8 @@ fi
 [[ -f "${ZIP_PATH}" ]] || die "Boss.zip not found at discovered path: ${ZIP_PATH}"
 echo "[boss-release] Boss.zip: ${ZIP_PATH}"
 
-# ── compute next release version ─────────────────────────────────────────────
-# Tags match boss-v1.0.N (monorepo-prefixed, mirrors checkleft-v* convention).
-# If no matching release exists yet, start at boss-v1.0.0.
-
-log "[boss-release] computing next version"
-EXISTING_TAGS=$(gh release list --repo spinyfin/mono --limit 200 \
-  --json tagName --jq '.[].tagName' 2>/dev/null || true)
-
-MAX_N=-1
-while IFS= read -r tag; do
-  if [[ "${tag}" =~ ^boss-v1\.0\.([0-9]+)$ ]]; then
-    n="${BASH_REMATCH[1]}"
-    if (( n > MAX_N )); then MAX_N="${n}"; fi
-  fi
-done <<< "${EXISTING_TAGS}"
-
-NEXT_N=$(( MAX_N + 1 ))
-VERSION="boss-v1.0.${NEXT_N}"
-ARTIFACT="Boss-1.0.${NEXT_N}.zip"
-echo "[boss-release] version: ${VERSION}  artifact: ${ARTIFACT}"
+# The build succeeded; cancel the tag-cleanup trap.
+trap - ERR
 
 # ── prepare the pre-zipped artifact ────────────────────────────────────────────
 # The macos_application rule pre-zips the bundle, so we just rename it to the
