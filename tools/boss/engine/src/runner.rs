@@ -1397,25 +1397,24 @@ fn work_item_pr_url(work_item: &WorkItem) -> Option<&str> {
     }
 }
 
-/// The PR this task is bound to, if any. Prefers the explicit
-/// `task.pr_url` column (set by `reconciler_attach_pr_url` and the
-/// `pr_url_capture` pipeline); when that is empty, falls back to
-/// scanning `task.description` for a single canonical GitHub PR URL.
+/// The PR this task is bound to, if any.
 ///
-/// The fallback exists because a task can be created — by a human via
-/// `bossctl`, by the issue importer's bootstrap path, or by any other
-/// surface — with a PR URL referenced in the description before the
-/// reconciler has had a chance to attach it. Without this fallback the
-/// worker dispatched against such a task does not see the
-/// `RESUME EXISTING PR` directive and falls through to the default
-/// "push a fresh `boss/exec_*` branch + `gh pr create`" flow,
-/// producing a duplicate PR alongside the one the task was already
-/// linked to (incident: mono#742).
+/// Returns the structured `task.pr_url` column as set by
+/// `reconciler_attach_pr_url` and the `pr_url_capture` pipeline.
+/// Returns `None` when that field is empty or null.
+///
+/// **No description scanning.** An earlier version fell back to
+/// pattern-matching a PR URL out of `task.description` (mono#742).
+/// That fallback was removed because it fires on any description that
+/// *mentions* a PR in passing (e.g. an issue-imported chore whose body
+/// cites a repro session's PR as an example — incident T683 /
+/// exec_18b341df81251750_4). A misfire sends the worker to a foreign
+/// repo's PR, which is strictly worse than a duplicate-PR restart.
+/// The reconciler path (`reconciler_attach_pr_url`) is responsible for
+/// populating `task.pr_url` before dispatch; if it has not done so yet
+/// the dispatcher should treat the task as PR-less and start fresh.
 pub(crate) fn task_bound_pr_url(task: &crate::work::Task) -> Option<&str> {
-    if let Some(url) = task.pr_url.as_deref().filter(|u| !u.is_empty()) {
-        return Some(url);
-    }
-    extract_pr_url_from_text(&task.description)
+    task.pr_url.as_deref().filter(|u| !u.is_empty())
 }
 
 /// Find a single canonical GitHub PR URL inside arbitrary text.
@@ -2206,28 +2205,6 @@ mod compose_prompt_tests {
     }
 
     #[test]
-    fn task_bound_pr_url_falls_back_to_description() {
-        // Reproduces the mono#742 incident: task has no explicit
-        // `pr_url` column but its description references the PR. The
-        // worker must see the PR so it doesn't open a duplicate.
-        let chore = match chore_without_pr() {
-            WorkItem::Chore(mut task) => {
-                task.description = "Resolve merge conflicts on https://github.com/org/repo/pull/235 — please rebase.".into();
-                WorkItem::Chore(task)
-            }
-            other => other,
-        };
-        let task = match &chore {
-            WorkItem::Chore(t) => t,
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            task_bound_pr_url(task),
-            Some("https://github.com/org/repo/pull/235"),
-        );
-    }
-
-    #[test]
     fn task_bound_pr_url_returns_none_when_description_has_only_issue_url() {
         let chore = match chore_without_pr() {
             WorkItem::Chore(mut task) => {
@@ -2244,15 +2221,39 @@ mod compose_prompt_tests {
     }
 
     #[test]
-    fn resume_directive_uses_pr_url_from_description() {
-        // Integration: when only the description mentions the PR, the
-        // composed prompt must still inject the RESUME EXISTING PR
-        // block — this is the worker-facing contract that closes the
-        // duplicate-PR incident.
+    fn task_bound_pr_url_ignores_pr_url_in_description() {
+        // Regression for T683 / exec_18b341df81251750_4: a chore imported
+        // from an issue whose body *mentions* a PR URL (e.g. as a repro
+        // example) must NOT cause a RESUME EXISTING PR block. The structured
+        // `pr_url` field is the only authoritative source.
         let chore = match chore_without_pr() {
             WorkItem::Chore(mut task) => {
                 task.description =
-                    "Rebase https://github.com/org/repo/pull/235 onto current main.".into();
+                    "Parent chore C19 landed at https://github.com/linkedin-multiproduct/dev-infra/pull/250 \
+                     as a repro example — this chore has no PR yet."
+                        .into();
+                WorkItem::Chore(task)
+            }
+            other => other,
+        };
+        let task = match &chore {
+            WorkItem::Chore(t) => t,
+            _ => unreachable!(),
+        };
+        assert!(
+            task_bound_pr_url(task).is_none(),
+            "description-embedded PR URL must not be treated as the task's PR",
+        );
+    }
+
+    #[test]
+    fn resume_directive_absent_when_pr_url_is_null() {
+        // Regression for T683: a chore with pr_url=null and a description
+        // mentioning a PR must not generate a RESUME EXISTING PR block.
+        let chore = match chore_without_pr() {
+            WorkItem::Chore(mut task) => {
+                task.description =
+                    "Ref: https://github.com/linkedin-multiproduct/dev-infra/pull/250".into();
                 WorkItem::Chore(task)
             }
             other => other,
@@ -2268,20 +2269,36 @@ mod compose_prompt_tests {
             None,
         );
         assert!(
+            !prompt.contains("## RESUME EXISTING PR"),
+            "RESUME block must NOT fire when task.pr_url is null, even if description mentions a PR:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn resume_directive_present_when_structured_pr_url_is_set() {
+        // Positive case: task with an explicit pr_url gets the RESUME block.
+        let chore = chore_with_pr("https://github.com/org/repo/pull/235");
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
             prompt.contains("## RESUME EXISTING PR"),
-            "resume block must fire when only the description carries the PR URL:\n{prompt}",
+            "resume block must fire when task.pr_url is set:\n{prompt}",
         );
         assert!(
             prompt.contains("https://github.com/org/repo/pull/235"),
-            "resume block must quote the description-derived PR URL:\n{prompt}",
+            "resume block must quote the structured PR URL:\n{prompt}",
         );
         assert!(
             prompt.contains("#235"),
             "resume block must surface the PR number:\n{prompt}",
-        );
-        assert!(
-            !prompt.contains("jj bookmark create boss/exec_abc123_01"),
-            "acceptance criterion must NOT instruct opening a fresh boss/exec_* branch:\n{prompt}",
         );
     }
 }
