@@ -2073,7 +2073,7 @@ impl WorkerCompletionHandler {
         };
         let bound_pr_url = match work_item {
             WorkItem::Task(task) | WorkItem::Chore(task) => {
-                // Primary: the task's own pr_url (or embedded in description).
+                // Primary: the task's own pr_url (structured field only).
                 // Fallback for revision_implementation: use execution.pr_url
                 // (set to the chain root's PR URL at dispatch time), because
                 // revision tasks always have task.pr_url = NULL by design.
