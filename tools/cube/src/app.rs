@@ -844,7 +844,6 @@ fn run_workspace(
             let mut clean_candidate: Option<String> = None;
             // first conflicted-but-repairable workspace found
             let mut conflicted_candidate: Option<(String, Vec<String>)> = None;
-            let mut dirty_count = 0usize;
             // Free workspaces whose directory exists but has neither .jj/ nor
             // .git/ — husks holding no recoverable work. Collected as
             // (workspace_id, path) so the lease path can GC them and reuse the
@@ -909,7 +908,6 @@ fn run_workspace(
                             ws_id,
                             WorkspaceHealth::Dirty,
                         )?;
-                        dirty_count += 1;
                         audit!(
                             database_path,
                             "workspace.health_check_skipped",
@@ -942,10 +940,9 @@ fn run_workspace(
             }
 
             // Decide which workspace to use: prefer clean, fall back to the
-            // first repairable conflicted workspace, otherwise self-heal any
-            // broken-empty husks and auto-create. The only hard stop is a pool
-            // where every free workspace is dirty (unpushed work the operator
-            // must reclaim).
+            // first repairable conflicted workspace, otherwise auto-create a
+            // fresh one. No pool state (dirty, husk, occupied) is ever a hard
+            // stop — cube always provisions new capacity for a reachable repo.
             let chosen_id = clean_candidate.or_else(|| {
                 conflicted_candidate.as_ref().map(|(id, _)| id.clone())
             });
@@ -976,32 +973,17 @@ fn run_workspace(
                 // recoverable work, so delete it and free its slot instead of
                 // surfacing it to the caller. A husk must never be a reason to
                 // deny a lease for a reachable repo (issue #845 part 2b).
-                let had_broken_empty = !broken_empty.is_empty();
                 for (ws_id, ws_path) in &broken_empty {
                     gc_broken_empty_workspace(&mut store, database_path, &repo, ws_id, ws_path)?;
                     candidates.retain(|c| &c.workspace_id != ws_id);
                 }
 
-                // The one remaining hard stop: every free workspace is dirty
-                // (none broken-empty, none missing). Dirty copies may hold
-                // unpushed work, so refuse and let the operator reclaim them.
-                // Return a structured error so Boss can surface this as
-                // `blocked`.
-                if !had_broken_empty
-                    && dirty_count > 0
-                    && dirty_count == ordered_ids.len()
-                {
-                    return Err(CubeError::NoAvailableWorkspace(format!(
-                        "{repo}: {dirty_count} workspace(s) have dirty working copies \
-                         (run `cube workspace force-release --reason crash` to reclaim); \
-                         run `cube workspace list --repo {repo}` to inspect"
-                    )));
-                }
-
-                // Pool is empty, fully leased, or only had broken-empty husks
-                // (now GC'd): grow the pool by one. The pool is an optimisation
-                // (reuse a known-good checkout), never a hard cap — a lease for
-                // a reachable repo always succeeds (issue #845 part 1).
+                // Pool is empty, fully leased, only had broken-empty husks
+                // (now GC'd), or all free slots are dirty: grow the pool by
+                // one. Dirty workspaces are left untouched so their unpushed
+                // work is preserved for later inspection. The pool is an
+                // optimisation (reuse a known-good checkout), never a hard
+                // cap — a lease for a reachable repo always succeeds.
                 let new_candidate = auto_create_workspace(runner, &repo_record, &candidates)?;
                 let new_id = new_candidate.workspace_id.clone();
                 candidates.push(new_candidate);
@@ -5189,8 +5171,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_lease_all_dirty_returns_structured_error() {
-        // Pool: dirty(003), dirty(007) → no usable workspace → structured error.
+    fn workspace_lease_all_dirty_auto_creates_fresh_workspace() {
+        // Pool: dirty(003), dirty(007) → no reusable slot → auto-create a new
+        // workspace instead of blocking. The dirty entries must be preserved.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         let path_003 = workspace_root.join("mono-agent-003");
@@ -5205,34 +5188,59 @@ mod tests {
         )
         .expect("repo");
 
+        // After health-checking 003 and 007 as dirty, the lease path falls
+        // through to auto_create_workspace which clones a new workspace.
+        let new_path = workspace_root.join("mono-agent-008");
+        let staging = workspace_root.join(".incoming-mono-agent-008");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(path_003.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
             ExpectedCommand::ok(path_007.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &staging.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(
+                staging.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
         ]);
 
-        let err = run_with_dependencies(
+        let result = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "all dirty"]),
             Some(&database_path),
             &runner,
         )
-        .expect_err("should fail when all workspaces are dirty");
+        .expect("lease should succeed via auto-create when all existing workspaces are dirty");
         runner.assert_exhausted();
 
-        match err {
-            CubeError::NoAvailableWorkspace(msg) => {
-                assert!(
-                    msg.contains("dirty working copies"),
-                    "error should mention dirty: {msg}"
-                );
-                assert!(
-                    msg.contains("mono"),
-                    "error should mention repo: {msg}"
-                );
-            }
-            other => panic!("expected NoAvailableWorkspace, got: {other:?}"),
-        }
+        // The leased workspace is the newly created one.
+        assert_eq!(
+            result.payload["workspace"]["workspace_id"],
+            "mono-agent-008",
+            "expected newly created workspace"
+        );
+        assert_eq!(result.payload["workspace"]["state"], "leased");
 
-        // Both workspaces should be marked dirty in the store.
+        // Both dirty workspaces are still in the store with their health marked.
         use crate::store::Store;
         let store = Store::open_at(&database_path).unwrap();
         for path in [&path_003, &path_007] {
@@ -5240,7 +5248,7 @@ mod tests {
             assert_eq!(
                 ws.health_status,
                 Some(crate::metadata::WorkspaceHealth::Dirty),
-                "expected dirty health for {}",
+                "dirty workspace should be preserved at {}",
                 path.display()
             );
         }
