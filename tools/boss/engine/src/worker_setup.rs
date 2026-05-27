@@ -103,8 +103,9 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     let draft_directive = if input.draft_pr_mode {
         "\n## PR creation mode\n\
          \n\
-         Default PR creation mode: when running `gh pr create`, pass `--draft`\n\
-         unless the chore description explicitly says to create a non-draft PR.\n"
+         Default PR creation mode: pass `--draft` to `cube pr ensure`\n\
+         (or `gh pr create`) unless the chore description explicitly says\n\
+         to create a non-draft PR.\n"
     } else {
         ""
     };
@@ -162,30 +163,29 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          \n\
          ## Creating a PR from a jj workspace\n\
          \n\
-         There is no `.git/` at the workspace root — the backing git store\n\
-         lives at `.jj/repo/store/git`. Bare `gh` calls fail with\n\
-         `fatal: not a git repository`.\n\
-         \n\
-         **Rule: prefix every `gh` call with `GIT_DIR=.jj/repo/store/git`.**\n\
-         **Rule: pass `--head <bookmark> --base main` to `gh pr create`.**\n\
-         **Rule: `jj git push -b <bookmark>` requires `--allow-new` the first time.**\n\
+         Cube workspaces are secondary jj workspaces. There is no `.git/`\n\
+         at the workspace root, so bare `gh` calls fail with\n\
+         `fatal: not a git repository`. Use `cube pr ensure` instead —\n\
+         it resolves the remote `owner/repo` from `jj git remote` and\n\
+         passes `-R <owner/repo>` to `gh`, so no `GIT_DIR` guess is needed.\n\
          \n\
          ### Canonical PR creation recipe\n\
          \n\
          ```sh\n\
          jj describe -m \"your commit message\"\n\
          jj bookmark create my-feature -r @\n\
-         GIT_DIR=.jj/repo/store/git jj git push -b my-feature --allow-new\n\
-         GIT_DIR=.jj/repo/store/git gh pr create \\\\\n\
-           --head my-feature --base main \\\\\n\
-           --title \"Your PR title\" \\\\\n\
-           --body \"PR description\"\n\
+         cube pr ensure --branch my-feature --title \"Your PR title\" --body \"PR description\"\n\
          ```\n\
          \n\
-         To update an existing PR:\n\
+         `cube pr ensure` is idempotent: if a PR for `my-feature` already\n\
+         exists, it prints its URL and exits 0 without opening a duplicate.\n\
+         **Rule: `jj git push -b <bookmark>` requires `--allow-new` the first\n\
+         time when calling jj directly; `cube pr ensure` handles this for you.**\n\
+         \n\
+         To update an existing PR (just push new commits):\n\
          \n\
          ```sh\n\
-         jj git push -b my-feature   # no --allow-new needed\n\
+         jj git push -b my-feature   # no --allow-new needed for subsequent pushes\n\
          ```\n\
          \n\
          ## Boundaries\n\
@@ -270,7 +270,7 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
             "import json,sys,re; ",
             "inp=json.load(sys.stdin); ",
             "cmd=inp.get('tool_input',{}).get('command',''); ",
-            r#"m=re.search(r'(?:^|\s|;|\||&|GIT_DIR=\S+\s+)gh\s+pr\s+create\b',cmd); "#,
+            r#"m=re.search(r'(?:^|\s|;|\||&|GIT_DIR=\S+\s+)gh\s+pr\s+create\b|cube\s+pr\s+ensure\b',cmd); "#,
             "msg='Revision tasks push commits to the existing parent PR; they must not open a new PR. Use jj git push to update the existing PR instead.'; ",
             "print(json.dumps({'decision':'block','reason':msg}) if m else json.dumps({'decision':'approve'})); ",
             "\""
@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_md_has_pr_creation_section_with_git_dir_prefix() {
+    fn claude_md_has_cube_pr_ensure_section() {
         let input = sample_input();
         let rendered = render_claude_md(&input);
         assert!(
@@ -1020,16 +1020,12 @@ mod tests {
             "expected a 'Creating a PR from a jj workspace' section",
         );
         assert!(
-            rendered.contains("GIT_DIR=.jj/repo/store/git"),
-            "expected GIT_DIR=.jj/repo/store/git prefix to be documented",
+            rendered.contains("cube pr ensure"),
+            "expected cube pr ensure to be the canonical PR creation command",
         );
         assert!(
-            rendered.contains("--head"),
-            "expected --head <bookmark> guidance",
-        );
-        assert!(
-            rendered.contains("--allow-new"),
-            "expected --allow-new guidance for first-time bookmark push",
+            rendered.contains("--branch"),
+            "expected --branch flag guidance",
         );
         assert!(
             rendered.contains("jj bookmark create"),
@@ -1039,13 +1035,9 @@ mod tests {
 
     #[test]
     fn claude_md_explains_no_git_at_workspace_root() {
-        // Workers must know why bare `gh` fails before reaching for the fix.
+        // Workers must know why bare `gh` calls fail before reaching for the fix.
         let input = sample_input();
         let rendered = render_claude_md(&input);
-        assert!(
-            rendered.contains(".jj/repo/store/git"),
-            "expected the backing git-store path to be documented",
-        );
         assert!(
             rendered.contains("fatal: not a git repository")
                 || rendered.contains("no `.git/`"),
@@ -1063,8 +1055,8 @@ mod tests {
             "CLAUDE.md must include --draft directive when draft_pr_mode is true",
         );
         assert!(
-            rendered.contains("gh pr create"),
-            "draft directive must reference gh pr create",
+            rendered.contains("cube pr ensure"),
+            "draft directive must reference cube pr ensure",
         );
     }
 
@@ -1197,11 +1189,15 @@ mod tests {
             serde_json::Value::String("Bash".into()),
             "second PreToolUse hook must match 'Bash'",
         );
-        // Guard command must reference the deny decision and gh pr create.
+        // Guard command must reference the deny decision and both gh pr create and cube pr ensure.
         let guard_cmd = pre[1]["hooks"][0]["command"].as_str().unwrap_or("");
         assert!(
             guard_cmd.contains("gh") && guard_cmd.contains("pr") && guard_cmd.contains("create"),
             "guard command must inspect gh pr create: {guard_cmd}",
+        );
+        assert!(
+            guard_cmd.contains("cube") && guard_cmd.contains("ensure"),
+            "guard command must also block cube pr ensure: {guard_cmd}",
         );
         assert!(
             guard_cmd.contains("block"),

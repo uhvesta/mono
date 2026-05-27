@@ -275,10 +275,35 @@ pub struct StackRebaseArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PrCommand {
+    /// Create or reuse a GitHub PR for the current jj bookmark.
+    ///
+    /// Resolves `owner/repo` from `jj git remote`, pushes the branch,
+    /// checks for an existing open PR, and creates one if none exists.
+    /// Prints the PR URL as the only stdout line. Idempotent — safe to
+    /// re-run: if the PR already exists its URL is returned unchanged.
+    /// Uses `-R <owner/repo>` with `gh` so no `GIT_DIR` guess is needed.
+    Ensure(PrEnsureArgs),
     /// Sync local change state to GitHub pull requests.
     Sync(PrSyncArgs),
     /// Merge one PR or a ready sub-stack.
     Merge(PrMergeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PrEnsureArgs {
+    /// Branch name to push and open a PR for.
+    /// Defaults to the first bookmark on the current jj commit.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// PR title (gh prompts interactively when omitted and stdin is a TTY).
+    #[arg(long)]
+    pub title: Option<String>,
+    /// PR body text.
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Open the PR as a draft.
+    #[arg(long)]
+    pub draft: bool,
 }
 
 #[derive(Debug, Args)]
@@ -319,7 +344,7 @@ pub struct DoctorArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{ChangeCommand, Cli, Command, PrCommand, RepoCommand, WorkspaceCommand};
+    use super::{ChangeCommand, Cli, Command, PrCommand, PrEnsureArgs, RepoCommand, WorkspaceCommand};
 
     #[test]
     fn repo_ensure_matches_phase_a_shape() {
@@ -777,6 +802,51 @@ mod tests {
                 assert_eq!(args.stack, None);
             }
             _ => panic!("expected pr merge command"),
+        }
+    }
+
+    #[test]
+    fn pr_ensure_accepts_all_flags() {
+        let cli = Cli::parse_from([
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "boss/exec_abc123_01",
+            "--title",
+            "My PR",
+            "--body",
+            "A description",
+            "--draft",
+        ]);
+
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, draft }),
+            } => {
+                assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
+                assert_eq!(title.as_deref(), Some("My PR"));
+                assert_eq!(body.as_deref(), Some("A description"));
+                assert!(draft);
+            }
+            _ => panic!("expected pr ensure command"),
+        }
+    }
+
+    #[test]
+    fn pr_ensure_branch_is_optional() {
+        let cli = Cli::parse_from(["cube", "pr", "ensure"]);
+
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, draft }),
+            } => {
+                assert!(branch.is_none());
+                assert!(title.is_none());
+                assert!(body.is_none());
+                assert!(!draft);
+            }
+            _ => panic!("expected pr ensure command"),
         }
     }
 }

@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::audit;
 use crate::cli::{
-    ChangeCommand, Cli, Command, DoctorArgs, GraphArgs, PrCommand, RepoCommand, StackCommand,
-    WorkspaceCommand,
+    ChangeCommand, Cli, Command, DoctorArgs, GraphArgs, PrCommand, PrEnsureArgs, RepoCommand,
+    StackCommand, WorkspaceCommand,
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::config;
@@ -224,7 +224,7 @@ fn run_with_context(
         Command::Workspace { command } => run_workspace(command, database_path, runner),
         Command::Change { command } => run_change(command, database_path, runner),
         Command::Stack { command } => run_stack(command),
-        Command::Pr { command } => run_pr(command),
+        Command::Pr { command } => run_pr(command, runner),
         Command::Graph(args) => run_graph(args),
         Command::Doctor(args) => run_doctor(args),
     }
@@ -1633,11 +1633,186 @@ fn run_stack(command: StackCommand) -> Result<RunResult> {
     )))
 }
 
-fn run_pr(command: PrCommand) -> Result<RunResult> {
-    Err(CubeError::NotImplemented(format!(
-        "pr command `{}` is not implemented yet",
-        pr_command_name(&command)
-    )))
+fn run_pr(command: PrCommand, runner: &dyn CommandRunner) -> Result<RunResult> {
+    match command {
+        PrCommand::Ensure(args) => ensure_pr(args, runner),
+        _ => Err(CubeError::NotImplemented(format!(
+            "pr command `{}` is not implemented yet",
+            pr_command_name(&command)
+        ))),
+    }
+}
+
+/// Create or reuse a GitHub PR for the current jj bookmark.
+///
+/// Pushes the branch via `jj git push` and then uses `gh pr create -R
+/// <owner/repo>` — no `GIT_DIR` guess needed, works from both primary
+/// and secondary cube workspaces.
+fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
+    let cwd = std::env::current_dir().map_err(CubeError::Io)?;
+
+    // Resolve owner/repo from jj remote list.
+    let remote_output = runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["git", "remote", "list"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to list jj remotes (is this a jj workspace?): {e}"
+            ))
+        })?;
+    let owner_repo = parse_github_owner_repo(&remote_output).ok_or_else(|| {
+        CubeError::InvalidArgument(format!(
+            "could not detect a github.com remote from `jj git remote list` output:\n{remote_output}"
+        ))
+    })?;
+
+    // Determine branch name.
+    let branch = match args.branch {
+        Some(b) => b,
+        None => detect_jj_bookmark(runner, &cwd)?,
+    };
+
+    // Push the branch (--allow-new is idempotent: fine when remote already exists).
+    runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["git", "push", "-b", &branch, "--allow-new"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!("failed to push branch `{branch}`: {e}"))
+        })?;
+
+    // Check for an existing open PR.
+    let list_json = runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "gh",
+            &[
+                "pr",
+                "list",
+                "-R",
+                &owner_repo,
+                "--head",
+                &branch,
+                "--json",
+                "url",
+            ],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!("failed to check for existing PR: {e}"))
+        })?;
+
+    if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(&list_json) {
+        if let Some(url) = prs
+            .first()
+            .and_then(|pr| pr.get("url"))
+            .and_then(|v| v.as_str())
+        {
+            let url = url.to_string();
+            return RunResult::new(url.clone(), json!({"url": url, "created": false}));
+        }
+    }
+
+    // No existing PR — create one.
+    let mut create_args: Vec<&str> = vec![
+        "pr", "create", "-R", &owner_repo, "--head", &branch, "--base", "main",
+    ];
+    let title_ref;
+    let body_ref;
+    if let Some(ref t) = args.title {
+        title_ref = t.as_str();
+        create_args.push("--title");
+        create_args.push(title_ref);
+    }
+    if let Some(ref b) = args.body {
+        body_ref = b.as_str();
+        create_args.push("--body");
+        create_args.push(body_ref);
+    }
+    if args.draft {
+        create_args.push("--draft");
+    }
+
+    let create_output = runner
+        .run(&RealCommandRunner::invocation(&cwd, "gh", &create_args))
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to create PR: {e}")))?;
+
+    let url = create_output.trim().to_string();
+    if url.is_empty() {
+        return Err(CubeError::InvalidArgument(
+            "gh pr create produced no output — PR may not have been created".to_string(),
+        ));
+    }
+    RunResult::new(url.clone(), json!({"url": url, "created": true}))
+}
+
+/// Parse the first recognisable `owner/repo` slug from `jj git remote list` output.
+///
+/// The output format is one remote per line: `<name>\t<url>` (or
+/// space-separated). Accepts both SSH (`git@github.com:owner/repo.git`)
+/// and HTTPS (`https://github.com/owner/repo`) remotes.
+fn parse_github_owner_repo(remote_list_output: &str) -> Option<String> {
+    for line in remote_list_output.lines() {
+        // Split on the first run of whitespace to get (name, url).
+        let mut iter = line.splitn(2, |c: char| c.is_whitespace());
+        let _ = iter.next(); // remote name
+        if let Some(url) = iter.next().map(str::trim) {
+            if let Some(slug) = parse_github_slug(url) {
+                return Some(slug);
+            }
+        }
+    }
+    None
+}
+
+/// Parse `owner/repo` from a GitHub remote URL (SSH or HTTPS).
+fn parse_github_slug(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let (_, after_host) = trimmed.split_once("github.com")?;
+    let after_host = after_host.trim_start_matches([':', '/']);
+    let mut parts = after_host.splitn(3, '/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Detect the first bookmark name on the current jj commit (`@`).
+fn detect_jj_bookmark(runner: &dyn CommandRunner, cwd: &Path) -> Result<String> {
+    let output = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                r#"bookmarks.map(|b| b.name()).join("\n")"#,
+            ],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to detect current jj bookmark: {e}"
+            ))
+        })?;
+
+    output
+        .lines()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .ok_or_else(|| {
+            CubeError::InvalidArgument(
+                "no bookmark on current jj commit — run `jj bookmark create <name> -r @` first"
+                    .to_string(),
+            )
+        })
+        .map(str::to_string)
 }
 
 fn run_graph(_args: GraphArgs) -> Result<RunResult> {
@@ -2909,6 +3084,7 @@ fn stack_command_name(command: &StackCommand) -> &'static str {
 
 fn pr_command_name(command: &PrCommand) -> &'static str {
     match command {
+        PrCommand::Ensure(_) => "ensure",
         PrCommand::Sync { .. } => "sync",
         PrCommand::Merge { .. } => "merge",
     }
@@ -3033,8 +3209,8 @@ mod tests {
 
     use super::{
         CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result, current_epoch_s,
-        is_bare_repo_slug, origin_path_matches_slug, origin_urls_equivalent, parse_origin,
-        run_with_context, run_with_dependencies,
+        is_bare_repo_slug, origin_path_matches_slug, origin_urls_equivalent, parse_github_owner_repo,
+        parse_github_slug, parse_origin, run_with_context, run_with_dependencies,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -9415,5 +9591,65 @@ steps:
             matches!(err, CubeError::WorkspaceDirCreate { ref path, .. } if path == &workspace_root),
             "expected WorkspaceDirCreate, got: {err:?}"
         );
+    }
+
+    // --- parse_github_slug / parse_github_owner_repo tests ---
+
+    #[test]
+    fn parse_github_slug_handles_ssh_url() {
+        assert_eq!(
+            parse_github_slug("git@github.com:spinyfin/mono.git"),
+            Some("spinyfin/mono".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_handles_https_url() {
+        assert_eq!(
+            parse_github_slug("https://github.com/spinyfin/mono"),
+            Some("spinyfin/mono".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_handles_https_url_with_git_suffix() {
+        assert_eq!(
+            parse_github_slug("https://github.com/spinyfin/mono.git"),
+            Some("spinyfin/mono".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_slug_returns_none_for_non_github_url() {
+        assert_eq!(parse_github_slug("git@bitbucket.org:user/repo.git"), None);
+    }
+
+    #[test]
+    fn parse_github_owner_repo_extracts_from_jj_remote_list() {
+        let output = "origin\tgit@github.com:spinyfin/mono.git\n";
+        assert_eq!(
+            parse_github_owner_repo(output),
+            Some("spinyfin/mono".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_owner_repo_handles_space_separated_output() {
+        let output = "origin  https://github.com/spinyfin/mono.git\n";
+        assert_eq!(
+            parse_github_owner_repo(output),
+            Some("spinyfin/mono".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_owner_repo_returns_none_when_no_github_remote() {
+        let output = "origin  git@bitbucket.org:user/repo.git\n";
+        assert_eq!(parse_github_owner_repo(output), None);
+    }
+
+    #[test]
+    fn parse_github_owner_repo_returns_none_for_empty_output() {
+        assert_eq!(parse_github_owner_repo(""), None);
     }
 }

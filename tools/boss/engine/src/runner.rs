@@ -802,6 +802,7 @@ fn compose_execution_prompt(
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
                  - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark and pushing — do NOT invent a different name.\n\
                  - Push your branch (`jj bookmark create {expected_branch} -r @ && jj git push -b {expected_branch} --allow-new`) and open a PR with `gh pr create --head {expected_branch} --base main` if one does not already exist.\n\
+                 - Alternatively, use `cube pr ensure --branch {expected_branch}` which pushes the branch and creates or reuses the PR in one step (jj-aware, no GIT_DIR needed).\n\
                  - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
                  - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
@@ -2079,7 +2080,7 @@ mod compose_prompt_tests {
             "acceptance criterion should guide fresh branch creation:\n{prompt}",
         );
         assert!(
-            prompt.contains("gh pr create"),
+            prompt.contains("gh pr create") || prompt.contains("cube pr ensure"),
             "acceptance criterion should guide opening a new PR:\n{prompt}",
         );
     }
@@ -2757,8 +2758,8 @@ mod pane_spawn_tests {
             "implementation prompt must tell the worker to print the URL on its own line: {prompt}",
         );
         assert!(
-            prompt.contains("gh pr create") || prompt.contains("gh pr view"),
-            "implementation prompt must mention gh pr commands: {prompt}",
+            prompt.contains("gh pr create") || prompt.contains("gh pr view") || prompt.contains("cube pr ensure"),
+            "implementation prompt must mention gh pr commands or cube pr ensure: {prompt}",
         );
         assert!(
             prompt.contains("jj diff -r @"),
