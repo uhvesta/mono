@@ -3491,6 +3491,11 @@ impl WorkDb {
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
         migrate_null_redundant_task_repo_remote_urls(&conn)?;
+        // NULL out any design_doc_branch values that look like ephemeral
+        // worker bookmarks (boss/exec_*). GitHub's Contents API misparses
+        // slashed refs and returns 404; NULL is resolved to "main" at read
+        // time. Must run before short_id so stale rows are fixed early.
+        migrate_backfill_ephemeral_design_doc_branch(&conn)?;
         // Runs last so the per-product `(created_at, id)` backfill
         // sees every task/project row that earlier migrations may
         // have inserted (notably `migrate_backfill_project_design_tasks`).
@@ -8967,6 +8972,30 @@ fn migrate_null_redundant_task_repo_remote_urls(conn: &Connection) -> Result<()>
                  AND p.repo_remote_url IS NOT NULL
                  AND t.repo_remote_url = p.repo_remote_url
            )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Backfill projects whose `design_doc_branch` was erroneously set to an
+/// ephemeral worker bookmark of the form `boss/exec_*`.
+///
+/// The DesignDetector previously wrote the PR *head* branch name into
+/// `design_doc_branch` when a `kind=design` task transitioned to
+/// `in_review`. That head branch has the form `boss/exec_<id>_<seq>`,
+/// which contains slashes. GitHub's Contents API misparses a slashed
+/// ref in `?ref=boss/exec_...` — it reads `boss` as the ref and the
+/// remainder as a path segment, returning HTTP 404 even while the
+/// branch still exists on the remote.
+///
+/// This migration NULLs out those rows. NULL resolves to `"main"` at
+/// read time in `resolve_project_design_doc`, which is the durable
+/// base branch the doc lives on after the PR merges.
+fn migrate_backfill_ephemeral_design_doc_branch(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE projects
+         SET design_doc_branch = NULL
+         WHERE design_doc_branch LIKE 'boss/exec_%'",
         [],
     )?;
     Ok(())
@@ -20659,6 +20688,103 @@ mod tests {
             divergent_val.as_deref(),
             Some("git@example.com:other.git"),
             "divergent override must survive migration unchanged",
+        );
+
+        drop(conn2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `migrate_backfill_ephemeral_design_doc_branch` NULLs out any
+    /// `design_doc_branch` that looks like a `boss/exec_*` ephemeral
+    /// bookmark, and leaves durable branch names (e.g. `"main"`,
+    /// `"docs"`) untouched.
+    #[test]
+    fn migrate_backfill_ephemeral_design_doc_branch_clears_boss_exec_rows() {
+        let path = disk_db_path("migration-ephemeral-design-doc-branch");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db.create_product(CreateProductInput {
+            name: "Foo".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+        }).unwrap();
+
+        // Create two projects via the API so all required columns (slug,
+        // short_id, etc.) are filled in correctly.
+        let p_ephemeral = db.create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Ephemeral".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: false,
+        }).unwrap();
+
+        let p_durable = db.create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Durable".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: false,
+        }).unwrap();
+
+        // Set design_doc_path via the API so the branch column is meaningful.
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: p_ephemeral.id.clone(),
+            design_doc_path: Some(
+                "tools/boss/docs/designs/editorial-controls.md".to_owned()
+            ),
+            design_doc_branch: None,
+            design_doc_repo_remote_url: None,
+            unset: false,
+        }).unwrap();
+
+        db.set_project_design_doc(SetProjectDesignDocInput {
+            project_id: p_durable.id.clone(),
+            design_doc_path: Some(
+                "tools/boss/docs/designs/some-other-doc.md".to_owned()
+            ),
+            design_doc_branch: Some("main".to_owned()),
+            design_doc_repo_remote_url: None,
+            unset: false,
+        }).unwrap();
+
+        // Directly plant the stale ephemeral branch value, simulating what the
+        // old DesignDetector wrote before the slashed-ref fix.
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE projects SET design_doc_branch = 'boss/exec_18b07a506d2518d0_1b'
+             WHERE id = ?1",
+            params![p_ephemeral.id],
+        ).unwrap();
+        drop(conn);
+
+        // Re-open to trigger migrations (including the new backfill).
+        let db2 = WorkDb::open(path.clone()).unwrap();
+        let conn2 = db2.connect().unwrap();
+
+        let ephemeral_branch: Option<String> = conn2.query_row(
+            "SELECT design_doc_branch FROM projects WHERE id = ?1",
+            [&p_ephemeral.id],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(
+            ephemeral_branch.is_none(),
+            "boss/exec_* branch must be NULLed by migration, got {ephemeral_branch:?}"
+        );
+
+        let durable_branch: Option<String> = conn2.query_row(
+            "SELECT design_doc_branch FROM projects WHERE id = ?1",
+            [&p_durable.id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            durable_branch.as_deref(),
+            Some("main"),
+            "durable branch 'main' must survive migration unchanged"
         );
 
         drop(conn2);

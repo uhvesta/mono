@@ -10,10 +10,12 @@
 //!
 //! - [`on_design_pr_detected`] — fired when `tasks.pr_url` is set for
 //!   a `kind=design` task (the `in_review` transition). Populates the
-//!   project's design-doc pointer when it is unset. If it is already
-//!   set, updates only `design_doc_branch` to the PR head branch so the
-//!   resolved URL correctly points to the file on the PR branch rather
-//!   than `main` (where the file does not exist yet).
+//!   project's design-doc pointer when it is unset, or updates only
+//!   `design_doc_branch` when it is already set. Always uses the PR's
+//!   **base** branch (e.g. `main`) — never the ephemeral head bookmark.
+//!   Slashed ref names like `boss/exec_*` are mishandled by GitHub's
+//!   Contents API (`?ref=boss/exec_...` is parsed as `ref=boss` + extra
+//!   path, returning 404) even while the branch still exists.
 //! - [`on_design_pr_merged`] — fired when `mark_chore_pr_merged`
 //!   transitions a `kind=design` task to `done`. If the project
 //!   already has a path, only the branch is updated to the PR's base
@@ -30,13 +32,11 @@ use boss_protocol::SetProjectDesignDocInput;
 
 const DESIGN_DOC_PREFIX: &str = "tools/boss/docs/designs/";
 
-/// Metadata extracted from `gh pr view --json files,headRefName,baseRefName`.
+/// Metadata extracted from `gh pr view --json files,baseRefName`.
 struct PrScanResult {
     /// The single design-doc path found in the PR, or `None` if zero
     /// or multiple design docs were present.
     doc_path: Option<String>,
-    /// Head branch name (e.g. `design-boss-ci-buildkite`).
-    head_ref_name: Option<String>,
     /// Base branch name (e.g. `main`).
     base_ref_name: Option<String>,
 }
@@ -45,10 +45,18 @@ struct PrScanResult {
 /// when the work item is `kind=design` with a `project_id`.
 ///
 /// Scans the PR's changed files for a design-doc markdown file under
-/// `tools/boss/docs/designs/`. On a single match, calls
-/// [`WorkDb::sync_project_design_doc_from_detector`] which populates
-/// the project's pointer only when it was previously `NULL` — existing
-/// human-set or previously-detected values are preserved.
+/// `tools/boss/docs/designs/`. On a single match, populates (or updates)
+/// the project's design-doc pointer using the PR's **base** branch.
+///
+/// The base branch (typically `main`) is used instead of the head branch
+/// because GitHub's Contents API misparses slashed ref names: a request
+/// for `?ref=boss/exec_18b.../path` is parsed with `boss` as the ref and
+/// the remainder as a path segment, returning HTTP 404 even while the
+/// branch still exists on the remote.
+///
+/// [`WorkDb::sync_project_design_doc_from_detector`] is used for the
+/// initial (pointer-is-NULL) case; it is a no-op when the path is already
+/// set, at which point only `design_doc_branch` is updated.
 pub async fn on_design_pr_detected(
     work_db: &WorkDb,
     task_id: &str,
@@ -64,8 +72,13 @@ pub async fn on_design_pr_detected(
         return;
     };
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
-    let head_ref_name = scan.head_ref_name;
-    let branch = head_ref_name.as_deref();
+    // Use the durable base branch (e.g. `main`) rather than the ephemeral
+    // head bookmark (e.g. `boss/exec_*`). GitHub's Contents API misparses
+    // slashed ref names — `?ref=boss/exec_...` is read as ref=`boss` with
+    // the remainder as a path segment, producing a 404 regardless of
+    // whether the branch still exists on the remote.
+    let base_ref_name = scan.base_ref_name;
+    let branch = base_ref_name.as_deref();
     match work_db.sync_project_design_doc_from_detector(
         project_id,
         repo_remote_url.as_deref(),
@@ -83,15 +96,14 @@ pub async fn on_design_pr_detected(
             );
         }
         Ok(false) => {
-            // Path was already set — the pointer is preserved, but we
-            // still update `design_doc_branch` to the PR head branch so
-            // the resolved web URL and raw-content URL point at the file
-            // on the PR branch (not at `main` where it doesn't exist yet).
-            if let Some(head_branch) = head_ref_name {
+            // Path was already set — update design_doc_branch to the durable
+            // base branch so it doesn't become stale after the PR merges and
+            // the ephemeral head bookmark is deleted.
+            if let Some(base_branch) = base_ref_name {
                 let input = SetProjectDesignDocInput {
                     project_id: project_id.to_owned(),
                     design_doc_path: None,
-                    design_doc_branch: Some(head_branch.clone()),
+                    design_doc_branch: Some(base_branch.clone()),
                     design_doc_repo_remote_url: None,
                     unset: false,
                 };
@@ -101,8 +113,8 @@ pub async fn on_design_pr_detected(
                             task_id,
                             project_id,
                             pr_url,
-                            branch = head_branch,
-                            "design detector: updated design-doc branch to PR head branch (in_review)"
+                            branch = base_branch,
+                            "design detector: updated design-doc branch to PR base branch (in_review)"
                         );
                     }
                     Err(err) => {
@@ -111,7 +123,7 @@ pub async fn on_design_pr_detected(
                             project_id,
                             pr_url,
                             ?err,
-                            "design detector: failed to update design-doc branch to PR head branch"
+                            "design detector: failed to update design-doc branch to PR base branch"
                         );
                     }
                 }
@@ -120,7 +132,7 @@ pub async fn on_design_pr_detected(
                     task_id,
                     project_id,
                     pr_url,
-                    "design detector: project already has a design-doc pointer, head branch unknown; skipping (in_review)"
+                    "design detector: project already has a design-doc pointer, base branch unknown; skipping (in_review)"
                 );
             }
         }
@@ -300,7 +312,7 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
             "view",
             pr_url,
             "--json",
-            "files,headRefName,baseRefName",
+            "files,baseRefName",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -313,7 +325,7 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "`gh pr view {pr_url} --json files,headRefName,baseRefName` failed: {}",
+            "`gh pr view {pr_url} --json files,baseRefName` failed: {}",
             stderr.trim()
         );
     }
@@ -321,12 +333,6 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let root: serde_json::Value = serde_json::from_str(&stdout)
         .with_context(|| format!("failed to parse `gh pr view {pr_url}` JSON"))?;
-
-    let head_ref_name = root
-        .get("headRefName")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
 
     let base_ref_name = root
         .get("baseRefName")
@@ -369,7 +375,6 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
 
     Ok(PrScanResult {
         doc_path,
-        head_ref_name,
         base_ref_name,
     })
 }
