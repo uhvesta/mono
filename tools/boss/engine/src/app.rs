@@ -9388,6 +9388,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -9591,6 +9592,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -9717,6 +9719,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -9840,6 +9843,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -9956,6 +9960,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -10081,6 +10086,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -10178,6 +10184,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -10359,6 +10366,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -10510,6 +10518,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -10638,6 +10647,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -10763,6 +10773,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -10849,6 +10860,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:p.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = server_state
@@ -11152,6 +11164,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/test.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -11260,6 +11273,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let item = WorkItem::Product(product_item);

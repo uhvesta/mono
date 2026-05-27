@@ -3329,6 +3329,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3419,6 +3420,7 @@ mod tests {
                 repo_remote_url: Some(origin.to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         // Two chores → two executions against the same product/URL.
@@ -3537,6 +3539,7 @@ mod tests {
                 repo_remote_url: Some(origin.to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3645,6 +3648,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3707,6 +3711,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3806,6 +3811,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3852,6 +3858,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3903,6 +3910,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -3975,6 +3983,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4167,6 +4176,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4307,6 +4317,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4382,6 +4393,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4502,6 +4514,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4589,6 +4602,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4681,6 +4695,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4798,6 +4813,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -4935,6 +4951,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -5019,6 +5036,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -5167,6 +5185,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let early = db
@@ -5263,6 +5282,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -5332,6 +5352,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -5409,6 +5430,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -5482,6 +5504,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let first_project = db
@@ -5613,6 +5636,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -5727,6 +5751,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -5900,6 +5925,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -5980,6 +6006,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let busy = db
@@ -6111,6 +6138,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -6224,6 +6252,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -6396,6 +6425,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -6546,6 +6576,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -6613,6 +6644,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db

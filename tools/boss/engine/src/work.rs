@@ -195,7 +195,7 @@ impl WorkDb {
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo
+            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo, worker_branch_prefix
              FROM products
              ORDER BY name COLLATE NOCASE ASC",
         )?;
@@ -214,11 +214,12 @@ impl WorkDb {
         let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
         let design_repo = canonicalize_repo_remote_url(input.design_repo);
         let docs_repo = canonicalize_repo_remote_url(input.docs_repo);
+        let worker_branch_prefix = canonicalize_worker_branch_prefix(input.worker_branch_prefix);
 
         tx.execute(
-            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, design_repo, docs_repo)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL, ?7, ?8)",
-            params![id, input.name, slug, description, repo_remote_url, now, design_repo, docs_repo],
+            "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, design_repo, docs_repo, worker_branch_prefix)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, NULL, ?7, ?8, ?9)",
+            params![id, input.name, slug, description, repo_remote_url, now, design_repo, docs_repo, worker_branch_prefix],
         )?;
 
         let product = query_product(&tx, &id)?
@@ -919,7 +920,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, prefer_is_soft
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -932,7 +933,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -968,7 +969,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -998,7 +999,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -1648,7 +1649,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
              FROM work_executions
              WHERE status = 'ready'
                AND (dispatch_not_before IS NULL
@@ -1674,7 +1675,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -1704,7 +1705,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -3330,7 +3331,8 @@ impl WorkDb {
                 dispatch_preamble TEXT,
                 external_tracker_kind TEXT,
                 external_tracker_config TEXT,
-                design_repo TEXT
+                design_repo TEXT,
+                worker_branch_prefix TEXT
             );
 
             CREATE TABLE IF NOT EXISTS projects (
@@ -3526,6 +3528,8 @@ impl WorkDb {
         migrate_products_dispatch_preamble(&conn)?;
         migrate_products_design_repo(&conn)?;
         migrate_products_docs_repo(&conn)?;
+        migrate_products_worker_branch_prefix(&conn)?;
+        migrate_work_executions_worker_branch_prefix(&conn)?;
         migrate_tasks_investigation_doc_columns(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
@@ -3636,12 +3640,21 @@ impl WorkDb {
         apply_text_patch(&mut product.status, patch.status);
         apply_optional_string_patch(&mut product.default_model, patch.default_model);
         apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
+        apply_optional_string_patch(
+            &mut product.worker_branch_prefix,
+            patch.worker_branch_prefix,
+        );
+        // Re-canonicalise so a patched (or pre-existing) prefix always
+        // carries its trailing `/`; idempotent on already-canonical
+        // values and on `None`.
+        product.worker_branch_prefix =
+            canonicalize_worker_branch_prefix(product.worker_branch_prefix.take());
         product.slug = unique_product_slug_for_update(&tx, id, &slugify(&product.name))?;
         product.updated_at = now_string();
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11
              WHERE id = ?1",
             params![
                 product.id,
@@ -3654,6 +3667,7 @@ impl WorkDb {
                 product.default_model,
                 product.dispatch_preamble,
                 product.design_repo,
+                product.worker_branch_prefix,
             ],
         )?;
 
@@ -4072,7 +4086,7 @@ impl WorkDb {
             .saturating_sub(lookback_secs)
             .to_string();
         let mut stmt = conn.prepare(
-            "SELECT we.id, we.work_item_id, we.repo_remote_url
+            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.worker_branch_prefix
              FROM work_executions we
              JOIN tasks t ON t.id = we.work_item_id
              WHERE we.status IN ('abandoned', 'completed', 'failed')
@@ -4091,6 +4105,9 @@ impl WorkDb {
                 execution_id: row.get(0)?,
                 work_item_id: row.get(1)?,
                 repo_remote_url: row.get(2)?,
+                worker_branch_prefix: row
+                    .get::<_, Option<String>>(3)?
+                    .filter(|s| !s.is_empty()),
             })
         })?;
         collect_rows(rows)
@@ -6487,7 +6504,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -6801,6 +6818,11 @@ pub struct LatePrCandidate {
     pub execution_id: String,
     pub work_item_id: String,
     pub repo_remote_url: String,
+    /// Worker branch-name prefix frozen onto the execution row.
+    /// `None` → engine default `boss/`. Carried so the late-PR sweep
+    /// reconstructs the same `<prefix>exec_<id>` branch the worker
+    /// pushed to. See [`crate::completion::expected_branch_name`].
+    pub worker_branch_prefix: Option<String>,
 }
 
 /// Raw external-ref data as stored in the `tasks` table. Returned by
@@ -6874,6 +6896,7 @@ fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         repo_remote_url: row.get(4)?,
         design_repo: row.get::<_, Option<String>>(12)?.filter(|s| !s.is_empty()),
         docs_repo: row.get::<_, Option<String>>(13)?.filter(|s| !s.is_empty()),
+        worker_branch_prefix: row.get::<_, Option<String>>(14)?.filter(|s| !s.is_empty()),
         status: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
@@ -7065,6 +7088,7 @@ fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         pr_url: row.get(16)?,
         pr_head_before: row.get(17)?,
         prefer_is_soft: row.get::<_, i64>(18)? != 0,
+        worker_branch_prefix: row.get::<_, Option<String>>(19)?.filter(|s| !s.is_empty()),
     })
 }
 
@@ -8079,13 +8103,19 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
     let finished_at = normalize_optional_text(input.finished_at);
     let prefer_is_soft: i64 = if input.prefer_is_soft { 1 } else { 0 };
     let pr_url = normalize_optional_text(input.pr_url);
+    // Freeze the owning product's worker branch prefix onto the
+    // execution row, mirroring `repo_remote_url`. This keeps the
+    // engine-supplied branch name (`<prefix>exec_<id>`) reconstructible
+    // from `state.db` alone and stable even if the product's prefix is
+    // later changed. `None` → engine default `boss/` at name construction.
+    let worker_branch_prefix = resolve_execution_worker_branch_prefix(conn, &input.work_item_id)?;
 
     conn.execute(
         "INSERT INTO work_executions (
             id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-            created_at, started_at, finished_at, prefer_is_soft, pr_url
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             id,
             input.work_item_id,
@@ -8103,15 +8133,38 @@ fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<Wo
             finished_at,
             prefer_is_soft,
             pr_url,
+            worker_branch_prefix,
         ],
     )?;
 
     query_execution(conn, &id)?.with_context(|| format!("missing execution after insert: {id}"))
 }
 
+/// Resolve the worker branch-name prefix for a new execution from its
+/// owning product's `worker_branch_prefix`. Returns `None` (→ engine
+/// default `boss/`) when the product carries no override. The stored
+/// value is already canonicalised (trailing `/`) at product write
+/// time, so it is returned verbatim.
+fn resolve_execution_worker_branch_prefix(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<Option<String>> {
+    let product_id = product_id_for_work_item(conn, work_item_id)?;
+    let prefix: Option<String> = conn
+        .query_row(
+            "SELECT worker_branch_prefix FROM products WHERE id = ?1",
+            [&product_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|s: &String| !s.is_empty());
+    Ok(prefix)
+}
+
 fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
-        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo
+        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo, worker_branch_prefix
          FROM products
          WHERE id = ?1",
         [id],
@@ -8151,7 +8204,7 @@ fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>>
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
          FROM work_executions
          WHERE id = ?1",
         [id],
@@ -9280,6 +9333,36 @@ fn migrate_products_docs_repo(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add `products.worker_branch_prefix` — the per-product leading prefix
+/// for worker branch names (`<prefix>exec_<id>`). `NULL` → engine
+/// default `boss/`. Lets orgs that enforce per-developer branch
+/// prefixes via local hooks (e.g. `bduff/`) configure the prefix while
+/// keeping the `exec_<id>` suffix that subsystems key off. Idempotent.
+fn migrate_products_worker_branch_prefix(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "worker_branch_prefix")? {
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN worker_branch_prefix TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Add `work_executions.worker_branch_prefix` — the worker branch-name
+/// prefix frozen onto the execution at creation time, denormalised
+/// from the owning product (same pattern as `repo_remote_url`). `NULL`
+/// → engine default `boss/`. Freezing it keeps the engine-supplied
+/// branch name reconstructible from `state.db` alone. Idempotent.
+fn migrate_work_executions_worker_branch_prefix(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "worker_branch_prefix")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN worker_branch_prefix TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Add the three `tasks.investigation_doc_*` pointer columns that
 /// store the investigation deliverable's `(repo, branch, path)` triple
 /// set by the worker after opening the doc PR.
@@ -10066,7 +10149,7 @@ fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
@@ -10096,7 +10179,7 @@ fn query_live_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
          FROM work_executions
          WHERE work_item_id = ?1
            AND status IN ('running', 'waiting_human')
@@ -11064,6 +11147,24 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
+/// Canonicalise a product's `worker_branch_prefix`. Trims surrounding
+/// whitespace; an empty result becomes `None` (→ engine default
+/// `boss/`). A non-empty prefix is guaranteed a single trailing `/`
+/// so the branch name `<prefix>exec_<id>` always has a path separator
+/// between the configured prefix and the stable `exec_<id>` suffix —
+/// callers may write `bduff` or `bduff/` and both land as `bduff/`.
+/// This is the only transformation; the prefix is otherwise stored
+/// verbatim and prepended literally at branch-name construction.
+pub fn canonicalize_worker_branch_prefix(value: Option<String>) -> Option<String> {
+    normalize_optional_text(value).map(|prefix| {
+        if prefix.ends_with('/') {
+            prefix
+        } else {
+            format!("{prefix}/")
+        }
+    })
+}
+
 /// Validate a caller-supplied `design_doc_path` per design Q8.
 ///
 /// Rules: relative path (no leading `/`), no `..` segments, not
@@ -11825,6 +11926,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -11897,6 +11999,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -11963,6 +12066,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -12041,6 +12145,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -12087,6 +12192,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore_idle = db
@@ -12183,6 +12289,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -12258,6 +12365,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let prereq = db
@@ -12304,6 +12412,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/other.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let other_prereq = db
@@ -12428,6 +12537,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -12498,6 +12608,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -12598,6 +12709,117 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Helper: create a product (optionally with a worker branch prefix),
+    /// a project, a task, and an execution under it. Returns the stored
+    /// product and execution so prefix denormalisation can be asserted.
+    #[cfg(test)]
+    fn product_task_execution_with_prefix(
+        db: &WorkDb,
+        worker_branch_prefix: Option<&str>,
+    ) -> (Product, WorkExecution) {
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Prefix Co".to_owned(),
+                description: Some("desc".to_owned()),
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: worker_branch_prefix.map(str::to_owned),
+            })
+            .unwrap();
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product.id.clone(),
+                name: "P".to_owned(),
+                description: None,
+                goal: None,
+                autostart: true,
+                no_design_task: false,
+            })
+            .unwrap();
+        let task = db
+            .create_task(CreateTaskInput {
+                product_id: product.id.clone(),
+                project_id: project.id.clone(),
+                name: "T".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: task.id.clone(),
+                kind: "task_implementation".to_owned(),
+                status: Some("ready".to_owned()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
+            })
+            .unwrap();
+        (product, execution)
+    }
+
+    #[test]
+    fn product_worker_branch_prefix_canonicalises_trailing_slash() {
+        let path = temp_db_path("prefix-canonicalise");
+        let db = WorkDb::open(path.clone()).unwrap();
+        // Caller omits the trailing slash — it must be added on write.
+        let (product, _) = product_task_execution_with_prefix(&db, Some("bduff"));
+        assert_eq!(product.worker_branch_prefix.as_deref(), Some("bduff/"));
+        // Re-reading the product yields the canonical value too.
+        let reloaded = db.get_product(&product.id).unwrap().unwrap();
+        assert_eq!(reloaded.worker_branch_prefix.as_deref(), Some("bduff/"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn execution_freezes_product_worker_branch_prefix_into_branch_name() {
+        let path = temp_db_path("prefix-denormalise");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (_, execution) = product_task_execution_with_prefix(&db, Some("bduff/"));
+        // The prefix is denormalised onto the execution row at creation.
+        assert_eq!(execution.worker_branch_prefix.as_deref(), Some("bduff/"));
+        // ...and threads through to the engine-supplied branch name while
+        // keeping the stable exec_<id> suffix the detector keys off.
+        let branch = crate::completion::expected_branch_name(
+            execution.worker_branch_prefix.as_deref(),
+            &execution.id,
+        );
+        assert_eq!(branch, format!("bduff/{}", execution.id));
+        assert!(branch.contains(&execution.id));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn execution_without_product_prefix_defaults_to_boss() {
+        let path = temp_db_path("prefix-default");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let (product, execution) = product_task_execution_with_prefix(&db, None);
+        assert_eq!(product.worker_branch_prefix, None);
+        // No override frozen onto the execution → default boss/ shape.
+        assert_eq!(execution.worker_branch_prefix, None);
+        let branch = crate::completion::expected_branch_name(
+            execution.worker_branch_prefix.as_deref(),
+            &execution.id,
+        );
+        assert_eq!(branch, format!("boss/{}", execution.id));
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn execution_requires_repo_remote_url_snapshot() {
         let path = temp_db_path("execution-repo");
@@ -12610,6 +12832,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -12675,6 +12898,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -12780,6 +13004,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -12864,6 +13089,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -12942,6 +13168,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -12998,6 +13225,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -13072,6 +13300,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -13138,6 +13367,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         // Neither product nor chore has a repo — enforce_task_repo_invariant now
@@ -13198,6 +13428,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13392,6 +13623,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13467,6 +13699,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13550,6 +13783,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13631,6 +13865,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13683,6 +13918,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13744,6 +13980,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13804,6 +14041,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -13871,6 +14109,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -13991,6 +14230,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -14150,6 +14390,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14221,6 +14462,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14304,6 +14546,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14422,6 +14665,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14515,6 +14759,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14577,6 +14822,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14636,6 +14882,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14709,6 +14956,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14763,6 +15011,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14839,6 +15088,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -14928,6 +15178,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15006,6 +15257,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15068,6 +15320,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let _todo_chore = db
@@ -15128,6 +15381,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15214,6 +15468,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15279,6 +15534,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         // Step 1: create with --no-autostart (autostart=false)
@@ -15353,6 +15609,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15438,6 +15695,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15494,6 +15752,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15541,6 +15800,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15602,6 +15862,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -15667,6 +15928,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -15714,6 +15976,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -15762,6 +16025,7 @@ mod tests {
                     repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                     design_repo: None,
                     docs_repo: None,
+                    worker_branch_prefix: None,
                 })
                 .unwrap();
             let project = db
@@ -15816,6 +16080,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -15873,6 +16138,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -16052,6 +16318,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let mut chore_ids = Vec::new();
@@ -16117,6 +16384,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let prereq = db
@@ -16193,6 +16461,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -16263,6 +16532,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -16363,6 +16633,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -16474,6 +16745,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -16531,6 +16803,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -16656,6 +16929,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/alpha.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let p2 = db
@@ -16665,6 +16939,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/beta.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -16723,6 +16998,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -16789,6 +17065,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -16863,6 +17140,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -16934,6 +17212,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let prereq = db
@@ -17014,6 +17293,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let dependent = db
@@ -17132,6 +17412,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let dependent = db
@@ -17233,6 +17514,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -17313,6 +17595,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap()
             .id;
@@ -17447,6 +17730,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -17537,6 +17821,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -17601,6 +17886,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -17673,6 +17959,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let a = db
@@ -17742,6 +18029,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let prereq = db
@@ -17978,6 +18266,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -18351,6 +18640,7 @@ mod tests {
                 repo_remote_url: Some("git@example.invalid:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -18725,6 +19015,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let budget: i64 = conn
@@ -18793,6 +19084,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -19004,6 +19296,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -19287,6 +19580,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let refs = db
@@ -19614,6 +19908,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -19699,6 +19994,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -19770,6 +20066,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -19879,6 +20176,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -19938,6 +20236,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -20308,6 +20607,7 @@ mod tests {
                 repo_remote_url: Some("https://github.com/myorg/wiki.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -20476,6 +20776,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -20911,6 +21212,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -21014,6 +21316,7 @@ mod tests {
                 repo_remote_url: product_repo.map(str::to_owned),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -21157,6 +21460,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         // Project creation seeds a `kind = 'design'` task.
@@ -21229,6 +21533,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -21278,6 +21583,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -21331,6 +21637,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         assert_eq!(
@@ -21405,6 +21712,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         assert!(product.default_model.is_none());
@@ -21441,6 +21749,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -21476,6 +21785,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -21545,6 +21855,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -21608,6 +21919,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         assert!(product.default_model.is_none());
@@ -21657,6 +21969,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -21765,6 +22078,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:test/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -21839,6 +22153,7 @@ mod tests {
             repo_remote_url: Some("git@example.com:foo.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         }).unwrap();
         let project = db.create_project(CreateProjectInput {
             product_id: product.id.clone(),
@@ -21937,6 +22252,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:concurrent.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -22015,6 +22331,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let flunge = db
@@ -22024,6 +22341,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:flunge.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -22174,6 +22492,7 @@ mod tests {
                 repo_remote_url: Some("git@example.com:boss.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -22229,6 +22548,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let other_manual_id = next_id("task");
@@ -22257,6 +22577,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -22308,6 +22629,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -22363,6 +22685,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -22399,6 +22722,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
 
@@ -22439,6 +22763,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -22505,6 +22830,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -22567,6 +22893,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -22634,6 +22961,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore_a = db
@@ -22779,6 +23107,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -22839,6 +23168,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -22934,6 +23264,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -23042,6 +23373,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:example/repo.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -23110,6 +23442,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -23373,6 +23706,7 @@ mod tests {
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         })
         .unwrap()
         .id

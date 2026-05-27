@@ -25,6 +25,16 @@ pub struct Product {
     /// `repo_remote_url`. `None` → fall through to user-level default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs_repo: Option<String>,
+    /// Leading prefix for worker branch names on this product. The
+    /// engine names a worker's branch `<worker_branch_prefix>exec_<id>`;
+    /// the `exec_<id>` suffix is the stable identifier every subsystem
+    /// keys off (PR-to-execution linking, the kanban Review lane, lease
+    /// lookups), so only this leading literal is configurable. `None`
+    /// (or empty) → the engine default `boss/`. Set it to satisfy orgs
+    /// that enforce per-developer branch prefixes via local hooks (e.g.
+    /// `bduff/`). Stored canonicalised with a guaranteed trailing `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_branch_prefix: Option<String>,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
@@ -463,6 +473,16 @@ pub struct WorkExecution {
     pub kind: String,
     pub status: String,
     pub repo_remote_url: String,
+    /// Worker branch-name prefix frozen onto this execution at creation
+    /// time, denormalised from the owning product's
+    /// `worker_branch_prefix` (same pattern as `repo_remote_url`).
+    /// Freezing it here keeps the engine-supplied branch name
+    /// reconstructible from `state.db` alone and immune to a product
+    /// prefix change between spawn and PR detection. `None` → the
+    /// engine default `boss/`. The branch name is
+    /// `<worker_branch_prefix>exec_<id>`; only the prefix varies.
+    #[serde(default)]
+    pub worker_branch_prefix: Option<String>,
     pub cube_repo_id: Option<String>,
     pub cube_lease_id: Option<String>,
     pub cube_workspace_id: Option<String>,
@@ -999,6 +1019,10 @@ pub struct CreateProductInput {
     /// `BOSS_USER_DOCS_REPO` for investigation deliverables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs_repo: Option<String>,
+    /// See [`Product::worker_branch_prefix`]. `None` → the engine
+    /// default `boss/`. Stored canonicalised with a trailing `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_branch_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1344,6 +1368,13 @@ pub struct WorkItemPatch {
     /// clear (write NULL). Stored canonicalised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_repo: Option<String>,
+    /// Product-level worker branch-name prefix. Only honoured on
+    /// product-targeted updates; ignored when patching a task / chore /
+    /// project. `None` → leave unchanged. `Some("")` → clear (write
+    /// NULL → engine default `boss/`). Stored canonicalised with a
+    /// trailing `/`. See [`Product::worker_branch_prefix`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_branch_prefix: Option<String>,
     /// Flip the `autostart` flag. `None` → leave unchanged.
     /// `Some(true)` → enable auto-dispatch; `Some(false)` → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]

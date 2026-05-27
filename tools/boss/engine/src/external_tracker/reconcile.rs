@@ -1382,6 +1382,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .expect("create product");
         db.set_product_external_tracker(
@@ -1402,6 +1403,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .expect("create product");
         db.set_product_external_tracker(
@@ -2257,6 +2259,7 @@ mod tests {
                 repo_remote_url: None,
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .expect("create product");
         let registry = TrackerRegistry::new();

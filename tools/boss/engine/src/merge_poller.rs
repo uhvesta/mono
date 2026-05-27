@@ -2408,6 +2408,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let project = db
@@ -2455,6 +2456,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db
@@ -5149,6 +5151,7 @@ mod tests {
                 repo_remote_url: Some("git@github.com:foo/bar.git".into()),
                 design_repo: None,
                 docs_repo: None,
+                worker_branch_prefix: None,
             })
             .unwrap();
         let chore = db

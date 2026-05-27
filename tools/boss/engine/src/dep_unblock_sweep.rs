@@ -200,6 +200,7 @@ mod tests {
             repo_remote_url: Some("https://github.com/test/repo".to_owned()),
             design_repo: None,
             docs_repo: None,
+            worker_branch_prefix: None,
         })
         .unwrap()
         .id
