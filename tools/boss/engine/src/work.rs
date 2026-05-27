@@ -8141,14 +8141,26 @@ fn insert_revision_in_tx(
         .or_else(|| Some("small".to_owned())); // revision-tasks.md §Q7: default small
     let model_override = normalize_model_override(input.model_override);
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "revision");
-    // Inherit product and project from the chain root.
-    // repo_remote_url is intentionally NOT copied to the revision row —
-    // revisions always target the same repo as the chain root and the
-    // dispatch flow resolves the repo from the chain root at spawn time.
-    // Copying it here would trigger the per-task override invariant check
-    // when the product already carries the same URL.
+    // Inherit product, project, and repo from the chain root. A revision
+    // by definition lands a follow-up commit on the chain root's PR, which
+    // lives in exactly one repo — the root's — so the revision must target
+    // the same repo.
+    //
+    // Copying `root.repo_remote_url` verbatim preserves the per-task repo
+    // override invariant (see `enforce_task_repo_invariant`): the root row
+    // carries a non-NULL `repo_remote_url` only for multi-repo products
+    // whose `product.repo_remote_url` is NULL, so the revision mirrors the
+    // same shape. When the product owns the repo, the root's column is NULL
+    // and the revision stays NULL too — `resolve_repo_for_work_item` then
+    // falls back to the product for both rows.
+    //
+    // Without this copy, a revision under a multi-repo product had a NULL
+    // repo on both the revision row and the (repo-less) product, so
+    // `resolve_repo_for_work_item` returned None and the autostarted
+    // execution died pre-start with no workspace (issue #840).
     let product_id = &root.product_id;
     let project_id = root.project_id.as_deref();
+    let repo_remote_url = root.repo_remote_url.as_deref();
     let short_id = allocate_short_id(conn, product_id)?;
     // `name` is the compact one-line card title. When the coordinator supplies
     // `input.name`, use it verbatim (after trimming); otherwise fall back to
@@ -8163,9 +8175,9 @@ fn insert_revision_in_tx(
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
-         effort_level, model_override, short_id, parent_task_id) \
+         effort_level, model_override, short_id, parent_task_id, repo_remote_url) \
          VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, 1, ?7, ?8, \
-         ?9, ?10, ?11, ?12)",
+         ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             product_id,
@@ -8179,6 +8191,7 @@ fn insert_revision_in_tx(
             model_override,
             short_id,
             parent_id,
+            repo_remote_url,
         ],
     )?;
     // `query_task` reads the trailing `parent_task_id` column (via
@@ -24432,6 +24445,145 @@ mod tests {
             revision.effort_level,
             Some(boss_protocol::EffortLevel::Small),
             "revision must default to small effort per §Q7"
+        );
+        // `make_revision_product` sets a product-level repo, so the root
+        // chore carries no per-task override (repo_remote_url is NULL per the
+        // enforce_task_repo_invariant rule). The revision must mirror that —
+        // a NULL repo here, not a redundant override of the product's URL.
+        assert!(
+            revision.repo_remote_url.is_none(),
+            "revision under a product that owns the repo must keep repo_remote_url NULL"
+        );
+    }
+
+    #[test]
+    fn create_revision_inherits_repo_remote_url_from_root() {
+        // Issue #840: under a multi-repo product (product.repo_remote_url is
+        // NULL) the chain root carries its own per-task repo override. The
+        // revision must inherit that override; otherwise
+        // `resolve_repo_for_work_item` returns None and the autostarted
+        // execution dies pre-start with no workspace to lease.
+        let db = WorkDb::open(temp_db_path("revision-inherit-repo")).unwrap();
+        // Multi-repo product: no product-level repo.
+        let product_id = db
+            .create_product(CreateProductInput {
+                name: "Boss-multirepo".to_owned(),
+                description: None,
+                repo_remote_url: None,
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap()
+            .id;
+        let root_repo = "git@github.com:linkedin-multiproduct/dev-infra.git";
+        // Root chore carries its own repo override (allowed: product has none).
+        let root_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.clone(),
+                name: "Root chore in multi-repo product".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: Some(root_repo.to_owned()),
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        assert_eq!(
+            root_chore.repo_remote_url.as_deref(),
+            Some(root_repo),
+            "fixture: root must carry its own repo override under a repo-less product"
+        );
+        // Put the root "in review" with an open PR so the revision gate passes.
+        let pr_url = "https://github.com/linkedin-multiproduct/dev-infra/pull/317";
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![root_chore.id, pr_url],
+            )
+            .unwrap();
+        }
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(revision_input(&root_chore.id), &checker)
+            .unwrap();
+
+        assert_eq!(
+            revision.repo_remote_url.as_deref(),
+            Some(root_repo),
+            "revision must inherit the chain root's repo override"
+        );
+
+        // The dispatch repo resolver must now find a repo for the revision
+        // row — this is what was returning None (→ pre-start failure) before.
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            resolve_repo_for_work_item(&conn, &revision.id)
+                .unwrap()
+                .as_deref(),
+            Some(root_repo),
+            "dispatch must resolve the inherited repo so the execution can lease a workspace"
+        );
+    }
+
+    #[test]
+    fn create_revision_of_revision_inherits_repo_from_chain_root() {
+        // A revision-of-a-revision must still inherit the chain root's repo:
+        // the immediate parent is itself a revision that inherited the repo,
+        // and `insert_revision_in_tx` copies from `root` (the non-revision
+        // ancestor that owns the PR), so the whole chain stays repo-aligned.
+        let db = WorkDb::open(temp_db_path("revision-of-revision-repo")).unwrap();
+        let product_id = db
+            .create_product(CreateProductInput {
+                name: "Boss-multirepo-chain".to_owned(),
+                description: None,
+                repo_remote_url: None,
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap()
+            .id;
+        let root_repo = "git@github.com:linkedin-multiproduct/dev-infra.git";
+        let root_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.clone(),
+                name: "Root chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: Some(root_repo.to_owned()),
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/linkedin-multiproduct/dev-infra/pull/1' WHERE id = ?1",
+                rusqlite::params![root_chore.id],
+            )
+            .unwrap();
+        }
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let r1 = db
+            .create_revision(revision_input(&root_chore.id), &checker)
+            .unwrap();
+        let r2 = db.create_revision(revision_input(&r1.id), &checker).unwrap();
+
+        assert_eq!(r1.repo_remote_url.as_deref(), Some(root_repo));
+        assert_eq!(
+            r2.repo_remote_url.as_deref(),
+            Some(root_repo),
+            "revision-of-revision must inherit the chain root's repo, not NULL"
         );
     }
 
