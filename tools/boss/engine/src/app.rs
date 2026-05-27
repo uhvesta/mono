@@ -4037,25 +4037,35 @@ async fn handle_frontend_connection(
                     );
                 }
             },
-            FrontendRequest::GetWorkItem { id } => match work_db.get_work_item(&id) {
-                Ok(item) => {
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::WorkItemResult { item },
-                    );
+            FrontendRequest::GetWorkItem { id } => {
+                // Use resolving variant so callers can pass T-form short ids
+                // (e.g. `T688`) without knowing the product; the DB lookup is
+                // global and short ids are unique across all products.
+                let result = work_db
+                    .get_work_item_resolving_short_id(&id)
+                    .and_then(|opt| {
+                        opt.ok_or_else(|| anyhow::anyhow!("unknown work item: {id}"))
+                    });
+                match result {
+                    Ok(item) => {
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            server_state.current_work_revision(),
+                            FrontendEvent::WorkItemResult { item },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
                 }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
+            }
             FrontendRequest::GetWorkItemByShortId {
                 product_id,
                 short_id,
