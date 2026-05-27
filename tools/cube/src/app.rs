@@ -845,9 +845,11 @@ fn run_workspace(
             // first conflicted-but-repairable workspace found
             let mut conflicted_candidate: Option<(String, Vec<String>)> = None;
             let mut dirty_count = 0usize;
-            // workspaces whose directory exists but has neither .jj/ nor .git/
-            let mut broken_empty_count = 0usize;
-            let mut broken_empty_paths: Vec<String> = Vec::new();
+            // Free workspaces whose directory exists but has neither .jj/ nor
+            // .git/ — husks holding no recoverable work. Collected as
+            // (workspace_id, path) so the lease path can GC them and reuse the
+            // freed slot rather than surfacing a "broken-empty" failure.
+            let mut broken_empty: Vec<(String, PathBuf)> = Vec::new();
 
             for ws_id in &ordered_ids {
                 let ws = free_workspaces
@@ -927,11 +929,7 @@ fn run_workspace(
                             "skipped": true,
                             "reason": "neither_git_nor_jj",
                         }));
-                        broken_empty_count += 1;
-                        broken_empty_paths.push(format!(
-                            "{ws_id} ({})",
-                            ws.workspace_path.display()
-                        ));
+                        broken_empty.push((ws_id.clone(), ws.workspace_path.clone()));
                         audit!(
                             database_path,
                             "workspace.broken_empty",
@@ -943,9 +941,11 @@ fn run_workspace(
                 }
             }
 
-            // Decide which workspace to use: prefer clean, fall back to
-            // first repairable conflicted workspace, otherwise auto-create
-            // (pool empty) or error (pool all-dirty).
+            // Decide which workspace to use: prefer clean, fall back to the
+            // first repairable conflicted workspace, otherwise self-heal any
+            // broken-empty husks and auto-create. The only hard stop is a pool
+            // where every free workspace is dirty (unpushed work the operator
+            // must reclaim).
             let chosen_id = clean_candidate.or_else(|| {
                 conflicted_candidate.as_ref().map(|(id, _)| id.clone())
             });
@@ -970,44 +970,55 @@ fn run_workspace(
                     .map(|(_, b)| b)
                     .unwrap_or_default();
                 (ws, false, bookmarks)
-            } else if !ordered_ids.is_empty()
-                && dirty_count + broken_empty_count == ordered_ids.len()
-            {
-                // Every free workspace is either dirty or broken-empty. Do NOT
-                // auto-create — the operator needs to intervene. Return a
-                // structured error so Boss can surface this as `blocked`.
-                let mut parts: Vec<String> = Vec::new();
-                if dirty_count > 0 {
-                    parts.push(format!(
-                        "{dirty_count} workspace(s) have dirty working copies \
-                         (run `cube workspace force-release --reason crash` to reclaim)"
-                    ));
-                }
-                if broken_empty_count > 0 {
-                    parts.push(format!(
-                        "{broken_empty_count} workspace(s) have neither .git/ nor .jj/ \
-                         (broken-empty): {}; re-clone manually or force-release and retry",
-                        broken_empty_paths.join(", ")
-                    ));
-                }
-                return Err(CubeError::NoAvailableWorkspace(format!(
-                    "{repo}: {}; run `cube workspace list --repo {repo}` to inspect",
-                    parts.join("; ")
-                )));
             } else {
-                // Pool has no free workspaces (empty or all leased): auto-create.
+                // No clean or repairable workspace. Self-heal any broken-empty
+                // husks first: a directory with neither .jj/ nor .git/ holds no
+                // recoverable work, so delete it and free its slot instead of
+                // surfacing it to the caller. A husk must never be a reason to
+                // deny a lease for a reachable repo (issue #845 part 2b).
+                let had_broken_empty = !broken_empty.is_empty();
+                for (ws_id, ws_path) in &broken_empty {
+                    gc_broken_empty_workspace(&mut store, database_path, &repo, ws_id, ws_path)?;
+                    candidates.retain(|c| &c.workspace_id != ws_id);
+                }
+
+                // The one remaining hard stop: every free workspace is dirty
+                // (none broken-empty, none missing). Dirty copies may hold
+                // unpushed work, so refuse and let the operator reclaim them.
+                // Return a structured error so Boss can surface this as
+                // `blocked`.
+                if !had_broken_empty
+                    && dirty_count > 0
+                    && dirty_count == ordered_ids.len()
+                {
+                    return Err(CubeError::NoAvailableWorkspace(format!(
+                        "{repo}: {dirty_count} workspace(s) have dirty working copies \
+                         (run `cube workspace force-release --reason crash` to reclaim); \
+                         run `cube workspace list --repo {repo}` to inspect"
+                    )));
+                }
+
+                // Pool is empty, fully leased, or only had broken-empty husks
+                // (now GC'd): grow the pool by one. The pool is an optimisation
+                // (reuse a known-good checkout), never a hard cap — a lease for
+                // a reachable repo always succeeds (issue #845 part 1).
                 let new_candidate = auto_create_workspace(runner, &repo_record, &candidates)?;
+                let new_id = new_candidate.workspace_id.clone();
                 candidates.push(new_candidate);
                 store.sync_workspaces(&repo, &candidates)?;
+                // Claim the workspace we just created by id. A generic claim
+                // could otherwise grab a leftover free-but-dirty workspace and
+                // destructively reset it — the dirty entries are intentionally
+                // preserved for the operator.
                 let ws = store
-                    .claim_workspace(
+                    .claim_specific_workspace(
                         &repo,
+                        &new_id,
                         &holder,
                         &task,
                         &lease_id,
                         leased_at_epoch_s,
                         lease_expires_at,
-                        prefer.as_deref(),
                     )?
                     .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
                 (ws, true, vec![])
@@ -1690,6 +1701,24 @@ fn auto_create_workspace(
         source: e,
     })?;
 
+    // Clone into a staging directory and only publish it under its final name
+    // once it is fully populated, via an atomic rename. A clone interrupted
+    // mid-flight then leaves only the dotted staging dir — which
+    // `discover_workspaces` ignores (it doesn't match the workspace prefix) —
+    // so a partially-populated tree can never be observed as a pool entry and
+    // become a "broken-empty" husk (issue #845 part 2a). The repo lock is held
+    // across the whole lease, so the staging name can't race a concurrent
+    // create for this repo; clear any leftover from a prior interrupted run.
+    let staging_path = repo_record
+        .workspace_root
+        .join(format!(".incoming-{workspace_id}"));
+    if staging_path.exists() {
+        fs::remove_dir_all(&staging_path).map_err(|source| CubeError::WorkspaceDirRemove {
+            path: staging_path.clone(),
+            source,
+        })?;
+    }
+
     let clone_source = match &repo_record.source {
         Some(source) if source.exists() => source.display().to_string(),
         _ => repo_record.origin.clone(),
@@ -1703,15 +1732,58 @@ fn auto_create_workspace(
             "clone".to_string(),
             "--colocate".to_string(),
             clone_source,
-            workspace_path.display().to_string(),
+            staging_path.display().to_string(),
         ],
     })?;
-    track_remote_bookmarks(runner, &workspace_path)?;
+    track_remote_bookmarks(runner, &staging_path)?;
+
+    // Publish atomically. Staging and final live under the same workspace_root
+    // (one filesystem), so the rename is atomic and the final path appears
+    // only when the checkout is complete.
+    fs::rename(&staging_path, &workspace_path).map_err(|source| CubeError::WorkspaceDirCreate {
+        path: workspace_path.clone(),
+        source,
+    })?;
 
     Ok(crate::metadata::WorkspaceCandidate {
         workspace_id,
         workspace_path,
     })
+}
+
+/// Self-heal a broken-empty pool entry: a workspace directory that exists but
+/// has neither `.jj/` nor `.git/`. Such a husk holds no recoverable work
+/// (no commits, no working copy), so remove the directory and forget its
+/// registry row, freeing the slot for a fresh clone. Called from the lease
+/// path so a degraded pool self-repairs instead of blocking a lease
+/// (issue #845 part 2b).
+fn gc_broken_empty_workspace(
+    store: &mut Store,
+    database_path: Option<&Path>,
+    repo: &str,
+    workspace_id: &str,
+    workspace_path: &Path,
+) -> Result<()> {
+    if workspace_path.exists() {
+        fs::remove_dir_all(workspace_path).map_err(|source| CubeError::WorkspaceDirRemove {
+            path: workspace_path.to_path_buf(),
+            source,
+        })?;
+    }
+    store.forget_workspace(repo, workspace_id)?;
+    eprintln!(
+        "warning: cube workspace `{repo}/{workspace_id}` had neither .git/ nor .jj/ \
+         (broken-empty) at {}; removing the husk and provisioning a fresh workspace",
+        workspace_path.display(),
+    );
+    audit!(
+        database_path,
+        "workspace.broken_empty_gc",
+        repo = repo,
+        workspace_id = workspace_id,
+        workspace_path = workspace_path.display().to_string(),
+    );
+    Ok(())
 }
 
 fn run_setup_for_workspace(
@@ -4094,6 +4166,7 @@ mod tests {
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
         let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -4103,19 +4176,19 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/mono.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::ok(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
                 "",
             ),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),
@@ -4182,6 +4255,7 @@ mod tests {
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
         let new_path = workspace_root.join("legacy-agent-001");
+        let staging = workspace_root.join(".incoming-legacy-agent-001");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -4191,18 +4265,18 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/legacy.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
             ),
             ExpectedCommand::ok(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
                 "",
@@ -4263,6 +4337,7 @@ mod tests {
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
         let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -4272,19 +4347,19 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/mono.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::ok(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
                 "",
             ),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),
@@ -4346,6 +4421,7 @@ mod tests {
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
         let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
         // Pretend the remote has many extra bookmarks (feature/foo,
         // release/1.0, gh-readonly-queue/main/...). The test enforces
         // its expectation negatively: only `main@origin` and
@@ -4360,19 +4436,19 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/mono.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::ok(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
                 "",
             ),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),
@@ -4422,7 +4498,7 @@ mod tests {
         ]);
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
-        let new_path = workspace_root.join("weird-agent-001");
+        let staging = workspace_root.join(".incoming-weird-agent-001");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -4432,18 +4508,18 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/weird.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
             ),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),
@@ -4496,7 +4572,7 @@ mod tests {
         ]);
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
-        let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -4506,13 +4582,13 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/mono.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand {
-                cwd: new_path.clone(),
+                cwd: staging.clone(),
                 program: "jj".to_string(),
                 args: vec![
                     "bookmark".to_string(),
@@ -4596,6 +4672,7 @@ mod tests {
 
         // Pool now exhausted; next lease should clone mono-agent-008 (max+1)
         let new_path = workspace_root.join("mono-agent-008");
+        let staging = workspace_root.join(".incoming-mono-agent-008");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -4605,19 +4682,19 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/mono.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::ok(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
                 "",
             ),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),
@@ -6408,6 +6485,7 @@ mod tests {
         // records the invocation; we manually create the resulting
         // directory.)
         let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -6417,19 +6495,19 @@ mod tests {
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/mono.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::ok(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
                 "",
             ),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),
@@ -8180,16 +8258,17 @@ steps:
     }
 
     #[test]
-    fn workspace_lease_broken_empty_gives_clear_error_without_calling_jj() {
-        // When a workspace directory has neither .jj/ nor .git/, cube detects
-        // the broken-empty state via a directory check BEFORE calling jj,
-        // and surfaces a clear NoAvailableWorkspace error naming the
-        // workspace path and what's missing. jj is never invoked.
+    fn workspace_lease_self_heals_broken_empty_and_auto_creates() {
+        // A workspace directory with neither .jj/ nor .git/ is a husk holding
+        // no recoverable work. Rather than blocking the lease, cube detects it
+        // via a directory check (no jj `status` call on the husk), GCs it
+        // (removes the directory and forgets its row), and provisions a fresh
+        // workspace by cloning. The lease then succeeds (issue #845).
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        let workspace_path = workspace_root.join("mono-agent-004");
+        let husk_path = workspace_root.join("mono-agent-004");
         // Intentionally no .jj/ or .git/ — this is the broken-empty state.
-        std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+        std::fs::create_dir_all(&husk_path).expect("workspace dir");
 
         run_with_dependencies(
             add_repo_cli(&workspace_root),
@@ -8198,38 +8277,220 @@ steps:
         )
         .expect("repo");
 
-        // FakeRunner has NO expected commands: cube must not call jj at all.
-        let runner = FakeRunner::default();
+        // After the husk is GC'd the pool is empty, so `next_workspace_id`
+        // reuses the lowest slot. The runner expects only the clone + track +
+        // reset sequence for the fresh workspace — never a `status` call
+        // against the broken-empty husk.
+        let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &staging.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(
+                staging.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
 
-        let error = run_with_dependencies(
+        let result = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "no git dir"]),
             Some(&database_path),
             &runner,
         )
-        .expect_err("lease should fail with a clear error when workspace is broken-empty");
+        .expect("lease should self-heal the husk and auto-create a fresh workspace");
         runner.assert_exhausted();
 
-        // Error must be NoAvailableWorkspace (not a raw CommandFailed from jj).
-        assert!(
-            matches!(error, CubeError::NoAvailableWorkspace(_)),
-            "expected NoAvailableWorkspace, got: {error:?}"
-        );
-        // Error message must name the workspace path and the missing directories.
-        let msg = error.to_string();
-        assert!(
-            msg.contains(workspace_path.to_str().unwrap()),
-            "error should name the workspace path; got: {msg}"
-        );
-        assert!(
-            msg.contains(".git") || msg.contains(".jj"),
-            "error should mention missing .git/ or .jj/; got: {msg}"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
+        assert_eq!(result.payload["workspace"]["state"], "leased");
 
-        // Audit log must contain the broken_empty event.
+        // The husk directory was removed and its registry row forgotten.
+        assert!(!husk_path.exists(), "broken-empty husk should be removed");
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let rows = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.workspace_id.as_str()).collect();
+        assert!(!ids.contains(&"mono-agent-004"), "husk row should be forgotten; saw {ids:?}");
+        assert!(ids.contains(&"mono-agent-001"), "fresh workspace should exist; saw {ids:?}");
+
+        // Audit log records both the detection and the GC of the husk.
         let events = audit_events(&tempdir);
         assert!(
             events.iter().any(|e| e["event"] == "workspace.broken_empty"),
             "expected workspace.broken_empty audit event; got: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e["event"] == "workspace.broken_empty_gc"
+                && e["workspace_id"] == "mono-agent-004"),
+            "expected workspace.broken_empty_gc audit event for the husk; got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_lease_self_heals_two_broken_empty_husks() {
+        // Exact repro from issue #845: every free workspace is broken-empty
+        // (the `ci-infra-027` / `ci-infra-028` case). The lease must GC both
+        // husks and provision a fresh workspace rather than failing with
+        // "no free workspace".
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let husk_a = workspace_root.join("mono-agent-027");
+        let husk_b = workspace_root.join("mono-agent-028");
+        // Neither has .jj/ nor .git/ — both are broken-empty husks.
+        std::fs::create_dir_all(&husk_a).expect("husk a");
+        std::fs::create_dir_all(&husk_b).expect("husk b");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Both husks GC'd → pool empty → fresh workspace takes the lowest slot.
+        let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &staging.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(
+                staging.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "two husks"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease should succeed by GC'ing both husks and auto-creating");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
+        assert!(!husk_a.exists(), "husk 027 should be removed");
+        assert!(!husk_b.exists(), "husk 028 should be removed");
+    }
+
+    #[test]
+    fn workspace_lease_gcs_broken_empty_and_keeps_dirty_then_auto_creates() {
+        // Mixed pool: one dirty workspace (holds possibly-unpushed work) and
+        // one broken-empty husk. The husk is GC'd and a fresh workspace is
+        // auto-created; the dirty workspace is left untouched for the operator
+        // to reclaim. A broken-empty entry must never turn into a hard stop,
+        // even when a dirty entry is also present.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let dirty_path = workspace_root.join("mono-agent-003");
+        let husk_path = workspace_root.join("mono-agent-027");
+        std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
+        std::fs::create_dir_all(&husk_path).expect("husk dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Health check visits 003 (dirty `status`) then 027 (broken-empty, no
+        // jj call). The husk is GC'd; `next_workspace_id` over the surviving
+        // dirty 003 yields mono-agent-004 for the fresh clone.
+        let new_path = workspace_root.join("mono-agent-004");
+        let staging = workspace_root.join(".incoming-mono-agent-004");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
+            ExpectedCommand::ok(
+                workspace_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &staging.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(
+                staging.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "abc1234",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "dirty plus husk"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease should succeed: GC the husk, keep the dirty one, auto-create");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+        // The husk is gone; the dirty workspace is preserved for inspection.
+        assert!(!husk_path.exists(), "broken-empty husk should be removed");
+        assert!(dirty_path.exists(), "dirty workspace must be left untouched");
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let dirty_row = store.get_workspace_by_path(&dirty_path).unwrap().unwrap();
+        assert_eq!(
+            dirty_row.health_status,
+            Some(crate::metadata::WorkspaceHealth::Dirty),
+            "dirty workspace should still be marked dirty"
         );
     }
 
@@ -8666,6 +8927,7 @@ steps:
         // `next_workspace_id` reuses the freed slot rather than skipping
         // ahead to mono-agent-002.
         let new_path = workspace_root.join("mono-agent-001");
+        let staging = workspace_root.join(".incoming-mono-agent-001");
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 workspace_root.clone(),
@@ -8675,19 +8937,19 @@ steps:
                     "clone",
                     "--colocate",
                     "git@github.com:spinyfin/mono.git",
-                    &new_path.display().to_string(),
+                    &staging.display().to_string(),
                 ],
                 "",
             )
-            .creating_dir(new_path.clone()),
+            .creating_dir(staging.clone()),
             ExpectedCommand::ok(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "main@origin"],
                 "",
             ),
             ExpectedCommand::no_such_remote_bookmark(
-                new_path.clone(),
+                staging.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),

@@ -162,8 +162,18 @@ Behavior:
   and silently falls back when the preferred workspace is leased or unknown,
   so callers should compare the returned workspace id against their preference
   to detect a fallback.
-- Otherwise find a free workspace from the pool, or create one if policy
-  allows it.
+- Otherwise find a free, healthy workspace from the pool, or create one. The
+  pool is an optimisation (reuse a known-good checkout), not a hard cap: a
+  lease for a registered, reachable repo always succeeds by growing the pool
+  on demand. The only hard stop is a pool in which every free workspace has a
+  dirty working copy — those may hold unpushed work, so the operator must
+  reclaim them (`cube workspace force-release --reason crash`) rather than have
+  cube silently discard the changes.
+- Self-heal degraded pool entries on lease. A free workspace whose directory
+  has neither `.jj/` nor `.git/` (a "broken-empty" husk, e.g. from a clone
+  interrupted before this guarantee landed) holds no recoverable work, so cube
+  deletes the husk, forgets its registry row, and provisions a fresh workspace
+  instead of surfacing the husk as a lease failure.
 - Mark the workspace leased with holder metadata.
 - Run the repo-specific reset sequence before returning it.
 - If the workspace is newly created, or its recorded setup state is stale, run
@@ -442,6 +452,20 @@ Selection should prefer:
 
 Cube does not need perfect cache prediction in v1. "Prefer a free existing
 workspace over creating a new one" is already a meaningful win.
+
+### Create
+
+Creating a workspace must be atomic with respect to the pool: a directory that
+matches the workspace prefix must never be observable while it is only
+partially populated. Cube clones into a hidden staging directory
+(`.incoming-<workspace-id>`, which the pool scan ignores because it does not
+match the prefix) and only publishes it under its final name via an atomic
+rename once the clone and bookmark setup have completed. A clone interrupted
+mid-flight therefore leaves only a staging directory, never a "broken-empty"
+husk that a later lease would have to step around. The repo-pool lock is held
+across the whole operation, so the staging name cannot collide with a
+concurrent create for the same repo, and any leftover staging directory from a
+previously interrupted run is cleared before the next clone.
 
 ### Setup and Provisioning
 
