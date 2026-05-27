@@ -5133,7 +5133,14 @@ async fn handle_frontend_connection(
                 let handler = server_state.completion_handler.clone();
                 let run_id_for_release = run_id.clone();
                 tokio::spawn(async move {
-                    handler.force_release(&run_id_for_release).await;
+                    // Use `force_stop_execution` instead of plain
+                    // `force_release`: this additionally cancels the
+                    // execution row and demotes the task from `active`
+                    // back to `todo` so the orphan sweep and
+                    // `reconcile_active_dispatch` cannot immediately
+                    // re-dispatch the work item the moment the worker
+                    // pool slot is freed.
+                    handler.force_stop_execution(&run_id_for_release).await;
                 });
                 send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
             }

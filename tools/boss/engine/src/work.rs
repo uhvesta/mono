@@ -6281,6 +6281,61 @@ impl WorkDb {
     /// `bossctl agents stop`) to claim ownership of the cube release
     /// before calling out to the cube CLI, so two concurrent callers
     /// don't issue duplicate releases against the same lease.
+    /// Atomically cancel a non-terminal execution and demote the owning
+    /// task from `active` back to `todo`. Called from the
+    /// `StopRun` / `force_stop_execution` path so that an explicitly
+    /// stopped worker does not leave an `active` task or a `running`
+    /// execution behind — both of which would cause the orphan sweep
+    /// or `reconcile_active_dispatch` to re-dispatch the work item
+    /// immediately.
+    ///
+    /// Idempotent: if the execution is already terminal the `UPDATE`
+    /// is a no-op; if the task is already out of `active` (e.g. moved
+    /// to `in_review` by `on_stop` in a concurrent path) the demote is
+    /// a no-op.
+    ///
+    /// Returns `(execution_cancelled, task_demoted)` so callers can
+    /// log what actually changed.
+    pub fn cancel_running_execution_and_demote_task(
+        &self,
+        execution_id: &str,
+    ) -> Result<(bool, bool)> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let now = now_string();
+        // Cancel the execution only if it is still non-terminal.
+        let exec_cancelled = if !execution_status_is_terminal(&execution.status) {
+            let affected = tx.execute(
+                "UPDATE work_executions
+                 SET status     = 'cancelled',
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE id = ?1",
+                params![execution_id, now],
+            )?;
+            affected > 0
+        } else {
+            false
+        };
+        // Demote the task only if it is still `active`.
+        let task_demoted = {
+            let affected = tx.execute(
+                "UPDATE tasks
+                 SET status             = 'todo',
+                     last_status_actor  = 'engine',
+                     updated_at         = ?2
+                 WHERE id              = ?1
+                   AND status          = 'active'
+                   AND deleted_at      IS NULL",
+                params![execution.work_item_id, now],
+            )?;
+            affected > 0
+        };
+        tx.commit()?;
+        Ok((exec_cancelled, task_demoted))
+    }
+
     pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<String>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -10654,15 +10709,38 @@ fn execution_status_is_live(status: &str) -> bool {
 }
 
 fn task_accepts_execution(task: &Task) -> bool {
-    if task.deleted_at.is_some() || task.status == "done" {
+    if task.deleted_at.is_some() {
+        return false;
+    }
+    // Non-dispatchable states. `in_review` is explicitly blocked here
+    // because moving a task directly to `in_review` (e.g. via
+    // `boss task update --status in-review` on a task that never went
+    // through `active`) used to trigger a spurious worker dispatch: the
+    // `UpdateWorkItem` handler calls `publish_work_invalidation` which
+    // calls `reconcile_product_executions` for the product, and without
+    // this check `reconcile_work_item_execution` would create a `ready`
+    // execution for the `in_review` task. The same guard closes the
+    // loophole for `archived` and `cancelled` tasks.
+    //
+    // NOTE: `blocked` is intentionally absent here. Dependency-blocked
+    // tasks (status = `blocked`) still need `reconcile_work_item_execution`
+    // to run so that `gating_prereqs_for` can create `waiting_dependency`
+    // execution rows. The gating logic inside `reconcile_work_item_execution`
+    // ensures that dependency-blocked tasks never receive a `ready`/dispatch
+    // execution — they only get `waiting_dependency` rows until all
+    // prerequisites are complete.
+    if matches!(
+        task.status.as_str(),
+        "done" | "archived" | "cancelled" | "in_review"
+    ) {
         return false;
     }
     // Honour the per-task autostart opt-out while the chore/task is
-    // still parked in `todo`. Once a human (or `bossctl work start`)
-    // moves it to a non-`todo` status, reconcile resumes normal
-    // behaviour and creates the `ready` execution. The autostart flag
-    // is a one-way pause for the auto-dispatcher only — explicit
-    // RequestExecution still creates a ready execution.
+    // still parked in `todo`. The autostart flag is a one-way pause
+    // for the auto-dispatcher only — explicit RequestExecution still
+    // creates a ready execution. Once `start_execution_run` flips the
+    // task to `active` it also clears `autostart` to 0 (single-shot
+    // semantics), so `active` tasks always pass this check.
     if !task.autostart && task.status == "todo" {
         return false;
     }
@@ -15095,6 +15173,232 @@ mod tests {
         let result = db.reconcile_product_executions(&product.id).unwrap();
         assert_eq!(result.created.len(), 1);
         assert_eq!(result.created[0].work_item_id, chore.id);
+    }
+
+    /// Regression: a chore that has been manually moved directly to
+    /// `in_review` (without going through `active`) must NOT receive a
+    /// `ready` execution from `reconcile_product_executions`.
+    ///
+    /// Before the fix, `task_accepts_execution` only blocked `done` and
+    /// `todo+autostart=false`; an `in_review` chore passed the gate and
+    /// `reconcile_work_item_execution` created a `ready` row for it, which
+    /// the dispatcher immediately turned into a worker launch.
+    #[test]
+    fn reconcile_skips_in_review_chore() {
+        let path = temp_db_path("in-review-no-dispatch");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Already in review".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Simulate `boss task update --status in-review`:
+        // the chore moves directly from `todo` to `in_review` without
+        // going through `active` (e.g. the PR was opened manually).
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let updated = db
+            .get_work_item(&chore.id)
+            .unwrap();
+        let updated_task = match updated {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            _ => panic!("expected chore"),
+        };
+        assert_eq!(updated_task.status, "in_review");
+
+        // reconcile_product_executions must NOT create an execution.
+        let result = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(
+            result.created.is_empty(),
+            "in_review chore must not get a ready execution from reconcile, got {:?}",
+            result.created,
+        );
+        assert!(
+            db.list_executions(Some(&chore.id)).unwrap().is_empty(),
+            "no execution must exist for in_review chore after reconcile",
+        );
+    }
+
+    /// Regression: the specific bug sequence that triggered the incident:
+    /// create `--no-autostart`, bind a PR, move directly to `in_review`,
+    /// then call `reconcile_product_executions`. No execution must be
+    /// created.
+    #[test]
+    fn no_autostart_direct_to_in_review_suppresses_dispatch() {
+        let path = temp_db_path("no-autostart-in-review");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        // Step 1: create with --no-autostart (autostart=false)
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Design doc T708".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        assert!(!chore.autostart);
+
+        // Reconcile right after create — no execution (autostart=false + todo).
+        let r = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(r.created.is_empty(), "step 1: no execution for no-autostart todo chore");
+
+        // Step 2: bind a PR (simulates `boss task bind-pr`). The PR patch
+        // goes through UpdateWorkItem; the reconcile that follows must still
+        // be a no-op because the task is still in `todo` with autostart=false.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                pr_url: Some("https://github.com/spinyfin/mono/pull/821".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let r = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(r.created.is_empty(), "step 2: still no execution after bind-pr");
+
+        // Step 3: manually move to in_review (simulates
+        // `boss task update --status in-review`). This is the exact
+        // trigger that fired a spurious dispatch before the fix.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let r = db.reconcile_product_executions(&product.id).unwrap();
+        assert!(
+            r.created.is_empty(),
+            "step 3: in_review chore must not get an execution after reconcile, got {:?}",
+            r.created,
+        );
+        assert!(
+            db.list_executions(Some(&chore.id)).unwrap().is_empty(),
+            "no execution row must exist at all for T708-shaped chore",
+        );
+    }
+
+    /// `cancel_running_execution_and_demote_task`: verify that a `running`
+    /// execution is set to `cancelled` and the owning `active` task is
+    /// moved back to `todo`. Calling it a second time is a no-op.
+    #[test]
+    fn cancel_running_execution_demotes_active_task() {
+        let path = temp_db_path("cancel-exec-demote");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Running chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        // Manually place the chore in `active` with a `running` execution,
+        // simulating what `start_execution_run` does.
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let exec = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".to_owned(),
+                status: Some("running".to_owned()),
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
+            })
+            .unwrap();
+
+        // First call: should cancel execution + demote task.
+        let (cancelled, demoted) = db
+            .cancel_running_execution_and_demote_task(&exec.id)
+            .unwrap();
+        assert!(cancelled, "execution must be marked cancelled");
+        assert!(demoted, "task must be demoted from active to todo");
+
+        let updated_exec = db.get_execution(&exec.id).unwrap();
+        assert_eq!(updated_exec.status, "cancelled");
+        let updated_task = match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            _ => panic!("expected chore"),
+        };
+        assert_eq!(updated_task.status, "todo");
+
+        // Second call: both ops must be no-ops (idempotent).
+        let (cancelled2, demoted2) = db
+            .cancel_running_execution_and_demote_task(&exec.id)
+            .unwrap();
+        assert!(!cancelled2, "second call: execution already terminal");
+        assert!(!demoted2, "second call: task already out of active");
     }
 
     /// Steady-state on-free rescan: an `active` chore whose only
