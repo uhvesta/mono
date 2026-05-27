@@ -18,11 +18,33 @@ BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Dev build (commits past tag):    boss-v1.0.4-16-gf3be785 → "1.0.4-dev-<SHA>"
 # Uses $SHA (from jj/git above) for the dev suffix so STABLE_BOSS_VERSION
 # and STABLE_BOSS_GIT_SHA always contain the same commit identifier.
-DESCRIBE=$(git describe --tags --match "boss-v*" --abbrev=0 2>/dev/null || echo "")
+#
+# In a jj workspace there is no .git directory — git describe must be pointed
+# at the bare git store jj maintains at .jj/repo/store/git.  jj commit IDs
+# are git SHAs, so we can pass the full commit_id directly to git describe.
+# In a plain git checkout the standard `git describe` path is used instead.
+if [ -d ".jj" ]; then
+    # jj workspace: resolve tags via the bare git store.
+    # Use the full jj commit ID (which is the git SHA) as the describe target.
+    FULL_SHA=$(jj log --no-graph -r @ -T 'commit_id' 2>/dev/null || echo "")
+    if [ -n "$FULL_SHA" ]; then
+        export GIT_DIR=".jj/repo/store/git"
+        DESCRIBE=$(git describe --tags --match "boss-v*" --abbrev=0 "$FULL_SHA" 2>/dev/null || echo "")
+        DESCRIBE_EXACT=$(git describe --tags --match "boss-v*" --exact-match "$FULL_SHA" 2>/dev/null || echo "")
+        unset GIT_DIR
+    else
+        DESCRIBE=""
+        DESCRIBE_EXACT=""
+    fi
+else
+    DESCRIBE=$(git describe --tags --match "boss-v*" --abbrev=0 2>/dev/null || echo "")
+    DESCRIBE_EXACT=$(git describe --tags --match "boss-v*" --exact-match 2>/dev/null || echo "")
+fi
+
 if [ -z "$DESCRIBE" ]; then
     BOSS_VERSION="0.0.0-dev-${SHA}"
     BOSS_BASE_VERSION="0.0.0"
-elif git describe --tags --match "boss-v*" --exact-match >/dev/null 2>&1; then
+elif [ -n "$DESCRIBE_EXACT" ]; then
     # Exactly on a release tag: strip the "boss-v" prefix.
     BOSS_VERSION="${DESCRIBE#boss-v}"
     BOSS_BASE_VERSION="${BOSS_VERSION}"

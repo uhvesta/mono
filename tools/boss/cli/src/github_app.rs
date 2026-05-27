@@ -591,6 +591,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
         add_issue_to_project(
             &server.uri(),
@@ -637,6 +638,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
         let err = add_issue_to_project(
             &server.uri(),
@@ -672,6 +674,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
         let err = add_issue_to_project(
             &server.uri(),

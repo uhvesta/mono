@@ -3,9 +3,16 @@ build --disk_cache=~/.cache/bazelcache
 build --experimental_disk_cache_gc_max_size=30G
 build --experimental_disk_cache_gc_max_age=7d
 
-# Release config: stamps binaries with the git SHA and wires the
-# workspace-status.sh script so STABLE_BOSS_GIT_SHA and BUILD_EMBED_LABEL
-# flow into the build (design doc Q4 Phase 2).
+# Always stamp builds with the git-derived version so that dev builds show a
+# meaningful version string (e.g. "1.0.9-dev-a58a932") in the About panel
+# instead of the unstamped placeholder "0.0.0".  Only the version plist and
+# build_info_rs actions use ctx.info_file, so the cache impact is minimal —
+# Swift/Rust compilation targets are unaffected.
+build --workspace_status_command=tools/boss/installer/workspace-status.sh
+build --stamp
+
+# Release config: identical stamp flags; kept as a named config so release.sh
+# and CI can use --config=release to opt into additional release-only settings.
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 
