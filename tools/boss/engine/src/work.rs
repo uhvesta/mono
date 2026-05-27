@@ -11447,7 +11447,19 @@ fn cascade_dependents_after_prereq_status_change(
     new_prereq_status: &str,
     now_epoch: &str,
 ) -> Result<()> {
-    if !deps::status_satisfies(prereq_id, new_prereq_status) {
+    // Fire the cascade when the prereq reaches any status that *might*
+    // satisfy at least one class of dependent:
+    //   - `done` / `archived` satisfy all dependents (standard rule).
+    //   - `in_review` satisfies revision dependents specifically
+    //     (the PR is open; the revision can push to it).
+    //
+    // `maybe_engine_unblock_dependent` re-evaluates each dependent's
+    // full gating list via `gating_prereqs_for`, which is revision-
+    // aware, so non-revision dependents are not inadvertently unblocked
+    // by an `in_review` transition.
+    let might_satisfy = deps::status_satisfies(prereq_id, new_prereq_status)
+        || new_prereq_status == "in_review";
+    if !might_satisfy {
         return Ok(());
     }
     let dependents = deps::dependents_of(conn, prereq_id, Some("blocks"))?;
@@ -16878,6 +16890,147 @@ mod tests {
         let WorkItem::Chore(t) = b_after else { panic!() };
         assert_eq!(t.status, "done");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// T701-class deadlock: a `kind = 'revision'` task gated on its parent
+    /// via a `blocks` edge must unblock as soon as the parent reaches
+    /// `in_review` (PR open). Previously the cascade bailed out on
+    /// `in_review` (only `done` was considered satisfying) so the revision
+    /// could never start — the PR would be merged and the revision's window
+    /// gone by the time it cleared its gate.
+    ///
+    /// Also verifies the negative: a non-revision (chore) dependent gated
+    /// on the same parent must NOT unblock on `in_review`; it still requires
+    /// `done`.
+    #[test]
+    fn revision_unblocks_when_prereq_reaches_in_review() {
+        let db = WorkDb::open(temp_db_path("revision-unblock-in-review")).unwrap();
+        let product_id = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+            })
+            .unwrap()
+            .id;
+
+        // Parent chore — will transition to in_review.
+        let parent = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.clone(),
+                name: "Parent chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Revision task — should unblock on parent reaching `in_review`.
+        // Insert directly to bypass the PR-state gate on `create_revision`.
+        let revision_id = {
+            let conn = db.connect().unwrap();
+            let id = next_id("task");
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO tasks
+                    (id, product_id, kind, name, description, status, autostart,
+                     last_status_actor, created_at, updated_at, parent_task_id)
+                 VALUES (?1, ?2, 'revision', 'Revision', '', 'todo', 1, 'engine', ?3, ?3, ?4)",
+                rusqlite::params![id, product_id, now, parent.id],
+            )
+            .unwrap();
+            id
+        };
+
+        // Non-revision (chore) dependent — must NOT unblock on in_review.
+        let chore_dep = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.clone(),
+                name: "Chore dependent".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Gate both dependents on the parent.
+        db.add_dependency(AddDependencyInput {
+            dependent: revision_id.clone(),
+            prerequisite: parent.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: chore_dep.id.clone(),
+            prerequisite: parent.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Verify both are now blocked (auto-blocked by add_dependency).
+        let rev_before = db.get_work_item(&revision_id).unwrap();
+        // Revision kind maps to WorkItem::Task (non-chore kinds are Task).
+        let WorkItem::Task(rev_t) = rev_before else { panic!("expected WorkItem::Task for revision") };
+        assert_eq!(rev_t.status, "blocked", "revision must be auto-blocked after add_dependency");
+
+        let chore_before = db.get_work_item(&chore_dep.id).unwrap();
+        let WorkItem::Chore(chore_t) = chore_before else { panic!() };
+        assert_eq!(chore_t.status, "blocked", "chore dependent must be auto-blocked after add_dependency");
+
+        // Transition parent to `in_review` (simulates PR opened).
+        db.update_work_item(
+            &parent.id,
+            WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // Revision must now be unblocked (gate satisfied by in_review).
+        let rev_after = db.get_work_item(&revision_id).unwrap();
+        let WorkItem::Task(rev_a) = rev_after else { panic!() };
+        assert_eq!(
+            rev_a.status, "todo",
+            "revision must unblock when prereq reaches in_review",
+        );
+        assert!(rev_a.blocked_reason.is_none(), "blocked_reason must be cleared on unblock");
+
+        // Chore dependent must still be blocked — in_review does not satisfy it.
+        let chore_after = db.get_work_item(&chore_dep.id).unwrap();
+        let WorkItem::Chore(chore_a) = chore_after else { panic!() };
+        assert_eq!(
+            chore_a.status, "blocked",
+            "non-revision chore must remain blocked when prereq is only in_review",
+        );
+
+        // Sanity: parent reaching `done` must then unblock the chore dep too.
+        db.update_work_item(
+            &parent.id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let chore_done = db.get_work_item(&chore_dep.id).unwrap();
+        let WorkItem::Chore(chore_d) = chore_done else { panic!() };
+        assert_eq!(
+            chore_d.status, "todo",
+            "chore must unblock when prereq reaches done",
+        );
     }
 
     /// A human-blocked dependent (no edges) is not touched by the
