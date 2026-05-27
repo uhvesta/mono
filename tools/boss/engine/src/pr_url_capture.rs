@@ -164,13 +164,17 @@ pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
         Some(c) => c,
         None => return false,
     };
-    const GH_PR_SUBCOMMANDS: &[&str] = &[
+    const PR_SUBCOMMANDS: &[&str] = &[
         "gh pr create",
         "gh pr view",
         "gh pr list",
         "gh pr edit",
+        // `cube pr ensure` is the jj-aware create-or-reuse wrapper that
+        // outputs a PR URL as its only stdout line — treat it the same as
+        // `gh pr create` for capture purposes.
+        "cube pr ensure",
     ];
-    GH_PR_SUBCOMMANDS.iter().any(|sub| command.contains(sub))
+    PR_SUBCOMMANDS.iter().any(|sub| command.contains(sub))
 }
 
 /// Outcome of [`StagedPrUrlCache::record_if_unset`].
@@ -501,6 +505,15 @@ mod tests {
     #[test]
     fn gh_pr_edit_is_a_gh_pr_command() {
         assert!(is_gh_pr_command(&json!({ "command": "gh pr edit 42 --add-label foo" })));
+    }
+
+    #[test]
+    fn cube_pr_ensure_is_a_gh_pr_command() {
+        // `cube pr ensure` outputs a PR URL as its only stdout line and
+        // must be captured the same way as `gh pr create`.
+        assert!(is_gh_pr_command(&json!({
+            "command": "cube pr ensure --branch boss/exec_abc123_01 --title 'my feature'"
+        })));
     }
 
     #[test]
