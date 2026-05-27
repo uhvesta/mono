@@ -37,6 +37,14 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS: i64 = 60 * 60;
 /// go live; the 4th trips the guard.
 pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 
+/// Attention-item `kind` raised when the engine stops auto-resuming a
+/// worker because its Claude API error is non-retryable (permanent or
+/// unrecognised). See [`crate::transient_recovery`].
+pub const ATTENTION_KIND_RECOVERY_PERMANENT: &str = "worker_recovery_permanent_error";
+/// Attention-item `kind` raised when the engine stops auto-resuming a
+/// worker because the transient-error retry cap was reached.
+pub const ATTENTION_KIND_RECOVERY_EXHAUSTED: &str = "worker_recovery_exhausted";
+
 /// Sliding window for the duplicate-create guard: a non-deleted task/chore
 /// in the same product with the same name created within this many seconds
 /// of the attempted insert causes a `DuplicateTaskError` unless
@@ -871,7 +879,13 @@ impl WorkDb {
             .unwrap_or_default()
             .as_secs() as i64;
         let cutoff = now_secs - min_age_secs;
-        let mut stmt = conn.prepare(
+        // The recovery-escalation exclusion: once the transient-recovery
+        // sweep has raised an open attention item because a worker's API
+        // error is non-retryable (permanent/unrecognised) or the retry
+        // cap was reached, this work item must NOT be blindly
+        // re-dispatched — it is flagged for a human. Resolving the
+        // attention item makes it a candidate again.
+        let stmt_sql = format!(
             "SELECT t.id FROM tasks t
              WHERE t.status = 'active'
                AND t.deleted_at IS NULL
@@ -881,8 +895,17 @@ impl WorkDb {
                    WHERE we.work_item_id = t.id
                      AND we.status = 'ready'
                )
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_attention_items a
+                   WHERE a.work_item_id = t.id
+                     AND a.status = 'open'
+                     AND a.kind IN ('{permanent}', '{exhausted}')
+               )
              ORDER BY t.updated_at ASC, t.id ASC",
-        )?;
+            permanent = ATTENTION_KIND_RECOVERY_PERMANENT,
+            exhausted = ATTENTION_KIND_RECOVERY_EXHAUSTED,
+        );
+        let mut stmt = conn.prepare(&stmt_sql)?;
         let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -920,7 +943,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -933,7 +956,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -969,7 +992,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -999,7 +1022,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -1600,6 +1623,160 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Auto-resume a work item whose worker stalled or died on a
+    /// *transient* Claude API error. In one transaction:
+    ///
+    ///   1. If `dead_execution_id` is still non-terminal, mark it
+    ///      `orphaned` (and stamp any still-active runs `orphaned` with
+    ///      `reason`). Orphaned — not abandoned — so the runner's
+    ///      startup-recovery path ([`Self::get_prior_orphaned_execution`])
+    ///      finds it and directs the new worker to resume the prior
+    ///      branch instead of starting from `main`.
+    ///   2. Insert a fresh `ready` execution for the same work item that
+    ///      **prefers the same cube workspace** (so cube's `--prefer`
+    ///      re-leases it and in-progress work in the jj workspace is not
+    ///      lost), carries `transient_failure_count = new_count`, and is
+    ///      deferred until `dispatch_not_before_epoch` (the backoff
+    ///      window — same `dispatch_not_before` gate the pre-start retry
+    ///      path uses, honoured by [`Self::list_ready_executions`]).
+    ///
+    /// Returns the new `ready` execution. The caller releases the worker
+    /// pool slot and emits the dispatch event. Because the work item now
+    /// has a `ready` execution, the orphan-active sweep skips it (no
+    /// double dispatch).
+    pub fn request_resume_execution(
+        &self,
+        dead_execution_id: &str,
+        new_count: i64,
+        dispatch_not_before_epoch: i64,
+        reason: &str,
+    ) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let dead = query_execution(&tx, dead_execution_id)?
+            .with_context(|| format!("unknown execution: {dead_execution_id}"))?;
+
+        let now = now_string();
+        if !execution_status_is_terminal(&dead.status) {
+            tx.execute(
+                "UPDATE work_executions
+                 SET status = 'orphaned',
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE id = ?1",
+                params![dead_execution_id, now.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE work_runs
+                 SET status = 'orphaned',
+                     result_summary = COALESCE(result_summary, ?3),
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE execution_id = ?1
+                   AND finished_at IS NULL",
+                params![dead_execution_id, now.as_str(), reason],
+            )?;
+        }
+
+        // Prefer the workspace the dead worker was actually leased into;
+        // fall back to its recorded preference if the lease metadata was
+        // never stamped. Hard prefer (prefer_is_soft carried from the
+        // dead row) so the resume lands on the same jj checkout.
+        let preferred_workspace_id = dead
+            .cube_workspace_id
+            .clone()
+            .or_else(|| dead.preferred_workspace_id.clone());
+
+        let new_id = next_id("exec");
+        let dispatch_not_before = dispatch_not_before_epoch.to_string();
+        tx.execute(
+            "INSERT INTO work_executions (
+                id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                created_at, started_at, finished_at, prefer_is_soft,
+                transient_failure_count, dispatch_not_before
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11)",
+            params![
+                new_id,
+                dead.work_item_id,
+                dead.kind,
+                dead.repo_remote_url,
+                dead.cube_repo_id,
+                dead.priority,
+                preferred_workspace_id,
+                now,
+                dead.prefer_is_soft as i64,
+                new_count,
+                dispatch_not_before,
+            ],
+        )?;
+
+        let new_execution = query_execution(&tx, &new_id)?
+            .with_context(|| format!("missing execution after resume insert: {new_id}"))?;
+        tx.commit()?;
+        Ok(new_execution)
+    }
+
+    /// Path of the most recent run's transcript for `execution_id`, or
+    /// `None` if no run recorded one. Used by the transient-recovery
+    /// sweep to read the worker's transcript tail (the ground-truth
+    /// signal for whether it stalled on an API error).
+    pub fn latest_transcript_path(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT transcript_path FROM work_runs
+             WHERE execution_id = ?1 AND transcript_path IS NOT NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            params![execution_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
+    /// Raise a work-item-scoped attention item for `work_item_id` unless
+    /// one with the same `kind` is already open. Idempotent so repeated
+    /// recovery-sweep passes don't pile up duplicate rows. Returns the
+    /// existing or newly-created item's id. Used by the transient-recovery
+    /// sweep to escalate non-retryable / retry-exhausted workers.
+    pub fn upsert_work_item_attention(
+        &self,
+        work_item_id: &str,
+        kind: &str,
+        title: &str,
+        body_markdown: &str,
+    ) -> Result<String> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let _ = product_id_for_work_item(&tx, work_item_id)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM work_attention_items
+                 WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open'
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+                params![work_item_id, kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = next_id("attn");
+                let now = now_string();
+                tx.execute(
+                    "INSERT INTO work_attention_items (
+                        id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
+                     ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL)",
+                    params![id, work_item_id, kind, title, body_markdown, now],
+                )?;
+                id
+            }
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Return the run ids that belong to `execution_id` and have not
     /// yet finished. The cancel-execution flow uses this to find any
     /// libghostty pane the execution still backs so the engine can
@@ -1649,7 +1826,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
              FROM work_executions
              WHERE status = 'ready'
                AND (dispatch_not_before IS NULL
@@ -1675,7 +1852,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -1705,7 +1882,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -2476,6 +2653,19 @@ impl WorkDb {
         conn.execute(
             "UPDATE work_executions SET started_at = ?2 WHERE id = ?1",
             params![execution_id, epoch_secs.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn force_transient_failure_count_for_test(
+        &self,
+        execution_id: &str,
+        count: i64,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET transient_failure_count = ?2 WHERE id = ?1",
+            params![execution_id, count],
         )?;
         Ok(())
     }
@@ -3573,6 +3763,7 @@ impl WorkDb {
         // Design: tools/boss/docs/designs/revision-tasks.md
         migrate_tasks_parent_task_id_column(&conn)?;
         migrate_work_executions_prefer_is_soft(&conn)?;
+        migrate_work_executions_transient_failure_count(&conn)?;
         // Revision card fix: update existing revision rows whose `name` was
         // set to the full description text (the original insertion behaviour).
         // The new insertion code uses only the first line; this backfill
@@ -6504,7 +6695,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -7089,6 +7280,7 @@ fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         pr_head_before: row.get(17)?,
         prefer_is_soft: row.get::<_, i64>(18)? != 0,
         worker_branch_prefix: row.get::<_, Option<String>>(19)?.filter(|s| !s.is_empty()),
+        transient_failure_count: row.get(20)?,
     })
 }
 
@@ -8204,7 +8396,7 @@ fn query_execution(conn: &Connection, id: &str) -> Result<Option<WorkExecution>>
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
          FROM work_executions
          WHERE id = ?1",
         [id],
@@ -8448,6 +8640,22 @@ fn migrate_work_executions_prefer_is_soft(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "prefer_is_soft")? {
         conn.execute(
             "ALTER TABLE work_executions ADD COLUMN prefer_is_soft INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// `transient_failure_count`: how many times the engine has auto-resumed
+/// this work item's execution chain because a worker stalled or died on
+/// a transient Claude API error. Carried forward onto each fresh resume
+/// execution by [`WorkDb::request_resume_execution`] so the bounded-retry
+/// policy in [`crate::transient_recovery`] can cap retries and back off.
+/// Idempotent; existing rows default to 0.
+fn migrate_work_executions_transient_failure_count(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "transient_failure_count")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN transient_failure_count INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -10149,7 +10357,7 @@ fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
@@ -10179,7 +10387,7 @@ fn query_live_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
          FROM work_executions
          WHERE work_item_id = ?1
            AND status IN ('running', 'waiting_human')

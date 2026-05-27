@@ -42,6 +42,8 @@ pub mod settings;
 pub mod spawn_flow;
 pub mod ssh_transport;
 pub mod transcript_tail;
+pub mod transient_error;
+pub mod transient_recovery;
 pub mod work;
 pub mod work_dependencies;
 pub mod worker_registry;

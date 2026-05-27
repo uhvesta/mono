@@ -126,6 +126,25 @@ pub enum Stage {
     /// loop that re-fired despite a healthy live run. See
     /// `task_18b347260cd7da80_e` (the R693 re-dispatch storm).
     DispatchDecision,
+    /// The transient-recovery sweep detected a worker that stalled or
+    /// died with a *transient* Claude API error as the last entry in
+    /// its transcript and auto-resumed it on the same workspace. The
+    /// `details` object carries `attempt`, `max_attempts`, the error
+    /// `class`, and a clipped `error` string so `bossctl dispatch tail`
+    /// shows "recovering, attempt 2/3" without a log dive.
+    TransientRecovery,
+    /// The transient-recovery sweep stopped retrying a worker and
+    /// raised a `WorkAttentionItem` instead — either the error was
+    /// non-retryable (permanent / unrecognised) or the retry cap was
+    /// reached. The `details` object carries the escalation `reason`.
+    TransientRecoveryExhausted,
+    /// The transient-recovery sweep sent a runtime nudge to a live idle
+    /// worker rather than tearing it down. The worker's `claude` process
+    /// is still alive at its REPL and can receive input; a nudge is
+    /// cheaper than orphan+respawn. If the nudge does not clear the error
+    /// by the next sweep the sweep falls back to the normal
+    /// orphan+respawn path.
+    TransientRecoveryNudge,
 }
 
 impl Stage {
@@ -145,6 +164,9 @@ impl Stage {
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
             Stage::DeadPidReconcile => "dead_pid_reconcile",
             Stage::DispatchDecision => "dispatch_decision",
+            Stage::TransientRecovery => "transient_recovery",
+            Stage::TransientRecoveryExhausted => "transient_recovery_exhausted",
+            Stage::TransientRecoveryNudge => "transient_recovery_nudge",
         }
     }
 }

@@ -535,6 +535,19 @@ pub struct WorkExecution {
     #[serde(default)]
     #[builder(default)]
     pub prefer_is_soft: bool,
+    /// Number of times the engine has auto-resumed this work item's
+    /// chain of executions because a worker stalled or died on a
+    /// *transient* Claude API error (socket closed, connection reset,
+    /// 5xx, `overloaded_error`, `rate_limit`/429, request timeout).
+    /// Carried forward onto each fresh resume execution by
+    /// [`crate::WorkExecution`]'s recovery path so the engine can cap
+    /// retries and back off — distinct from
+    /// [`Self::pre_start_failure_count`], which counts failures that
+    /// happen *before* a worker ever runs. Reset to 0 on a human-
+    /// initiated or first dispatch.
+    #[serde(default)]
+    #[builder(default)]
+    pub transient_failure_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
