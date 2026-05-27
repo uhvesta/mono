@@ -24,14 +24,28 @@ struct GhosttyTerminalView: NSViewRepresentable {
     let runtime: GhosttyRuntime
     let session: TerminalPaneSession
     let launchSpec: TerminalLaunchSpec
+    /// Gate for the per-pane 0.5s viewport screen-scrape that drives
+    /// `claudeState`. Flows in as a plain SwiftUI input — `updateNSView`
+    /// reconciles the timer against it — rather than a `@Published` on
+    /// the session that a parent mutates mid-render. Worker panes pass
+    /// `liveState == nil` (the scrape is the pre-hook fallback; once the
+    /// engine pushes a `LiveWorkerState` the pill renders hook-driven
+    /// activity and the scrape is redundant); Boss panes pass `false`
+    /// (they never display `claudeState`).
+    let claudeMonitorEnabled: Bool
 
     func makeNSView(context: Context) -> GhosttyTerminalHostView {
-        GhosttyTerminalHostView(runtime: runtime, session: session, launchSpec: launchSpec)
+        GhosttyTerminalHostView(
+            runtime: runtime,
+            session: session,
+            launchSpec: launchSpec,
+            claudeMonitorEnabled: claudeMonitorEnabled
+        )
     }
 
     func updateNSView(_ view: GhosttyTerminalHostView, context: Context) {
         view.syncGeometry()
-        view.reconcileClaudeMonitor()
+        view.reconcileClaudeMonitor(enabled: claudeMonitorEnabled)
     }
 }
 
@@ -46,6 +60,11 @@ final class GhosttyTerminalHostView: NSView {
     private var cursorVisible = true
     private var backgroundColor = NSColor.black
     private var claudeMonitorTimer: Timer?
+    /// Latest value of the SwiftUI `claudeMonitorEnabled` input. Stored
+    /// so the internal reconcile callers (surface creation,
+    /// `viewDidMoveToWindow`) can converge the timer without a value
+    /// argument; `updateNSView` refreshes it whenever the input changes.
+    private var claudeMonitorEnabled: Bool
     /// Token for the display-configuration observer installed only
     /// while surface creation has failed. libghostty's
     /// `ghostty_surface_new` returns NULL when the machine has no
@@ -105,10 +124,16 @@ final class GhosttyTerminalHostView: NSView {
         let surface: ghostty_surface_t
     }
 
-    init(runtime: GhosttyRuntime, session: TerminalPaneSession, launchSpec: TerminalLaunchSpec) {
+    init(
+        runtime: GhosttyRuntime,
+        session: TerminalPaneSession,
+        launchSpec: TerminalLaunchSpec,
+        claudeMonitorEnabled: Bool
+    ) {
         self.runtime = runtime
         self.session = session
         self.launchSpec = launchSpec
+        self.claudeMonitorEnabled = claudeMonitorEnabled
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 820))
 
         wantsLayer = true
@@ -646,14 +671,20 @@ final class GhosttyTerminalHostView: NSView {
     }
 
     /// Converge `claudeMonitorTimer` on the desired state given the
-    /// pane's window attachment and the session's `claudeMonitorEnabled`
-    /// gate. Idempotent: safe to call from `init`, `viewDidMoveToWindow`,
-    /// and `NSViewRepresentable.updateNSView` without duplicating work.
-    /// The screen-scrape is the only main-thread cost in this view that
-    /// runs on a regular timer, so a worker pane drops to ~zero baseline
-    /// once the engine starts pushing `LiveWorkerState`.
-    func reconcileClaudeMonitor() {
-        let shouldRun = window != nil && session.claudeMonitorEnabled
+    /// pane's window attachment and the `claudeMonitorEnabled` gate.
+    /// `updateNSView` passes the latest SwiftUI input via `enabled:`;
+    /// the internal callers (surface creation, `viewDidMoveToWindow`)
+    /// omit it and reconcile against the last-known value. Idempotent:
+    /// safe to call from `init`, `viewDidMoveToWindow`, and
+    /// `NSViewRepresentable.updateNSView` without duplicating work. The
+    /// screen-scrape is the only main-thread cost in this view that runs
+    /// on a regular timer, so a worker pane drops to ~zero baseline once
+    /// the engine starts pushing `LiveWorkerState`.
+    func reconcileClaudeMonitor(enabled: Bool? = nil) {
+        if let enabled {
+            claudeMonitorEnabled = enabled
+        }
+        let shouldRun = window != nil && claudeMonitorEnabled
         if shouldRun {
             if claudeMonitorTimer == nil {
                 startClaudeMonitor()

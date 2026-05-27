@@ -334,24 +334,21 @@ private struct WorkerPaneTerminalView: View {
     let liveState: WorkerLiveState?
 
     var body: some View {
-        GhosttyTerminalView(
-            runtime: runtime,
-            session: session,
-            launchSpec: session.launchSpec
-        )
-        .background(Color(nsColor: .black))
         // Once the engine pushes a LiveWorkerState for this worker the
         // titlebar pill renders hook-driven activity and the per-pane
         // 0.5s viewport screen-scrape becomes redundant. Gate the
-        // monitor so it only runs as the pre-hook fallback. `initial:
-        // true` covers the spawn case where liveState is already
-        // present by the time this pane mounts (e.g. a re-render after
-        // a run resumed).
-        .onChange(of: liveState != nil, initial: true) { _, hasLiveState in
-            let enabled = !hasLiveState
-            if session.claudeMonitorEnabled != enabled {
-                session.claudeMonitorEnabled = enabled
-            }
-        }
+        // monitor so it only runs as the pre-hook fallback. Passing the
+        // gate as a plain input (rather than mutating a @Published on
+        // the session) keeps the reconcile out of the render pass —
+        // including the spawn case where liveState is already present
+        // by the time this pane mounts (e.g. a re-render after a run
+        // resumed).
+        GhosttyTerminalView(
+            runtime: runtime,
+            session: session,
+            launchSpec: session.launchSpec,
+            claudeMonitorEnabled: liveState == nil
+        )
+        .background(Color(nsColor: .black))
     }
 }

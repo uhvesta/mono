@@ -218,11 +218,15 @@ struct DesignsView: View {
             detail
                 .background(Color(nsColor: .windowBackgroundColor))
         }
-        .task {
+        // Re-resolve the design tree whenever the active product set
+        // changes. A `.task(id:)` runs the refresh after the render
+        // commits — keying it on `activeProducts` replaces the old
+        // `.task` + `.onChange` pair, whose `.onChange` mutated the
+        // view model's @Published state synchronously during the update
+        // ChatViewModel triggered ("Publishing changes from within view
+        // updates").
+        .task(id: chat.activeProducts) {
             model.refresh(products: chat.activeProducts)
-        }
-        .onChange(of: chat.activeProducts) { _, newProducts in
-            model.refresh(products: newProducts)
         }
     }
 

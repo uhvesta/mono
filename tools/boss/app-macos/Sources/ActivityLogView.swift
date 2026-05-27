@@ -121,7 +121,6 @@ struct ActivityRow: Identifiable, Hashable {
 @MainActor
 final class ActivityLogModel: ObservableObject {
     @Published var dispatchEvents: [DispatchEvent] = []
-    @Published var engineAttempts: [EngineAttemptRow] = []
     @Published var dispatchSourceMissing: Bool = false
     @Published var lastDispatchEventAt: Date?
 
@@ -148,20 +147,6 @@ final class ActivityLogModel: ObservableObject {
         tailer = nil
     }
 
-    /// Merge the two attempt subsystems (`conflict_resolutions` +
-    /// `ci_remediations`) into the single sortable list the activity
-    /// log renders. Design Phase 11 #37 grows this from one row kind
-    /// to two; future kinds (rebase, review-feedback) just add another
-    /// argument here.
-    func updateEngineAttempts(
-        conflicts: [WorkConflictResolution],
-        ci: [WorkCiRemediation]
-    ) {
-        let conflictRows = conflicts.map { EngineAttemptRow.conflictResolution($0) }
-        let ciRows = ci.map { EngineAttemptRow.ciRemediation($0) }
-        engineAttempts = conflictRows + ciRows
-    }
-
     private func appendDispatch(_ new: [DispatchEvent]) {
         dispatchSourceMissing = false
         dispatchEvents.insert(contentsOf: new.reversed(), at: 0)
@@ -171,10 +156,25 @@ final class ActivityLogModel: ObservableObject {
         lastDispatchEventAt = new.last.map { $0.timestamp } ?? lastDispatchEventAt
     }
 
-    func makeRows(sourceFilter: ActivitySourceFilter) -> [ActivityRow] {
+    /// Build the merged, newest-first activity list. Engine attempts
+    /// are *derived* from the engine's `conflict_resolutions` +
+    /// `ci_remediations` snapshots (owned by `ChatViewModel`) rather
+    /// than mirrored into a `@Published` here — the caller threads the
+    /// current snapshots straight through. Keeping the merge a pure
+    /// function of upstream state means it can never publish a change
+    /// from within a view update. Design Phase 11 #37 grew this from
+    /// one row kind to two; future kinds (rebase, review-feedback) just
+    /// add another parameter and `map`.
+    func makeRows(
+        sourceFilter: ActivitySourceFilter,
+        conflicts: [WorkConflictResolution] = [],
+        ci: [WorkCiRemediation] = []
+    ) -> [ActivityRow] {
         let d: [ActivityRow] = dispatchEvents.map { e in
             ActivityRow(id: "d:\(e.id)", timestamp: e.timestamp, payload: .dispatch(e))
         }
+        let engineAttempts = conflicts.map { EngineAttemptRow.conflictResolution($0) }
+            + ci.map { EngineAttemptRow.ciRemediation($0) }
         let ea: [ActivityRow] = engineAttempts.map { r in
             ActivityRow(
                 id: "e:\(r.id)",
@@ -226,7 +226,11 @@ struct ActivityLogView: View {
     }
 
     private var filteredRows: [ActivityRow] {
-        let raw = model.makeRows(sourceFilter: sourceFilter)
+        let raw = model.makeRows(
+            sourceFilter: sourceFilter,
+            conflicts: chat.conflictResolutions,
+            ci: chat.ciRemediations
+        )
         let outcomes = outcomeFilter
         let query = searchText.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         return raw.filter { row in
@@ -246,19 +250,9 @@ struct ActivityLogView: View {
         }
         .onAppear {
             model.start()
-            model.updateEngineAttempts(
-                conflicts: chat.conflictResolutions,
-                ci: chat.ciRemediations
-            )
         }
         .onDisappear {
             model.stop()
-        }
-        .onChange(of: chat.conflictResolutions) { _, new in
-            model.updateEngineAttempts(conflicts: new, ci: chat.ciRemediations)
-        }
-        .onChange(of: chat.ciRemediations) { _, new in
-            model.updateEngineAttempts(conflicts: chat.conflictResolutions, ci: new)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -272,7 +266,7 @@ struct ActivityLogView: View {
                 .font(.title3.bold())
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
-                Text("\(model.dispatchEvents.count) dispatch • \(model.engineAttempts.count) engine")
+                Text("\(model.dispatchEvents.count) dispatch • \(chat.conflictResolutions.count + chat.ciRemediations.count) engine")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let last = model.lastDispatchEventAt {
@@ -342,7 +336,7 @@ struct ActivityLogView: View {
     @ViewBuilder
     private var mainContent: some View {
         let rows = filteredRows
-        if model.dispatchEvents.isEmpty && model.engineAttempts.isEmpty {
+        if model.dispatchEvents.isEmpty && chat.conflictResolutions.isEmpty && chat.ciRemediations.isEmpty {
             emptyState
         } else {
             HSplitView {

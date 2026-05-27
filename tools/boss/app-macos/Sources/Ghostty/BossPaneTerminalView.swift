@@ -21,7 +21,10 @@ private struct BossTerminalSurface: View {
         GhosttyTerminalView(
             runtime: runtime,
             session: session,
-            launchSpec: session.launchSpec
+            launchSpec: session.launchSpec,
+            // Boss panes never display `claudeState`, so the screen
+            // scrape stays off.
+            claudeMonitorEnabled: false
         )
     }
 }
