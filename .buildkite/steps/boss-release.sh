@@ -23,7 +23,51 @@ log "[boss-release] starting"
 echo "[boss-release] agent: $(uname -a)"
 echo "[boss-release] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-# ── guard: skip if no Boss-affecting changes (cron path) ─────────────────────
+# ── resolve last released tag (all trigger paths) ────────────────────────────
+# Always resolve the last boss-v* tag and its commit SHA.  Both the
+# idempotency guard (below) and the cron change-detection block need them,
+# so we do the lookup once here unconditionally.
+
+BUILDKITE_SOURCE="${BUILDKITE_SOURCE:-}"
+
+log "[boss-release] resolving last boss-v* release tag"
+LAST_TAG=$(gh release list --repo spinyfin/mono --limit 200 --json tagName \
+  --jq '[.[] | select(.tagName | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tagName' 2>/dev/null || true)
+
+LAST_SHA=""
+if [[ -n "${LAST_TAG}" ]]; then
+  # BK checkouts are shallow (single-commit fetch, no --tags). Fetch the
+  # specific release tag so git rev-list can resolve it locally.
+  git fetch origin "refs/tags/${LAST_TAG}:refs/tags/${LAST_TAG}" 2>/dev/null || true
+
+  LAST_SHA=$(git rev-list -n 1 "${LAST_TAG}" 2>/dev/null || true)
+
+  if [[ -z "${LAST_SHA}" ]]; then
+    # Local resolution still failed (annotated tag, fetch blocked, etc.).
+    # Fall back to GitHub API — resolves both lightweight and annotated tags.
+    echo "[boss-release] ${LAST_TAG} not in local refs; querying GitHub API"
+    LAST_SHA=$(gh api "repos/spinyfin/mono/commits/${LAST_TAG}" \
+      --jq '.sha' 2>/dev/null || true)
+  fi
+fi
+
+# ── idempotency guard: never re-release an already-tagged commit (ALL paths) ─
+# This check is SEPARATE from change-detection and applies to every trigger,
+# including manual / API runs. Rationale: a manual re-trigger on an unchanged
+# main branch would otherwise bump MAX_N and cut a new version on the same
+# commit (observed as boss-v1.0.10 and boss-v1.0.11 both on commit 484ea18).
+#
+# If a deliberate re-cut is ever required, delete the tag first or use a
+# dedicated --force flag; do NOT rely on manual triggering.
+if [[ -n "${LAST_SHA}" ]]; then
+  HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")
+  if [[ "${HEAD_SHA}" == "${LAST_SHA}" ]]; then
+    echo "release step skipped: HEAD (${HEAD_SHA:0:12}) is already the commit for ${LAST_TAG} — re-releasing the same commit is a no-op"
+    exit 0
+  fi
+fi
+
+# ── guard: skip if no Boss-affecting changes (cron path only) ─────────────────
 # For scheduled (cron) builds, only publish a release when there are
 # Boss-affecting changes since the last boss-v* tag. A cron run with no Boss
 # changes exits 0 silently.
@@ -36,58 +80,31 @@ echo "[boss-release] bazelisk: $(bazelisk version 2>&1 | head -1)"
 #   - .buildkite/steps/boss-release.sh — the release script itself
 #   - .buildkite/pipeline.yml — the release wiring
 
-BUILDKITE_SOURCE="${BUILDKITE_SOURCE:-}"
-
 if [[ "${BUILDKITE_SOURCE}" == "ui" || "${BUILDKITE_SOURCE}" == "api" ]]; then
   echo "[boss-release] manual trigger via ${BUILDKITE_SOURCE}; skipping change-detection"
 else
   log "[boss-release] checking for Boss-affecting changes since last tag"
-  LAST_TAG=$(gh release list --repo spinyfin/mono --limit 200 --json tagName \
-    --jq '[.[] | select(.tagName | test("^boss-v1\\.0\\.[0-9]+$"))] | .[0].tagName' 2>/dev/null || true)
 
   if [[ -z "${LAST_TAG}" ]]; then
     echo "[boss-release] no previous boss-v* tag found; proceeding with first release"
+  elif [[ -z "${LAST_SHA}" ]]; then
+    echo "[boss-release] WARNING: could not resolve tag ${LAST_TAG} by any means; proceeding"
   else
-    # BK checkouts are shallow (single-commit fetch, no --tags). Fetch the
-    # specific release tag so git rev-list can resolve it locally.
-    git fetch origin "refs/tags/${LAST_TAG}:refs/tags/${LAST_TAG}" 2>/dev/null || true
-
-    LAST_SHA=$(git rev-list -n 1 "${LAST_TAG}" 2>/dev/null || true)
-
-    if [[ -z "${LAST_SHA}" ]]; then
-      # Local resolution still failed (annotated tag, fetch blocked, etc.).
-      # Fall back to GitHub API — resolves both lightweight and annotated tags.
-      echo "[boss-release] ${LAST_TAG} not in local refs; querying GitHub API"
-      LAST_SHA=$(gh api "repos/spinyfin/mono/commits/${LAST_TAG}" \
-        --jq '.sha' 2>/dev/null || true)
+    # Unshallow if needed so git diff can reach LAST_SHA.
+    if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+      echo "[boss-release] unshallowing repo for full diff"
+      git fetch --unshallow origin 2>/dev/null || true
     fi
 
-    if [[ -z "${LAST_SHA}" ]]; then
-      echo "[boss-release] WARNING: could not resolve tag ${LAST_TAG} by any means; proceeding"
-    else
-      HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")
-      # Guard: if HEAD is already the last-released commit, nothing to do.
-      if [[ "${HEAD_SHA}" == "${LAST_SHA}" ]]; then
-        echo "release step skipped: HEAD (${HEAD_SHA:0:12}) is already the commit for ${LAST_TAG}"
-        exit 0
-      fi
+    TOUCHED=$(git diff --name-only "${LAST_SHA}..HEAD" 2>/dev/null || true)
+    BOSS_TOUCHED=$(echo "${TOUCHED}" | grep -E "^(tools/boss/|\.buildkite/steps/boss-release\.sh|\.buildkite/pipeline\.yml)" || true)
 
-      # Unshallow if needed so git diff can reach LAST_SHA.
-      if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
-        echo "[boss-release] unshallowing repo for full diff"
-        git fetch --unshallow origin 2>/dev/null || true
-      fi
-
-      TOUCHED=$(git diff --name-only "${LAST_SHA}..HEAD" 2>/dev/null || true)
-      BOSS_TOUCHED=$(echo "${TOUCHED}" | grep -E "^(tools/boss/|\.buildkite/steps/boss-release\.sh|\.buildkite/pipeline\.yml)" || true)
-
-      if [[ -z "${BOSS_TOUCHED}" ]]; then
-        TOUCHED_SUMMARY=$(echo "${TOUCHED}" | tr '\n' ' ')
-        echo "release step skipped: no Boss-affecting changes since ${LAST_TAG} (touched: ${TOUCHED_SUMMARY})"
-        exit 0
-      fi
-      echo "[boss-release] Boss-affecting changes detected since ${LAST_TAG}; proceeding"
+    if [[ -z "${BOSS_TOUCHED}" ]]; then
+      TOUCHED_SUMMARY=$(echo "${TOUCHED}" | tr '\n' ' ')
+      echo "release step skipped: no Boss-affecting changes since ${LAST_TAG} (touched: ${TOUCHED_SUMMARY})"
+      exit 0
     fi
+    echo "[boss-release] Boss-affecting changes detected since ${LAST_TAG}; proceeding"
   fi
 fi
 
