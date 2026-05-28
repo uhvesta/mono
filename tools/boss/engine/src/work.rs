@@ -2886,6 +2886,59 @@ impl WorkDb {
         }
     }
 
+    /// Inverse of [`Self::delete_work_item`]: clear the `deleted_at`
+    /// tombstone on a soft-deleted task so it becomes visible again.
+    /// Accepts a canonical `task_…` id or a friendly short id (`T43`);
+    /// the friendly resolution deliberately includes soft-deleted rows
+    /// so a tombstoned task is still findable. Idempotent — restoring a
+    /// row that is already live succeeds as a no-op. Returns the now-live
+    /// work item.
+    ///
+    /// Note: the dependency edges that `delete_work_item` dropped are
+    /// NOT recreated — they were deleted outright, not tombstoned, so a
+    /// restored task comes back with no dependency edges. The operator
+    /// must re-add any that still matter.
+    pub fn restore_work_item(&self, id: &str) -> Result<WorkItem> {
+        let conn = self.connect()?;
+        let canonical = resolve_friendly_work_item_id_inner(&conn, id, true)?
+            .unwrap_or_else(|| id.to_owned());
+        match classify_id(&canonical)? {
+            ItemKind::Task => {
+                // The row must exist (live or tombstoned). A WHERE that
+                // matched only tombstoned rows would make an idempotent
+                // re-restore indistinguishable from an unknown id, so we
+                // check existence separately before the conditional
+                // UPDATE.
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM tasks WHERE id = ?1",
+                        params![canonical],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    bail!("unknown task: {canonical}");
+                }
+                let now = now_string();
+                conn.execute(
+                    "UPDATE tasks SET deleted_at = NULL, updated_at = ?2
+                     WHERE id = ?1 AND deleted_at IS NOT NULL",
+                    params![canonical, now],
+                )?;
+                query_task(&conn, &canonical)?
+                    .map(task_to_item)
+                    .with_context(|| format!("unknown task: {canonical}"))
+            }
+            ItemKind::Product => {
+                bail!("products are archived, not soft-deleted; nothing to restore")
+            }
+            ItemKind::Project => {
+                bail!("projects are archived, not soft-deleted; nothing to restore")
+            }
+        }
+    }
+
     pub fn get_work_tree(&self, product_id: &str) -> Result<WorkTree> {
         let conn = self.connect()?;
         let product = query_product(&conn, product_id)?
@@ -3080,27 +3133,34 @@ impl WorkDb {
         product_id: &str,
         project_id: Option<&str>,
         dep_filter: Option<&DependencyFilter>,
+        include_deleted: bool,
     ) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
+        // The soft-delete predicate is dropped entirely (rather than
+        // negated) when the caller asks to include deleted rows, so the
+        // default `--deleted` view shows live and tombstoned tasks
+        // together. Restore acts on the tombstoned ones.
+        let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
+
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
                  FROM tasks
-                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design', 'investigation') AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ('project_task', 'design', 'investigation'){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
-            )?;
+            ))?;
             let rows = stmt.query_map(params![product_id, project_id], map_task)?;
             collect_rows(rows)?
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation') AND deleted_at IS NULL
+                 WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation'){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
-            )?;
+            ))?;
             let rows = stmt.query_map([product_id], map_task)?;
             collect_rows(rows)?
         };
@@ -3190,16 +3250,19 @@ impl WorkDb {
         &self,
         product_id: &str,
         dep_filter: Option<&DependencyFilter>,
+        include_deleted: bool,
     ) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
-        let mut stmt = conn.prepare(
+        // See `list_tasks` for the include-deleted contract.
+        let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
              FROM tasks
-             WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
+             WHERE product_id = ?1 AND kind = 'chore'{deleted_clause}
              ORDER BY created_at ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([product_id], map_task)?;
         let mut chores: Vec<Task> = collect_rows(rows)?;
         if let Some(filter) = dep_filter {
@@ -11630,6 +11693,19 @@ enum ItemKind {
 /// Returns `Ok(None)` when `id` is not a friendly-id form or when no row
 /// matches; callers should treat the original id as-is in that case.
 fn resolve_friendly_work_item_id(conn: &Connection, id: &str) -> Result<Option<String>> {
+    resolve_friendly_work_item_id_inner(conn, id, false)
+}
+
+/// Variant of [`resolve_friendly_work_item_id`] that, when
+/// `include_deleted` is true, resolves a `T<n>` short id even if its
+/// task row carries a `deleted_at` tombstone. Only `restore` needs
+/// this — every other resolution path wants the live-only view and
+/// calls through the plain wrapper above.
+fn resolve_friendly_work_item_id_inner(
+    conn: &Connection,
+    id: &str,
+    include_deleted: bool,
+) -> Result<Option<String>> {
     if id.len() < 2 {
         return Ok(None);
     }
@@ -11641,12 +11717,13 @@ fn resolve_friendly_work_item_id(conn: &Connection, id: &str) -> Result<Option<S
         Ok(n) if n > 0 => n,
         _ => return Ok(None),
     };
+    let task_sql = if include_deleted {
+        "SELECT id FROM tasks WHERE short_id = ?1 LIMIT 1"
+    } else {
+        "SELECT id FROM tasks WHERE short_id = ?1 AND deleted_at IS NULL LIMIT 1"
+    };
     if let Some(primary_id) = conn
-        .query_row(
-            "SELECT id FROM tasks WHERE short_id = ?1 AND deleted_at IS NULL LIMIT 1",
-            params![n],
-            |row| row.get::<_, String>(0),
-        )
+        .query_row(task_sql, params![n], |row| row.get::<_, String>(0))
         .optional()?
     {
         return Ok(Some(primary_id));
@@ -12090,7 +12167,7 @@ mod tests {
     /// did before.
     fn complete_design_for_project(db: &WorkDb, project_id: &str) {
         let project = db.get_project(project_id).unwrap();
-        let tasks = db.list_tasks(&project.product_id, Some(project_id), None).unwrap();
+        let tasks = db.list_tasks(&project.product_id, Some(project_id), None, false).unwrap();
         let design = tasks
             .iter()
             .find(|t| t.kind == "design")
@@ -12209,6 +12286,70 @@ mod tests {
     }
 
     #[test]
+    fn restore_work_item_clears_tombstone() {
+        let path = temp_db_path("restore");
+        let db = WorkDb::open(path.clone()).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Recover me".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let short_id = chore.short_id.expect("chore has a short id");
+
+        db.delete_work_item(&chore.id).unwrap();
+        // Live listing hides it; the include-deleted listing surfaces it
+        // with the tombstone populated.
+        assert!(db.list_chores(&product.id, None, false).unwrap().is_empty());
+        let deleted_view = db.list_chores(&product.id, None, true).unwrap();
+        assert_eq!(deleted_view.len(), 1);
+        assert!(deleted_view[0].deleted_at.is_some());
+        assert!(db.get_work_item(&chore.id).is_err());
+
+        let item_id = |item: &WorkItem| match item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.id.clone(),
+            WorkItem::Product(p) => p.id.clone(),
+            WorkItem::Project(p) => p.id.clone(),
+        };
+
+        // Restore by friendly short id — the friendly resolver must find
+        // the tombstoned row.
+        let restored = db.restore_work_item(&format!("T{short_id}")).unwrap();
+        assert_eq!(item_id(&restored), chore.id);
+        assert!(db.get_work_item(&chore.id).is_ok());
+        assert_eq!(db.list_chores(&product.id, None, false).unwrap().len(), 1);
+
+        // Idempotent: restoring an already-live row succeeds as a no-op,
+        // and a canonical id works just as well as the friendly form.
+        let again = db.restore_work_item(&chore.id).unwrap();
+        assert_eq!(item_id(&again), chore.id);
+
+        // An id that matches no row is an error, not a silent no-op.
+        assert!(db.restore_work_item("task_doesnotexist").is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn create_many_tasks_inserts_all_in_one_transaction() {
         let path = temp_db_path("create-many-tasks");
         let db = WorkDb::open(path.clone()).unwrap();
@@ -12265,7 +12406,7 @@ mod tests {
         }
 
         let tasks = db
-            .list_tasks(&product.id, Some(&project.id), None)
+            .list_tasks(&product.id, Some(&project.id), None, false)
             .unwrap();
         // Five user-created tasks plus the auto-created design task
         // that every new project carries.
@@ -12341,7 +12482,7 @@ mod tests {
         );
 
         let tasks = db
-            .list_tasks(&product.id, Some(&project.id), None)
+            .list_tasks(&product.id, Some(&project.id), None, false)
             .unwrap();
         // The batch's project_task inserts must roll back, but the
         // auto-created design task (inserted in `create_project`'s
@@ -16100,7 +16241,7 @@ mod tests {
         // The project comes with a `kind = 'design'` task already
         // attached, named "Design <project name>" and parked at `ordinal = 0` so it
         // sorts first in the project's chain.
-        let tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        let tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
         let design = tasks
             .iter()
             .find(|t| t.kind == "design")
@@ -16163,7 +16304,7 @@ mod tests {
             })
             .unwrap();
 
-        let tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        let tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
         let design = tasks
             .iter()
             .find(|t| t.kind == "design")
@@ -16211,7 +16352,7 @@ mod tests {
             })
             .unwrap();
 
-        let tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        let tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
         assert!(
             tasks.is_empty(),
             "no_design_task project must have zero child tasks, found: {tasks:?}",
@@ -16274,7 +16415,7 @@ mod tests {
         // Re-open: the migration fires and backfills a design task.
         let db = WorkDb::open(path.clone()).unwrap();
         let project = db.get_project(&project_id).unwrap();
-        let tasks = db.list_tasks(&project.product_id, Some(&project_id), None).unwrap();
+        let tasks = db.list_tasks(&project.product_id, Some(&project_id), None, false).unwrap();
         let design = tasks
             .iter()
             .find(|t| t.kind == "design")
@@ -18533,7 +18674,7 @@ mod tests {
                 no_design_task: false,
             })
             .unwrap();
-        let project_tasks = db.list_tasks(&product.id, Some(&project.id), None).unwrap();
+        let project_tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
         let design_task = project_tasks
             .iter()
             .find(|t| t.kind == "design")
@@ -22888,7 +23029,7 @@ mod tests {
         assert_eq!(chore2.short_id, Some(2));
 
         // `list_chores` also surfaces the field (exercises the SELECT path).
-        let fetched = db.list_chores(&product.id, None).unwrap();
+        let fetched = db.list_chores(&product.id, None, false).unwrap();
         assert_eq!(fetched[0].short_id, Some(1));
 
         let _ = std::fs::remove_file(path);

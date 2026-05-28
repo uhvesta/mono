@@ -4007,7 +4007,13 @@ async fn handle_frontend_connection(
                 product_id,
                 project_id,
                 dep_filter,
-            } => match work_db.list_tasks(&product_id, project_id.as_deref(), dep_filter.as_ref()) {
+                include_deleted,
+            } => match work_db.list_tasks(
+                &product_id,
+                project_id.as_deref(),
+                dep_filter.as_ref(),
+                include_deleted,
+            ) {
                 Ok(tasks) => {
                     send_response_with_revision(
                         &sink,
@@ -4033,7 +4039,8 @@ async fn handle_frontend_connection(
             FrontendRequest::ListChores {
                 product_id,
                 dep_filter,
-            } => match work_db.list_chores(&product_id, dep_filter.as_ref()) {
+                include_deleted,
+            } => match work_db.list_chores(&product_id, dep_filter.as_ref(), include_deleted) {
                 Ok(chores) => {
                     send_response_with_revision(
                         &sink,
@@ -4569,6 +4576,41 @@ async fn handle_frontend_connection(
                         );
                     }
                 },
+                Err(err) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::RestoreWorkItem { id } => match work_db.restore_work_item(&id) {
+                Ok(item) => {
+                    // Restore makes a tombstoned row live again, so the
+                    // kanban / list consumers need to reload exactly as
+                    // they would for any other mutation. Reuse the
+                    // `work_item_updated` invalidation rather than minting
+                    // a restore-specific topic event.
+                    let product_id = work_item_product_id(&item);
+                    let revision = publish_work_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        vec![work_product_topic(&product_id)],
+                        "work_item_updated",
+                        Some(product_id),
+                        vec![work_item_id(&item)],
+                    )
+                    .await;
+                    send_response_with_revision(
+                        &sink,
+                        &request_id,
+                        revision,
+                        FrontendEvent::WorkItemRestored { item },
+                    );
+                }
                 Err(err) => {
                     send_response(
                         &sink,

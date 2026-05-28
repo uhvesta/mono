@@ -218,6 +218,68 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn delete_then_restore_round_trip_through_engine() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = create_product(
+        &mut client,
+        CreateProductInput {
+            name: "Recoverable".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@example.com:recoverable.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        },
+    )
+    .await?;
+
+    let chore = create_chore(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Fat-fingered delete target".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
+    let short_id = chore.short_id.expect("chore has a short id");
+
+    delete_work_item(&mut client, &chore.id).await?;
+    // Live listing hides the tombstoned chore; the include-deleted
+    // listing surfaces it with `deleted_at` populated — this is the row
+    // an operator would `restore`.
+    assert!(list_chores(&mut client, &product.id).await?.is_empty());
+    let deleted_view = list_chores_including_deleted(&mut client, &product.id).await?;
+    assert_eq!(deleted_view.len(), 1);
+    assert_eq!(deleted_view[0].id, chore.id);
+    assert!(deleted_view[0].deleted_at.is_some());
+
+    // Restore by the friendly `T<n>` short id, which the engine must
+    // resolve even though the row is tombstoned.
+    let restored = expect_chore(restore_work_item(&mut client, &format!("T{short_id}")).await?)?;
+    assert_eq!(restored.id, chore.id);
+    assert!(restored.deleted_at.is_none());
+    assert_eq!(list_chores(&mut client, &product.id).await?.len(), 1);
+
+    // Idempotent: restoring an already-live chore by canonical id is a
+    // no-op success.
+    let again = expect_chore(restore_work_item(&mut client, &chore.id).await?)?;
+    assert_eq!(again.id, chore.id);
+    assert!(again.deleted_at.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn task_and_chore_priority_round_trips_through_engine() -> Result<()> {
     // Exercises the first-class `priority` field on tasks / chores:
     // the create flow honors `Some("high")`, the omitted-priority
@@ -898,6 +960,33 @@ async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<()> {
     }
 }
 
+async fn restore_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem> {
+    match client
+        .send_request(&FrontendRequest::RestoreWorkItem { id: id.to_owned() })
+        .await?
+    {
+        FrontendEvent::WorkItemRestored { item } => Ok(item),
+        other => Err(unexpected_event("restore", other)),
+    }
+}
+
+async fn list_chores_including_deleted(
+    client: &mut BossClient,
+    product_id: &str,
+) -> Result<Vec<Task>> {
+    match client
+        .send_request(&FrontendRequest::ListChores {
+            product_id: product_id.to_owned(),
+            dep_filter: None,
+            include_deleted: true,
+        })
+        .await?
+    {
+        FrontendEvent::ChoresList { chores, .. } => Ok(chores),
+        other => Err(unexpected_event("list chores include-deleted", other)),
+    }
+}
+
 async fn list_products(client: &mut BossClient) -> Result<Vec<Product>> {
     match client.send_request(&FrontendRequest::ListProducts).await? {
         FrontendEvent::ProductsList { products } => Ok(products),
@@ -945,6 +1034,7 @@ async fn list_tasks_filtered(
             product_id: product_id.to_owned(),
             project_id: project_id.map(str::to_owned),
             dep_filter,
+            include_deleted: false,
         })
         .await?
     {
@@ -966,6 +1056,7 @@ async fn list_chores_filtered(
         .send_request(&FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
             dep_filter,
+            include_deleted: false,
         })
         .await?
     {

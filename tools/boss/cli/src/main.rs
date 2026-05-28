@@ -258,7 +258,7 @@ enum ProjectCommand {
 /// Subcommands under `boss task ...`.
 ///
 /// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
-/// `depend`, `bind-pr`) operate on any leaf work item by id. A chore
+/// `restore`, `depend`, `bind-pr`) operate on any leaf work item by id. A chore
 /// *is* a kind of task — the engine already knows the kind from the
 /// id, so the noun is permissive. The same verbs are mirrored under
 /// `boss chore ...` for back-compat and for callers who prefer to
@@ -286,6 +286,13 @@ enum TaskCommand {
     Move(TaskMoveArgs),
     /// Delete any leaf work item (task or chore) by id.
     Delete(TaskDeleteArgs),
+    /// Restore a soft-deleted leaf work item (task or chore) — the
+    /// inverse of `delete`. Clears the `deleted_at` tombstone so the
+    /// item is visible again. Idempotent on an already-live item.
+    /// Accepts the canonical id (`task_…`) or a friendly short id
+    /// (`T43`). Find tombstoned ids with `boss task list --deleted`.
+    #[command(alias = "undelete")]
+    Restore(TaskRestoreArgs),
     Reorder(TaskReorderArgs),
     /// Manage dependency edges (`A depends on B` ⇒ B gates A).
     Depend {
@@ -364,6 +371,9 @@ enum ChoreCommand {
     Move(TaskMoveArgs),
     /// Alias for `boss task delete`. Accepts any leaf work item id.
     Delete(TaskDeleteArgs),
+    /// Alias for `boss task restore`. Accepts any leaf work item id.
+    #[command(alias = "undelete")]
+    Restore(TaskRestoreArgs),
     /// Alias for `boss task depend`. The engine doesn't care about kind.
     Depend {
         #[command(subcommand)]
@@ -1215,6 +1225,12 @@ struct TaskListArgs {
     #[arg(long)]
     id: Vec<String>,
 
+    /// Include soft-deleted (tombstoned) tasks in the listing. Use this
+    /// to find a `deleted_at` row to `boss task restore`. The DELETED
+    /// column appears whenever any listed row carries a tombstone.
+    #[arg(long = "deleted", alias = "include-deleted")]
+    include_deleted: bool,
+
     /// Filter by resolved repo. Accepts a full URL or a short
     /// name (basename of the URL minus `.git`). Resolution falls
     /// back to the parent product's `repo_remote_url` when the
@@ -1438,6 +1454,11 @@ struct ChoreListArgs {
     #[arg(long)]
     id: Vec<String>,
 
+    /// Include soft-deleted (tombstoned) chores in the listing. See
+    /// `boss task list --help`.
+    #[arg(long = "deleted", alias = "include-deleted")]
+    include_deleted: bool,
+
     /// Filter by resolved repo. See `boss task list --help`.
     #[arg(long = "repo")]
     repo: Option<String>,
@@ -1644,6 +1665,16 @@ struct ProjectMoveArgs {
 
 #[derive(Debug, Clone, Args)]
 struct TaskDeleteArgs {
+    id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TaskRestoreArgs {
+    /// Task/chore id to restore. Accepts the canonical primary id
+    /// (`task_…`) or a friendly short id (`T43` / `t43`). Bare `#43` /
+    /// `43` and cross-product `boss/43` forms are not accepted here —
+    /// a soft-deleted row is hidden from the per-product short-id
+    /// resolver, so pass the globally-unique `T43` or canonical id.
     id: String,
 }
 
@@ -2007,14 +2038,14 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Do not use boss ... --help for syntax discovery when this reference is available.",
             "Omit --socket-path unless you explicitly need a non-default socket.",
             "Omit --no-autostart unless you explicitly need to suppress worker auto-dispatch on `task create` / `chore create` (also gates the auto-spawned `kind=design` seed task on `project create`). --no-autostart does NOT prevent the CLI from transparently starting the engine — the engine is always needed to track work. To forbid transparent engine startup, use --no-engine-autostart (independent of --no-autostart).",
-            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
+            "Kind-agnostic verbs (show, update, move, delete, restore, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         selector_semantics: vec![
             "Product selectors accept a product id, slug, or 1-based interactive index. For agent use, prefer slug or id, not numeric indexes.",
             "Project selectors accept a project id, slug, short id (#42 or 42), or 1-based interactive index within the selected product. For agent use, prefer slug, short id, or primary id; avoid numeric indexes.",
             "Task and chore selectors accept: (1) primary id (task_…); (2) friendly short id — `T441` / `t441` / `42` / `#42` within the context product, or `boss/42` / `boss/#42` for a specific product. Projects accept `P7` / `p7` in the same position. For agent use, prefer the short id form (T-prefix or #42) when talking to a human, and the primary id when calling other engine RPCs.",
-            "Kind-agnostic verbs (show, update, move, delete, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
+            "Kind-agnostic verbs (show, update, move, delete, restore, depend, bind-pr, link-external, unlink-external) accept any leaf work item id under either `boss task` or `boss chore` — a chore is a kind of task. Use whichever noun reads more naturally for the call site; the engine resolves the kind from the id.",
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         status_semantics: vec![
@@ -2023,6 +2054,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Task and chore move targets map: backlog|todo -> todo, doing|active -> active, review|in-review -> in_review, blocked -> blocked, done -> done.",
             "Product move/delete: --to active|paused|archived. delete is a soft archive (sets status=archived).",
             "Project move/delete: --to planned|active|blocked|done|archived. delete is a soft archive (sets status=archived).",
+            "Task/chore delete is a soft delete (sets deleted_at). Recover an accidentally deleted leaf work item with `boss task restore <id>` (alias `undelete`); it clears deleted_at and is idempotent. Find tombstoned rows to restore with `boss task list --deleted` / `boss chore list --deleted`.",
         ],
         workflow_guidance: vec![
             "Use the current UI or conversational context first when deciding where new work belongs.",
@@ -2359,7 +2391,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             // `create_project` inserts the design task in the same
             // sqlite transaction, so it's always present by the
             // time we get the project back.
-            let design_task = list_tasks(&mut client, &product.id, Some(&project.id), None)
+            let design_task = list_tasks(&mut client, &product.id, Some(&project.id), None, false)
                 .await?
                 .into_iter()
                 .find(|t| t.kind == "design");
@@ -2696,6 +2728,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 &product.id,
                 project.as_ref().map(|project| project.id.as_str()),
                 dep_filter,
+                args.include_deleted,
             )
             .await?;
             let tasks = apply_task_list_filters(
@@ -2716,6 +2749,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
+        TaskCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
         TaskCommand::Reorder(args) => {
             let product = resolve_product_inferable(
                 &mut client,
@@ -2805,7 +2839,8 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
-            let chores = list_chores(&mut client, &product.id, dep_filter).await?;
+            let chores =
+                list_chores(&mut client, &product.id, dep_filter, args.include_deleted).await?;
             let chores = apply_task_list_filters(
                 chores,
                 &args.status,
@@ -2824,6 +2859,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
         ChoreCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
         ChoreCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
         ChoreCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
@@ -3055,6 +3091,31 @@ async fn run_delete_leaf(
             }
         },
     )
+}
+
+async fn run_restore_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskRestoreArgs,
+) -> Result<(), CliError> {
+    // Restore resolution is intentionally not routed through
+    // `resolve_selector_to_primary_id`: a soft-deleted row is hidden
+    // from the per-product short-id resolver, so bare `#43` / `boss/43`
+    // can't reach it. The engine resolves the globally-unique `T43`
+    // form (and canonical `task_…` ids) against tombstoned rows itself,
+    // so we pass the raw selector straight through.
+    let item = restore_work_item(client, args.id.trim()).await?;
+    let (label, friendly) = match &item {
+        WorkItem::Task(t) => ("Task", t.short_id.map(|n| format!("T{n}"))),
+        WorkItem::Chore(t) => ("Chore", t.short_id.map(|n| format!("T{n}"))),
+        _ => ("Item", None),
+    };
+    let friendly = friendly.unwrap_or_else(|| work_item_primary_id(&item).to_owned());
+    print_entity(ctx, &serde_json::json!({ "item": item }), || {
+        if !ctx.quiet {
+            println!("Restored {label} {friendly}");
+        }
+    })
 }
 
 /// "task" -> "Task". The label set comes from
@@ -3968,12 +4029,14 @@ async fn list_tasks(
     product_id: &str,
     project_id: Option<&str>,
     dep_filter: Option<DependencyFilter>,
+    include_deleted: bool,
 ) -> Result<Vec<Task>, CliError> {
     match client
         .send_request(&FrontendRequest::ListTasks {
             product_id: product_id.to_owned(),
             project_id: project_id.map(str::to_owned),
             dep_filter,
+            include_deleted,
         })
         .await
         .map_err(CliError::internal)?
@@ -3990,11 +4053,13 @@ async fn list_chores(
     client: &mut BossClient,
     product_id: &str,
     dep_filter: Option<DependencyFilter>,
+    include_deleted: bool,
 ) -> Result<Vec<Task>, CliError> {
     match client
         .send_request(&FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
             dep_filter,
+            include_deleted,
         })
         .await
         .map_err(CliError::internal)?
@@ -4834,6 +4899,20 @@ async fn delete_work_item(client: &mut BossClient, id: &str) -> Result<(), CliEr
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("work item delete", &other)),
+    }
+}
+
+async fn restore_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
+    match client
+        .send_request(&FrontendRequest::RestoreWorkItem { id: id.to_owned() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemRestored { item } => Ok(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("work item restore", &other)),
     }
 }
 
@@ -5914,6 +5993,10 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // human-readability nicety only.
     let show_effort = tasks.iter().any(|t| t.effort_level.is_some());
     let show_short_id = tasks.iter().any(|t| t.short_id.is_some());
+    // Surface the soft-delete tombstone only when a row actually carries
+    // one — i.e. when the caller passed `--deleted`. Keeps the common
+    // live-only listing unchanged. Mirrors the `show_effort` pattern.
+    let show_deleted = tasks.iter().any(|t| t.deleted_at.is_some());
     let mut table = Table::new();
     let mut header: Vec<&str> = Vec::new();
     if show_short_id {
@@ -5927,6 +6010,9 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         header.push("EFFORT");
     }
     header.extend_from_slice(&["PROJECT", "ORDINAL", "PR URL"]);
+    if show_deleted {
+        header.push("DELETED");
+    }
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(header);
@@ -5953,6 +6039,9 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         row.push(task.project_id.clone().unwrap_or_default());
         row.push(ordinal);
         row.push(task.pr_url.clone().unwrap_or_default());
+        if show_deleted {
+            row.push(task.deleted_at.clone().unwrap_or_default());
+        }
         table.add_row(row);
     }
     println!("{table}");
@@ -7084,6 +7173,54 @@ mod tests {
                 assert_eq!(args.selector, "boss");
             }
             _ => panic!("expected product delete command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_restore_command() {
+        let cli = Cli::parse_from(["boss", "task", "restore", "T43"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Restore(args),
+            } => assert_eq!(args.id, "T43"),
+            _ => panic!("expected task restore command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_undelete_alias() {
+        // `undelete` is an alias for `restore`.
+        let cli = Cli::parse_from(["boss", "task", "undelete", "task_abc"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Restore(args),
+            } => assert_eq!(args.id, "task_abc"),
+            _ => panic!("expected task restore command via undelete alias"),
+        }
+    }
+
+    #[test]
+    fn parses_chore_restore_command() {
+        let cli = Cli::parse_from(["boss", "chore", "restore", "T9"]);
+        match cli.command {
+            Commands::Chore {
+                command: ChoreCommand::Restore(args),
+            } => assert_eq!(args.id, "T9"),
+            _ => panic!("expected chore restore command"),
+        }
+    }
+
+    #[test]
+    fn parses_task_list_deleted_flag() {
+        // Both `--deleted` and its `--include-deleted` alias flip the flag.
+        for flag in ["--deleted", "--include-deleted"] {
+            let cli = Cli::parse_from(["boss", "task", "list", "--product", "boss", flag]);
+            match cli.command {
+                Commands::Task {
+                    command: TaskCommand::List(args),
+                } => assert!(args.include_deleted, "expected include_deleted for {flag}"),
+                _ => panic!("expected task list command"),
+            }
         }
     }
 

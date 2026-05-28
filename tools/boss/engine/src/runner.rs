@@ -3546,7 +3546,7 @@ mod pane_spawn_tests {
         // Find the design task `create_project` auto-filed for this
         // project. It sorts ordinal-0 with `kind = 'design'`.
         let design_task = work_db
-            .list_tasks(&product.id, Some(&project.id), None)
+            .list_tasks(&product.id, Some(&project.id), None, false)
             .unwrap()
             .into_iter()
             .find(|t| t.kind == "design")
@@ -3685,7 +3685,7 @@ mod pane_spawn_tests {
             .unwrap();
 
         let design_task = work_db
-            .list_tasks(&product.id, Some(&project.id), None)
+            .list_tasks(&product.id, Some(&project.id), None, false)
             .unwrap()
             .into_iter()
             .find(|t| t.kind == "design")

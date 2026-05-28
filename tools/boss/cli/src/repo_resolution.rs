@@ -181,6 +181,7 @@ async fn send_list_tasks(client: &mut BossClient, product_id: &str) -> Result<Ve
             product_id: product_id.to_owned(),
             project_id: None,
             dep_filter: None,
+            include_deleted: false,
         })
         .await
         .map_err(CliError::internal)?
@@ -204,6 +205,7 @@ async fn send_list_chores(
         .send_request(&FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
             dep_filter: None,
+            include_deleted: false,
         })
         .await
         .map_err(CliError::internal)?

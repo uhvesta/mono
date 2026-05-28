@@ -116,12 +116,21 @@ pub enum FrontendRequest {
         /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
         #[serde(default)]
         dep_filter: Option<DependencyFilter>,
+        /// When `true`, soft-deleted rows (`deleted_at IS NOT NULL`) are
+        /// included in the result so the operator can find a tombstoned
+        /// task to `restore` it. Defaults to `false` — pre-existing
+        /// callers omit the field and keep the historical live-only view.
+        #[serde(default)]
+        include_deleted: bool,
     },
     ListChores {
         product_id: String,
         /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].
         #[serde(default)]
         dep_filter: Option<DependencyFilter>,
+        /// See [`Self::ListTasks::include_deleted`].
+        #[serde(default)]
+        include_deleted: bool,
     },
     GetWorkItem {
         id: String,
@@ -165,6 +174,16 @@ pub enum FrontendRequest {
         patch: WorkItemPatch,
     },
     DeleteWorkItem {
+        id: String,
+    },
+    /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
+    /// tombstone on a soft-deleted task, making it visible again. The
+    /// `id` accepts a canonical `task_…` id or a friendly short id
+    /// (`T43`); the engine resolves the friendly form against
+    /// soft-deleted rows too, so a tombstoned task is still findable.
+    /// Idempotent — restoring an already-live row succeeds as a no-op.
+    /// Replies with [`FrontendEvent::WorkItemRestored`] on success.
+    RestoreWorkItem {
         id: String,
     },
     GetWorkTree {
@@ -909,6 +928,11 @@ pub enum FrontendEvent {
     },
     WorkItemDeleted {
         id: String,
+    },
+    /// Reply to [`FrontendRequest::RestoreWorkItem`]. Carries the
+    /// now-live work item so the CLI can echo its friendly id / name.
+    WorkItemRestored {
+        item: WorkItem,
     },
     WorkError {
         message: String,
