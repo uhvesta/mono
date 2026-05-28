@@ -44,6 +44,7 @@ rust_library(
         "src/metrics/mod.rs",
         "src/metrics/persistence.rs",
         "src/metrics/registry.rs",
+        "src/nudge_breaker.rs",
         "src/orphan_sweep.rs",
         "src/pane_summary.rs",
         "src/pr_url_capture.rs",
@@ -178,6 +179,11 @@ rust_test(
         "live_status_redact::",
         "runner::",
         "build_info::",
+        # nudge_breaker is pure in-memory (no global state) and is the
+        # auto-nudge sibling of completion; group it here rather than in
+        # shard 4 so it doesn't add parallelism to that shard's
+        # global-state-sharing tests (audit/worker_setup).
+        "nudge_breaker::",
     ],
     env = {"HOME": "/tmp"},
     deps = all_crate_deps(normal = True, normal_dev = True),
@@ -208,6 +214,7 @@ rust_test(
         "--skip", "live_status_redact::",
         "--skip", "runner::",
         "--skip", "build_info::",
+        "--skip", "nudge_breaker::",
     ],
     env = {"HOME": "/tmp"},
     deps = all_crate_deps(normal = True, normal_dev = True),

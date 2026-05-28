@@ -1619,6 +1619,9 @@ async fn sweep_pending_pr(
         | StopOutcome::NoWorkspace
         | StopOutcome::RunningNoStagedPr
         | StopOutcome::FallbackDisabledByFlag
+        // `recheck_for_pr` never parks via the breaker (only the on-Stop
+        // path nudges); covered here for exhaustiveness.
+        | StopOutcome::NudgeBreakerParked { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -1662,6 +1665,9 @@ async fn sweep_late_pr(
         | StopOutcome::NoWorkspace
         | StopOutcome::RunningNoStagedPr
         | StopOutcome::FallbackDisabledByFlag
+        // `recheck_for_pr_late` never parks via the breaker; covered for
+        // exhaustiveness.
+        | StopOutcome::NudgeBreakerParked { .. }
         | StopOutcome::DbError => {}
     }
 }
