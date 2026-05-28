@@ -49,6 +49,7 @@ rust_library(
         "src/pr_url_capture.rs",
         "src/protocol.rs",
         "src/remote_wrapper.rs",
+        "src/repo_slug.rs",
         "src/resolution_signal_capture.rs",
         "src/run_reconcile.rs",
         "src/runner.rs",

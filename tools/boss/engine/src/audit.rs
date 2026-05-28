@@ -384,15 +384,18 @@ mod tests {
     }
 
     fn fresh_audit_path(dir: &TempDir, name: &str) -> PathBuf {
-        let path = dir.path().join(name);
-        // Each test runs in a child process via `tempfile::TempDir`,
-        // but the OnceLock for AUDIT_PATH is per-test-binary. Reset
-        // it via the env override so multiple tests in this module
-        // can each pick their own path.
-        unsafe {
-            std::env::set_var(AUDIT_PATH_ENV, &path);
-        }
-        path
+        // Just build a per-test path under the TempDir. The callers below
+        // write through `record_via_direct_path` / `append_to`, which take
+        // an explicit path and never consult `AUDIT_PATH_ENV` or the
+        // OnceLock — so this helper must NOT touch the process-global env
+        // var. It used to call `set_var(AUDIT_PATH_ENV, …)`, which served
+        // no purpose here (these tests don't go through `resolve_path`) but
+        // raced with `public_start_and_shutdown_path_emits_two_records`,
+        // the one test that does read the env: a concurrent `set_var` here
+        // clobbered that test's path mid-`record_start`, so it then read a
+        // file that was never written (`NotFound`). Keeping this pure makes
+        // the audit tests independent under libtest's default parallelism.
+        dir.path().join(name)
     }
 
     #[test]

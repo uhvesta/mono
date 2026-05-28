@@ -1088,7 +1088,9 @@ pub struct CreateTaskInput {
     pub created_via: Option<String>,
     /// Per-work-item repo override. `None` → the task inherits from
     /// its product. Canonical remote URL form (engine canonicalises
-    /// caller-supplied URLs at write time).
+    /// caller-supplied URLs at write time). A bare registered cube repo
+    /// slug (e.g. `bduff`) is also accepted and resolved to its origin
+    /// URL at write time so the stored row is always dispatchable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
     /// Effort estimate. `None` → leave NULL on the row; dispatcher
@@ -1129,7 +1131,9 @@ pub struct CreateChoreInput {
     pub created_via: Option<String>,
     /// Per-work-item repo override. `None` → the chore inherits from
     /// its product. Canonical remote URL form (engine canonicalises
-    /// caller-supplied URLs at write time).
+    /// caller-supplied URLs at write time). A bare registered cube repo
+    /// slug (e.g. `bduff`) is also accepted and resolved to its origin
+    /// URL at write time so the stored row is always dispatchable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
     /// See [`CreateTaskInput::effort_level`].

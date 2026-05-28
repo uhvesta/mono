@@ -32,6 +32,7 @@ use crate::protocol::{
     TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic,
     work_product_topic,
 };
+use crate::repo_slug;
 use crate::work::{DuplicateTaskError, GhPrStateChecker, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -4157,6 +4158,15 @@ async fn handle_frontend_connection(
                     input.created_via =
                         Some(transport_default_created_via(&server_state, &session_id).await);
                 }
+                // A `--repo <slug>` override (e.g. `bduff`) names a
+                // registered cube repo, not a git URL. Resolve it to the
+                // canonical origin now so the durable row is dispatchable
+                // and `cube repo ensure` never sees a bare slug (#861).
+                repo_slug::resolve_repo_slugs(
+                    &server_state.cube_client,
+                    &mut [&mut input.repo_remote_url],
+                )
+                .await;
                 match work_db.create_task(input) {
                 Ok(task) => {
                     let item = WorkItem::Task(task);
@@ -4192,6 +4202,13 @@ async fn handle_frontend_connection(
                     input.created_via =
                         Some(transport_default_created_via(&server_state, &session_id).await);
                 }
+                // Resolve a `--repo <slug>` override to its canonical cube
+                // origin before persisting (#861); see the CreateTask arm.
+                repo_slug::resolve_repo_slugs(
+                    &server_state.cube_client,
+                    &mut [&mut input.repo_remote_url],
+                )
+                .await;
                 match work_db.create_chore(input) {
                 Ok(task) => {
                     let item = WorkItem::Chore(task);
@@ -4229,6 +4246,13 @@ async fn handle_frontend_connection(
                         item.created_via = Some(fallback.clone());
                     }
                 }
+                // Resolve any `--repo <slug>` overrides in the batch to
+                // canonical cube origins in a single registry round-trip (#861).
+                {
+                    let mut fields: Vec<&mut Option<String>> =
+                        input.items.iter_mut().map(|i| &mut i.repo_remote_url).collect();
+                    repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut fields).await;
+                }
                 handle_create_many(
                     work_db.create_many_tasks(input),
                     "tasks_created",
@@ -4246,6 +4270,13 @@ async fn handle_frontend_connection(
                     if item.created_via.is_none() {
                         item.created_via = Some(fallback.clone());
                     }
+                }
+                // Resolve any `--repo <slug>` overrides in the batch to
+                // canonical cube origins in a single registry round-trip (#861).
+                {
+                    let mut fields: Vec<&mut Option<String>> =
+                        input.items.iter_mut().map(|i| &mut i.repo_remote_url).collect();
+                    repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut fields).await;
                 }
                 handle_create_many(
                     work_db.create_many_chores(input),

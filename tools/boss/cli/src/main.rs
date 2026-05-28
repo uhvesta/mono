@@ -1164,9 +1164,11 @@ struct TaskCreateArgs {
     #[arg(long)]
     priority: Option<TaskPriority>,
 
-    /// Repo URL override for this task. Omit to inherit from the
-    /// product default; pass `""` later via `task update --repo ""`
-    /// to clear an override.
+    /// Repo override for this task. Accepts a full remote URL or a
+    /// registered cube repo slug (e.g. `bduff`), which the engine
+    /// resolves to its canonical origin URL at create time. Omit to
+    /// inherit from the product default; pass `""` later via
+    /// `task update --repo ""` to clear an override.
     #[arg(long = "repo")]
     #[arg(alias = "repo-remote-url")]
     repo_remote_url: Option<String>,
@@ -1259,9 +1261,11 @@ struct ChoreCreateArgs {
     #[arg(long)]
     priority: Option<TaskPriority>,
 
-    /// Repo URL override for this chore. Omit to inherit from the
-    /// product default; pass `""` later via `chore update --repo ""`
-    /// to clear an override.
+    /// Repo override for this chore. Accepts a full remote URL or a
+    /// registered cube repo slug (e.g. `bduff`), which the engine
+    /// resolves to its canonical origin URL at create time. Omit to
+    /// inherit from the product default; pass `""` later via
+    /// `chore update --repo ""` to clear an override.
     #[arg(long = "repo")]
     #[arg(alias = "repo-remote-url")]
     repo_remote_url: Option<String>,

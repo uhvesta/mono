@@ -35,6 +35,7 @@ pub mod pane_summary;
 pub mod pr_url_capture;
 pub mod protocol;
 pub mod remote_wrapper;
+pub mod repo_slug;
 pub mod resolution_signal_capture;
 pub mod run_reconcile;
 pub mod runner;
