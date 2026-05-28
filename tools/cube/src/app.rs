@@ -244,14 +244,34 @@ fn run_repo(
     };
 
     match command {
-        RepoCommand::Ensure { origin } => {
-            let origin = normalize_origin(&origin)?;
+        RepoCommand::Ensure { reponame, origin } => {
             let defaults = if let Some(defaults) = repo_ensure_defaults {
                 defaults.clone()
             } else {
                 default_repo_ensure_defaults()?
             };
-            let record = ensure_repo(&store, runner, &origin, &defaults, cube_config)?;
+            let cfg = match cube_config {
+                Some(c) => c,
+                None => config::load_config()?,
+            };
+            let record = match (reponame, origin) {
+                (_, Some(origin)) => {
+                    // Explicit origin URL: skip name resolution and clone the
+                    // URL directly with plain `jj git clone`.
+                    let origin = normalize_origin(&origin)?;
+                    let repo_id = repo_id_from_origin(&origin)?;
+                    ensure_repo_core(&store, runner, &repo_id, &origin, None, &defaults)?
+                }
+                (Some(name), None) => {
+                    ensure_repo_by_name(&store, runner, &name, &defaults, &cfg)?
+                }
+                (None, None) => {
+                    // clap enforces that exactly one of the two is present.
+                    return Err(CubeError::InvalidArgument(
+                        "repo ensure requires a <reponame> or --origin <url>".to_string(),
+                    ));
+                }
+            };
             let repo_id = record.repo.clone();
             RunResult::new(
                 format!("Ensured repo `{repo_id}`."),
@@ -276,6 +296,7 @@ fn run_repo(
                 workspace_root: PathBuf::from(workspace_root),
                 workspace_prefix,
                 source: source.map(PathBuf::from),
+                clone_command: None,
             };
             let record = store.upsert_repo(&config)?;
             RunResult::new(
@@ -309,28 +330,114 @@ fn run_repo(
     }
 }
 
-fn ensure_repo(
+/// Resolve a bare `<reponame>` and ensure the repo, walking the resolution
+/// chain in order; the first step that yields a URL wins:
+///
+///   1. **Existing slug.** A registered repo whose `slug == <reponame>` — the
+///      slug *is* the reponame, so this is a no-op (idempotent re-ensure).
+///   2. **Configured resolvers.** Each `repo-resolver` from cube's settings,
+///      in declared order. The first whose `origin_pattern` produces a URL
+///      wins; its optional `clone_command` materializes the repo.
+///   3. **GitHub `<org>/<name>` fallback.** When `<reponame>` is in
+///      `<org>/<name>` shape, synthesize `git@github.com:<org>/<name>.git`
+///      and clone it with plain `jj git clone`.
+///
+/// When nothing produces a URL, the error names each step that was tried and
+/// what it decided.
+fn ensure_repo_by_name(
     store: &Store,
     runner: &dyn CommandRunner,
-    origin: &str,
+    name: &str,
     defaults: &RepoEnsureDefaults,
-    cube_config: Option<config::CubeConfig>,
+    cfg: &config::CubeConfig,
 ) -> Result<RepoRecord> {
-    let cfg = match cube_config {
-        Some(c) => c,
-        None => config::load_config()?,
-    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CubeError::InvalidArgument(
+            "repo name must not be empty".to_string(),
+        ));
+    }
 
+    // Step 1: the reponame already names a registered slug.
+    if let Some(existing) = store.get_repo(name)? {
+        fs::create_dir_all(&existing.workspace_root).map_err(|e| {
+            CubeError::WorkspaceDirCreate {
+                path: existing.workspace_root.clone(),
+                source: e,
+            }
+        })?;
+        materialize_repo_source_if_missing(runner, &existing)?;
+        return Ok(existing);
+    }
+
+    // Step 2: configured resolvers, in declared order.
+    let mut resolver_notes: Vec<String> = Vec::new();
+    for resolver in &cfg.repo_resolvers {
+        match resolver.resolve_origin(name) {
+            Some(origin) => {
+                let clone_command = resolver.resolve_clone_command(name);
+                // The reponame is the slug, so a later `cube repo ensure
+                // <name>` short-circuits at step 1.
+                return ensure_repo_core(store, runner, name, &origin, clone_command, defaults);
+            }
+            None => resolver_notes.push(format!(
+                "resolver `{}`: pattern `{}` produced no URL",
+                resolver.name, resolver.origin_pattern
+            )),
+        }
+    }
+
+    // Step 3: GitHub `<org>/<name>` fallback.
+    if let Some((org, repo)) = parse_org_name_shape(name) {
+        let origin = format!("git@github.com:{org}/{repo}.git");
+        let repo_id = repo_id_from_origin(&origin)?;
+        return ensure_repo_core(store, runner, &repo_id, &origin, None, defaults)
+            .map_err(|err| github_fallback_error(err, &org, &repo));
+    }
+
+    let step2 = if cfg.repo_resolvers.is_empty() {
+        "no `repo-resolvers` are configured".to_string()
+    } else {
+        resolver_notes.join("; ")
+    };
+    Err(CubeError::InvalidArgument(format!(
+        "could not resolve repo `{name}`:\n  \
+         1. registered slug: no repo with slug `{name}` exists\n  \
+         2. resolvers: {step2}\n  \
+         3. GitHub `<org>/<name>` fallback: `{name}` is not in `<org>/<name>` shape"
+    )))
+}
+
+/// Register and materialize a repo given a fully-resolved origin and clone
+/// strategy. `clone_command` (already `{name}`-substituted) is used in place
+/// of `jj git clone` when present. Idempotent: an existing repo matched by
+/// origin or by slug is reused rather than re-registered.
+fn ensure_repo_core(
+    store: &Store,
+    runner: &dyn CommandRunner,
+    repo_id: &str,
+    origin: &str,
+    clone_command: Option<String>,
+    defaults: &RepoEnsureDefaults,
+) -> Result<RepoRecord> {
     if let Some(record) = store.get_repo_by_origin(origin)? {
         fs::create_dir_all(&record.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
             path: record.workspace_root.clone(),
             source: e,
         })?;
-        materialize_repo_source_if_missing(runner, &record, &cfg)?;
+        materialize_repo_source_if_missing(runner, &record)?;
         return Ok(record);
     }
 
-    let record = infer_repo_record_from_origin(origin, defaults)?;
+    let record = RepoRecord {
+        repo: repo_id.to_string(),
+        origin: origin.to_string(),
+        main_branch: "main".to_string(),
+        workspace_root: defaults.workspace_root.clone(),
+        workspace_prefix: format!("{repo_id}-agent-"),
+        source: Some(defaults.repo_root.join(repo_id)),
+        clone_command,
+    };
     if let Some(existing) = store.get_repo(&record.repo)? {
         // The repo is already configured under this id, so we never need to
         // synthesise an origin to clone with — `existing.origin` is the source
@@ -361,7 +468,7 @@ fn ensure_repo(
             path: existing.workspace_root.clone(),
             source: e,
         })?;
-        materialize_repo_source_if_missing(runner, &existing, &cfg)?;
+        materialize_repo_source_if_missing(runner, &existing)?;
         return Ok(existing);
     }
 
@@ -369,8 +476,49 @@ fn ensure_repo(
         path: record.workspace_root.clone(),
         source: e,
     })?;
-    materialize_repo_source_if_missing(runner, &record, &cfg)?;
+    materialize_repo_source_if_missing(runner, &record)?;
     store.upsert_repo(&record)
+}
+
+/// Split a bare `<org>/<name>` slug into its two halves. Returns `None` unless
+/// the input is exactly two non-empty `/`-separated segments free of URL
+/// punctuation (no scheme, no `:` host separator, no `user@` prefix) — i.e. a
+/// bare GitHub `owner/repo` slug rather than a clone URL or single name.
+fn parse_org_name_shape(name: &str) -> Option<(String, String)> {
+    let s = name.trim().trim_end_matches('/');
+    if s.contains(':') || s.contains('@') {
+        return None;
+    }
+    let mut parts = s.split('/');
+    let org = parts.next().filter(|p| !p.is_empty())?;
+    let repo = parts.next().filter(|p| !p.is_empty())?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((org.to_string(), repo.to_string()))
+}
+
+/// Wrap a GitHub-fallback clone failure that looks like a missing remote with
+/// guidance pointing at the resolver path. Other errors pass through unchanged.
+fn github_fallback_error(err: CubeError, org: &str, repo: &str) -> CubeError {
+    let looks_like_missing_remote = match &err {
+        CubeError::CommandFailed { stderr, .. } => {
+            let s = stderr.to_lowercase();
+            s.contains("not found")
+                || s.contains("does not exist")
+                || s.contains("could not read from remote repository")
+        }
+        _ => false,
+    };
+    if looks_like_missing_remote {
+        CubeError::InvalidArgument(format!(
+            "fell back to GitHub `{org}/{repo}` — remote not found; if this is an \
+             internal repo you may need a resolver. Add a `[[repo-resolvers]]` entry \
+             to your cube config so `{repo}` resolves to the right origin."
+        ))
+    } else {
+        err
+    }
 }
 
 /// Parsed representation of a git remote URL, normalised for equivalence checks.
@@ -513,25 +661,16 @@ fn default_repo_ensure_defaults() -> Result<RepoEnsureDefaults> {
     })
 }
 
-fn infer_repo_record_from_origin(
-    origin: &str,
-    defaults: &RepoEnsureDefaults,
-) -> Result<RepoRecord> {
-    let repo = repo_id_from_origin(origin)?;
-    Ok(RepoRecord {
-        repo: repo.clone(),
-        origin: origin.to_string(),
-        main_branch: "main".to_string(),
-        workspace_root: defaults.workspace_root.clone(),
-        workspace_prefix: format!("{repo}-agent-"),
-        source: Some(defaults.repo_root.join(&repo)),
-    })
-}
-
+/// Clone the repo's source tree into `record.source` when it isn't present.
+///
+/// When `record.clone_command` is set (a resolver's `{name}`-substituted
+/// command), that command is run in the workspace pool root in place of
+/// `jj git clone` — it's expected to leave the working tree under
+/// `<pool-root>/<reponame>`, after which cube colocates jj over it. Otherwise
+/// cube runs `jj git clone <origin> <source>` and promotes the default branch.
 fn materialize_repo_source_if_missing(
     runner: &dyn CommandRunner,
     record: &RepoRecord,
-    config: &config::CubeConfig,
 ) -> Result<()> {
     let Some(source) = &record.source else {
         return Ok(());
@@ -558,29 +697,41 @@ fn materialize_repo_source_if_missing(
         source: e,
     })?;
 
-    let mp = &config.multiproduct;
-    if mp.enabled && is_multiproduct_repo(&record.origin, &mp.org) {
-        let repo_name = repo_name_for_mint_clone(&record.origin)?;
-        if which::which(&mp.clone_command).is_err() {
-            let config_path = config::config_file_path()
-                .unwrap_or_else(|_| PathBuf::from("~/.config/cube/cube.toml"));
+    if let Some(clone_command) = &record.clone_command {
+        let parts = shlex::split(clone_command).ok_or_else(|| {
+            CubeError::InvalidArgument(format!(
+                "resolver clone_command `{clone_command}` is not a parseable shell command"
+            ))
+        })?;
+        let mut iter = parts.into_iter();
+        let program = iter.next().ok_or_else(|| {
+            CubeError::InvalidArgument(format!(
+                "resolver clone_command `{clone_command}` is empty"
+            ))
+        })?;
+        let args: Vec<String> = iter.collect();
+        if which::which(&program).is_err() {
             return Err(CubeError::InvalidArgument(format!(
-                "`{}` is not on PATH, but multiproduct cloning is enabled in `{}`. \
-                 Install `{}` or set `[multiproduct] enabled = false` in that file.",
-                mp.clone_command,
-                config_path.display(),
-                mp.clone_command,
+                "`{program}` (from resolver clone_command `{clone_command}`) is not on PATH; \
+                 install it or fix the resolver in your cube config"
             )));
         }
         eprintln!(
-            "cube: using `{} clone` for multiproduct repo `{}`",
-            mp.clone_command, repo_name
+            "cube: using `{clone_command}` to clone repo `{}`",
+            record.repo
         );
-        runner.run(&CommandInvocation {
-            cwd: parent.to_path_buf(),
-            program: mp.clone_command.clone(),
-            args: vec!["clone".to_string(), repo_name],
-        })?;
+        runner
+            .run(&CommandInvocation {
+                cwd: parent.to_path_buf(),
+                program,
+                args,
+            })
+            .map_err(|err| match err {
+                CubeError::CommandFailed { stderr, .. } => CubeError::InvalidArgument(format!(
+                    "resolver clone_command `{clone_command}` failed: {stderr}"
+                )),
+                other => other,
+            })?;
         eprintln!(
             "cube: running `jj git init --colocate` in {}",
             source.display()
@@ -675,35 +826,6 @@ fn is_no_such_remote_bookmark(err: &CubeError) -> bool {
     stderr
         .to_lowercase()
         .contains(JJ_NO_REMOTE_BOOKMARK_SIGNATURE)
-}
-
-/// Returns true when the given origin URL identifies a multiproduct repo.
-/// Detection uses two strategies:
-/// - URL-based (option b): the remote path contains `/{org}/` or `:{org}/`
-/// - Bare-name (option a): the origin has no URL separators (no `/`, `:`, or `@`),
-///   i.e. the user passed a short repo name directly
-fn is_multiproduct_repo(origin: &str, org: &str) -> bool {
-    origin.contains(&format!("/{org}/"))
-        || origin.contains(&format!(":{org}/"))
-        || (!origin.contains('/') && !origin.contains(':') && !origin.contains('@'))
-}
-
-/// Extract the short repo name from an origin to pass to `mint clone`.
-/// For a full URL like `org-127256988@github.com:linkedin-multiproduct/frontend-api.git`,
-/// returns `"frontend-api"`. For a bare name like `"frontend-api"`, returns it as-is.
-fn repo_name_for_mint_clone(origin: &str) -> Result<String> {
-    let trimmed = origin.trim().trim_end_matches('/');
-    let tail = trimmed
-        .rsplit(['/', ':'])
-        .next()
-        .unwrap_or(trimmed);
-    let name = tail.strip_suffix(".git").unwrap_or(tail);
-    if name.is_empty() {
-        return Err(CubeError::InvalidArgument(format!(
-            "could not extract repo name from origin `{origin}` for mint clone"
-        )));
-    }
-    Ok(name.to_string())
 }
 
 fn repo_id_from_origin(origin: &str) -> Result<String> {
@@ -3455,29 +3577,28 @@ mod tests {
         runner.assert_exhausted();
     }
 
-    fn multiproduct_config(enabled: bool) -> crate::config::CubeConfig {
-        multiproduct_config_with_cmd(enabled, "mint")
-    }
-
-    fn multiproduct_config_with_cmd(enabled: bool, cmd: &str) -> crate::config::CubeConfig {
+    fn resolver_config(
+        name: &str,
+        origin_pattern: &str,
+        clone_command: Option<&str>,
+    ) -> crate::config::CubeConfig {
         crate::config::CubeConfig {
-            multiproduct: crate::config::MultiproductConfig {
-                enabled,
-                clone_command: cmd.to_string(),
-                org: "linkedin-multiproduct".to_string(),
-            },
+            repo_resolvers: vec![crate::config::RepoResolver {
+                name: name.to_string(),
+                origin_pattern: origin_pattern.to_string(),
+                clone_command: clone_command.map(str::to_string),
+            }],
         }
     }
 
     #[test]
-    fn repo_ensure_uses_mint_clone_for_multiproduct_url() {
+    fn repo_ensure_by_name_uses_resolver_clone_command() {
         let (tempdir, database_path) = with_database_path();
         let defaults = repo_ensure_defaults(&tempdir);
         let source_path = defaults.repo_root.join("frontend-api");
-        let origin = "org-127256988@github.com:linkedin-multiproduct/frontend-api.git";
 
-        // Use "true" as the clone command — it exists on PATH (/usr/bin/true)
-        // so the which-check succeeds without mint being installed.
+        // "true" stands in for `mint` — it exists on PATH so the which-check
+        // passes. The clone command is the {name}-substituted resolver string.
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
@@ -3494,76 +3615,45 @@ mod tests {
             ),
         ]);
 
-        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "frontend-api"]);
         let result = run_with_context(
             ensure,
             Some(&database_path),
             &runner,
             Some(&defaults),
-            Some(multiproduct_config_with_cmd(true, "true")),
+            Some(resolver_config(
+                "mint",
+                "org-127256988@github.com:linkedin-multiproduct/{name}.git",
+                Some("true clone {name}"),
+            )),
         )
         .expect("ensure");
 
         assert_eq!(result.message, "Ensured repo `frontend-api`.");
         assert_eq!(result.payload["repo_id"], "frontend-api");
+        assert_eq!(
+            result.payload["repo"]["origin"],
+            "org-127256988@github.com:linkedin-multiproduct/frontend-api.git"
+        );
+        assert_eq!(
+            result.payload["repo"]["clone_command"],
+            "true clone frontend-api"
+        );
         runner.assert_exhausted();
     }
 
     #[test]
-    fn repo_ensure_uses_mint_clone_for_bare_name() {
+    fn repo_ensure_by_name_uses_resolver_without_clone_command() {
         let (tempdir, database_path) = with_database_path();
         let defaults = repo_ensure_defaults(&tempdir);
-        let source_path = defaults.repo_root.join("frontend-api");
-
-        // Use "true" as the clone command so the which-check passes without mint installed.
-        let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                defaults.repo_root.clone(),
-                "true",
-                &["clone", "frontend-api"],
-                "",
-            )
-            .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["git", "init", "--colocate"],
-                "",
-            ),
-        ]);
-
-        let ensure =
-            Cli::parse_from(["cube", "repo", "ensure", "--origin", "frontend-api"]);
-        let result = run_with_context(
-            ensure,
-            Some(&database_path),
-            &runner,
-            Some(&defaults),
-            Some(multiproduct_config_with_cmd(true, "true")),
-        )
-        .expect("ensure");
-
-        assert_eq!(result.message, "Ensured repo `frontend-api`.");
-        runner.assert_exhausted();
-    }
-
-    #[test]
-    fn repo_ensure_uses_git_clone_for_non_multiproduct_url_even_when_flag_enabled() {
-        let (tempdir, database_path) = with_database_path();
-        let defaults = repo_ensure_defaults(&tempdir);
-        let source_path = defaults.repo_root.join("myrepo");
-        let origin = "git@github.com:linkedin-sandbox/myrepo.git";
+        let source_path = defaults.repo_root.join("widget");
+        let origin = "git@github.example.com:corp/widget.git";
 
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
-                &[
-                    "git",
-                    "clone",
-                    origin,
-                    &source_path.display().to_string(),
-                ],
+                &["git", "clone", origin, &source_path.display().to_string()],
                 "",
             )
             .creating_dir(source_path.clone()),
@@ -3580,146 +3670,185 @@ mod tests {
             ),
         ]);
 
-        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "widget"]);
         let result = run_with_context(
             ensure,
             Some(&database_path),
             &runner,
             Some(&defaults),
-            Some(multiproduct_config(true)),
+            Some(resolver_config(
+                "corp-github",
+                "git@github.example.com:corp/{name}.git",
+                None,
+            )),
         )
         .expect("ensure");
 
-        assert_eq!(result.message, "Ensured repo `myrepo`.");
+        assert_eq!(result.message, "Ensured repo `widget`.");
+        assert_eq!(result.payload["repo"]["clone_command"], serde_json::Value::Null);
         runner.assert_exhausted();
     }
 
     #[test]
-    fn repo_ensure_uses_git_clone_when_multiproduct_disabled() {
+    fn repo_ensure_by_name_slug_match_is_noop_and_beats_resolver() {
         let (tempdir, database_path) = with_database_path();
         let defaults = repo_ensure_defaults(&tempdir);
-        let source_path = defaults.repo_root.join("frontend-api");
-        let origin = "org-127256988@github.com:linkedin-multiproduct/frontend-api.git";
-
-        let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                defaults.repo_root.clone(),
-                "jj",
-                &[
-                    "git",
-                    "clone",
-                    origin,
-                    &source_path.display().to_string(),
-                ],
-                "",
-            )
-            .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
-            ExpectedCommand::no_such_remote_bookmark(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
-        ]);
-
-        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
-        let result = run_with_context(
-            ensure,
-            Some(&database_path),
-            &runner,
-            Some(&defaults),
-            Some(multiproduct_config(false)),
-        )
-        .expect("ensure");
-
-        assert_eq!(result.message, "Ensured repo `frontend-api`.");
-        runner.assert_exhausted();
-    }
-
-    #[test]
-    fn is_multiproduct_repo_detection() {
-        // URL-based detection
-        assert!(super::is_multiproduct_repo(
-            "org-127@github.com:linkedin-multiproduct/frontend-api.git",
-            "linkedin-multiproduct"
-        ));
-        assert!(super::is_multiproduct_repo(
-            "https://github.com/linkedin-multiproduct/frontend-api",
-            "linkedin-multiproduct"
-        ));
-        // Bare name detection
-        assert!(super::is_multiproduct_repo("frontend-api", "linkedin-multiproduct"));
-        // Non-multiproduct URLs
-        assert!(!super::is_multiproduct_repo(
-            "git@github.com:linkedin-sandbox/myrepo.git",
-            "linkedin-multiproduct"
-        ));
-        assert!(!super::is_multiproduct_repo(
+        // Pre-register `mono` with an on-disk source so materialize is a no-op.
+        std::fs::create_dir_all(defaults.repo_root.join("mono")).expect("source dir");
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
             "git@github.com:spinyfin/mono.git",
-            "linkedin-multiproduct"
-        ));
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+            "--source",
+            &defaults.repo_root.join("mono").display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("add");
+
+        // A resolver is configured, but the slug match (step 1) wins first, so
+        // no clone command runs at all.
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "mono"]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            Some(resolver_config(
+                "mint",
+                "org-1@github.com:linkedin-multiproduct/{name}.git",
+                Some("true clone {name}"),
+            )),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `mono`.");
+        assert_eq!(
+            result.payload["repo"]["origin"],
+            "git@github.com:spinyfin/mono.git"
+        );
     }
 
     #[test]
-    fn repo_name_for_mint_clone_extracts_names() {
-        assert_eq!(
-            super::repo_name_for_mint_clone(
-                "org-127@github.com:linkedin-multiproduct/frontend-api.git"
-            )
-            .unwrap(),
-            "frontend-api"
-        );
-        assert_eq!(
-            super::repo_name_for_mint_clone("frontend-api").unwrap(),
-            "frontend-api"
-        );
-        assert_eq!(
-            super::repo_name_for_mint_clone(
-                "https://github.com/linkedin-multiproduct/frontend-api"
-            )
-            .unwrap(),
-            "frontend-api"
-        );
-    }
-
-    #[test]
-    fn repo_ensure_errors_clearly_when_clone_command_not_on_path() {
+    fn repo_ensure_by_name_github_fallback() {
         let (tempdir, database_path) = with_database_path();
         let defaults = repo_ensure_defaults(&tempdir);
-        let origin = "org-127256988@github.com:linkedin-multiproduct/frontend-api.git";
+        let source_path = defaults.repo_root.join("mono");
+        let origin = "git@github.com:spinyfin/mono.git";
 
-        // Use a binary name that definitely does not exist on PATH.
-        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", origin]);
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &["git", "clone", origin, &source_path.display().to_string()],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
+
+        // No resolvers configured, so the `<org>/<name>` fallback synthesises a
+        // github.com origin and clones it with plain `jj git clone`.
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "spinyfin/mono"]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(crate::config::CubeConfig::default()),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.message, "Ensured repo `mono`.");
+        assert_eq!(result.payload["repo"]["origin"], origin);
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn repo_ensure_by_name_no_match_errors_with_chain() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+
+        // A bare single-segment name with no resolvers and no slug: every step
+        // fails, so the error should narrate all three.
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "bduff"]);
         let err = run_with_context(
             ensure,
             Some(&database_path),
             &FakeRunner::default(),
             Some(&defaults),
-            Some(multiproduct_config_with_cmd(
-                true,
-                "this-binary-does-not-exist-cube-test",
+            Some(crate::config::CubeConfig::default()),
+        )
+        .expect_err("should fail when nothing resolves");
+
+        let msg = err.to_string();
+        assert!(msg.contains("could not resolve repo `bduff`"), "{msg}");
+        assert!(msg.contains("registered slug"), "{msg}");
+        assert!(msg.contains("no `repo-resolvers`"), "{msg}");
+        assert!(msg.contains("GitHub `<org>/<name>`"), "{msg}");
+    }
+
+    #[test]
+    fn repo_ensure_resolver_clone_command_missing_binary_errors() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "frontend-api"]);
+        let err = run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&defaults),
+            Some(resolver_config(
+                "mint",
+                "org-1@github.com:linkedin-multiproduct/{name}.git",
+                Some("this-binary-does-not-exist-cube-test clone {name}"),
             )),
         )
-        .expect_err("should fail when clone command is missing");
+        .expect_err("should fail when clone command binary is missing");
 
         let msg = err.to_string();
         assert!(
             msg.contains("this-binary-does-not-exist-cube-test"),
             "error should name the missing binary: {msg}"
         );
+        assert!(msg.contains("not on PATH"), "error should mention PATH: {msg}");
         assert!(
-            msg.contains("not on PATH"),
-            "error should mention PATH: {msg}"
+            msg.contains("resolver"),
+            "error should reference the resolver config: {msg}"
         );
-        assert!(
-            msg.contains("multiproduct"),
-            "error should reference multiproduct config: {msg}"
+    }
+
+    #[test]
+    fn parse_org_name_shape_accepts_two_segments() {
+        assert_eq!(
+            super::parse_org_name_shape("spinyfin/mono"),
+            Some(("spinyfin".to_string(), "mono".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_org_name_shape_rejects_non_slug_shapes() {
+        assert_eq!(super::parse_org_name_shape("bduff"), None);
+        assert_eq!(super::parse_org_name_shape("a/b/c"), None);
+        assert_eq!(super::parse_org_name_shape("git@github.com:o/r.git"), None);
+        assert_eq!(super::parse_org_name_shape("https://github.com/o/r"), None);
+        assert_eq!(super::parse_org_name_shape("/mono"), None);
     }
 
     // --- parse_origin / origin_urls_equivalent unit tests ---

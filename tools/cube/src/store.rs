@@ -105,14 +105,16 @@ impl Store {
                     main_branch,
                     workspace_root,
                     workspace_prefix,
-                    source_path
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    source_path,
+                    clone_command
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ON CONFLICT(repo) DO UPDATE SET
                     origin = excluded.origin,
                     main_branch = excluded.main_branch,
                     workspace_root = excluded.workspace_root,
                     workspace_prefix = excluded.workspace_prefix,
-                    source_path = excluded.source_path
+                    source_path = excluded.source_path,
+                    clone_command = excluded.clone_command
                 "#,
                 params![
                     config.repo,
@@ -121,6 +123,7 @@ impl Store {
                     config.workspace_root.display().to_string(),
                     config.workspace_prefix,
                     config.source.as_ref().map(|path| path_to_string(path)),
+                    config.clone_command,
                 ],
             )
             .map_err(CubeError::Storage)?;
@@ -133,7 +136,7 @@ impl Store {
         self.connection
             .query_row(
                 r#"
-                SELECT repo, origin, main_branch, workspace_root, workspace_prefix, source_path
+                SELECT repo, origin, main_branch, workspace_root, workspace_prefix, source_path, clone_command
                 FROM repos
                 WHERE repo = ?1
                 "#,
@@ -148,7 +151,7 @@ impl Store {
         self.connection
             .query_row(
                 r#"
-                SELECT repo, origin, main_branch, workspace_root, workspace_prefix, source_path
+                SELECT repo, origin, main_branch, workspace_root, workspace_prefix, source_path, clone_command
                 FROM repos
                 WHERE origin = ?1
                 ORDER BY repo
@@ -166,7 +169,7 @@ impl Store {
             .connection
             .prepare(
                 r#"
-                SELECT repo, origin, main_branch, workspace_root, workspace_prefix, source_path
+                SELECT repo, origin, main_branch, workspace_root, workspace_prefix, source_path, clone_command
                 FROM repos
                 ORDER BY repo
                 "#,
@@ -1002,7 +1005,8 @@ impl Store {
                     main_branch TEXT NOT NULL,
                     workspace_root TEXT NOT NULL,
                     workspace_prefix TEXT NOT NULL,
-                    source_path TEXT
+                    source_path TEXT,
+                    clone_command TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS repos_origin_idx
@@ -1079,6 +1083,10 @@ impl Store {
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN health_status TEXT",
         )?;
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE repos ADD COLUMN clone_command TEXT",
+        )?;
 
         Ok(())
     }
@@ -1129,6 +1137,7 @@ fn row_to_repo_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoRecord> {
         workspace_root: row.get::<_, String>(3)?.into(),
         workspace_prefix: row.get(4)?,
         source: row.get::<_, Option<String>>(5)?.map(Into::into),
+        clone_command: row.get(6)?,
     })
 }
 
@@ -1198,6 +1207,7 @@ mod tests {
             workspace_root: "/tmp/workspaces".into(),
             workspace_prefix: "mono-agent-".to_string(),
             source: None,
+            clone_command: None,
         };
         store.upsert_repo(&config).expect("repo");
 
@@ -1216,6 +1226,7 @@ mod tests {
             workspace_root: workspace_root.clone(),
             workspace_prefix: "mono-agent-".to_string(),
             source: None,
+            clone_command: None,
         };
         store.upsert_repo(&config).expect("repo");
 
@@ -1263,6 +1274,7 @@ mod tests {
                     workspace_root: workspace_root.clone(),
                     workspace_prefix: format!("{repo}-agent-"),
                     source: None,
+                    clone_command: None,
                 })
                 .expect("repo");
             store
@@ -1377,6 +1389,7 @@ mod tests {
                 workspace_root: workspace_root.clone(),
                 workspace_prefix: "mono-agent-".to_string(),
                 source: None,
+                clone_command: None,
             })
             .expect("repo");
         store
@@ -1457,6 +1470,7 @@ mod tests {
                 workspace_root: workspace_root.clone(),
                 workspace_prefix: "mono-agent-".to_string(),
                 source: None,
+                clone_command: None,
             })
             .expect("repo");
         store
@@ -1492,6 +1506,7 @@ mod tests {
             workspace_root,
             workspace_prefix: "mono-agent-".to_string(),
             source: None,
+            clone_command: None,
         };
         store.upsert_repo(&config).expect("repo");
 

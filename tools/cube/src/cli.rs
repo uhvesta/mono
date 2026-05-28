@@ -39,11 +39,19 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum RepoCommand {
-    /// Resolve or materialize a repo pool from its origin URL.
+    /// Resolve or materialize a repo pool from a name or origin URL.
+    ///
+    /// Pass a bare `<reponame>` to resolve it through the chain:
+    /// registered slug → configured `repo-resolvers` → GitHub
+    /// `<org>/<name>` fallback. Or pass `--origin <git-url>` to skip
+    /// resolution and use the URL directly.
     Ensure {
-        /// Origin URL for the repo.
-        #[arg(long)]
-        origin: String,
+        /// Repo name to resolve via the resolver chain.
+        #[arg(conflicts_with = "origin", required_unless_present = "origin")]
+        reponame: Option<String>,
+        /// Origin URL for the repo (bypasses name resolution).
+        #[arg(long, conflicts_with = "reponame")]
+        origin: Option<String>,
     },
     /// Add or update repo pool configuration.
     Add {
@@ -358,12 +366,39 @@ mod tests {
 
         match cli.command {
             Command::Repo {
-                command: RepoCommand::Ensure { origin },
+                command: RepoCommand::Ensure { reponame, origin },
             } => {
-                assert_eq!(origin, "git@github.com:spinyfin/mono.git");
+                assert!(reponame.is_none());
+                assert_eq!(origin.as_deref(), Some("git@github.com:spinyfin/mono.git"));
             }
             _ => panic!("expected repo ensure command"),
         }
+    }
+
+    #[test]
+    fn repo_ensure_accepts_positional_reponame() {
+        let cli = Cli::parse_from(["cube", "repo", "ensure", "bduff"]);
+
+        match cli.command {
+            Command::Repo {
+                command: RepoCommand::Ensure { reponame, origin },
+            } => {
+                assert_eq!(reponame.as_deref(), Some("bduff"));
+                assert!(origin.is_none());
+            }
+            _ => panic!("expected repo ensure command"),
+        }
+    }
+
+    #[test]
+    fn repo_ensure_rejects_both_or_neither() {
+        let both = Cli::try_parse_from([
+            "cube", "repo", "ensure", "bduff", "--origin", "git@github.com:o/r.git",
+        ]);
+        assert!(both.is_err());
+
+        let neither = Cli::try_parse_from(["cube", "repo", "ensure"]);
+        assert!(neither.is_err());
     }
 
     #[test]

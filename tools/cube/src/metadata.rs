@@ -10,6 +10,10 @@ pub struct RepoRecord {
     pub workspace_root: PathBuf,
     pub workspace_prefix: String,
     pub source: Option<PathBuf>,
+    /// Resolver-supplied clone command (with `{name}` already substituted),
+    /// used in place of `jj git clone` when materializing this repo's source.
+    /// `None` means cube clones the origin with plain `jj git clone`.
+    pub clone_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
