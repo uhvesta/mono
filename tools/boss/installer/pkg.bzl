@@ -176,7 +176,9 @@ def _build_info_rs_impl(ctx):
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
         "[ -z \"$BUILD_TIME\" ] && BUILD_TIME=unknown\n" +
         "printf 'pub const BOSS_VERSION: &str = \"%s\";\\n" +
+        "#[allow(dead_code)]\\n" +
         "pub const BOSS_GIT_SHA: &str = \"%s\";\\n" +
+        "#[allow(dead_code)]\\n" +
         "pub const BOSS_BUILD_TIME: &str = \"%s\";\\n' " +
         "\"$VERSION\" \"$SHA\" \"$BUILD_TIME\" > " + output.path + "\n"
     )
