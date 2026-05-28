@@ -45,6 +45,17 @@ final class ChatViewModel: ObservableObject {
     @Published var productLevelRevisionsByProductID: [String: [WorkTask]] = [:] {
         didSet { invalidateWorkCache() }
     }
+    /// Product-level work items (`project_id IS NULL`) that are neither
+    /// chores nor revisions — `kind == "investigation"` today, and any
+    /// future product-level kind the engine emits. The work-tree handler
+    /// used to drop every non-revision product-level row on the floor,
+    /// so an investigation with no project was invisible on the board even
+    /// while a live worker produced against it (issue #886). Routing the
+    /// catch-all here makes the omission impossible by construction: a new
+    /// kind lands in a real bucket and renders instead of vanishing.
+    @Published var productLevelTasksByProductID: [String: [WorkTask]] = [:] {
+        didSet { invalidateWorkCache() }
+    }
     @Published var taskRuntimesByID: [String: WorkTaskRuntime] = [:]
     /// Dependency edges keyed by product. Refreshed whenever the engine
     /// pushes a fresh `WorkTree` for that product. The kanban joins
@@ -508,6 +519,14 @@ final class ChatViewModel: ObservableObject {
         for project in projectsForSelectedProduct {
             guard projectFilter.isEmpty || projectFilter.contains(project.id) else { continue }
             items.append(contentsOf: (tasksByProjectID[project.id] ?? []).sorted(by: taskSort))
+        }
+        // Product-level work items (investigations, etc.) have no project, so a
+        // project filter legitimately excludes them; otherwise they always
+        // render. They are first-class work — not gated by the chores toggle,
+        // which would otherwise hide an investigation a live worker is
+        // producing against (issue #886).
+        if projectFilter.isEmpty {
+            items.append(contentsOf: (productLevelTasksByProductID[productID] ?? []).sorted(by: taskSort))
         }
         if includeChores && projectFilter.isEmpty {
             items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
@@ -1556,13 +1575,21 @@ final class ChatViewModel: ObservableObject {
                 existingTasks.first?.productID != product.id
             }
             var productLevelRevisions: [WorkTask] = []
+            var productLevelTasks: [WorkTask] = []
             for task in tasks {
                 guard let projectID = task.projectID else {
-                    // A chore-parented revision inherits no project_id; keep it
-                    // in the product-level revision bucket rather than dropping
-                    // it, so it stays reachable in the kanban (issue #789).
+                    // Product-level rows (`project_id IS NULL`) have no project
+                    // lane to live under. Route every one of them into a bucket
+                    // rather than dropping the ones we don't special-case — a
+                    // chore-parented revision rolls up under its parent (issue
+                    // #789), and everything else (investigations, any future
+                    // product-level kind) renders as a first-class card (issue
+                    // #886). The `else` is a catch-all on purpose: nothing the
+                    // engine sends should silently disappear here.
                     if task.kind == "revision" {
                         productLevelRevisions.append(task)
+                    } else {
+                        productLevelTasks.append(task)
                     }
                     continue
                 }
@@ -1574,6 +1601,7 @@ final class ChatViewModel: ObservableObject {
             }
             choresByProductID[product.id] = chores.sorted(by: taskSort)
             productLevelRevisionsByProductID[product.id] = productLevelRevisions.sorted(by: taskSort)
+            productLevelTasksByProductID[product.id] = productLevelTasks.sorted(by: taskSort)
             mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
             dependenciesByProductID[product.id] = dependencies
             seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
@@ -1885,6 +1913,14 @@ final class ChatViewModel: ObservableObject {
                 return revision
             }
         }
+        // Product-level investigations (and any other product-level kind) live
+        // here; search it so card selection and detail lookups resolve them
+        // (issue #886).
+        for tasks in productLevelTasksByProductID.values {
+            if let task = tasks.first(where: { $0.id == id }) {
+                return task
+            }
+        }
         return nil
     }
 
@@ -2031,6 +2067,7 @@ final class ChatViewModel: ObservableObject {
             taskRows.append(contentsOf: tasksByProjectID[project.id] ?? [])
         }
         taskRows.append(contentsOf: choresByProductID[productID] ?? [])
+        taskRows.append(contentsOf: productLevelTasksByProductID[productID] ?? [])
         let byRecency = taskRows.sorted { lhs, rhs in
             lhs.updatedAt > rhs.updatedAt
         }

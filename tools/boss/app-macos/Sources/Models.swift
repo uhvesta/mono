@@ -526,6 +526,25 @@ struct WorkTask: Identifiable, Hashable {
         kind == "chore"
     }
 
+    /// Human-readable label for the work item's kind, shown in the card
+    /// detail popover. Falls back to a title-cased rendering of the raw
+    /// kind string so a kind the app doesn't explicitly know about still
+    /// reads sensibly instead of being mislabeled "Task" (issue #886).
+    var kindLabel: String {
+        switch kind {
+        case "chore": return "Chore"
+        case "investigation": return "Investigation"
+        case "revision": return "Revision"
+        case "design": return "Design"
+        case "project_task", "task": return "Task"
+        default:
+            return kind
+                .split(separator: "_")
+                .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+                .joined(separator: " ")
+        }
+    }
+
     /// GitHub web URL for the investigation doc, derived at render time
     /// from the stored `(repo, branch, path)` pointer. Returns `nil`
     /// when the pointer is not yet set or the repo URL can't be parsed.

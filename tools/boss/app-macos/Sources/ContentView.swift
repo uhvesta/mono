@@ -2209,7 +2209,7 @@ private struct WorkCardPopoverView: View {
                                 .accessibilityLabel("T\(id)")
                         }
                     }
-                    Text(task.isChore ? "Chore" : "Task")
+                    Text(task.kindLabel)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
