@@ -1,2 +1,27 @@
 [[checks]]
 id = "docs-link-integrity"
+
+[[checks]]
+id = "file-size"
+
+[checks.config]
+max_lines = 3000
+exclude_globs = [
+  # Lockfiles and generated files — never check these for size
+  "Cargo.lock",
+  "**/package-lock.json",
+  "**/go.sum",
+  "**/*.pb.rs",
+  # Grandfathered oversized files — TODO: split each below 3000
+  "tools/boss/engine/src/app.rs",
+  "tools/boss/engine/src/completion.rs",
+  "tools/boss/engine/src/coordinator.rs",
+  "tools/boss/engine/src/merge_poller.rs",
+  "tools/boss/engine/src/runner.rs",
+  "tools/boss/cli/src/main.rs",
+  "tools/cube/src/app.rs",
+]
+
+[checks.policy]
+severity = "error"
+allow_bypass = true
