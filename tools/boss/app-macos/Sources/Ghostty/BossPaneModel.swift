@@ -299,7 +299,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     ### Rules (top-to-bottom, first match wins)
 
     1. **Design-kind or investigation-kind row → `large`** (confidence high). Reason: "design or investigation kind."
-    2. **Title or description matches investigate-family marker → `large`** (confidence high). Markers: `investigate`, `audit`, `instrument`, `diagnose`, `end-to-end`, `root cause`, `architect`, `redesign`, `migrate`, `rearchitect`.
+    2. **Title or description matches investigate-family marker → `large`** (confidence high). Markers: `investigate`, `audit`, `instrument`, `diagnose`, `end-to-end`, `root cause`, `architect`, `redesign`, `migrate`, `rearchitect`. **Size only, not kind** — these markers bump effort to `large` but must not bias the kind decision. An investigate-shaped prompt may still be an investigation task (see "Investigation tasks" section); do not let this rule push you toward a plain chore when the user wants a writeup.
     3. **Description ≥ 4 KB → `large`** (confidence medium). Reason: "description size N KB."
     4. **Title or description has multi-file/multi-subsystem hint → `medium`** (confidence medium). Hints: `+` between subsystems, "across", "spans", multiple module names (`engine`, `cli`, `protocol`, `app-macos`, `cube`, `bossctl`).
     5. **Title matches mechanical-edit marker → `trivial`** (confidence high). Markers: `rename`, `apply`, `revert`, `bump`, `move`, `delete`, `remove`, `hide`, `show`, `pad`, `align`, `re-export`, `gap`, `cursor`, `badge`, `tooltip`.
@@ -428,6 +428,32 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     Every project has exactly one `kind=design` task. Reach for it; don't create new ones.
 
     \(directDeveloperMode ? bossFilingGuidanceDirect : bossFilingGuidanceStandard)
+
+    ## Investigation tasks
+
+    An **investigation** task's deliverable is a markdown **writeup** (a doc PR), NOT code. Use it when the user wants understanding or a durable record — not a fix.
+
+    **Create with:**
+
+    ```
+    boss task create-investigation --product <p> [--project <proj>] --name "…" --description "…"
+    ```
+
+    The worker writes the doc, opens a PR, and registers the pointer with:
+
+    ```
+    boss task set-investigation-doc --task <id> --path <path> --branch <branch>
+    ```
+
+    The Review-column card then shows a doc affordance.
+
+    **When to reach for it (deliverable-based):**
+
+    - User wants understanding / a durable writeup, no code change expected → **investigation task**.
+    - User wants the problem fixed → **normal chore** (investigate-and-fix is within standard chore scope).
+    - Genuinely ambiguous whether they want a writeup or a fix → **ask first**: "investigation task (writeup) or investigate-and-fix chore?" Do not silently default to a chore.
+
+    **Effort cross-reference:** Investigation tasks are `large` by rule 1. The investigate-family markers in rule 2 bump *size* only — they must not steer the kind decision. Size and kind are independent.
 
     ## Revision tasks
 
