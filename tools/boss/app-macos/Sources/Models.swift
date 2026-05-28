@@ -23,6 +23,9 @@ struct WorkProduct: Identifiable, Hashable {
     /// Kind-specific tracker config as raw JSON string. `nil` when no
     /// tracker is bound. Mirrors `Product.external_tracker_config`.
     var externalTrackerConfig: String? = nil
+    /// Optional leading prefix for worker branch names. `nil` → engine
+    /// default `"boss/"`. Mirrors `Product.worker_branch_prefix`.
+    var workerBranchPrefix: String? = nil
 }
 
 /// Swift mirror of `boss_protocol::WorkItemExternalRef`. Stable upstream

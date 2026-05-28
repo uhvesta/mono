@@ -1194,7 +1194,8 @@ final class EngineClient: @unchecked Sendable {
             createdAt: createdAt,
             updatedAt: updatedAt,
             externalTrackerKind: payload["external_tracker_kind"] as? String,
-            externalTrackerConfig: externalTrackerConfigString
+            externalTrackerConfig: externalTrackerConfigString,
+            workerBranchPrefix: payload["worker_branch_prefix"] as? String
         )
     }
 

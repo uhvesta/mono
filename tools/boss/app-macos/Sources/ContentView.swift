@@ -233,7 +233,7 @@ struct ContentView: View {
             WorkEditSheet(
                 request: request,
                 onCancel: { model.dismissWorkEditRequest() },
-                onSave: { name, description, status, repoRemoteURL, goal, priority, prURL in
+                onSave: { name, description, status, repoRemoteURL, goal, priority, prURL, workerBranchPrefix in
                     model.submitWorkEditRequest(
                         request,
                         name: name,
@@ -242,7 +242,8 @@ struct ContentView: View {
                         repoRemoteURL: repoRemoteURL,
                         goal: goal,
                         priority: priority,
-                        prURL: prURL
+                        prURL: prURL,
+                        workerBranchPrefix: workerBranchPrefix
                     )
                 },
                 onSetTracker: { kind, org, repo, projectNumber, reverseClose in
@@ -2997,7 +2998,7 @@ private struct WorkCreateSheet: View {
 private struct WorkEditSheet: View {
     let request: WorkEditRequest
     let onCancel: () -> Void
-    let onSave: (String, String, String, String, String, String, String) -> Void
+    let onSave: (String, String, String, String, String, String, String, String) -> Void
     let onSetTracker: ((String, String, String, Int, Bool) -> Void)?
     let onUnsetTracker: (() -> Void)?
 
@@ -3008,6 +3009,7 @@ private struct WorkEditSheet: View {
     @State private var goal: String
     @State private var priority: String
     @State private var prURL: String
+    @State private var workerBranchPrefix: String
 
     // External tracker state (product only)
     @State private var trackerKind: String
@@ -3021,7 +3023,7 @@ private struct WorkEditSheet: View {
     init(
         request: WorkEditRequest,
         onCancel: @escaping () -> Void,
-        onSave: @escaping (String, String, String, String, String, String, String) -> Void,
+        onSave: @escaping (String, String, String, String, String, String, String, String) -> Void,
         onSetTracker: ((String, String, String, Int, Bool) -> Void)? = nil,
         onUnsetTracker: (() -> Void)? = nil
     ) {
@@ -3040,6 +3042,7 @@ private struct WorkEditSheet: View {
             _goal = State(initialValue: "")
             _priority = State(initialValue: "")
             _prURL = State(initialValue: "")
+            _workerBranchPrefix = State(initialValue: product.workerBranchPrefix ?? "")
 
             if let kind = product.externalTrackerKind,
                let configJSON = product.externalTrackerConfig,
@@ -3075,6 +3078,7 @@ private struct WorkEditSheet: View {
             _goal = State(initialValue: project.goal)
             _priority = State(initialValue: project.priority)
             _prURL = State(initialValue: "")
+            _workerBranchPrefix = State(initialValue: "")
             _trackerKind = State(initialValue: "github")
             _trackerOrg = State(initialValue: "")
             _trackerRepo = State(initialValue: "")
@@ -3089,6 +3093,7 @@ private struct WorkEditSheet: View {
             _goal = State(initialValue: "")
             _priority = State(initialValue: task.priority)
             _prURL = State(initialValue: task.prURL ?? "")
+            _workerBranchPrefix = State(initialValue: "")
             _trackerKind = State(initialValue: "github")
             _trackerOrg = State(initialValue: "")
             _trackerRepo = State(initialValue: "")
@@ -3114,6 +3119,13 @@ private struct WorkEditSheet: View {
                     }
                 }
                 TextField("Remote URL", text: $repoRemoteURL)
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("Worker branch prefix (e.g. bduff/)", text: $workerBranchPrefix)
+                    Text("Optional. Workers push to <prefix>exec_<id>. Leave blank to use the default prefix boss/. Trailing / is conventional.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 Divider()
                     .padding(.vertical, 2)
@@ -3158,7 +3170,7 @@ private struct WorkEditSheet: View {
                 Spacer()
                 Button("Cancel", action: onCancel)
                 Button("Save") {
-                    onSave(name, description, status, repoRemoteURL, goal, priority, prURL)
+                    onSave(name, description, status, repoRemoteURL, goal, priority, prURL, workerBranchPrefix)
                     if case .product = request.item, trackerFormValid,
                        let num = Int(trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)) {
                         onSetTracker?(trackerKind, trackerOrg, trackerRepo, num, trackerReverseClose)
