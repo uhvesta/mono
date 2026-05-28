@@ -1,0 +1,506 @@
+use super::*;
+
+/// Return the id of the most-recently-created non-done revision that is a
+/// descendant of `root_id`, or `None` when the chain has no prior active
+/// revision.
+///
+/// This is used by [`assert_parent_revisable_and_insert`] to find the
+/// "tail" of the revision chain so the new revision can be automatically
+/// gated on it, serialising back-to-back revisions targeting the same PR.
+///
+/// "Active" = status is not `'done'` (includes `todo`, `blocked`,
+/// `in_progress`, `in_review`).  A done revision is already finished and
+/// cannot race with the new one, so it does not need to gate it.
+///
+/// The recursive CTE walks `parent_task_id` links one level at a time,
+/// starting from direct children of `root_id`.  Depth is capped at 64 by
+/// the CTE's `UNION ALL` termination condition (no infinite loop in
+/// well-formed data; the engine never creates cycles).
+pub(crate) fn find_latest_active_revision_in_chain(
+    conn: &Connection,
+    root_id: &str,
+) -> Result<Option<String>> {
+    let id: Option<String> = conn
+        .query_row(
+            "WITH RECURSIVE chain(id) AS (
+                SELECT id
+                FROM tasks
+                WHERE parent_task_id = ?1
+                  AND kind = 'revision'
+                  AND deleted_at IS NULL
+              UNION ALL
+                SELECT t.id
+                FROM tasks t
+                JOIN chain c ON t.parent_task_id = c.id
+                WHERE t.kind = 'revision'
+                  AND t.deleted_at IS NULL
+            )
+            SELECT c.id
+            FROM chain c
+            JOIN tasks t ON t.id = c.id
+            WHERE t.status != 'done'
+            ORDER BY c.id DESC
+            LIMIT 1",
+            params![root_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// Run the create-time gate and, on success, insert a `kind = 'revision'`
+/// task row atomically. This is the single point of truth for the invariant
+/// "kind = revision ⇒ parent_task_id IS NOT NULL AND chain root has an open PR".
+///
+/// Gate order (per revision-tasks.md §Q4):
+/// 1. Resolve `input.parent_task_id` to a real task; walk to chain root.
+/// 2. If chain root has no `pr_url` → [`RevisionGateError::NoPr`].
+/// 3. If chain root `status == "done"` → [`RevisionGateError::Merged`] (PR merged = task done).
+/// 4. Otherwise call `pr_checker.check(pr_url)` for the live state:
+///    `Merged` → merged error; `ClosedUnmerged` → closed error; `Open` → insert.
+pub(crate) fn assert_parent_revisable_and_insert(
+    conn: &Connection,
+    input: CreateRevisionInput,
+    pr_checker: &dyn PrStateChecker,
+) -> Result<Task> {
+    // ── 1. Resolve parent and chain root ────────────────────────────────────
+    let parent_id = resolve_task_id_from_selector(conn, &input.parent_task_id)?;
+    let root_id = chain_root(conn, &parent_id)?;
+    let root =
+        query_task(conn, &root_id)?.with_context(|| format!("chain root {root_id} not found"))?;
+
+    // ── 2. No PR → reject ───────────────────────────────────────────────────
+    let pr_url = match &root.pr_url {
+        None => return Err(anyhow::Error::new(RevisionGateError::no_pr(&root))),
+        Some(url) => url.clone(),
+    };
+
+    // ── 3. Cached: task done → PR merged ────────────────────────────────────
+    if root.status == "done" {
+        return Err(anyhow::Error::new(RevisionGateError::merged(
+            &root, &pr_url,
+        )));
+    }
+
+    // ── 4. Live probe for Open vs ClosedUnmerged ────────────────────────────
+    match pr_checker.check(&pr_url)? {
+        PrOpenState::Merged => {
+            return Err(anyhow::Error::new(RevisionGateError::merged(
+                &root, &pr_url,
+            )));
+        }
+        PrOpenState::ClosedUnmerged => {
+            return Err(anyhow::Error::new(RevisionGateError::closed(
+                &root, &pr_url,
+            )));
+        }
+        PrOpenState::Open => {}
+    }
+
+    // ── 5. Find chain tail for auto-sequencing ──────────────────────────────
+    // Snapshot the latest non-done revision for this chain root *before*
+    // inserting the new one.  The new revision will be gated on this tail
+    // so that back-to-back revisions targeting the same PR always execute
+    // one-after-another rather than racing as concurrent workers.
+    let chain_tail_id = find_latest_active_revision_in_chain(conn, &root_id)?;
+
+    // ── 6. Insert revision ──────────────────────────────────────────────────
+    let now = now_string();
+    let new_revision = insert_revision_in_tx(conn, input, &parent_id, &root)?;
+
+    // ── 7. Auto-gate: block new revision on chain tail ───────────────────────
+    // When a prior unfinished revision exists, the new one must wait for it
+    // before the dispatcher can run it.  This prevents two workers from
+    // committing to the same PR branch simultaneously.
+    if let Some(tail_id) = chain_tail_id {
+        deps::insert_edge(conn, &new_revision.id, &tail_id, RELATION_BLOCKS, &now)?;
+        maybe_engine_block_dependent(conn, &new_revision.id, &now)?;
+        // Re-read the row so the caller sees the updated status.
+        return query_task(conn, &new_revision.id)?
+            .with_context(|| format!("missing revision after auto-block: {}", new_revision.id));
+    }
+
+    Ok(new_revision)
+}
+
+/// Resolve a caller-supplied task selector (full `task_<hex>` id, `T<n>`
+/// short id, or bare primary id) to the primary `tasks.id`. For now only
+/// full ids are supported; short-id resolution requires the product scope
+/// which the engine RPC can carry. Extended when needed.
+pub(crate) fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -> Result<String> {
+    let trimmed = selector.trim();
+    // Full typed id
+    if trimmed.starts_with("task_") {
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL)",
+            [trimmed],
+            |r| r.get::<_, i64>(0),
+        )?;
+        if exists == 0 {
+            bail!("unknown task: {trimmed}");
+        }
+        return Ok(trimmed.to_owned());
+    }
+    bail!(
+        "unsupported selector {trimmed:?}; pass the full task id (task_<hex>). \
+         Short-id (T<n>) resolution is done by the CLI before sending the RPC."
+    )
+}
+
+// ── Revision projection helpers ─────────────────────────────────────────────
+
+/// Derive `revision_seq` and `revision_parent_pr_url` for every revision task
+/// in `tasks` and return the annotated list.
+///
+/// Algorithm:
+/// 1. Build a lookup of all task IDs → (kind, parent_task_id, pr_url) from
+///    both `tasks` and `chores` (the chain root can be a chore).
+/// 2. For each revision, walk `parent_task_id` links until a non-revision
+///    ancestor is reached — that is the chain root.
+/// 3. Group revisions by chain-root ID; sort each group by `created_at ASC`
+///    (creation order = R<n> order).
+/// 4. Assign 1-based sequence numbers within each group and set
+///    `revision_parent_pr_url` from the chain root's `pr_url`.
+///
+/// Capped at a chain depth of 20 to protect against cycles in corrupt data.
+pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task]) -> Vec<Task> {
+    // Compact lookup: id → (kind, parent_task_id, pr_url)
+    type Entry = (String, Option<String>, Option<String>);
+    let mut lookup: std::collections::HashMap<String, Entry> = std::collections::HashMap::new();
+    for t in tasks.iter().chain(chores.iter()) {
+        lookup.insert(
+            t.id.clone(),
+            (t.kind.clone(), t.parent_task_id.clone(), t.pr_url.clone()),
+        );
+    }
+
+    /// Walk parent_task_id links to the first non-revision ancestor.
+    /// Returns `(root_id, root_pr_url)` or `None` when the chain is broken.
+    fn chain_root(
+        start: &str,
+        lookup: &std::collections::HashMap<String, (String, Option<String>, Option<String>)>,
+    ) -> Option<(String, Option<String>)> {
+        let mut cur = start.to_owned();
+        for _ in 0..20 {
+            let (kind, parent_id, pr_url) = lookup.get(&cur)?;
+            if kind != "revision" {
+                return Some((cur, pr_url.clone()));
+            }
+            cur = parent_id.clone()?;
+        }
+        None // cycle or unexpectedly deep chain
+    }
+
+    // Find chain root for every revision, then group and sequence.
+    // We work with indices into `tasks` so we can mutate them afterwards.
+    let mut root_info: Vec<Option<(String, Option<String>)>> = tasks
+        .iter()
+        .map(|t| {
+            if t.kind == "revision" {
+                chain_root(&t.id, &lookup)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Group revision indices by root_id, sorted by created_at.
+    // Key: root_id → Vec<(created_at, index)> sorted by created_at.
+    let mut by_root: std::collections::HashMap<String, Vec<(String, usize)>> =
+        std::collections::HashMap::new();
+    for (idx, t) in tasks.iter().enumerate() {
+        if t.kind == "revision" {
+            if let Some((root_id, _)) = &root_info[idx] {
+                by_root
+                    .entry(root_id.clone())
+                    .or_default()
+                    .push((t.created_at.clone(), idx));
+            }
+        }
+    }
+    for entries in by_root.values_mut() {
+        entries.sort_by(|a, b| a.0.cmp(&b.0)); // stable sort by created_at
+    }
+
+    // Build seq map: task index → 1-based sequence number.
+    let mut seq_map: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
+    for entries in by_root.values() {
+        for (seq_0, (_, idx)) in entries.iter().enumerate() {
+            seq_map.insert(*idx, (seq_0 + 1) as i64);
+        }
+    }
+
+    // Apply projections to the task list.
+    for (idx, task) in tasks.iter_mut().enumerate() {
+        if task.kind != "revision" {
+            continue;
+        }
+        if let Some((_, pr_url)) = root_info[idx].take() {
+            task.revision_parent_pr_url = pr_url;
+        }
+        if let Some(seq) = seq_map.get(&idx) {
+            task.revision_seq = Some(*seq);
+        }
+    }
+
+    tasks
+}
+
+// ── revision name helpers ────────────────────────────────────────────────────
+
+/// Extract a short display name from a revision description.
+///
+/// Returns the first non-empty, non-blank line of `description`, trimmed.
+/// If that first line exceeds 120 characters it is hard-truncated at the
+/// nearest word boundary below 120 and an ellipsis is appended. The full
+/// description is stored separately in `tasks.description`; the `name`
+/// column is just the compact card title.
+pub(crate) fn revision_name_from_description(description: &str) -> String {
+    for line in description.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return if trimmed.len() <= 120 {
+            trimmed.to_owned()
+        } else {
+            let cutoff = &trimmed[..120];
+            match cutoff.rfind(' ') {
+                Some(pos) => format!("{}…", &cutoff[..pos]),
+                None => format!("{cutoff}…"),
+            }
+        };
+    }
+    // Fallback: should not reach here — insert_revision_in_tx enforces non-empty.
+    description.trim().to_owned()
+}
+
+/// Insert a `kind = 'revision'` task row. Called only after the gate passes.
+///
+/// `parent_id` is the immediate parent (may itself be a revision).
+/// `root` is the chain root task (non-revision ancestor that owns the PR).
+pub(crate) fn insert_revision_in_tx(
+    conn: &Connection,
+    input: CreateRevisionInput,
+    parent_id: &str,
+    root: &Task,
+) -> Result<Task> {
+    let id = next_id("task");
+    let now = now_string();
+    let description = input.description.trim().to_owned();
+    if description.is_empty() {
+        bail!("revision description must be non-empty");
+    }
+    let priority = normalize_priority(input.priority.as_deref())?;
+    let effort_level = input
+        .effort_level
+        .map(|l| l.as_str().to_owned())
+        .or_else(|| Some("small".to_owned())); // revision-tasks.md §Q7: default small
+    let model_override = normalize_model_override(input.model_override);
+    let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "revision");
+    // Inherit product, project, and repo from the chain root. A revision
+    // by definition lands a follow-up commit on the chain root's PR, which
+    // lives in exactly one repo — the root's — so the revision must target
+    // the same repo.
+    //
+    // Copying `root.repo_remote_url` verbatim preserves the per-task repo
+    // override invariant (see `enforce_task_repo_invariant`): the root row
+    // carries a non-NULL `repo_remote_url` only for multi-repo products
+    // whose `product.repo_remote_url` is NULL, so the revision mirrors the
+    // same shape. When the product owns the repo, the root's column is NULL
+    // and the revision stays NULL too — `resolve_repo_for_work_item` then
+    // falls back to the product for both rows.
+    //
+    // Without this copy, a revision under a multi-repo product had a NULL
+    // repo on both the revision row and the (repo-less) product, so
+    // `resolve_repo_for_work_item` returned None and the autostarted
+    // execution died pre-start with no workspace (issue #840).
+    let product_id = &root.product_id;
+    let project_id = root.project_id.as_deref();
+    let repo_remote_url = root.repo_remote_url.as_deref();
+    let short_id = allocate_short_id(conn, product_id)?;
+    // `name` is the compact one-line card title. When the coordinator supplies
+    // `input.name`, use it verbatim (after trimming); otherwise fall back to
+    // deriving the name from the first non-empty line of `description`.
+    let name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| revision_name_from_description(&description));
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
+         pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
+         effort_level, model_override, short_id, parent_task_id, repo_remote_url) \
+         VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, 1, ?7, ?8, \
+         ?9, ?10, ?11, ?12, ?13)",
+        params![
+            id,
+            product_id,
+            project_id,
+            name,
+            description,
+            now,
+            priority,
+            created_via,
+            effort_level,
+            model_override,
+            short_id,
+            parent_id,
+            repo_remote_url,
+        ],
+    )?;
+    // `query_task` reads the trailing `parent_task_id` column (via
+    // `map_task_with_parent`), so the returned revision row already carries
+    // its parent linkage — callers (`create-revision --json`) can verify it
+    // without a second lookup.
+    query_task(conn, &id)?.with_context(|| format!("missing revision after insert: {id}"))
+}
+
+/// Trim and reduce an empty model slug to `None`. The CLI uses
+/// `--model ""` to clear a stored override on update verbs; the
+/// engine treats the same shape consistently on create so callers
+/// don't have to special-case empty strings. Non-empty strings pass
+/// through verbatim — claude is the source of truth on slug
+/// resolution (design §Q3).
+pub(crate) fn normalize_model_override(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
+/// Insert a `kind = 'design'` task as the first row under
+/// `project_id`. Used by `create_project` and the migration that
+/// backfills design tasks for projects predating this column. The
+/// design task always has `ordinal = 0` so it sorts ahead of every
+/// `project_task` (which start at `ordinal = 1`) and the dispatcher
+/// picks it up first via the existing first-incomplete chain.
+///
+/// `created_via` is always `engine_auto`: the user did not file the
+/// design task directly, the engine added it as a side-effect of
+/// project creation (or backfill). That distinction is the entire
+/// point of the column — manual chores and engine-spawned ones must
+/// be tellable apart in one query.
+pub(crate) fn insert_design_task_for_project_in_tx(
+    conn: &Connection,
+    product_id: &str,
+    project_id: &str,
+    project_name: &str,
+    autostart: bool,
+) -> Result<Task> {
+    let id = next_id("task");
+    let now = now_string();
+    let autostart_value: i64 = if autostart { 1 } else { 0 };
+    let name = format!("Design {project_name}");
+    let short_id = allocate_short_id(conn, product_id)?;
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id)
+         VALUES (?1, ?2, ?3, 'design', ?7, '', 'todo', 0, NULL, NULL, ?4, ?4, ?5, 'medium', ?6, ?8)",
+        params![id, product_id, project_id, now, autostart_value, CREATED_VIA_ENGINE_AUTO, name, short_id],
+    )?;
+    query_task(conn, &id)?.with_context(|| format!("missing design task after insert: {id}"))
+}
+
+/// Resolve the caller-supplied `created_via` to a stored string. A
+/// `None` input lands as `unknown` (the engine app should normally
+/// have already substituted a transport-layer hint by the time the
+/// row reaches this insert; falling through to `unknown` here is the
+/// last-resort safety net). Values outside the documented set are
+/// stored verbatim but logged so we can spot undocumented sources
+/// sneaking in. `id_for_log` and `kind_for_log` exist only to make
+/// the warning useful — they don't affect the stored value.
+pub(crate) fn canonicalize_created_via(
+    raw: Option<&str>,
+    id_for_log: &str,
+    kind_for_log: &str,
+) -> String {
+    let value = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(CREATED_VIA_UNKNOWN);
+    if !is_known_created_via(value) {
+        tracing::warn!(
+            id = %id_for_log,
+            kind = %kind_for_log,
+            created_via = %value,
+            "created_via not in documented set; storing as-is",
+        );
+    }
+    value.to_owned()
+}
+
+/// Validate a caller-supplied priority and return the canonical
+/// lower-case value. `None`, the empty string, and pure whitespace
+/// resolve to the schema default (`medium`) so callers never have
+/// to type `--priority medium` explicitly. Anything outside
+/// `low` / `medium` / `high` is rejected up-front so the engine
+/// stays the single source of truth for the vocabulary.
+pub fn normalize_priority(value: Option<&str>) -> Result<String> {
+    let trimmed = value.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return Ok("medium".to_owned());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "low" | "medium" | "high" => Ok(lower),
+        other => bail!("invalid priority `{other}`; expected one of low, medium, high"),
+    }
+}
+
+pub(crate) fn insert_execution(
+    conn: &Connection,
+    input: CreateExecutionInput,
+) -> Result<WorkExecution> {
+    let repo_remote_url = resolve_execution_repo_remote_url(
+        conn,
+        &input.work_item_id,
+        normalize_optional_text(input.repo_remote_url),
+    )?;
+    let id = next_id("exec");
+    let now = now_string();
+    let status = input.status.unwrap_or_else(|| "queued".to_owned());
+    let cube_repo_id = normalize_optional_text(input.cube_repo_id);
+    let cube_lease_id = normalize_optional_text(input.cube_lease_id);
+    let cube_workspace_id = normalize_optional_text(input.cube_workspace_id);
+    let workspace_path = normalize_optional_text(input.workspace_path);
+    let priority = input.priority.unwrap_or(0);
+    let preferred_workspace_id = normalize_optional_text(input.preferred_workspace_id);
+    let started_at = normalize_optional_text(input.started_at);
+    let finished_at = normalize_optional_text(input.finished_at);
+    let prefer_is_soft: i64 = if input.prefer_is_soft { 1 } else { 0 };
+    let pr_url = normalize_optional_text(input.pr_url);
+    // Freeze the owning product's worker branch prefix onto the
+    // execution row, mirroring `repo_remote_url`. This keeps the
+    // engine-supplied branch name (`<prefix>exec_<id>`) reconstructible
+    // from `state.db` alone and stable even if the product's prefix is
+    // later changed. `None` → engine default `boss/` at name construction.
+    let worker_branch_prefix = resolve_execution_worker_branch_prefix(conn, &input.work_item_id)?;
+
+    conn.execute(
+        "INSERT INTO work_executions (
+            id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+            cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+            created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            id,
+            input.work_item_id,
+            input.kind,
+            status,
+            repo_remote_url,
+            cube_repo_id,
+            cube_lease_id,
+            cube_workspace_id,
+            workspace_path,
+            priority,
+            preferred_workspace_id,
+            now,
+            started_at,
+            finished_at,
+            prefer_is_soft,
+            pr_url,
+            worker_branch_prefix,
+        ],
+    )?;
+
+    query_execution(conn, &id)?.with_context(|| format!("missing execution after insert: {id}"))
+}
