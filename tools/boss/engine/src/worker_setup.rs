@@ -824,7 +824,23 @@ fn heal_single_settings_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Serializes tests that touch the *shared* worker-settings dir
+    /// (`worker_settings_dir()`, a fixed `$TMPDIR` path). `write_workspace_files`
+    /// truncate-writes the global `boss-path-guard.py` there; a concurrent
+    /// reader of that same file otherwise observes a half-written (empty)
+    /// script. The path isn't per-test overridable, so a lock is the
+    /// minimal isolation. Recovers from poisoning so one failing test
+    /// doesn't cascade.
+    static SHARED_SETTINGS_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_shared_settings_dir() -> std::sync::MutexGuard<'static, ()> {
+        SHARED_SETTINGS_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn sample_input() -> WorkerSetupInput {
         WorkerSetupInput {
@@ -1113,6 +1129,7 @@ mod tests {
 
     #[test]
     fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
+        let _shared = lock_shared_settings_dir();
         let dir = TempDir::new().unwrap();
         let input = WorkerSetupInput {
             run_id: "run-1".into(),
@@ -1218,6 +1235,7 @@ mod tests {
 
     #[test]
     fn write_workspace_files_overwrites_existing_files() {
+        let _shared = lock_shared_settings_dir();
         let dir = TempDir::new().unwrap();
         let claude_dir = dir.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -1581,6 +1599,7 @@ mod tests {
 
     #[test]
     fn write_workspace_files_writes_path_guard_script_outside_workspace() {
+        let _shared = lock_shared_settings_dir();
         let dir = TempDir::new().unwrap();
         let input = WorkerSetupInput {
             run_id: "run-guard".into(),

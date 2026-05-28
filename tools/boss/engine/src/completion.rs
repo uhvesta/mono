@@ -53,7 +53,10 @@ use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::merge_poller::{MergeProbe, NoopMergeProbe, update_pr_poll_state};
 use crate::metrics::Registry;
-use crate::work::{PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget};
+use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
+use crate::work::{
+    CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget,
+};
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
 // fires when the PostToolUse staging cache already holds the URL; the
@@ -693,6 +696,18 @@ pub struct WorkerCompletionHandler {
     /// finalizer unchanged.
     staged_resolution_signals:
         Arc<crate::resolution_signal_capture::StagedResolutionSignalCache>,
+    /// Circuit breaker for the auto-nudge loop. Every nudge site routes
+    /// through [`Self::nudge_or_park`], which records the nudge against
+    /// this breaker; once `max_unproductive_nudges` consecutive nudges
+    /// fire with no state change the execution is parked instead of
+    /// nudged again (the Worf-incident fix). Shared via `Arc` so the
+    /// per-execution counters survive across the multiple `on_stop`
+    /// calls of a single worker session. Defaults to a fresh breaker.
+    nudge_breaker: Arc<NudgeBreaker>,
+    /// Cap on consecutive unproductive auto-nudges before the breaker
+    /// trips. Defaults to [`DEFAULT_MAX_UNPRODUCTIVE_NUDGES`]; tests
+    /// override it via [`Self::with_max_unproductive_nudges`].
+    max_unproductive_nudges: u32,
 }
 
 impl WorkerCompletionHandler {
@@ -726,7 +741,25 @@ impl WorkerCompletionHandler {
             staged_resolution_signals: Arc::new(
                 crate::resolution_signal_capture::StagedResolutionSignalCache::new(),
             ),
+            nudge_breaker: Arc::new(NudgeBreaker::new()),
+            max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
         }
+    }
+
+    /// Wire an externally-owned [`NudgeBreaker`] into this handler.
+    /// `app.rs` does not need to call this — each handler owns its own
+    /// breaker. Tests use it to share / inspect breaker state.
+    pub fn with_nudge_breaker(mut self, breaker: Arc<NudgeBreaker>) -> Self {
+        self.nudge_breaker = breaker;
+        self
+    }
+
+    /// Override the consecutive-unproductive-nudge cap. Tests set this
+    /// low to trip the breaker deterministically; production uses the
+    /// default.
+    pub fn with_max_unproductive_nudges(mut self, max: u32) -> Self {
+        self.max_unproductive_nudges = max;
+        self
     }
 
     /// Wire the engine-global metrics registry into this handler. `app.rs`
@@ -990,15 +1023,24 @@ impl WorkerCompletionHandler {
                     )
                     .await;
             }
-            ShaDeltaGateOutcome::NoContribution => {
+            ShaDeltaGateOutcome::NoContribution { pr_url } => {
                 tracing::info!(
                     execution_id,
-                    "stop event: bound PR did not move during this run — probing to push and open one"
+                    bound_pr_url = %pr_url,
+                    "stop event: bound PR did not move during this run — nudging to push to the existing PR"
                 );
-                self.publish_awaiting_pr(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_NO_PR);
-                return StopOutcome::AwaitingInput;
+                // A PR is already bound: never tell the worker to create
+                // one. Nudge it to push to the existing branch, bounded
+                // by the circuit breaker.
+                return self
+                    .nudge_or_park(
+                        &execution,
+                        &probe_push_to_existing_pr(&pr_url),
+                        &format!("nocontribution:{pr_url}"),
+                        Some(&pr_url),
+                        StopOutcome::AwaitingInput,
+                    )
+                    .await;
             }
             ShaDeltaGateOutcome::Inapplicable => {
                 // No bound `chore.pr_url`, or the snapshot/fetch was
@@ -1051,15 +1093,65 @@ impl WorkerCompletionHandler {
 
         let (pr_url, target) = match pr_status {
             PrStatus::None | PrStatus::Closed { .. } => {
+                // The branch-keyed detector found no PR on *this*
+                // execution's branch. Before concluding "no PR, nudge to
+                // create one", resolve whether the chore already has a
+                // PR bound on a sibling execution (the `ci_remediation`
+                // / resume case the cold-path search structurally
+                // misses). If so, never say `gh pr create` — nudge to
+                // push to the existing PR instead.
+                if let Some(bound_pr_url) = self.resolve_bound_pr_url(&execution) {
+                    tracing::info!(
+                        execution_id,
+                        expected_branch = %expected_branch,
+                        %bound_pr_url,
+                        kind = %execution.kind,
+                        "stop event: chore already has a bound PR the branch search missed — nudging to push to it, not create"
+                    );
+                    return self
+                        .nudge_or_park(
+                            &execution,
+                            &probe_push_to_existing_pr(&bound_pr_url),
+                            &format!("push_existing:{bound_pr_url}"),
+                            Some(&bound_pr_url),
+                            StopOutcome::AwaitingInput,
+                        )
+                        .await;
+                }
+                // No bound PR resolvable. A `ci_remediation` worker must
+                // NEVER be told to create a PR — if it somehow has no
+                // bound PR, that is an anomalous upstream state; park it
+                // for a human rather than nudging it to `gh pr create`.
+                if execution.kind == "ci_remediation" {
+                    tracing::warn!(
+                        execution_id,
+                        kind = %execution.kind,
+                        "stop event: ci_remediation execution has no resolvable bound PR — parking instead of nudging to create one"
+                    );
+                    return self
+                        .park_for_unproductive_nudges(
+                            &execution,
+                            0,
+                            None,
+                            "ci_remediation execution has no bound PR to push to; it must not be \
+asked to open one",
+                        )
+                        .await;
+                }
                 tracing::info!(
                     execution_id,
                     expected_branch = %expected_branch,
                     "stop event: worker idle without an active PR — probing to push and open one"
                 );
-                self.publish_awaiting_pr(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_NO_PR);
-                return StopOutcome::AwaitingInput;
+                return self
+                    .nudge_or_park(
+                        &execution,
+                        PROBE_NO_PR,
+                        "no_pr",
+                        None,
+                        StopOutcome::AwaitingInput,
+                    )
+                    .await;
             }
             PrStatus::Stale { url, reason } => {
                 tracing::info!(
@@ -1069,10 +1161,18 @@ impl WorkerCompletionHandler {
                     %reason,
                     "stop event: PR exists but local commits are unpushed — probing to push"
                 );
-                self.publish_awaiting_pr(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_STALE_PR);
-                return StopOutcome::StalePr { pr_url: url, reason };
+                return self
+                    .nudge_or_park(
+                        &execution,
+                        PROBE_STALE_PR,
+                        &format!("stale:{url}"),
+                        Some(&url),
+                        StopOutcome::StalePr {
+                            pr_url: url.clone(),
+                            reason,
+                        },
+                    )
+                    .await;
             }
             PrStatus::EmptyDiff { url } => {
                 tracing::warn!(
@@ -1081,10 +1181,17 @@ impl WorkerCompletionHandler {
                     pr_url = %url,
                     "stop event: PR has an empty diff — worker pushed a no-op change; probing to fix or close"
                 );
-                self.publish_awaiting_pr(&execution).await;
-                self.probe_queuer
-                    .queue_probe(execution_id, PROBE_EMPTY_PR);
-                return StopOutcome::EmptyDiffPr { pr_url: url };
+                return self
+                    .nudge_or_park(
+                        &execution,
+                        PROBE_EMPTY_PR,
+                        &format!("empty:{url}"),
+                        Some(&url),
+                        StopOutcome::EmptyDiffPr {
+                            pr_url: url.clone(),
+                        },
+                    )
+                    .await;
             }
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
@@ -1368,6 +1475,9 @@ impl WorkerCompletionHandler {
         // a failed DB write leaves the cache intact and the next
         // merge-poller sweep can retry with the same staged URL.
         self.staged_pr_urls.forget(execution_id);
+        // The worker contributed a PR — reset any accumulated nudge
+        // count so a later unrelated nudge cycle starts clean.
+        self.nudge_breaker.forget(execution_id);
         if let Some(lease_id) = completion.released_lease_id.as_deref() {
             if let Err(err) = self.cube_client.release_workspace(lease_id).await {
                 tracing::error!(
@@ -1701,6 +1811,10 @@ impl WorkerCompletionHandler {
             // `waiting_human` for the human to resolve; do not
             // pre-empt with a `failed` mark either.
             StopOutcome::FallbackDisabledByFlag => false,
+            // The auto-nudge breaker parked the execution for a human;
+            // a `failed` mark could trigger a retrigger/respawn that
+            // re-enters the loop. Leave the attempt for the human.
+            StopOutcome::NudgeBreakerParked { .. } => false,
             // Catch-all branches: the worker exited and we have no
             // evidence of a push.
             StopOutcome::AwaitingInput
@@ -1833,6 +1947,9 @@ impl WorkerCompletionHandler {
             // Incident-001 gates (mirrors conflict finalizer).
             StopOutcome::RunningNoStagedPr => false,
             StopOutcome::FallbackDisabledByFlag => false,
+            // Breaker parked the execution for a human; don't mark the
+            // attempt failed (that risks a retrigger that re-loops).
+            StopOutcome::NudgeBreakerParked { .. } => false,
             // Catch-all branches: worker exited without evidence of a
             // push and without classifying via `mark-failed`.
             StopOutcome::AwaitingInput
@@ -2001,6 +2118,177 @@ impl WorkerCompletionHandler {
                 "worker_awaiting_pr",
             )
             .await;
+    }
+
+    /// Resolve the PR already bound to this execution's chore, if any.
+    /// Mirrors [`Self::evaluate_sha_delta_gate`]'s resolution: the
+    /// chore's own structured `pr_url` is authoritative (it is set by
+    /// whichever sibling execution opened the PR — for a
+    /// `ci_remediation` exec that is the `chore_implementation` exec
+    /// that shipped the original change). `revision_implementation`
+    /// chores carry `pr_url = NULL` by design, so for that kind we fall
+    /// back to `execution.pr_url` (the chain root's PR, stamped at
+    /// dispatch).
+    ///
+    /// Used by the nudge path to decide whether a "produce a PR" nudge
+    /// is even appropriate: when a PR is already bound the worker must
+    /// be pointed at the existing branch, never told to `gh pr create`.
+    fn resolve_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
+        match self.work_db.get_work_item(&execution.work_item_id) {
+            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
+                crate::runner::task_bound_pr_url(&task)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        if execution.kind == "revision_implementation" {
+                            execution.pr_url.clone().filter(|u| !u.is_empty())
+                        } else {
+                            None
+                        }
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    /// Generic auto-nudge gate. Records the intent to nudge `execution`
+    /// against the circuit breaker (keyed by `fingerprint`, which must
+    /// encode the work state so an unchanged state counts as
+    /// unproductive) and either:
+    ///
+    /// - queues `probe_text`, publishes the awaiting-PR signal, and
+    ///   returns `proceed_outcome` (the nudge fired); or
+    /// - parks the execution via [`Self::park_for_unproductive_nudges`]
+    ///   and returns [`StopOutcome::NudgeBreakerParked`] (the breaker
+    ///   tripped — `max_unproductive_nudges` consecutive nudges fired
+    ///   with no state change).
+    ///
+    /// This is the single choke point for the nudge loop: bounding it
+    /// here makes the breaker generic to *every* auto-nudge, not just
+    /// the "produce a PR" one.
+    async fn nudge_or_park(
+        &self,
+        execution: &crate::work::WorkExecution,
+        probe_text: &str,
+        fingerprint: &str,
+        bound_pr_url: Option<&str>,
+        proceed_outcome: StopOutcome,
+    ) -> StopOutcome {
+        match self.nudge_breaker.record(
+            &execution.id,
+            fingerprint,
+            self.max_unproductive_nudges,
+        ) {
+            NudgeDecision::Proceed { count } => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    nudge_count = count,
+                    max = self.max_unproductive_nudges,
+                    "auto-nudge: queueing probe (under circuit-breaker cap)"
+                );
+                self.publish_awaiting_pr(execution).await;
+                self.probe_queuer.queue_probe(&execution.id, probe_text);
+                proceed_outcome
+            }
+            NudgeDecision::Trip { count } => {
+                self.park_for_unproductive_nudges(
+                    execution,
+                    count,
+                    bound_pr_url,
+                    "no new commit, PR, or state change",
+                )
+                .await
+            }
+        }
+    }
+
+    /// Park `execution` because the auto-nudge circuit breaker tripped
+    /// (or because nudging it is structurally wrong, e.g. a
+    /// `ci_remediation` exec with no bound PR). Files a (deduplicated)
+    /// attention item with a human-readable reason and publishes
+    /// `AttentionItemCreated` so the coordinator/UI surfaces it, then
+    /// publishes a distinct live-state reason. The execution stays in
+    /// `waiting_human` — that *is* the parked-for-human state — but the
+    /// engine stops nudging it.
+    async fn park_for_unproductive_nudges(
+        &self,
+        execution: &crate::work::WorkExecution,
+        nudge_count: u32,
+        bound_pr_url: Option<&str>,
+        detail: &str,
+    ) -> StopOutcome {
+        let pr_clause = match bound_pr_url {
+            Some(url) => format!("A PR already exists for this work: {url}."),
+            None => "No PR was produced.".to_owned(),
+        };
+        let reason = if nudge_count > 0 {
+            format!(
+                "Auto-nudge circuit breaker tripped: nudged {nudge_count} times with {detail}. \
+{pr_clause} Parked for human review."
+            )
+        } else {
+            format!("Worker parked without nudging: {detail}. {pr_clause}")
+        };
+
+        // Deduplicate: only one open attention item of this kind per
+        // execution, so repeated Stops after the breaker trips don't
+        // pile up identical items.
+        let already_filed = self
+            .work_db
+            .list_attention_items(&execution.id)
+            .map(|items| {
+                items.iter().any(|i| {
+                    i.kind == NUDGE_BREAKER_ATTENTION_KIND && i.status != "resolved"
+                })
+            })
+            .unwrap_or(false);
+        if !already_filed {
+            match self.work_db.create_attention_item(CreateAttentionItemInput {
+                execution_id: Some(execution.id.clone()),
+                work_item_id: None,
+                kind: NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
+                status: None,
+                title: "Worker parked: auto-nudge loop bounded".to_owned(),
+                body_markdown: reason.clone(),
+                resolved_at: None,
+            }) {
+                Ok(item) => {
+                    if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                        let product_id = work_item_product_id(&work_item);
+                        self.publisher
+                            .publish_frontend_event_on_product(
+                                &product_id,
+                                FrontendEvent::AttentionItemCreated { item },
+                            )
+                            .await;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "nudge breaker: failed to file attention item; parking without UI surface"
+                    );
+                }
+            }
+        }
+
+        self.publisher
+            .publish(
+                &execution.id,
+                &execution.work_item_id,
+                &execution.status,
+                "worker_nudge_breaker_parked",
+            )
+            .await;
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            kind = %execution.kind,
+            nudge_count,
+            %reason,
+            "auto-nudge circuit breaker tripped — parked execution, no further nudges"
+        );
+        StopOutcome::NudgeBreakerParked { reason }
     }
 
     /// Hook invoked once when an execution transitions to `running`
@@ -2226,7 +2514,9 @@ impl WorkerCompletionHandler {
                 pr_head_before = %pr_head_before,
                 "sha-delta gate: bound PR head unchanged — worker did not contribute"
             );
-            ShaDeltaGateOutcome::NoContribution
+            ShaDeltaGateOutcome::NoContribution {
+                pr_url: bound_pr_url,
+            }
         } else {
             tracing::info!(
                 execution_id,
@@ -2258,15 +2548,22 @@ enum ShaDeltaGateOutcome {
     Contributed { pr_url: String },
     /// The chore had a bound `pr_url`, snapshot+current SHA were
     /// fetched, and the SHAs are equal — this run did not move the
-    /// bound PR. Caller should queue `PROBE_NO_PR` directly without
-    /// falling through to the cold-path branch detector.
-    NoContribution,
+    /// bound PR. Caller nudges the worker to push to the *existing*
+    /// bound PR (never `gh pr create`), bounded by the circuit breaker,
+    /// without falling through to the cold-path branch detector.
+    NoContribution { pr_url: String },
     /// The gate could not evaluate (no bound PR, no snapshot, or a
     /// fetch failure). Caller falls through to the existing
     /// branch-keyed cold-path detector — preserves pre-change
     /// behaviour for the new-PR flow.
     Inapplicable,
 }
+
+/// Attention-item `kind` filed when the auto-nudge circuit breaker
+/// parks an execution. Distinct kind so the coordinator/UI can surface
+/// "worker parked: nudge loop bounded" separately from other attention
+/// flows, and so repeated Stops dedupe against an already-open item.
+pub const NUDGE_BREAKER_ATTENTION_KIND: &str = "nudge_breaker_tripped";
 
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
@@ -2275,6 +2572,21 @@ enum ShaDeltaGateOutcome {
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
 If the work is complete, push your branch and open the PR with `gh pr create`. \
 If you're blocked, explain what you need.";
+
+/// Probe text dispatched when a PR is already bound to the worker's
+/// chore (a resume, or a `ci_remediation` exec whose sibling
+/// `chore_implementation` opened the PR). The worker must NEVER be told
+/// to `gh pr create` here — its job is to push fixes to the existing
+/// PR's branch. Phrased so a worker with nothing left to do can say so
+/// rather than churning; the circuit breaker bounds repeats.
+pub fn probe_push_to_existing_pr(pr_url: &str) -> String {
+    format!(
+        "A PR already exists for this work: {pr_url}. Do NOT open a new PR. If you have local \
+commits, push them to the existing PR's branch (`jj git push -b <bookmark>`). If your changes \
+are already pushed or there is nothing left to do, say so — explain your status instead of \
+re-running."
+    )
+}
 
 /// Probe text dispatched when a PR exists but the worker has local
 /// commits that haven't been pushed yet — the PR is stale.
@@ -2337,6 +2649,13 @@ pub enum StopOutcome {
     /// is probed to make real edits or close the PR; the work item
     /// stays in its current state.
     EmptyDiffPr { pr_url: String },
+    /// The auto-nudge circuit breaker tripped: the worker was nudged
+    /// `max_unproductive_nudges` consecutive times with no new commit,
+    /// PR, or state transition. The execution is parked (an attention
+    /// item is filed and an `AttentionItemCreated` event published)
+    /// instead of being nudged again. `reason` is the human-readable
+    /// explanation recorded on the attention item.
+    NudgeBreakerParked { reason: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }
@@ -2416,6 +2735,13 @@ mod tests {
                 result: Mutex::new(Err(message.to_owned())),
                 calls: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        /// Swap the status returned by subsequent `detect_pr` calls.
+        /// Lets a test model a worker that's idle for a couple of Stops
+        /// and then finally opens a PR.
+        async fn set_result(&self, status: PrStatus) {
+            *self.result.lock().await = Ok(status);
         }
 
         fn call_count(&self) -> usize {
@@ -5682,6 +6008,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Resume bounce-back where the worker exited without pushing
         // any commit. The gate must NOT swallow this case — the
         // loop-catch nudge is load-bearing for genuinely-idle workers.
+        //
+        // A PR is already bound, though, so the nudge must point the
+        // worker at the *existing* PR (never `gh pr create`): this is
+        // the T541/T686 defect family. The first nudge fires under the
+        // circuit-breaker cap.
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
         let head = "1111111111111111111111111111111111111111";
@@ -5714,7 +6045,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         let queued = probes.snapshot();
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].1, PROBE_NO_PR);
+        assert_eq!(
+            queued[0].1,
+            probe_push_to_existing_pr(pr_url),
+            "bound PR exists: nudge must target the existing PR, not `gh pr create`",
+        );
+        assert!(
+            !queued[0].1.contains("gh pr create"),
+            "a worker with a bound PR must never be told to `gh pr create`",
+        );
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             // Chore stays put — no finalize.
@@ -5773,11 +6112,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     }
 
     #[tokio::test]
-    async fn resume_with_missing_snapshot_falls_through_to_cold_detector() {
-        // Fail-safe: `chore.pr_url` is bound but `pr_head_before`
-        // was never captured (e.g. the snapshot fetch failed at run
-        // start). Gate declares itself inapplicable and the existing
-        // detector path runs — never noisier than pre-change.
+    async fn resume_with_missing_snapshot_nudges_to_existing_pr_not_create() {
+        // Fail-safe: `chore.pr_url` is bound but `pr_head_before` was
+        // never captured (e.g. the snapshot fetch failed at run start),
+        // so the SHA-delta gate is inapplicable and the cold-path
+        // branch detector runs — and misses the PR, because it searches
+        // this execution's own branch. Pre-fix that false miss queued
+        // `PROBE_NO_PR` ("create a PR"); per T686 the bound PR must be
+        // resolved from the structured `pr_url` even with no snapshot,
+        // so the worker is pointed at the existing PR instead.
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
@@ -5809,11 +6152,203 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert_eq!(
             outcome,
             StopOutcome::AwaitingInput,
-            "fall-through to cold-path detector preserves the existing nudge behaviour",
+            "bound PR exists but worker idle: nudge fires (under the breaker cap)",
         );
         let queued = probes.snapshot();
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].1, PROBE_NO_PR);
+        assert_eq!(
+            queued[0].1,
+            probe_push_to_existing_pr(pr_url),
+            "missing snapshot must NOT regress to `gh pr create`; resolve the bound PR from pr_url",
+        );
+        assert!(!queued[0].1.contains("gh pr create"));
+    }
+
+    // -----------------------------------------------------------
+    // Auto-nudge circuit breaker (the Worf incident).
+    //
+    // exec_18b3945c5b7d7e78_1b (ci_remediation on chore T735) was sent
+    // the "produce a PR" nudge 20 times because the chore's PR #869 was
+    // bound on a sibling chore_implementation exec, not on the
+    // remediation exec's own row — the branch-keyed cold-path search
+    // missed it and concluded "no PR". The two guards below pin:
+    //   1. A ci_remediation exec whose chore has a bound PR is NEVER
+    //      told to `gh pr create`, and the breaker parks it after N
+    //      unproductive nudges instead of looping forever.
+    //   2. A genuine no-PR chore_implementation exec still gets the
+    //      "produce a PR" nudge (healthy case preserved), but the
+    //      breaker bounds even that after N.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn ci_remediation_with_bound_pr_never_creates_and_breaker_parks() {
+        let workspace = tempdir().unwrap();
+        let (db, product_id, _chore_id, execution_id, _attempt_id) =
+            ci_remediation_fixture(workspace.path());
+        let bound_pr = "https://github.com/spinyfin/mono/pull/88";
+        // Cold-path detector finds no PR on the remediation exec's own
+        // branch — exactly the Worf false miss.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        // Default cap is 3: nudges 1..=3 fire, the 4th trips.
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let mut outcomes = Vec::new();
+        for _ in 0..4 {
+            outcomes.push(handler.on_stop(&execution_id).await);
+        }
+
+        // First three nudges fire; all target the existing PR, none say
+        // `gh pr create`, none are the "produce a PR" probe.
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 3, "exactly 3 nudges before the breaker trips");
+        for (_, text) in &queued {
+            assert_eq!(text, &probe_push_to_existing_pr(bound_pr));
+            assert!(!text.contains("gh pr create"), "must never instruct create");
+            assert_ne!(text, PROBE_NO_PR, "must never send the produce-a-PR nudge");
+        }
+        assert!(
+            matches!(outcomes[0], StopOutcome::AwaitingInput),
+            "first nudge fires; got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(outcomes[3], StopOutcome::NudgeBreakerParked { .. }),
+            "the 4th attempt must trip the breaker; got {:?}",
+            outcomes[3]
+        );
+
+        // The execution is parked with a surfaced attention item.
+        let items = db.list_attention_items(&execution_id).unwrap();
+        let parked = items
+            .iter()
+            .find(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND)
+            .expect("breaker must file an attention item");
+        assert!(
+            parked.body_markdown.contains(bound_pr),
+            "parked reason should name the existing PR; got {:?}",
+            parked.body_markdown
+        );
+        // Idempotent: only one attention item despite the repeated trips.
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND)
+                .count(),
+            1,
+            "repeated trips must not pile up duplicate attention items",
+        );
+        // Surfaced to the coordinator/UI.
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(p, ev)| p == &product_id
+                && matches!(ev, boss_protocol::FrontendEvent::AttentionItemCreated { .. })),
+            "an AttentionItemCreated event must be published; got {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_no_pr_chore_still_nudges_then_breaker_parks() {
+        // Healthy case: a chore_implementation exec with no bound PR and
+        // no PR on its branch. The legitimate "produce a PR" nudge must
+        // still fire — but the breaker bounds it too. Cap lowered to 2
+        // to keep the test short.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_max_unproductive_nudges(2);
+
+        let o1 = handler.on_stop(&execution_id).await;
+        let o2 = handler.on_stop(&execution_id).await;
+        let o3 = handler.on_stop(&execution_id).await;
+
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 2, "the legitimate produce-a-PR nudge fires up to the cap");
+        assert_eq!(queued[0].1, PROBE_NO_PR, "healthy no-PR case must still nudge to create");
+        assert_eq!(queued[1].1, PROBE_NO_PR);
+        assert!(matches!(o1, StopOutcome::AwaitingInput));
+        assert!(matches!(o2, StopOutcome::AwaitingInput));
+        assert!(
+            matches!(o3, StopOutcome::NudgeBreakerParked { .. }),
+            "breaker must bound the no-PR nudge after the cap; got {o3:?}",
+        );
+        // Chore is untouched (no false finalize); execution stays parked.
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+            "parking must file an attention item",
+        );
+    }
+
+    #[tokio::test]
+    async fn nudge_breaker_resets_after_worker_finally_opens_pr() {
+        // A worker that gets nudged a couple of times and THEN opens a
+        // real PR must finalize cleanly — the accumulated nudge count is
+        // reset on finalize, so it doesn't carry over to poison a later
+        // cycle.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // First two stops find no PR; the third finds a fresh PR.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        assert!(matches!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput));
+        assert!(matches!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput));
+        // The worker finally opens a real PR before the breaker trips.
+        detector
+            .set_result(PrStatus::Fresh {
+                url: "https://github.com/foo/bar/pull/77".to_owned(),
+            })
+            .await;
+        let final_outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(final_outcome, StopOutcome::PrDetected { .. }),
+            "the worker's real PR must finalize; got {final_outcome:?}",
+        );
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 
     #[tokio::test]

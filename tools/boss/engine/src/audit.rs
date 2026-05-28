@@ -373,7 +373,24 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Serializes the audit tests that mutate process-global state — the
+    /// `AUDIT_PATH_ENV` env var, the `AUDIT_PATH` `OnceLock`, and the
+    /// `START_EPOCH_S` / `SHUTDOWN_EMITTED` statics. These are shared
+    /// across the whole test binary, so without a lock two of these
+    /// tests running concurrently in the same shard clobber each other's
+    /// env override and atomics (observed as a flaky
+    /// "expected shutdown, got start"). The lock recovers from poisoning
+    /// so one failing test doesn't cascade into the others.
+    static AUDIT_GLOBALS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
+        AUDIT_GLOBALS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn parse_lines(path: &Path) -> Vec<Value> {
         let raw = fs::read_to_string(path).unwrap();
@@ -408,6 +425,7 @@ mod tests {
 
     #[test]
     fn record_start_writes_required_fields() {
+        let _globals = lock_globals();
         let dir = TempDir::new().unwrap();
         let path = fresh_audit_path(&dir, "start.log");
 
@@ -437,6 +455,7 @@ mod tests {
 
     #[test]
     fn record_shutdown_includes_uptime_when_start_was_recorded() {
+        let _globals = lock_globals();
         let dir = TempDir::new().unwrap();
         let path = fresh_audit_path(&dir, "shutdown.log");
 
@@ -529,6 +548,7 @@ mod tests {
     /// `record_shutdown` per process must override later calls.
     #[test]
     fn public_start_and_shutdown_path_emits_two_records() {
+        let _globals = lock_globals();
         // Use a fresh path *and* clear the OnceLock by going through
         // the env override. This test runs in process; if another test
         // already populated AUDIT_PATH the env override won't help —

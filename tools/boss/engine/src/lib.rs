@@ -30,6 +30,7 @@ pub mod live_status_redact;
 pub mod live_worker_state;
 pub mod merge_poller;
 pub mod metrics;
+pub mod nudge_breaker;
 pub mod orphan_sweep;
 pub mod pane_summary;
 pub mod pr_url_capture;
