@@ -12,7 +12,7 @@ steps:
     key: "bootstrap"
     command: ".buildkite/steps/bootstrap.sh"
     agents:
-      queue: "linux-amd64"
+      queue: "bazel-any"
     notify:
       - github_commit_status:
           context: "buildkite/mono/bootstrap"
@@ -24,7 +24,7 @@ steps:
     artifact_paths:
       - "bazel-out/**/extra_action_outputs/**/*"
     agents:
-      queue: "linux-amd64"
+      queue: "bazel-any"
     notify:
       - github_commit_status:
           context: "buildkite/mono/bazel-build"
@@ -44,7 +44,7 @@ steps:
     command: ".buildkite/steps/checks.sh"
     depends_on: "bootstrap"
     agents:
-      queue: "linux-amd64"
+      queue: "bazel-any"
     notify:
       - github_commit_status:
           context: "buildkite/mono/checks"
@@ -59,7 +59,7 @@ steps:
       - "bazel-testlogs/**/test.log"
       - "bazel-testlogs/**/test.xml"
     agents:
-      queue: "linux-amd64"
+      queue: "bazel-any"
     notify:
       - github_commit_status:
           context: "buildkite/mono/bazel-test"
