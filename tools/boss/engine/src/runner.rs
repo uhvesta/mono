@@ -1536,6 +1536,9 @@ pub(crate) fn task_bound_pr_url(task: &crate::work::Task) -> Option<&str> {
 /// query strings, fragments, and surrounding punctuation are all
 /// dropped so the same URL appearing twice with different decorations
 /// counts as one match.
+// Fully tested but not yet wired into the exec runner; keeping here so it
+// can be called once the PR-URL extraction step is plumbed in.
+#[allow(dead_code)]
 pub(crate) fn extract_pr_url_from_text(text: &str) -> Option<&str> {
     const SCHEME: &str = "https://github.com/";
     let mut found: Option<&str> = None;
@@ -1566,6 +1569,7 @@ pub(crate) fn extract_pr_url_from_text(text: &str) -> Option<&str> {
 /// byte index just past the last digit of `<N>`. `None` if the
 /// structure doesn't match (e.g. the URL is for an issue, a tree, the
 /// repo root, etc.).
+#[allow(dead_code)] // helper for extract_pr_url_from_text
 fn parse_canonical_pr_url(text: &str, after_scheme: usize) -> Option<usize> {
     let rest = text.get(after_scheme..)?;
     let slash1 = rest.find('/')?;
@@ -1590,6 +1594,7 @@ fn parse_canonical_pr_url(text: &str, after_scheme: usize) -> Option<usize> {
     Some(after_scheme + after_repo + "pull/".len() + digit_len)
 }
 
+#[allow(dead_code)] // helper for parse_canonical_pr_url
 fn is_github_path_segment(s: &str) -> bool {
     !s.is_empty()
         && s.chars()

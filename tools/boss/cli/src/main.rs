@@ -4326,7 +4326,7 @@ async fn run_create_investigation(
         if !ctx.quiet {
             println!("created investigation T{}: {}", task.short_id.unwrap_or(0), name);
         }
-    });
+    })?;
     Ok(())
 }
 
@@ -4416,7 +4416,7 @@ async fn run_create_revision(
                 description
             );
         }
-    });
+    })?;
     Ok(())
 }
 
@@ -4444,7 +4444,7 @@ async fn run_set_investigation_doc(
                 println!("set investigation-doc pointer on T{}", task.short_id.unwrap_or(0));
             }
         }
-    });
+    })?;
     Ok(())
 }
 

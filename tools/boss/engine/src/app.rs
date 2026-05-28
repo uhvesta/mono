@@ -1239,10 +1239,6 @@ impl ServerState {
         }
     }
 
-    pub fn worker_registry_handle(&self) -> &WorkerRegistry {
-        &self.worker_registry
-    }
-
     /// Snapshot of every allocated worker slot's live runtime state.
     pub fn live_worker_states_snapshot(&self) -> Vec<crate::protocol::LiveWorkerState> {
         self.live_worker_states.snapshot()
