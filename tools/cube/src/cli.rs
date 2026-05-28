@@ -306,9 +306,14 @@ pub struct PrEnsureArgs {
     /// PR title (gh prompts interactively when omitted and stdin is a TTY).
     #[arg(long)]
     pub title: Option<String>,
-    /// PR body text.
-    #[arg(long)]
+    /// PR body text. WARNING: unsafe when the body contains backticks or $(...) because
+    /// the shell evaluates them before cube sees the argument. Use --body-file instead.
+    #[arg(long, conflicts_with = "body_file")]
     pub body: Option<String>,
+    /// Path to a file containing the PR body. Preferred over --body: the file path is
+    /// passed shell-safely, so backticks and $(...) in the body are never evaluated.
+    #[arg(long, conflicts_with = "body")]
+    pub body_file: Option<String>,
     /// Open the PR as a draft.
     #[arg(long)]
     pub draft: bool,
@@ -857,11 +862,12 @@ mod tests {
 
         match cli.command {
             Command::Pr {
-                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, draft }),
+                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, body_file, draft }),
             } => {
                 assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
                 assert_eq!(title.as_deref(), Some("My PR"));
                 assert_eq!(body.as_deref(), Some("A description"));
+                assert!(body_file.is_none());
                 assert!(draft);
             }
             _ => panic!("expected pr ensure command"),
@@ -874,11 +880,40 @@ mod tests {
 
         match cli.command {
             Command::Pr {
-                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, draft }),
+                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, body_file, draft }),
             } => {
                 assert!(branch.is_none());
                 assert!(title.is_none());
                 assert!(body.is_none());
+                assert!(body_file.is_none());
+                assert!(!draft);
+            }
+            _ => panic!("expected pr ensure command"),
+        }
+    }
+
+    #[test]
+    fn pr_ensure_accepts_body_file_flag() {
+        let cli = Cli::parse_from([
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "boss/exec_abc123_01",
+            "--title",
+            "My PR",
+            "--body-file",
+            "/tmp/pr-body.md",
+        ]);
+
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, body_file, draft }),
+            } => {
+                assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
+                assert_eq!(title.as_deref(), Some("My PR"));
+                assert!(body.is_none());
+                assert_eq!(body_file.as_deref(), Some("/tmp/pr-body.md"));
                 assert!(!draft);
             }
             _ => panic!("expected pr ensure command"),

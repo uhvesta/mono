@@ -129,13 +129,17 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          \n\
          **A task is not complete until a PR exists.** Local commits are NOT enough.\n\
          \n\
-         - Push your branch and open a PR with `gh pr create` once\n\
+         - Push your branch and open a PR with `cube pr ensure` once\n\
            commits exist and tests pass.\n\
          - **If a PR already exists** (resuming or addressing review),\n\
            push new commits to update it; do NOT open a duplicate. Check:\n\
            `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
            or `gh pr view`.\n\
          - Do not hard-wrap PR bodies.\n\
+         - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
+           evaluates backticks and `$(...)` inside double-quoted strings, which\n\
+           corrupts any body that contains inline code. Always write the body to\n\
+           a file and use `--body-file` (see the recipe below).\n\
          - Print the PR URL on its own line as the last thing in your final response.\n\
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
@@ -180,10 +184,18 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          \n\
          ### Canonical PR creation recipe\n\
          \n\
+         Write the PR body to a temp file — never embed it inline on the command\n\
+         line. This protects backticks, `$(...)`, and `${{VAR}}` from shell evaluation.\n\
+         \n\
          ```sh\n\
          jj describe -m \"your commit message\"\n\
          jj bookmark create my-feature -r @\n\
-         cube pr ensure --branch my-feature --title \"Your PR title\" --body \"PR description\"\n\
+         body=$(mktemp)\n\
+         cat > \"$body\" << 'PRBODY'\n\
+         ## Summary\n\
+         Your description here. Inline code like `crate-name` and `$(cmd)` is safe.\n\
+         PRBODY\n\
+         cube pr ensure --branch my-feature --title \"Your PR title\" --body-file \"$body\"\n\
          ```\n\
          \n\
          `cube pr ensure` is idempotent: if a PR for `my-feature` already\n\

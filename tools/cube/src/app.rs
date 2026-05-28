@@ -1845,6 +1845,7 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     ];
     let title_ref;
     let body_ref;
+    let body_file_ref;
     if let Some(ref t) = args.title {
         title_ref = t.as_str();
         create_args.push("--title");
@@ -1854,6 +1855,11 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
         body_ref = b.as_str();
         create_args.push("--body");
         create_args.push(body_ref);
+    }
+    if let Some(ref f) = args.body_file {
+        body_file_ref = f.as_str();
+        create_args.push("--body-file");
+        create_args.push(body_file_ref);
     }
     if args.draft {
         create_args.push("--draft");
@@ -9780,5 +9786,85 @@ steps:
     #[test]
     fn parse_github_owner_repo_returns_none_for_empty_output() {
         assert_eq!(parse_github_owner_repo(""), None);
+    }
+
+    // --- ensure_pr body-file regression tests ---
+
+    #[test]
+    fn ensure_pr_uses_body_file_flag_not_body_flag() {
+        // Regression: when --body-file is given, gh pr create must receive
+        // --body-file <path>, NOT --body <content>. Passing the body inline
+        // via --body "..." lets the shell evaluate backticks and $(...) before
+        // cube ever sees the argument, corrupting PR bodies that contain
+        // inline code.
+        let body_content =
+            "Use `rustc --help` or `$(cargo --version)` or ${CARGO_HOME}.\n\nMore `code`.";
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), body_content).expect("write body");
+        let body_path = tmp.path().display().to_string();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", "my-feature", "--allow-new"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                ],
+                "[]",
+            ),
+            // The critical assertion: gh receives --body-file <path>, not --body <content>.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "create",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--base",
+                    "main",
+                    "--title",
+                    "Test PR",
+                    "--body-file",
+                    &body_path,
+                ],
+                "https://github.com/spinyfin/mono/pull/99",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "my-feature",
+            "--title",
+            "Test PR",
+            "--body-file",
+            &body_path,
+        ]);
+        let result =
+            run_with_dependencies(cli, None, &runner).expect("ensure_pr with --body-file");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/99");
+        // Body file must not be modified — backticks and $(...) survive verbatim.
+        let body_on_disk = std::fs::read_to_string(tmp.path()).expect("read body");
+        assert_eq!(body_on_disk, body_content);
     }
 }
