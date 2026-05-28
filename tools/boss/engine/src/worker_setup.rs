@@ -24,6 +24,15 @@
 //!   runtime state. The engine points the spawned session at it with
 //!   `claude --settings <abs-path>`.
 //!
+//!   On top of the `deny` globs, the `PreToolUse` hooks include a
+//!   *deterministic* Boss-data-dir gate (see [`PATH_GUARD_SCRIPT`]): a
+//!   small script that canonicalises the working dir and every candidate
+//!   path and blocks any tool call that resolves inside the Boss data
+//!   dir, regardless of which tool dresses up the access or whether the
+//!   session model spots the path string. The script is written next to
+//!   the settings file by [`write_workspace_files`] / refreshed by
+//!   [`heal_worker_settings_json`].
+//!
 //!   This file is deliberately **never** written into the workspace
 //!   tree — not as `.claude/settings.json`, not as
 //!   `.claude/settings.local.json`. Repos commonly check in a shared,
@@ -262,6 +271,36 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
     // This ensures a mis-derived execution kind (e.g. revision
     // re-dispatched as `task_implementation`) still cannot open a PR.
     let mut pre_tool_use_hooks = vec![hook.clone()];
+
+    // Deterministic Boss-data-dir gate (every session, every tool). The
+    // script canonicalises the working dir and every candidate path
+    // (Bash argv tokens + file-tool `file_path`/`notebook_path`) and
+    // blocks if any resolves inside the Boss data dir. This is the real
+    // gate the issue asks for: unlike the `deny` globs below and the
+    // engine-side audit, it resolves symlinks / `..` / `~` / `$VAR`
+    // indirection, so the boundary holds regardless of which tool
+    // dresses up the access or whether the model spots the path string.
+    // Matcher is `*` (not a per-tool list) so a future tool that takes a
+    // path is covered without a settings change; the script fast-paths
+    // tools it doesn't inspect. The Boss data dir is derived from
+    // `events_socket_path`'s parent — same source as `deny_rules`.
+    if let Some(state_dir) = input.events_socket_path.parent() {
+        let guard_command = format!(
+            "BOSS_DATA_DIR={dir} python3 {script}",
+            dir = shell_escape(&state_dir.display().to_string()),
+            script = shell_escape(&path_guard_script_path().display().to_string()),
+        );
+        pre_tool_use_hooks.push(serde_json::json!({
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": guard_command,
+                }
+            ],
+        }));
+    }
+
     let is_revision = input.execution_kind == "revision_implementation"
         || input.task_kind.as_deref() == Some("revision");
     if is_revision {
@@ -393,6 +432,160 @@ const CLAUDE_DIR_GITIGNORE: &str = "*\n";
 /// worker's `jj`/`git` never sees these files — see the module docs.
 const WORKER_SETTINGS_SUBDIR: &str = "boss-worker-settings";
 
+/// Filename of the deterministic Boss-data-dir access gate script.
+/// Written next to the worker settings file (same dir, shared fate) and
+/// invoked by the `PreToolUse` hook with its absolute path.
+const PATH_GUARD_SCRIPT_NAME: &str = "boss-path-guard.py";
+
+/// The deterministic Boss-data-dir access gate, run as a `PreToolUse`
+/// hook for every tool call.
+///
+/// The `deny` globs in [`deny_rules`] catch the obvious literal-path
+/// shapes, and the engine-side audit in [`crate::worker_sandbox_audit`]
+/// observes attempts — but both depend on the path *appearing literally*
+/// in the tool input. This script is the layer that does not: it
+/// canonicalises the working directory and every candidate path
+/// (expanding `~`, `$VAR` and `..`; resolving symlinks) and rejects on a
+/// component-wise prefix match against the Boss data dir. That makes the
+/// boundary identical regardless of which tool dresses up the access
+/// (`sqlite3`, `duckdb`, `cp`, an editor, a relative `state.db` after a
+/// `cd`, a `$HOME`-prefixed path in a shell var, etc.) and regardless of
+/// whether the session model notices the path string.
+///
+/// The data dir is supplied via the `BOSS_DATA_DIR` env var (set by the
+/// hook command). The script is fail-open: anything it cannot positively
+/// resolve to a path under the data dir is approved, so a payload-shape
+/// change can never wedge a session — the positive prefix match is the
+/// only deterministic block.
+const PATH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
+"""Deterministic Boss data-directory access gate (Claude Code PreToolUse hook).
+
+Blocks any tool call whose target path canonically resolves inside the Boss
+data directory (state.db, its -wal/-shm sidecars, the events socket, engine
+pid/state files, and any future sidecar). Unlike an LLM classifier this does
+not depend on the model recognising a path string in argv: it canonicalises
+the working directory and every candidate path -- expanding ~, environment
+variables and .. , and resolving symlinks -- then rejects on a component-wise
+prefix match against the data directory.
+
+The data directory is supplied via the BOSS_DATA_DIR environment variable,
+set by the engine in the hook command. The PreToolUse payload arrives as JSON
+on stdin; a decision JSON is written to stdout.
+
+Fail-open by design: anything that cannot be positively resolved to a path
+under the data directory is approved, so a payload-shape change can never
+wedge a session. The positive prefix match is the only deterministic block.
+"""
+import json
+import os
+import shlex
+import sys
+
+RECOVERY = (
+    "Blocked: direct access to the Boss data directory "
+    "(~/Library/Application Support/Boss) is not allowed from a coordinator "
+    "or worker session. That directory is engine-owned -- state.db, its "
+    "-wal/-shm sidecars, the events socket, and engine pid/state files must "
+    "never be read, copied, moved, edited, or opened by a session (no "
+    "sqlite3, duckdb, litecli, sqlite-utils, cp/mv/rm, cat/head/tail/hexdump, "
+    "editors, lsof, etc.). To recover or inspect Boss state use the "
+    "sanctioned surface instead: ask the coordinator, file a shake with "
+    "'boss shake' describing what you need, or use the dedicated boss/bossctl "
+    "verb once it exists (e.g. 'boss task restore'). Do not work around this "
+    "gate."
+)
+
+
+def canonical(path, cwd):
+    expanded = os.path.expanduser(os.path.expandvars(path))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(cwd, expanded)
+    return os.path.realpath(expanded)
+
+
+def is_inside(child, parent):
+    parent = parent.rstrip(os.sep)
+    if not parent:
+        return False
+    return child == parent or child.startswith(parent + os.sep)
+
+
+def emit(decision, reason=None):
+    out = {"decision": decision}
+    if reason is not None:
+        out["reason"] = reason
+    sys.stdout.write(json.dumps(out))
+    sys.exit(0)
+
+
+def main():
+    raw_dir = os.environ.get("BOSS_DATA_DIR", "").strip()
+    if not raw_dir:
+        emit("approve")
+    data_dir = os.path.realpath(os.path.expanduser(raw_dir))
+
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        emit("approve")
+    if not isinstance(payload, dict):
+        emit("approve")
+
+    tool = payload.get("tool_name") or ""
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    cwd = payload.get("cwd") or os.getcwd()
+
+    candidates = []
+    for key in ("file_path", "notebook_path", "path"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            candidates.append(value)
+
+    raw_command = ""
+    if tool == "Bash":
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            raw_command = command
+            try:
+                tokens = shlex.split(command)
+            except Exception:
+                tokens = command.split()
+            candidates.extend(tokens)
+
+    for candidate in candidates:
+        try:
+            if is_inside(canonical(candidate, cwd), data_dir):
+                emit("block", RECOVERY)
+        except Exception:
+            continue
+
+    # Substring belt for Bash: catches $VAR / ~ indirection and backslash-
+    # escaped spaces that tokenisation + canonicalisation miss (e.g.
+    # P="$HOME/Library/Application Support/Boss/state.db"; sqlite3 "$P").
+    # Needles are derived from the *non*-realpath expanded dir so the
+    # home prefix matches the literal command text even when the real
+    # home contains symlinks (realpath data_dir would diverge from the
+    # $HOME the shell expands to).
+    if raw_command:
+        expanded_dir = os.path.expanduser(raw_dir)
+        needles = [data_dir, expanded_dir]
+        home = os.path.expanduser("~")
+        if expanded_dir.startswith(home + os.sep):
+            needles.append(expanded_dir[len(home):].lstrip(os.sep))
+        unescaped = raw_command.replace("\\", "")
+        for needle in needles:
+            if needle and (needle in raw_command or needle in unescaped):
+                emit("block", RECOVERY)
+
+    emit("approve")
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 /// Directory holding all per-workspace worker settings files. The
 /// engine writes into it at spawn time and heals stale `boss-event`
 /// paths in it on restart ([`heal_worker_settings_json`]).
@@ -420,6 +613,25 @@ pub fn worker_settings_path(workspace_path: &Path) -> PathBuf {
     worker_settings_dir().join(format!("{key}.json"))
 }
 
+/// Absolute path to the deterministic Boss-data-dir gate script. Shared
+/// across every session (the script is data-dir-agnostic; the dir is
+/// passed at invocation via `BOSS_DATA_DIR`), so it lives once in the
+/// [`worker_settings_dir`] alongside the per-workspace settings files.
+pub fn path_guard_script_path() -> PathBuf {
+    worker_settings_dir().join(PATH_GUARD_SCRIPT_NAME)
+}
+
+/// Write the [`PATH_GUARD_SCRIPT`] into `dir`, creating it if needed.
+/// Idempotent: overwrites any existing copy with the current source so a
+/// stale script from an older engine build is refreshed. Returns the
+/// path written.
+pub fn ensure_path_guard_script_in(dir: &Path) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(PATH_GUARD_SCRIPT_NAME);
+    std::fs::write(&path, PATH_GUARD_SCRIPT)?;
+    Ok(path)
+}
+
 /// Write `CLAUDE.md` and a self-excluding `.gitignore` under
 /// `<workspace>/.claude/`, and the worker settings file *outside* the
 /// workspace at [`worker_settings_path`]. Creates parent directories as
@@ -442,6 +654,10 @@ pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFile
     let settings_path = worker_settings_path(&input.workspace_path);
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)?;
+        // The PreToolUse gate script lives next to the settings file
+        // (same dir, shared fate) and the hook invokes it by absolute
+        // path; write it whenever we materialise the settings file.
+        ensure_path_guard_script_in(parent)?;
     }
     std::fs::write(&settings_path, render_settings_json(input))?;
 
@@ -515,6 +731,18 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
             return;
         }
     };
+
+    // The settings dir exists, so live workers may have PreToolUse hooks
+    // pointing at the gate script in it. Refresh the script (TMPDIR churn
+    // or an older engine build may have removed/staled it) so the gate
+    // survives an engine restart, not just a fresh spawn.
+    if let Err(err) = ensure_path_guard_script_in(settings_dir) {
+        tracing::warn!(
+            dir = %settings_dir.display(),
+            ?err,
+            "failed to refresh path-guard script during settings heal",
+        );
+    }
 
     for entry in entries.flatten() {
         let settings_path = entry.path();
@@ -655,8 +883,15 @@ mod tests {
         ] {
             assert!(hooks.contains_key(name), "missing hook: {name}");
             let entries = hooks.get(name).unwrap().as_array().unwrap();
-            assert_eq!(entries.len(), 1);
+            // The boss-event shim is always the first entry for every
+            // hook event. `PreToolUse` carries extra entries (the
+            // deterministic path guard, plus a revision-only guard); the
+            // other six events are wired exactly once.
+            assert!(!entries.is_empty(), "{name} has no hook entries");
             assert_eq!(entries[0]["matcher"], "*");
+            if name != "PreToolUse" {
+                assert_eq!(entries.len(), 1, "{name} should have exactly one hook entry");
+            }
         }
     }
 
@@ -1177,20 +1412,20 @@ mod tests {
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
-        // Must have 2 entries: the standard shim hook + the guard.
+        // Must have 3 entries: the shim, the deterministic path guard,
+        // and the revision-only gh-pr-create guard.
         assert_eq!(
             pre.len(),
-            2,
-            "revision_implementation PreToolUse must have 2 hooks, got {pre:?}",
+            3,
+            "revision_implementation PreToolUse must have shim + path guard + pr guard, got {pre:?}",
         );
-        // Second entry must be a Bash matcher.
-        assert_eq!(
-            pre[1]["matcher"],
-            serde_json::Value::String("Bash".into()),
-            "second PreToolUse hook must match 'Bash'",
-        );
+        // The revision guard is the Bash-matcher entry.
+        let pr_guard = pre
+            .iter()
+            .find(|e| e["matcher"] == serde_json::Value::String("Bash".into()))
+            .expect("revision PreToolUse must include a Bash-matcher guard");
         // Guard command must reference the deny decision and both gh pr create and cube pr ensure.
-        let guard_cmd = pre[1]["hooks"][0]["command"].as_str().unwrap_or("");
+        let guard_cmd = pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
         assert!(
             guard_cmd.contains("gh") && guard_cmd.contains("pr") && guard_cmd.contains("create"),
             "guard command must inspect gh pr create: {guard_cmd}",
@@ -1206,23 +1441,38 @@ mod tests {
     }
 
     #[test]
-    fn chore_implementation_has_no_extra_pre_tool_use_guard() {
+    fn chore_implementation_has_shim_and_path_guard_but_no_revision_guard() {
         let input = sample_input(); // execution_kind: "chore_implementation"
         let parsed: serde_json::Value =
             serde_json::from_str(&render_settings_json(&input)).unwrap();
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
+        // chore: [boss-event shim, deterministic path guard]. The
+        // revision-only `gh pr create` guard must NOT be present.
         assert_eq!(
             pre.len(),
-            1,
-            "chore_implementation PreToolUse must have exactly 1 hook (no extra guard), got {pre:?}",
+            2,
+            "chore_implementation PreToolUse must have shim + path guard, got {pre:?}",
         );
         assert_eq!(
             pre[0]["matcher"],
             serde_json::Value::String("*".into()),
-            "chore_implementation's sole PreToolUse hook must be the catch-all shim",
+            "first PreToolUse hook must be the catch-all shim",
         );
+        let path_guard = pre[1]["hooks"][0]["command"].as_str().unwrap_or("");
+        assert!(
+            path_guard.contains("BOSS_DATA_DIR=") && path_guard.contains(PATH_GUARD_SCRIPT_NAME),
+            "second PreToolUse hook must be the path guard, got {path_guard}",
+        );
+        // No revision guard: nothing inspects `cube ... ensure`.
+        for entry in pre {
+            let cmd = entry["hooks"][0]["command"].as_str().unwrap_or("");
+            assert!(
+                !cmd.contains("ensure"),
+                "chore must not carry the revision gh-pr-create guard: {cmd}",
+            );
+        }
     }
 
     /// Defense-in-depth: even if `execution_kind` is wrong (e.g. a revision
@@ -1245,13 +1495,137 @@ mod tests {
 
         assert_eq!(
             pre.len(),
-            2,
-            "revision task_kind must add the guard even when execution_kind is wrong, got {pre:?}",
+            3,
+            "revision task_kind must add the pr guard (shim + path guard + pr guard) even when execution_kind is wrong, got {pre:?}",
         );
-        let guard_cmd = pre[1]["hooks"][0]["command"].as_str().unwrap_or("");
+        let pr_guard = pre
+            .iter()
+            .find(|e| e["matcher"] == serde_json::Value::String("Bash".into()))
+            .expect("revision task_kind must include a Bash-matcher guard");
+        let guard_cmd = pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
         assert!(
             guard_cmd.contains("block"),
             "guard must produce a block decision: {guard_cmd}",
         );
+    }
+
+    /// Locate the deterministic path-guard PreToolUse hook command (the
+    /// one that invokes the gate script), if present.
+    fn path_guard_command(parsed: &serde_json::Value) -> Option<String> {
+        parsed["hooks"]["PreToolUse"]
+            .as_array()?
+            .iter()
+            .filter_map(|e| e["hooks"][0]["command"].as_str())
+            .find(|c| c.contains(PATH_GUARD_SCRIPT_NAME))
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn settings_json_adds_deterministic_path_guard_hook() {
+        // Every session must carry the deterministic Boss-data-dir gate
+        // as a PreToolUse hook. The hook invokes the gate script with the
+        // Boss data dir passed via BOSS_DATA_DIR so the script resolves
+        // candidate paths against the right boundary.
+        let input = sample_input();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let cmd = path_guard_command(&parsed)
+            .expect("PreToolUse must include the deterministic path-guard hook");
+        assert!(cmd.contains("python3"), "guard must run via python3: {cmd}");
+        // The data dir is the Boss state dir (events socket parent),
+        // single-quoted because of the space in "Application Support".
+        assert!(
+            cmd.contains("BOSS_DATA_DIR='/Users/brianduff/Library/Application Support/Boss'"),
+            "guard must pass the Boss data dir via BOSS_DATA_DIR: {cmd}",
+        );
+        // The script path lives outside any workspace, in the shared
+        // worker-settings dir.
+        let script = path_guard_script_path();
+        assert!(
+            cmd.contains(&shell_escape(&script.display().to_string())),
+            "guard must invoke the absolute gate-script path: {cmd}",
+        );
+    }
+
+    #[test]
+    fn path_guard_present_for_revision_sessions_too() {
+        // The gate is session-kind-agnostic: revision sessions get it
+        // alongside their gh-pr-create guard.
+        let mut input = sample_input();
+        input.execution_kind = "revision_implementation".into();
+        input.task_kind = Some("revision".into());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        assert!(
+            path_guard_command(&parsed).is_some(),
+            "revision sessions must also carry the deterministic path guard",
+        );
+    }
+
+    #[test]
+    fn path_guard_script_has_the_load_bearing_logic() {
+        // Guard against an accidental edit that guts the script. The
+        // deterministic gate hinges on: reading BOSS_DATA_DIR, resolving
+        // symlinks/.. via realpath, a component-wise prefix test, emitting
+        // a block decision, and pointing at the sanctioned recovery path.
+        let s = PATH_GUARD_SCRIPT;
+        assert!(s.contains("BOSS_DATA_DIR"), "must read the data dir from env");
+        assert!(s.contains("realpath"), "must canonicalise paths via realpath");
+        assert!(s.contains("expanduser") && s.contains("expandvars"),
+            "must expand ~ and $VAR indirection");
+        assert!(s.contains("\"decision\"") && s.contains("\"block\""),
+            "must be able to emit a block decision");
+        assert!(s.contains("boss task restore") || s.contains("boss shake"),
+            "block message must point at the sanctioned recovery surface");
+    }
+
+    #[test]
+    fn write_workspace_files_writes_path_guard_script_outside_workspace() {
+        let dir = TempDir::new().unwrap();
+        let input = WorkerSetupInput {
+            run_id: "run-guard".into(),
+            lease_id: "lease-guard".into(),
+            workspace_path: dir.path().to_path_buf(),
+            events_socket_path: PathBuf::from("/tmp/events.sock"),
+            boss_event_path: PathBuf::from("/tmp/boss-event"),
+            draft_pr_mode: false,
+            execution_kind: "chore_implementation".into(),
+            task_kind: Some("chore".into()),
+        };
+        write_workspace_files(&input).unwrap();
+
+        let script = path_guard_script_path();
+        assert!(script.exists(), "gate script must be written: {}", script.display());
+        // Must live outside the workspace tree (same rule as the
+        // settings file — never shipped into a worker PR).
+        assert!(
+            !script.starts_with(dir.path()),
+            "gate script must live outside the workspace: {}",
+            script.display(),
+        );
+        let body = std::fs::read_to_string(&script).unwrap();
+        assert_eq!(body, PATH_GUARD_SCRIPT, "written script must match the source");
+        // And the engine must never drop the gate script into the
+        // workspace's .claude/ where VCS could pick it up.
+        assert!(
+            !dir.path().join(".claude").join(PATH_GUARD_SCRIPT_NAME).exists(),
+            "gate script must not be written into the workspace .claude/ dir",
+        );
+    }
+
+    #[test]
+    fn heal_worker_settings_json_refreshes_path_guard_script() {
+        // On engine restart the heal sweep must (re)materialise the gate
+        // script so a live worker whose settings reference it still has a
+        // working PreToolUse gate even after TMPDIR churn.
+        let settings_dir = TempDir::new().unwrap();
+        // A settings file must exist for the dir to be considered live.
+        std::fs::write(settings_dir.path().join("ws.json"), "{}").unwrap();
+
+        heal_worker_settings_json(settings_dir.path(), &PathBuf::from("/stable/boss-event"));
+
+        let script = settings_dir.path().join(PATH_GUARD_SCRIPT_NAME);
+        assert!(script.exists(), "heal must refresh the gate script");
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), PATH_GUARD_SCRIPT);
     }
 }
