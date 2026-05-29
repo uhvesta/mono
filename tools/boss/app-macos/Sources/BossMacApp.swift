@@ -1,10 +1,14 @@
 import AppKit
 import SwiftUI
+import UpdateCore
 
 @main
 struct BossMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var chatModel = ChatViewModel(paths: BossEnginePaths.production())
+    // fromBundle() is only nil when CFBundleShortVersionString is absent —
+    // a condition that cannot occur in a stamped .app bundle.
+    @StateObject private var updateModel = UpdateModel.fromBundle()!
 
     var body: some Scene {
         WindowGroup {
@@ -41,6 +45,7 @@ struct BossMacApp: App {
         Settings {
             SettingsView()
                 .environmentObject(chatModel)
+                .environmentObject(updateModel)
         }
 
         WindowGroup("Description", id: "markdown-viewer", for: MarkdownViewerContent.self) { $content in

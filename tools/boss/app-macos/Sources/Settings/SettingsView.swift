@@ -1,4 +1,5 @@
 import SwiftUI
+import UpdateCore
 
 /// macOS Settings window for Boss (opened via Boss → Settings… or ⌘,).
 ///
@@ -8,6 +9,7 @@ import SwiftUI
 /// `state.db` and therefore their own independent settings.
 struct SettingsView: View {
     @EnvironmentObject private var chatModel: ChatViewModel
+    @EnvironmentObject private var updateModel: UpdateModel
 
     var body: some View {
         TabView {
@@ -22,6 +24,10 @@ struct SettingsView: View {
             FeatureFlagsViewer()
                 .tabItem {
                     Label("Feature Flags", systemImage: "flag")
+                }
+            UpdateSettingsView(model: updateModel)
+                .tabItem {
+                    Label("Updates", systemImage: "arrow.down.circle")
                 }
         }
         .environmentObject(chatModel)
