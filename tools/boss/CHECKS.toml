@@ -4,53 +4,39 @@ id = "rust-giant-structs-use-builder"
 [checks.config]
 builder = "bon"
 # Grandfathered files containing structs with 6+ named fields and no bon::Builder.
-# `exclude_files` skips the WHOLE file, so a new giant struct added to one of these
-# files is never examined. Prefer `exclude_structs` (below) for ordinary grandfathering:
-# it keeps the file in scope and exempts only the named legacy structs, so new
-# violators are still caught. Migrate files off this list onto `exclude_structs`.
-# TODO: Convert each listed struct to use bon::Builder and shrink both lists to empty.
+# `exclude_files` skips the WHOLE file: any giant struct in a listed file — including
+# ones added later — is never examined. That is the wrong tool for grandfathering
+# existing violations, so this list is intentionally tiny. Prefer `exclude_structs`
+# (below): the file stays in scope and only the named legacy structs are exempt, so a
+# NEW giant struct in the same file is still flagged.
+#
 # Paths are relative to this CHECKS.toml's directory (tools/boss/).
+#
+# The sole remaining entry is `cli/src/main.rs`, whose giant structs are clap
+# `#[derive(Parser/Args)]` command definitions. syn cannot tell those apart from
+# ordinary structs yet, so the whole file stays excluded until the separate
+# "clap args exempt by default" chore lands clap detection — at which point this
+# `exclude_files` list should disappear entirely.
 exclude_files = [
-  "bossctl/src/main.rs",
   "cli/src/main.rs",
-  "client/src/lib.rs",
-  "engine/src/app.rs",
-  "engine/src/audit.rs",
-  "engine/src/completion.rs",
-  "engine/src/coordinator.rs",
-  "engine/src/dispatch_events.rs",
-  "engine/src/dispatch_reader.rs",
-  "engine/src/external_tracker/github.rs",
-  "engine/src/external_tracker/mod.rs",
-  "engine/src/external_tracker/reconcile.rs",
-  "engine/src/host_adapter.rs",
-  "engine/src/host_registry.rs",
-  "engine/src/live_status_loop.rs",
-  "engine/src/merge_poller.rs",
-  "engine/src/settings.rs",
-  "engine/src/spawn_flow.rs",
-  "engine/src/work/audit_misc.rs",
-  "engine/src/work/mappers.rs",
-  "engine/src/worker_registry.rs",
-  "engine/src/worker_setup.rs",
-  "protocol/src/engine_app.rs",
-  "protocol/src/live_status_debug.rs",
-  "protocol/src/live_worker_state.rs",
-  "protocol/src/wire.rs",
 ]
-# Grandfathered struct NAMES. The file is still scanned, so any NEW giant struct added
-# alongside these is flagged. `tools/boss/protocol/src/types.rs` was migrated here off
-# `exclude_globs` so that new input/row types added to it (e.g. CreateAttentionInput)
-# are caught. TODO: convert these to #[derive(bon::Builder)] and remove them.
+# Grandfathered struct violations, scanned-but-exempt. The file is still parsed, so a
+# NEW giant struct added alongside any of these is flagged (this is how the
+# `CreateAttentionInput` miss — see T819 — is now caught). TODO: convert each to
+# `#[derive(bon::Builder)]` and delete its entry.
 #
 # Entry forms:
 #   "StructName"                   — simple name, scoped to this CHECKS.toml's subtree
 #                                    (tools/boss/). A same-named struct elsewhere in the
 #                                    repo is NOT exempted.
-#   "relative/path.rs::StructName" — qualified, resolved relative to this file's directory.
-#                                    Exempts that struct only in that exact file.
+#   "relative/path.rs::StructName" — qualified, resolved relative to this file's directory
+#                                    (tools/boss/). Exempts that struct only in that exact
+#                                    file, so a same-named struct in another file is still
+#                                    flagged. This is the form used by entries migrated off
+#                                    `exclude_globs` (T828/T829): it exempts exactly the
+#                                    known-existing violation and nothing more.
 exclude_structs = [
-  # tools/boss/protocol/src/types.rs
+  # tools/boss/protocol/src/types.rs (migrated from exclude_globs in T819/T828)
   "WorkItemExternalRef",
   "WorkRun",
   "WorkAttentionItem",
@@ -72,6 +58,45 @@ exclude_structs = [
   "CreateRunInput",
   "CreateAttentionItemInput",
   "WorkItemPatch",
+
+  # Migrated off exclude_globs (qualified per-file form). Each line is the exact giant
+  # struct that existed in that file when it was grandfathered; new giant structs in
+  # these files are now flagged. host_adapter.rs, settings.rs, and worker_registry.rs
+  # were dropped from exclude_globs without replacement — they have zero current
+  # violations (the structs that earned the exclude have since been migrated/removed).
+  "bossctl/src/main.rs::MetricRow",
+  "client/src/lib.rs::Discovery",
+  "engine/src/app.rs::ServerState",
+  "engine/src/audit.rs::StartContext",
+  "engine/src/completion.rs::ApiPr",
+  "engine/src/completion.rs::WorkerCompletionHandler",
+  "engine/src/coordinator.rs::CubeWorkspaceStatus",
+  "engine/src/coordinator.rs::CubeRepoSummary",
+  "engine/src/coordinator.rs::ExecutionCoordinator",
+  "engine/src/dispatch_events.rs::DispatchEvent",
+  "engine/src/dispatch_reader.rs::GhostActiveEntry",
+  "engine/src/dispatch_reader.rs::StalledStage",
+  "engine/src/external_tracker/github.rs::GitHubConfig",
+  "engine/src/external_tracker/mod.rs::UpstreamItem",
+  "engine/src/external_tracker/reconcile.rs::PassOutcome",
+  "engine/src/host_registry.rs::Host",
+  "engine/src/live_status_loop.rs::SlotDebugSnapshot",
+  "engine/src/live_status_loop.rs::DispatcherStatsSnapshot",
+  "engine/src/live_status_loop.rs::SlotConfig",
+  "engine/src/merge_poller.rs::PrLifecycleProbe",
+  "engine/src/merge_poller.rs::SweepOutcome",
+  "engine/src/spawn_flow.rs::StartWorkerInput",
+  "engine/src/work/audit_misc.rs::ProjectPropertyAuditEntry",
+  "engine/src/work/mappers.rs::ConflictResolutionInsertInput",
+  "engine/src/work/mappers.rs::CiRemediationInsertInput",
+  "engine/src/worker_setup.rs::WorkerSetupInput",
+  "protocol/src/engine_app.rs::SpawnWorkerPaneInput",
+  "protocol/src/live_status_debug.rs::LiveStatusDebugReport",
+  "protocol/src/live_status_debug.rs::DispatcherStatsReport",
+  "protocol/src/live_status_debug.rs::LiveStatusSlotDebug",
+  "protocol/src/live_worker_state.rs::LiveWorkerState",
+  "protocol/src/wire.rs::WorkspacePoolEntry",
+  "protocol/src/wire.rs::MetricLiveEntry",
 ]
 
 [checks.policy]

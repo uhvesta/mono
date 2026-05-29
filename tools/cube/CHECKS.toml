@@ -3,13 +3,21 @@ id = "rust-giant-structs-use-builder"
 
 [checks.config]
 builder = "bon"
-# Grandfathered files containing structs with 6+ named fields and no bon::Builder.
-# TODO: Convert each listed struct to use bon::Builder and remove the file from this list.
-# Paths are relative to this CHECKS.toml's directory (tools/cube/).
-exclude_files = [
-  "src/app.rs",
-  "src/metadata.rs",
-  "src/store.rs",
+# No whole-file excludes: all grandfathered cube files were migrated to per-struct
+# `exclude_structs` entries (below). `exclude_files` skips the WHOLE file, blinding the
+# check to any giant struct added later; `exclude_structs` keeps the file in scope and
+# exempts only the named legacy struct, so a NEW giant struct in the same file is flagged.
+exclude_files = []
+# Grandfathered struct violations, scanned-but-exempt. Qualified `relative/path.rs::Name`
+# form, resolved relative to this file's directory (tools/cube/): each entry exempts that
+# struct only in that exact file. TODO: convert each to `#[derive(bon::Builder)]` and
+# delete its entry.
+exclude_structs = [
+  "src/app.rs::ReconciledRow",
+  "src/metadata.rs::RepoRecord",
+  "src/metadata.rs::WorkspaceRecord",
+  "src/metadata.rs::ChangeRecord",
+  "src/store.rs::ExpiredLease",
 ]
 
 [checks.policy]
