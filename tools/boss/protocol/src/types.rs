@@ -408,6 +408,14 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "is_false")]
     #[builder(default)]
     pub has_in_progress_revision: bool,
+    /// FK to the `automations.id` that produced this task via the triage
+    /// phase. `None` for every task not produced by an automation. When set:
+    /// (1) links the task back to its automation for per-automation task
+    /// listing, (2) drives backlog/kanban exclusion, (3) routes the
+    /// execution to the automations pool, (4) is the denominator for the
+    /// automation's open-task limit. `None` on all pre-automation rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_automation_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1672,6 +1680,186 @@ pub enum ProjectDesignDocState {
 pub struct ResolveProjectDesignDocOutput {
     pub project_id: String,
     pub state: ProjectDesignDocState,
+}
+
+/// Trigger specification for an automation. The `schedule` variant is
+/// the only implemented trigger in v1; the enum is open to future
+/// variants (`Event`, `Manual`, etc.) without a schema migration because
+/// the DB stores the tagged JSON representation across two columns
+/// (`trigger_kind` discriminator + `trigger_config` body).
+///
+/// IANA timezone names (e.g. `"America/Los_Angeles"`) are stored alongside
+/// the cron expression so "every weekday at 2pm" means 2pm *local* across
+/// DST transitions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutomationTrigger {
+    Schedule {
+        /// Standard 5-field cron expression (`min hour dom month dow`).
+        cron: String,
+        /// IANA timezone name (e.g. `"America/Los_Angeles"`).
+        timezone: String,
+    },
+}
+
+/// A standing, triggered instruction that periodically asks whether a
+/// concrete maintenance task exists right now, and if so spawns one via
+/// a two-phase triage → execute flow. Automations live outside the normal
+/// backlog; the tasks they produce carry `source_automation_id` so they
+/// can be excluded from the kanban and accounted against the per-automation
+/// open-task cap.
+///
+/// See `tools/boss/docs/designs/maintenance-tasks.md` for the full design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct Automation {
+    pub id: String,
+    /// Per-product A-namespace short id (e.g. A1, A2 …). `None` only on rows
+    /// that predate the column (in practice always `Some` after schema
+    /// migration runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<i64>,
+    pub product_id: String,
+    pub name: String,
+    /// Explicit target repo for the triage worker lease. `None` → default to
+    /// the product's primary `repo_remote_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote_url: Option<String>,
+    /// Deserialized trigger — schedule cron+tz for the `schedule` variant.
+    /// Stored in the DB as two columns (`trigger_kind` + `trigger_config`).
+    pub trigger: AutomationTrigger,
+    /// The standing instruction passed verbatim to the triage agent.
+    pub standing_instruction: String,
+    /// Maximum number of produced tasks that may be open simultaneously. The
+    /// scheduler skips a fire and records `suppressed_at_limit` when the live
+    /// count reaches this cap. Default 1.
+    #[serde(default = "default_open_task_limit")]
+    #[builder(default = default_open_task_limit())]
+    pub open_task_limit: i64,
+    /// Per-automation override of the catch-up window (seconds). `None` → use
+    /// the engine constant (15 min). See scheduling semantics in the design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_window_secs: Option<i64>,
+    /// `true` → the scheduler considers this automation for firing. `false` →
+    /// the automation is paused; no fires are recorded.
+    #[serde(default = "default_true")]
+    #[builder(default = true)]
+    pub enabled: bool,
+    /// Surface that created this automation (`cli`, `mac_app`, `unknown`, …).
+    #[serde(default = "default_unknown_created_via")]
+    #[builder(default = default_unknown_created_via())]
+    pub created_via: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// RFC 3339 timestamp of the most recent scheduler fire (whether it
+    /// produced a task, was skipped, or failed). `None` until the first fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<String>,
+    /// Outcome of the most recent `automation_runs` row for this automation.
+    /// Mirrors `AutomationRun::outcome`; denormalised here for cheap list
+    /// display. `None` until the first fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
+    /// UTC RFC 3339 timestamp of the next scheduled fire, computed from the
+    /// cron expression + timezone. `None` for disabled automations or before
+    /// the first `next_due_at` computation runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_due_at: Option<String>,
+}
+
+fn default_open_task_limit() -> i64 {
+    1
+}
+
+/// One recorded fire of an automation — the wire shape of an
+/// `automation_runs` row. Created for every occurrence, including
+/// no-ops (`skipped`) and failures (`failed_will_retry`,
+/// `failed_gave_up`), so the Automations tab can show a complete
+/// history. `outcome` values:
+///
+/// - `produced_task` — triage agent created a task; `produced_task_id` is set.
+/// - `skipped` — triage agent decided nothing actionable exists right now.
+/// - `suppressed_at_limit` — fire was due but open-task count was already at
+///   the cap; no triage agent ran.
+/// - `failed_will_retry` — pre-start failure (VPN down, cube lease error);
+///   same `scheduled_for` will be retried with backoff.
+/// - `failed_gave_up` — retries exhausted; occurrence abandoned, schedule
+///   advances.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct AutomationRun {
+    pub id: String,
+    pub automation_id: String,
+    /// UTC RFC 3339 timestamp of the cron occurrence this run satisfies.
+    /// Used as the dedup key (at most one run per occurrence per automation).
+    pub scheduled_for: String,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// The `work_executions.id` of the phase-1 triage execution. `None`
+    /// when no triage execution was created (e.g. `suppressed_at_limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_execution_id: Option<String>,
+    pub outcome: String,
+    /// FK to the `tasks.id` produced by triage. Set iff `outcome =
+    /// 'produced_task'`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_task_id: Option<String>,
+    /// Human-readable reason for `skipped` or failure detail for
+    /// `failed_*` outcomes. `None` for `produced_task` /
+    /// `suppressed_at_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Input to `CreateAutomation`. Carries only the caller-supplied fields;
+/// the engine stamps `id`, `short_id`, `created_at`, `updated_at`, and the
+/// initial scheduler bookkeeping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct CreateAutomationInput {
+    pub product_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote_url: Option<String>,
+    pub trigger: AutomationTrigger,
+    pub standing_instruction: String,
+    #[serde(default = "default_open_task_limit")]
+    #[builder(default = default_open_task_limit())]
+    pub open_task_limit: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_window_secs: Option<i64>,
+    /// When `false`, the automation is created disabled. Defaults to `true`.
+    #[serde(default = "default_true")]
+    #[builder(default = true)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
+}
+
+/// Input to `UpdateAutomation`. All fields are `Option`; `None` means
+/// "leave unchanged."
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct AutomationPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<AutomationTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_instruction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_task_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_window_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 /// Input to `SetProductExternalTracker`: bind (or unbind) an external
@@ -2995,6 +3183,105 @@ mod tests {
             let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
             assert_eq!(auth, back);
         }
+    }
+
+    #[test]
+    fn automation_trigger_schedule_roundtrips() {
+        let trigger = AutomationTrigger::Schedule {
+            cron: "0 14 * * 1-5".to_owned(),
+            timezone: "America/Los_Angeles".to_owned(),
+        };
+        let encoded = serde_json::to_value(&trigger).unwrap();
+        assert_eq!(encoded["kind"], "schedule");
+        assert_eq!(encoded["cron"], "0 14 * * 1-5");
+        assert_eq!(encoded["timezone"], "America/Los_Angeles");
+        let back: AutomationTrigger = serde_json::from_value(encoded).unwrap();
+        assert_eq!(trigger, back);
+    }
+
+    #[test]
+    fn automation_roundtrips() {
+        let trigger = AutomationTrigger::Schedule {
+            cron: "0 2 * * *".to_owned(),
+            timezone: "UTC".to_owned(),
+        };
+        let automation = Automation::builder()
+            .id("auto_1")
+            .product_id("prod_1")
+            .name("Nightly lint")
+            .trigger(trigger)
+            .standing_instruction("Fix clippy warnings if any exist")
+            .created_at("1700000000")
+            .updated_at("1700000000")
+            .build();
+        assert_eq!(automation.open_task_limit, 1);
+        assert!(automation.enabled);
+        assert_eq!(automation.created_via, CREATED_VIA_UNKNOWN);
+        let encoded = serde_json::to_value(&automation).unwrap();
+        let back: Automation = serde_json::from_value(encoded).unwrap();
+        assert_eq!(automation.id, back.id);
+        assert_eq!(automation.open_task_limit, back.open_task_limit);
+    }
+
+    #[test]
+    fn automation_run_roundtrips() {
+        let run = AutomationRun::builder()
+            .id("run_1")
+            .automation_id("auto_1")
+            .scheduled_for("1700000000")
+            .started_at("1700000001")
+            .outcome("skipped")
+            .detail("no clippy warnings found")
+            .build();
+        let encoded = serde_json::to_value(&run).unwrap();
+        let back: AutomationRun = serde_json::from_value(encoded).unwrap();
+        assert_eq!(run.id, back.id);
+        assert_eq!(run.outcome, back.outcome);
+        assert_eq!(run.detail, back.detail);
+        assert!(back.produced_task_id.is_none());
+    }
+
+    #[test]
+    fn task_source_automation_id_defaults_to_none() {
+        let raw = json!({
+            "id": "task_1",
+            "product_id": "prod_1",
+            "project_id": null,
+            "kind": "chore",
+            "name": "Fix lint",
+            "description": "",
+            "status": "todo",
+            "ordinal": null,
+            "pr_url": null,
+            "deleted_at": null,
+            "created_at": "1700000000",
+            "updated_at": "1700000000",
+        });
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert!(task.source_automation_id.is_none());
+    }
+
+    #[test]
+    fn task_source_automation_id_roundtrips() {
+        let raw = json!({
+            "id": "task_1",
+            "product_id": "prod_1",
+            "project_id": null,
+            "kind": "chore",
+            "name": "Fix lint",
+            "description": "",
+            "status": "todo",
+            "ordinal": null,
+            "pr_url": null,
+            "deleted_at": null,
+            "created_at": "1700000000",
+            "updated_at": "1700000000",
+            "source_automation_id": "auto_1",
+        });
+        let task: Task = serde_json::from_value(raw).unwrap();
+        assert_eq!(task.source_automation_id.as_deref(), Some("auto_1"));
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert_eq!(encoded["source_automation_id"], "auto_1");
     }
 
     #[test]

@@ -288,8 +288,15 @@ impl WorkDb {
         // other table; `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
         // Design: tools/boss/docs/designs/comments-in-markdown-viewer.md
         migrate_work_comments_table(&conn)?;
+        // Automations foundation (maintenance-tasks.md): `automations`,
+        // `automation_runs`, `automation_short_id_sequences` tables plus
+        // `tasks.source_automation_id` provenance column. Purely additive —
+        // no existing rows are touched and no behaviour changes ship with
+        // this migration. Everything depends on these tables existing.
+        migrate_automations_tables(&conn)?;
+        migrate_tasks_source_automation_id(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '12')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '13')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

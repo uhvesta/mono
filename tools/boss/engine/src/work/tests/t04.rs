@@ -665,7 +665,7 @@ fn fresh_init_includes_external_tracker_schema() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "12");
+    assert_eq!(version, "13");
     let _ = std::fs::remove_file(path);
 }
 
@@ -764,7 +764,7 @@ fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "12");
+    assert_eq!(version, "13");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1219,7 +1219,7 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "12");
+    assert_eq!(version, "13");
 
     // After migration we can also write a fresh `blocked` row
     // and re-backfill is still a no-op (the existing rows

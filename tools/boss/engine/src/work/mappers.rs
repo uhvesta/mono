@@ -155,6 +155,9 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         revision_parent_pr_url: None,
         // Computed by attach_in_progress_revision_flag in get_work_tree.
         has_in_progress_revision: false,
+        // Populated by map_task_with_source_automation_id when the SELECT
+        // includes that column; None for all standard task queries.
+        source_automation_id: None,
     })
 }
 
@@ -487,4 +490,107 @@ pub(crate) fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option
     )?;
     let row = stmt.query_row([id], map_ci_remediation).optional()?;
     Ok(row)
+}
+
+/// Reconstruct an [`AutomationTrigger`] from the two DB columns
+/// (`trigger_kind` discriminator + `trigger_config` JSON body).
+///
+/// The body does NOT contain the `"kind"` field — the discriminator is
+/// stored separately for cheap index filtering. We inject it back before
+/// deserialising.
+pub(crate) fn automation_trigger_from_db(
+    kind: &str,
+    config_json: &str,
+) -> anyhow::Result<boss_protocol::AutomationTrigger> {
+    let mut config: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(config_json)
+            .with_context(|| format!("failed to parse trigger_config JSON: {config_json}"))?;
+    config.insert(
+        "kind".to_owned(),
+        serde_json::Value::String(kind.to_owned()),
+    );
+    let trigger =
+        serde_json::from_value::<boss_protocol::AutomationTrigger>(serde_json::Value::Object(
+            config,
+        ))
+        .with_context(|| format!("failed to deserialise AutomationTrigger with kind={kind}"))?;
+    Ok(trigger)
+}
+
+/// Split an [`AutomationTrigger`] into `(trigger_kind, trigger_config_json)`
+/// for DB storage. The `"kind"` field is removed from the config body so the
+/// discriminator can be stored separately without duplication.
+pub(crate) fn automation_trigger_to_db(
+    trigger: &boss_protocol::AutomationTrigger,
+) -> anyhow::Result<(String, String)> {
+    let tagged = serde_json::to_value(trigger)
+        .context("failed to serialise AutomationTrigger")?;
+    let mut map = match tagged {
+        serde_json::Value::Object(m) => m,
+        other => anyhow::bail!("unexpected AutomationTrigger JSON shape: {other}"),
+    };
+    let kind = map
+        .remove("kind")
+        .and_then(|v| v.as_str().map(|s| s.to_owned()))
+        .context("AutomationTrigger serialised without 'kind' field")?;
+    let config = serde_json::to_string(&map).context("failed to re-serialise trigger body")?;
+    Ok((kind, config))
+}
+
+/// Map a row from the canonical `automations` SELECT column order:
+/// 0  id, 1 short_id, 2 product_id, 3 name, 4 repo_remote_url,
+/// 5  trigger_kind, 6 trigger_config, 7 standing_instruction,
+/// 8  open_task_limit, 9 catch_up_window_secs, 10 enabled,
+/// 11 created_via, 12 created_at, 13 updated_at,
+/// 14 last_fired_at, 15 last_outcome, 16 next_due_at
+pub(crate) fn map_automation(
+    row: &Row<'_>,
+) -> rusqlite::Result<boss_protocol::Automation> {
+    let trigger_kind: String = row.get(5)?;
+    let trigger_config: String = row.get(6)?;
+    let trigger =
+        automation_trigger_from_db(&trigger_kind, &trigger_config).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+            )
+        })?;
+    Ok(boss_protocol::Automation {
+        id: row.get(0)?,
+        short_id: row.get(1)?,
+        product_id: row.get(2)?,
+        name: row.get(3)?,
+        repo_remote_url: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+        trigger,
+        standing_instruction: row.get(7)?,
+        open_task_limit: row.get(8)?,
+        catch_up_window_secs: row.get(9)?,
+        enabled: row.get::<_, i64>(10)? != 0,
+        created_via: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        last_fired_at: row.get::<_, Option<String>>(14)?.filter(|s| !s.is_empty()),
+        last_outcome: row.get::<_, Option<String>>(15)?.filter(|s| !s.is_empty()),
+        next_due_at: row.get::<_, Option<String>>(16)?.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Map a row from the canonical `automation_runs` SELECT column order:
+/// 0 id, 1 automation_id, 2 scheduled_for, 3 started_at, 4 finished_at,
+/// 5 triage_execution_id, 6 outcome, 7 produced_task_id, 8 detail
+pub(crate) fn map_automation_run(
+    row: &Row<'_>,
+) -> rusqlite::Result<boss_protocol::AutomationRun> {
+    Ok(boss_protocol::AutomationRun {
+        id: row.get(0)?,
+        automation_id: row.get(1)?,
+        scheduled_for: row.get(2)?,
+        started_at: row.get(3)?,
+        finished_at: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+        triage_execution_id: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+        outcome: row.get(6)?,
+        produced_task_id: row.get::<_, Option<String>>(7)?.filter(|s| !s.is_empty()),
+        detail: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+    })
 }
