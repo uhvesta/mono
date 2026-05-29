@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # checks.sh — CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.).
-# On PR builds: scoped to changed files via --base_ref=origin/<base-branch>.
-# On push-to-main builds: runs --all.
+# Always scoped to what changed via --base-ref=<base>. Never runs --all
+# automatically. --all is manual-only, for catching/fixing pre-existing
+# violations.
 # Does not invoke jj; checkleft detects the git VCS automatically.
 #
 # checkleft is invoked via repobin (bin/checkleft) rather than `bazel run` so
@@ -17,14 +18,17 @@ echo "--- [checks] installing repobin tools into bin/"
 bazel build --config=ci-linux-disk-cache //tools/repobin:repobin
 ./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
 
-# Determine run scope: PR builds scope to changed files; main builds run all.
+# Always scope to what changed. --all is manual-only.
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
     base_branch="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
     echo "[checks] PR build — scoping to changes against origin/${base_branch}"
     CHECKLEFT_ARGS=(run --base-ref="origin/${base_branch}")
 else
-    echo "[checks] push build — running all checks"
-    CHECKLEFT_ARGS=(run --all)
+    # Push-to-main or merge-queue build. Derive the merge-base against
+    # origin/main so only this push's changes are checked.
+    merge_base=$(git merge-base HEAD origin/main)
+    echo "[checks] push/merge-queue build — scoping to changes since ${merge_base}"
+    CHECKLEFT_ARGS=(run --base-ref="${merge_base}")
 fi
 
 bin/checkleft "${CHECKLEFT_ARGS[@]}"
