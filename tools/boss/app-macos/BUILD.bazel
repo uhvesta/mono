@@ -81,6 +81,11 @@ macos_application(
         "//tools/boss/event-shim:boss-event": "Resources/bin",
         "//tools/cube:cube": "Resources/bin",
         "//tools/boss/app-macos/Sources/Resources/TrekIcons:trek_icons": "Resources/TrekIcons",
+        # relaunch-helper.sh: the detached swap/relaunch watchdog the app spawns
+        # after UpdateInstaller (UpdateCore) stages the new bundle in-process.
+        # Bundled at Resources/ top level so the app resolves it with
+        # Bundle.main.url(forResource: "relaunch-helper", withExtension: "sh").
+        "//tools/boss/app-macos/Sources/Resources/RelaunchHelper:relaunch_helper": "Resources",
     },
     visibility = ["//tools/boss/installer:__pkg__"],
 )

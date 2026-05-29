@@ -227,6 +227,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
+        // Self-updater: complete any pending bundle swap and write this version's
+        // first-launch-OK flag (which the relaunch watchdog polls for). Runs before
+        // anything else touches the update state so a relaunch helper from the swap
+        // that brought us here sees a healthy launch promptly. The startup-swap
+        // *fallback* (applying a not-yet-installed staged update) runs later, at the
+        // engine-launch chokepoint in ChatViewModel.startIfNeeded(). See
+        // [[UpdateLifecycle]] and design doc §4.
+        UpdateLifecycle.reconcileAtLaunch()
+
         // Start the main-thread hang watchdog. Captures the main thread's
         // Mach port here (we are on the main thread), then runs a
         // background watchdog that records a stall + backtrace whenever
@@ -261,6 +270,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Quit Anyway
         return .terminateNow
+    }
+
+    /// Swap-on-quit (design doc §4): once termination is confirmed, apply any staged
+    /// update in place so the next launch runs the new version. The agents-running
+    /// gate is upstream in `applicationShouldTerminate(_:)` — reaching here means the
+    /// user accepted the quit. Best-effort and non-blocking: a failed swap leaves the
+    /// current bundle untouched, and the startup path retries next launch.
+    func applicationWillTerminate(_ notification: Notification) {
+        UpdateLifecycle.applyQuitSwapIfNeeded()
     }
 
     /// When the last window is closed and workers are still alive, keep
