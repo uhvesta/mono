@@ -1789,6 +1789,9 @@ struct WorkBoardCardView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         PriorityChip(priority: WorkPriority.parse(task.priority))
+                        if let effortLevel = task.effortLevel {
+                            EffortChip(effortLevel: effortLevel)
+                        }
                         if let projectName, !projectName.isEmpty {
                             WorkStatusBadge(text: projectName)
                         }
@@ -4108,6 +4111,70 @@ private struct PriorityChip: View {
         case .high: return .red
         case .medium: return Color(nsColor: .secondaryLabelColor)
         case .low: return .blue
+        }
+    }
+}
+
+/// Effort-level chip rendered on kanban cards. Only shown when the
+/// task carries a non-nil effort_level — unset rows must not masquerade
+/// as medium.
+private struct EffortChip: View {
+    let effortLevel: String
+
+    var body: some View {
+        Text(letter)
+            .font(.caption.weight(.bold))
+            .foregroundStyle(foregroundColor)
+            .frame(minWidth: 18)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(backgroundColor)
+            .clipShape(Capsule())
+            .help("Effort: \(label)")
+            .accessibilityLabel("Effort \(label)")
+    }
+
+    private var letter: String {
+        switch effortLevel {
+        case "trivial": return "T"
+        case "small": return "S"
+        case "medium": return "M"
+        case "large": return "L"
+        case "max": return "X"
+        default: return effortLevel.prefix(1).uppercased()
+        }
+    }
+
+    private var label: String {
+        switch effortLevel {
+        case "trivial": return "Trivial"
+        case "small": return "Small"
+        case "medium": return "Medium"
+        case "large": return "Large"
+        case "max": return "Max"
+        default: return effortLevel.capitalized
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch effortLevel {
+        case "trivial": return Color.blue.opacity(0.12)
+        case "small": return Color.green.opacity(0.14)
+        case "medium": return Color.gray.opacity(0.18)
+        case "large": return Color.orange.opacity(0.18)
+        case "max": return Color.red.opacity(0.14)
+        default: return Color.gray.opacity(0.18)
+        }
+    }
+
+    private var foregroundColor: Color {
+        switch effortLevel {
+        case "trivial": return .blue
+        case "small": return Color(nsColor: .systemGreen)
+        case "medium": return Color(nsColor: .secondaryLabelColor)
+        case "large": return .orange
+        case "max": return .red
+        default: return Color(nsColor: .secondaryLabelColor)
         }
     }
 }

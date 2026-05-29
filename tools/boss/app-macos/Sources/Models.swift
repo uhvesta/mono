@@ -523,6 +523,11 @@ struct WorkTask: Identifiable, Hashable {
     /// PR should not be merged yet. Only meaningful on chain-root tasks that
     /// carry a `prURL`. Mirrors `has_in_progress_revision` on the wire.
     var hasInProgressRevision: Bool = false
+    /// Size estimate for this work item. One of `trivial`, `small`, `medium`,
+    /// `large`, `max`. `nil` when the row has no effort estimate (pre-column
+    /// rows or items where the engine emitted `null`). Mirrors
+    /// `Task.effort_level` on the wire; absent means unset, NOT medium.
+    var effortLevel: String? = nil
 
     var isChore: Bool {
         kind == "chore"
