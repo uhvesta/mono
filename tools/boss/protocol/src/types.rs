@@ -401,6 +401,17 @@ pub struct Task {
     /// root has no PR yet (rare — the create gate normally blocks that).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_parent_pr_url: Option<String>,
+    /// `true` when any descendant revision task in the chain has status
+    /// `todo` or `active` — new commits are still incoming, so the PR is
+    /// not safe to merge yet. Derived projection, not stored. Only
+    /// meaningful on chain-root tasks that carry a `pr_url`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub has_in_progress_revision: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 fn default_true() -> bool {

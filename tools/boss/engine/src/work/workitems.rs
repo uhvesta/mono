@@ -274,7 +274,7 @@ impl WorkDb {
             collect_rows(rows)?
         };
 
-        let chores = {
+        let mut chores = {
             let mut stmt = conn.prepare(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_branch, parent_task_id
                  FROM tasks
@@ -294,7 +294,10 @@ impl WorkDb {
         // Compute revision projections (revision_seq, revision_parent_pr_url)
         // for every `kind = 'revision'` task. These are derived fields —
         // not stored columns — so they are calculated fresh here.
-        let tasks = attach_revision_projections(tasks, &chores);
+        let mut tasks = attach_revision_projections(tasks, &chores);
+        // Compute has_in_progress_revision for every chain-root task that
+        // has at least one todo/active descendant revision.
+        attach_in_progress_revision_flag(&mut tasks, &mut chores);
 
         Ok(WorkTree {
             product,

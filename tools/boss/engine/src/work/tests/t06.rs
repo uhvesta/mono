@@ -1299,6 +1299,160 @@ fn get_work_tree_two_revisions_get_distinct_seqs() {
     assert_eq!(seq(&r2.id), Some(2), "r2 must be R2");
 }
 
+// ── attach_in_progress_revision_flag ─────────────────────────────────────
+
+#[test]
+fn in_progress_flag_set_for_todo_revision() {
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/1"), "2026-01-01");
+    let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    rev.status = "todo".to_owned();
+
+    let mut tasks = vec![rev];
+    let mut chores = vec![root];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    assert!(
+        chores.iter().find(|t| t.id == "root").unwrap().has_in_progress_revision,
+        "todo revision must trigger the flag on the chain root"
+    );
+}
+
+#[test]
+fn in_progress_flag_set_for_active_revision() {
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/2"), "2026-01-01");
+    let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    rev.status = "active".to_owned();
+
+    let mut tasks = vec![rev];
+    let mut chores = vec![root];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    assert!(
+        chores.iter().find(|t| t.id == "root").unwrap().has_in_progress_revision,
+        "active revision must trigger the flag on the chain root"
+    );
+}
+
+#[test]
+fn in_progress_flag_clear_for_in_review_revision() {
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/3"), "2026-01-01");
+    let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    rev.status = "in_review".to_owned();
+
+    let mut tasks = vec![rev];
+    let mut chores = vec![root];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    assert!(
+        !chores.iter().find(|t| t.id == "root").unwrap().has_in_progress_revision,
+        "in_review revision must NOT trigger the flag"
+    );
+}
+
+#[test]
+fn in_progress_flag_clear_for_done_revision() {
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/4"), "2026-01-01");
+    let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    rev.status = "done".to_owned();
+
+    let mut tasks = vec![rev];
+    let mut chores = vec![root];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    assert!(
+        !chores.iter().find(|t| t.id == "root").unwrap().has_in_progress_revision,
+        "done revision must NOT trigger the flag"
+    );
+}
+
+#[test]
+fn in_progress_flag_chain_revision_of_revision() {
+    // R2 is a revision-of-R1: the flag must still reach the chain root.
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/5"), "2026-01-01");
+    let r1 = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    // r1 is done; r2 (chained) is todo
+    let mut r1 = r1;
+    r1.status = "done".to_owned();
+    let mut r2 = make_bare_task("r2", "revision", Some("r1"), None, "2026-01-03");
+    r2.status = "todo".to_owned();
+
+    let mut tasks = vec![r1, r2];
+    let mut chores = vec![root];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    assert!(
+        chores.iter().find(|t| t.id == "root").unwrap().has_in_progress_revision,
+        "in-progress revision deep in the chain must still flag the root"
+    );
+}
+
+#[test]
+fn in_progress_flag_project_task_root() {
+    // Chain root is a project_task in the tasks slice (not in chores).
+    let mut root = make_bare_task("root", "project_task", None, Some("https://gh/pull/6"), "2026-01-01");
+    root.status = "in_review".to_owned();
+    let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
+    rev.status = "todo".to_owned();
+
+    let mut tasks = vec![root, rev];
+    let mut chores = vec![];
+    attach_in_progress_revision_flag(&mut tasks, &mut chores);
+
+    assert!(
+        tasks.iter().find(|t| t.id == "root").unwrap().has_in_progress_revision,
+        "flag must be set on a project_task root in the tasks slice"
+    );
+    assert!(
+        !tasks.iter().find(|t| t.id == "r1").unwrap().has_in_progress_revision,
+        "flag must NOT be set on the revision itself"
+    );
+}
+
+#[test]
+fn get_work_tree_has_in_progress_revision() {
+    // End-to-end: a todo revision causes the chain root chore to carry the flag.
+    let db = WorkDb::open(temp_db_path("in-progress-rev-flag")).unwrap();
+    let product_id = make_revision_product(&db, "flag-e2e");
+    let pr_url = "https://github.com/spinyfin/mono/pull/500";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    db.create_revision(revision_input(&parent_id), &checker).unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let root_chore = tree.chores.iter().find(|c| c.id == parent_id)
+        .expect("chain root chore must be in work_tree.chores");
+
+    assert!(
+        root_chore.has_in_progress_revision,
+        "chain root chore must carry has_in_progress_revision=true when a todo revision exists"
+    );
+}
+
+#[test]
+fn get_work_tree_flag_cleared_when_revision_in_review() {
+    // A revision that moves to in_review no longer triggers the flag.
+    let db = WorkDb::open(temp_db_path("in-progress-rev-cleared")).unwrap();
+    let product_id = make_revision_product(&db, "flag-cleared");
+    let pr_url = "https://github.com/spinyfin/mono/pull/501";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+
+    // Move the revision to in_review (simulates the worker completing and opening a PR).
+    db.force_task_status_for_test(&revision.id, "in_review").unwrap();
+
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let root_chore = tree.chores.iter().find(|c| c.id == parent_id)
+        .expect("chain root chore must be in work_tree.chores");
+
+    assert!(
+        !root_chore.has_in_progress_revision,
+        "flag must be false when the only revision is in_review"
+    );
+}
+
 // ── auto-gate: new revision blocks on prior active revision ─────────────
 
 /// First revision on a PR has no prior sibling → no dependency edge.

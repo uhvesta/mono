@@ -1851,6 +1851,9 @@ struct WorkBoardCardView: View {
                         font: .caption,
                         ambiguousRepoNames: ambiguousRepoNames
                     )
+                    if task.hasInProgressRevision {
+                        PrInRevisionIndicator()
+                    }
                     Spacer(minLength: 0)
                 }
             }
@@ -3544,6 +3547,27 @@ private struct PrMergingIndicator: View {
         @unknown default:
             return Color(red: 165/255, green: 107/255, blue: 0/255)
         }
+    }
+}
+
+/// Warning indicator shown on the PR card of a chain root when at least one
+/// descendant revision is still `todo` or `active`. Signals that new commits
+/// are incoming and the PR should not be merged yet.
+private struct PrInRevisionIndicator: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2.weight(.semibold))
+            Text("in revision")
+                .font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(Color.white)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.orange)
+        .clipShape(Capsule())
+        .help("A revision is in progress — do not merge this PR yet")
+        .accessibilityLabel("In revision — do not merge")
     }
 }
 

@@ -518,6 +518,11 @@ struct WorkTask: Identifiable, Hashable {
     /// Denormalized parent chain-root PR URL for fast revision card rendering.
     /// `nil` for non-revision rows. Mirrors `revision_parent_pr_url` on the wire.
     var revisionParentPrUrl: String? = nil
+    /// `true` when any descendant revision task in the chain has status
+    /// `todo` or `active`. Indicates new commits are still incoming and the
+    /// PR should not be merged yet. Only meaningful on chain-root tasks that
+    /// carry a `prURL`. Mirrors `has_in_progress_revision` on the wire.
+    var hasInProgressRevision: Bool = false
 
     var isChore: Bool {
         kind == "chore"

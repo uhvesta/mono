@@ -246,6 +246,70 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
     tasks
 }
 
+/// Set `has_in_progress_revision = true` on every chain-root task that has
+/// at least one descendant revision with status `todo` or `active`.
+///
+/// Called by `get_work_tree` after [`attach_revision_projections`]. Only
+/// revisions in the `tasks` slice are inspected (revisions can only be
+/// `kind = "revision"` tasks, never chores). The chain root can live in
+/// either `tasks` or `chores`, so both slices are mutated.
+///
+/// Status rule: `todo` and `active` are the in-progress states. `in_review`
+/// means the revision's commit has already landed on the PR branch — that is
+/// NOT a merge blocker. `done` and deleted revisions likewise don't trigger
+/// the flag.
+pub(crate) fn attach_in_progress_revision_flag(tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {
+    // Build a compact lookup: id → (kind, parent_task_id) for chain walking.
+    let mut lookup: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
+    for t in tasks.iter().chain(chores.iter()) {
+        lookup.insert(t.id.clone(), (t.kind.clone(), t.parent_task_id.clone()));
+    }
+
+    /// Walk parent_task_id links to the first non-revision ancestor.
+    /// Returns the root id or `None` when the chain is broken or cycles.
+    fn walk_to_root(
+        start: &str,
+        lookup: &std::collections::HashMap<String, (String, Option<String>)>,
+    ) -> Option<String> {
+        let mut cur = start.to_owned();
+        for _ in 0..20 {
+            let (kind, parent_id) = lookup.get(&cur)?;
+            if kind != "revision" {
+                return Some(cur);
+            }
+            cur = parent_id.clone()?;
+        }
+        None
+    }
+
+    // Collect all root ids that have at least one in-progress revision.
+    let mut in_progress_roots: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for t in tasks.iter() {
+        if t.kind == "revision" && (t.status == "todo" || t.status == "active") {
+            if let Some(root_id) = walk_to_root(&t.id, &lookup) {
+                in_progress_roots.insert(root_id);
+            }
+        }
+    }
+
+    if in_progress_roots.is_empty() {
+        return;
+    }
+
+    for task in tasks.iter_mut() {
+        if task.kind != "revision" && in_progress_roots.contains(&task.id) {
+            task.has_in_progress_revision = true;
+        }
+    }
+    for chore in chores.iter_mut() {
+        if in_progress_roots.contains(&chore.id) {
+            chore.has_in_progress_revision = true;
+        }
+    }
+}
+
 // ── revision name helpers ────────────────────────────────────────────────────
 
 /// Extract a short display name from a revision description.
