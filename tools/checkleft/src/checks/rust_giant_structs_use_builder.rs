@@ -129,8 +129,7 @@ impl ConfiguredCheck for ParsedConfig {
                     }),
                     remediation: Some(format!(
                         "Add `#[derive({}::Builder)]` (and `#[builder(on(String, into))]` per the project convention) above the struct.\n\
-                        Permanently exempt a file by adding it to `exclude_globs` in `CHECKS.toml`.\n\
-                        Request a one-off PR exception using `BYPASS_RUST_GIANT_STRUCTS_USE_BUILDER=<specific legitimate reason>` in the PR or commit description. Only for a real exception or emergency — never use bypasses for convenience.",
+                        Permanently exempt a file by adding it to `exclude_globs` in `CHECKS.toml`.",
                         self.builder.crate_name(),
                     )),
                     suggested_fix: None,

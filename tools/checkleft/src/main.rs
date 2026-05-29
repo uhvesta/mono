@@ -490,7 +490,7 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
     out.push_str(&format!(
         "{}[{}]: {}\n",
         style.paint_severity(finding.severity),
-        result.check_id,
+        style.paint_check_id(&result.check_id),
         style.paint_message(&finding.message)
     ));
 
@@ -505,8 +505,9 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
         let lines: Vec<&str> = remediation.lines().collect();
         if lines.len() > 1 {
             out.push_str(&format!("   = {}:\n", style.paint_help_label("to resolve")));
+            let bullet = style.resolution_bullet();
             for line in lines {
-                out.push_str(&format!("   - {}\n", style.paint_help_body(line)));
+                out.push_str(&format!("   {bullet} {}\n", style.paint_help_body(line)));
             }
         } else {
             out.push_str(&format!(
@@ -609,6 +610,14 @@ impl OutputStyle {
 
     fn paint_message(self, text: &str) -> String {
         self.paint_ansi(text, "1")
+    }
+
+    fn paint_check_id(self, text: &str) -> String {
+        self.paint_help_body(text)
+    }
+
+    fn resolution_bullet(self) -> &'static str {
+        if self.level != ColorLevel::None { "○" } else { "-" }
     }
 
     fn paint_help_body(self, text: &str) -> String {

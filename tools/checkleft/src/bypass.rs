@@ -80,7 +80,7 @@ pub fn bypass_name_for_check_id(check_id: &str) -> String {
 
 pub fn bypass_failure_guidance(bypass_name: &str) -> String {
     format!(
-        "Add `{bypass_name}=<specific legitimate reason>` to the PR or commit description only for a real exception. Never use bypasses for convenience."
+        "Request a one-off PR exception using `{bypass_name}=<specific legitimate reason>` in the PR or commit description. Only for a real exception or emergency - never use bypasses for convenience."
     )
 }
 
@@ -204,7 +204,7 @@ mod tests {
     fn bypass_failure_guidance_includes_strict_wording() {
         let guidance = bypass_failure_guidance("BYPASS_API_BREAKING_SURFACE");
         assert!(guidance.contains("BYPASS_API_BREAKING_SURFACE=<specific legitimate reason>"));
-        assert!(guidance.contains("Never use bypasses for convenience"));
+        assert!(guidance.contains("never use bypasses for convenience"));
     }
 
     #[test]

@@ -155,6 +155,69 @@ fn human_output_multi_line_remediation_renders_as_bullets() {
 }
 
 #[test]
+fn human_output_multi_line_remediation_uses_circle_bullet_when_color_enabled() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "check-id".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Error,
+                message: "something is wrong".to_owned(),
+                location: None,
+                remediation: Some("Do option A.\nDo option B.".to_owned()),
+                suggested_fix: None,
+            }],
+        }],
+        OutputStyle { level: ColorLevel::Basic },
+        Duration::from_secs(1),
+    );
+
+    assert!(output.contains("   ○ "));
+    assert!(!output.contains("   - "));
+}
+
+#[test]
+fn human_output_check_id_is_gray_when_color_enabled() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "no-debug-logging".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Error,
+                message: "Found debug log.".to_owned(),
+                location: None,
+                remediation: None,
+                suggested_fix: None,
+            }],
+        }],
+        OutputStyle { level: ColorLevel::Basic },
+        Duration::from_secs(1),
+    );
+
+    // Severity keyword is bold-red, check id is dimmed
+    assert!(output.contains("\u{1b}[1;31merror\u{1b}[0m[\u{1b}[2mno-debug-logging\u{1b}[0m]"));
+}
+
+#[test]
+fn human_output_check_id_is_plain_when_color_disabled() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "no-debug-logging".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Error,
+                message: "Found debug log.".to_owned(),
+                location: None,
+                remediation: None,
+                suggested_fix: None,
+            }],
+        }],
+        OutputStyle { level: ColorLevel::None },
+        Duration::from_secs(1),
+    );
+
+    assert!(output.contains("error[no-debug-logging]:"));
+    assert!(!output.contains("\u{1b}["));
+}
+
+#[test]
 fn human_output_no_findings_includes_elapsed_time() {
     let output = render_human_results(
         &[CheckResult {

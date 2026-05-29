@@ -203,7 +203,7 @@ allow_bypass = true
             .remediation
             .as_deref()
             .unwrap_or_default()
-            .contains("Never use bypasses for convenience")
+            .contains("never use bypasses for convenience")
     );
 }
 
