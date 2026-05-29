@@ -1,0 +1,18 @@
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+package(default_visibility = ["//visibility:private"])
+
+swift_library(
+    name = "UpdateCore",
+    module_name = "UpdateCore",
+    srcs = glob(["*.swift"]),
+    copts = [
+        "-swift-version",
+        "6",
+        "-strict-concurrency=complete",
+    ],
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/app-macos/Tests/UpdateCore:__pkg__",
+    ],
+)

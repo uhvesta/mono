@@ -29,6 +29,7 @@ swift_library(
         "-strict-concurrency=complete",
     ],
     deps = [
+        "//tools/boss/app-macos/Sources/UpdateCore:UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",
     ],
