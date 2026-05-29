@@ -50,6 +50,11 @@ PLIST_EOF
 fi
 
 bazel build //tools/boss/app-macos/... //tools/boss/installer/...
-bazel test --test_output=errors //tools/boss/app-macos:BossTests
+# Run every macOS Swift test target, not just BossTests, so the UpdateCore
+# module's tests (UpdateChecker / UpdateDownloader — the self-update download,
+# verification, quarantine-strip, and staging logic) gate merges too. The `...`
+# wildcard picks up both //tools/boss/app-macos:BossTests and
+# //tools/boss/app-macos/Tests/UpdateCore:UpdateTests.
+bazel test --test_output=errors //tools/boss/app-macos/...
 
 echo "[mac-app-build] ok"
