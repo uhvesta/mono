@@ -435,9 +435,10 @@ pub enum FrontendRequest {
         input: CreateRevisionInput,
     },
     /// Set (or clear) the investigation-doc pointer on a task. Persists
-    /// the three `tasks.investigation_doc_*` columns per
-    /// [`SetTaskInvestigationDocInput`]'s semantics and replies with the
-    /// updated `Task` row wrapped in a `WorkItemUpdated` event.
+    /// `tasks.investigation_doc_path` and `tasks.investigation_doc_branch`
+    /// per [`SetTaskInvestigationDocInput`]'s semantics and replies with the
+    /// updated `Task` row wrapped in a `WorkItemUpdated` event. The doc's
+    /// repo is always derived from the task's `repo_remote_url`.
     SetTaskInvestigationDoc {
         #[serde(flatten)]
         input: SetTaskInvestigationDocInput,

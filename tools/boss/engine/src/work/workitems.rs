@@ -262,7 +262,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch, parent_task_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_branch, parent_task_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation', 'revision') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -276,7 +276,7 @@ impl WorkDb {
 
         let chores = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch, parent_task_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, investigation_doc_path, investigation_doc_branch, parent_task_id
                  FROM tasks
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -295,28 +295,6 @@ impl WorkDb {
         // for every `kind = 'revision'` task. These are derived fields —
         // not stored columns — so they are calculated fresh here.
         let tasks = attach_revision_projections(tasks, &chores);
-
-        // For investigation tasks whose doc pointer was registered without an
-        // explicit repo URL (--repo omitted), resolve the repo from the
-        // product's `docs_repo`, then the task's own `repo_remote_url`, then
-        // the product's `repo_remote_url`. This covers records written before
-        // `set_task_investigation_doc` began resolving the repo at write time.
-        let tasks = tasks
-            .into_iter()
-            .map(|mut t| {
-                if t.kind == "investigation"
-                    && t.investigation_doc_path.is_some()
-                    && t.investigation_doc_repo_remote_url.is_none()
-                {
-                    t.investigation_doc_repo_remote_url = product
-                        .docs_repo
-                        .clone()
-                        .or_else(|| t.repo_remote_url.clone())
-                        .or_else(|| product.repo_remote_url.clone());
-                }
-                t
-            })
-            .collect::<Vec<_>>();
 
         Ok(WorkTree {
             product,
@@ -427,7 +405,7 @@ impl WorkDb {
         let conn = self.connect()?;
         if let Some(task) = conn
             .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, parent_task_id, investigation_doc_path, investigation_doc_repo_remote_url, investigation_doc_branch
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, parent_task_id, investigation_doc_path, investigation_doc_branch
                  FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
                 params![product_id, short_id],

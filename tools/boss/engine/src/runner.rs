@@ -908,9 +908,8 @@ fn compose_investigation_directive(work_item: &WorkItem) -> String {
     out.push_str("- open a PR with the doc regardless of which repo it lands in. Do NOT push directly to `main` even on the user's personal docs repo (e.g. `brianduff/docs`). The PR is the user's edit window.\n");
     out.push_str("- after the PR is open, register the doc pointer so the kanban card shows the doc affordance:\n");
     out.push_str(&format!(
-        "  `boss task set-investigation-doc --task {task_id} --path <repo-relative-path> --branch <pr-branch> --repo <remote-url-of-the-repo-hosting-the-doc>`\n"
+        "  `boss task set-investigation-doc --task {task_id} --path <repo-relative-path> --branch <pr-branch>`\n"
     ));
-    out.push_str("  The `--repo` flag should be the SSH or HTTPS remote URL of the repo the doc PR was opened against (e.g. `git@github.com:owner/repo.git`). Obtain it with `jj git remote get-url origin` in the workspace.\n");
     out.push_str("- investigations do not touch code. If the description asks for both research and a code change, write only the investigation doc and note the follow-up code changes at the end of the doc for the user to file separately.\n");
     out
 }

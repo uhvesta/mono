@@ -608,19 +608,14 @@ pub(crate) fn migrate_work_executions_worker_branch_prefix(conn: &Connection) ->
     Ok(())
 }
 
-/// Add the three `tasks.investigation_doc_*` pointer columns that
-/// store the investigation deliverable's `(repo, branch, path)` triple
-/// set by the worker after opening the doc PR.
+/// Add the `tasks.investigation_doc_path` and `tasks.investigation_doc_branch`
+/// pointer columns set by the worker after opening the doc PR. The doc's repo
+/// is always derived from the task's `repo_remote_url` at read time and is
+/// never stored as a separate column.
 pub(crate) fn migrate_tasks_investigation_doc_columns(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "tasks", "investigation_doc_path")? {
         conn.execute(
             "ALTER TABLE tasks ADD COLUMN investigation_doc_path TEXT",
-            [],
-        )?;
-    }
-    if !table_has_column(conn, "tasks", "investigation_doc_repo_remote_url")? {
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN investigation_doc_repo_remote_url TEXT",
             [],
         )?;
     }

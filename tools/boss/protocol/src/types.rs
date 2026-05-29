@@ -375,15 +375,12 @@ pub struct Task {
     /// `kind = 'investigation'` rows; ignored on all other kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation_doc_path: Option<String>,
-    /// Remote URL of the repo that hosts the investigation doc. `None`
-    /// means "resolve from product `docs_repo` or `BOSS_USER_DOCS_REPO`
-    /// at set time." Stored canonicalised (same form as `repo_remote_url`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub investigation_doc_repo_remote_url: Option<String>,
     /// Branch the investigation doc PR was opened against. `None` until
     /// the worker sets the pointer. Used to construct the in-review
     /// GitHub URL `…/blob/{branch}/{path}` while the PR is open; after
-    /// merge the UI falls back to `main`.
+    /// merge the UI falls back to `main`. The doc's repo is always
+    /// derived from the task's own `repo_remote_url` — no separate
+    /// stored repo pointer exists for investigation docs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation_doc_branch: Option<String>,
     /// Soft FK to the `tasks.id` whose PR this revision targets. `None`
@@ -1192,14 +1189,12 @@ pub struct SetTaskInvestigationDocInput {
     /// rejected — use `unset = true` to clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation_doc_path: Option<String>,
-    /// Remote URL of the hosting repo. `None` → inherit from the
-    /// product's `docs_repo` or `BOSS_USER_DOCS_REPO` env var.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub investigation_doc_repo_remote_url: Option<String>,
     /// PR branch name. `None` → infer from the task's `pr_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub investigation_doc_branch: Option<String>,
-    /// When `true`, clear all three pointer columns (set to NULL).
+    /// When `true`, clear both pointer columns (path + branch; set to NULL).
+    /// The doc's repo is always derived from the task's `repo_remote_url`
+    /// and is never stored separately.
     #[serde(default)]
     pub unset: bool,
 }

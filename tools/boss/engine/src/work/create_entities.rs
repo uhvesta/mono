@@ -221,7 +221,6 @@ impl WorkDb {
             conn.execute(
                 "UPDATE tasks
                  SET investigation_doc_path = NULL,
-                     investigation_doc_repo_remote_url = NULL,
                      investigation_doc_branch = NULL,
                      updated_at = ?2
                  WHERE id = ?1",
@@ -234,32 +233,14 @@ impl WorkDb {
                 }
                 Some(p) => p.to_owned(),
             };
-            // When the caller omits --repo, resolve from the product's docs_repo,
-            // then the task's own repo_remote_url, then the product's repo_remote_url.
-            // Storing a resolved value avoids relying on read-time fallback logic for
-            // newly written pointers.
-            let repo = if let Some(r) = input
-                .investigation_doc_repo_remote_url
-                .filter(|s| !s.is_empty())
-            {
-                Some(r)
-            } else {
-                let product = query_product(&conn, &task.product_id)?;
-                product
-                    .as_ref()
-                    .and_then(|p| p.docs_repo.clone())
-                    .or_else(|| task.repo_remote_url.clone())
-                    .or_else(|| product.as_ref().and_then(|p| p.repo_remote_url.clone()))
-            };
             let branch = input.investigation_doc_branch.filter(|s| !s.is_empty());
             conn.execute(
                 "UPDATE tasks
                  SET investigation_doc_path = ?2,
-                     investigation_doc_repo_remote_url = ?3,
-                     investigation_doc_branch = ?4,
-                     updated_at = ?5
+                     investigation_doc_branch = ?3,
+                     updated_at = ?4
                  WHERE id = ?1",
-                params![input.task_id, path, repo, branch, now],
+                params![input.task_id, path, branch, now],
             )?;
         }
         query_task(&conn, &input.task_id)?
