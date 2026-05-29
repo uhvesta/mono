@@ -5,10 +5,11 @@ id = "rust-giant-structs-use-builder"
 builder = "bon"
 # Grandfathered files containing structs with 6+ named fields and no bon::Builder.
 # TODO: Convert each listed struct to use bon::Builder and remove the file from this list.
-exclude_globs = [
-  "tools/cube/src/app.rs",
-  "tools/cube/src/metadata.rs",
-  "tools/cube/src/store.rs",
+# Paths are relative to this CHECKS.toml's directory (tools/cube/).
+exclude_files = [
+  "src/app.rs",
+  "src/metadata.rs",
+  "src/store.rs",
 ]
 
 [checks.policy]

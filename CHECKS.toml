@@ -6,7 +6,7 @@ id = "file-size"
 
 [checks.config]
 max_lines = 3000
-exclude_globs = [
+exclude_files = [
   # Lockfiles and generated files — never check these for size
   "Cargo.lock",
   "**/package-lock.json",

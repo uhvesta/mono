@@ -34,7 +34,7 @@ const DEFAULT_MAX_FIELDS: usize = 5;
 ///     Use this when you need pinpoint precision or want to grandfather a struct whose
 ///     simple name might collide with something elsewhere.
 ///
-/// * `exclude_globs` — file globs that are skipped *entirely*. Reserve this for files
+/// * `exclude_files` — file globs that are skipped *entirely*. Reserve this for files
 ///   syn cannot meaningfully check (generated code, huge clap-arg modules). Prefer
 ///   `exclude_structs` for ordinary grandfathering: a whole-file exclude permanently
 ///   blinds the check to every future struct in that file.
@@ -50,8 +50,8 @@ struct RawConfig {
     max_fields: Option<i64>,
     #[serde(default)]
     builder: Option<String>,
-    #[serde(default)]
-    exclude_globs: Option<Vec<String>>,
+    #[serde(default, alias = "exclude_globs")]
+    exclude_files: Option<Vec<String>>,
     #[serde(default)]
     exclude_structs: Option<Vec<String>>,
 }
@@ -59,7 +59,7 @@ struct RawConfig {
 struct ParsedConfig {
     max_fields: usize,
     builder: BuilderKind,
-    exclude_globs: Option<GlobSet>,
+    exclude_files: Option<GlobSet>,
     /// Simple names scoped to the config subtree (see `config_dir`).
     exclude_structs: HashSet<String>,
     /// Qualified exclusions: repo-root-relative file path → set of exempt struct names.
@@ -132,8 +132,9 @@ impl ConfiguredCheck for ParsedConfig {
                 continue;
             }
 
-            if let Some(globs) = &self.exclude_globs {
-                if globs.is_match(&changed_file.path) {
+            if let Some(globs) = &self.exclude_files {
+                let config_dir = self.config_dir.as_deref().unwrap_or(Path::new(""));
+                if is_excluded(&changed_file.path, globs, config_dir) {
                     continue;
                 }
             }
@@ -189,7 +190,7 @@ impl ConfiguredCheck for ParsedConfig {
                     }),
                     remediation: Some(format!(
                         "Add `#[derive({}::Builder)]` (and `#[builder(on(String, into))]` per the project convention) above the struct.\n\
-                        Permanently exempt a file by adding it to `exclude_globs` in `CHECKS.toml`.",
+                        Permanently exempt a file by adding it to `exclude_files` in `CHECKS.toml`.",
                         self.builder.crate_name(),
                     )),
                     suggested_fix: None,
@@ -392,14 +393,14 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
     Ok(ParsedConfig {
         max_fields,
         builder,
-        exclude_globs: parse_exclude_globs(raw.exclude_globs.as_deref())?,
+        exclude_files: parse_exclude_files(raw.exclude_files.as_deref())?,
         exclude_structs,
         exclude_structs_qualified,
         config_dir: config_dir.map(|p| p.to_path_buf()),
     })
 }
 
-fn parse_exclude_globs(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
+fn parse_exclude_files(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
     let Some(patterns) = patterns else {
         return Ok(None);
     };
@@ -409,14 +410,23 @@ fn parse_exclude_globs(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `exclude_globs` pattern: {pattern}"))?;
+            .with_context(|| format!("invalid `exclude_files` pattern: {pattern}"))?;
         builder.add(glob);
     }
     Ok(Some(
         builder
             .build()
-            .context("failed to compile `exclude_globs` patterns")?,
+            .context("failed to compile `exclude_files` patterns")?,
     ))
+}
+
+/// Returns true if `path` is within `config_dir` and matches `globs` (relative to config_dir).
+/// Files outside the config_dir subtree are never excluded.
+fn is_excluded(path: &Path, globs: &GlobSet, config_dir: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(config_dir) else {
+        return false;
+    };
+    globs.is_match(relative)
 }
 
 #[cfg(test)]
@@ -605,7 +615,37 @@ pub struct Medium {
     }
 
     #[tokio::test]
-    async fn exclude_globs_skips_matching_files() {
+    async fn exclude_files_skips_matching_files() {
+        let temp = tempdir().expect("create temp dir");
+        fs::write(
+            temp.path().join("skipped.rs"),
+            r#"
+pub struct Big {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#,
+        )
+        .expect("write file");
+
+        let check = RustGiantStructsUseBuilderCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: Path::new("skipped.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]);
+        let config = toml::Value::Table(toml::toml! {
+            exclude_files = ["skipped.rs"]
+        });
+        let result = check
+            .run(&changeset, &tree, &config)
+            .await
+            .expect("run check");
+        assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exclude_globs_alias_still_works() {
         let temp = tempdir().expect("create temp dir");
         fs::write(
             temp.path().join("skipped.rs"),
@@ -921,5 +961,42 @@ pub struct Grandfathered {
             messages.is_empty(),
             "expected no findings (qualified path resolved relative to config_dir), got {messages:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn exclude_files_does_not_apply_outside_config_dir_subtree() {
+        let source = r#"
+pub struct Big {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+        let temp = tempdir().expect("create temp dir");
+        fs::write(temp.path().join("test.rs"), source).expect("write file");
+        let check = RustGiantStructsUseBuilderCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+
+        // "test.rs" at root is NOT in "sub/dir" subtree; pattern "test.rs" should not match it.
+        let configured = check
+            .configure_scoped(
+                &toml::Value::Table(toml::toml! {
+                    exclude_files = ["test.rs"]
+                }),
+                Some(Path::new("sub/dir")),
+            )
+            .expect("configure_scoped");
+
+        let result = configured
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("test.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+            )
+            .await
+            .expect("run check");
+
+        assert_eq!(result.findings.len(), 1, "file outside config_dir should not be excluded");
     }
 }

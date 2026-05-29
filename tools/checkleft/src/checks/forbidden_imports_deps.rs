@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::check::{Check, ConfiguredCheck};
@@ -11,6 +12,16 @@ use crate::output::{CheckResult, Finding, Location, Severity};
 
 #[derive(Debug, Default)]
 pub struct ForbiddenImportsDepsCheck;
+
+impl ForbiddenImportsDepsCheck {
+    fn configure_with_dir(
+        &self,
+        config: &toml::Value,
+        config_dir: &Path,
+    ) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config, config_dir)?))
+    }
+}
 
 #[async_trait]
 impl Check for ForbiddenImportsDepsCheck {
@@ -23,7 +34,15 @@ impl Check for ForbiddenImportsDepsCheck {
     }
 
     fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
-        Ok(Arc::new(parse_config(config)?))
+        self.configure_with_dir(config, Path::new(""))
+    }
+
+    fn configure_scoped(
+        &self,
+        config: &toml::Value,
+        config_dir: Option<&Path>,
+    ) -> Result<Arc<dyn ConfiguredCheck>> {
+        self.configure_with_dir(config, config_dir.unwrap_or_else(|| Path::new("")))
     }
 }
 
@@ -91,8 +110,8 @@ struct ForbiddenImportsDepsRuleConfig {
     message: String,
     #[serde(default)]
     include_globs: Vec<String>,
-    #[serde(default)]
-    exclude_globs: Vec<String>,
+    #[serde(default, alias = "exclude_globs")]
+    exclude_files: Vec<String>,
     #[serde(default)]
     severity: Option<String>,
     #[serde(default)]
@@ -106,16 +125,17 @@ struct CompiledForbiddenImportsDepsConfig {
 struct CompiledRule {
     pattern: Regex,
     include_globs: Option<GlobSet>,
-    exclude_globs: Option<GlobSet>,
+    exclude_files: Option<GlobSet>,
+    config_dir: PathBuf,
     message: String,
     remediation: String,
     severity: Severity,
 }
 
 impl CompiledRule {
-    fn applies_to(&self, path: &std::path::Path) -> bool {
-        if let Some(exclude_globs) = &self.exclude_globs {
-            if exclude_globs.is_match(path) {
+    fn applies_to(&self, path: &Path) -> bool {
+        if let Some(exclude_files) = &self.exclude_files {
+            if is_excluded(path, exclude_files, &self.config_dir) {
                 return false;
             }
         }
@@ -126,7 +146,10 @@ impl CompiledRule {
     }
 }
 
-fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenImportsDepsConfig> {
+fn parse_config(
+    config: &toml::Value,
+    config_dir: &Path,
+) -> Result<CompiledForbiddenImportsDepsConfig> {
     let parsed: ForbiddenImportsDepsConfig = config
         .clone()
         .try_into()
@@ -148,7 +171,8 @@ fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenImportsDepsConf
         rules.push(CompiledRule {
             pattern,
             include_globs: compile_globs("include_globs", &rule.include_globs)?,
-            exclude_globs: compile_globs("exclude_globs", &rule.exclude_globs)?,
+            exclude_files: compile_globs("exclude_files", &rule.exclude_files)?,
+            config_dir: config_dir.to_path_buf(),
             message: rule.message,
             remediation: rule
                 .remediation
@@ -158,6 +182,15 @@ fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenImportsDepsConf
     }
 
     Ok(CompiledForbiddenImportsDepsConfig { rules })
+}
+
+/// Returns true if `path` is within `config_dir` and matches `globs` (relative to config_dir).
+/// Files outside the config_dir subtree are never excluded.
+fn is_excluded(path: &Path, globs: &GlobSet, config_dir: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(config_dir) else {
+        return false;
+    };
+    globs.is_match(relative)
 }
 
 fn compile_globs(field_name: &str, patterns: &[String]) -> Result<Option<GlobSet>> {
@@ -226,6 +259,41 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_excluded_paths() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join("frontend/src/api")).expect("create dirs");
+        fs::write(
+            temp.path().join("frontend/src/api/http.ts"),
+            "const x = fetch(url(\"/api/v2/statusz\"));\n",
+        )
+        .expect("write source");
+
+        let check = ForbiddenImportsDepsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("frontend/src/api/http.ts").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{
+                        pattern = "\\bfetch\\(url\\(",
+                        message = "Use frontend api/* modules for backend calls.",
+                        include_globs = ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
+                        exclude_files = ["frontend/src/api/**"]
+                    }]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exclude_globs_alias_still_works() {
         let temp = tempdir().expect("create temp dir");
         fs::create_dir_all(temp.path().join("frontend/src/api")).expect("create dirs");
         fs::write(

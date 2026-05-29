@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::check::{Check, ConfiguredCheck};
@@ -12,6 +13,16 @@ const DEFAULT_MAX_LINES: usize = 500;
 
 #[derive(Debug, Default)]
 pub struct FileSizeCheck;
+
+impl FileSizeCheck {
+    fn configure_with_dir(
+        &self,
+        config: &toml::Value,
+        config_dir: &Path,
+    ) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config, config_dir)?))
+    }
+}
 
 #[async_trait]
 impl Check for FileSizeCheck {
@@ -24,7 +35,15 @@ impl Check for FileSizeCheck {
     }
 
     fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
-        Ok(Arc::new(parse_config(config)?))
+        self.configure_with_dir(config, Path::new(""))
+    }
+
+    fn configure_scoped(
+        &self,
+        config: &toml::Value,
+        config_dir: Option<&Path>,
+    ) -> Result<Arc<dyn ConfiguredCheck>> {
+        self.configure_with_dir(config, config_dir.unwrap_or_else(|| Path::new("")))
     }
 }
 
@@ -37,8 +56,8 @@ impl ConfiguredCheck for ParsedFileSizeConfig {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
             }
-            if let Some(exclude_globs) = &self.exclude_globs {
-                if exclude_globs.is_match(&changed_file.path) {
+            if let Some(exclude_files) = &self.exclude_files {
+                if is_excluded(&changed_file.path, exclude_files, &self.config_dir) {
                     continue;
                 }
             }
@@ -112,16 +131,17 @@ fn file_grew_in_change(changed_file: &crate::input::ChangedFile, changeset: &Cha
 struct FileSizeConfig {
     #[serde(default)]
     max_lines: Option<i64>,
-    #[serde(default)]
-    exclude_globs: Option<Vec<String>>,
+    #[serde(default, alias = "exclude_globs")]
+    exclude_files: Option<Vec<String>>,
 }
 
 struct ParsedFileSizeConfig {
     max_lines: usize,
-    exclude_globs: Option<GlobSet>,
+    exclude_files: Option<GlobSet>,
+    config_dir: PathBuf,
 }
 
-fn parse_config(config: &toml::Value) -> Result<ParsedFileSizeConfig> {
+fn parse_config(config: &toml::Value, config_dir: &Path) -> Result<ParsedFileSizeConfig> {
     let parsed: FileSizeConfig = config
         .clone()
         .try_into()
@@ -136,11 +156,12 @@ fn parse_config(config: &toml::Value) -> Result<ParsedFileSizeConfig> {
 
     Ok(ParsedFileSizeConfig {
         max_lines,
-        exclude_globs: parse_exclude_globs(parsed.exclude_globs.as_deref())?,
+        exclude_files: parse_exclude_files(parsed.exclude_files.as_deref())?,
+        config_dir: config_dir.to_path_buf(),
     })
 }
 
-fn parse_exclude_globs(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
+fn parse_exclude_files(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
     let Some(patterns) = patterns else {
         return Ok(None);
     };
@@ -151,14 +172,23 @@ fn parse_exclude_globs(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `exclude_globs` pattern: {pattern}"))?;
+            .with_context(|| format!("invalid `exclude_files` pattern: {pattern}"))?;
         builder.add(glob);
     }
 
     let globset = builder
         .build()
-        .context("failed to compile `exclude_globs` patterns")?;
+        .context("failed to compile `exclude_files` patterns")?;
     Ok(Some(globset))
+}
+
+/// Returns true if `path` is within `config_dir` and matches `globs` (relative to config_dir).
+/// Files outside the config_dir subtree are never excluded.
+fn is_excluded(path: &Path, globs: &GlobSet, config_dir: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(config_dir) else {
+        return false;
+    };
+    globs.is_match(relative)
 }
 
 #[cfg(test)]
@@ -275,6 +305,32 @@ mod tests {
                 &tree,
                 &toml::Value::Table(toml::toml! {
                     max_lines = 2
+                    exclude_files = ["**/package-lock.json"]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exclude_globs_alias_still_works() {
+        let temp = tempdir().expect("create temp dir");
+        fs::write(temp.path().join("package-lock.json"), "a\nb\nc\n").expect("write file");
+
+        let check = FileSizeCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("package-lock.json").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    max_lines = 2
                     exclude_globs = ["**/package-lock.json"]
                 }),
             )
@@ -282,5 +338,88 @@ mod tests {
             .expect("run check");
 
         assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exclude_files_does_not_apply_outside_config_dir_subtree() {
+        let temp = tempdir().expect("create temp dir");
+        // File lives at root level, but the check is configured from "sub/dir".
+        // Pattern "oversized.rs" should only match "sub/dir/oversized.rs", NOT "oversized.rs".
+        fs::write(temp.path().join("oversized.rs"), "a\nb\nc\n").expect("write file");
+
+        let check = FileSizeCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let configured = check
+            .configure_with_dir(
+                &toml::Value::Table(toml::toml! {
+                    max_lines = 2
+                    exclude_files = ["oversized.rs"]
+                }),
+                Path::new("sub/dir"),
+            )
+            .expect("configure check");
+
+        let result = configured
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("oversized.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }])
+                .with_file_line_delta(
+                    Path::new("oversized.rs").to_path_buf(),
+                    FileLineDelta {
+                        added_lines: 2,
+                        removed_lines: 0,
+                    },
+                ),
+                &tree,
+            )
+            .await
+            .expect("run check");
+
+        // Pattern "oversized.rs" from sub/dir context does NOT match root-level "oversized.rs".
+        assert_eq!(result.findings.len(), 1, "file outside config_dir should not be excluded");
+    }
+
+    #[tokio::test]
+    async fn exclude_files_matches_within_config_dir_subtree() {
+        let temp = tempdir().expect("create temp dir");
+        fs::create_dir_all(temp.path().join("sub/dir")).expect("create dirs");
+        fs::write(temp.path().join("sub/dir/oversized.rs"), "a\nb\nc\n").expect("write file");
+
+        let check = FileSizeCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let configured = check
+            .configure_with_dir(
+                &toml::Value::Table(toml::toml! {
+                    max_lines = 2
+                    exclude_files = ["oversized.rs"]
+                }),
+                Path::new("sub/dir"),
+            )
+            .expect("configure check");
+
+        let result = configured
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("sub/dir/oversized.rs").to_path_buf(),
+                    kind: ChangeKind::Modified,
+                    old_path: None,
+                }])
+                .with_file_line_delta(
+                    Path::new("sub/dir/oversized.rs").to_path_buf(),
+                    FileLineDelta {
+                        added_lines: 2,
+                        removed_lines: 0,
+                    },
+                ),
+                &tree,
+            )
+            .await
+            .expect("run check");
+
+        // Pattern "oversized.rs" from sub/dir context matches "sub/dir/oversized.rs".
+        assert!(result.findings.is_empty(), "file inside config_dir should be excluded");
     }
 }
