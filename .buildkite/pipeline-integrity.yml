@@ -1,0 +1,28 @@
+# mono-integrity Buildkite pipeline.
+#
+# Goal: verify that everything in the mono repo builds and tests cleanly
+# and that the repo's overall state is healthy — not just the diff of a single PR.
+#
+# Shape:
+#   commit-delta → (if new commits) [integrity-bazel (macOS) | integrity-checkleft (Linux)]
+#                                                                 ↓ (wait)
+#                                                          integrity-tag-update
+#
+# Schedule: ~every 30 minutes.  Configure in the Buildkite pipeline settings
+# for the mono-integrity pipeline with a cron expression such as "*/30 * * * *".
+#
+# Agent queues:
+#   bazel-any   — Linux agents for the commit-delta check, checkleft, and tag-update.
+#   macos-arm64 — Zakalwe-1 for the full bazel build + test (includes Swift/macOS targets).
+#
+# Short-circuit: scheduled runs compare HEAD to the mono-integrity-last-run git
+# tag.  If unchanged, the pipeline exits quickly without running expensive checks.
+# Manual (UI/API) triggers bypass change detection and always run the checks.
+# The tag is advanced to HEAD after a successful run by integrity-tag-update.sh.
+
+steps:
+  - label: ":mag: commit-delta"
+    key: "commit-delta"
+    command: ".buildkite/steps/integrity-commit-delta.sh"
+    agents:
+      queue: "bazel-any"
