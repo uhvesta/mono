@@ -1,5 +1,26 @@
 use super::*;
 
+impl WorkDb {
+    /// For a `revision` task, walk the parent chain to the chain root and
+    /// return the chain root's bound `pr_url`, or `None` if the chain root
+    /// cannot be resolved or has no bound PR yet.
+    ///
+    /// This is the authoritative fallback for completion-handler code that
+    /// needs the bound PR URL but cannot rely on `execution.pr_url` (e.g.
+    /// executions created before `pr_url` was reliably stamped at dispatch
+    /// time). It mirrors the lookup performed by `reconcile_revision_execution`
+    /// so the completion handler and the dispatcher always agree on which PR
+    /// the revision belongs to.
+    pub(crate) fn get_revision_chain_root_pr_url(&self, task_id: &str) -> Option<String> {
+        let conn = self.connect().ok()?;
+        get_chain_root_task(&conn, task_id)
+            .ok()
+            .flatten()
+            .and_then(|t| t.pr_url)
+            .filter(|u| !u.is_empty())
+    }
+}
+
 /// Return the id of the most-recently-created non-done revision that is a
 /// descendant of `root_id`, or `None` when the chain has no prior active
 /// revision.

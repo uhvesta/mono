@@ -1110,6 +1110,28 @@ asked to open one",
                         )
                         .await;
                 }
+                // `revision_implementation` workers must NEVER be told to
+                // create a PR — their deliverable is a commit on the parent
+                // task's existing PR branch.  The chain-root lookup above
+                // covers the common case; if we still have no resolvable PR
+                // it is an upstream data anomaly.  Park for a human instead
+                // of contradicting the worker's own task instructions.
+                if execution.kind == "revision_implementation" {
+                    tracing::warn!(
+                        execution_id,
+                        kind = %execution.kind,
+                        "stop event: revision_implementation execution has no resolvable bound PR — parking instead of nudging to create one"
+                    );
+                    return self
+                        .park_for_unproductive_nudges(
+                            &execution,
+                            0,
+                            None,
+                            "revision_implementation execution has no bound PR to push to; it \
+must not be asked to open one",
+                        )
+                        .await;
+                }
                 tracing::info!(
                     execution_id,
                     expected_branch = %expected_branch,
@@ -1886,7 +1908,18 @@ asked to open one",
                     .map(str::to_owned)
                     .or_else(|| {
                         if execution.kind == "revision_implementation" {
-                            execution.pr_url.clone().filter(|u| !u.is_empty())
+                            // Primary: execution.pr_url is stamped at dispatch time.
+                            // Fallback: walk the parent chain to find the chain root's
+                            // pr_url for executions where execution.pr_url was not set
+                            // (e.g. older executions predating reliable dispatch stamping).
+                            execution
+                                .pr_url
+                                .clone()
+                                .filter(|u| !u.is_empty())
+                                .or_else(|| {
+                                    self.work_db
+                                        .get_revision_chain_root_pr_url(&task.id)
+                                })
                         } else {
                             None
                         }
@@ -2066,13 +2099,21 @@ asked to open one",
             Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
                 // For revision_implementation executions the task's own
                 // pr_url is always NULL (design: revision tasks don't own
-                // a PR).  Fall back to execution.pr_url, which is set to
-                // the chain root's PR URL at dispatch time.
+                // a PR).  Fall back to execution.pr_url (stamped at
+                // dispatch), then to a chain-root lookup for executions
+                // where execution.pr_url was not reliably set.
                 crate::runner::task_bound_pr_url(&task)
                     .map(str::to_owned)
                     .or_else(|| {
                         if execution.kind == "revision_implementation" {
-                            execution.pr_url.clone().filter(|u| !u.is_empty())
+                            execution
+                                .pr_url
+                                .clone()
+                                .filter(|u| !u.is_empty())
+                                .or_else(|| {
+                                    self.work_db
+                                        .get_revision_chain_root_pr_url(&task.id)
+                                })
                         } else {
                             None
                         }
@@ -2193,7 +2234,17 @@ asked to open one",
                 match from_task {
                     Some(url) => url,
                     None if execution.kind == "revision_implementation" => {
-                        match execution.pr_url.clone().filter(|u| !u.is_empty()) {
+                        // Primary: execution.pr_url stamped at dispatch time.
+                        // Fallback: chain-root lookup for executions where it
+                        // was not stamped.
+                        match execution
+                            .pr_url
+                            .clone()
+                            .filter(|u| !u.is_empty())
+                            .or_else(|| {
+                                self.work_db
+                                    .get_revision_chain_root_pr_url(&task.id)
+                            }) {
                             Some(url) => url,
                             None => return ShaDeltaGateOutcome::Inapplicable,
                         }
@@ -5549,6 +5600,300 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert!(
             items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
             "parking must file an attention item",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // revision_implementation stop-boundary fix (T-this).
+    //
+    // A `revision_implementation` execution must NEVER be told to
+    // `gh pr create` — the revision's job is to push a new commit to
+    // the parent task's EXISTING PR branch.  Two sub-cases pinned:
+    //   1. execution.pr_url was not stamped (older exec) but chain root
+    //      has a pr_url: chain-root lookup finds the bound PR → worker
+    //      gets probe_push_to_existing_pr, never PROBE_NO_PR.
+    //   2. No bound PR resolvable at all (anomalous data): park instead
+    //      of contradicting the worker with PROBE_NO_PR.
+    // -----------------------------------------------------------
+
+    /// Build a revision fixture but leave `execution.pr_url` as NULL
+    /// (simulates an execution created before pr_url was reliably stamped).
+    /// The parent chore still has `pr_url` set so the chain-root lookup
+    /// can find it.
+    fn revision_fixture_no_execution_pr_url(
+        workspace_path: &Path,
+        parent_pr_url: &str,
+    ) -> (Arc<WorkDb>, String, String, String) {
+        use boss_protocol::CreateRevisionInput;
+        use crate::work::{FakePrStateChecker, PrOpenState};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss-revision-chain-root-test")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let parent = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Parent chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![parent.id, parent_pr_url],
+            )
+            .unwrap();
+        }
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent.id.clone())
+                    .description("Fix conflict")
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        // Create execution WITHOUT pr_url (simulates older dispatch path).
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id.clone())
+                    .kind("revision_implementation")
+                    .status("ready")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .prefer_is_soft(true)
+                    // Intentionally omitting pr_url to test chain-root fallback.
+                    .build(),
+            )
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned revision worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        (db, product.id, revision.id, execution.id)
+    }
+
+    #[tokio::test]
+    async fn revision_with_null_execution_pr_url_falls_back_to_chain_root_pr() {
+        // T-this regression: a `revision_implementation` execution whose
+        // `execution.pr_url` is NULL (created before reliable stamping)
+        // must not receive PROBE_NO_PR ("open a new PR with `gh pr create`").
+        // The chain-root lookup must find the parent chore's pr_url and
+        // return `probe_push_to_existing_pr` instead.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
+        let (db, _product_id, _revision_id, execution_id) =
+            revision_fixture_no_execution_pr_url(workspace.path(), parent_pr_url);
+        // Cold-path detector returns None — correct for revisions which
+        // have no branch of their own.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "revision with no execution.pr_url must nudge (not PROBE_NO_PR)",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(queued.len(), 1, "exactly one nudge queued");
+        assert_eq!(
+            queued[0].1,
+            probe_push_to_existing_pr(parent_pr_url),
+            "must use chain-root pr_url, never PROBE_NO_PR",
+        );
+        assert_ne!(
+            queued[0].1, PROBE_NO_PR,
+            "revision must NEVER receive the produce-a-PR nudge",
+        );
+        assert!(
+            !queued[0].1.contains("gh pr create"),
+            "revision nudge must not mention `gh pr create`",
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_with_no_bound_pr_parks_instead_of_nudging_create() {
+        // Safety net: if even the chain-root lookup yields no PR URL
+        // (anomalous data — e.g. chain root never opened a PR), the
+        // revision execution must be parked rather than nudged with
+        // PROBE_NO_PR.  A parked revision surfaces as an attention item
+        // for a human to investigate; PROBE_NO_PR would contradict the
+        // worker's own task instructions.
+        use boss_protocol::CreateRevisionInput;
+        use crate::work::{FakePrStateChecker, PrOpenState};
+
+        let workspace = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss-revision-no-pr-test")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        // Parent chore with NO pr_url (never opened a PR).
+        let parent = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Parent chore no PR")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        // Manually set parent to in_review WITHOUT a pr_url so the
+        // revision gate passes (bypassed via direct SQL) but the chain
+        // root has no PR to resolve.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![parent.id],
+            )
+            .unwrap();
+            // Force the revision gate to see Open by setting a temporary
+            // pr_url, create the revision, then clear it.
+            conn.execute(
+                "UPDATE tasks SET pr_url = 'https://github.com/spinyfin/mono/pull/999' WHERE id = ?1",
+                rusqlite::params![parent.id],
+            )
+            .unwrap();
+        }
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent.id.clone())
+                    .description("Fix conflict — no PR scenario")
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        // Clear the parent pr_url so the chain-root lookup yields None.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET pr_url = NULL WHERE id = ?1",
+                rusqlite::params![parent.id],
+            )
+            .unwrap();
+        }
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id.clone())
+                    .kind("revision_implementation")
+                    .status("ready")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .prefer_is_soft(true)
+                    .build(),
+            )
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned revision worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution.id).await;
+        assert!(
+            matches!(outcome, StopOutcome::NudgeBreakerParked { .. }),
+            "revision with no resolvable bound PR must park, not produce PROBE_NO_PR; got {outcome:?}",
+        );
+        let queued = probes.snapshot();
+        assert!(
+            queued.is_empty(),
+            "no probe must be queued when parking a revision with no bound PR; got {queued:?}",
+        );
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert!(
+            items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+            "parking must file an attention item",
+        );
+        // Critical: PROBE_NO_PR must never be queued.
+        assert!(
+            queued.iter().all(|(_, t)| t != PROBE_NO_PR),
+            "revision must never receive PROBE_NO_PR",
         );
     }
 
