@@ -64,19 +64,20 @@ pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
 pub const CI_CHURN_LIMIT: i64 = 5;
 
 pub use boss_protocol::{
-    AddDependencyInput, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
-    BlockedSignal, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_ORPHANED,
-    COMMENT_STATUS_RESOLVED, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN, CiBudgetSnapshot,
-    CiRemediation, CommentAnchor, CommentResolution, ConflictResolution, CreateAttentionItemInput,
-    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge,
-    DependencyFilter, EffortLevel, EngineAttemptListEntry, RESOLVED_WITH_EXACT,
-    RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, ResolvedComment, WorkComment,
-    ExecutionReconcileResult, ListDependenciesInput, Product, Project, ProjectDesignDocState,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
+    AutomationTrigger, BlockedSignal, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED,
+    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ENGINE_AUTO,
+    CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution,
+    ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
+    CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput,
+    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
+    EffortLevel, EngineAttemptListEntry, ExecutionReconcileResult, ListDependenciesInput,
+    Product, Project, ProjectDesignDocState, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY,
+    RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind,
+    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
     WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
 };
 

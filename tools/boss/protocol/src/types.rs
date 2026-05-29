@@ -1978,6 +1978,190 @@ pub enum OrgAuthState {
     Unknown,
 }
 
+/// One attention group — the human-actionable unit of the Attentions
+/// feature. Id prefix `atg`. Related attentions (questions or followups)
+/// collect into a group keyed by a stable `grouping_key`; the group is
+/// what the human reads and acts on, producing a single downstream
+/// artifact.
+///
+/// Design: `tools/boss/docs/designs/attentions.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct AttentionGroup {
+    pub id: String,
+    pub product_id: String,
+    /// Per-product `A<n>` friendly id. `None` until the engine assigns
+    /// one at creation time. Partial-unique index enforces uniqueness
+    /// per product when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<i64>,
+    /// `"question"` or `"followup"`.
+    pub kind: String,
+    /// Exactly one of `association_project_id` / `association_task_id`
+    /// is set — the XOR constraint mirrors `work_attention_items`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_task_id: Option<String>,
+    /// `"design_doc"` | `"task_transcript"` | `"manual"`.
+    pub source_kind: String,
+    /// Originating design/impl task (jump-back target for the UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<String>,
+    /// Transcript pointer (`runs.id`); pairs with `runs.transcript_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    /// Repo-relative design-doc path (populated for `design_doc`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc_repo_remote_url: Option<String>,
+    /// Head branch for in-review viewing of the source doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc_branch: Option<String>,
+    /// Stable derived key — the upsert dedup target for reconciliation.
+    /// Shape: `"question|{project_id}|doc:{path}"` or
+    /// `"followup|{task_id}"`.
+    pub grouping_key: String,
+    /// Bumped each time the same source re-runs after the prior group
+    /// was actioned/dismissed, keeping "one group ⇒ one revision" true.
+    #[builder(default = 0)]
+    pub generation: i64,
+    /// `"open"` | `"partially_answered"` | `"actioned"` | `"dismissed"`.
+    #[builder(default = "open".to_string())]
+    pub state: String,
+    /// Set when the group has been actioned: `"revision"` |
+    /// `"design_task"` | `"tasks"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_artifact_kind: Option<String>,
+    /// JSON: revision task id / new task ids / PR url.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_artifact_ref: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actioned_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_at: Option<String>,
+}
+
+/// One member of an [`AttentionGroup`]. Id prefix `atn`.
+///
+/// Question groups carry the `question_type` / `prompt_text` /
+/// `choice_options` / `answer` fields. Followup groups carry the
+/// `proposed_*` / `rationale` fields. Both share `source_anchor`,
+/// `answer_state`, and `confidence_source`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct Attention {
+    pub id: String,
+    pub group_id: String,
+    /// Display order within the group (1-based).
+    pub ordinal: i64,
+    /// Doc section / heading slug (questions) or transcript offset hint.
+    /// Drives inline placement in the design-doc viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_anchor: Option<String>,
+    /// `"open"` | `"answered"` | `"skipped"` | `"dismissed"`.
+    #[builder(default = "open".to_string())]
+    pub answer_state: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    // --- question fields (populated when group.kind = "question") ---
+    /// `"yes_no"` | `"multiple_choice"` | `"prompt"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_type: Option<String>,
+    /// The question shown to the human.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_text: Option<String>,
+    /// JSON array of strings (`multiple_choice` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_options: Option<String>,
+    /// Captured answer: `"yes"`/`"no"`, chosen index/value, or free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    // --- followup fields (populated when group.kind = "followup") ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_description: Option<String>,
+    /// Effort hint (`"trivial"` … `"max"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_effort: Option<String>,
+    /// `"task"` | `"chore"` | `"project"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_work_kind: Option<String>,
+    /// Why the agent suggested this followup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// `"structured"` (from a manifest/sentinel) or `"extracted"`
+    /// (from a model pass over a transcript or doc).
+    #[builder(default = "structured".to_string())]
+    pub confidence_source: String,
+}
+
+/// Input for creating a new attention (question or followup member).
+/// The engine resolves or creates the appropriate group based on the
+/// association and source fields; callers may pass an explicit
+/// `group_id` to join an already-open group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateAttentionInput {
+    /// `"question"` or `"followup"`.
+    pub kind: String,
+    /// Explicit group to join. When `None` the engine derives or creates
+    /// the group from `(kind, association, source_*)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Caller-supplied grouping key override. Ignored when `group_id` is
+    /// set; the engine computes the key from association + source when
+    /// both are `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_task_id: Option<String>,
+    /// `"design_doc"` | `"task_transcript"` | `"manual"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc_repo_remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_anchor: Option<String>,
+    // question content
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_options: Option<String>,
+    // followup content
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_work_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// `"structured"` or `"extracted"`. Defaults to `"structured"` when
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_source: Option<String>,
+}
+
 // ===========================================================================
 // Comments in the markdown viewer (design:
 // tools/boss/docs/designs/comments-in-markdown-viewer.md). Phase 2 adds the

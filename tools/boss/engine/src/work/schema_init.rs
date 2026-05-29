@@ -295,6 +295,10 @@ impl WorkDb {
         // this migration. Everything depends on these tables existing.
         migrate_automations_tables(&conn)?;
         migrate_tasks_source_automation_id(&conn)?;
+        // Attentions — new `attention_groups` and `attentions` tables for
+        // agent-raised, human-actionable notifications (questions +
+        // followups). Design: tools/boss/docs/designs/attentions.md.
+        migrate_attentions(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '13')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

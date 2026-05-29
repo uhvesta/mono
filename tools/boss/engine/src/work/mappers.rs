@@ -476,6 +476,72 @@ pub(crate) fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediatio
     })
 }
 
+/// Map one `attention_groups` row into [`AttentionGroup`].
+///
+/// Column order must match the canonical SELECT used by all attention-group
+/// queries:
+/// `id(0), product_id(1), short_id(2), kind(3),
+///  association_project_id(4), association_task_id(5),
+///  source_kind(6), source_task_id(7), source_run_id(8),
+///  source_doc_path(9), source_doc_repo_remote_url(10), source_doc_branch(11),
+///  grouping_key(12), generation(13), state(14),
+///  produced_artifact_kind(15), produced_artifact_ref(16),
+///  created_at(17), actioned_at(18), dismissed_at(19)`.
+pub(crate) fn map_attention_group(row: &Row<'_>) -> rusqlite::Result<AttentionGroup> {
+    Ok(AttentionGroup {
+        id: row.get(0)?,
+        product_id: row.get(1)?,
+        short_id: row.get(2)?,
+        kind: row.get(3)?,
+        association_project_id: row.get(4)?,
+        association_task_id: row.get(5)?,
+        source_kind: row.get(6)?,
+        source_task_id: row.get(7)?,
+        source_run_id: row.get(8)?,
+        source_doc_path: row.get(9)?,
+        source_doc_repo_remote_url: row.get(10)?,
+        source_doc_branch: row.get(11)?,
+        grouping_key: row.get(12)?,
+        generation: row.get(13)?,
+        state: row.get(14)?,
+        produced_artifact_kind: row.get::<_, Option<String>>(15)?.filter(|s| !s.is_empty()),
+        produced_artifact_ref: row.get::<_, Option<String>>(16)?.filter(|s| !s.is_empty()),
+        created_at: row.get(17)?,
+        actioned_at: row.get(18)?,
+        dismissed_at: row.get(19)?,
+    })
+}
+
+/// Map one `attentions` row into [`Attention`].
+///
+/// Column order must match the canonical SELECT:
+/// `id(0), group_id(1), ordinal(2), source_anchor(3),
+///  answer_state(4), created_at(5), answered_at(6),
+///  question_type(7), prompt_text(8), choice_options(9), answer(10),
+///  proposed_name(11), proposed_description(12), proposed_effort(13),
+///  proposed_work_kind(14), rationale(15), confidence_source(16)`.
+pub(crate) fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
+    Ok(Attention {
+        id: row.get(0)?,
+        group_id: row.get(1)?,
+        ordinal: row.get(2)?,
+        source_anchor: row.get(3)?,
+        answer_state: row.get(4)?,
+        created_at: row.get(5)?,
+        answered_at: row.get(6)?,
+        question_type: row.get(7)?,
+        prompt_text: row.get(8)?,
+        choice_options: row.get(9)?,
+        answer: row.get(10)?,
+        proposed_name: row.get(11)?,
+        proposed_description: row.get(12)?,
+        proposed_effort: row.get::<_, Option<String>>(13)?.filter(|s| !s.is_empty()),
+        proposed_work_kind: row.get(14)?,
+        rationale: row.get(15)?,
+        confidence_source: row.get(16)?,
+    })
+}
+
 pub(crate) fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option<CiRemediation>> {
     let mut stmt = conn.prepare(
         "SELECT id, product_id, work_item_id, pr_url, pr_number,
