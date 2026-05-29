@@ -1259,6 +1259,52 @@ pub async fn rescue_stranded_ci_remediation_attempt(
     }
 }
 
+/// Called after a PR is marked merged. Abandons any pending or running
+/// `ci_remediations` rows for `work_item_id` (they are moot now that the PR
+/// has shipped) and emits `CiFailureCleared` if any rows were cleaned up.
+///
+/// This closes the invalidation gap where a task is `blocked: ci_failure`
+/// (or had an outstanding remediation row) when the PR is merged: without
+/// this cleanup, the `pending` row causes `sendListCiRemediations` to
+/// re-set the "ci failing" badge on every app restart, even after the
+/// task is `done`.
+pub async fn on_pr_merged(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+) {
+    let count = match work_db.abandon_active_ci_remediations_for_work_item(&candidate.work_item_id) {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to abandon active ci_remediations on PR merge; badge may persist",
+            );
+            return;
+        }
+    };
+    if count > 0 {
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                FrontendEvent::CiFailureCleared {
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            count,
+            "ci_watch: abandoned active ci_remediations on PR merge; CiFailureCleared emitted",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
