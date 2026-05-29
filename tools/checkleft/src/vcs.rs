@@ -562,7 +562,10 @@ R docs/old.md => docs/new.md
         }
 
         let temp = tempdir().expect("create temp dir");
-        run_git(temp.path(), &["init"]);
+        // Pin the initial branch name so the test does not depend on the
+        // machine's `init.defaultBranch` config (CI leaves it unset, which
+        // defaults to `master`, breaking the `git merge-base main HEAD` below).
+        run_git(temp.path(), &["init", "-b", "main"]);
         run_git(
             temp.path(),
             &["config", "user.email", "test@checkleft.example"],
