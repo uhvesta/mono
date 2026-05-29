@@ -31,7 +31,12 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
         echo "[checks] shallow repo detected; unshallowing for merge-base computation"
         git fetch --unshallow origin 2>/dev/null || true
     fi
-    CHECKLEFT_ARGS=(run --base-ref="origin/${base_branch}")
+    # Use the fork point (3-dot diff equivalent) so that commits merged to
+    # origin/<base_branch> AFTER this branch forked are not attributed to this PR.
+    # Using origin/<base_branch> directly (2-dot) sweeps in main's divergence.
+    merge_base=$(git merge-base "origin/${base_branch}" HEAD)
+    echo "[checks] PR build — scoping to changes since merge-base ${merge_base}"
+    CHECKLEFT_ARGS=(run --base-ref="${merge_base}")
 elif [[ "${BUILDKITE_BRANCH:-}" == gh-readonly-queue/* ]]; then
     # GitHub merge-queue build. HEAD is a merge commit created by GitHub:
     #   HEAD^1 = the main tip this PR is being merged onto

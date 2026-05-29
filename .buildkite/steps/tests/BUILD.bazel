@@ -6,3 +6,10 @@ sh_test(
     size = "small",
     visibility = ["//visibility:private"],
 )
+
+sh_test(
+    name = "checks_pr_base_test",
+    srcs = ["checks_pr_base_test.sh"],
+    size = "small",
+    visibility = ["//visibility:private"],
+)
