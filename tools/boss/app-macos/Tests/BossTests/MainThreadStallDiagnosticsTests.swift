@@ -95,6 +95,34 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         XCTAssertEqual(lastFiveMin.map(\.context), ["recent"])
     }
 
+    // MARK: - StallLog duration growth (ongoing-freeze fidelity)
+
+    func testGrowDurationRaisesOngoingStallToTrueMagnitude() {
+        // A hard beachball is first recorded at the detection lower bound
+        // (~threshold), then grown each watchdog tick while still frozen.
+        let log = StallLog(directory: nil, capacity: 10)
+        let rec = makeRecord(tsEpochMs: 1, context: "Activity", duration: 250)
+        log.record(rec)
+        log.growDuration(id: rec.id, toAtLeast: 5200)
+        XCTAssertEqual(log.snapshot().first?.durationMs, 5200)
+    }
+
+    func testGrowDurationNeverShrinks() {
+        let log = StallLog(directory: nil, capacity: 10)
+        let rec = makeRecord(tsEpochMs: 1, context: "Activity", duration: 5200)
+        log.record(rec)
+        log.growDuration(id: rec.id, toAtLeast: 300) // smaller → ignored
+        XCTAssertEqual(log.snapshot().first?.durationMs, 5200)
+    }
+
+    func testGrowDurationIgnoresUnknownId() {
+        let log = StallLog(directory: nil, capacity: 10)
+        let rec = makeRecord(tsEpochMs: 1, context: "Activity", duration: 250)
+        log.record(rec)
+        log.growDuration(id: UUID(), toAtLeast: 9999)
+        XCTAssertEqual(log.snapshot().first?.durationMs, 250)
+    }
+
     func testStallLogSnapshotIsIndependentCopy() {
         let log = StallLog(directory: nil, capacity: 10)
         log.record(makeRecord(tsEpochMs: 1, context: "a"))
