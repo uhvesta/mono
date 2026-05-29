@@ -2,14 +2,20 @@ import Foundation
 
 // MARK: - Version types
 
-struct VersionTuple: Comparable, Equatable, Sendable, CustomStringConvertible {
-    let major: Int
-    let minor: Int
-    let patch: Int
+public struct VersionTuple: Comparable, Equatable, Sendable, CustomStringConvertible {
+    public let major: Int
+    public let minor: Int
+    public let patch: Int
 
-    var description: String { "\(major).\(minor).\(patch)" }
+    public init(major: Int, minor: Int, patch: Int) {
+        self.major = major
+        self.minor = minor
+        self.patch = patch
+    }
 
-    static func parse(_ string: String) -> VersionTuple? {
+    public var description: String { "\(major).\(minor).\(patch)" }
+
+    public static func parse(_ string: String) -> VersionTuple? {
         let parts = string.split(separator: ".", maxSplits: 2, omittingEmptySubsequences: false)
         guard parts.count == 3,
               let major = Int(parts[0]),
@@ -18,22 +24,30 @@ struct VersionTuple: Comparable, Equatable, Sendable, CustomStringConvertible {
         return VersionTuple(major: major, minor: minor, patch: patch)
     }
 
-    static func < (lhs: VersionTuple, rhs: VersionTuple) -> Bool {
+    public static func < (lhs: VersionTuple, rhs: VersionTuple) -> Bool {
         if lhs.major != rhs.major { return lhs.major < rhs.major }
         if lhs.minor != rhs.minor { return lhs.minor < rhs.minor }
         return lhs.patch < rhs.patch
     }
 }
 
-struct AvailableUpdate: Equatable, Sendable {
-    let tagName: String
-    let version: VersionTuple
-    let assetURL: URL
-    let assetSize: Int
-    let releaseNotes: String
+public struct AvailableUpdate: Equatable, Sendable {
+    public let tagName: String
+    public let version: VersionTuple
+    public let assetURL: URL
+    public let assetSize: Int
+    public let releaseNotes: String
+
+    public init(tagName: String, version: VersionTuple, assetURL: URL, assetSize: Int, releaseNotes: String) {
+        self.tagName = tagName
+        self.version = version
+        self.assetURL = assetURL
+        self.assetSize = assetSize
+        self.releaseNotes = releaseNotes
+    }
 }
 
-enum UpdateCheckResult: Equatable, Sendable {
+public enum UpdateCheckResult: Equatable, Sendable {
     case upToDate
     case available(AvailableUpdate)
     /// Polling must suspend until `retryAfter`.
