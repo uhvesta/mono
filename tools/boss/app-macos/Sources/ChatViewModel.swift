@@ -332,6 +332,35 @@ final class ChatViewModel: ObservableObject {
         try await GitHubContentFetcher.fetch(url)
     }
 
+    /// Indirection for opening a review terminal window. Installed by
+    /// [[ContentView]] using `@Environment(\.openWindow)` — same
+    /// boundary-crossing pattern as [[designRendererOpener]]. When set,
+    /// a `ReviewTerminalReady` engine event triggers `openWindow` for the
+    /// `"review-terminal"` scene. `nil` in tests and headless contexts.
+    var reviewTerminalOpener: ((ReviewTerminalContent) -> Void)?
+
+    /// Work item IDs for which `open_review_terminal` has been sent but
+    /// `review_terminal_ready` (or `work_error`) has not yet arrived.
+    /// Guards against a second click while the engine is still leasing.
+    private var openingReviewTerminalIDs: Set<String> = []
+
+    /// Ask the engine to lease a workspace for the given Review-column
+    /// task's PR branch and open a Ghostty terminal there. Idempotent per
+    /// in-flight request: a second call while one is pending is a no-op.
+    func openReviewTerminal(for task: WorkTask) {
+        guard let prURL = task.prURL, !prURL.isEmpty else { return }
+        guard !openingReviewTerminalIDs.contains(task.id) else { return }
+        openingReviewTerminalIDs.insert(task.id)
+        engine.sendOpenReviewTerminal(workItemID: task.id)
+    }
+
+    /// Notify the engine that the review terminal for `leaseID` has
+    /// closed so the workspace lease can be released. Called from the
+    /// `ReviewTerminalView.onDisappear` handler.
+    func releaseReviewTerminal(leaseID: String) {
+        engine.sendReleaseReviewTerminal(leaseID: leaseID)
+    }
+
     /// Toggle the live-status summarizer for `slotId`. Sends the
     /// RPC and optimistically updates local state; the engine echo
     /// brings the two back in sync.
@@ -1635,6 +1664,10 @@ final class ChatViewModel: ObservableObject {
             }
         case .workError(let message):
             workErrorMessage = message
+            // Allow the user to retry any in-flight review terminal request
+            // that failed — the specific work_error message is shown in the
+            // modal, so clearing in-flight state here is safe.
+            openingReviewTerminalIDs.removeAll()
         case .error(let message):
             if isSocketTransportError(message) {
                 // Transport errors fire continuously while the engine
@@ -1786,6 +1819,14 @@ final class ChatViewModel: ObservableObject {
             engine.sendListCiRemediations(limit: 200)
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
+        case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
+            openingReviewTerminalIDs.remove(workItemID)
+            let content = ReviewTerminalContent(
+                workItemID: workItemID,
+                workspacePath: workspacePath,
+                leaseID: leaseID
+            )
+            reviewTerminalOpener?(content)
         }
     }
 

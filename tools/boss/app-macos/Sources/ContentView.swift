@@ -123,6 +123,9 @@ struct ContentView: View {
             model.asyncMarkdownViewerOpener = { [openWindow] in
                 openWindow(id: "async-markdown-viewer")
             }
+            model.reviewTerminalOpener = { [openWindow] content in
+                openWindow(id: "review-terminal", value: content)
+            }
             model.startIfNeeded()
         }
         .toolbar {
@@ -1441,7 +1444,10 @@ private struct WorkBoardCardItem: View {
                     parentShortID: parentShortID,
                     onDepBadgeHover: { hovering in
                         model.setDepBadgeHover(hovering ? task.id : nil)
-                    }
+                    },
+                    onOpenReviewTerminal: (column == .review && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
+                        ? { model.openReviewTerminal(for: task) }
+                        : nil
                 )
             }
             .buttonStyle(.plain)
@@ -1660,6 +1666,10 @@ struct WorkBoardCardView: View {
     /// `nil` when the card doesn't need to report badge hover (e.g.
     /// in the Designs viewer).
     var onDepBadgeHover: ((Bool) -> Void)? = nil
+    /// Invoked when the user taps the terminal icon on a Review-column
+    /// card. `nil` hides the button — callers only pass a closure when
+    /// `column == .review && task.prURL != nil`.
+    var onOpenReviewTerminal: (() -> Void)? = nil
 
     @State private var isHovered: Bool = false
 
@@ -1824,6 +1834,18 @@ struct WorkBoardCardView: View {
                             }
                             .buttonStyle(.plain)
                             .help("Open investigation doc: \(webURL)")
+                        }
+                        if let openTerminal = onOpenReviewTerminal {
+                            Button {
+                                openTerminal()
+                            } label: {
+                                Image(systemName: "terminal")
+                                    .font(.caption)
+                                    .foregroundStyle(Color.secondary)
+                                    .accessibilityLabel("Open terminal on PR branch")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open terminal on PR branch")
                         }
                     }
                     if stacksStatusBadges {

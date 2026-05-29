@@ -83,6 +83,18 @@ struct BossMacApp: App {
         }
         .defaultSize(width: 880, height: 700)
 
+        // Review-terminal window: opened from a Review-column card's
+        // terminal button. Hosts a Ghostty surface in the cube-leased
+        // workspace that the engine set up on the PR branch.
+        WindowGroup("Review Terminal", id: "review-terminal", for: ReviewTerminalContent.self) { $content in
+            if let content {
+                ReviewTerminalView(content: content)
+                    .environmentObject(chatModel)
+                    .navigationTitle("Review: \(content.workItemID)")
+            }
+        }
+        .defaultSize(width: 1000, height: 660)
+
         Window("Activity", id: "activity") {
             ActivityView()
         }

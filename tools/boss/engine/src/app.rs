@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::audit_effort;
@@ -7212,6 +7213,136 @@ async fn handle_frontend_connection(
                     },
                 );
             }
+            FrontendRequest::OpenReviewTerminal { work_item_id } => {
+                let item = match work_db.get_work_item(&work_item_id) {
+                    Ok(item) => item,
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!("open_review_terminal: unknown work item: {err}"),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let (pr_url, product_id, task_repo_url) = match &item {
+                    WorkItem::Task(task) | WorkItem::Chore(task) => (
+                        task.pr_url.clone(),
+                        task.product_id.clone(),
+                        task.repo_remote_url.clone(),
+                    ),
+                    _ => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: "open_review_terminal only supports tasks/chores"
+                                    .to_owned(),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let pr_url = match pr_url.filter(|s| !s.is_empty()) {
+                    Some(u) => u,
+                    None => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: "open_review_terminal: task has no PR URL".to_owned(),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let product = match work_db
+                    .get_product(&product_id)
+                    .ok()
+                    .flatten()
+                {
+                    Some(p) => p,
+                    None => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "open_review_terminal: unknown product: {product_id}"
+                                ),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let repo_remote_url = match task_repo_url
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| product.repo_remote_url.filter(|s| !s.is_empty()))
+                {
+                    Some(url) => url,
+                    None => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message:
+                                    "open_review_terminal: task has no repo URL".to_owned(),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let cube_client = server_state.cube_client.clone();
+                let sink2 = sink.clone();
+                let request_id2 = request_id.clone();
+                let work_item_id2 = work_item_id.clone();
+                tokio::spawn(async move {
+                    match open_review_terminal_async(
+                        &cube_client,
+                        &repo_remote_url,
+                        &pr_url,
+                        &work_item_id2,
+                    )
+                    .await
+                    {
+                        Ok((workspace_path, lease_id)) => {
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::ReviewTerminalReady {
+                                    work_item_id: work_item_id2,
+                                    workspace_path,
+                                    lease_id,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::WorkError {
+                                    message: format!("open_review_terminal failed: {err:#}"),
+                                },
+                            );
+                        }
+                    }
+                });
+            }
+            FrontendRequest::ReleaseReviewTerminal { lease_id } => {
+                let cube_client = server_state.cube_client.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = cube_client.release_workspace(&lease_id).await {
+                        tracing::warn!(
+                            %lease_id,
+                            ?err,
+                            "release_review_terminal: workspace release failed"
+                        );
+                    }
+                });
+                // fire-and-forget: no reply sent
+            }
         }
     }
 
@@ -7689,6 +7820,126 @@ async fn handle_create_many(
             send_response(sink, request_id, duplicate_or_work_error(err));
         }
     }
+}
+
+/// Orchestrate the review-terminal workspace setup for
+/// [`FrontendRequest::OpenReviewTerminal`].
+///
+/// 1. Ensure the repo is registered with cube.
+/// 2. Lease a workspace for that repo.
+/// 3. Resolve the PR head branch via `gh pr view`.
+/// 4. Fetch remote state with `jj git fetch`.
+/// 5. Create a new jj commit atop `<branch>@origin` with `jj new`.
+/// 6. Return `(workspace_path, lease_id)` to the caller.
+///
+/// On any failure after a lease is acquired, the lease is released
+/// before returning the error so we don't leak idle workspaces.
+async fn open_review_terminal_async(
+    cube_client: &Arc<dyn CubeClient>,
+    repo_remote_url: &str,
+    pr_url: &str,
+    work_item_id: &str,
+) -> Result<(String, String)> {
+    // Step 1: ensure repo
+    let repo = cube_client
+        .ensure_repo(repo_remote_url)
+        .await
+        .with_context(|| format!("cube repo ensure failed for {repo_remote_url}"))?;
+
+    // Step 2: lease workspace
+    let task_label = format!("review terminal for {work_item_id}");
+    let lease = cube_client
+        .lease_workspace(&repo.repo_id, &task_label, None)
+        .await
+        .with_context(|| format!("cube workspace lease failed for repo {}", repo.repo_id))?;
+
+    // Helper: release lease and propagate the original error.
+    macro_rules! fail_with_release {
+        ($err:expr) => {{
+            let e = $err;
+            let _ = cube_client.release_workspace(&lease.lease_id).await;
+            return Err(e);
+        }};
+    }
+
+    // Step 3: resolve PR head branch
+    let head_branch = match get_pr_head_branch(pr_url).await {
+        Ok(b) => b,
+        Err(e) => fail_with_release!(e),
+    };
+
+    // Step 4: jj git fetch
+    let fetch_out = TokioCommand::new("jj")
+        .args(["git", "fetch"])
+        .current_dir(&lease.workspace_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match fetch_out {
+        Err(e) => fail_with_release!(anyhow::anyhow!("failed to spawn jj git fetch: {e}")),
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            fail_with_release!(anyhow::anyhow!(
+                "jj git fetch failed: {}",
+                stderr.trim()
+            ))
+        }
+        Ok(_) => {}
+    }
+
+    // Step 5: jj new -r <branch>@origin
+    let rev = format!("{head_branch}@origin");
+    let new_out = TokioCommand::new("jj")
+        .args(["new", "-r", &rev])
+        .current_dir(&lease.workspace_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match new_out {
+        Err(e) => fail_with_release!(anyhow::anyhow!("failed to spawn jj new: {e}")),
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            fail_with_release!(anyhow::anyhow!(
+                "jj new -r {rev} failed: {}",
+                stderr.trim()
+            ))
+        }
+        Ok(_) => {}
+    }
+
+    Ok((lease.workspace_path.display().to_string(), lease.lease_id))
+}
+
+/// Call `gh pr view <pr_url> --json headRefName --jq .headRefName` and
+/// return the head branch name. Mirrors the approach in
+/// `design_detector::do_scan_pr` but requests only the one field we need.
+async fn get_pr_head_branch(pr_url: &str) -> Result<String> {
+    let output = TokioCommand::new("gh")
+        .args(["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn gh pr view for {pr_url}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh pr view {pr_url} failed: {}", stderr.trim());
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if branch.is_empty() {
+        anyhow::bail!("gh pr view {pr_url} returned empty headRefName");
+    }
+    Ok(branch)
 }
 
 /// Transport-layer fallback for `created_via` when a caller didn't

@@ -210,6 +210,11 @@ enum EngineEvent {
     /// Response to `list_attention_items_for_work_item` — open and
     /// resolved attention items for a given product/work-item id.
     case attentionItemsForWorkItemList(workItemID: String, items: [WorkAttentionItem])
+    /// Response to `open_review_terminal` — the engine has leased a
+    /// workspace, fetched the PR branch, and created a new jj commit
+    /// atop `<branch>@origin`. The app should open a Ghostty terminal
+    /// window rooted at `workspacePath`.
+    case reviewTerminalReady(workItemID: String, workspacePath: String, leaseID: String)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -394,6 +399,26 @@ final class EngineClient: @unchecked Sendable {
         sendLine([
             "type": "list_attention_items_for_work_item",
             "work_item_id": workItemID,
+        ])
+    }
+
+    /// Ask the engine to lease a workspace for the given Review-column
+    /// work item, check out the PR head branch, and return the workspace
+    /// path for opening a Ghostty terminal. The engine replies with
+    /// `review_terminal_ready` or `work_error`.
+    func sendOpenReviewTerminal(workItemID: String) {
+        sendLine([
+            "type": "open_review_terminal",
+            "work_item_id": workItemID,
+        ])
+    }
+
+    /// Notify the engine that a review terminal window closed so it can
+    /// release the associated workspace lease. Fire-and-forget.
+    func sendReleaseReviewTerminal(leaseID: String) {
+        sendLine([
+            "type": "release_review_terminal",
+            "lease_id": leaseID,
         ])
     }
 
@@ -1140,6 +1165,17 @@ final class EngineClient: @unchecked Sendable {
                 let items = raw.compactMap(parseAttentionItem)
                 if !workItemID.isEmpty {
                     emit(.attentionItemsForWorkItemList(workItemID: workItemID, items: items))
+                }
+            case "review_terminal_ready":
+                let workItemID = payload["work_item_id"] as? String ?? ""
+                let workspacePath = payload["workspace_path"] as? String ?? ""
+                let leaseID = payload["lease_id"] as? String ?? ""
+                if !workItemID.isEmpty && !workspacePath.isEmpty && !leaseID.isEmpty {
+                    emit(.reviewTerminalReady(
+                        workItemID: workItemID,
+                        workspacePath: workspacePath,
+                        leaseID: leaseID
+                    ))
                 }
             default:
                 break

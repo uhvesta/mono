@@ -828,6 +828,20 @@ pub enum FrontendRequest {
     /// immediately with a [`FrontendEvent::GitHubAuthState`] push
     /// reflecting the latest known state.
     GitHubAuthStatus,
+    /// App asks the engine to lease a workspace for the given Review-
+    /// column work item, fetch the PR branch, and create a fresh jj
+    /// commit off `<branch>@origin`. The engine replies with
+    /// [`FrontendEvent::ReviewTerminalReady`] on success or
+    /// [`FrontendEvent::WorkError`] on failure.
+    OpenReviewTerminal {
+        work_item_id: String,
+    },
+    /// App notifies the engine that a review terminal window has closed
+    /// and the associated workspace lease should be released. This is
+    /// fire-and-forget: the engine logs failures but does not reply.
+    ReleaseReviewTerminal {
+        lease_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1488,6 +1502,17 @@ pub enum FrontendEvent {
     /// renders whatever state the engine pushes without polling.
     GitHubAuthState {
         state: GitHubAuthStateDto,
+    },
+    /// Response to [`FrontendRequest::OpenReviewTerminal`]: the engine
+    /// has leased a workspace, fetched the PR branch, and created a new
+    /// jj commit atop `<branch>@origin`. The app should open a Ghostty
+    /// terminal window rooted at `workspace_path` and send
+    /// [`FrontendRequest::ReleaseReviewTerminal`] with `lease_id` when
+    /// the window closes to avoid leaking the lease.
+    ReviewTerminalReady {
+        work_item_id: String,
+        workspace_path: String,
+        lease_id: String,
     },
 }
 
