@@ -878,6 +878,17 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("  - **Alternatives considered** — at least two distinct approaches and why they were not chosen.\n");
     out.push_str("  - **Chosen approach** — the design itself, with enough detail that a follow-up implementation task can be filed against it.\n");
     out.push_str("  - **Risks / open questions** — anything the author wants a human reviewer to land on before implementation starts.\n");
+    out.push_str("  - **Proposed implementation task breakdown** — this section is **required** and must be the final section of the doc. It is the machine-findable handoff to scheduling (see below).\n");
+    out.push_str("- the **Proposed implementation task breakdown** section must:\n");
+    out.push_str("  - use exactly that heading (`## Proposed implementation task breakdown`) so a downstream parser can locate it reliably.\n");
+    out.push_str("  - list PR-sized tasks in dependency order, where each entry contains:\n");
+    out.push_str("    - a short **task name** (one line).\n");
+    out.push_str("    - a one-paragraph **scope** description.\n");
+    out.push_str("    - an **effort hint**: one of `trivial | small | medium | large`.\n");
+    out.push_str("    - **explicit dependencies** — which other entries in this list gate this one (use the task names; \"none\" if it can start immediately).\n");
+    out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
+    out.push_str("  - include items that are deferred or explicitly out of scope, marked as `future / not a v1 blocker` rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected.\n");
+    out.push_str("  - This section is what P783's auto-populate will consume to materialise dependent tasks with edges, so completeness matters.\n");
     out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up work items the human files after the design is approved.\n");
     out
 }
