@@ -1764,25 +1764,87 @@ impl From<EffortLevelArg> for boss_protocol::EffortLevel {
     }
 }
 
+/// Translation between the leaf work-item (task/chore) status taxonomy
+/// as the engine *stores* it and the names the kanban board *shows*.
+///
+/// The board lanes are Backlog / Doing / Review / Done / Blocked. The
+/// engine has always stored the left-hand legacy strings below. As of
+/// the taxonomy-alignment change the CLI speaks the board's vocabulary
+/// everywhere a human or `--json` consumer can see it, while the engine
+/// and stored rows keep the legacy strings untouched. The legacy names
+/// remain accepted on input as aliases (see [`TaskStatus`] /
+/// [`MoveTarget`]) so old scripts and stored data keep working.
+mod status_vocab {
+    /// `(stored, ui)` pairs for every status whose name differs between
+    /// the two vocabularies. `done` and `blocked` are identical in both
+    /// and so are absent here — [`to_ui`] passes them (and any unknown
+    /// value) through unchanged.
+    const RENAMED: [(&str, &str); 3] =
+        [("todo", "backlog"), ("active", "doing"), ("in_review", "review")];
+
+    /// Map a stored status string to the board (UI) name shown to
+    /// humans and emitted in `--json`. Unknown values pass through so
+    /// the CLI never hides a status the engine starts emitting before
+    /// this table is updated.
+    pub fn to_ui(stored: &str) -> &str {
+        RENAMED
+            .iter()
+            .find(|(s, _)| *s == stored)
+            .map_or(stored, |(_, ui)| *ui)
+    }
+}
+
+/// Return a copy of `task` with its `status` rewritten to the board (UI)
+/// name. Applied at every display boundary (human output and `--json`)
+/// after any status filtering, which still runs against the stored
+/// vocabulary. See [`status_vocab`].
+fn with_display_status(mut task: Task) -> Task {
+    task.status = status_vocab::to_ui(&task.status).to_owned();
+    task
+}
+
+/// [`with_display_status`] for the `WorkItem` envelope: rewrites the
+/// status of the leaf (task/chore) variants and leaves products /
+/// projects (which have their own taxonomies) untouched.
+fn work_item_with_display_status(item: WorkItem) -> WorkItem {
+    match item {
+        WorkItem::Task(task) => WorkItem::Task(with_display_status(task)),
+        WorkItem::Chore(chore) => WorkItem::Chore(with_display_status(chore)),
+        other => other,
+    }
+}
+
+/// `boss task|chore update --status` and `--status` list filters.
+///
+/// The variants are the board (UI) names; the legacy stored names are
+/// accepted as hidden aliases for backward compatibility. [`Self::as_str`]
+/// always returns the stored string, so both the wire patch sent to the
+/// engine and the status-filter comparison stay in the stored vocabulary.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum TaskStatus {
-    Todo,
-    Active,
+    #[value(alias = "todo")]
+    Backlog,
+    #[value(alias = "active")]
+    Doing,
     Blocked,
-    InReview,
+    #[value(alias = "in-review", alias = "in_review")]
+    Review,
     Done,
 }
 
+/// `boss task|chore move --to`. Same board-name-primary,
+/// legacy-name-alias scheme as [`TaskStatus`]; [`Self::as_status`]
+/// returns the stored string.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum MoveTarget {
+    #[value(alias = "todo")]
     Backlog,
+    #[value(alias = "active")]
     Doing,
+    #[value(alias = "in-review", alias = "in_review")]
     Review,
     Done,
-    Todo,
-    Active,
     Blocked,
-    InReview,
 }
 
 impl ProductStatus {
@@ -1828,23 +1890,28 @@ impl TaskPriority {
 }
 
 impl TaskStatus {
+    /// The stored status string sent to the engine and used for
+    /// status-filter comparisons. Maps the board (UI) variant name back
+    /// to the legacy stored vocabulary.
     fn as_str(self) -> &'static str {
         match self {
-            Self::Todo => "todo",
-            Self::Active => "active",
+            Self::Backlog => "todo",
+            Self::Doing => "active",
             Self::Blocked => "blocked",
-            Self::InReview => "in_review",
+            Self::Review => "in_review",
             Self::Done => "done",
         }
     }
 }
 
 impl MoveTarget {
+    /// The stored status string the engine persists. Maps the board (UI)
+    /// variant name back to the legacy stored vocabulary.
     fn as_status(self) -> &'static str {
         match self {
-            Self::Backlog | Self::Todo => "todo",
-            Self::Doing | Self::Active => "active",
-            Self::Review | Self::InReview => "in_review",
+            Self::Backlog => "todo",
+            Self::Doing => "active",
+            Self::Review => "in_review",
             Self::Done => "done",
             Self::Blocked => "blocked",
         }
@@ -2053,9 +2120,9 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "Kind-specific verbs (create, create-many, list, reorder) stay split by kind because their inputs and filters genuinely differ (e.g. tasks have a project, chores don't; reorder is project-task-only).",
         ],
         status_semantics: vec![
-            "CLI status values use in-review on the command line.",
-            "Internally, in-review maps to in_review.",
-            "Task and chore move targets map: backlog|todo -> todo, doing|active -> active, review|in-review -> in_review, blocked -> blocked, done -> done.",
+            "Task and chore status uses the board (kanban) names: backlog, doing, review, done, blocked. These are the canonical values shown in --status help and emitted in --json.",
+            "The legacy stored names are accepted as aliases on input: todo->backlog, active->doing, in_review (or in-review)->review. They remain how rows are stored, so --json/human output always shows the board name regardless of how a row was set.",
+            "boss task|chore update --status and --status list filters accept either vocabulary; boss task|chore move --to backlog|doing|review|done|blocked (legacy names also accepted).",
             "Product move/delete: --to active|paused|archived. delete is a soft archive (sets status=archived).",
             "Project move/delete: --to planned|active|blocked|done|archived. delete is a soft archive (sets status=archived).",
             "Task/chore delete is a soft delete (sets deleted_at). Recover an accidentally deleted leaf work item with `boss task restore <id>` (alias `undelete`); it clears deleted_at and is idempotent. Find tombstoned rows to restore with `boss task list --deleted` / `boss chore list --deleted`.",
@@ -2398,7 +2465,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let design_task = list_tasks(&mut client, &product.id, Some(&project.id), None, false)
                 .await?
                 .into_iter()
-                .find(|t| t.kind == "design");
+                .find(|t| t.kind == "design")
+                .map(with_display_status);
 
             print_entity(
                 ctx,
@@ -2707,6 +2775,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 },
             )
             .await?;
+            let task = with_display_status(task);
             print_entity(ctx, &serde_json::json!({ "task": task }), || {
                 print_task_details("Created task", &task, None, false);
             })
@@ -2745,6 +2814,9 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
             );
+            // Status filtering above runs against the stored vocabulary;
+            // remap to the board names only for output.
+            let tasks: Vec<Task> = tasks.into_iter().map(with_display_status).collect();
             print_entity(ctx, &serde_json::json!({ "tasks": tasks }), || {
                 print_tasks_table(&tasks, args.with_primary_id)
             })
@@ -2835,6 +2907,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 },
             )
             .await?;
+            let chore = with_display_status(chore);
             print_entity(ctx, &serde_json::json!({ "chore": chore }), || {
                 print_task_details("Created chore", &chore, None, false);
             })
@@ -2855,6 +2928,9 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
                 repo_selector.as_ref(),
                 product.repo_remote_url.as_deref(),
             );
+            // Status filtering above runs against the stored vocabulary;
+            // remap to the board names only for output.
+            let chores: Vec<Task> = chores.into_iter().map(with_display_status).collect();
             print_entity(ctx, &serde_json::json!({ "chores": chores }), || {
                 print_tasks_table(&chores, args.with_primary_id)
             })
@@ -2904,6 +2980,7 @@ async fn run_show_leaf(
         }
     };
     let (item, label) = expect_leaf_work_item(work_item)?;
+    let item = with_display_status(item);
     let product = expect_product(get_work_item(client, &item.product_id).await?)?;
     let detail = list_dependencies_detailed(
         client,
@@ -3049,6 +3126,7 @@ async fn run_update_leaf(
     };
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, product_hint).await?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
+    let item = with_display_status(item);
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Updated {label}"), &item, None, false);
     })
@@ -3066,6 +3144,7 @@ async fn run_move_leaf(
         ..WorkItemPatch::default()
     };
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
+    let item = with_display_status(item);
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Moved {label}"), &item, None, false);
     })
@@ -3108,7 +3187,7 @@ async fn run_restore_leaf(
     // can't reach it. The engine resolves the globally-unique `T43`
     // form (and canonical `task_…` ids) against tombstoned rows itself,
     // so we pass the raw selector straight through.
-    let item = restore_work_item(client, args.id.trim()).await?;
+    let item = work_item_with_display_status(restore_work_item(client, args.id.trim()).await?);
     let (label, friendly) = match &item {
         WorkItem::Task(t) => ("Task", t.short_id.map(|n| format!("T{n}"))),
         WorkItem::Chore(t) => ("Chore", t.short_id.map(|n| format!("T{n}"))),
@@ -5199,10 +5278,16 @@ fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete: bool) -> 
     } else {
         ""
     };
+    // Projects carry their own status taxonomy (planned/active/…); only
+    // task/chore edges share the board vocabulary, so remap just those.
+    let status = if edge.id.starts_with("proj_") {
+        edge.status.as_str()
+    } else {
+        status_vocab::to_ui(&edge.status)
+    };
     format!(
         "    {id:<32}  {status:<10}{name}{suffix}",
         id = edge.id,
-        status = edge.status,
     )
 }
 
@@ -6911,11 +6996,11 @@ mod tests {
     use super::{
         BindPrAction, BulkCreateItem, ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity,
         MoveTarget, OpenDesignAction, ProductCommand, ProductStatus, ProjectCommand,
-        ProjectStatus, RepoSelector, RunContext, TaskCommand, classify_bind_pr,
+        ProjectStatus, RepoSelector, RunContext, TaskCommand, TaskStatus, classify_bind_pr,
         classify_lint_finding, decide_open_design_action, ensure_explicit_product_matches,
         expect_leaf_work_item, format_project_design_doc_line, format_repo_line,
         is_typed_work_item_id, lint_summary_line, pick_by_index, short_name_for,
-        split_shake_report, validate_github_pr_url,
+        split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -6923,10 +7008,82 @@ mod tests {
     };
 
     #[test]
-    fn move_target_maps_review_to_in_review() {
-        assert_eq!(MoveTarget::Review.as_status(), "in_review");
+    fn move_target_maps_board_names_to_stored() {
+        assert_eq!(MoveTarget::Backlog.as_status(), "todo");
         assert_eq!(MoveTarget::Doing.as_status(), "active");
+        assert_eq!(MoveTarget::Review.as_status(), "in_review");
+        assert_eq!(MoveTarget::Done.as_status(), "done");
         assert_eq!(MoveTarget::Blocked.as_status(), "blocked");
+    }
+
+    #[test]
+    fn task_status_maps_board_names_to_stored() {
+        // `--status`/filter values are the board names; the stored
+        // string sent to the engine stays in the legacy vocabulary.
+        assert_eq!(TaskStatus::Backlog.as_str(), "todo");
+        assert_eq!(TaskStatus::Doing.as_str(), "active");
+        assert_eq!(TaskStatus::Review.as_str(), "in_review");
+        assert_eq!(TaskStatus::Done.as_str(), "done");
+        assert_eq!(TaskStatus::Blocked.as_str(), "blocked");
+    }
+
+    #[test]
+    fn status_vocab_maps_stored_to_board_names() {
+        assert_eq!(status_vocab::to_ui("todo"), "backlog");
+        assert_eq!(status_vocab::to_ui("active"), "doing");
+        assert_eq!(status_vocab::to_ui("in_review"), "review");
+        // done / blocked are identical in both vocabularies.
+        assert_eq!(status_vocab::to_ui("done"), "done");
+        assert_eq!(status_vocab::to_ui("blocked"), "blocked");
+        // Unknown values pass through unchanged.
+        assert_eq!(status_vocab::to_ui("archived"), "archived");
+    }
+
+    #[test]
+    fn with_display_status_rewrites_only_the_status_field() {
+        let task = Task::builder()
+            .id("task_1")
+            .product_id("prod_1")
+            .name("n")
+            .description("d")
+            .kind("task")
+            .status("in_review")
+            .created_at("t")
+            .updated_at("t")
+            .build();
+        let shown = with_display_status(task);
+        assert_eq!(shown.status, "review");
+    }
+
+    #[test]
+    fn task_status_accepts_legacy_aliases_on_input() {
+        // Board name resolves to its variant...
+        let cli = Cli::parse_from(["boss", "task", "list", "--status", "backlog"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::List(args),
+            } => assert!(matches!(args.status.as_slice(), [TaskStatus::Backlog])),
+            _ => panic!("expected task list command"),
+        }
+        // ...and so does the legacy stored name as an alias.
+        let cli = Cli::parse_from(["boss", "task", "list", "--status", "in-review"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::List(args),
+            } => assert!(matches!(args.status.as_slice(), [TaskStatus::Review])),
+            _ => panic!("expected task list command"),
+        }
+    }
+
+    #[test]
+    fn move_target_accepts_board_name_primary() {
+        let cli = Cli::parse_from(["boss", "task", "move", "task_1", "--to", "backlog"]);
+        match cli.command {
+            Commands::Task {
+                command: TaskCommand::Move(args),
+            } => assert!(matches!(args.target, MoveTarget::Backlog)),
+            _ => panic!("expected task move command"),
+        }
     }
 
     #[test]
@@ -6983,7 +7140,9 @@ mod tests {
         }
     }
 
-    /// `boss chore move` is now a thin alias for the same handler.
+    /// `boss chore move` is now a thin alias for the same handler. The
+    /// legacy `active` value still parses (as an alias of the board name
+    /// `doing`), exercising backward compatibility.
     #[test]
     fn parses_chore_move_command() {
         let cli = Cli::parse_from(["boss", "chore", "move", "task_xyz", "--to", "active"]);
@@ -6992,7 +7151,7 @@ mod tests {
                 command: ChoreCommand::Move(args),
             } => {
                 assert_eq!(args.id, "task_xyz");
-                assert!(matches!(args.target, MoveTarget::Active));
+                assert!(matches!(args.target, MoveTarget::Doing));
             }
             _ => panic!("expected chore move command"),
         }

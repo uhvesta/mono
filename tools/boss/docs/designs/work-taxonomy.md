@@ -107,7 +107,7 @@ Suggested fields:
 - `project_id`
 - `name`
 - `description`
-- `status` (`todo`, `active`, `blocked`, `in_review`, `done`)
+- `status` — stored as `todo`, `active`, `blocked`, `in_review`, `done`. The CLI and kanban board surface these under the board (UI) names `backlog`, `doing`, `blocked`, `review`, `done`; the stored strings above remain accepted as input aliases. See `work-cli.md` §Status vocabulary.
 - `priority` (`low`, `medium`, `high` — defaults to `medium`)
 - `ordinal`
 - `pr_url`
@@ -138,7 +138,7 @@ Suggested fields:
 - `product_id`
 - `name`
 - `description`
-- `status` (`todo`, `active`, `blocked`, `in_review`, `done`)
+- `status` — stored as `todo`, `active`, `blocked`, `in_review`, `done`. The CLI and kanban board surface these under the board (UI) names `backlog`, `doing`, `blocked`, `review`, `done`; the stored strings above remain accepted as input aliases. See `work-cli.md` §Status vocabulary.
 - `priority` (`low`, `medium`, `high` — defaults to `medium`)
 - `pr_url`
 - `created_at`

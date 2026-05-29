@@ -21,7 +21,7 @@ boss product list
 boss project create
 boss task create
 boss chore create
-boss task update task_123 --status in_review
+boss task update task_123 --status review
 boss task move task_123 --to review
 ```
 
@@ -211,7 +211,7 @@ boss project update work-cli --product boss --priority high --status active
 boss task create --product boss --project work-cli --name "Socket request client"
 boss task list --product boss --project work-cli
 boss task show task_123
-boss task update task_123 --status in_review --pr-url https://github.com/spinyfin/mono/pull/99
+boss task update task_123 --status review --pr-url https://github.com/spinyfin/mono/pull/99
 boss task move task_123 --to review
 boss task reorder --project work-cli --product boss --ids task_2,task_1,task_3
 boss task delete task_123
@@ -223,7 +223,7 @@ boss task delete task_123
 boss chore create --product boss --name "Trim stale work items"
 boss chore list --product boss
 boss chore show task_456
-boss chore update task_456 --status active
+boss chore update task_456 --status doing
 boss chore move task_456 --to done
 boss chore delete task_456
 ```
@@ -275,7 +275,7 @@ Created task task_123
 Name: Socket request client
 Product: Boss
 Project: Work CLI
-Status: todo
+Status: backlog
 ```
 
 ### Machine Output
@@ -303,7 +303,7 @@ Example:
     "project_id": "proj_work_cli",
     "kind": "project_task",
     "name": "Socket request client",
-    "status": "todo"
+    "status": "backlog"
   }
 }
 ```
@@ -351,25 +351,25 @@ boss project show work-cli --product boss
 
 This keeps resolution simple and deterministic.
 
-## Status and Board Semantics
+## Status vocabulary
 
-The CLI should expose canonical storage statuses:
+The board (kanban) names are the canonical CLI vocabulary. They are what `--status` help lists, what `move --to` advertises, and what `--json` and human output emit for a leaf work item's `status`:
 
-- `todo`
-- `active`
+- `backlog`
+- `doing`
 - `blocked`
-- `in_review`
+- `review`
 - `done`
 
-For humans, `move` should also accept board column aliases:
+The engine still *stores* the original strings, and they remain accepted as input aliases everywhere a status is parsed (`--status`, `--to`), so old scripts and stored data keep working:
 
-- `backlog` -> `todo`
-- `doing` -> `active`
-- `review` -> `in_review`
-- `done` -> `done`
+- `todo` ↔ `backlog`
+- `active` ↔ `doing`
+- `in_review` (also spelled `in-review`) ↔ `review`
+- `blocked` ↔ `blocked` (unchanged)
+- `done` ↔ `done` (unchanged)
 
-That lets users work in board language without making the database less
-explicit.
+Because output is always remapped to the board name, a row stored as `active` lists/shows as `doing` regardless of which spelling set it. The translation lives entirely in the CLI (`status_vocab` in `tools/boss/cli/src/main.rs`); the engine, wire protocol, and SQL rows are untouched, keeping the database explicit.
 
 ## Engine Protocol Changes
 
