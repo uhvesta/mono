@@ -1,0 +1,10 @@
+[package]
+name = "boss-transcript-markdown"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

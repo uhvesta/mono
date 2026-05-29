@@ -5,6 +5,7 @@ members = [
   "tools/boss/cli",
   "tools/boss/client",
   "tools/boss/engine",
+  "tools/boss/engine/boss-transcript-markdown",
   "tools/boss/event-shim",
   "tools/boss/protocol",
   "tools/hood",
