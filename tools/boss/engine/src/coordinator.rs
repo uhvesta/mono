@@ -12,10 +12,8 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::ci_log_reader;
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis;
-use crate::merge_poller::CiProvider;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
@@ -2223,27 +2221,11 @@ impl ExecutionCoordinator {
             worker_id.clone(),
         );
 
-        // Pre-spawn: collect conflict-file diagnosis for conflict_resolution
-        // executions so the worker prompt can embed it without running git itself.
-        if execution.kind == "conflict_resolution" {
-            self.collect_conflict_diagnosis_pre_spawn(&execution, &lease)
-                .await;
-        } else if execution.kind == "revision_implementation" {
-            // Phase 3 cutover: a merge-conflict-provenance revision is the
-            // fix vehicle for a linked `conflict_resolutions` row. Collect
-            // the same `git merge-tree` diagnosis onto that row pre-spawn so
-            // `compose_revision_directive` (Phase 2) injects it into the
-            // worker prompt exactly as the old `conflict_resolution` worker
-            // received it. No-op for non-merge-conflict revision provenance.
+        // Pre-spawn: collect the merge-tree diagnosis for revision_implementation
+        // executions with merge-conflict provenance so compose_revision_directive
+        // injects it into the worker prompt. No-op for other provenance.
+        if execution.kind == "revision_implementation" {
             self.collect_revision_conflict_diagnosis_pre_spawn(&execution, &work_item, &lease)
-                .await;
-        }
-        // Pre-spawn: fetch the failing job's log tail for ci_remediation
-        // executions (Phase 9 #27) so the worker prompt embeds it directly.
-        // Best-effort: a failed fetch leaves `log_excerpt` NULL and the
-        // worker prompt falls back to the CLI invocation hint.
-        if execution.kind == "ci_remediation" {
-            self.collect_ci_log_excerpt_pre_spawn(&execution, &lease)
                 .await;
         }
 
@@ -2500,44 +2482,9 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Run `conflict_diagnosis::collect` in the leased workspace and persist
-    /// the result on the matching `conflict_resolutions` row before the worker
-    /// spawns. Failures are logged but never propagate — if the diagnosis
-    /// can't be collected we still spawn the worker, which starts from a fresh
-    /// `jj rebase -d main` without the pre-collected hint.
-    async fn collect_conflict_diagnosis_pre_spawn(
-        &self,
-        execution: &WorkExecution,
-        lease: &CubeWorkspaceLease,
-    ) {
-        let attempt = match self
-            .work_db
-            .active_conflict_resolution_for_work_item(&execution.work_item_id)
-        {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                tracing::debug!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    "collect_conflict_diagnosis: no active attempt row; skipping pre-spawn diagnosis",
-                );
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    ?err,
-                    "collect_conflict_diagnosis: failed to look up attempt row; skipping",
-                );
-                return;
-            }
-        };
-        self.collect_conflict_diagnosis_for_attempt(&attempt, lease)
-            .await;
-    }
-
-    /// Phase 3 cutover companion to [`Self::collect_conflict_diagnosis_pre_spawn`]:
+    /// Phase 3 cutover: for revision_implementation executions with merge-conflict
+    /// provenance, resolve the linked `conflict_resolutions` row (via
+    /// `created_via = "merge-conflict:<crz_id>"`) and collect its diagnosis:
     /// resolve the `conflict_resolutions` row a merge-conflict revision was
     /// spawned from (via `created_via = "merge-conflict:<crz_id>"`) and
     /// collect its diagnosis. No-op when the revision's provenance is not a
@@ -2654,107 +2601,6 @@ impl ExecutionCoordinator {
                 conflicted_files = diagnosis.files.len(),
                 "collect_conflict_diagnosis: diagnosis persisted",
             );
-        }
-    }
-
-    /// Pre-spawn (Phase 9 #27): read the failing job's log tail via the
-    /// per-provider `CiLogReader` and persist it on the matching
-    /// `ci_remediations` row. The worker prompt embeds the excerpt so
-    /// the fix-kind worker doesn't have to shell out to `bk` / `gh` for
-    /// the basic case. Best-effort — failures are logged but never
-    /// propagate; the worker prompt falls back to the CLI invocation
-    /// hint when `log_excerpt` is NULL.
-    ///
-    /// `retrigger`-kind attempts skip the fetch: the engine has already
-    /// decided to re-run the failing job and a log read would only
-    /// drag the spawn path on a non-load-bearing dependency.
-    async fn collect_ci_log_excerpt_pre_spawn(
-        &self,
-        execution: &WorkExecution,
-        _lease: &CubeWorkspaceLease,
-    ) {
-        let attempt = match self
-            .work_db
-            .active_ci_remediation_for_work_item(&execution.work_item_id)
-        {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                tracing::debug!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    "collect_ci_log_excerpt: no active attempt row; skipping",
-                );
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    ?err,
-                    "collect_ci_log_excerpt: failed to look up attempt row; skipping",
-                );
-                return;
-            }
-        };
-
-        if attempt.attempt_kind == "retrigger" {
-            tracing::debug!(
-                attempt_id = %attempt.id,
-                "collect_ci_log_excerpt: retrigger-kind attempt; log read skipped",
-            );
-            return;
-        }
-
-        let Some(failing) = pick_worst_failing_check(&attempt.failed_checks) else {
-            tracing::debug!(
-                attempt_id = %attempt.id,
-                "collect_ci_log_excerpt: failed_checks JSON parsed empty / had no actionable entry",
-            );
-            return;
-        };
-
-        let Some(job_id) = failing.provider_job_id else {
-            tracing::debug!(
-                attempt_id = %attempt.id,
-                target_url = %failing.target_url,
-                provider = %failing.provider,
-                "collect_ci_log_excerpt: failing check has no provider_job_id; cannot fetch log",
-            );
-            return;
-        };
-        let provider = match failing.provider.as_str() {
-            "buildkite" => CiProvider::Buildkite,
-            "github_actions" => CiProvider::GithubActions,
-            _ => CiProvider::Other,
-        };
-        let reader = ci_log_reader::reader_for(provider);
-        match reader.read_log_tail(&job_id, 200).await {
-            Ok(tail) => {
-                if let Err(err) = self
-                    .work_db
-                    .set_ci_remediation_log_excerpt(&attempt.id, &tail)
-                {
-                    tracing::warn!(
-                        attempt_id = %attempt.id,
-                        ?err,
-                        "collect_ci_log_excerpt: failed to persist excerpt; continuing without it",
-                    );
-                } else {
-                    tracing::debug!(
-                        attempt_id = %attempt.id,
-                        bytes = tail.len(),
-                        "collect_ci_log_excerpt: excerpt persisted",
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    job_id = %job_id,
-                    ?err,
-                    "collect_ci_log_excerpt: provider log read failed; continuing without an excerpt",
-                );
-            }
         }
     }
 

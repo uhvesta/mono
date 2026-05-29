@@ -114,11 +114,6 @@ crate::register_counter!(
     "Missed PR-open transitions recovered by recheck in one sweep."
 );
 crate::register_counter!(
-    CONFLICT_REDISPATCHED,
-    "merge_poller.conflict_redispatched",
-    "Stranded conflict-resolution attempts re-dispatched in one sweep."
-);
-crate::register_counter!(
     PR_RECHECK_UNRESOLVED,
     "merge_poller.pr_recheck_unresolved",
     "PR-detection rechecks that still found no bindable PR in one sweep."
@@ -146,7 +141,6 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&CONFLICT_FLAGGED);
     registry.register_counter(&CONFLICT_CLEARED);
     registry.register_counter(&PR_RECHECK_RECOVERED);
-    registry.register_counter(&CONFLICT_REDISPATCHED);
     registry.register_counter(&PR_RECHECK_UNRESOLVED);
     registry.register_counter(&MERGE_QUEUE_REBOUNCED);
     registry.register_counter(&LATE_PR_RECOVERED);
@@ -1261,11 +1255,6 @@ pub struct SweepOutcome {
     /// recheck moved them to `in_review` (or `done` if the PR was
     /// already merged).
     pub pr_recheck_recovered: usize,
-    /// Number of stranded `conflict_resolutions` attempts (status
-    /// `pending`, no live execution) for which a fresh execution was
-    /// re-emitted. Covers the engine-restart / worker-die gap where
-    /// no normal sweep would otherwise rescue the attempt.
-    pub conflict_redispatched: usize,
     /// Number of `waiting_human` executions where this sweep ran a
     /// recheck but the detector still did not resolve a bindable PR
     /// (returned `None`, `Stale`, `EmptyDiff`, or errored). Mirrors
@@ -1306,7 +1295,6 @@ impl SweepOutcome {
             + self.ci_flagged
             + self.ci_cleared
             + self.pr_recheck_recovered
-            + self.conflict_redispatched
             + self.merge_queue_rebounced
             + self.ci_remediation_redispatched
             + self.late_pr_recovered
@@ -1375,16 +1363,6 @@ pub async fn run_one_pass(
             Vec::new()
         }
     };
-    let stranded_attempts = match work_db.list_stranded_conflict_resolution_attempts() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "merge poller: failed to list stranded conflict resolution attempts",
-            );
-            Vec::new()
-        }
-    };
     let stranded_ci_attempts = match work_db.list_stranded_ci_remediation_attempts() {
         Ok(items) => items,
         Err(err) => {
@@ -1419,7 +1397,6 @@ pub async fn run_one_pass(
         + blocked_conflict.len()
         + blocked_ci.len()
         + pending_pr_recheck.len()
-        + stranded_attempts.len()
         + stranded_ci_attempts.len()
         + late_pr_candidates.len();
     if total == 0 {
@@ -1430,7 +1407,6 @@ pub async fn run_one_pass(
         blocked_conflict = blocked_conflict.len(),
         blocked_ci = blocked_ci.len(),
         pending_pr_recheck = pending_pr_recheck.len(),
-        stranded_attempts = stranded_attempts.len(),
         stranded_ci_attempts = stranded_ci_attempts.len(),
         late_pr_candidates = late_pr_candidates.len(),
         "merge poller: sweep started",
@@ -1459,11 +1435,6 @@ pub async fn run_one_pass(
             count = pending_pr_recheck.len(),
             "merge poller: pending PR-detection candidates skipped (no completion_handler wired)",
         );
-    }
-    for attempt in &stranded_attempts {
-        if conflict_watch::rescue_stranded_attempt(work_db, publisher, attempt).await {
-            outcome.conflict_redispatched += 1;
-        }
     }
     // Rescue stranded ci_remediations attempts: `pending` rows with no live
     // execution. These arise when two dequeue events land in the same sweep —
@@ -2238,7 +2209,6 @@ pub fn spawn_loop(
             CONFLICT_FLAGGED.inc_by(&metrics, outcome.conflict_flagged as u64);
             CONFLICT_CLEARED.inc_by(&metrics, outcome.conflict_cleared as u64);
             PR_RECHECK_RECOVERED.inc_by(&metrics, outcome.pr_recheck_recovered as u64);
-            CONFLICT_REDISPATCHED.inc_by(&metrics, outcome.conflict_redispatched as u64);
             PR_RECHECK_UNRESOLVED.inc_by(&metrics, outcome.pr_recheck_unresolved as u64);
             MERGE_QUEUE_REBOUNCED.inc_by(&metrics, outcome.merge_queue_rebounced as u64);
             LATE_PR_RECOVERED.inc_by(&metrics, outcome.late_pr_recovered as u64);
@@ -2248,7 +2218,6 @@ pub fn spawn_loop(
                     merged = outcome.merged,
                     conflict_flagged = outcome.conflict_flagged,
                     conflict_cleared = outcome.conflict_cleared,
-                    conflict_redispatched = outcome.conflict_redispatched,
                     ci_flagged = outcome.ci_flagged,
                     ci_cleared = outcome.ci_cleared,
                     pr_recheck_recovered = outcome.pr_recheck_recovered,
@@ -4185,156 +4154,6 @@ mod tests {
     }
 
     /// Helper: seed a chore into `blocked: merge_conflict` with a pending
-    /// `conflict_resolutions` row and return `(product_id, chore_id, attempt_id)`.
-    fn make_chore_blocked_with_pending_attempt(
-        db: &WorkDb,
-        name: &str,
-        pr_url: &str,
-    ) -> (String, String, String) {
-        let (product_id, chore_id) = make_chore_in_review(db, name, pr_url);
-        db.mark_chore_blocked_merge_conflict(&chore_id, pr_url)
-            .unwrap();
-        let attempt = db
-            .insert_conflict_resolution(ConflictResolutionInsertInput {
-                product_id: product_id.clone(),
-                work_item_id: chore_id.clone(),
-                pr_url: pr_url.into(),
-                pr_number: 0,
-                head_branch: "feature".into(),
-                base_branch: "main".into(),
-                base_sha_at_trigger: Some("sha-base".into()),
-                head_sha_before: Some("sha-head".into()),
-            })
-            .unwrap()
-            .expect("attempt should be inserted (not UNIQUE collision)");
-        (product_id, chore_id, attempt.id)
-    }
-
-    /// Flip `products.auto_pr_maintenance_enabled` directly on the
-    /// SQLite file so opt-out tests can drive the gate without
-    /// exposing a setter that production code doesn't need.
-    fn set_product_auto_pr_maintenance(db_path: &std::path::Path, product_id: &str, enabled: bool) {
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        conn.execute(
-            "UPDATE products SET auto_pr_maintenance_enabled = ?2 WHERE id = ?1",
-            rusqlite::params![product_id, if enabled { 1 } else { 0 }],
-        )
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn stranded_pending_attempt_with_no_execution_gets_redispatched() {
-        // (a) A stranded `pending` attempt with no live execution gets a
-        // new execution emitted and `conflict_redispatched` increments.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/900";
-        let (_product, chore, _attempt) =
-            make_chore_blocked_with_pending_attempt(&db, "C-stranded", pr);
-
-        // The probe still reports Conflict (the row is blocked, so the
-        // probe sweep's `on_conflict_detected` will WHERE-guard miss —
-        // the stranded sweep is the only path that creates an execution).
-        let probe = StubProbe::new();
-        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-        let publisher = Arc::new(RecordingPublisher::default());
-
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(outcome.conflict_redispatched, 1);
-
-        // A ready execution should now exist for the chore.
-        let ready = db.list_ready_executions().unwrap();
-        assert!(
-            ready
-                .iter()
-                .any(|e| e.work_item_id == chore && e.kind == "conflict_resolution"),
-            "expected a ready conflict_resolution execution; got {ready:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn stranded_attempt_with_live_ready_execution_is_skipped() {
-        // (b) An attempt with a live `ready` execution is NOT re-dispatched.
-        // The query checks status IN ('ready','running','waiting_human');
-        // 'ready' is the representative live case here.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/901";
-        let (_, chore, _) = make_chore_blocked_with_pending_attempt(&db, "C-live-ready", pr);
-
-        // Create a `ready` execution so the stranded-sweep exclusion kicks in.
-        db.create_execution(crate::work::CreateExecutionInput {
-            work_item_id: chore.clone(),
-            kind: "conflict_resolution".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        })
-        .unwrap();
-
-        let probe = StubProbe::new();
-        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-        let publisher = Arc::new(RecordingPublisher::default());
-
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(outcome.conflict_redispatched, 0);
-
-        // Only the one pre-existing execution should exist.
-        let ready = db.list_ready_executions().unwrap();
-        assert_eq!(
-            ready
-                .iter()
-                .filter(|e| e.work_item_id == chore && e.kind == "conflict_resolution")
-                .count(),
-            1,
-            "no duplicate execution should have been created",
-        );
-    }
-
-    #[tokio::test]
-    async fn abandoned_stranded_attempt_is_not_rescued() {
-        // (c) An `abandoned` (`failed` / `succeeded`) attempt must NOT be
-        // rescued — the churn guard or human owns that path. We use the
-        // `failed` terminal state to represent both abandoned and failed rows.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/903";
-        let (product, chore) = make_chore_in_review(&db, "C-abandoned", pr);
-        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-        let attempt = db
-            .insert_conflict_resolution(ConflictResolutionInsertInput {
-                product_id: product.clone(),
-                work_item_id: chore.clone(),
-                pr_url: pr.into(),
-                pr_number: 0,
-                head_branch: "feature".into(),
-                base_branch: "main".into(),
-                base_sha_at_trigger: Some("sha-903".into()),
-                head_sha_before: None,
-            })
-            .unwrap()
-            .expect("attempt should insert");
-        // Terminal status — churn guard or human abandoned this.
-        db.mark_conflict_resolution_failed(&attempt.id, "worker_died_terminally")
-            .unwrap();
-
-        let probe = StubProbe::new();
-        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-        let publisher = Arc::new(RecordingPublisher::default());
-
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(outcome.conflict_redispatched, 0);
-        assert!(db.list_ready_executions().unwrap().is_empty());
-    }
 
     /// T230 scenario integration test: worker B resolved against stale main
     /// SHA (already-succeeded crz), but PR is still CONFLICTING. The next
@@ -4561,89 +4380,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn opted_out_product_stranded_attempt_is_skipped() {
-        // (d) A stranded attempt for an opted-out product is skipped.
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("boss.db");
-        let db = WorkDb::open(db_path.clone()).unwrap();
-        let pr = "https://github.com/foo/bar/pull/904";
-        let (product, _chore, _attempt) =
-            make_chore_blocked_with_pending_attempt(&db, "C-optout-stranded", pr);
-
-        set_product_auto_pr_maintenance(&db_path, &product, false);
-
-        let probe = StubProbe::new();
-        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-        let publisher = Arc::new(RecordingPublisher::default());
-
-        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(outcome.conflict_redispatched, 0);
-        assert!(db.list_ready_executions().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn stranded_attempt_redispatch_then_worker_die_redispatches_again() {
-        // Integration: simulate worker-die-before-PR-update — the
-        // stranded sweep re-dispatches. If the execution is then
-        // cancelled (worker die) without marking the attempt terminal,
-        // the next sweep re-dispatches again.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/905";
-        let (_product, chore, _attempt) =
-            make_chore_blocked_with_pending_attempt(&db, "C-redispatch-cycle", pr);
-
-        let probe = StubProbe::new();
-        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-        let publisher = Arc::new(RecordingPublisher::default());
-
-        // Pass 1: stranded attempt gets an execution.
-        let outcome1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(outcome1.conflict_redispatched, 1);
-        let ready1 = db.list_ready_executions().unwrap();
-        assert_eq!(
-            ready1
-                .iter()
-                .filter(|e| e.work_item_id == chore && e.kind == "conflict_resolution")
-                .count(),
-            1,
-        );
-
-        // Simulate worker die: cancel the execution (terminal) without
-        // touching the attempt row (attempt stays `pending`).
-        let exec_id = ready1
-            .iter()
-            .find(|e| e.work_item_id == chore && e.kind == "conflict_resolution")
-            .unwrap()
-            .id
-            .clone();
-        db.cancel_execution(&exec_id).unwrap();
-
-        // Pass 2: no live execution → stranded sweep fires again.
-        let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(outcome2.conflict_redispatched, 1);
-        assert_eq!(
-            db.list_ready_executions()
-                .unwrap()
-                .iter()
-                .filter(|e| e.work_item_id == chore && e.kind == "conflict_resolution")
-                .count(),
-            1,
-        );
-    }
-
-    /// Acceptance test for the window-activation kick quiesce logic.
-    ///
-    /// Simulates the inner `'wait` loop from `spawn_loop` directly:
-    /// - a kick that arrives immediately after a run (within the 15 s
-    ///   quiesce window) must NOT cause a second run to start.
-    /// - a kick that arrives after the quiesce window has elapsed MUST
-    ///   break out of the wait loop (i.e. trigger a new pass).
-    ///
-    /// Tested at the `select!` level rather than through `spawn_loop`
-    /// to avoid the dependency on a fully-constructed
-    /// `WorkerCompletionHandler`.
     #[tokio::test]
     async fn activation_kick_quiesce_absorbs_rapid_repeats() {
         use tokio::time::timeout;

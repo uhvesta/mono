@@ -839,6 +839,27 @@ pub async fn on_merge_queue_rebounce_detected(
         }
     };
 
+    // Phase 5 cutover (mirrors Phase 4 for on_ci_failure_detected): rebounce `fix`
+    // attempts now deliver via an engine-triggered revision instead of a bespoke
+    // `ci_remediation` execution. The `revision_task_id` soft-FK is the idempotency
+    // latch — a repeat probe at the same before_commit_sha hits `Ok(None)` on the
+    // insert above so `attempt` is `None` and this branch is skipped. The PR is
+    // known-open at this point (it was in the merge queue), so a static checker
+    // is correct here and avoids a redundant `gh pr view` round-trip.
+    if let Some(ref a) = attempt {
+        if a.status == "pending" && a.revision_task_id.is_none() {
+            maybe_spawn_ci_revision(
+                work_db,
+                publisher,
+                &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+                candidate,
+                &[], // no per-check failures for rebounce; directive uses failure_kind
+                a,
+            )
+            .await;
+        }
+    }
+
     if task_transitioned {
         if attempt.is_some() {
             if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
@@ -857,32 +878,6 @@ pub async fn on_merge_queue_rebounce_detected(
             )
             .await;
         if let Some(attempt) = attempt.as_ref() {
-            match work_db.create_execution(CreateExecutionInput {
-                work_item_id: candidate.work_item_id.clone(),
-                kind: "ci_remediation".to_owned(),
-                status: Some("ready".to_owned()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            }) {
-                Ok(_) => publisher.kick_scheduler(),
-                Err(err) => {
-                    tracing::warn!(
-                        work_item_id = %candidate.work_item_id,
-                        attempt_id = %attempt.id,
-                        ?err,
-                        "ci_watch: failed to create ci_remediation execution (rebounce)",
-                    );
-                }
-            }
             publisher
                 .publish_frontend_event_on_product(
                     &candidate.product_id,
@@ -2357,7 +2352,8 @@ mod tests {
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
 
-        // A ci_remediation work_execution must be parked for the worker.
+        // Phase 5 cutover: no bespoke ci_remediation execution — the fix
+        // delivers via an engine-triggered revision instead.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let exec_count: i64 = conn
             .query_row(
@@ -2367,9 +2363,18 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(exec_count, 1, "expected exactly one ci_remediation execution");
+        assert_eq!(exec_count, 0, "cutover: no bespoke ci_remediation execution");
+        let rev_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
+                rusqlite::params![&chore],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rev_count, 1, "rebounce must spawn exactly one revision task");
 
-        // The ci_remediations row must record the failure as a queue rebounce.
+        // The ci_remediations row must record the failure as a queue rebounce
+        // and have its revision_task_id stamped.
         let attempt = db
             .active_ci_remediation_for_work_item(&chore)
             .unwrap()
@@ -2381,6 +2386,10 @@ mod tests {
         assert_eq!(
             attempt.before_commit_sha.as_deref(),
             Some("synthetic-merge-sha-abc")
+        );
+        assert!(
+            attempt.revision_task_id.is_some(),
+            "attempt must have revision_task_id stamped"
         );
     }
 
@@ -2476,7 +2485,7 @@ mod tests {
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
 
-        // Exactly one execution row.
+        // Phase 5 cutover: exactly one revision, no ci_remediation executions.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let exec_count: i64 = conn
             .query_row(
@@ -2486,7 +2495,15 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(exec_count, 1, "duplicate probe must not create a second execution");
+        assert_eq!(exec_count, 0, "cutover: no bespoke ci_remediation execution");
+        let rev_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
+                rusqlite::params![&chore],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rev_count, 1, "exactly one revision; duplicate probe must not spawn a second");
     }
 
     /// After the worker marks the attempt succeeded, the next `on_ci_resolved`
@@ -2555,8 +2572,8 @@ mod tests {
     ///               chore blocked, but NO execution (attempt is None).
     ///      - SHA_2: INSERT succeeds → attempt=Some; mark_chore_blocked_ci_failure
     ///               WHERE-guard misses (chore already blocked) → no execution.
-    ///   5. Stranded rescue finds SHA_2 row (pending, no live execution) and
-    ///      creates EXEC-2.
+    ///   5. SHA_2's attempt gets a revision immediately via `maybe_spawn_ci_revision`
+    ///      (called even when task_transitioned=false), so it is never stranded.
     ///
     /// Detection must not require a live worker on the chore.
     #[tokio::test]
@@ -2568,7 +2585,7 @@ mod tests {
         let (product, chore) = make_in_review(&db, "C-t628-backtoback", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
-        // Step 1: first dequeue (SHA_1) → chore flips to blocked, EXEC-1 parked.
+        // Step 1: first dequeue (SHA_1) → chore flips to blocked, revision spawned.
         let first = on_merge_queue_rebounce_detected(
             &db,
             pub_.as_ref(),
@@ -2584,6 +2601,8 @@ mod tests {
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
         {
+            // Phase 5 cutover: no bespoke ci_remediation execution; a revision is
+            // spawned instead.
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             let n: i64 = conn
                 .query_row(
@@ -2593,11 +2612,20 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(n, 1, "exactly one execution after first dequeue");
+            assert_eq!(n, 0, "cutover: no ci_remediation execution after first dequeue");
+            let r: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
+                    rusqlite::params![&chore],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(r, 1, "exactly one revision after first dequeue");
         }
 
-        // Step 2: worker claims EXEC-1 (transitions work_executions to 'succeeded')
-        // and marks SHA_1 as succeeded_via_rebase (PR re-queued by human).
+        // Step 2: mark SHA_1's ci_remediations row succeeded_via_rebase (PR re-queued
+        // by human). In production a revision_implementation worker does the push and
+        // the poller retires the ledger row; here we use the DB helper directly.
         let sha1_attempt = db
             .active_ci_remediation_for_work_item(&chore)
             .unwrap()
@@ -2605,17 +2633,6 @@ mod tests {
         db.mark_ci_remediation_succeeded_via_rebase(&sha1_attempt.id)
             .unwrap()
             .expect("succeeded_via_rebase update");
-        // Simulate the worker finishing its execution so EXEC-1 is terminal.
-        // In production the coordinator does this; for the test we update directly.
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute(
-                "UPDATE work_executions SET status = 'succeeded'
-                  WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
-                rusqlite::params![&chore],
-            )
-            .unwrap();
-        }
 
         // Step 3: on_ci_resolved clears the block → chore in_review again.
         let cleared = on_ci_resolved(
@@ -2630,7 +2647,8 @@ mod tests {
         assert_eq!(status, "in_review");
 
         // Step 4a: next sweep replays SHA_1 — INSERT is ignored (key exists, row
-        // terminal). attempt=None → task flips (WHERE guard matches) but NO execution.
+        // terminal). attempt=None → task flips (WHERE guard matches) but NO new
+        // revision (no attempt to stamp).
         let sha1_replay = on_merge_queue_rebounce_detected(
             &db,
             pub_.as_ref(),
@@ -2641,28 +2659,27 @@ mod tests {
             &[],
         )
         .await;
-        // The chore was in_review so mark_chore_blocked_ci_failure succeeds, returning true.
         assert!(sha1_replay, "sha1 replay must flip chore (INSERT ignored, task_transitioned=true)");
         let (status, reason) = chore_state(&db, &chore);
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
-        // No new execution created because attempt was None.
+        // Still just the original revision from step 1.
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
-            let n: i64 = conn
+            let r: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM work_executions
-                      WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                    "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
                     rusqlite::params![&chore],
                     |r| r.get(0),
                 )
                 .unwrap();
-            // Still only the original EXEC-1 (from step 1, now terminal).
-            assert_eq!(n, 1, "sha1 replay must not create a second execution");
+            assert_eq!(r, 1, "sha1 replay must not spawn a second revision");
         }
 
         // Step 4b: same sweep also sees SHA_2 — INSERT succeeds (new key), but
         // mark_chore_blocked_ci_failure WHERE-guard misses (chore already blocked).
+        // Phase 5 fix: maybe_spawn_ci_revision is called regardless of
+        // task_transitioned, so SHA_2 gets its own revision immediately.
         let sha2_detect = on_merge_queue_rebounce_detected(
             &db,
             pub_.as_ref(),
@@ -2677,8 +2694,8 @@ mod tests {
             !sha2_detect,
             "sha2 detection must return false — task already blocked, WHERE guard missed"
         );
-        // SHA_2's ci_remediations row must exist as pending.
-        {
+        // SHA_2's ci_remediations row must exist as pending with revision_task_id stamped.
+        let sha2_attempt = {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             let pending: i64 = conn
                 .query_row(
@@ -2690,60 +2707,35 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(pending, 1, "sha2 ci_remediations row must be pending");
-        }
-        // Still no new execution — SHA_2's row is stranded.
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            let exec_n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM work_executions
-                      WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
-                    rusqlite::params![&chore],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(exec_n, 1, "sha2 detection must not create an execution");
-        }
-
-        // Step 5: stranded rescue detects SHA_2's pending row and dispatches EXEC-2.
-        let stranded = db.list_stranded_ci_remediation_attempts().unwrap();
-        assert_eq!(
-            stranded.len(),
-            1,
-            "exactly one stranded ci_remediation attempt (SHA_2)"
+            db.active_ci_remediation_for_work_item(&chore)
+                .unwrap()
+                .expect("sha2 attempt row")
+        };
+        assert!(
+            sha2_attempt.revision_task_id.is_some(),
+            "sha2 attempt must have a revision immediately — no stranding"
         );
-        assert_eq!(stranded[0].work_item_id, chore);
-
-        let rescued = rescue_stranded_ci_remediation_attempt(
-            &db,
-            pub_.as_ref(),
-            &stranded[0],
-        )
-        .await;
-        assert!(rescued, "stranded SHA_2 attempt must be rescued with a new execution");
-
-        // After rescue: EXEC-2 exists and chore is still blocked.
+        // Two revisions total: one for SHA_1, one for SHA_2.
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
-            let exec_n: i64 = conn
+            let r: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM work_executions
-                      WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                    "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
                     rusqlite::params![&chore],
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(exec_n, 2, "after rescue, two ci_remediation executions exist");
+            assert_eq!(r, 2, "sha2 must have its own revision; total revisions must be 2");
         }
         let (status, reason) = chore_state(&db, &chore);
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("ci_failure"));
 
-        // Sanity: no further stranded attempts — the rescue created a live execution.
-        let stranded_after = db.list_stranded_ci_remediation_attempts().unwrap();
+        // Sanity: no stranded ci_remediation attempts — sha2 has revision_task_id.
+        let stranded = db.list_stranded_ci_remediation_attempts().unwrap();
         assert!(
-            stranded_after.is_empty(),
-            "no stranded attempts after rescue creates a live execution"
+            stranded.is_empty(),
+            "no stranded attempts: sha2 has revision_task_id so it is excluded from rescue"
         );
     }
 }

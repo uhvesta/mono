@@ -73,22 +73,6 @@ pub struct StoredExternalRef {
     pub unbound_at: Option<String>,
 }
 
-/// A `conflict_resolutions` row that is `pending` but has no live
-/// execution (`kind='conflict_resolution'` with status in
-/// `'ready'`, `'running'`, or `'waiting_human'`). The merge poller's
-/// stranded-attempt sweep rescues these by re-emitting a fresh
-/// execution request.
-///
-/// `abandoned` rows are excluded by the caller's SQL (`status =
-/// 'pending'` filter) — the churn guard or a human owns that path.
-#[derive(Debug, Clone)]
-pub struct StrandedConflictAttempt {
-    pub attempt_id: String,
-    pub work_item_id: String,
-    pub product_id: String,
-    pub pr_url: String,
-}
-
 /// A `ci_remediations` row that is `pending` but has no live execution
 /// (`kind='ci_remediation'` with status in `'ready'`, `'running'`, or
 /// `'waiting_human'`). This arises when two merge-queue dequeue events

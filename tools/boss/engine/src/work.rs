@@ -217,7 +217,6 @@ pub use output_types::PendingMergeCheck;
 pub use output_types::SetRunTranscriptPathOutcome;
 pub use output_types::StoredExternalRef;
 pub use output_types::StrandedCiRemediationAttempt;
-pub use output_types::StrandedConflictAttempt;
 pub use output_types::WorkerPrCompletion;
 pub use output_types::WorkerPrCompletionTarget;
 #[cfg(test)]

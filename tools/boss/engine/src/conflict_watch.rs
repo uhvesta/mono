@@ -31,80 +31,8 @@ use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, Fron
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
 use crate::work::{
-    ConflictResolutionInsertInput, CreateExecutionInput, PendingMergeCheck, PrStateChecker,
-    StrandedConflictAttempt, WorkDb,
+    ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb,
 };
-
-/// One-shot startup backfill: create a `ready` `conflict_resolution`
-/// execution for every `conflict_resolutions` row that is `pending` but
-/// has no `work_executions` entry. This recovers attempts that were
-/// inserted by `on_conflict_detected` before PR #430 wired the
-/// `create_execution` call into the same handler (rows written at ~17:07
-/// UTC 2026-05-13 for task `task_18af2d5bc18e2b48_25`, attempt
-/// `crz_18af37b7f0da0898_1`).
-///
-/// The DB query is idempotent (NOT EXISTS predicate), so a second engine
-/// restart after the backfill finds zero rows and logs nothing.
-pub fn backfill_orphaned_executions(
-    work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
-) {
-    let orphans = match work_db.pending_conflict_resolutions_without_execution() {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "conflict_watch backfill: failed to query orphaned conflict_resolutions; skipping",
-            );
-            return;
-        }
-    };
-    if orphans.is_empty() {
-        tracing::debug!("conflict_watch backfill: no orphaned conflict_resolutions found");
-        return;
-    }
-    let mut backfilled = 0usize;
-    for attempt in &orphans {
-        tracing::debug!(
-            attempt_id = %attempt.id,
-            work_item_id = %attempt.work_item_id,
-            "conflict_watch backfill: creating execution_request for orphaned attempt",
-        );
-        match work_db.create_execution(CreateExecutionInput {
-            work_item_id: attempt.work_item_id.clone(),
-            kind: "conflict_resolution".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        }) {
-            Ok(_) => {
-                backfilled += 1;
-                publisher.kick_scheduler();
-            }
-            Err(err) => {
-                tracing::warn!(
-                    attempt_id = %attempt.id,
-                    work_item_id = %attempt.work_item_id,
-                    ?err,
-                    "conflict_watch backfill: failed to create execution; attempt will remain undispatched",
-                );
-            }
-        }
-    }
-    tracing::info!(
-        backfilled,
-        "conflict_watch backfill: created execution_request for orphaned conflict_resolutions",
-    );
-}
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
 /// (per-product flag or per-PR label) suppresses this conflict-watch
@@ -694,69 +622,6 @@ pub async fn on_resolved(
     true
 }
 
-/// Re-emit a `conflict_resolution` execution for a stranded pending
-/// attempt — one where the `conflict_resolutions` row is `pending` but
-/// no live execution exists. This happens when the engine restarts after
-/// the attempt row was inserted but before `create_execution` ran, or
-/// when the dispatched worker dies before reaching a terminal state
-/// (leaving the attempt stuck in `pending` with no live execution).
-///
-/// Only the product-level opt-out is checked here; the PR-label opt-out
-/// requires a fresh GH probe that this recovery path intentionally skips
-/// to avoid extra network round-trips.  Label changes are rare and the
-/// normal probe sweep will catch them on the next pass.
-///
-/// Returns `true` if a new execution was successfully emitted.
-pub async fn rescue_stranded_attempt(
-    work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
-    attempt: &StrandedConflictAttempt,
-) -> bool {
-    let candidate = PendingMergeCheck {
-        work_item_id: attempt.work_item_id.clone(),
-        product_id: attempt.product_id.clone(),
-        pr_url: attempt.pr_url.clone(),
-    };
-    if auto_pr_maintenance_disabled(work_db, &candidate, &[]) {
-        return false;
-    }
-    match work_db.create_execution(CreateExecutionInput {
-        work_item_id: attempt.work_item_id.clone(),
-        kind: "conflict_resolution".to_owned(),
-        status: Some("ready".to_owned()),
-        repo_remote_url: None,
-        cube_repo_id: None,
-        cube_lease_id: None,
-        cube_workspace_id: None,
-        workspace_path: None,
-        priority: None,
-        preferred_workspace_id: None,
-        started_at: None,
-        finished_at: None,
-        prefer_is_soft: false,
-        pr_url: None,
-    }) {
-        Ok(_) => {
-            publisher.kick_scheduler();
-            tracing::info!(
-                work_item_id = %attempt.work_item_id,
-                attempt_id = %attempt.attempt_id,
-                pr_url = %attempt.pr_url,
-                "conflict_watch: re-dispatched execution for stranded pending attempt",
-            );
-            true
-        }
-        Err(err) => {
-            tracing::warn!(
-                work_item_id = %attempt.work_item_id,
-                attempt_id = %attempt.attempt_id,
-                ?err,
-                "conflict_watch: failed to re-emit execution for stranded attempt",
-            );
-            false
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1893,161 +1758,6 @@ mod tests {
         );
     }
 
-    // ----- backfill_orphaned_executions -----
-
-    /// Publisher that counts `kick_scheduler` calls so the backfill
-    /// tests can assert the scheduler was nudged for each recovered row.
-    #[derive(Default)]
-    struct KickCountingPublisher {
-        kicks: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait]
-    impl ExecutionPublisher for KickCountingPublisher {
-        async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
-        async fn publish_work_item_changed(&self, _: &str, _: &str, _: &str) {}
-        async fn publish_frontend_event_on_product(&self, _: &str, _: FrontendEvent) {}
-        fn kick_scheduler(&self) {
-            self.kicks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    /// Directly insert a `pending` conflict_resolution row into `db`
-    /// without also creating an execution — this simulates the
-    /// pre-PR-#430 state where on_conflict_detected wrote the attempt
-    /// but not the execution.
-    fn plant_pending_attempt(
-        db: &WorkDb,
-        product_id: &str,
-        work_item_id: &str,
-        pr_url: &str,
-        sha: &str,
-    ) -> String {
-        db.insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
-            product_id: product_id.to_owned(),
-            work_item_id: work_item_id.to_owned(),
-            pr_url: pr_url.to_owned(),
-            pr_number: 427,
-            head_branch: "feat".into(),
-            base_branch: "main".into(),
-            base_sha_at_trigger: Some(sha.into()),
-            head_sha_before: Some("head".into()),
-        })
-        .unwrap()
-        .expect("attempt insert must succeed for a fresh (work_item, sha) key")
-        .id
-    }
-
-    #[test]
-    fn backfill_creates_execution_for_pending_orphan() {
-        // (a) A stranded pending attempt with no execution gets a ready
-        // execution after backfill_orphaned_executions runs.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/427";
-        let (product, chore) = make_in_review(&db, "B-pending", pr);
-        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-
-        let attempt_id = plant_pending_attempt(&db, &product, &chore, pr, "sha-orphan");
-        let pub_ = KickCountingPublisher::default();
-
-        backfill_orphaned_executions(&db, &pub_);
-
-        // Exactly one execution must now exist for this work item.
-        let executions = db
-            .pending_conflict_resolutions_without_execution()
-            .unwrap();
-        assert!(
-            executions.is_empty(),
-            "after backfill the NOT-EXISTS query must return no rows; got {executions:?}",
-        );
-        assert_eq!(
-            pub_.kicks.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "scheduler must be kicked once per recovered attempt",
-        );
-        // Verify the attempt row itself is still pending — the backfill
-        // only adds the execution, not the worker side-effects.
-        let row = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
-        assert_eq!(row.status, "pending");
-    }
-
-    #[test]
-    fn backfill_skips_abandoned_attempts() {
-        // (b) An abandoned (churn-guard) attempt must NOT receive an
-        // execution — the guard explicitly marked it dead.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/428";
-        let (product, chore) = make_in_review(&db, "B-abandoned", pr);
-        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-
-        // Insert three attempts first so the fourth trips the churn guard.
-        for sha in ["s1", "s2", "s3"] {
-            plant_pending_attempt(&db, &product, &chore, pr, sha);
-        }
-        // Fourth insert — churn guard fires, returns abandoned.
-        let dead = db
-            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
-                product_id: product.clone(),
-                work_item_id: chore.clone(),
-                pr_url: pr.into(),
-                pr_number: 428,
-                head_branch: "feat".into(),
-                base_branch: "main".into(),
-                base_sha_at_trigger: Some("s4".into()),
-                head_sha_before: Some("head".into()),
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(dead.status, "abandoned");
-
-        let pub_ = KickCountingPublisher::default();
-        backfill_orphaned_executions(&db, &pub_);
-
-        // The abandoned row must not appear in the orphan query.
-        let orphans = db
-            .pending_conflict_resolutions_without_execution()
-            .unwrap();
-        // The three live (pending) attempts don't have executions yet
-        // so they will be in the list; abandoned must not be.
-        for o in &orphans {
-            assert_ne!(
-                o.id, dead.id,
-                "abandoned attempt must never appear in orphan backfill query",
-            );
-        }
-    }
-
-    #[test]
-    fn backfill_is_idempotent_when_execution_already_exists() {
-        // (c) An attempt that already has an execution must not get a
-        // duplicate — the NOT EXISTS guard excludes it on the second run.
-        let dir = tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/429";
-        let (product, chore) = make_in_review(&db, "B-idem", pr);
-        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
-
-        plant_pending_attempt(&db, &product, &chore, pr, "sha-idem");
-
-        let pub_ = KickCountingPublisher::default();
-        // First run — should create one execution.
-        backfill_orphaned_executions(&db, &pub_);
-        let kicks_after_first =
-            pub_.kicks.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(kicks_after_first, 1);
-
-        // Second run — no new executions should be created.
-        backfill_orphaned_executions(&db, &pub_);
-        let kicks_after_second =
-            pub_.kicks.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(
-            kicks_after_second, 1,
-            "second backfill must be a no-op; kick count must not increase",
-        );
-    }
-
     // ----- Phase 3 cutover: engine-triggered revision as the fix vehicle -----
 
     #[tokio::test]
@@ -2101,19 +1811,6 @@ mod tests {
             "cutover must not create a conflict_resolution execution; got {ready:?}",
         );
 
-        // The revision-backed row is invisible to the dormant recovery paths.
-        assert!(
-            db.pending_conflict_resolutions_without_execution()
-                .unwrap()
-                .is_empty(),
-            "revision-backed attempt must be excluded from the backfill query",
-        );
-        assert!(
-            db.list_stranded_conflict_resolution_attempts()
-                .unwrap()
-                .is_empty(),
-            "revision-backed attempt must be excluded from the rescue query",
-        );
     }
 
     #[tokio::test]
@@ -2257,12 +1954,5 @@ mod tests {
             Some("revision_create_failed"),
         );
         assert!(attempts[0].revision_task_id.is_none());
-
-        // No stranded pending row for the dormant rescue path to pick up.
-        assert!(
-            db.list_stranded_conflict_resolution_attempts()
-                .unwrap()
-                .is_empty(),
-        );
     }
 }

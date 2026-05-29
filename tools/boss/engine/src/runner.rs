@@ -327,23 +327,11 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .and_then(|project_id| self.work_db.get_project(project_id).ok()),
             _ => None,
         };
-        // For conflict-resolution executions, the worker's prompt
-        // embeds the engine's pre-spawn diagnosis. The attempt row is
-        // created at conflict-detection time (Phase 2 wiring) and
-        // updated with the diagnosis JSON pre-spawn. Look it up by
-        // work_item_id so the prompt composer renders the templated
-        // markdown surface regardless of how the row got there.
-        //
         // For revision_implementation executions with a merge-conflict
         // provenance, look up the linked attempt by the id embedded in
         // created_via (format: "merge-conflict:<crz_id>") so
         // compose_revision_directive can inject the conflict fragment.
-        let conflict_attempt = if execution.kind == "conflict_resolution" {
-            self.work_db
-                .active_conflict_resolution_for_work_item(&execution.work_item_id)
-                .ok()
-                .flatten()
-        } else if execution.kind == "revision_implementation" {
+        let conflict_attempt = if execution.kind == "revision_implementation" {
             work_item_created_via(work_item)
                 .and_then(|cv| cv.strip_prefix("merge-conflict:"))
                 .and_then(|id| self.work_db.get_conflict_resolution(id).ok().flatten())
@@ -392,11 +380,8 @@ impl ExecutionRunner for PaneSpawnRunner {
             None
         };
 
-        // For ci_remediation executions, the worker's prompt embeds the
-        // engine's pre-spawn log excerpt and the failing-check list.
-        // The attempt row is created at CI-failure detection time
-        // (`ci_watch::on_ci_failure_detected`) and updated by the
-        // coordinator's `collect_ci_log_excerpt_pre_spawn` before spawn.
+        // For ci_remediation executions (retrigger-kind only after Phase 5),
+        // look up the active attempt so the prompt can show the failing checks.
         //
         // For revision_implementation executions with a ci-fix provenance,
         // look up the linked attempt by the id embedded in created_via
@@ -518,13 +503,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             .agent()
             .ok()
             .and_then(|agent| agent.anthropic_api_key.clone());
-        // For conflict-resolution executions the pane summary must reflect
-        // resolution activity, not the original task's gerund. We skip the
-        // cache and Claude call entirely — the phrase is fully determined by
-        // the execution kind and a truncation of the parent task name.
-        let title_summary = if execution.kind == "conflict_resolution" {
-            pane_summary::conflict_resolution_summary(work_item_name(work_item))
-        } else if execution.kind == "ci_remediation" {
+        let title_summary = if execution.kind == "ci_remediation" {
             pane_summary::ci_remediation_summary(work_item_name(work_item))
         } else {
             pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await
@@ -597,25 +576,6 @@ fn compose_execution_prompt(
     recovery_branch: Option<&str>,
     ci_attempt: Option<&CiRemediation>,
 ) -> String {
-    // The conflict_resolution kind has a wholly different shape than
-    // implementation/design kinds — it carries an embedded diagnosis,
-    // a tight playbook, and explicit stop conditions. Render it via
-    // a dedicated composer instead of trying to splice into the
-    // generic flow. Falls through to the generic prompt if (somehow)
-    // the conflict-resolution attempt row is missing — better to ship
-    // a generic worker prompt than to fail the spawn.
-    if execution.kind == "conflict_resolution" {
-        if let Some(attempt) = conflict_attempt {
-            return compose_conflict_resolution_prompt(
-                execution,
-                work_item,
-                workspace_path,
-                cube_change_id,
-                attempt,
-                /* test_command */ None,
-            );
-        }
-    }
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
     // the engine-collected log excerpt, the failing-check set, and the
     // attempt-kind-specific playbook (rebase-first for `fix`, just the
@@ -1348,211 +1308,30 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     out
 }
 
-/// Templated prompt for the `conflict_resolution` execution kind
-/// (design Q4 of `tools/boss/docs/designs/merge-conflict-handling-in-review.md`).
-///
-/// Embeds the engine's pre-spawn diagnosis (parsed back from the JSON
-/// the engine stored on `conflict_resolutions.conflict_diagnosis`)
-/// and the project's `test_command` if one is configured. The worker
-/// is *not* asked to add scope — the prompt is explicit that the only
-/// allowed change is resolving the rebase conflict and pushing the
-/// resolved branch.
-fn compose_conflict_resolution_prompt(
-    execution: &WorkExecution,
-    work_item: &WorkItem,
-    workspace_path: &Path,
-    cube_change_id: Option<&str>,
-    attempt: &ConflictResolution,
-    test_command: Option<&str>,
-) -> String {
-    let mut prompt = String::new();
-    prompt.push_str(&format!(
-        "## Conflict resolution: PR #{pr_num} has merge conflicts against `{base}`\n\n",
-        pr_num = attempt.pr_number,
-        base = attempt.base_branch,
-    ));
-    prompt.push_str(&format!("**PR**: {}\n", attempt.pr_url));
-    prompt.push_str(&format!(
-        "**Branch**: `{}` based off `{}`\n",
-        attempt.head_branch, attempt.base_branch,
-    ));
-    if let Some(base_sha) = attempt.base_sha_at_trigger.as_deref() {
-        prompt.push_str(&format!(
-            "**Base sha at conflict detection**: `{base_sha}` (current `{}` may be ahead)\n",
-            attempt.base_branch,
-        ));
-    }
-    prompt.push_str(&format!("**Workspace**: `{}`\n", workspace_path.display()));
-    prompt.push_str(&format!("**Attempt id**: `{}`\n", attempt.id));
-    prompt.push_str(&format!("**Execution id**: `{}`\n", execution.id));
-    if let Some(change) = cube_change_id {
-        prompt.push_str(&format!("**Local change**: `{change}`\n"));
-    }
-    prompt.push_str(&format!(
-        "**Work item**: `{}`\n\n",
-        work_item_name(work_item),
-    ));
-    prompt.push_str(
-        "This PR was in code review when `main` moved under it. The PR's diff against\n\
-         the current `main` does not apply cleanly. Your job is to resolve the conflicts,\n\
-         push the resolved branch, and stop. **You are not adding new work to this PR.**\n\n",
-    );
-    prompt.push_str("### Steps\n\n");
-    prompt.push_str("1. `jj git fetch`\n");
-    prompt.push_str(&format!("2. `jj edit {}`\n", attempt.head_branch));
-    prompt.push_str(&format!(
-        "3. `jj rebase -d {} -b {}`\n",
-        attempt.base_branch, attempt.head_branch,
-    ));
-    prompt.push_str(
-        "4. If the rebase reports a conflict:\n\
-            - Inspect with `jj st`, `jj resolve --list <file>`.\n\
-            - Resolve each conflict. Read the conflict diagnosis below for what was\n  \
-              touched on the upstream side.\n",
-    );
-    match test_command {
-        Some(cmd) => prompt.push_str(&format!(
-            "5. Run the project's tests with `{cmd}`. If green, push. If red and the\n   \
-                failure is rebase-induced, fix it. If red and the failure was pre-existing,\n   \
-                stop and surface it via the stop-condition path below.\n",
-        )),
-        None => prompt.push_str(
-            "5. No `test_command` is configured for this product; skip the local test\n   \
-                run and rely on CI to verify the push.\n",
-        ),
-    }
-    prompt.push_str(&format!(
-        "6. `jj git push --bookmark {}`\n",
-        attempt.head_branch,
-    ));
-    prompt.push_str(&format!(
-        "7. `gh pr comment {} --body \"<post-resolution comment — see template below>\"`\n",
-        attempt.pr_number,
-    ));
-    prompt.push_str(
-        "8. Stop. Do not change the PR base, do not change the PR title or description,\n   \
-            do not push new commits beyond the resolved rebase.\n\n",
-    );
-    prompt.push_str("### Conflict diagnosis (from the engine's pre-spawn pass)\n\n");
-    match attempt
-        .conflict_diagnosis
-        .as_deref()
-        .map(serde_json::from_str::<ConflictDiagnosis>)
-    {
-        Some(Ok(diagnosis)) => prompt.push_str(&render_diagnosis_markdown(&diagnosis)),
-        Some(Err(err)) => {
-            prompt.push_str(&format!(
-                "_Engine could not re-parse the diagnosis JSON (error: {err}). The\n\
-                 raw blob is on `conflict_resolutions.conflict_diagnosis` if you need it._\n",
-            ));
-        }
-        None => {
-            prompt.push_str(
-                "_No engine-collected diagnosis is available for this attempt. Use\n\
-                 `jj st` and `jj resolve --list` after the rebase to discover the\n\
-                 conflicts directly._\n",
-            );
-        }
-    }
-    prompt.push_str("\n### Stop conditions\n\n");
-    prompt.push_str(
-        "If any of the following applies, comment on the PR explaining the situation,\n\
-         do NOT push, and run `boss engine conflicts mark-failed <attempt-id> --reason <r>`\n\
-         with the appropriate reason — the engine will mark the attempt `failed`:\n\n\
-            1. **Semantic obsolescence** — the upstream change accomplished what this PR\n   \
-            was trying to do. Reason: `obsolescence_suspected`.\n\
-            2. **Product decision required** — the conflict needs a human choice between\n   \
-            two valid resolutions. Reason: `product_decision_required`.\n\
-            3. **Architectural mismatch** — the upstream removed an abstraction this PR\n   \
-            was extending. Reason: `architectural_mismatch`.\n\n\
-         Do NOT close the PR yourself. Closing is the human's call.\n\n",
-    );
-    prompt.push_str("### Post-resolution PR comment template\n\n");
-    prompt.push_str(
-        "```\n\
-         🤖 boss resolved merge conflicts on this PR after `main` moved.\n\n\
-         Resolutions:\n\
-         - <per-file resolution summary>\n\n\
-         <If a test command was configured, paste its result here.>\n\
-         Branch force-pushed; per branch protection, prior approvals have been dismissed.\n\
-         Re-review when ready.\n\
-         ```\n\n",
-    );
-    prompt.push_str("Respond with concise markdown using exactly these sections:\n");
-    prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
-    prompt
-}
 
-/// Templated prompt for the `ci_remediation` execution kind
-/// (`tools/boss/docs/designs/merge-conflict-handling-in-review.md` §Q4).
-///
-/// Two attempt kinds (mirroring `ci_remediations.attempt_kind`):
-///
-/// - `retrigger`: the engine pre-classified every failure as
-///   `STARTUP_FAILURE` / `CANCELLED` (unambiguous infra). The worker's
-///   only job is to re-run the failing build via the per-provider CLI
-///   and call `boss engine ci mark-retriggered`. No code change, no
-///   budget consumed.
-///
-/// - `fix`: at least one failure has a non-infra conclusion. Per the
-///   reconciled 2026-05-17 design call (project description: "Always
-///   try a rebase-onto-base BEFORE consuming a fix-attempt budget
-///   slot"), the worker's **first** action is a rebase onto the base
-///   branch HEAD followed by a force-push. If post-rebase CI goes
-///   green the worker calls `boss engine ci mark-succeeded-via-rebase`
-///   and the engine refunds the detection-side budget bump. Only when
-///   post-rebase CI is still red does the worker proceed to a code
-///   fix (the budget slot is then consumed as today).
+/// Templated prompt for the `ci_remediation` execution kind, retrigger path
+/// only. `fix`-kind CI attempts now dispatch through the revision substrate
+/// (`revision_implementation`); only `retrigger` (design Q6: no commit,
+/// not revision-shaped) still uses this bespoke execution kind.
 fn compose_ci_remediation_prompt(
     execution: &WorkExecution,
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
     attempt: &CiRemediation,
-    test_command: Option<&str>,
+    _test_command: Option<&str>,
 ) -> String {
-    let is_rebounce = attempt
-        .failure_kind
-        .as_deref()
-        .map_or(false, |k| k == "merge_queue_rebounce");
-
     let mut prompt = String::new();
 
-    if is_rebounce {
-        prompt.push_str(&format!(
-            "## [merge-queue-rebounce] CI remediation: PR #{pr_num} ({kind}) — merge-queue FAILED_CHECKS\n\n",
-            pr_num = attempt.pr_number,
-            kind = attempt.attempt_kind,
-        ));
-        // Clear preamble so the worker doesn't waste time on the PR's own CI.
-        prompt.push_str(
-            "> **Important**: this is a **merge-queue rebounce**, not a per-PR CI failure.\n\
-             > - The PR's own required checks are **green** on its head SHA. Do NOT look at them.\n\
-             > - The failure happened on the **synthetic merge commit** GitHub assembled when the PR\n\
-             >   entered the queue. See `Synthetic merge SHA` below.\n\
-             > - Root cause: something landed on `main` between this PR's CI run and its queue turn\n\
-             >   that is semantically incompatible (a new required field, a renamed type, etc.). This\n\
-             >   is a textbook semantic merge conflict that the merge queue exists to catch.\n\
-             > - After fixing, **re-enqueue** the PR — the merge queue does not auto-retry.\n\n",
-        );
-    } else {
-        prompt.push_str(&format!(
-            "## CI remediation: PR #{pr_num} ({kind}) — required checks failing\n\n",
-            pr_num = attempt.pr_number,
-            kind = attempt.attempt_kind,
-        ));
-    }
+    prompt.push_str(&format!(
+        "## CI remediation: PR #{pr_num} ({kind}) — required checks failing\n\n",
+        pr_num = attempt.pr_number,
+        kind = attempt.attempt_kind,
+    ));
 
     prompt.push_str(&format!("**PR**: {}\n", attempt.pr_url));
     if !attempt.head_branch.is_empty() {
         prompt.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
-    }
-    if is_rebounce {
-        if let Some(ref sha) = attempt.before_commit_sha {
-            prompt.push_str(&format!(
-                "**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",
-            ));
-        }
     }
     prompt.push_str(&format!(
         "**Head sha at trigger**: `{}`\n",
@@ -1582,160 +1361,28 @@ fn compose_ci_remediation_prompt(
     }
     prompt.push('\n');
 
-    if attempt.attempt_kind == "retrigger" {
-        // §Q4 retrigger playbook: every failure is unambiguous infra,
-        // no log read needed, no code change.
-        prompt.push_str("### Action: retrigger the failing build\n\n");
-        prompt.push_str(
-            "The engine has pre-classified this failure as infra (every failing check has \
-             `conclusion ∈ {STARTUP_FAILURE, CANCELLED}`). No log read or code change is needed.\n\n",
-        );
-        prompt.push_str(
-            "1. Re-run the failing build via the per-provider CLI (`bk build retry <build-id>` \
-             for Buildkite or `gh run rerun <run-id> --failed` for GitHub Actions). The failing \
-             check's `target_url` above carries the right id.\n\
-             2. Call `boss engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
-             so the engine records the new run id and stays out of the budget path. Do NOT call \
-             `mark-failed` or push code.\n\
-             3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",
-        );
-    } else {
-        // §"fix" path with the reconciled-2026-05-17 rebase-first step.
-        if is_rebounce {
-            prompt.push_str("### Action: rebase onto current main, then fix the semantic conflict\n\n");
-            prompt.push_str(
-                "A merge-queue rebounce almost always means something landed on `main` between \
-                 this PR's CI run and its queue turn that is **semantically incompatible** — the \
-                 two patches don't textually conflict (GitHub's merge was clean) but the combined \
-                 code doesn't compile or fails tests. The fix is:\n\
-                 1. Rebase onto current `main` HEAD.\n\
-                 2. Look at the CI failure on the **synthetic merge SHA** (not the PR head) to \
-                    understand what became incompatible.\n\
-                 3. Add a focused fix, push, and re-enqueue the PR.\n\n",
-            );
-        } else {
-            prompt.push_str("### Action: rebase first, then fix\n\n");
-            prompt.push_str(
-                "Many CI failures on long-running PRs are caused by `main` moving (a dep bump, a fix \
-                 that landed, an env change). The cheapest experiment is rebasing onto `main` HEAD \
-                 before changing any code — if CI goes green after the rebase, no fix-attempt slot is \
-                 consumed against this PR's budget.\n\n",
-            );
-        }
-        prompt.push_str("**Step 1 — Rebase onto base HEAD and force-push.**\n\n");
-        prompt.push_str(&format!(
-            "```\n\
-             jj git fetch\n\
-             jj edit {branch}\n\
-             jj rebase -d main -b {branch}\n\
-             jj git push -b {branch}      # force-push: prior approvals will be dismissed by branch protection\n\
-             ```\n\n",
-            branch = if attempt.head_branch.is_empty() {
-                "<branch>"
-            } else {
-                attempt.head_branch.as_str()
-            },
-        ));
-        if is_rebounce {
-            prompt.push_str(
-                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
-                 - **If post-rebase CI is green**, call \
-                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. \
-                 Then re-enqueue the PR (see Step 3 below). The engine flips the attempt to \
-                 `succeeded` and the budget slot is not consumed.\n\
-                 - **If post-rebase CI is still red**, the semantic conflict requires a code fix — \
-                 continue to Step 2.\n\n",
-            );
-        } else {
-            prompt.push_str(
-                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
-                 - **If post-rebase CI is green**, call \
-                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. The \
-                 engine flips the attempt to `succeeded`, sets `consumes_budget = 0`, and decrements \
-                 `tasks.ci_attempts_used` so this attempt does not count against the PR's budget.\n\
-                 - **If post-rebase CI is still red**, continue to Step 2. The budget slot is now \
-                 consumed; this is the fix attempt the engine pre-classified.\n\n",
-            );
-        }
-
-        prompt.push_str("**Step 2 — Read the log, classify, fix, push.**\n\n");
-        if is_rebounce {
-            // For rebounce, direct the worker to the synthetic merge SHA.
-            // The PR head's logs are green and uninformative.
-            let sha_hint = attempt
-                .before_commit_sha
-                .as_deref()
-                .unwrap_or("<synthetic-merge-sha>");
-            prompt.push_str(&format!(
-                "Fetch CI logs from the **synthetic merge SHA `{sha_hint}`**, not the PR head \
-                 (whose checks are green). Use the per-provider CLI:\n\n\
-                 - Buildkite: `bk job log <job-id>` (job id from the failing check URL)\n\
-                 - GitHub Actions: `gh run view --log-failed --job <job-id>` (job id from failing check URL)\n\n",
-            ));
-        } else {
-            prompt.push_str("Engine-collected log excerpt (failing job tail):\n\n");
-            match attempt.log_excerpt.as_deref().map(str::trim) {
-                Some(tail) if !tail.is_empty() => {
-                    prompt.push_str("```\n");
-                    prompt.push_str(tail);
-                    prompt.push_str("\n```\n\n");
-                }
-                _ => {
-                    prompt.push_str(
-                        "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
-                         Shell out to the per-provider CLI (`bk job log <job-id>` / \
-                         `gh run view --log-failed --job <job-id>`) from the failing check's `target_url`._\n\n",
-                    );
-                }
-            }
-        }
-        prompt.push_str(
-            "1. Classify the failure with `boss engine ci classify --attempt-id <attempt-id> --class <tractable|flaky_or_infra|unfixable>`.\n   \
-                - `tractable` → there's a clear code change that resolves it. Make it. Push.\n   \
-                - `flaky_or_infra` → the failure is environmental / not caused by this PR's diff. \
-                Pivot to the retrigger playbook (re-run the failing build via the provider CLI \
-                and call `mark-retriggered`).\n   \
-                - `unfixable` → the failure is real and out of scope (e.g. a hard gate the PR \
-                cannot satisfy). Call `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
-                and stop. Do NOT push.\n",
-        );
-        match test_command {
-            Some(cmd) => prompt.push_str(&format!(
-                "2. Before pushing a code change, validate locally with `{cmd}`.\n",
-            )),
-            None => prompt.push_str(
-                "2. No `test_command` is configured for this product; rely on CI to verify the push.\n",
-            ),
-        }
-        prompt.push_str(&format!(
-            "3. Push your fix with `jj git push -b {branch}` (force-push if your worker rebased \
-                first). The merge-poller will observe the new head sha and re-evaluate CI on the \
-                next sweep — when green it flips the attempt to `succeeded` and unblocks the parent.\n\n",
-            branch = if attempt.head_branch.is_empty() {
-                "<branch>"
-            } else {
-                attempt.head_branch.as_str()
-            },
-        ));
-        if is_rebounce {
-            prompt.push_str(
-                "**Step 3 (after CI is green) — Re-enqueue the PR.**\n\n\
-                 The merge queue does **not** auto-retry after a dequeue. After your push produces \
-                 green CI, re-add the PR to the merge queue:\n\n\
-                 ```\n\
-                 gh pr merge --auto --squash  # or --merge / --rebase per repo policy\n\
-                 ```\n\n",
-            );
-        }
-    }
+    // §Q4 retrigger playbook: every failure is unambiguous infra,
+    // no log read needed, no code change.
+    prompt.push_str("### Action: retrigger the failing build\n\n");
+    prompt.push_str(
+        "The engine has pre-classified this failure as infra (every failing check has \
+         `conclusion ∈ {STARTUP_FAILURE, CANCELLED}`). No log read or code change is needed.\n\n",
+    );
+    prompt.push_str(
+        "1. Re-run the failing build via the per-provider CLI (`bk build retry <build-id>` \
+         for Buildkite or `gh run rerun <run-id> --failed` for GitHub Actions). The failing \
+         check's `target_url` above carries the right id.\n\
+         2. Call `boss engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
+         so the engine records the new run id and stays out of the budget path. Do NOT call \
+         `mark-failed` or push code.\n\
+         3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",
+    );
 
     prompt.push_str("### Stop conditions\n\n");
     prompt.push_str(
         "- **You are not adding scope.** The only allowed change is one that makes the failing \
-         required checks pass (rebase, infra retrigger, or a focused fix).\n\
-         - **Do not close the PR yourself.** Closing is the human's call.\n\
-         - **Always pass `-m \"…\"` to `git commit` / `jj describe` / `jj squash`.** The worker \
-         environment has no usable `$EDITOR`.\n\n",
+         required checks pass (infra retrigger only — no code changes).\n\
+         - **Do not close the PR yourself.** Closing is the human's call.\n\n",
     );
     prompt.push_str("Respond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -1994,241 +1641,6 @@ fn task_details(task: &Task) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-#[cfg(test)]
-mod conflict_resolution_prompt_tests {
-    //! Pure tests for the conflict-resolution prompt composer. The
-    //! function takes a `ConflictResolution` + execution context and
-    //! emits the templated markdown the worker pane will see.
-
-    use super::*;
-    use crate::conflict_diagnosis::{ConflictDiagnosis, ConflictedFile};
-    use crate::work::ConflictResolution;
-    use boss_protocol::WorkExecution;
-
-    fn sample_execution() -> WorkExecution {
-        WorkExecution::builder()
-            .id("exec-cr-1")
-            .work_item_id("task_1")
-            .kind("conflict_resolution")
-            .status("running")
-            .repo_remote_url("git@example.invalid:foo/bar.git")
-            .cube_repo_id("foo")
-            .cube_lease_id("lease-1")
-            .cube_workspace_id("ws-1")
-            .workspace_path("/tmp/workspace")
-            .created_at("1700000000")
-            .started_at("1700000010")
-            .build()
-    }
-
-    fn sample_work_item() -> WorkItem {
-        WorkItem::Chore(
-            crate::work::Task::builder()
-                .id("task_1")
-                .product_id("prod_1")
-                .kind("chore")
-                .name("Some in-review chore")
-                .description("")
-                .status("blocked")
-                .pr_url("https://github.com/foo/bar/pull/42")
-                .created_at("1700000000")
-                .updated_at("1700000000")
-                .autostart(false)
-                .last_status_actor("engine")
-                .created_via("engine_auto")
-                .blocked_reason("merge_conflict")
-                .blocked_attempt_id("crz_x")
-                .build(),
-        )
-    }
-
-    fn attempt_with_diagnosis(diag_json: Option<String>) -> ConflictResolution {
-        ConflictResolution {
-            id: "crz_42".into(),
-            product_id: "prod_1".into(),
-            work_item_id: "task_1".into(),
-            pr_url: "https://github.com/foo/bar/pull/42".into(),
-            pr_number: 42,
-            head_branch: "riker/feature".into(),
-            base_branch: "main".into(),
-            base_sha_at_trigger: Some("abc123".into()),
-            head_sha_before: Some("def456".into()),
-            head_sha_after: None,
-            status: "running".into(),
-            failure_reason: None,
-            cube_lease_id: Some("lease-1".into()),
-            cube_workspace_id: Some("ws-1".into()),
-            worker_id: Some("worker-1".into()),
-            conflict_diagnosis: diag_json,
-            created_at: "1700000000".into(),
-            started_at: Some("1700000010".into()),
-            finished_at: None,
-            revision_task_id: None,
-        }
-    }
-
-    #[test]
-    fn prompt_embeds_pr_branch_and_attempt_id() {
-        let diag = ConflictDiagnosis {
-            schema_version: 1,
-            base_sha: "abc123".into(),
-            head_sha: "def456".into(),
-            files: vec![ConflictedFile {
-                path: "src/foo.rs".into(),
-                marker_count: Some(2),
-                shape: "content".into(),
-            }],
-            error: None,
-        };
-        let json = serde_json::to_string(&diag).unwrap();
-        let attempt = attempt_with_diagnosis(Some(json));
-
-        let prompt = compose_conflict_resolution_prompt(
-            &sample_execution(),
-            &sample_work_item(),
-            std::path::Path::new("/tmp/workspace"),
-            Some("chg_1"),
-            &attempt,
-            None,
-        );
-
-        assert!(
-            prompt.contains("## Conflict resolution: PR #42"),
-            "missing PR-number header:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("riker/feature"),
-            "missing head branch:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("`crz_42`"),
-            "missing attempt id:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("`exec-cr-1`"),
-            "missing execution id:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("Base sha at conflict detection"),
-            "missing base sha line:\n{prompt}",
-        );
-        // Steps refer to the head branch verbatim.
-        assert!(
-            prompt.contains("jj edit riker/feature"),
-            "missing rebase step:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("jj git push --bookmark riker/feature"),
-            "missing push step:\n{prompt}",
-        );
-        // Diagnosis surface renders the conflicted file.
-        assert!(
-            prompt.contains("`src/foo.rs`"),
-            "missing diagnosis file:\n{prompt}",
-        );
-    }
-
-    #[test]
-    fn prompt_includes_test_command_when_configured() {
-        let attempt = attempt_with_diagnosis(None);
-        let prompt = compose_conflict_resolution_prompt(
-            &sample_execution(),
-            &sample_work_item(),
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            &attempt,
-            Some("bazel test //..."),
-        );
-        assert!(
-            prompt.contains("bazel test //..."),
-            "configured test command should appear verbatim:\n{prompt}",
-        );
-    }
-
-    #[test]
-    fn prompt_omits_test_step_when_test_command_is_none() {
-        let attempt = attempt_with_diagnosis(None);
-        let prompt = compose_conflict_resolution_prompt(
-            &sample_execution(),
-            &sample_work_item(),
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            &attempt,
-            None,
-        );
-        assert!(
-            prompt.contains("No `test_command` is configured"),
-            "prompt should explicitly note the omission:\n{prompt}",
-        );
-    }
-
-    #[test]
-    fn prompt_calls_out_mark_failed_for_stop_conditions() {
-        let attempt = attempt_with_diagnosis(None);
-        let prompt = compose_conflict_resolution_prompt(
-            &sample_execution(),
-            &sample_work_item(),
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            &attempt,
-            None,
-        );
-        assert!(
-            prompt.contains("boss engine conflicts mark-failed"),
-            "prompt must point workers at the mark-failed CLI:\n{prompt}",
-        );
-        // All three canonical reasons appear by name.
-        for reason in [
-            "obsolescence_suspected",
-            "product_decision_required",
-            "architectural_mismatch",
-        ] {
-            assert!(
-                prompt.contains(reason),
-                "stop-condition reason {reason} missing:\n{prompt}",
-            );
-        }
-    }
-
-    #[test]
-    fn prompt_handles_unparsable_diagnosis_gracefully() {
-        let attempt = attempt_with_diagnosis(Some("{not valid json".into()));
-        let prompt = compose_conflict_resolution_prompt(
-            &sample_execution(),
-            &sample_work_item(),
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            &attempt,
-            None,
-        );
-        assert!(
-            prompt.contains("could not re-parse the diagnosis JSON"),
-            "missing fallback for bad diagnosis JSON:\n{prompt}",
-        );
-    }
-
-    #[test]
-    fn prompt_renders_diagnosis_error_surface() {
-        let diag = ConflictDiagnosis::errored("abc", "def", "git not on PATH");
-        let attempt = attempt_with_diagnosis(Some(serde_json::to_string(&diag).unwrap()));
-        let prompt = compose_conflict_resolution_prompt(
-            &sample_execution(),
-            &sample_work_item(),
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            &attempt,
-            None,
-        );
-        assert!(
-            prompt.contains("Engine-side probe failed"),
-            "prompt should surface the engine probe error:\n{prompt}",
-        );
-        assert!(
-            prompt.contains("git not on PATH"),
-            "prompt should include the probe error message:\n{prompt}",
-        );
-    }
-}
 
 #[cfg(test)]
 mod compose_prompt_tests {

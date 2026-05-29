@@ -33,57 +33,6 @@ impl WorkDb {
         collect_rows(rows)
     }
 
-    /// Conflict-resolution attempts that are stranded: the parent task
-    /// is `blocked: merge_conflict`, the `conflict_resolutions` row is
-    /// `pending`, and no live execution (`kind='conflict_resolution'`
-    /// AND `status IN ('ready','running','waiting_human')`) exists for
-    /// that `work_item_id`. The merge poller's recovery sweep re-emits
-    /// a fresh execution request for each of these so a worker can
-    /// attempt the rebase.
-    ///
-    /// `abandoned` rows are excluded by the `status = 'pending'`
-    /// filter — the churn guard (or a human) owns that path and those
-    /// rows must not be automatically rescued.
-    ///
-    /// Post-cutover (Phase 3): rows with `revision_task_id` set are driven
-    /// by the revision substrate (a `revision_implementation` execution),
-    /// not the dormant `conflict_resolution` kind, so they are excluded —
-    /// only legacy (pre-cutover) pending attempts are rescued here.
-    pub fn list_stranded_conflict_resolution_attempts(
-        &self,
-    ) -> Result<Vec<StrandedConflictAttempt>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT cr.id, cr.work_item_id, cr.product_id, cr.pr_url
-             FROM conflict_resolutions cr
-             WHERE cr.status = 'pending'
-               AND cr.revision_task_id IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM tasks t
-                   WHERE t.id = cr.work_item_id
-                     AND t.status = 'blocked'
-                     AND t.blocked_reason = 'merge_conflict'
-                     AND t.deleted_at IS NULL
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM work_executions we
-                   WHERE we.work_item_id = cr.work_item_id
-                     AND we.kind = 'conflict_resolution'
-                     AND we.status IN ('ready', 'running', 'waiting_human')
-               )
-             ORDER BY cr.created_at ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(StrandedConflictAttempt {
-                attempt_id: row.get(0)?,
-                work_item_id: row.get(1)?,
-                product_id: row.get(2)?,
-                pr_url: row.get(3)?,
-            })
-        })?;
-        collect_rows(rows)
-    }
-
     /// CI-remediation attempts that are stranded: the parent task is
     /// `blocked: ci_failure`, the `ci_remediations` row is `pending`,
     /// and no live execution (`kind='ci_remediation'` AND
