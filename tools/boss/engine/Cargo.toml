@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bon = { workspace = true }
 boss-protocol = { path = "../protocol" }
 clap = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }

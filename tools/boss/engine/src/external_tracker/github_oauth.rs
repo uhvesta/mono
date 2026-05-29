@@ -77,7 +77,8 @@ impl Default for DeviceFlowConfig {
 
 // ── GitHub API response shapes ────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 struct RawDeviceCodeResponse {
     device_code: String,
     user_code: String,
@@ -116,7 +117,8 @@ struct RawUserResponse {
 /// Information returned from the device-code request step.
 /// The `device_code` is a bearer-equivalent secret kept internal to the engine;
 /// the UI only ever sees `user_code` and `verification_uri` via the DTO.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DeviceCodeInfo {
     /// Bearer-equivalent secret — never send to the UI.
     pub device_code: String,
