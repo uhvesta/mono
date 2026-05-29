@@ -1460,7 +1460,7 @@ private struct WorkBoardCardItem: View {
                     onDepBadgeHover: { hovering in
                         model.setDepBadgeHover(hovering ? task.id : nil)
                     },
-                    onOpenReviewTerminal: (column == .review && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
+                    onOpenReviewTerminal: ((column == .review || column == .done) && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
                         ? { model.openReviewTerminal(for: task) }
                         : nil
                 )
