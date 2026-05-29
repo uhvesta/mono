@@ -251,6 +251,7 @@ dependencies = [
  "bon",
  "boss-client",
  "boss-protocol",
+ "boss-transcript-markdown",
  "clap",
  "fastrand 2.3.0",
  "keyring",
@@ -290,6 +291,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "boss-transcript-markdown"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

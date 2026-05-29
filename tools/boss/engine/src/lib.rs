@@ -1,3 +1,5 @@
+pub use boss_transcript_markdown as transcript_markdown;
+
 pub mod app;
 pub mod audit;
 pub mod audit_effort;

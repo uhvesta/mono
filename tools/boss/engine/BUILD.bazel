@@ -122,6 +122,7 @@ rust_library(
         "//tools/boss/engine:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/boss-transcript-markdown:transcript_markdown",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
