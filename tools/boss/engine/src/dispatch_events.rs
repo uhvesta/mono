@@ -145,6 +145,17 @@ pub enum Stage {
     /// by the next sweep the sweep falls back to the normal
     /// orphan+respawn path.
     TransientRecoveryNudge,
+    /// The periodic stale-worker sweep found a slot whose `claude`
+    /// process is still alive but has emitted no hook event for longer
+    /// than the staleness threshold while `activity=working` with no
+    /// tool in flight — the wedged-dependency hang (e.g. a backgrounded
+    /// bazel build the worker is idling on that never completes). The
+    /// execution has been marked `orphaned`, the pool slot released, and
+    /// the work item will be redispatched by the orphan sweep on the
+    /// next tick. Distinct from `dead_pid_reconcile` (PID gone) because
+    /// here the process is *alive but parked* — `kill(pid, 0)` would
+    /// report it healthy.
+    StaleWorkerReconcile,
 }
 
 impl Stage {
@@ -167,6 +178,7 @@ impl Stage {
             Stage::TransientRecovery => "transient_recovery",
             Stage::TransientRecoveryExhausted => "transient_recovery_exhausted",
             Stage::TransientRecoveryNudge => "transient_recovery_nudge",
+            Stage::StaleWorkerReconcile => "stale_worker_reconcile",
         }
     }
 }

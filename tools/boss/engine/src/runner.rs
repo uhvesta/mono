@@ -828,7 +828,9 @@ fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
          - If a CI workflow file exists (`.github/workflows/*.yml`), open it and mirror the exact bazel target set it builds/tests (these repos typically run `bazel build //...` or a curated rollup). Run that same command locally so your gate matches what CI will enforce.\n\
          - Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests, no clippy/lint failures — before you push.\n\
          \n\
-         If the build or tests fail and you cannot make them pass within this run, do NOT push red code. Emit an `[effort-escalation]` marker in your final response with the failing command and its error output, and stop. Escalating a blocker is correct; pushing a known-broken branch is not.\n"
+         Run the build gate in the FOREGROUND and read its exit code directly. Do NOT background bazel (no `&`, no `run_in_background`, no redirecting to a log file you then poll) and then idle in a self-paced wait-loop \"until the gate is green\". If the bazel server wedges (host contention, a hung toolchain), those log files may never appear and the completion notification never arrives — you will wait forever with no way out, stranding your slot. If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle.\n\
+         \n\
+         If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit an `[effort-escalation]` marker in your final response with the failing/timed-out command and its output, and stop. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
             .to_string(),
     )
 }
@@ -2219,6 +2221,10 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("[effort-escalation]"),
             "gate must direct failures to an effort-escalation marker:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("FOREGROUND") && prompt.contains("run_in_background"),
+            "gate must mandate foreground execution and forbid the background-and-idle anti-pattern (issue #976):\n{prompt}",
         );
     }
 

@@ -302,6 +302,16 @@ fn current_iso8601() -> String {
     format_iso8601_utc(secs)
 }
 
+/// Format `epoch_secs` as the same fixed-width ISO-8601 UTC string
+/// (`YYYY-MM-DDTHH:MM:SSZ`) the registry stamps into `last_event_at`.
+/// Because the format is fixed-width, lexicographic string ordering
+/// matches chronological ordering — the stale-worker sweep builds a
+/// cutoff timestamp with this and compares `last_event_at < cutoff`
+/// directly, with no date parsing.
+pub fn iso8601_utc(epoch_secs: i64) -> String {
+    format_iso8601_utc(epoch_secs)
+}
+
 /// Minimal ISO-8601 UTC formatter (`YYYY-MM-DDTHH:MM:SSZ`). Avoids
 /// pulling in chrono just to stamp event timestamps.
 fn format_iso8601_utc(epoch_secs: i64) -> String {
