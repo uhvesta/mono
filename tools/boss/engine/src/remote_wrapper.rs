@@ -10,12 +10,20 @@
 //! "Wrapper Distribution"):
 //!
 //! - The wrapper carries a `BOSS_REMOTE_RUN_VERSION` constant near the
-//!   top, replaced at engine build time with a value derived from the
-//!   engine's git short SHA (e.g. `eng-7a3f2c1`).
+//!   top, replaced at push time with a value derived from the running
+//!   engine binary's content fingerprint (e.g. `eng-7a3f2c1b9e04`).
 //! - `--version` prints exactly that string and exits zero.
-//! - The engine's expected version is the same string baked into the
-//!   engine binary; comparison is exact-equality, not semver.
+//! - The engine's expected version is computed from the same binary at
+//!   runtime; comparison is exact-equality, not semver.
 //! - Any mismatch triggers a re-push.
+//!
+//! The version used to derive from the engine's stamped git SHA, but
+//! stamping the SHA into the engine crate busted the build cache on
+//! every commit (see `installer/pkg.bzl`'s `build_info_rs`). The binary
+//! fingerprint is a strictly better discriminator anyway: it changes iff
+//! the engine bytes change — and because the wrapper source is bundled
+//! into the engine via `include_str!`, any edit to the wrapper changes
+//! those bytes and therefore the fingerprint, preserving the contract.
 
 /// Verbatim wrapper script source. Bundled at compile time so the
 /// engine has one source of truth and no separate distribution path.
@@ -26,15 +34,17 @@ const WRAPPER_SOURCE: &str = include_str!("../remote/boss-remote-run.sh");
 /// in either side fails the unit test below at build time.
 const VERSION_PLACEHOLDER: &str = "__BOSS_REMOTE_RUN_VERSION__";
 
-/// The canonical wrapper version string. Built from the engine's git
-/// short SHA when stamped; falls back to `eng-unknown` when the build
-/// environment didn't stamp `BOSS_ENGINE_GIT_SHA`.
+/// The canonical wrapper version string, derived from the running
+/// engine binary's content fingerprint (e.g. `eng-7a3f2c1b9e04`). Falls
+/// back to `eng-unknown` only if the engine cannot read its own binary
+/// (extremely rare; see [`crate::build_info::binary_fingerprint`]).
 ///
-/// Exact-equality is the engine ↔ wrapper version contract. Any change
-/// to the wrapper source that would invalidate the contract should
-/// trigger a fresh engine build (and therefore a fresh SHA).
+/// Exact-equality is the engine ↔ wrapper version contract. The wrapper
+/// source is bundled into the engine via `include_str!`, so any change
+/// to it produces a different engine binary, a different fingerprint,
+/// and therefore a re-push — which is exactly the contract we want.
 pub fn expected_version() -> String {
-    format!("eng-{}", crate::build_info::git_sha())
+    format!("eng-{}", crate::build_info::binary_fingerprint())
 }
 
 /// Return the wrapper source ready to push to a remote host, with the

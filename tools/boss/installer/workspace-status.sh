@@ -11,7 +11,6 @@
 set -euo pipefail
 
 SHA=$(jj log --no-graph -r @ -T 'commit_id.short(7)' 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Compute a semantic version string from git tags (boss-v* prefix).
 # Release build (exact tag match): boss-v1.0.4 → "1.0.4"
@@ -54,12 +53,23 @@ else
     BOSS_VERSION="${BOSS_BASE_VERSION}-dev-${SHA}"
 fi
 
-# Goes to stable-status.txt — consumed by build_info_rs, boss_short_version_plist,
-# and boss_pkg_unsigned to embed the SHA in the .pkg filename.
+# Goes to stable-status.txt. Consumers:
+#   - boss_short_version_plist: STABLE_BOSS_VERSION / STABLE_BOSS_BASE_VERSION
+#   - boss_pkg_unsigned:        STABLE_BOSS_GIT_SHA (embedded in the .pkg filename)
+#   - build_info_rs:            STABLE_BOSS_BASE_VERSION only
+#
+# IMPORTANT: do not add a per-build or per-commit value (wall-clock time, full
+# git SHA, dev-suffixed version) to anything build_info_rs reads. That file is
+# compiled into engine_lib/cli/bossctl, so a value that changes every build or
+# every commit busts the Rust action cache and forces a full recompile on every
+# CI run. build_info_rs deliberately reads only the rarely-changing base version
+# so its output is byte-stable and downstream compiles stay cached. The SHA and
+# full version remain here solely for the terminal packaging actions above,
+# which are cheap and do not recompile Rust. (A wall-clock STABLE_BOSS_BUILD_TIME
+# used to live here; it was the prime offender and has been removed.)
 echo "STABLE_BOSS_VERSION $BOSS_VERSION"
 echo "STABLE_BOSS_BASE_VERSION $BOSS_BASE_VERSION"
 echo "STABLE_BOSS_GIT_SHA $SHA"
-echo "STABLE_BOSS_BUILD_TIME $BUILD_TIME"
 
 # Goes to volatile-status.txt — not used for version stamping but kept for
 # build tooling compatibility.

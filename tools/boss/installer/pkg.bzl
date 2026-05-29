@@ -160,27 +160,35 @@ def _build_info_rs_impl(ctx):
     # ctx.info_file is the non-volatile status file (stable-status.txt)
     info_file = ctx.info_file
 
-    # Read STABLE_BOSS_VERSION, STABLE_BOSS_GIT_SHA, and STABLE_BOSS_BUILD_TIME
-    # from stable-status.txt and emit a Rust source file with pub constants.
-    # BOSS_VERSION is the primary version string (e.g. "1.0.4" or
-    # "1.0.4-dev-f3be785") derived from git tags by workspace-status.sh.
+    # Read ONLY STABLE_BOSS_BASE_VERSION (the numeric, tag-derived version, e.g.
+    # "1.0.4") from stable-status.txt and emit a Rust source file with pub
+    # constants. BOSS_GIT_SHA and BOSS_BUILD_TIME are intentionally emitted as
+    # the literal "unknown" rather than stamped.
+    #
+    # Why not stamp the SHA / build time here: this file is compiled into
+    # engine_lib (and the cli/bossctl crates). The git SHA changes on every
+    # commit and a wall-clock build time changes on every build, so stamping
+    # either one made the generated file change constantly, which busted the
+    # Rust action cache and forced a full recompile of the largest crate in the
+    # tree on every CI run. Reading only the base version — which changes only
+    # when a new boss-v* release tag is cut — keeps this file byte-stable across
+    # commits, so the downstream rustc actions hit the disk cache.
+    #
+    # The runtime "which binary am I?" signal that actually matters lives in
+    # engine::build_info::binary_fingerprint() (a hash of the engine binary's
+    # own bytes), and the user-facing release version is stamped separately into
+    # Info.plist by boss_short_version_plist. So nothing of value is lost here.
     command = (
         "set -euo pipefail\n" +
-        "VERSION=$(grep STABLE_BOSS_VERSION " + info_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "SHA=$(grep STABLE_BOSS_GIT_SHA " + info_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "BUILD_TIME=$(grep STABLE_BOSS_BUILD_TIME " + info_file.path +
+        "VERSION=$(grep STABLE_BOSS_BASE_VERSION " + info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$VERSION\" ] && VERSION=unknown\n" +
-        "[ -z \"$SHA\" ] && SHA=unknown\n" +
-        "[ -z \"$BUILD_TIME\" ] && BUILD_TIME=unknown\n" +
         "printf 'pub const BOSS_VERSION: &str = \"%s\";\\n" +
         "#[allow(dead_code)]\\n" +
-        "pub const BOSS_GIT_SHA: &str = \"%s\";\\n" +
+        "pub const BOSS_GIT_SHA: &str = \"unknown\";\\n" +
         "#[allow(dead_code)]\\n" +
-        "pub const BOSS_BUILD_TIME: &str = \"%s\";\\n' " +
-        "\"$VERSION\" \"$SHA\" \"$BUILD_TIME\" > " + output.path + "\n"
+        "pub const BOSS_BUILD_TIME: &str = \"unknown\";\\n' " +
+        "\"$VERSION\" > " + output.path + "\n"
     )
 
     ctx.actions.run_shell(
@@ -202,16 +210,23 @@ build_info_rs = rule(
         ),
     },
     doc = """
-Generates a Rust source file containing stamped build constants.
+Generates a Rust source file containing build constants.
 
 Emits:
-  pub const BOSS_VERSION: &str = "<semver>";
-  pub const BOSS_GIT_SHA: &str = "<sha>";
-  pub const BOSS_BUILD_TIME: &str = "<iso8601>";
+  pub const BOSS_VERSION: &str = "<base-version>";   // e.g. "1.0.4"
+  pub const BOSS_GIT_SHA: &str = "unknown";          // intentionally not stamped
+  pub const BOSS_BUILD_TIME: &str = "unknown";       // intentionally not stamped
 
-BOSS_VERSION is the primary user-visible version string derived from git tags
-by workspace-status.sh (e.g. "1.0.4" on a release tag or "1.0.4-dev-f3be785"
-on a dev build). Consumed by engine_lib, boss, and bossctl for --version output.
+BOSS_VERSION is the numeric, tag-derived base version (STABLE_BOSS_BASE_VERSION),
+consumed by engine_lib, boss, and bossctl for --version output. It changes only
+when a new boss-v* release tag is cut, so this file stays byte-stable across
+commits and the crates that compile it in keep hitting the Bazel action cache.
+
+BOSS_GIT_SHA and BOSS_BUILD_TIME are emitted as the literal "unknown" on purpose:
+stamping per-commit / per-build values here forced a full recompile of engine_lib
+on every CI build. The reliable runtime build identity is
+engine::build_info::binary_fingerprint(); the user-facing release version is
+stamped separately into Info.plist by boss_short_version_plist.
 """,
 )
 

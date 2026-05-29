@@ -4,19 +4,25 @@
 //! problem ("you merged the fix but rebuilt this morning's engine?")
 //! is immediately visible without guessing.
 //!
-//! Version information (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME) is
-//! stamped at Bazel build time via workspace-status.sh + build_info_rs
-//! genrule, then threaded through compile_data + $(execpath) in rustc_env.
-//! Cargo builds fall back to "unknown" via build.rs.
+//! Only BOSS_VERSION (the numeric, tag-derived base version, e.g.
+//! "1.0.4") is stamped at Bazel build time, via workspace-status.sh +
+//! the build_info_rs genrule, threaded through compile_data + $(execpath)
+//! in rustc_env. Cargo builds fall back to "unknown" via build.rs.
 //!
-//! Additionally, two runtime signals help identify the running binary:
+//! BOSS_GIT_SHA and BOSS_BUILD_TIME are NOT stamped — they are always
+//! "unknown". Stamping a per-commit SHA / per-build wall-clock time into
+//! this file (which compiles into engine_lib) forced a full recompile of
+//! the engine on every CI build; see installer/pkg.bzl's build_info_rs.
+//! The runtime signals below are what actually identify the binary:
 //!
-//! 1. The engine binary's filesystem mtime, evaluated at startup.
+//! 1. The engine binary's filesystem mtime, evaluated at startup
+//!    (what [`build_time`] now reports, since the const is "unknown").
 //! 2. **Binary content fingerprint** — short SHA-256 of the engine
 //!    binary's bytes, computed once at first call to
 //!    [`binary_fingerprint`]. Survives a Bazel cache hit that doesn't
 //!    bump mtime. This is the unambiguous "am I running the binary I
-//!    think I am?" signal — version constants can lie on uncached builds.
+//!    think I am?" signal — and the discriminator the remote-wrapper
+//!    version contract uses (see [`crate::remote_wrapper`]).
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,9 +31,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-// Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+// Build-info constants. Only BOSS_VERSION carries data (the base version);
+// BOSS_GIT_SHA and BOSS_BUILD_TIME are always "unknown" (see module docs).
 // BOSS_BUILD_INFO_RS is set to an absolute path by:
-//   - Bazel: via compile_data + $(execpath) in rustc_env (stamped release value)
+//   - Bazel: via compile_data + $(execpath) in rustc_env (stamped base version)
 //   - Cargo: via build.rs pointing to src/build_info_default.rs ("unknown" fallback)
 mod build_info_stamp {
     include!(env!("BOSS_BUILD_INFO_RS"));
@@ -40,8 +47,10 @@ pub fn version_string(binary_name: &str) -> String {
     format!("{binary_name} {}", build_info_stamp::BOSS_VERSION)
 }
 
-/// Short git SHA the engine binary was built from, baked at compile
-/// time. Returns `"unknown"` when the build environment did not stamp.
+/// Short git SHA the engine binary was built from. No longer stamped
+/// (it busted the build cache on every commit), so this always returns
+/// `"unknown"`. Retained for the diagnostic display fields that report
+/// it; use [`binary_fingerprint`] for an actual build discriminator.
 pub fn git_sha() -> &'static str {
     build_info_stamp::BOSS_GIT_SHA
 }
