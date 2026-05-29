@@ -2232,3 +2232,75 @@ fn resolve_project_design_doc_surfaces_broken_when_no_repo() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Regression for the P844/T845 bug: a design doc that lives under a
+/// non-boss product directory (e.g. `tools/checkleft/docs/designs/`) must
+/// resolve to the PR head branch while the PR is still open, not to "main".
+///
+/// Root cause: `is_design_doc_path` previously rejected paths that did not
+/// start with `tools/boss/docs/designs/`, so `on_design_pr_detected` returned
+/// early without updating `design_doc_branch` to the PR head. The column
+/// stayed `NULL`, and resolution fell back to "main" (the
+/// `unwrap_or_else(|| "main".to_owned())` default), causing a 404 when the
+/// app tried to load the doc from the default branch while it only existed
+/// on the PR branch.
+///
+/// After the fix `is_design_doc_path` matches any `docs/designs/*.md` path,
+/// so the detector sets the branch to the PR head regardless of the product
+/// prefix.  This test verifies the full resolution round-trip given that the
+/// pointer was populated with the PR head branch.
+#[test]
+fn resolve_project_design_doc_returns_pr_head_branch_for_non_boss_product_path() {
+    let path = temp_db_path("resolve-pr-head-non-boss");
+    let db = WorkDb::open(path.clone()).unwrap();
+    // seed_project_for_design_doc uses `git@github.com:spinyfin/mono.git`.
+    let (_, project) = seed_project_for_design_doc(&db);
+
+    // Simulate what on_design_pr_detected now does: populate the pointer
+    // with the PR head branch. The doc lives under checkleft's design dir.
+    db.set_project_design_doc(SetProjectDesignDocInput {
+        project_id: project.id.clone(),
+        design_doc_repo_remote_url: None,
+        design_doc_branch: Some("boss/exec_18b3fffb232a8060_ec".to_owned()),
+        design_doc_path: Some(
+            "tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md".to_owned(),
+        ),
+        unset: false,
+    })
+    .unwrap();
+
+    let resolved = db
+        .resolve_project_design_doc(&project.id, |_| None)
+        .unwrap();
+    let ProjectDesignDocState::Resolved {
+        resolved,
+        raw_content_url,
+        web_url,
+        ..
+    } = resolved.state
+    else {
+        panic!("expected Resolved, got {:?}", resolved.state);
+    };
+
+    assert_eq!(
+        resolved.branch, "boss/exec_18b3fffb232a8060_ec",
+        "unmerged design PR must resolve to the PR head branch, not main"
+    );
+    assert_eq!(
+        resolved.path,
+        "tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md",
+    );
+    // Slashed branch must be %2F-encoded; URL must use the PR head branch.
+    assert_eq!(
+        raw_content_url.as_deref(),
+        Some(
+            "https://raw.githubusercontent.com/spinyfin/mono/tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md?ref=boss%2Fexec_18b3fffb232a8060_ec"
+        ),
+    );
+    assert_eq!(
+        web_url,
+        "https://github.com/spinyfin/mono/blob/boss/exec_18b3fffb232a8060_ec/tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md",
+    );
+
+    let _ = std::fs::remove_file(path);
+}

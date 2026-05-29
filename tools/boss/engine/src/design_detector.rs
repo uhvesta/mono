@@ -2,9 +2,10 @@
 //!
 //! When a `kind=design` task's worker opens a PR, or that PR merges,
 //! the engine scans the PR's changed files for a single markdown file
-//! under `tools/boss/docs/designs/`. If exactly one match is found,
-//! it becomes the project's design-doc pointer. Zero matches or
-//! multiple matches skip auto-population with a logged warning.
+//! under any product's `docs/designs/` directory (e.g.
+//! `tools/boss/docs/designs/` or `tools/checkleft/docs/designs/`). If
+//! exactly one match is found, it becomes the project's design-doc pointer.
+//! Zero matches or multiple matches skip auto-population with a logged warning.
 //!
 //! Two entry points, called from their respective trigger modules:
 //!
@@ -30,8 +31,6 @@ use tokio::process::Command;
 use crate::work::WorkDb;
 use boss_protocol::SetProjectDesignDocInput;
 
-const DESIGN_DOC_PREFIX: &str = "tools/boss/docs/designs/";
-
 /// Metadata extracted from `gh pr view --json files,headRefName,baseRefName`.
 struct PrScanResult {
     /// The single design-doc path found in the PR, or `None` if zero
@@ -46,8 +45,8 @@ struct PrScanResult {
 /// Fired by `completion::finalize_pr_transition` (target = `InReview`)
 /// when the work item is `kind=design` with a `project_id`.
 ///
-/// Scans the PR's changed files for a design-doc markdown file under
-/// `tools/boss/docs/designs/`. On a single match, populates (or updates)
+/// Scans the PR's changed files for a design-doc markdown file under any
+/// product's `docs/designs/` directory. On a single match, populates (or updates)
 /// the project's design-doc pointer using the PR's **head** branch so
 /// the in-app viewer can fetch the doc from the PR branch while the PR
 /// is still open. The `raw_content_url` builder percent-encodes `/` as
@@ -398,7 +397,7 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
         0 => {
             tracing::warn!(
                 pr_url,
-                "design detector: no `tools/boss/docs/designs/*.md` file in PR changed files; \
+                "design detector: no `docs/designs/*.md` file in PR changed files; \
                  design-doc pointer not updated — add the file and re-push, or set \
                  manually with `boss project set-design-doc`"
             );
@@ -408,7 +407,7 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
             tracing::warn!(
                 pr_url,
                 count = n,
-                "design detector: multiple `tools/boss/docs/designs/*.md` files in PR; \
+                "design detector: multiple `docs/designs/*.md` files in PR; \
                  skipping auto-populate — use `boss project set-design-doc` to resolve"
             );
             None
@@ -422,12 +421,23 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
     })
 }
 
+/// Return `true` when `path` is a direct child of any `docs/designs/`
+/// directory, regardless of the leading product prefix.  For example:
+/// - `tools/boss/docs/designs/foo.md`        → true
+/// - `tools/checkleft/docs/designs/foo.md`   → true
+/// - `docs/designs/foo.md`                   → true
+/// - `tools/boss/docs/designs/sub/foo.md`    → false (sub-directory)
+/// - `tools/boss/docs/other/foo.md`          → false (wrong segment)
 fn is_design_doc_path(path: &str) -> bool {
-    let rest = match path.strip_prefix(DESIGN_DOC_PREFIX) {
-        Some(r) => r,
-        None => return false,
+    // Locate `docs/designs/` preceded by `/` or at the very start.
+    let rest = if let Some(rest) = path.strip_prefix("docs/designs/") {
+        rest
+    } else if let Some((_, rest)) = path.split_once("/docs/designs/") {
+        rest
+    } else {
+        return false;
     };
-    // Only match direct children (no sub-directories).
+    // Only direct children — no sub-directories.
     !rest.contains('/') && (rest.ends_with(".md") || rest.ends_with(".markdown"))
 }
 
@@ -437,6 +447,7 @@ mod tests {
 
     #[test]
     fn design_doc_path_matches_direct_child() {
+        // Boss product directory.
         assert!(is_design_doc_path(
             "tools/boss/docs/designs/my-feature.md"
         ));
@@ -446,6 +457,15 @@ mod tests {
         assert!(is_design_doc_path(
             "tools/boss/docs/designs/x.markdown"
         ));
+        // Non-boss product directories are also accepted (regression for P844).
+        assert!(is_design_doc_path(
+            "tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md"
+        ));
+        assert!(is_design_doc_path(
+            "tools/flunge/docs/designs/flunge-auth.md"
+        ));
+        // Root-level docs/designs/ (no product prefix).
+        assert!(is_design_doc_path("docs/designs/top-level.md"));
     }
 
     #[test]
@@ -454,18 +474,26 @@ mod tests {
         assert!(!is_design_doc_path(
             "tools/boss/docs/designs/sub/doc.md"
         ));
+        assert!(!is_design_doc_path(
+            "tools/checkleft/docs/designs/sub/doc.md"
+        ));
     }
 
     #[test]
-    fn design_doc_path_rejects_wrong_prefix() {
+    fn design_doc_path_rejects_wrong_segment() {
         assert!(!is_design_doc_path("tools/boss/docs/other/doc.md"));
         assert!(!is_design_doc_path("README.md"));
-        assert!(!is_design_doc_path("docs/designs/doc.md"));
+        // `prodocs/designs/` does NOT contain `/docs/designs/` as a
+        // proper segment, so it must be rejected.
+        assert!(!is_design_doc_path("prodocs/designs/doc.md"));
     }
 
     #[test]
     fn design_doc_path_rejects_non_markdown() {
         assert!(!is_design_doc_path("tools/boss/docs/designs/doc.txt"));
         assert!(!is_design_doc_path("tools/boss/docs/designs/doc.rs"));
+        assert!(!is_design_doc_path(
+            "tools/checkleft/docs/designs/doc.txt"
+        ));
     }
 }
