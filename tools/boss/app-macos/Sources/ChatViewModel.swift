@@ -169,6 +169,14 @@ final class ChatViewModel: ObservableObject {
     /// in this session.
     @Published var featureFlags: [FeatureFlag] = []
 
+    /// Current GitHub OAuth auth state for github.com (OAuth device-flow
+    /// design §3/§4). The engine owns a single per-host state; the app
+    /// subscribes to the `github.auth` topic and refreshes this on every
+    /// `git_hub_auth_state` push as the device flow advances. Backs the
+    /// "GitHub account" subsection of the external-tracker settings.
+    /// Defaults to `.disconnected` until the engine's first reply lands.
+    @Published var gitHubAuthState: GitHubAuthState = .disconnected
+
     /// Resolved design-doc pointer state per project. Populated lazily
     /// when a project surface (kanban project header, future detail
     /// view) calls `resolveProjectDesignDoc(_:)`; refreshed whenever
@@ -1102,6 +1110,40 @@ final class ChatViewModel: ObservableObject {
         engine.sendUnsetProductExternalTracker(productId: productId)
     }
 
+    // MARK: GitHub OAuth device-flow bridges (OAuth device-flow design §4)
+    //
+    // Thin pass-throughs to the engine RPCs. The engine owns the flow and
+    // the token; these just kick state transitions. The resulting
+    // `gitHubAuthState` updates arrive via `git_hub_auth_state` events.
+
+    /// Begin the device flow (the "Connect" / "Start over" action).
+    func gitHubAuthConnect() {
+        engine.sendGitHubAuthStart()
+    }
+
+    /// Abort an in-progress device flow (the "Cancel" action).
+    func gitHubAuthCancel() {
+        engine.sendGitHubAuthCancel()
+    }
+
+    /// Delete the stored token and return to disconnected.
+    func gitHubAuthDisconnect() {
+        engine.sendGitHubAuthDisconnect()
+    }
+
+    /// Re-run the device flow, overwriting the stored token. Identical to
+    /// `gitHubAuthConnect` at the wire level (the engine restarts the flow
+    /// from `Authorized`); named separately so the call site reads clearly.
+    func gitHubAuthReauthorize() {
+        engine.sendGitHubAuthStart()
+    }
+
+    /// Re-request the current state, which re-runs the engine's org/SSO
+    /// probe when connected (the "Re-check" affordance, design §7).
+    func gitHubAuthRecheck() {
+        engine.sendGitHubAuthStatus()
+    }
+
     func deleteSelectedWorkItem() {
         guard let task = selectedTask else { return }
         engine.sendDeleteWorkItem(id: task.id)
@@ -1501,6 +1543,11 @@ final class ChatViewModel: ObservableObject {
             // so the top-of-window banner reflects the *current* engine,
             // not the one we attached to before a restart (#699).
             engine.sendGetEngineHealth()
+            // Pull the current GitHub OAuth auth state so the "GitHub
+            // account" settings subsection reflects a token persisted by a
+            // prior session (the engine restores it from the keychain at
+            // boot) without waiting for a device-flow transition.
+            engine.sendGitHubAuthStatus()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
             }
@@ -1851,6 +1898,11 @@ final class ChatViewModel: ObservableObject {
                 // Release the lease immediately since nobody will consume it.
                 engine.sendReleaseReviewTerminal(leaseID: leaseID)
             }
+        case .gitHubAuthState(let state):
+            // The engine pushes this on every device-flow transition (and
+            // as the reply to a `git_hub_auth_*` request). The settings
+            // subsection observes `gitHubAuthState` and re-renders.
+            gitHubAuthState = state
         }
     }
 
@@ -1896,7 +1948,12 @@ final class ChatViewModel: ObservableObject {
     }
 
     private var desiredWorkTopics: Set<String> {
-        var topics: Set<String> = ["work.products", "worker.live_states"]
+        // `github.auth` is a global (per-host, not per-product) topic
+        // carrying GitHub OAuth auth-state pushes; the engine fans every
+        // device-flow transition out on it. We stay subscribed for the
+        // whole session so the "GitHub account" settings subsection
+        // re-renders live (OAuth device-flow design §4, TOPIC_GITHUB_AUTH).
+        var topics: Set<String> = ["work.products", "worker.live_states", "github.auth"]
         if let productID = currentSelectedProductID {
             topics.insert(workTopic(forProductID: productID))
         }

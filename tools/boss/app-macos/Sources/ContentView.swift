@@ -271,6 +271,11 @@ struct ContentView: View {
                     }
                 }
             )
+            // Re-inject the model so the nested GitHubAccountSection (inside
+            // ExternalTrackerSection) can read it via @EnvironmentObject;
+            // sheet content does not always inherit the presenter's
+            // environment objects.
+            .environmentObject(model)
         }
     }
 
@@ -3367,10 +3372,176 @@ private struct ExternalTrackerSection: View {
                         Spacer()
                     }
                 }
+
+                GitHubAccountSection()
             }
         }
     }
 
+}
+
+/// "GitHub account" subsection of the external-tracker settings — drives
+/// and renders the engine-owned OAuth device flow (OAuth device-flow design
+/// §4/§7/§8). All flow logic lives in the engine; the display mapping lives
+/// in `GitHubAuthPresentation`. This view is a thin renderer over
+/// `model.gitHubAuthState` plus button wiring to the `gitHubAuth*` bridges.
+///
+/// The auth state is global (one github.com token shared across all
+/// GitHub-bound products), so this subsection shows the same state in every
+/// product's settings sheet.
+private struct GitHubAccountSection: View {
+    @EnvironmentObject private var model: ChatViewModel
+
+    private var presentation: GitHubAuthPresentation {
+        GitHubAuthPresentation.forState(model.gitHubAuthState)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+                .padding(.vertical, 2)
+
+            Text("GitHub account")
+                .font(.subheadline.weight(.semibold))
+
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if presentation.isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: presentation.statusIcon)
+                        .foregroundStyle(.secondary)
+                }
+                Text(presentation.statusLine)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let prompt = presentation.pendingPrompt {
+                pendingPromptView(prompt)
+            }
+
+            ForEach(Array(presentation.banners.enumerated()), id: \.offset) { _, banner in
+                bannerView(banner)
+            }
+
+            if !presentation.actions.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(presentation.actions, id: \.self) { action in
+                        actionButton(action)
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionButton(_ action: GitHubAuthPresentation.Action) -> some View {
+        switch action {
+        case .connect:
+            Button(presentation.connectIsRestart ? "Start over" : "Connect") {
+                model.gitHubAuthConnect()
+            }
+        case .cancel:
+            Button("Cancel") {
+                model.gitHubAuthCancel()
+            }
+        case .disconnect:
+            Button("Disconnect", role: .destructive) {
+                model.gitHubAuthDisconnect()
+            }
+        case .reauthorize:
+            Button("Re-authorize") {
+                model.gitHubAuthReauthorize()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pendingPromptView(_ prompt: GitHubAuthPresentation.PendingPrompt) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Code")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text(prompt.userCode)
+                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 8) {
+                if let url = URL(string: prompt.openURL) {
+                    Link("Open in browser", destination: url)
+                }
+                Text(prompt.verificationURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Text("Enter the code at the verification URL to authorize Boss for issue sync.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    @ViewBuilder
+    private func bannerView(_ banner: GitHubAuthPresentation.Banner) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: bannerIcon(banner.kind))
+                    .foregroundStyle(bannerColor(banner.kind))
+                Text(banner.message)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if banner.actionURL != nil || banner.offersRecheck {
+                HStack(spacing: 8) {
+                    if let urlString = banner.actionURL,
+                       let label = banner.actionLabel,
+                       let url = URL(string: urlString) {
+                        Link(label, destination: url)
+                    }
+                    if banner.offersRecheck {
+                        Button("Re-check") {
+                            model.gitHubAuthRecheck()
+                        }
+                    }
+                }
+                .font(.caption)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(bannerColor(banner.kind).opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func bannerIcon(_ kind: GitHubAuthPresentation.Banner.Kind) -> String {
+        switch kind {
+        case .needsOrgApproval: return "building.2"
+        case .needsSso: return "lock.shield"
+        case .unknownOrg: return "questionmark.circle"
+        case .limitedScopes: return "exclamationmark.triangle"
+        case .expired: return "clock.badge.exclamationmark"
+        case .denied: return "hand.raised"
+        case .error: return "exclamationmark.octagon"
+        }
+    }
+
+    private func bannerColor(_ kind: GitHubAuthPresentation.Banner.Kind) -> Color {
+        switch kind {
+        case .needsOrgApproval, .needsSso, .unknownOrg, .limitedScopes, .expired:
+            return .orange
+        case .denied, .error:
+            return .red
+        }
+    }
 }
 
 /// Capsule chip surfacing a repo's short name on a kanban card or
