@@ -102,10 +102,19 @@ impl Vcs {
                 Ok(changeset)
             }
             VcsKind::Git => {
-                let range = format!("{base_ref}...HEAD");
-                let summary = run_command(&self.root, "git", &["diff", "--name-status", &range])?;
+                let merge_base = resolve_git_merge_base(&self.root, base_ref)?;
+                info!(base_ref, merge_base, "resolved merge-base for changeset");
+                let summary = run_command(
+                    &self.root,
+                    "git",
+                    &["diff", "--name-status", &merge_base, "HEAD"],
+                )?;
                 let mut changeset = parse_git_name_status(&summary)?;
-                let patch = run_command(&self.root, "git", &["diff", "--patch", &range])?;
+                let patch = run_command(
+                    &self.root,
+                    "git",
+                    &["diff", "--patch", &merge_base, "HEAD"],
+                )?;
                 attach_line_deltas(&mut changeset, &patch);
                 Ok(changeset)
             }
@@ -524,6 +533,75 @@ R docs/old.md => docs/new.md
         assert_eq!(
             normalize_non_empty(Some("  example/flunge  ".to_owned())),
             Some("example/flunge".to_owned())
+        );
+    }
+
+    /// Verifies that `changeset_since` scopes to the PR's own changes only, not
+    /// drift that landed on the base branch after the PR was forked.
+    ///
+    /// Scenario: main gains a "drift" commit after the PR branch forked.
+    /// `changeset_since("main")` must return only the PR file, not the drift file.
+    #[test]
+    fn git_changeset_since_excludes_base_branch_drift() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        fn run_git(root: &std::path::Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init"]);
+        run_git(
+            temp.path(),
+            &["config", "user.email", "test@checkleft.example"],
+        );
+        run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
+
+        // Base commit on main
+        fs::write(temp.path().join("base.txt"), "base\n").expect("write base");
+        run_git(temp.path(), &["add", "base.txt"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        // Create PR branch from here and add pr_file.txt
+        run_git(temp.path(), &["checkout", "-b", "pr-branch"]);
+        fs::write(temp.path().join("pr_file.txt"), "pr change\n").expect("write pr file");
+        run_git(temp.path(), &["add", "pr_file.txt"]);
+        run_git(temp.path(), &["commit", "-m", "pr change"]);
+
+        // Back to main: simulate another PR landing (drift)
+        run_git(temp.path(), &["checkout", "-"]);
+        fs::write(temp.path().join("drift.txt"), "main drift\n").expect("write drift");
+        run_git(temp.path(), &["add", "drift.txt"]);
+        run_git(temp.path(), &["commit", "-m", "main drift"]);
+
+        // Return to PR branch (HEAD is now the PR tip, main has moved past fork)
+        run_git(temp.path(), &["checkout", "pr-branch"]);
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        let changeset = vcs.changeset_since("main").expect("changeset since main");
+
+        let changed_paths: Vec<_> = changeset
+            .changed_files
+            .iter()
+            .map(|f| f.path.as_path())
+            .collect();
+
+        assert_eq!(
+            changed_paths,
+            vec![std::path::Path::new("pr_file.txt")],
+            "expected only pr_file.txt; drift.txt must be excluded. Got: {changed_paths:?}"
         );
     }
 }
