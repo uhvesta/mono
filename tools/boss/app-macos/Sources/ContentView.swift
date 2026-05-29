@@ -199,6 +199,10 @@ struct ContentView: View {
                     )
                 }
             }
+
+            ToolbarItem(placement: .primaryAction) {
+                UpdateBadgeToolbarButton(updateModel: updateModel)
+            }
         }
         .onChange(of: model.navigationMode) { _, _ in
             isSearchExpanded = false
@@ -4385,5 +4389,111 @@ private struct EngineHealthBanner: View {
 
     private var accessibilityLabel: String {
         issues.map { "\($0.title). \($0.body)" }.joined(separator: " ")
+    }
+}
+
+// MARK: - Update badge
+
+/// Trailing toolbar button that appears when an update is available in Notify or Automatic mode.
+/// Visibility is driven by `UpdateModel`; clicking opens a popover with version info and actions.
+private struct UpdateBadgeToolbarButton: View {
+    @ObservedObject var updateModel: UpdateModel
+    @State private var isPopoverPresented = false
+
+    var body: some View {
+        if let update = visibleUpdate {
+            Button {
+                isPopoverPresented.toggle()
+            } label: {
+                Image(systemName: "arrow.down.circle.fill")
+                    .foregroundStyle(Color.accentColor)
+            }
+            .help("Update available: Boss \(update.version)")
+            .popover(isPresented: $isPopoverPresented, arrowEdge: .bottom) {
+                UpdateBadgePopover(update: update, updateModel: updateModel) {
+                    isPopoverPresented = false
+                }
+            }
+        }
+    }
+
+    private var visibleUpdate: AvailableUpdate? {
+        guard updateModel.mode != .manual,
+              case .available(let update) = updateModel.lastCheckResult,
+              update.version.description != updateModel.skippedVersion
+        else { return nil }
+        return update
+    }
+}
+
+private struct UpdateBadgePopover: View {
+    let update: AvailableUpdate
+    @ObservedObject var updateModel: UpdateModel
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .foregroundStyle(Color.accentColor)
+                    .font(.title3)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Update Available")
+                        .font(.headline)
+                    Text("Boss \(update.version)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            Divider()
+
+            if !update.releaseNotes.isEmpty {
+                ScrollView {
+                    Text(update.releaseNotes)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                }
+                .frame(maxHeight: 160)
+
+                Divider()
+            }
+
+            HStack(spacing: 8) {
+                Button("Skip This Version") {
+                    updateModel.skipCurrentVersion()
+                    onDismiss()
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .font(.callout)
+
+                Spacer(minLength: 0)
+
+                Button("Later") {
+                    onDismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Download") {
+                    NSWorkspace.shared.open(releasePageURL ?? update.assetURL)
+                    onDismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+        }
+        .frame(minWidth: 300, maxWidth: 360)
+    }
+
+    private var releasePageURL: URL? {
+        URL(string: "https://github.com/spinyfin/mono/releases/tag/\(update.tagName)")
     }
 }

@@ -67,6 +67,8 @@ struct HTTPFetcher: Sendable {
         }
         return (data, httpResponse)
     }
+
+    static let noop = HTTPFetcher { _ in throw URLError(.cancelled) }
 }
 
 // MARK: - GitHub API response types

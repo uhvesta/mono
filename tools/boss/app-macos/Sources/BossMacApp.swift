@@ -16,6 +16,9 @@ struct BossMacApp: App {
                     appDelegate.updateModel = updateModel
                     updateModel.startPollingIfNeeded()
                 }
+                .task {
+                    updateModel.startPollingIfNeeded()
+                }
         }
         .environmentObject(chatModel)
         .environmentObject(updateModel)
