@@ -897,6 +897,34 @@ impl WorkerCompletionHandler {
             return StopOutcome::AlreadyTerminal;
         }
 
+        // Stale-Stop guard (reused-workspace hook leak): if a newer live
+        // execution now occupies this execution's cube workspace, this
+        // Stop leaked from a stale `boss-event` hook registration left in
+        // the warm-cached workspace. Finalizing here would mis-attribute
+        // completion to the wrong run and could release the live run's
+        // re-leased workspace. Ignore it; the newest execution's own Stop
+        // drives its completion. Belt-and-suspenders with
+        // `worker_setup::purge_leaked_worker_hooks`, which stops the leak
+        // at the source.
+        match self.work_db.execution_superseded_in_workspace(&execution) {
+            Ok(true) => {
+                tracing::warn!(
+                    execution_id,
+                    cube_workspace_id = ?execution.cube_workspace_id,
+                    "stop event: execution superseded by a newer live execution in the same reused workspace — ignoring stale Stop (reused-workspace hook leak)",
+                );
+                return StopOutcome::SupersededInWorkspace;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "stop event: superseded-in-workspace check failed; proceeding with completion",
+                );
+            }
+        }
+
         // Primary path: a PR URL was already captured from a
         // `PostToolUse` Bash hook event (`gh pr create` /
         // `gh pr view` / `gh pr edit` stdout) while the worker was
@@ -1798,8 +1826,11 @@ asked to open one",
             // to fix the situation; don't pre-empt that with a failed mark.
             StopOutcome::StalePr { .. } | StopOutcome::EmptyDiffPr { .. } => false,
             // Race with an already-finalized execution (a second Stop
-            // for the same worker, or finalize_run racing). Skip.
-            StopOutcome::AlreadyTerminal | StopOutcome::UnknownExecution => false,
+            // for the same worker, or finalize_run racing) or a stale
+            // Stop from a superseded reused-workspace occupant. Skip.
+            StopOutcome::AlreadyTerminal
+            | StopOutcome::UnknownExecution
+            | StopOutcome::SupersededInWorkspace => false,
             // AI #6 (incident 001): the Stop hook fired on a still-`running`
             // worker with an empty staged-URL cache. The fallback didn't
             // fire by design; the worker is alive and may still push. Do
@@ -1942,8 +1973,11 @@ asked to open one",
             // on-Stop probe path has already nudged the worker; don't
             // pre-empt with a `failed` mark.
             StopOutcome::StalePr { .. } | StopOutcome::EmptyDiffPr { .. } => false,
-            // Race with an already-finalized execution.
-            StopOutcome::AlreadyTerminal | StopOutcome::UnknownExecution => false,
+            // Race with an already-finalized execution, or a stale Stop
+            // from a superseded reused-workspace occupant.
+            StopOutcome::AlreadyTerminal
+            | StopOutcome::UnknownExecution
+            | StopOutcome::SupersededInWorkspace => false,
             // Incident-001 gates (mirrors conflict finalizer).
             StopOutcome::RunningNoStagedPr => false,
             StopOutcome::FallbackDisabledByFlag => false,
@@ -2613,6 +2647,14 @@ pub enum StopOutcome {
     UnknownExecution,
     /// Execution was already in a terminal status — no transition.
     AlreadyTerminal,
+    /// The Stop arrived for an execution that is a stale prior occupant
+    /// of a reused (warm-cached) cube workspace — a newer live execution
+    /// now claims the same workspace. The event leaked from a stale
+    /// `boss-event` hook registration left in the re-leased workspace;
+    /// processing it would mis-attribute completion or release the live
+    /// run's workspace. Quiet outcome — no transition, no reap. The
+    /// newest execution's own Stop drives its completion.
+    SupersededInWorkspace,
     /// Execution had no workspace_path recorded.
     NoWorkspace,
     /// `gh` failed with a non-"no-PR" error; surfaced as awaiting input.
@@ -4680,6 +4722,150 @@ mod tests {
         assert!(
             bob_url.contains(&expected_branch_name(None, &bob_exec)),
             "bob's bound URL must derive from his own execution id, got {bob_url}",
+        );
+    }
+
+    /// Seed a chore + execution left in `waiting_human` (the lease still
+    /// held), occupying cube workspace `workspace_id`. Returns
+    /// `(chore_id, execution_id)`. Mirrors the `fixture` lifecycle but
+    /// lets a test place several occupants in one workspace.
+    fn seed_workspace_occupant(
+        db: &Arc<WorkDb>,
+        product_id: &str,
+        name: &str,
+        lease: &str,
+        workspace_id: &str,
+        workspace_path: &str,
+    ) -> (String, String) {
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product_id.to_owned(),
+                name: name.to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: true,
+            })
+            .unwrap();
+        let exec = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
+            })
+            .unwrap();
+        let (_e, run) = db
+            .start_execution_run(&exec.id, "worker", "mono", lease, workspace_id, workspace_path)
+            .unwrap();
+        db.finish_execution_run(
+            &exec.id,
+            &run.id,
+            "waiting_human",
+            "completed",
+            Some("spawned worker pane"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        (chore.id, exec.id)
+    }
+
+    /// Reused-workspace stale-Stop guard (the bug this change fixes):
+    /// two executions occupy the same warm-cached cube workspace. The
+    /// older is a stale prior occupant whose `boss-event` Stop hook
+    /// leaked from a settings.json left in the re-leased tree. Its Stop
+    /// must be ignored — not finalized, no lease released — while the
+    /// live (newest) execution's own Stop still completes it.
+    #[tokio::test]
+    async fn stale_stop_from_superseded_workspace_occupant_is_ignored() {
+        let ws = tempdir().unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        let ws_path = ws.path().to_str().unwrap();
+        let (stale_chore, stale_exec) =
+            seed_workspace_occupant(&db, &product.id, "stale", "lease-stale", "mono-agent-shared", ws_path);
+        let (_live_chore, live_exec) =
+            seed_workspace_occupant(&db, &product.id, "live", "lease-live", "mono-agent-shared", ws_path);
+
+        // Force deterministic recency: the stale occupant created
+        // earlier. (`created_at` is second-granularity, so two rows
+        // created in the same test tick would otherwise tie.)
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET created_at = '100' WHERE id = ?1",
+                rusqlite::params![stale_exec],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE work_executions SET created_at = '200' WHERE id = ?1",
+                rusqlite::params![live_exec],
+            )
+            .unwrap();
+        }
+
+        let cube = Arc::new(StubCubeClient::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/910")),
+            cube.clone(),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        );
+
+        // The stale occupant's leaked Stop must be ignored.
+        assert_eq!(
+            handler.on_stop(&stale_exec).await,
+            StopOutcome::SupersededInWorkspace,
+            "a stale Stop from a superseded reused-workspace occupant must be ignored",
+        );
+        // Its chore is not pushed to in_review and no lease is released.
+        match db.get_work_item(&stale_chore).unwrap() {
+            WorkItem::Chore(t) => assert_ne!(
+                t.status, "in_review",
+                "the stale occupant's task must not transition on a leaked Stop",
+            ),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "a leaked stale Stop must not release any cube lease",
+        );
+
+        // The live (newest) execution's own Stop still finalizes it.
+        assert!(
+            matches!(handler.on_stop(&live_exec).await, StopOutcome::PrDetected { .. }),
+            "the live execution's own Stop must still complete it",
         );
     }
 

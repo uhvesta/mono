@@ -644,6 +644,147 @@ pub fn ensure_path_guard_script_in(dir: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Substring that marks a hook command as engine-injected. Every
+/// `boss-event` hook command inline-prefixes `BOSS_RUN_ID=...` (see
+/// [`settings_value`]); a per-run identity like this is never checked
+/// into a repo's tracked `.claude/settings.json`, so it is a reliable
+/// signature for a *leaked* engine hook left inside a reused workspace.
+const LEAKED_HOOK_SIGNATURE: &str = "BOSS_RUN_ID=";
+
+/// Remove stale engine-injected hook registrations from any
+/// `.claude/settings.json` / `.claude/settings.local.json` left inside
+/// the workspace tree.
+///
+/// Background: the engine writes worker settings *outside* the
+/// workspace (see module docs and [`worker_settings_path`]) and points
+/// the session at them via `claude --settings`. But cube workspaces are
+/// warm caches reused across executions, and `.claude/` is gitignored
+/// (`*`), so a `settings.json` written into the tree by a pre-fix engine
+/// build survives `jj new main` indefinitely. Claude merges hooks from
+/// that in-tree file *and* the engine's `--settings` file, so the
+/// `boss-event` Stop hook fires twice — once with the live `BOSS_RUN_ID`
+/// and once with the stale prior one. The stale Stop event then leaks
+/// into the engine's completion path, mis-attributing / preempting the
+/// live execution's completion and leaving its task stuck in `Doing`
+/// with the agent un-reaped.
+///
+/// Best-effort: this strips only hook groups whose command carries the
+/// [`LEAKED_HOOK_SIGNATURE`], leaving any legitimately repo-tracked
+/// content (deny rules, non-boss hooks) intact. IO / parse failures are
+/// logged and skipped — a malformed user file must never abort worker
+/// setup, and a settings file with no leaked hooks is left byte-for-byte
+/// untouched.
+pub fn purge_leaked_worker_hooks(workspace_path: &Path) {
+    let claude_dir = workspace_path.join(".claude");
+    for name in ["settings.json", "settings.local.json"] {
+        let path = claude_dir.join(name);
+        if let Err(err) = purge_leaked_hooks_in_file(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                ?err,
+                "worker setup: failed to purge leaked boss hooks from in-workspace settings; leaving file untouched",
+            );
+        }
+    }
+}
+
+/// Strip leaked `boss-event` hook groups from a single settings file.
+/// Removes the file entirely if nothing meaningful remains. Returns
+/// `Ok(())` (a no-op) when the file is absent, is not JSON, or carries
+/// no leaked-hook signature.
+fn purge_leaked_hooks_in_file(path: &Path) -> io::Result<()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // Cheap pre-check: only touch files that actually carry a leaked
+    // hook. A clean repo settings.json is left exactly as-is.
+    if !raw.contains(LEAKED_HOOK_SIGNATURE) {
+        return Ok(());
+    }
+    let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                %err,
+                "worker setup: in-workspace settings carries BOSS_RUN_ID but is not parseable JSON; leaving untouched",
+            );
+            return Ok(());
+        }
+    };
+    if !strip_leaked_hooks(&mut value) {
+        return Ok(());
+    }
+    // A file that was *only* leaked engine config (empty after the
+    // strip) is removed so the no-settings-in-tree invariant is fully
+    // restored. Anything else is rewritten with the leak stripped.
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        std::fs::remove_file(path)?;
+        tracing::info!(
+            path = %path.display(),
+            "worker setup: removed stale engine-only settings file from reused workspace tree",
+        );
+        return Ok(());
+    }
+    let serialized = serde_json::to_string_pretty(&value)
+        .expect("settings JSON value is always serializable");
+    std::fs::write(path, serialized)?;
+    tracing::info!(
+        path = %path.display(),
+        "worker setup: stripped stale boss-event hooks from in-workspace settings file",
+    );
+    Ok(())
+}
+
+/// Remove hook groups carrying the [`LEAKED_HOOK_SIGNATURE`] from the
+/// `hooks` map of a settings value. Drops an event key when its array
+/// becomes empty, and the whole `hooks` key when no events remain.
+/// Returns true if anything was removed.
+fn strip_leaked_hooks(value: &mut serde_json::Value) -> bool {
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    let event_keys: Vec<String> = hooks.keys().cloned().collect();
+    for event in event_keys {
+        let Some(groups) = hooks.get_mut(&event).and_then(|g| g.as_array_mut()) else {
+            continue;
+        };
+        let before = groups.len();
+        groups.retain(|group| !hook_group_is_leaked(group));
+        if groups.len() != before {
+            changed = true;
+        }
+        if groups.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+    if hooks.is_empty() {
+        obj.remove("hooks");
+    }
+    changed
+}
+
+/// A hook group `{matcher, hooks: [{type, command}, ...]}` is leaked if
+/// any of its inner command strings carries the signature.
+fn hook_group_is_leaked(group: &serde_json::Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|inner| {
+            inner.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains(LEAKED_HOOK_SIGNATURE))
+            })
+        })
+}
+
 /// Write `CLAUDE.md` and a self-excluding `.gitignore` under
 /// `<workspace>/.claude/`, and the worker settings file *outside* the
 /// workspace at [`worker_settings_path`]. Creates parent directories as
@@ -656,6 +797,14 @@ pub fn ensure_path_guard_script_in(dir: &Path) -> io::Result<PathBuf> {
 pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFiles> {
     let claude_dir = input.workspace_path.join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
+
+    // Reused (warm-cached) workspaces can carry a stale `.claude/
+    // settings.json` written into the tree by an older engine build.
+    // Claude merges hooks from it *and* the engine's `--settings`
+    // file, so the `boss-event` Stop hook would fire twice — once with
+    // the live `BOSS_RUN_ID` and once with the stale prior one. Purge
+    // the leak before the worker session reads its settings.
+    purge_leaked_worker_hooks(&input.workspace_path);
 
     let claude_md_path = claude_dir.join("CLAUDE.md");
     let gitignore_path = claude_dir.join(".gitignore");
@@ -1201,6 +1350,159 @@ mod tests {
         // `.gitignore` itself) is hidden from `jj status` / `git status`.
         let gitignore_contents = std::fs::read_to_string(&written.gitignore_path).unwrap();
         assert_eq!(gitignore_contents, "*\n");
+    }
+
+    /// A leaked settings file holding a `boss-event` Stop hook with a
+    /// stale `BOSS_RUN_ID` (as written by a pre-fix engine build into a
+    /// reused workspace). Mirrors the real on-disk shape.
+    fn leaked_settings_json(run_id: &str) -> String {
+        serde_json::json!({
+            "permissions": { "defaultMode": "auto", "deny": ["Bash(bossctl)"] },
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("BOSS_LEASE_ID='l' BOSS_RUN_ID='{run_id}' /Applications/Boss.app/Contents/Resources/bin/boss-event"),
+                    }],
+                }],
+                "Stop": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("BOSS_LEASE_ID='l' BOSS_RUN_ID='{run_id}' /Applications/Boss.app/Contents/Resources/bin/boss-event"),
+                    }],
+                }],
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn purge_leaked_worker_hooks_strips_stale_boss_hooks_but_keeps_other_content() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.json");
+        std::fs::write(&settings, leaked_settings_json("exec_stale_99")).unwrap();
+
+        purge_leaked_worker_hooks(dir.path());
+
+        // The leaked Stop hook (and every other boss hook) is gone, so
+        // a worker session can no longer fire a second Stop with the
+        // stale run id. Non-hook content (the repo-style deny rules)
+        // survives.
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(
+            !std::fs::read_to_string(&settings).unwrap().contains("BOSS_RUN_ID"),
+            "no leaked BOSS_RUN_ID hook may remain",
+        );
+        assert!(
+            after.get("hooks").is_none(),
+            "all hooks were boss hooks, so the now-empty hooks key is dropped",
+        );
+        assert_eq!(
+            after["permissions"]["deny"][0], "Bash(bossctl)",
+            "non-hook content must be preserved",
+        );
+    }
+
+    #[test]
+    fn purge_leaked_worker_hooks_removes_pure_engine_file() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        // A settings file that is *only* leaked boss hooks (no other
+        // keys) is removed entirely, restoring the no-settings-in-tree
+        // invariant.
+        let local = claude_dir.join("settings.local.json");
+        let only_hooks = serde_json::json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "BOSS_RUN_ID='exec_old' /bin/boss-event",
+                    }],
+                }],
+            },
+        });
+        std::fs::write(&local, only_hooks.to_string()).unwrap();
+
+        purge_leaked_worker_hooks(dir.path());
+
+        assert!(
+            !local.exists(),
+            "a settings file with only leaked boss hooks must be removed",
+        );
+    }
+
+    #[test]
+    fn purge_leaked_worker_hooks_leaves_clean_repo_settings_untouched() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        // A legitimately repo-tracked settings.json (no boss hooks) must
+        // survive byte-for-byte: the cheap signature pre-check means we
+        // never even parse it.
+        let settings = claude_dir.join("settings.json");
+        let clean = "{\n  \"hooks\": {\n    \"Stop\": [ { \"matcher\": \"*\", \"hooks\": [ { \"type\": \"command\", \"command\": \"echo hi\" } ] } ]\n  }\n}\n";
+        std::fs::write(&settings, clean).unwrap();
+
+        purge_leaked_worker_hooks(dir.path());
+
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            clean,
+            "a clean repo settings.json with no BOSS_RUN_ID hook must be untouched byte-for-byte",
+        );
+    }
+
+    #[test]
+    fn purge_leaked_worker_hooks_is_noop_when_absent() {
+        let dir = TempDir::new().unwrap();
+        // No .claude/ dir at all — must not panic or create anything.
+        purge_leaked_worker_hooks(dir.path());
+        assert!(!dir.path().join(".claude").join("settings.json").exists());
+    }
+
+    #[test]
+    fn write_workspace_files_purges_leaked_in_tree_settings() {
+        let _shared = lock_shared_settings_dir();
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        // Simulate a warm-cached workspace carrying a stale settings.json
+        // from a prior execution.
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            leaked_settings_json("exec_prev_run"),
+        )
+        .unwrap();
+
+        let input = WorkerSetupInput {
+            run_id: "exec_current".into(),
+            lease_id: "test-lease".into(),
+            workspace_path: dir.path().to_path_buf(),
+            events_socket_path: PathBuf::from("/tmp/events.sock"),
+            boss_event_path: PathBuf::from("/tmp/boss-event"),
+            draft_pr_mode: false,
+            execution_kind: "chore_implementation".into(),
+            task_kind: Some("chore".into()),
+        };
+
+        write_workspace_files(&input).unwrap();
+
+        let settings = claude_dir.join("settings.json");
+        // The leaked prior run's hook must be gone after setup; only
+        // the engine's out-of-tree `--settings` file carries hooks now.
+        if settings.exists() {
+            assert!(
+                !std::fs::read_to_string(&settings).unwrap().contains("BOSS_RUN_ID"),
+                "write_workspace_files must purge the stale in-tree boss hook",
+            );
+        }
     }
 
     #[test]

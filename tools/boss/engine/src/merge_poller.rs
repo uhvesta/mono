@@ -1616,6 +1616,7 @@ async fn sweep_pending_pr(
         // on these: they're not stuck-worker indicators.
         StopOutcome::AlreadyTerminal
         | StopOutcome::UnknownExecution
+        | StopOutcome::SupersededInWorkspace
         | StopOutcome::NoWorkspace
         | StopOutcome::RunningNoStagedPr
         | StopOutcome::FallbackDisabledByFlag
@@ -1662,6 +1663,7 @@ async fn sweep_late_pr(
         // Genuinely silent: execution/task moved on between list and recheck.
         StopOutcome::AlreadyTerminal
         | StopOutcome::UnknownExecution
+        | StopOutcome::SupersededInWorkspace
         | StopOutcome::NoWorkspace
         | StopOutcome::RunningNoStagedPr
         | StopOutcome::FallbackDisabledByFlag

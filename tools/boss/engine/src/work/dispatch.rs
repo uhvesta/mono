@@ -489,6 +489,42 @@ impl WorkDb {
         query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
     }
 
+    /// Return true if `execution` is a stale prior occupant of a reused
+    /// (warm-cached) cube workspace: another live (`running` /
+    /// `waiting_human`) execution now claims the same `cube_workspace_id`
+    /// and is more recent (by `created_at`, then `id`, matching the
+    /// dispatch-ordering convention).
+    ///
+    /// Used by the completion handler to ignore Stop events that leaked
+    /// from a stale `boss-event` hook registration left in a re-leased
+    /// workspace (see [`crate::worker_setup::purge_leaked_worker_hooks`]).
+    /// Without this guard a stale Stop could mis-attribute completion to
+    /// the wrong run or release the live run's re-leased workspace. The
+    /// newest execution is never its own predecessor, so its own Stop
+    /// still finalizes it.
+    pub fn execution_superseded_in_workspace(&self, execution: &WorkExecution) -> Result<bool> {
+        let Some(workspace_id) = execution
+            .cube_workspace_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(false);
+        };
+        let conn = self.connect()?;
+        let newest_live: Option<String> = conn
+            .query_row(
+                "SELECT id FROM work_executions
+                 WHERE cube_workspace_id = ?1
+                   AND status IN ('running', 'waiting_human')
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                rusqlite::params![workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(matches!(newest_live, Some(id) if id != execution.id))
+    }
+
     /// Find the most recent `orphaned` execution for a work item that has
     /// no `pr_url` set. Used by the runner at spawn time to detect a
     /// prior mid-flight execution whose branch the new worker should
