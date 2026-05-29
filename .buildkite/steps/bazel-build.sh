@@ -6,14 +6,11 @@
 # mac-app-build step on a macos-arm64 agent.
 # //tools/boss/installer/... is excluded because boss_pkg_payload transitively
 # depends on //tools/boss/app-macos:Boss (Swift), which has no Linux toolchain.
-# //tools/boss/experiments/... is excluded for the same Swift-toolchain reason
-# (e.g. textual-perf is a SwiftPM-only macOS app); experiments are local-run
-# playgrounds and aren't built by mac-app-build either.
 set -euo pipefail
 
 echo "--- [bazel-build] starting"
 echo "[bazel-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-bazel build --config=ci-linux-disk-cache --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/... -//tools/boss/experiments/...
+bazel build --config=ci-linux-disk-cache --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...
 
 echo "[bazel-build] ok"
