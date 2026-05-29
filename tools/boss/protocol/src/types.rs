@@ -2106,7 +2106,8 @@ pub struct Attention {
 /// The engine resolves or creates the appropriate group based on the
 /// association and source fields; callers may pass an explicit
 /// `group_id` to join an already-open group.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(bon::Builder, Debug, Clone, Default, Serialize, Deserialize)]
+#[builder(on(String, into))]
 pub struct CreateAttentionInput {
     /// `"question"` or `"followup"`.
     pub kind: String,
