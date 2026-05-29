@@ -44,6 +44,21 @@ impl PrStateChecker for GhPrStateChecker {
     }
 }
 
+/// A `PrStateChecker` that returns a fixed, already-observed state without
+/// issuing a `gh` call. Used by the merge-conflict producer (Phase 3): the
+/// poller has *just* probed the PR live and is acting on an
+/// `OpenPrMergeability::Conflict` result, which by construction means the PR
+/// is open. Feeding that observation straight into the `create_revision`
+/// gate reuses the gate's parent-revisable invariant (R4) while avoiding a
+/// redundant — and, in tests, non-hermetic — `gh pr view` round-trip.
+pub struct StaticPrStateChecker(pub PrOpenState);
+
+impl PrStateChecker for StaticPrStateChecker {
+    fn check(&self, _pr_url: &str) -> Result<PrOpenState> {
+        Ok(self.0.clone())
+    }
+}
+
 /// Test double: returns a preset state for known PR URLs.
 #[cfg(test)]
 pub struct FakePrStateChecker {

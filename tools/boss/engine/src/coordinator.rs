@@ -2228,6 +2228,15 @@ impl ExecutionCoordinator {
         if execution.kind == "conflict_resolution" {
             self.collect_conflict_diagnosis_pre_spawn(&execution, &lease)
                 .await;
+        } else if execution.kind == "revision_implementation" {
+            // Phase 3 cutover: a merge-conflict-provenance revision is the
+            // fix vehicle for a linked `conflict_resolutions` row. Collect
+            // the same `git merge-tree` diagnosis onto that row pre-spawn so
+            // `compose_revision_directive` (Phase 2) injects it into the
+            // worker prompt exactly as the old `conflict_resolution` worker
+            // received it. No-op for non-merge-conflict revision provenance.
+            self.collect_revision_conflict_diagnosis_pre_spawn(&execution, &work_item, &lease)
+                .await;
         }
         // Pre-spawn: fetch the failing job's log tail for ci_remediation
         // executions (Phase 9 #27) so the worker prompt embeds it directly.
@@ -2524,7 +2533,71 @@ impl ExecutionCoordinator {
                 return;
             }
         };
+        self.collect_conflict_diagnosis_for_attempt(&attempt, lease)
+            .await;
+    }
 
+    /// Phase 3 cutover companion to [`Self::collect_conflict_diagnosis_pre_spawn`]:
+    /// resolve the `conflict_resolutions` row a merge-conflict revision was
+    /// spawned from (via `created_via = "merge-conflict:<crz_id>"`) and
+    /// collect its diagnosis. No-op when the revision's provenance is not a
+    /// merge conflict (e.g. operator/CI-fix revisions), or when a diagnosis
+    /// is already stored (a respawn).
+    async fn collect_revision_conflict_diagnosis_pre_spawn(
+        &self,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        lease: &CubeWorkspaceLease,
+    ) {
+        let created_via = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task.created_via.as_str(),
+            _ => return,
+        };
+        let Some(crz_id) =
+            created_via.strip_prefix(boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        else {
+            return;
+        };
+        let attempt = match self.work_db.get_conflict_resolution(crz_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    crz_id,
+                    "collect_conflict_diagnosis: revision's linked attempt row missing; skipping",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    crz_id,
+                    ?err,
+                    "collect_conflict_diagnosis: failed to look up revision's linked attempt; skipping",
+                );
+                return;
+            }
+        };
+        if attempt.conflict_diagnosis.is_some() {
+            tracing::debug!(
+                attempt_id = %attempt.id,
+                "collect_conflict_diagnosis: diagnosis already present on linked attempt; skipping",
+            );
+            return;
+        }
+        self.collect_conflict_diagnosis_for_attempt(&attempt, lease)
+            .await;
+    }
+
+    /// Run `conflict_diagnosis::collect` in the leased workspace and persist
+    /// the result on `attempt`. Shared by the bespoke `conflict_resolution`
+    /// path and the Phase 3 merge-conflict revision path. Best-effort —
+    /// failures are logged but never propagate.
+    async fn collect_conflict_diagnosis_for_attempt(
+        &self,
+        attempt: &crate::work::ConflictResolution,
+        lease: &CubeWorkspaceLease,
+    ) {
         let base_sha = attempt.base_sha_at_trigger.as_deref().unwrap_or("");
         let head_sha = attempt.head_sha_before.as_deref().unwrap_or("");
         if base_sha.is_empty() || head_sha.is_empty() {

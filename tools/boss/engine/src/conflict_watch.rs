@@ -26,12 +26,12 @@
 //!
 //! [`OpenPrMergeability`]: crate::merge_poller::OpenPrMergeability
 
-use boss_protocol::FrontendEvent;
+use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, FrontendEvent};
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
 use crate::work::{
-    ConflictResolutionInsertInput, CreateExecutionInput, PendingMergeCheck,
+    ConflictResolutionInsertInput, CreateExecutionInput, PendingMergeCheck, PrStateChecker,
     StrandedConflictAttempt, WorkDb,
 };
 
@@ -161,9 +161,20 @@ fn auto_pr_maintenance_disabled(
 /// flip (Phase 3 wiring), this path also publishes a typed
 /// [`FrontendEvent::ConflictResolutionStarted`] envelope so activity-feed
 /// subscribers can render the start-of-attempt entry without polling.
+///
+/// Phase 3 cutover (design Q1/Q5): on a *genuinely-new* attempt row the
+/// fix vehicle is now an **engine-triggered revision** (`parent = chore`,
+/// `created_via = "merge-conflict:<crz_id>"`) created via the shared
+/// `create_revision` gate, rather than a bespoke `conflict_resolution`
+/// execution. The producer reuses the create-time `assert_parent_revisable`
+/// gate (R4) and stamps `attempt.revision_task_id`; the reconcile loop then
+/// dispatches a `revision_implementation` execution into the chain root's
+/// warm workspace. `pr_checker` supplies the gate's live PR-state probe
+/// (`&GhPrStateChecker` in production, a fake in tests).
 pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {
@@ -375,37 +386,18 @@ pub async fn on_conflict_detected(
         }
     };
 
-    // Request a conflict_resolution execution for live (pending) attempts.
-    // Pre-abandoned churn-guard rows get no execution so the scheduler
-    // doesn't dispatch a worker that would immediately fail the same way.
+    // Phase 3 cutover (design Q1/Q5): on a genuinely-new live attempt,
+    // create an engine-triggered revision as the fix vehicle instead of a
+    // bespoke `conflict_resolution` execution. The `revision_task_id`
+    // soft-FK is the idempotency latch: a fresh `insert_conflict_resolution`
+    // returns a row with it NULL; a same-base-sha repeat probe hits the
+    // existing row (already stamped) and skips. Pre-abandoned churn-guard
+    // rows (`status != 'pending'`) get no revision, so the parent stays
+    // `blocked: merge_conflict` for human attention — the cap is enforced
+    // here, before create, exactly as the old execution-request guard was.
     if let Some(ref a) = attempt {
-        if a.status == "pending" {
-            match work_db.create_execution(CreateExecutionInput {
-                work_item_id: candidate.work_item_id.clone(),
-                kind: "conflict_resolution".to_owned(),
-                status: Some("ready".to_owned()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            }) {
-                Ok(_) => publisher.kick_scheduler(),
-                Err(err) => {
-                    tracing::warn!(
-                        work_item_id = %candidate.work_item_id,
-                        attempt_id = %a.id,
-                        ?err,
-                        "conflict_watch: failed to create conflict_resolution execution; worker will not be dispatched",
-                    );
-                }
-            }
+        if a.status == "pending" && a.revision_task_id.is_none() {
+            maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a).await;
         }
     }
 
@@ -433,6 +425,112 @@ pub async fn on_conflict_detected(
         "conflict_watch: PR conflicts with base; conflict detection ran",
     );
     task_flipped_now
+}
+
+/// Create the engine-triggered revision that delivers the conflict fix and
+/// stamp the trigger-ledger row's `revision_task_id` back-pointer (design
+/// Q1/Q2/Q5).
+///
+/// `attempt` is the just-inserted, live (`pending`) `conflict_resolutions`
+/// row. On success the reconcile loop picks up the new `kind=revision` task
+/// and dispatches a `revision_implementation` execution into the chain
+/// root's warm workspace. On failure — almost always the create-time gate
+/// (`assert_parent_revisable`, R4) refusing a parent whose PR has since
+/// merged/closed, occasionally a transient `gh` probe error — the ledger
+/// row is marked `abandoned` so it never strands as a `pending` attempt
+/// with no fix vehicle (which the dormant backfill/rescue paths would
+/// otherwise try to dispatch). The parent stays `blocked: merge_conflict`;
+/// the poller's merged/closed handling reconciles it on a later sweep.
+async fn maybe_spawn_conflict_revision(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    attempt: &crate::work::ConflictResolution,
+) {
+    let base_branch = probe
+        .base_ref_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("main");
+    // Short, one-line card title (design Q3 / R5): generated from the base
+    // branch, never the diagnosis body. The long worker directive
+    // (diagnosis tables, step-by-step rebase recipe) is injected at
+    // dispatch by `compose_revision_directive`, keyed off `created_via`
+    // (Phase 2).
+    let description = format!("Resolve merge conflict against {base_branch}");
+    let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{}", attempt.id);
+
+    let revision = match work_db.create_revision(
+        CreateRevisionInput {
+            parent_task_id: candidate.work_item_id.clone(),
+            description,
+            name: None,
+            priority: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+            created_via: Some(created_via),
+        },
+        pr_checker,
+    ) {
+        Ok(rev) => rev,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                attempt_id = %attempt.id,
+                error = %format!("{err:#}"),
+                "conflict_watch: create_revision failed (parent likely no longer revisable); abandoning attempt",
+            );
+            if let Err(abandon_err) =
+                work_db.mark_conflict_resolution_abandoned(&attempt.id, "revision_create_failed")
+            {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?abandon_err,
+                    "conflict_watch: failed to abandon attempt after create_revision failure",
+                );
+            }
+            return;
+        }
+    };
+
+    // Stamp the reverse link. This is the idempotency latch (repeat probes
+    // at the same base sha find it set and skip) and the marker that tells
+    // the dormant backfill/rescue paths to leave this row alone.
+    match work_db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                revision_task_id = %revision.id,
+                "conflict_watch: attempt row vanished before revision_task_id could be stamped",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                revision_task_id = %revision.id,
+                ?err,
+                "conflict_watch: failed to stamp revision_task_id; revision will still run",
+            );
+        }
+    }
+
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        attempt_id = %attempt.id,
+        revision_task_id = %revision.id,
+        "conflict_watch: spawned engine-triggered revision for merge conflict",
+    );
+
+    // Nudge the scheduler so the reconcile loop dispatches the revision's
+    // `revision_implementation` execution promptly rather than waiting for
+    // the next opportunistic kick.
+    publisher.kick_scheduler();
 }
 
 /// Symmetric resolution path: flip a `blocked: merge_conflict` row
@@ -774,6 +872,14 @@ mod tests {
         }
     }
 
+    /// A `PrStateChecker` that reports every PR as `Open`, so the
+    /// `create_revision` create-time gate passes for the in-review chore
+    /// fixtures these tests build. A conflicting PR is, by definition,
+    /// still open — matching what `GhPrStateChecker` returns in production.
+    fn open_checker() -> crate::work::FakePrStateChecker {
+        crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open)
+    }
+
     fn probe_with_labels(
         pr_url: &str,
         state: PrLifecycleState,
@@ -803,6 +909,7 @@ mod tests {
         let transitioned = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -832,6 +939,7 @@ mod tests {
         let first = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -839,6 +947,7 @@ mod tests {
         let second = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -860,6 +969,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -895,6 +1005,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -919,6 +1030,7 @@ mod tests {
             on_conflict_detected(
                 &db,
                 pub_.as_ref(),
+                &open_checker(),
                 &candidate(&product, &chore, pr),
                 &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
             )
@@ -929,6 +1041,7 @@ mod tests {
             on_conflict_detected(
                 &db,
                 pub_.as_ref(),
+                &open_checker(),
                 &candidate(&product, &chore, pr),
                 &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
             )
@@ -976,6 +1089,7 @@ mod tests {
         let transitioned = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -997,6 +1111,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1132,6 +1247,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1211,6 +1327,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1279,6 +1396,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1337,6 +1455,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1379,6 +1498,7 @@ mod tests {
         let first = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1404,6 +1524,7 @@ mod tests {
         let second = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1443,6 +1564,7 @@ mod tests {
         let transitioned = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1501,6 +1623,7 @@ mod tests {
         let r = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1539,6 +1662,7 @@ mod tests {
         let r = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1564,6 +1688,7 @@ mod tests {
         let r = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe_with_labels(
                 pr,
@@ -1592,6 +1717,7 @@ mod tests {
         let r = on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe_with_labels(
                 pr,
@@ -1621,6 +1747,7 @@ mod tests {
         on_conflict_detected(
             &db,
             pub_.as_ref(),
+            &open_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
@@ -1918,6 +2045,224 @@ mod tests {
         assert_eq!(
             kicks_after_second, 1,
             "second backfill must be a no-op; kick count must not increase",
+        );
+    }
+
+    // ----- Phase 3 cutover: engine-triggered revision as the fix vehicle -----
+
+    #[tokio::test]
+    async fn detection_spawns_revision_and_stamps_attempt() {
+        // A genuinely-new conflict creates a `kind=revision` task (parent =
+        // chore, merge-conflict provenance), stamps the ledger row's
+        // `revision_task_id`, and creates NO bespoke conflict_resolution
+        // execution — the dormant path stays dormant and the row is hidden
+        // from the backfill/rescue recovery queries.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/30";
+        let (product, chore) = make_in_review(&db, "C-rev-spawn", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        assert!(
+            on_conflict_detected(
+                &db,
+                pub_.as_ref(),
+                &open_checker(),
+                &candidate(&product, &chore, pr),
+                &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+            )
+            .await
+        );
+
+        let attempt = db
+            .active_conflict_resolution_for_work_item(&chore)
+            .unwrap()
+            .expect("a pending attempt row must exist");
+        assert_eq!(attempt.status, "pending");
+        let rev_id = attempt
+            .revision_task_id
+            .clone()
+            .expect("the producer must stamp revision_task_id on the attempt");
+
+        let revision = match db.get_work_item(&rev_id).unwrap() {
+            WorkItem::Task(t) => t,
+            other => panic!("expected revision task, got {other:?}"),
+        };
+        assert_eq!(revision.kind, "revision");
+        assert_eq!(revision.parent_task_id.as_deref(), Some(chore.as_str()));
+        assert_eq!(revision.created_via, format!("merge-conflict:{}", attempt.id));
+        assert_eq!(revision.description, "Resolve merge conflict against main");
+
+        // No bespoke conflict_resolution execution: the revision rides the
+        // reconcile loop's revision_implementation dispatch instead.
+        let ready = db.list_ready_executions().unwrap();
+        assert!(
+            !ready.iter().any(|e| e.kind == "conflict_resolution"),
+            "cutover must not create a conflict_resolution execution; got {ready:?}",
+        );
+
+        // The revision-backed row is invisible to the dormant recovery paths.
+        assert!(
+            db.pending_conflict_resolutions_without_execution()
+                .unwrap()
+                .is_empty(),
+            "revision-backed attempt must be excluded from the backfill query",
+        );
+        assert!(
+            db.list_stranded_conflict_resolution_attempts()
+                .unwrap()
+                .is_empty(),
+            "revision-backed attempt must be excluded from the rescue query",
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_idempotent_does_not_double_spawn_revision() {
+        // Re-firing on the same base sha reuses the existing attempt (whose
+        // revision_task_id is already set) and spawns no second revision.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/31";
+        let (product, chore) = make_in_review(&db, "C-rev-idem", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        // Reset to in_review so the second probe re-enters the primary flip
+        // path with the same base sha (UNIQUE collision on the ledger).
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+
+        let attempts = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap();
+        assert_eq!(attempts.len(), 1, "same base sha must not stack attempts");
+        let revision_backed = attempts
+            .iter()
+            .filter(|r| r.revision_task_id.is_some())
+            .count();
+        assert_eq!(revision_backed, 1, "exactly one revision-backed attempt");
+    }
+
+    #[tokio::test]
+    async fn churn_abandoned_attempt_spawns_no_revision() {
+        // The 4th conflict in the rolling window is pre-abandoned by the
+        // churn guard; the producer's `status == 'pending'` guard means it
+        // gets no revision (the cap is enforced before create).
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/32";
+        let (product, chore) = make_in_review(&db, "C-rev-churn", pr);
+
+        // Three prior attempts in the window arm the guard. Plant them while
+        // the chore is still `in_review` so the producer's primary flip path
+        // (not the re-arm short-circuit) reaches the insert for the fourth.
+        for sha in ["s1", "s2", "s3"] {
+            db.insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 32,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some(sha.into()),
+                head_sha_before: Some("head".into()),
+            })
+            .unwrap();
+        }
+
+        let pub_ = Arc::new(RecordingPublisher::default());
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            // probe base is "abc123" — a fourth distinct sha in the window.
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+
+        let fourth = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.base_sha_at_trigger.as_deref() == Some("abc123"))
+            .expect("fourth attempt row must exist");
+        assert_eq!(fourth.status, "abandoned");
+        assert_eq!(
+            fourth.failure_reason.as_deref(),
+            Some("churn_threshold_exceeded"),
+        );
+        assert!(
+            fourth.revision_task_id.is_none(),
+            "churn-abandoned attempt must spawn no revision",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_revision_failure_abandons_attempt() {
+        // When the create-time gate refuses (parent PR no longer open, R4),
+        // the producer marks the ledger row `abandoned` so it never strands
+        // as a pending attempt with no fix vehicle, and spawns no revision.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/33";
+        let (product, chore) = make_in_review(&db, "C-rev-fail", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let closed =
+            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &closed,
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+
+        // The parent flip precedes the gate, so the chore is still blocked;
+        // the poller's merged/closed handling reconciles it on a later sweep.
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("merge_conflict"));
+
+        let attempts = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "abandoned");
+        assert_eq!(
+            attempts[0].failure_reason.as_deref(),
+            Some("revision_create_failed"),
+        );
+        assert!(attempts[0].revision_task_id.is_none());
+
+        // No stranded pending row for the dormant rescue path to pick up.
+        assert!(
+            db.list_stranded_conflict_resolution_attempts()
+                .unwrap()
+                .is_empty(),
         );
     }
 }

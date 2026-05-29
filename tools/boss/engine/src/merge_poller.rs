@@ -1769,9 +1769,16 @@ async fn sweep_one(
             let ci = &open.ci;
             match mergeability {
                 OpenPrMergeability::Conflict => {
+                    // Phase 3 cutover: the conflict producer creates an
+                    // engine-triggered revision via the shared
+                    // `create_revision` gate (R4 reuse). We are inside the
+                    // `Open` arm with `mergeability = Conflict`, so the PR is
+                    // known-open; feed that observation to the gate via a
+                    // static checker rather than a redundant `gh pr view`.
                     if conflict_watch::on_conflict_detected(
                         work_db,
                         publisher,
+                        &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
                         candidate,
                         &probe_result,
                     )
@@ -4367,30 +4374,44 @@ mod tests {
         // (the task didn't flip from in_review — it was already blocked).
         assert_eq!(outcome.conflict_flagged, 0, "no new flip expected");
 
-        // A fresh ready execution must have been dispatched for the re-arm.
-        let ready = db.list_ready_executions().unwrap();
-        assert!(
-            ready
-                .iter()
-                .any(|e| e.work_item_id == chore && e.kind == "conflict_resolution"),
-            "expected a fresh ready conflict_resolution execution for the re-arm; got {ready:?}",
-        );
-
         // A new crz must exist with base_sha_at_trigger = "sha-new".
         let crz_rows = db
             .list_conflict_resolutions(None, &[], Some(&chore), None)
             .unwrap();
         let fresh_crz = crz_rows
             .iter()
-            .find(|r| r.base_sha_at_trigger.as_deref() == Some("sha-new"));
+            .find(|r| r.base_sha_at_trigger.as_deref() == Some("sha-new"))
+            .unwrap_or_else(|| {
+                panic!("expected a fresh crz with base_sha_at_trigger=sha-new; rows={crz_rows:?}")
+            });
+        assert_eq!(fresh_crz.status, "pending", "fresh crz must be pending");
+
+        // Phase 3 cutover: the re-arm spawns an engine-triggered revision
+        // (not a bespoke conflict_resolution execution) as the fix vehicle.
+        // The fresh crz carries the reverse link to that revision.
+        let revision_task_id = fresh_crz
+            .revision_task_id
+            .as_deref()
+            .expect("fresh crz must carry a revision_task_id after the re-arm cutover");
+        let revision = match db.get_work_item(revision_task_id).unwrap() {
+            crate::work::WorkItem::Task(t) => t,
+            other => panic!("expected revision task, got {other:?}"),
+        };
+        assert_eq!(revision.kind, "revision");
+        assert_eq!(revision.parent_task_id.as_deref(), Some(chore.as_str()));
         assert!(
-            fresh_crz.is_some(),
-            "expected a fresh crz with base_sha_at_trigger=sha-new; rows={crz_rows:?}",
+            revision.created_via.starts_with("merge-conflict:"),
+            "revision created_via must carry merge-conflict provenance; got {}",
+            revision.created_via,
         );
-        assert_eq!(
-            fresh_crz.unwrap().status,
-            "pending",
-            "fresh crz must be pending",
+
+        // The dormant conflict_resolution dispatch must NOT fire post-cutover.
+        let ready = db.list_ready_executions().unwrap();
+        assert!(
+            !ready
+                .iter()
+                .any(|e| e.work_item_id == chore && e.kind == "conflict_resolution"),
+            "cutover must not create a conflict_resolution execution; got {ready:?}",
         );
 
         // The original crz must still be succeeded.

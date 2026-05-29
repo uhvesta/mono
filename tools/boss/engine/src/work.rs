@@ -221,4 +221,5 @@ pub use pr_state::GhPrStateChecker;
 pub use pr_state::PrOpenState;
 pub use pr_state::PrStateChecker;
 pub use pr_state::RevisionGateError;
+pub use pr_state::StaticPrStateChecker;
 pub use revision_helpers::normalize_priority;

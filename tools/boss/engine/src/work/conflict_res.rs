@@ -219,6 +219,12 @@ impl WorkDb {
     /// The query is idempotent: once an execution is created the row no
     /// longer satisfies the `NOT EXISTS` predicate and is excluded on
     /// every subsequent call.
+    ///
+    /// Post-cutover (Phase 3): rows with `revision_task_id` set are owned
+    /// by the revision substrate, not the dormant `conflict_resolution`
+    /// execution kind. Excluding them here keeps the backfill from
+    /// resurrecting the old dispatch for a row that already has a revision
+    /// fix-vehicle; only legacy (pre-cutover) pending rows are recovered.
     pub fn pending_conflict_resolutions_without_execution(
         &self,
     ) -> Result<Vec<ConflictResolution>> {
@@ -232,6 +238,7 @@ impl WorkDb {
                     cr.revision_task_id
              FROM conflict_resolutions cr
              WHERE cr.status = 'pending'
+               AND cr.revision_task_id IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM work_executions we
                    WHERE we.work_item_id = cr.work_item_id
@@ -258,6 +265,39 @@ impl WorkDb {
                 SET conflict_diagnosis = ?2
               WHERE id = ?1",
             params![attempt_id, diagnosis_json],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Stamp the soft-FK from a `conflict_resolutions` trigger-ledger row
+    /// to the `kind=revision` task the merge-conflict producer spawned
+    /// (design Q2 reverse link / Phase 3 cutover). Set by
+    /// `conflict_watch::on_conflict_detected` immediately after
+    /// `create_revision` succeeds. Idempotent — a second call with the
+    /// same id overwrites; `Ok(None)` when the attempt id is unknown.
+    ///
+    /// Once set, this row is owned by the revision substrate: the dormant
+    /// `conflict_resolution` backfill/rescue paths skip it (their queries
+    /// filter `revision_task_id IS NULL`), so the old execution kind is
+    /// never re-dispatched for a revision-backed attempt.
+    pub fn set_conflict_resolution_revision_task_id(
+        &self,
+        attempt_id: &str,
+        revision_task_id: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET revision_task_id = ?2
+              WHERE id = ?1",
+            params![attempt_id, revision_task_id],
         )?;
         if rows == 0 {
             tx.commit()?;

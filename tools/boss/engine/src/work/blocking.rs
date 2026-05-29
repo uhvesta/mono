@@ -44,6 +44,11 @@ impl WorkDb {
     /// `abandoned` rows are excluded by the `status = 'pending'`
     /// filter — the churn guard (or a human) owns that path and those
     /// rows must not be automatically rescued.
+    ///
+    /// Post-cutover (Phase 3): rows with `revision_task_id` set are driven
+    /// by the revision substrate (a `revision_implementation` execution),
+    /// not the dormant `conflict_resolution` kind, so they are excluded —
+    /// only legacy (pre-cutover) pending attempts are rescued here.
     pub fn list_stranded_conflict_resolution_attempts(
         &self,
     ) -> Result<Vec<StrandedConflictAttempt>> {
@@ -52,6 +57,7 @@ impl WorkDb {
             "SELECT cr.id, cr.work_item_id, cr.product_id, cr.pr_url
              FROM conflict_resolutions cr
              WHERE cr.status = 'pending'
+               AND cr.revision_task_id IS NULL
                AND EXISTS (
                    SELECT 1 FROM tasks t
                    WHERE t.id = cr.work_item_id
