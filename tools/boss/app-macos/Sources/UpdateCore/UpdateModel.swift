@@ -1,4 +1,7 @@
 import Foundation
+import os.log
+
+private let modelLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
 
 // MARK: - UpdateMode
 
@@ -114,6 +117,7 @@ public final class UpdateModel: ObservableObject {
     /// Shows the update-result sheet and starts a fresh check.
     /// Safe to call from a synchronous button action — the check runs in a detached Task.
     public func presentUpdateSheet() {
+        modelLog.info("update check triggered: source=manual-menu")
         showUpdateSheet = true
         Task { await checkNow() }
     }
@@ -121,13 +125,18 @@ public final class UpdateModel: ObservableObject {
     /// Starts the polling scheduler if the current mode enables it.
     /// Call once from `applicationDidFinishLaunching`.
     public func startPollingIfNeeded() {
-        guard mode != .manual else { return }
+        guard mode != .manual else {
+            modelLog.info("update polling: skipped (mode=manual)")
+            return
+        }
+        modelLog.info("update polling: starting background scheduler (mode=\(self.mode.rawValue, privacy: .public) intervalSeconds=\(Self.pollInterval, privacy: .public))")
         startPolling()
     }
 
     /// Changes the update mode, persists it, and starts or stops polling as needed.
     public func setMode(_ newMode: UpdateMode) {
         let oldMode = mode
+        modelLog.info("update mode changed: \(oldMode.rawValue, privacy: .public) → \(newMode.rawValue, privacy: .public)")
         mode = newMode
         defaults.set(newMode.rawValue, forKey: StorageKeys.mode)
         switch (oldMode, newMode) {
@@ -151,6 +160,20 @@ public final class UpdateModel: ObservableObject {
         let now = Date()
         lastCheckDate = now
         defaults.set(now.timeIntervalSince1970, forKey: StorageKeys.lastCheck)
+
+        switch result {
+        case .upToDate:
+            modelLog.info("update check complete: up-to-date")
+        case .available(let update):
+            modelLog.info(
+                "update check complete: update available version=\(update.version.description, privacy: .public) tag=\(update.tagName, privacy: .public)"
+            )
+        case .rateLimited(let retryAfter):
+            modelLog.warning("update check complete: rate-limited, retry after \(retryAfter.description, privacy: .public)")
+        case .networkError(let message):
+            modelLog.error("update check complete: network error — \(message, privacy: .public)")
+        }
+
         return result
     }
 
@@ -188,6 +211,7 @@ public final class UpdateModel: ObservableObject {
     private func runSchedulerLoop() async {
         // Jitter prevents a fleet of machines behind one NAT from hitting the API at the same second.
         let jitter = TimeInterval.random(in: jitterRange)
+        modelLog.info("update scheduler: first check in \(jitter, privacy: .public)s (jitter)")
         do {
             try await Task.sleep(for: .seconds(jitter))
         } catch {
@@ -195,6 +219,7 @@ public final class UpdateModel: ObservableObject {
         }
 
         while !Task.isCancelled {
+            modelLog.info("update check triggered: source=background-poll")
             let result = await checkNow()
 
             let nextDelay: TimeInterval
@@ -205,6 +230,7 @@ public final class UpdateModel: ObservableObject {
                 nextDelay = Self.pollInterval
             }
 
+            modelLog.info("update scheduler: next poll in \(nextDelay, privacy: .public)s")
             do {
                 try await Task.sleep(for: .seconds(nextDelay))
             } catch {
