@@ -1348,6 +1348,53 @@ asked to open one",
             return StopOutcome::RunningNoStagedPr;
         }
 
+        // SHA-delta gate: for executions with a bound PR URL — either the
+        // task's own `pr_url` (chore resume) or `execution.pr_url` for
+        // `revision_implementation` tasks (which never open their own PR but
+        // push commits to the parent PR) — check whether the bound PR's HEAD
+        // SHA moved since this execution started.
+        //
+        // This is the primary recovery path for `revision_implementation`
+        // executions: the cold-path branch-keyed detector always returns None
+        // for revisions because they have no branch of their own. The SHA-delta
+        // gate is therefore the only fallback that can advance a revision from
+        // `active` to `in_review` when `on_stop_inner` failed transiently (e.g.
+        // a GitHub API timeout during the SHA fetch, or an engine restart
+        // between execution start and Stop).  Without this gate the merge-poller
+        // sweep repeatedly calls `recheck_for_pr`, finds no PR on the revision's
+        // branch, and silently returns — leaving the revision stranded in `doing`
+        // even after the worker successfully pushed its commit (reproduces T848).
+        //
+        // `Contributed` → finalize now (worker pushed to the bound PR).
+        // `NoContribution` / `Inapplicable` → fall through; the cold path
+        // returns quietly for revisions (no PR on their own branch).
+        match self.evaluate_sha_delta_gate(execution_id, &execution).await {
+            ShaDeltaGateOutcome::Contributed { pr_url } => {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %pr_url,
+                    "pr-recheck: SHA-delta gate: bound PR head moved — finalising without cold-path detector",
+                );
+                return self
+                    .finalize_pr_transition(
+                        execution_id,
+                        pr_url,
+                        WorkerPrCompletionTarget::InReview,
+                        "pr_recheck_sha_delta",
+                    )
+                    .await;
+            }
+            ShaDeltaGateOutcome::NoContribution { pr_url: _ } => {
+                // Bound PR did not advance during this run; fall through.
+                // The cold-path detector will return quietly for revisions
+                // (no PR on revision's own branch). The next sweep retries.
+            }
+            ShaDeltaGateOutcome::Inapplicable => {
+                // No bound PR or snapshot unavailable — fall through to the
+                // cold-path branch-keyed detector.
+            }
+        }
+
         // Feature-flag gate mirror (AI #5): the merge-poller's sweep
         // runs on the same cold-path fallback `on_stop_inner` does,
         // so the human's debug-pane toggle must take effect here too.
@@ -6765,5 +6812,249 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         };
         assert_eq!(task.status, "active");
         assert!(task.pr_url.is_none());
+    }
+
+    // -----------------------------------------------------------
+    // Revision task completion via SHA-delta gate in recheck_for_pr
+    //
+    // Reproduces T848: a revision worker pushed its commit to the parent
+    // PR but the revision task stayed in `doing` (active). The on_stop SHA
+    // delta gate failed transiently; the merge-poller's recheck_for_pr had
+    // no SHA-delta fallback, so the revision was stranded forever.
+    //
+    // The fix adds the SHA-delta gate to recheck_for_pr. Tests below pin:
+    //   1. Revision worker pushed → SHA moved → recheck_for_pr finalises.
+    //   2. Revision worker not yet pushed → SHA unchanged → recheck quiet.
+    //   3. Revision with no pr_head_before snapshot → Inapplicable → cold
+    //      path still runs (returns quiet; no regression).
+    // -----------------------------------------------------------
+
+    /// Build a fixture simulating a revision task whose worker has been
+    /// spawned and is in `waiting_human` state. The parent chore carries
+    /// `parent_pr_url` and the revision execution's `pr_url` is set to
+    /// the same URL (as the dispatcher does at create time). `head_before`
+    /// is stored as `pr_head_before` to simulate the snapshot taken by
+    /// `on_execution_started`.
+    fn revision_fixture(
+        workspace_path: &Path,
+        parent_pr_url: &str,
+        head_before: &str,
+    ) -> (Arc<WorkDb>, String, String, String) {
+        use boss_protocol::CreateRevisionInput;
+        use crate::work::{FakePrStateChecker, PrOpenState};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss-revision-test")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        // Parent chore: in_review with a bound pr_url.
+        let parent = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Parent chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![parent.id, parent_pr_url],
+            )
+            .unwrap();
+        }
+        // Revision task: created against the parent.
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent.id.clone())
+                    .description("Add missing builder derive")
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        // Execution: revision_implementation with pr_url = parent PR URL.
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id.clone())
+                    .kind("revision_implementation")
+                    .status("ready")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .prefer_is_soft(true)
+                    .pr_url(parent_pr_url)
+                    .build(),
+            )
+            .unwrap();
+        // Mirror PaneSpawnRunner: start → running (task → active), then
+        // finish → waiting_human (pane spawned, engine waiting for Claude).
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned revision worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        // Snapshot the parent PR's head SHA as `on_execution_started` does.
+        db.set_execution_pr_head_before(&execution.id, head_before)
+            .unwrap();
+        (db, product.id, revision.id, execution.id)
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_sha_delta_advances_revision_to_in_review() {
+        // T848 regression: revision worker pushed a commit to the parent
+        // PR (head SHA changed), but `on_stop` failed to detect it (GitHub
+        // API timeout during SHA fetch). The merge-poller's `recheck_for_pr`
+        // should advance the revision to `in_review` on the next sweep via
+        // the SHA-delta gate.
+        //
+        // Before the fix, `recheck_for_pr` had no SHA-delta gate; it fell
+        // through to the cold-path branch-keyed detector which always returns
+        // None for revisions (they never open their own PR), so the revision
+        // stayed in `active` indefinitely.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/922";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Cold-path detector returns None — correct for revisions which
+        // have no branch of their own.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Branch verifier: SHA moved (worker pushed the revision commit).
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "SHA-delta gate must advance revision to in_review when head moved; got {outcome:?}",
+        );
+        // Revision task must be in_review; pr_url stays NULL (revisions don't own PRs).
+        let item = db.get_work_item(&revision_id).unwrap();
+        match item {
+            WorkItem::Task(t) => {
+                assert_eq!(t.status, "in_review", "revision must move to in_review");
+                assert!(
+                    t.pr_url.is_none(),
+                    "revision pr_url must stay NULL; parent owns the PR"
+                );
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        // Execution must be completed; lease must be released.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "completed");
+        assert!(execution.finished_at.is_some());
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released after revision finalises",
+        );
+        // Work-item changed event must fire so the kanban updates.
+        let work_events = publisher.work_events.lock().await.clone();
+        assert!(
+            work_events.iter().any(|(p, w, _)| p == &product_id && w == &revision_id),
+            "work-item invalidation must fire for the revision, got {work_events:?}",
+        );
+        // No probe must be queued — the revision is done.
+        assert!(
+            probes.snapshot().is_empty(),
+            "no probe must fire when revision is finalised; got {:?}",
+            probes.snapshot(),
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_for_pr_sha_unchanged_leaves_revision_active() {
+        // Revision worker has not pushed yet (no commit since execution
+        // started). The SHA-delta gate returns NoContribution; the cold
+        // path returns quietly (no PR on revision branch). The revision
+        // stays in `active` so the merge-poller will retry on the next
+        // sweep.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/922";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        // Branch verifier: SHA unchanged.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "unchanged SHA means revision not yet done; got {outcome:?}",
+        );
+        let item = db.get_work_item(&revision_id).unwrap();
+        match item {
+            WorkItem::Task(t) => assert_eq!(t.status, "active"),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "lease must stay held when revision is not done",
+        );
+        assert!(probes.snapshot().is_empty(), "recheck must not nudge");
     }
 }
