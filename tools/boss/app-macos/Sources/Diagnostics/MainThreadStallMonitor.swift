@@ -57,6 +57,11 @@ final class MainThreadStallMonitor: @unchecked Sendable {
     private var watchdogTimer: DispatchSourceTimer?
     private var mainThreadPort: thread_t = 0
     private var running = false
+
+    /// Id of the stall record for the episode currently in progress, so
+    /// `tick()` can grow its duration while the freeze persists. Touched
+    /// only from `tick()`/`start()` on the watchdog queue.
+    private var ongoingRecordId: UUID?
     private let watchdogQueue = DispatchQueue(
         label: "boss.diagnostics.stall-watchdog",
         qos: .utility
@@ -84,6 +89,9 @@ final class MainThreadStallMonitor: @unchecked Sendable {
             $0.beat = 0
             $0.recordedBeat = .max
         }
+        // Safe to set here: the watchdog timer is resumed below, so no
+        // `tick()` can be running yet.
+        ongoingRecordId = nil
 
         let interval = DispatchTimeInterval.milliseconds(Int(config.heartbeatIntervalMs))
         let hb = DispatchSource.makeTimerSource(queue: .main)
@@ -137,8 +145,18 @@ final class MainThreadStallMonitor: @unchecked Sendable {
 
         // Already recorded this episode? The heartbeat sequence only
         // advances when the main thread runs, so a still-blocked main
-        // thread keeps the same `beat` and we suppress duplicates.
-        guard snap.beat != snap.recorded else { return }
+        // thread keeps the same `beat`. Rather than capturing a second
+        // backtrace, grow the recorded duration so an ongoing freeze
+        // reflects its true length. Without this a multi-second beachball
+        // was logged once at the ~250 ms detection lower bound and looked
+        // indistinguishable from a routine micro-stall — which is why this
+        // hang did not stand out in the UI Stalls list.
+        guard snap.beat != snap.recorded else {
+            if let id = ongoingRecordId {
+                log.growDuration(id: id, toAtLeast: durationMs)
+            }
+            return
+        }
         state.withLock { $0.recordedBeat = snap.beat }
 
         let addresses = MainThreadBacktrace.capture(thread: mainThreadPort, maxFrames: config.maxFrames)
@@ -151,6 +169,7 @@ final class MainThreadStallMonitor: @unchecked Sendable {
             context: snap.ctx,
             backtrace: frames
         )
+        ongoingRecordId = record.id
         log.record(record)
     }
 

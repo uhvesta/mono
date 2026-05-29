@@ -201,6 +201,7 @@ extension DispatchEvent {
 /// decode lines themselves. I/O runs on a background utility queue.
 final class JsonlLineTailer: @unchecked Sendable {
     private let url: URL
+    private let initialTailBytes: UInt64
     private let onLines: ([String]) -> Void
     private let onEmpty: () -> Void
 
@@ -209,11 +210,19 @@ final class JsonlLineTailer: @unchecked Sendable {
     private var source: DispatchSourceFileSystemObject?
     private var pollTimer: DispatchSourceTimer?
     private var readOffset: UInt64 = 0
+    private var dropPartialFirstLine = false
     private var monitoredInode: UInt64?
     private var running = false
 
-    init(url: URL, label: String, onLines: @escaping ([String]) -> Void, onEmpty: @escaping () -> Void) {
+    init(
+        url: URL,
+        label: String,
+        initialTailBytes: UInt64 = LogTailWindow.defaultBytes,
+        onLines: @escaping ([String]) -> Void,
+        onEmpty: @escaping () -> Void
+    ) {
         self.url = url
+        self.initialTailBytes = initialTailBytes
         self.onLines = onLines
         self.onEmpty = onEmpty
         self.ioQueue = DispatchQueue(label: label, qos: .utility)
@@ -267,6 +276,15 @@ final class JsonlLineTailer: @unchecked Sendable {
 
         fileHandle = handle
         readOffset = 0
+        dropPartialFirstLine = false
+        if initial {
+            let size = UInt64(statBuf.st_size)
+            let offset = LogTailWindow.initialReadOffset(fileSize: size, cap: initialTailBytes)
+            if offset > 0 {
+                readOffset = offset
+                dropPartialFirstLine = true
+            }
+        }
         monitoredInode = UInt64(statBuf.st_ino)
 
         let src = DispatchSource.makeFileSystemObjectSource(
@@ -298,7 +316,11 @@ final class JsonlLineTailer: @unchecked Sendable {
         guard let data = try? handle.readToEnd(), !data.isEmpty else { return }
         readOffset = currentSize
 
-        guard let chunk = String(data: data, encoding: .utf8) else { return }
+        guard var chunk = String(data: data, encoding: .utf8) else { return }
+        if dropPartialFirstLine {
+            dropPartialFirstLine = false
+            chunk = LogTailWindow.dropPartialFirstLine(chunk)
+        }
         let lines = chunk.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         guard !lines.isEmpty else { return }
         let cb = onLines
@@ -426,6 +448,14 @@ final class LogViewerModel: ObservableObject {
 
     private static let maxEntries = 10_000
 
+    /// Serial queue for decoding engine-trace JSONL off the main thread.
+    /// Decoding a long backlog on `start()` used to run on the main thread
+    /// and beachballed the Logs tab (see [[LogTailWindow]]); serial keeps
+    /// batch ordering stable.
+    private static let engineDecodeQueue = DispatchQueue(
+        label: "boss.logviewer.engine-decode", qos: .utility
+    )
+
     func start() {
         guard engineTailer == nil else { return }
         startEngineTrace()
@@ -447,8 +477,19 @@ final class LogViewerModel: ObservableObject {
             url: LogViewerPaths.engineTraceJsonl(),
             label: "boss.engine-trace.tail",
             onLines: { [weak self] lines in
-                let entries = lines.compactMap { EngineTraceDecoder.decode(line: $0) }
-                self?.addEntries(entries)
+                // `lines` is delivered on the main queue but the initial
+                // open can hand over a large backlog. Decoding JSON here
+                // used to run on the main thread and hard-beachballed the
+                // Logs tab once the engine-trace file had grown over a long
+                // session (O(N) in total log length). Decode off-main, then
+                // hop back to the main actor only to publish.
+                Self.engineDecodeQueue.async {
+                    let entries = lines.compactMap { EngineTraceDecoder.decode(line: $0) }
+                    guard !entries.isEmpty else { return }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { self?.addEntries(entries) }
+                    }
+                }
             },
             onEmpty: {}
         )

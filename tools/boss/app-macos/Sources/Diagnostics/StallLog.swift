@@ -55,6 +55,22 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         self.context = context
         self.backtrace = backtrace
     }
+
+    /// A copy with `durationMs` replaced. Used when the watchdog grows an
+    /// ongoing stall's duration as the freeze continues, so a multi-second
+    /// beachball is recorded at its true length rather than the
+    /// ~threshold lower bound captured the instant it was first noticed.
+    func withDurationMs(_ ms: Double) -> StallRecord {
+        StallRecord(
+            id: id,
+            tsEpochMs: tsEpochMs,
+            durationMs: ms,
+            heartbeatIntervalMs: heartbeatIntervalMs,
+            thresholdMs: thresholdMs,
+            context: context,
+            backtrace: backtrace
+        )
+    }
 }
 
 /// Decides whether the main thread is currently stalled given the last
@@ -146,6 +162,22 @@ final class StallLog: @unchecked Sendable {
                 openFile(dateStr: dateStr)
             }
             fileHandle?.write(lineData)
+        }
+    }
+
+    /// Grow the recorded duration of an ongoing stall episode (in-memory
+    /// ring only). The watchdog records a stall the instant it crosses the
+    /// threshold — a lower bound — then calls this on each subsequent tick
+    /// while the *same* episode is still frozen, so a hard beachball ends
+    /// up shown at its true magnitude (e.g. ≥5000 ms) instead of the
+    /// ≥250 ms lower bound that made real freezes look like routine blips
+    /// in [[UIStallsViewer]]. Growing never shrinks; an unknown id is a
+    /// no-op. The on-disk mirror keeps the detection-time lower bound.
+    func growDuration(id: UUID, toAtLeast durationMs: Double) {
+        ring.withLock { buf in
+            guard let idx = buf.lastIndex(where: { $0.id == id }),
+                  durationMs > buf[idx].durationMs else { return }
+            buf[idx] = buf[idx].withDurationMs(durationMs)
         }
     }
 
