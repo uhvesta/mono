@@ -22,11 +22,11 @@ bazel build --config=ci-linux-disk-cache //tools/repobin:repobin
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
     base_branch="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
     echo "[checks] PR build — scoping to changes against origin/${base_branch}"
-    # BK checkouts are shallow by default. Unshallow so that git merge-base can
-    # reach the fork point between the PR branch and origin/<base_branch>.
-    # Without full history the merge-base computation fails and checkleft would
-    # either error or fall back to diffing against the tip, mis-attributing
-    # origin/<base_branch> drift to this PR.
+    # BK agents fetch only the specific PR commit SHA, leaving origin/<base_branch>
+    # potentially stale from a prior run. Refresh it so the merge-base and diff
+    # scope are computed against the current tip, not a much-older cached ref.
+    # Also unshallow if needed so git merge-base can reach the fork point.
+    git fetch origin "${base_branch}"
     if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
         echo "[checks] shallow repo detected; unshallowing for merge-base computation"
         git fetch --unshallow origin 2>/dev/null || true
@@ -65,6 +65,13 @@ elif [[ "${BUILDKITE_BRANCH:-}" == gh-readonly-queue/* ]]; then
 else
     # Push-to-main build. Derive the merge-base against origin/main so only
     # this push's changes are checked.
+    #
+    # BK agents fetch only the specific commit SHA for each build, leaving
+    # origin/main stale from a prior run. Refresh it so that git merge-base
+    # computes the correct fork point — without this, a stale origin/main
+    # returns a much older commit and sweeps every intervening change into the
+    # diff, mis-attributing unrelated files (e.g. github_oauth.rs) to this PR.
+    git fetch origin main
     merge_base=$(git merge-base HEAD origin/main)
     echo "[checks] push/main build — scoping to changes since ${merge_base}"
     CHECKLEFT_ARGS=(run --base-ref="${merge_base}")
