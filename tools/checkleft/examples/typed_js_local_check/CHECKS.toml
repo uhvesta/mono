@@ -1,7 +1,14 @@
+# Illustrative only: this check resolves `generated:no-debug-logging` from a
+# generated external-check index that is wired up exclusively by this example's
+# own Bazel targets (see BUILD.bazel / README). The repo-wide `checkleft run
+# --all` invocation has no such index configured, so the provider resolves to
+# nothing and the check errors out. Disable it here so the example config still
+# documents the intended `generated:` wiring without breaking the repo-wide scan.
 [[checks]]
 id = "no-debug-logging"
 check = "no-debug-logging"
 implementation = "generated:no-debug-logging"
+enabled = false
 
 [checks.config]
 forbidden_calls = ["console.log"]

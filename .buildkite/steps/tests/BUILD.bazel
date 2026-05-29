@@ -1,0 +1,8 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "checks_merge_queue_base_test",
+    srcs = ["checks_merge_queue_base_test.sh"],
+    size = "small",
+    visibility = ["//visibility:private"],
+)
