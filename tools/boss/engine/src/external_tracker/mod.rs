@@ -7,6 +7,7 @@
 
 pub mod credentials;
 pub mod github;
+pub mod github_oauth;
 pub mod reconcile;
 
 use std::collections::HashMap;
