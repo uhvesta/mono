@@ -6,18 +6,19 @@ import UpdateCore
 struct BossMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var chatModel = ChatViewModel(paths: BossEnginePaths.production())
-    // fromBundle() is only nil when CFBundleShortVersionString is absent —
-    // a condition that cannot occur in a stamped .app bundle.
-    @StateObject private var updateModel = UpdateModel.fromBundle()!
+    @StateObject private var updateModel: UpdateModel = UpdateModel.makeForApp()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .task {
                     appDelegate.liveWorkerStates = chatModel.liveWorkerStates
+                    appDelegate.updateModel = updateModel
+                    updateModel.startPollingIfNeeded()
                 }
         }
         .environmentObject(chatModel)
+        .environmentObject(updateModel)
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1060, height: 680)
         .commands {
@@ -33,6 +34,9 @@ struct BossMacApp: App {
                         .applicationVersion: full,
                     ])
                 }
+            }
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesCommand()
             }
             CommandGroup(after: .windowList) {
                 Divider()
@@ -119,6 +123,15 @@ struct BossMacApp: App {
     }
 }
 
+private struct CheckForUpdatesCommand: View {
+    var body: some View {
+        Button("Check for Updates…") {
+            guard let model = (NSApp.delegate as? AppDelegate)?.updateModel else { return }
+            model.presentUpdateSheet()
+        }
+    }
+}
+
 private struct LogViewerCommand: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
@@ -197,6 +210,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// brief window between launch and first-render — treated as "no agents
     /// working" so a very-early Cmd-Q is never held hostage.
     var liveWorkerStates: LiveWorkerStateStore?
+    /// Set by BossMacApp on first ContentView appear. Accessed by CheckForUpdatesCommand
+    /// (commands cannot reliably use @EnvironmentObject; AppDelegate is always reachable).
+    var updateModel: UpdateModel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // When launched outside a regular .app bundle (e.g. `swift run`

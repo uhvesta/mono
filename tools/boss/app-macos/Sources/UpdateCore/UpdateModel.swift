@@ -37,6 +37,8 @@ public final class UpdateModel: ObservableObject {
     @Published public private(set) var skippedVersion: String
     @Published public private(set) var lastCheckResult: UpdateCheckResult?
     @Published public private(set) var isChecking: Bool = false
+    /// Set to `true` to present the update-result sheet. Dismissed when the user closes the sheet.
+    @Published public var showUpdateSheet: Bool = false
 
     // MARK: - Private
 
@@ -79,6 +81,30 @@ public final class UpdateModel: ObservableObject {
     }
 
     // MARK: - Public API
+
+    /// `true` when the running binary is a dev build (BossFullVersion contains `-dev-`).
+    /// The sheet uses this to suppress auto-install while still showing update availability.
+    public var isDevBuild: Bool { checker.isDevBuild }
+
+    /// Factory that always returns a model. Falls back to a version-less dev build if
+    /// the bundle's `CFBundleShortVersionString` is unavailable (e.g. `swift run` without plist).
+    public static func makeForApp() -> UpdateModel {
+        if let model = fromBundle() { return model }
+        return UpdateModel(
+            checker: UpdateChecker(
+                currentVersionString: "0.0.0",
+                fullVersionString: "0.0.0-dev-local",
+                fetcher: .live
+            )
+        )
+    }
+
+    /// Shows the update-result sheet and starts a fresh check.
+    /// Safe to call from a synchronous button action — the check runs in a detached Task.
+    public func presentUpdateSheet() {
+        showUpdateSheet = true
+        Task { await checkNow() }
+    }
 
     /// Starts the polling scheduler if the current mode enables it.
     /// Call once from `applicationDidFinishLaunching`.

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UpdateCore
 
 private let workBoardColumnWidth: CGFloat = 280
 private let workBoardColumnWidthWide: CGFloat = 340
@@ -16,6 +17,7 @@ private let workBossPanelDividerHitWidth: CGFloat = 12
 
 struct ContentView: View {
     @EnvironmentObject private var model: ChatViewModel
+    @EnvironmentObject private var updateModel: UpdateModel
     #if canImport(GhosttyKit)
     @StateObject private var workersWorkspace = WorkersWorkspaceModel()
     @StateObject private var bossPane = BossPaneModel()
@@ -276,6 +278,13 @@ struct ContentView: View {
             // sheet content does not always inherit the presenter's
             // environment objects.
             .environmentObject(model)
+        }
+        .sheet(isPresented: Binding(
+            get: { updateModel.showUpdateSheet },
+            set: { updateModel.showUpdateSheet = $0 }
+        )) {
+            UpdateResultSheet()
+                .environmentObject(updateModel)
         }
     }
 
