@@ -28,6 +28,7 @@ rust_library(
         "src/events_socket.rs",
         "src/external_tracker/credentials.rs",
         "src/external_tracker/github.rs",
+        "src/external_tracker/github_oauth.rs",
         "src/external_tracker/mod.rs",
         "src/external_tracker/reconcile.rs",
         "src/feature_flags.rs",
