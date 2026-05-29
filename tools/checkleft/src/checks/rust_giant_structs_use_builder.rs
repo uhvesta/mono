@@ -1122,4 +1122,95 @@ pub struct PlainBig {
         );
         assert!(messages[0].contains("PlainBig"));
     }
+
+    /// The exact shape this repo's `exclude_globs` → `exclude_structs` migration relies on:
+    /// a file under the config subtree holds a giant struct grandfathered by a *qualified*
+    /// entry AND a newly-added giant struct. The grandfathered one stays exempt; the new
+    /// one IS flagged. A whole-file `exclude_globs` entry would have suppressed both — that
+    /// is precisely the blind spot the migration removes. Mirrors the real config layout:
+    /// config_dir `tools/boss`, file `tools/boss/engine/src/app.rs`, entry
+    /// `engine/src/app.rs::ServerState`.
+    #[tokio::test]
+    async fn qualified_grandfather_exempts_known_struct_but_flags_new_sibling() {
+        let source = r#"
+pub struct ServerState {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+
+pub struct FreshlyAdded {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+        let temp = tempdir().expect("create temp dir");
+        std::fs::create_dir_all(temp.path().join("tools/boss/engine/src"))
+            .expect("mkdir tools/boss/engine/src");
+        fs::write(temp.path().join("tools/boss/engine/src/app.rs"), source).expect("write file");
+        let check = RustGiantStructsUseBuilderCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: Path::new("tools/boss/engine/src/app.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]);
+        // Qualified entry resolved relative to config_dir `tools/boss` →
+        // `tools/boss/engine/src/app.rs`, exempting only `ServerState` there.
+        let config = toml::Value::Table(toml::toml! {
+            exclude_structs = ["engine/src/app.rs::ServerState"]
+        });
+        let configured = check
+            .configure_scoped(&config, Some(Path::new("tools/boss")))
+            .expect("configure_scoped");
+        let messages: Vec<String> = configured
+            .run(&changeset, &tree)
+            .await
+            .expect("run check")
+            .findings
+            .into_iter()
+            .map(|f| f.message)
+            .collect();
+        assert_eq!(messages.len(), 1, "expected only the new struct flagged, got {messages:?}");
+        assert!(messages[0].contains("FreshlyAdded"));
+        assert!(!messages[0].contains("ServerState"));
+    }
+
+    /// Counterpart to the qualified-grandfather test: the same struct name in a *different*
+    /// file is NOT exempted by a qualified entry, so moving/renaming a grandfathered struct
+    /// out of its declared file re-arms the check. Guards the "only the known-existing
+    /// violation is exempt" property the migration is meant to deliver.
+    #[tokio::test]
+    async fn qualified_grandfather_does_not_exempt_same_name_in_other_file() {
+        let source = r#"
+pub struct ServerState {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+        let temp = tempdir().expect("create temp dir");
+        std::fs::create_dir_all(temp.path().join("tools/boss/engine/src"))
+            .expect("mkdir tools/boss/engine/src");
+        // Same struct name, but in a different file than the qualified entry points at.
+        fs::write(temp.path().join("tools/boss/engine/src/other.rs"), source).expect("write file");
+        let check = RustGiantStructsUseBuilderCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: Path::new("tools/boss/engine/src/other.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]);
+        let config = toml::Value::Table(toml::toml! {
+            exclude_structs = ["engine/src/app.rs::ServerState"]
+        });
+        let configured = check
+            .configure_scoped(&config, Some(Path::new("tools/boss")))
+            .expect("configure_scoped");
+        let messages: Vec<String> = configured
+            .run(&changeset, &tree)
+            .await
+            .expect("run check")
+            .findings
+            .into_iter()
+            .map(|f| f.message)
+            .collect();
+        assert_eq!(messages.len(), 1, "expected ServerState flagged in the wrong file, got {messages:?}");
+        assert!(messages[0].contains("ServerState"));
+    }
 }
