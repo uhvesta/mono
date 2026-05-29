@@ -1821,10 +1821,13 @@ final class ChatViewModel: ObservableObject {
             attentionItemsByWorkItemID[workItemID] = items
         case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
             openingReviewTerminalIDs.remove(workItemID)
+            let resolved = task(withID: workItemID)
             let content = ReviewTerminalContent(
                 workItemID: workItemID,
                 workspacePath: workspacePath,
-                leaseID: leaseID
+                leaseID: leaseID,
+                taskName: resolved?.name,
+                taskShortID: resolved?.shortID
             )
             reviewTerminalOpener?(content)
         }

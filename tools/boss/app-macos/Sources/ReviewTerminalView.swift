@@ -9,8 +9,28 @@ struct ReviewTerminalContent: Codable, Hashable, Identifiable {
     let workItemID: String
     let workspacePath: String
     let leaseID: String
+    /// Human-readable task name, e.g. "Fix the fencer scraper".
+    var taskName: String?
+    /// Per-product short id, e.g. 808. Displayed as "T808".
+    var taskShortID: Int?
 
     var id: String { workItemID }
+
+    /// Formatted window title: "Review: T<n> - <name>" when both are
+    /// available; falls back gracefully when either is missing.
+    var windowTitle: String {
+        let prefix = "Review"
+        switch (taskShortID, taskName) {
+        case let (shortID?, name?) where !name.isEmpty:
+            return "\(prefix): T\(shortID) - \(name)"
+        case let (shortID?, _):
+            return "\(prefix): T\(shortID)"
+        case let (_, name?) where !name.isEmpty:
+            return "\(prefix): \(name)"
+        default:
+            return "\(prefix): \(workItemID)"
+        }
+    }
 }
 
 /// Full-window Ghostty terminal opened from a Review-column card's

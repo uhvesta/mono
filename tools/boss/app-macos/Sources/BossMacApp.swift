@@ -90,7 +90,7 @@ struct BossMacApp: App {
             if let content {
                 ReviewTerminalView(content: content)
                     .environmentObject(chatModel)
-                    .navigationTitle("Review: \(content.workItemID)")
+                    .navigationTitle(content.windowTitle)
             }
         }
         .defaultSize(width: 1000, height: 660)
