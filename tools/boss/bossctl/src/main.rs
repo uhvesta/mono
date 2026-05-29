@@ -196,6 +196,27 @@ enum DispatchAction {
     },
 }
 
+/// Output format for `bossctl agents transcript --format`.
+#[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
+enum TranscriptFormat {
+    /// Plain-text summary (default).
+    Text,
+    /// Raw JSONL lines as emitted by Claude Code.
+    Jsonl,
+    /// Converted markdown via the engine's transcript renderer.
+    Markdown,
+}
+
+impl std::fmt::Display for TranscriptFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TranscriptFormat::Text => write!(f, "text"),
+            TranscriptFormat::Jsonl => write!(f, "jsonl"),
+            TranscriptFormat::Markdown => write!(f, "markdown"),
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum AgentsAction {
     /// List worker sessions and their current state.
@@ -250,6 +271,12 @@ enum AgentsAction {
         agent: String,
         #[arg(long, default_value_t = 100)]
         lines: usize,
+        /// Output format for the transcript.
+        /// `text` renders a plain-text summary, `jsonl` prints raw JSONL
+        /// lines, and `markdown` converts the transcript to formatted
+        /// markdown via the engine's transcript converter.
+        #[arg(long, value_enum, default_value_t = TranscriptFormat::Text)]
+        format: TranscriptFormat,
     },
     /// Mark an execution as `orphaned` (terminal) without releasing
     /// its cube workspace lease. Used to recover from a Boss app
@@ -495,8 +522,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::Interrupt { agent },
         } => agents_interrupt(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
-            action: AgentsAction::Transcript { agent, lines },
-        } => agents_transcript(&cli.socket_path, cli.json, agent, lines).await,
+            action: AgentsAction::Transcript { agent, lines, format },
+        } => agents_transcript(&cli.socket_path, cli.json, agent, lines, format).await,
         Command::Agents {
             action: AgentsAction::Reap { run_id },
         } => agents_reap(&cli.socket_path, cli.json, run_id).await,
@@ -1426,6 +1453,7 @@ async fn agents_transcript(
     json: bool,
     agent: String,
     lines: usize,
+    format: TranscriptFormat,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -1464,6 +1492,19 @@ async fn agents_transcript(
             lines: tail,
             truncated,
         } => {
+            if format == TranscriptFormat::Markdown {
+                // Convert the raw JSONL lines to rendered markdown locally.
+                let joined = tail.join("\n");
+                let events =
+                    boss_engine::transcript_markdown::parse_transcript(&joined);
+                let segments = boss_engine::transcript_markdown::events_to_segments(
+                    &events,
+                    &Default::default(),
+                );
+                let md = boss_engine::transcript_markdown::segments_to_markdown(&segments);
+                print!("{md}");
+                return Ok(());
+            }
             if json {
                 println!(
                     "{}",

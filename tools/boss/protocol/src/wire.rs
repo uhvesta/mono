@@ -11,9 +11,9 @@ use crate::types::{
     EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
     PrWorkItemMatch, Product, Project, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedComment, SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task, TaskRuntime, WorkAttentionItem,
-    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
-    WorkItemDependencyView, WorkItemPatch, WorkRun,
+    SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task, TaskRuntime, TranscriptSegment,
+    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -1005,6 +1005,20 @@ pub enum FrontendRequest {
     ReleaseReviewTerminal {
         lease_id: String,
     },
+    /// Resolve and render the full transcript for a completed or
+    /// in-progress execution, keyed on the durable execution id.
+    ///
+    /// The engine reads from `work_runs.transcript_path` (via the
+    /// durable `work_executions` row) rather than the live supervisor
+    /// — this sidesteps the "unknown run" divergence and makes
+    /// historical executions, retries, and remediations all reachable.
+    ///
+    /// Returns [`FrontendEvent::ExecutionTranscriptResult`] on success
+    /// or [`FrontendEvent::ExecutionTranscriptUnavailable`] when the
+    /// transcript file is absent or the execution never recorded one.
+    ExecutionTranscript {
+        execution_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1296,6 +1310,27 @@ pub enum FrontendEvent {
         transcript_path: String,
         lines: Vec<String>,
         truncated: bool,
+    },
+    /// Rendered transcript for an execution. Segments are ordered by
+    /// `seq` (conversation order). `is_live` is true when the execution
+    /// is still running; `complete` is the inverse. The app renders
+    /// segments lazily — one segment at a time — to avoid building a
+    /// full MarkdownUI AST for the entire document.
+    ExecutionTranscriptResult {
+        execution_id: String,
+        segments: Vec<TranscriptSegment>,
+        /// True when the execution status is still running / waiting_human.
+        is_live: bool,
+        /// True when the execution has a terminal status (complement of `is_live`).
+        complete: bool,
+    },
+    /// The transcript file for an execution is unavailable — the
+    /// worker may never have started a Claude Code session, the JSONL
+    /// was rotated or GC'd, or no `transcript_path` row was ever
+    /// recorded. `reason` is a human-readable explanation.
+    ExecutionTranscriptUnavailable {
+        execution_id: String,
+        reason: String,
     },
     /// Snapshot of the cube workspace pool. The engine proxies
     /// `cube --json workspace list`; each entry corresponds to one

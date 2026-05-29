@@ -5801,6 +5801,109 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            FrontendRequest::ExecutionTranscript { execution_id } => {
+                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            message: "execution_transcript requires app or Boss authority"
+                                .to_owned(),
+                        },
+                    );
+                    continue;
+                }
+                let execution = match work_db.get_execution(&execution_id) {
+                    Ok(exec) => exec,
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let is_live = execution.finished_at.is_none()
+                    && matches!(
+                        execution.status.as_str(),
+                        "running" | "waiting_human"
+                    );
+                let transcript_path = match work_db.transcript_path_for_execution(&execution_id) {
+                    Ok(Some(path)) => path,
+                    Ok(None) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ExecutionTranscriptUnavailable {
+                                execution_id,
+                                reason: "no transcript path recorded for this execution"
+                                    .to_owned(),
+                            },
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "transcript lookup failed for {execution_id}: {err}"
+                                ),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                match tokio::fs::read_to_string(&transcript_path).await {
+                    Ok(content) => {
+                        let events =
+                            crate::transcript_markdown::parse_transcript(&content);
+                        let segments = crate::transcript_markdown::events_to_segments(
+                            &events,
+                            &Default::default(),
+                        );
+                        let wire_segments: Vec<boss_protocol::TranscriptSegment> =
+                            segments.into_iter().map(segment_to_wire).collect();
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ExecutionTranscriptResult {
+                                execution_id,
+                                segments: wire_segments,
+                                is_live,
+                                complete: !is_live,
+                            },
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::ExecutionTranscriptUnavailable {
+                                execution_id,
+                                reason: format!(
+                                    "transcript file not found: {transcript_path}"
+                                ),
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "transcript read failed for {transcript_path}: {err}"
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::WorkspacePoolSummary => {
                 // Read-only view of `cube workspace list` plus engine
                 // annotations. The coordinator contract documents this
@@ -8665,6 +8768,34 @@ fn resolve_transcript_for_tail(
         return TranscriptResolution::KnownNoTranscript;
     }
     TranscriptResolution::Unknown
+}
+
+/// Convert an internal `TranscriptSegment` from the converter crate to the
+/// wire-protocol `TranscriptSegment` that travels over the RPC socket.
+fn segment_to_wire(
+    s: crate::transcript_markdown::TranscriptSegment,
+) -> boss_protocol::TranscriptSegment {
+    use crate::transcript_markdown::SegmentRole;
+    boss_protocol::TranscriptSegment {
+        seq: s.seq,
+        role: match s.role {
+            SegmentRole::User => boss_protocol::SegmentRole::User,
+            SegmentRole::Assistant => boss_protocol::SegmentRole::Assistant,
+            SegmentRole::Thinking => boss_protocol::SegmentRole::Thinking,
+            SegmentRole::Tool => boss_protocol::SegmentRole::Tool,
+            SegmentRole::System => boss_protocol::SegmentRole::System,
+        },
+        label: s.label,
+        timestamp: s.timestamp,
+        model: s.model,
+        markdown: s.markdown,
+        collapsible: s.collapsible,
+        default_collapsed: s.default_collapsed,
+        truncated: s.truncated.map(|t| boss_protocol::TruncationInfo {
+            shown_bytes: t.shown_bytes,
+            total_bytes: t.total_bytes,
+        }),
+    }
 }
 
 async fn read_transcript_tail(
@@ -12238,5 +12369,274 @@ mod tests {
             .await;
 
         send.await.expect("send task").expect("send ok");
+    }
+
+    // ── executions.transcript tests ──────────────────────────────────────────
+
+    /// Helper: create a product + chore + execution (in `ready` status).
+    fn make_execution_for_test(
+        server_state: &Arc<ServerState>,
+    ) -> boss_protocol::WorkExecution {
+        let product = server_state
+            .work_db
+            .create_product(boss_protocol::CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = server_state
+            .work_db
+            .create_chore(boss_protocol::CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        server_state
+            .work_db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: None,
+                force: false,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn segment_to_wire_maps_all_roles() {
+        use crate::transcript_markdown::{SegmentRole, TruncationInfo, TranscriptSegment};
+        let seg = TranscriptSegment::builder()
+            .seq(1u64)
+            .role(SegmentRole::Assistant)
+            .label("Assistant")
+            .markdown("hello")
+            .timestamp("2026-01-01")
+            .model("claude-opus-4")
+            .collapsible(false)
+            .default_collapsed(false)
+            .truncated(TruncationInfo { shown_bytes: 10, total_bytes: 100 })
+            .build();
+        let wire = segment_to_wire(seg);
+        assert_eq!(wire.seq, 1);
+        assert_eq!(wire.role, boss_protocol::SegmentRole::Assistant);
+        assert_eq!(wire.label, "Assistant");
+        assert_eq!(wire.markdown, "hello");
+        assert_eq!(wire.timestamp.as_deref(), Some("2026-01-01"));
+        assert_eq!(wire.model.as_deref(), Some("claude-opus-4"));
+        assert!(!wire.collapsible);
+        assert!(!wire.default_collapsed);
+        let trunc = wire.truncated.unwrap();
+        assert_eq!(trunc.shown_bytes, 10);
+        assert_eq!(trunc.total_bytes, 100);
+    }
+
+    #[test]
+    fn segment_to_wire_all_roles() {
+        use crate::transcript_markdown::SegmentRole;
+        let roles = [
+            (SegmentRole::User, boss_protocol::SegmentRole::User),
+            (SegmentRole::Assistant, boss_protocol::SegmentRole::Assistant),
+            (SegmentRole::Thinking, boss_protocol::SegmentRole::Thinking),
+            (SegmentRole::Tool, boss_protocol::SegmentRole::Tool),
+            (SegmentRole::System, boss_protocol::SegmentRole::System),
+        ];
+        for (src, expected) in roles {
+            let seg = crate::transcript_markdown::TranscriptSegment::builder()
+                .seq(0u64)
+                .role(src)
+                .label("x")
+                .markdown("y")
+                .build();
+            assert_eq!(segment_to_wire(seg).role, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_transcript_no_path_returns_unavailable() {
+        let server_state = test_server_state();
+        let execution = make_execution_for_test(&server_state);
+
+        // No run row → no transcript_path.
+        let path = server_state
+            .work_db
+            .transcript_path_for_execution(&execution.id)
+            .unwrap();
+        assert!(
+            path.is_none(),
+            "precondition: fresh execution has no transcript path"
+        );
+        // The handler would return ExecutionTranscriptUnavailable.
+        // Verify the DB layer returns None and is_live is false.
+        let is_live = execution.finished_at.is_none()
+            && matches!(execution.status.as_str(), "running" | "waiting_human");
+        assert!(!is_live, "ready execution should not be live");
+    }
+
+    #[tokio::test]
+    async fn execution_transcript_missing_file_case() {
+        let server_state = test_server_state();
+        let execution = make_execution_for_test(&server_state);
+
+        // Create a run row pointing at a non-existent file.
+        let nonexistent = "/tmp/does_not_exist_boss_test.jsonl";
+        server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: Some(nonexistent.into()),
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        let path = server_state
+            .work_db
+            .transcript_path_for_execution(&execution.id)
+            .unwrap();
+        assert_eq!(path.as_deref(), Some(nonexistent));
+
+        // Try to read — should be NotFound.
+        let err = tokio::fs::read_to_string(nonexistent).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "file must not exist for this test to be valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_transcript_normal_case() {
+        let server_state = test_server_state();
+        let execution = make_execution_for_test(&server_state);
+
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript_path = transcript_dir.path().join("session.jsonl");
+        // One user turn + one assistant turn.
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"world\"}]}}\n",
+        );
+        std::fs::write(&transcript_path, jsonl).unwrap();
+
+        server_state
+            .work_db
+            .create_run(crate::protocol::CreateRunInput {
+                execution_id: execution.id.clone(),
+                agent_id: "agent-1".into(),
+                status: Some("active".into()),
+                transcript_path: Some(transcript_path.display().to_string()),
+                artifacts_path: None,
+                result_summary: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+            })
+            .unwrap();
+
+        let path = server_state
+            .work_db
+            .transcript_path_for_execution(&execution.id)
+            .unwrap()
+            .expect("transcript path must be set");
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let events = crate::transcript_markdown::parse_transcript(&content);
+        assert!(!events.is_empty(), "must parse at least one event");
+
+        let segments = crate::transcript_markdown::events_to_segments(
+            &events,
+            &Default::default(),
+        );
+        assert!(!segments.is_empty(), "must produce at least one segment");
+
+        let wire: Vec<boss_protocol::TranscriptSegment> =
+            segments.into_iter().map(segment_to_wire).collect();
+        assert!(
+            wire.iter().any(|s| s.role == boss_protocol::SegmentRole::User),
+            "must have a User segment"
+        );
+        assert!(
+            wire.iter().any(|s| s.role == boss_protocol::SegmentRole::Assistant),
+            "must have an Assistant segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_transcript_live_flag() {
+        let server_state = test_server_state();
+        let execution = make_execution_for_test(&server_state);
+
+        // Start the execution so its status becomes "running".
+        let (live_exec, _run) = server_state
+            .work_db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                "/tmp/mono-agent-001",
+            )
+            .unwrap();
+
+        let is_live = live_exec.finished_at.is_none()
+            && matches!(live_exec.status.as_str(), "running" | "waiting_human");
+        assert!(is_live, "a running execution must be flagged as live");
+    }
+
+    #[test]
+    fn executions_list_returns_empty_for_task_with_no_executions() {
+        let server_state = test_server_state();
+        let product = server_state
+            .work_db
+            .create_product(boss_protocol::CreateProductInput {
+                name: "p".into(),
+                description: None,
+                repo_remote_url: Some("git@example.com:p.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let task = server_state
+            .work_db
+            .create_chore(boss_protocol::CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "c".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        let executions = server_state
+            .work_db
+            .list_executions(Some(&task.id))
+            .unwrap();
+        assert!(
+            executions.is_empty(),
+            "a task with no executions must return an empty list"
+        );
     }
 }
