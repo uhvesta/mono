@@ -3621,12 +3621,19 @@ private struct ResolvingConflictsBadge: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Color.orange)
                 .lineLimit(1)
+                .truncationMode(.tail)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        // The icon keeps its intrinsic size, but the label is allowed to
+        // truncate so a wide badge yields footer width to the fixed-size
+        // repo chip and short-id rather than pushing them off the card's
+        // right edge. The full text stays reachable via the tooltip and
+        // accessibility label. `.layoutPriority(-1)` makes this badge the
+        // first element the footer HStack squeezes when space is tight.
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(Color.orange.opacity(0.12))
         .clipShape(Capsule())
+        .layoutPriority(-1)
         .help("A worker is actively resolving a merge conflict on this PR.")
         .accessibilityLabel("Resolving merge conflict")
     }
@@ -3645,12 +3652,17 @@ private struct ResolvingCIFailureBadge: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Color.orange)
                 .lineLimit(1)
+                .truncationMode(.tail)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        // See [[ResolvingConflictsBadge]]: the label truncates so this
+        // wider badge can't clip the trailing repo chip / short-id off the
+        // card's right edge. Full text remains in the tooltip and a11y
+        // label, and `.layoutPriority(-1)` makes it yield space first.
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(Color.orange.opacity(0.12))
         .clipShape(Capsule())
+        .layoutPriority(-1)
         .help("A worker is actively resolving a CI failure on this PR.")
         .accessibilityLabel("Resolving CI failure")
     }
