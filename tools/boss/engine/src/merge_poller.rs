@@ -576,9 +576,10 @@ pub struct MergeQueueDequeueEvent {
 }
 
 /// Query the PR's timeline for `RemovedFromMergeQueueEvent` entries.
-/// Returns events with `reason == "FAILED_CHECKS"` (the only case Boss
-/// treats as a CI failure). Events for other reasons (`MANUAL_REMOVAL`,
-/// `MERGE_CONFLICT`, etc.) are filtered out at the call site.
+/// Returns events with `reason == "failed_checks"` (case-insensitive;
+/// GitHub's API returns the lowercase form even though the GraphQL schema
+/// documents the enum as uppercase `FAILED_CHECKS`). Events for other
+/// reasons (`MANUAL_REMOVAL`, `MERGE_CONFLICT`, etc.) are filtered out.
 ///
 /// Returns an empty vec on any error so the sweep degrades gracefully.
 /// The `INSERT OR IGNORE` idempotency on `ci_remediations` deduplicates
@@ -608,7 +609,19 @@ async fn fetch_merge_queue_dequeue_events(pr_url: &str) -> Vec<MergeQueueDequeue
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
-    let body: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+    parse_dequeue_events_response(&output.stdout)
+}
+
+/// Pure parser for the GraphQL `timelineItems` response body from
+/// [`fetch_merge_queue_dequeue_events`]. Extracted so the parsing rules
+/// can be unit-tested without a live `gh` call.
+///
+/// GitHub's API returns `reason` in lowercase snake_case (e.g.
+/// `"failed_checks"`) even though the GraphQL enum is documented in
+/// uppercase (`FAILED_CHECKS`). The filter uses a case-insensitive
+/// comparison so both forms are accepted.
+fn parse_dequeue_events_response(body: &[u8]) -> Vec<MergeQueueDequeueEvent> {
+    let body: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -626,7 +639,10 @@ async fn fetch_merge_queue_dequeue_events(pr_url: &str) -> Vec<MergeQueueDequeue
         };
         // Only surface FAILED_CHECKS — all other reasons are informational
         // or terminal-success and must not feed the ci_failure path.
-        if reason != "FAILED_CHECKS" {
+        // GitHub returns the lowercase form "failed_checks" even though
+        // the schema declares the enum as FAILED_CHECKS; compare
+        // case-insensitively to accept both.
+        if !reason.eq_ignore_ascii_case("failed_checks") {
             continue;
         }
         let before_commit_oid = node["beforeCommit"]["oid"].as_str().map(|s| s.to_owned());
@@ -5289,5 +5305,122 @@ mod tests {
             outcome.late_pr_recovered, 0,
             "late_pr_recovered must be 0 when no handler is wired",
         );
+    }
+
+    // ----- parse_dequeue_events_response (merge-queue reason case T770/T771) -----
+
+    /// GitHub's GraphQL API returns `reason` in lowercase snake_case
+    /// ("failed_checks") even though the schema documents the enum as
+    /// FAILED_CHECKS.  The parser must accept the lowercase form.
+    #[test]
+    fn parse_dequeue_events_response_accepts_lowercase_failed_checks() {
+        let body = br#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {
+                            "nodes": [
+                                {
+                                    "reason": "failed_checks",
+                                    "beforeCommit": {"oid": "abc123def456"}
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let events = parse_dequeue_events_response(body);
+        assert_eq!(events.len(), 1, "lowercase 'failed_checks' must be surfaced");
+        assert_eq!(events[0].reason, "failed_checks");
+        assert_eq!(events[0].before_commit_oid.as_deref(), Some("abc123def456"));
+    }
+
+    /// The schema-documented uppercase form must also be accepted for
+    /// forward-compatibility (in case GitHub normalises casing in future).
+    #[test]
+    fn parse_dequeue_events_response_accepts_uppercase_failed_checks() {
+        let body = br#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {
+                            "nodes": [
+                                {
+                                    "reason": "FAILED_CHECKS",
+                                    "beforeCommit": {"oid": "def456abc789"}
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let events = parse_dequeue_events_response(body);
+        assert_eq!(events.len(), 1, "uppercase 'FAILED_CHECKS' must also be surfaced");
+        assert_eq!(events[0].before_commit_oid.as_deref(), Some("def456abc789"));
+    }
+
+    /// Non-FAILED_CHECKS reasons (manual dequeue, merge conflict, etc.) must
+    /// be silently discarded — they must not trigger the ci_failure path.
+    #[test]
+    fn parse_dequeue_events_response_filters_non_failed_checks() {
+        let body = br#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {
+                            "nodes": [
+                                {"reason": "dequeued",       "beforeCommit": {"oid": "sha1"}},
+                                {"reason": "merge_conflict", "beforeCommit": {"oid": "sha2"}},
+                                {"reason": "queue_cleared",  "beforeCommit": {"oid": "sha3"}},
+                                {"reason": "failed_checks",  "beforeCommit": {"oid": "sha4"}}
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let events = parse_dequeue_events_response(body);
+        assert_eq!(events.len(), 1, "only failed_checks must be surfaced");
+        assert_eq!(events[0].before_commit_oid.as_deref(), Some("sha4"));
+    }
+
+    /// `beforeCommit` can be null when GitHub omits it. The event must
+    /// still be returned (with `before_commit_oid = None`) so the caller
+    /// can decide how to handle it.
+    #[test]
+    fn parse_dequeue_events_response_handles_null_before_commit() {
+        let body = br#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {
+                            "nodes": [
+                                {"reason": "failed_checks", "beforeCommit": null}
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let events = parse_dequeue_events_response(body);
+        assert_eq!(events.len(), 1, "null beforeCommit must not drop the event");
+        assert!(events[0].before_commit_oid.is_none());
+    }
+
+    /// An empty nodes array returns an empty vec without panicking.
+    #[test]
+    fn parse_dequeue_events_response_empty_nodes() {
+        let body = br#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "timelineItems": {"nodes": []}
+                    }
+                }
+            }
+        }"#;
+        assert!(parse_dequeue_events_response(body).is_empty());
     }
 }
