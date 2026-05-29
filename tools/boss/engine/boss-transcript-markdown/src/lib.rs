@@ -382,58 +382,54 @@ pub fn events_to_segments(events: &[TranscriptEvent], opts: &RenderOpts) -> Vec<
 
 fn event_to_segment(event: &TranscriptEvent, opts: &RenderOpts) -> Option<TranscriptSegment> {
     match &event.kind {
-        TranscriptEventKind::UserText(text) => Some(TranscriptSegment {
-            seq: event.seq,
-            role: SegmentRole::User,
-            label: "User".to_owned(),
-            timestamp: event.timestamp.clone(),
-            model: None,
-            markdown: text.clone(),
-            collapsible: false,
-            default_collapsed: false,
-            truncated: None,
-        }),
+        TranscriptEventKind::UserText(text) => Some(
+            TranscriptSegment::builder()
+                .seq(event.seq)
+                .role(SegmentRole::User)
+                .label("User")
+                .maybe_timestamp(event.timestamp.clone())
+                .markdown(text.clone())
+                .build(),
+        ),
 
-        TranscriptEventKind::AssistantText(text) => Some(TranscriptSegment {
-            seq: event.seq,
-            role: SegmentRole::Assistant,
-            label: "Assistant".to_owned(),
-            timestamp: event.timestamp.clone(),
-            model: event.model.clone(),
-            markdown: text.clone(),
-            collapsible: false,
-            default_collapsed: false,
-            truncated: None,
-        }),
+        TranscriptEventKind::AssistantText(text) => Some(
+            TranscriptSegment::builder()
+                .seq(event.seq)
+                .role(SegmentRole::Assistant)
+                .label("Assistant")
+                .maybe_timestamp(event.timestamp.clone())
+                .maybe_model(event.model.clone())
+                .markdown(text.clone())
+                .build(),
+        ),
 
         TranscriptEventKind::Thinking(text) => {
             let markdown = blockquote(text);
-            Some(TranscriptSegment {
-                seq: event.seq,
-                role: SegmentRole::Thinking,
-                label: "💭 Thinking".to_owned(),
-                timestamp: event.timestamp.clone(),
-                model: event.model.clone(),
-                markdown,
-                collapsible: true,
-                default_collapsed: true,
-                truncated: None,
-            })
+            Some(
+                TranscriptSegment::builder()
+                    .seq(event.seq)
+                    .role(SegmentRole::Thinking)
+                    .label("💭 Thinking")
+                    .maybe_timestamp(event.timestamp.clone())
+                    .maybe_model(event.model.clone())
+                    .markdown(markdown)
+                    .collapsible(true)
+                    .default_collapsed(true)
+                    .build(),
+            )
         }
 
         TranscriptEventKind::ToolUse { name, input } => {
             let markdown = render_tool_use(name, input);
-            Some(TranscriptSegment {
-                seq: event.seq,
-                role: SegmentRole::Tool,
-                label: format!("⚙ {name}"),
-                timestamp: event.timestamp.clone(),
-                model: None,
-                markdown,
-                collapsible: false,
-                default_collapsed: false,
-                truncated: None,
-            })
+            Some(
+                TranscriptSegment::builder()
+                    .seq(event.seq)
+                    .role(SegmentRole::Tool)
+                    .label(format!("⚙ {name}"))
+                    .maybe_timestamp(event.timestamp.clone())
+                    .markdown(markdown)
+                    .build(),
+            )
         }
 
         TranscriptEventKind::ToolResult { output, is_error } => {
@@ -517,17 +513,17 @@ fn render_tool_result_segment(
     let markdown = format!("{error_marker}```\n{shown_output}\n```");
     let large = truncated.is_some() || total_bytes > 1024;
 
-    Some(TranscriptSegment {
-        seq: event.seq,
-        role: SegmentRole::Tool,
-        label: "↳ result".to_owned(),
-        timestamp: event.timestamp.clone(),
-        model: None,
-        markdown,
-        collapsible: large,
-        default_collapsed: false,
-        truncated,
-    })
+    Some(
+        TranscriptSegment::builder()
+            .seq(event.seq)
+            .role(SegmentRole::Tool)
+            .label("↳ result")
+            .maybe_timestamp(event.timestamp.clone())
+            .markdown(markdown)
+            .collapsible(large)
+            .maybe_truncated(truncated)
+            .build(),
+    )
 }
 
 fn render_system_segment(
@@ -543,17 +539,15 @@ fn render_system_segment(
             } else {
                 body.to_owned()
             };
-            Some(TranscriptSegment {
-                seq: event.seq,
-                role: SegmentRole::System,
-                label: "🔗 PR".to_owned(),
-                timestamp: event.timestamp.clone(),
-                model: None,
-                markdown,
-                collapsible: false,
-                default_collapsed: false,
-                truncated: None,
-            })
+            Some(
+                TranscriptSegment::builder()
+                    .seq(event.seq)
+                    .role(SegmentRole::System)
+                    .label("🔗 PR")
+                    .maybe_timestamp(event.timestamp.clone())
+                    .markdown(markdown)
+                    .build(),
+            )
         }
         Some("stop_hook_summary") => {
             let markdown = if body.is_empty() {
@@ -561,17 +555,15 @@ fn render_system_segment(
             } else {
                 blockquote(body)
             };
-            Some(TranscriptSegment {
-                seq: event.seq,
-                role: SegmentRole::System,
-                label: "stop_hook_summary".to_owned(),
-                timestamp: event.timestamp.clone(),
-                model: None,
-                markdown,
-                collapsible: false,
-                default_collapsed: false,
-                truncated: None,
-            })
+            Some(
+                TranscriptSegment::builder()
+                    .seq(event.seq)
+                    .role(SegmentRole::System)
+                    .label("stop_hook_summary")
+                    .maybe_timestamp(event.timestamp.clone())
+                    .markdown(markdown)
+                    .build(),
+            )
         }
         Some("turn_duration") => {
             let markdown = if body.is_empty() {
@@ -579,47 +571,42 @@ fn render_system_segment(
             } else {
                 blockquote(body)
             };
-            Some(TranscriptSegment {
-                seq: event.seq,
-                role: SegmentRole::System,
-                label: "turn_duration".to_owned(),
-                timestamp: event.timestamp.clone(),
-                model: None,
-                markdown,
-                collapsible: false,
-                default_collapsed: false,
-                truncated: None,
-            })
+            Some(
+                TranscriptSegment::builder()
+                    .seq(event.seq)
+                    .role(SegmentRole::System)
+                    .label("turn_duration")
+                    .maybe_timestamp(event.timestamp.clone())
+                    .markdown(markdown)
+                    .build(),
+            )
         }
         Some(subtype_str) => {
             // Hook events, attachments, etc.
             let verbose = body.len() > 500;
             let markdown = render_body_as_markdown(body);
-            Some(TranscriptSegment {
-                seq: event.seq,
-                role: SegmentRole::System,
-                label: subtype_str.to_owned(),
-                timestamp: event.timestamp.clone(),
-                model: None,
-                markdown,
-                collapsible: verbose,
-                default_collapsed: false,
-                truncated: None,
-            })
+            Some(
+                TranscriptSegment::builder()
+                    .seq(event.seq)
+                    .role(SegmentRole::System)
+                    .label(subtype_str.to_owned())
+                    .maybe_timestamp(event.timestamp.clone())
+                    .markdown(markdown)
+                    .collapsible(verbose)
+                    .build(),
+            )
         }
         None => {
             let markdown = render_body_as_markdown(body);
-            Some(TranscriptSegment {
-                seq: event.seq,
-                role: SegmentRole::System,
-                label: "system".to_owned(),
-                timestamp: event.timestamp.clone(),
-                model: None,
-                markdown,
-                collapsible: false,
-                default_collapsed: false,
-                truncated: None,
-            })
+            Some(
+                TranscriptSegment::builder()
+                    .seq(event.seq)
+                    .role(SegmentRole::System)
+                    .label("system")
+                    .maybe_timestamp(event.timestamp.clone())
+                    .markdown(markdown)
+                    .build(),
+            )
         }
     }
 }
@@ -1147,34 +1134,26 @@ mod tests {
 
     #[test]
     fn segments_to_markdown_produces_h2_headers() {
-        let segs = vec![TranscriptSegment {
-            seq: 0,
-            role: SegmentRole::User,
-            label: "User".to_owned(),
-            timestamp: None,
-            model: None,
-            markdown: "Hello".to_owned(),
-            collapsible: false,
-            default_collapsed: false,
-            truncated: None,
-        }];
+        let segs = vec![TranscriptSegment::builder()
+            .seq(0)
+            .role(SegmentRole::User)
+            .label("User")
+            .markdown("Hello")
+            .build()];
         let md = segments_to_markdown(&segs);
         assert!(md.contains("## User\n\nHello"), "got: {md}");
     }
 
     #[test]
     fn segments_to_markdown_includes_timestamp_in_header() {
-        let segs = vec![TranscriptSegment {
-            seq: 0,
-            role: SegmentRole::Assistant,
-            label: "Assistant".to_owned(),
-            timestamp: Some("2024-01-01T00:00:01Z".to_owned()),
-            model: Some("claude-sonnet-4-6".to_owned()),
-            markdown: "Reply".to_owned(),
-            collapsible: false,
-            default_collapsed: false,
-            truncated: None,
-        }];
+        let segs = vec![TranscriptSegment::builder()
+            .seq(0)
+            .role(SegmentRole::Assistant)
+            .label("Assistant")
+            .timestamp("2024-01-01T00:00:01Z")
+            .model("claude-sonnet-4-6")
+            .markdown("Reply")
+            .build()];
         let md = segments_to_markdown(&segs);
         assert!(md.contains("2024-01-01T00:00:01Z"));
         assert!(md.contains("claude-sonnet-4-6"));
@@ -1182,20 +1161,17 @@ mod tests {
 
     #[test]
     fn segments_to_markdown_adds_truncation_note() {
-        let segs = vec![TranscriptSegment {
-            seq: 0,
-            role: SegmentRole::Tool,
-            label: "↳ result".to_owned(),
-            timestamp: None,
-            model: None,
-            markdown: "```\nshort\n```".to_owned(),
-            collapsible: true,
-            default_collapsed: false,
-            truncated: Some(TruncationInfo {
+        let segs = vec![TranscriptSegment::builder()
+            .seq(0)
+            .role(SegmentRole::Tool)
+            .label("↳ result")
+            .markdown("```\nshort\n```")
+            .collapsible(true)
+            .maybe_truncated(Some(TruncationInfo {
                 shown_bytes: 100,
                 total_bytes: 5000,
-            }),
-        }];
+            }))
+            .build()];
         let md = segments_to_markdown(&segs);
         assert!(md.contains("showing 100 of 5000 bytes"), "got: {md}");
     }
