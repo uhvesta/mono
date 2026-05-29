@@ -434,6 +434,68 @@ impl WorkDb {
         Ok(None)
     }
 
+    /// Find every work item bound to GitHub PR number `pr_number`,
+    /// together with the revisions in each match's chain.
+    ///
+    /// Unlike [`Self::list_tasks`] / [`Self::list_chores`] this scans
+    /// the entire `tasks` table — all kinds (`project_task`, `chore`,
+    /// `design`, `investigation`, `revision`) across every product — so
+    /// a chore- or revision-backed PR is just as findable as a project
+    /// task. The PR number is parsed from each row's stored `pr_url`
+    /// using the same parser the merge poller uses, so query strings and
+    /// fragments are tolerated. Revisions carry no `pr_url`, so they
+    /// never appear as an owner; they surface only inside a matched
+    /// owner's `revisions` list.
+    ///
+    /// Soft-deleted rows are excluded from both owners and revisions.
+    /// Returns an empty vec when no row is bound to the PR number. More
+    /// than one element means the PR number is shared across repos —
+    /// the caller disambiguates by repo.
+    pub fn find_work_items_by_pr(&self, pr_number: i64) -> Result<Vec<PrWorkItemMatch>> {
+        let conn = self.connect()?;
+        // Owners: any live row carrying a pr_url. We parse the number in
+        // Rust (rather than a SQL LIKE) so the match is identical to the
+        // merge poller's and robust to `?`/`#` suffixes.
+        let owners: Vec<Task> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, parent_task_id, investigation_doc_path, investigation_doc_branch
+                 FROM tasks
+                 WHERE pr_url IS NOT NULL AND pr_url != '' AND deleted_at IS NULL
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], map_task_with_parent_and_investigation_doc)?;
+            collect_rows(rows)?
+                .into_iter()
+                .filter(|task| {
+                    task.pr_url
+                        .as_deref()
+                        .and_then(crate::merge_poller::parse_pr_number)
+                        == Some(pr_number)
+                })
+                .collect()
+        };
+
+        let mut matches = Vec::with_capacity(owners.len());
+        for owner in owners {
+            // Gather every revision in this owner's chain (BFS over
+            // parent_task_id) and annotate them with revision_seq /
+            // revision_parent_pr_url so the caller can render R1, R2, ….
+            let revision_ids = collect_chain_revision_ids(&conn, &owner.id)?;
+            let mut revisions = Vec::with_capacity(revision_ids.len());
+            for rev_id in &revision_ids {
+                if let Some(task) = query_task(&conn, rev_id)? {
+                    if task.deleted_at.is_none() {
+                        revisions.push(task);
+                    }
+                }
+            }
+            let mut revisions = attach_revision_projections(revisions, std::slice::from_ref(&owner));
+            revisions.sort_by_key(|rev| rev.revision_seq.unwrap_or(i64::MAX));
+            matches.push(PrWorkItemMatch { owner, revisions });
+        }
+        Ok(matches)
+    }
+
     pub fn list_tasks(
         &self,
         product_id: &str,

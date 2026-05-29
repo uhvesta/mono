@@ -1061,6 +1061,24 @@ pub enum WorkItem {
     Chore(Task),
 }
 
+/// One work item bound to a given PR number, together with the
+/// revisions in that PR's chain. Returned by
+/// [`crate::wire::FrontendRequest::FindWorkItemsByPr`].
+///
+/// `owner` is the row that owns the `pr_url` — the chain root, which
+/// may be any kind (`project_task`, `chore`, `design`,
+/// `investigation`). `revisions` are the `kind = 'revision'`
+/// descendants that committed to the same PR branch without owning a
+/// `pr_url` of their own; they carry `revision_seq` /
+/// `revision_parent_pr_url` projections and are ordered by sequence
+/// (R1, R2, …). Empty when the owner has no revisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrWorkItemMatch {
+    pub owner: Task,
+    #[serde(default)]
+    pub revisions: Vec<Task>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[derive(bon::Builder)]
 #[builder(on(String, into))]

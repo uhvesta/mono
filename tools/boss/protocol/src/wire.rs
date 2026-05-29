@@ -9,11 +9,11 @@ use crate::types::{
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
     EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    Product, Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    ResolvedComment, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    SetTaskInvestigationDocInput, Task, TaskRuntime, WorkAttentionItem, WorkComment, WorkExecution,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
-    WorkRun,
+    PrWorkItemMatch, Product, Project, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task, TaskRuntime, WorkAttentionItem,
+    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -160,6 +160,25 @@ pub enum FrontendRequest {
     GetWorkItemByShortId {
         product_id: String,
         short_id: i64,
+    },
+    /// Look up the work item(s) bound to a GitHub PR number, spanning
+    /// the *entire* `tasks` table — every kind (`project_task`,
+    /// `chore`, `design`, `investigation`, `revision`) across every
+    /// product. Unlike `ListTasks` / `ListChores` there is no kind or
+    /// product partition, so a chore- or revision-backed PR is just as
+    /// findable as a project task. The PR number is parsed from each
+    /// row's stored `pr_url`.
+    ///
+    /// Replies with [`FrontendEvent::WorkItemsByPrResult`] carrying one
+    /// [`PrWorkItemMatch`] per owning row (a row whose `pr_url` resolves
+    /// to `pr_number`), each bundling the revisions in that PR's chain.
+    /// More than one match means the same PR number exists in more than
+    /// one repo — the caller disambiguates by repo. An empty list means
+    /// no work item is bound to the PR. Repo filtering and ambiguity
+    /// messaging are left to the caller, which has the repo-selector
+    /// vocabulary.
+    FindWorkItemsByPr {
+        pr_number: i64,
     },
     CreateProject {
         #[serde(flatten)]
@@ -1036,6 +1055,16 @@ pub enum FrontendEvent {
     },
     WorkItemResult {
         item: WorkItem,
+    },
+    /// Reply for [`FrontendRequest::FindWorkItemsByPr`]. `matches` carries
+    /// one entry per work item whose `pr_url` resolves to `pr_number`
+    /// (across all kinds and products); each entry bundles the revisions
+    /// in that PR's chain. An empty `matches` means no work item is bound
+    /// to the PR; more than one entry means the PR number is ambiguous
+    /// across repos.
+    WorkItemsByPrResult {
+        pr_number: i64,
+        matches: Vec<PrWorkItemMatch>,
     },
     WorkItemCreated {
         item: WorkItem,

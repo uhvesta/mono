@@ -4186,6 +4186,27 @@ async fn handle_frontend_connection(
                     );
                 }
             },
+            FrontendRequest::FindWorkItemsByPr { pr_number } => {
+                match work_db.find_work_items_by_pr(pr_number) {
+                    Ok(matches) => {
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            server_state.current_work_revision(),
+                            FrontendEvent::WorkItemsByPrResult { pr_number, matches },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
             FrontendRequest::CreateProject { input } => match work_db.create_project(input) {
                 Ok(project) => {
                     let item = WorkItem::Project(project);

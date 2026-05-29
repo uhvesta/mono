@@ -14,7 +14,7 @@ use boss_protocol::{
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
     DependencyFilter, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
     FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    OrgAuthState, Product, Project,
+    OrgAuthState, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
     SetTaskInvestigationDocInput, Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
@@ -288,6 +288,24 @@ enum TaskCommand {
     #[command(name = "create-many")]
     CreateMany(TaskCreateManyArgs),
     List(TaskListArgs),
+    /// Look up the work item that owns a GitHub PR, by PR number.
+    ///
+    /// Spans the *entire* work-item space — every kind (`project_task`,
+    /// `chore`, `design`, `investigation`, `revision`) across every
+    /// product — so a chore- or revision-backed PR is found just as
+    /// readily as a project task. This sidesteps the `task list` blind
+    /// spot (it omits chores and revisions), which is the only other way
+    /// to map a PR back to its work item.
+    ///
+    /// `--repo` is optional: a PR number is unique within a repo, so it
+    /// is only needed when the same number exists in more than one repo.
+    /// Accepts a full remote URL or a short name (basename minus `.git`),
+    /// matched against the repo parsed from the PR URL.
+    ///
+    /// Revisions commit to the owner's PR without owning a `pr_url`, so
+    /// they are surfaced under the owning row rather than returned alone.
+    #[command(name = "by-pr")]
+    ByPr(ByPrArgs),
     /// Show any leaf work item (task or chore) by id.
     Show(TaskIdArg),
     /// Update any leaf work item (task or chore) by id.
@@ -1293,6 +1311,21 @@ struct TaskListArgs {
 
     #[command(flatten)]
     dep: DependencyFilterArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ByPrArgs {
+    /// The GitHub PR number to look up (e.g. `959` for `…/pull/959`).
+    pr_number: i64,
+
+    /// Disambiguate when the same PR number exists in more than one
+    /// repo. Accepts a full remote URL or a short name (basename of the
+    /// URL minus `.git`), matched against the repo parsed from each
+    /// match's PR URL. Short-name match is case-insensitive prefix;
+    /// selectors shorter than 2 chars are rejected. Unnecessary in a
+    /// single-repo context.
+    #[arg(long = "repo")]
+    repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2870,6 +2903,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 print_tasks_table(&tasks, args.with_primary_id)
             })
         }
+        TaskCommand::ByPr(args) => run_by_pr(&mut client, ctx, args).await,
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
@@ -4419,6 +4453,23 @@ async fn list_chores(
     }
 }
 
+async fn find_work_items_by_pr(
+    client: &mut BossClient,
+    pr_number: i64,
+) -> Result<Vec<PrWorkItemMatch>, CliError> {
+    match client
+        .send_request(&FrontendRequest::FindWorkItemsByPr { pr_number })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemsByPrResult { matches, .. } => Ok(matches),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("work items by pr", &other)),
+    }
+}
+
 async fn create_product(
     client: &mut BossClient,
     input: CreateProductInput,
@@ -4822,6 +4873,145 @@ async fn update_work_item(
             Err(CliError::application(message))
         }
         other => Err(unexpected_event("work item update", &other)),
+    }
+}
+
+/// Recover a repo's base URL from a PR URL by dropping the
+/// `/pull/<n>` segment (and anything after it):
+/// `https://github.com/owner/repo/pull/959` →
+/// `https://github.com/owner/repo`. Returns the input unchanged when
+/// no `/pull/` segment is present, so a non-PR-shaped URL still flows
+/// through the repo matcher.
+fn repo_url_from_pr_url(pr_url: &str) -> &str {
+    pr_url.split_once("/pull/").map_or(pr_url, |(base, _)| base)
+}
+
+/// Friendly `T<n>` id, falling back to the canonical id when a row
+/// somehow lacks a short_id.
+fn friendly_task_id(task: &Task) -> String {
+    task.short_id
+        .map(|n| format!("T{n}"))
+        .unwrap_or_else(|| task.id.clone())
+}
+
+/// Apply [`with_display_status`] to the owner and every revision in a
+/// PR match so rendered statuses use the board vocabulary.
+fn with_display_pr_match(m: PrWorkItemMatch) -> PrWorkItemMatch {
+    PrWorkItemMatch {
+        owner: with_display_status(m.owner),
+        revisions: m.revisions.into_iter().map(with_display_status).collect(),
+    }
+}
+
+/// Human-readable rendering of a single PR → work-item match: the
+/// owning row plus any revisions in the PR's chain.
+fn print_pr_match(m: &PrWorkItemMatch) {
+    let owner = &m.owner;
+    let repo = owner
+        .pr_url
+        .as_deref()
+        .map(repo_url_from_pr_url)
+        .unwrap_or("");
+    println!(
+        "{}  {}  [{}]  {}",
+        friendly_task_id(owner),
+        owner.kind,
+        owner.status,
+        owner.name,
+    );
+    if !repo.is_empty() {
+        println!("Repo: {repo}");
+    }
+    if let Some(pr_url) = &owner.pr_url {
+        println!("PR URL: {pr_url}");
+    }
+    if m.revisions.is_empty() {
+        return;
+    }
+    println!("Revisions in this PR's chain:");
+    for revision in &m.revisions {
+        let seq = revision
+            .revision_seq
+            .map(|n| format!("R{n} "))
+            .unwrap_or_default();
+        println!(
+            "  {seq}{}  [{}]  {}",
+            friendly_task_id(revision),
+            revision.status,
+            revision.name,
+        );
+    }
+}
+
+/// Handler for `boss task by-pr <pr-number> [--repo <r>]`. Resolves a
+/// PR number to the work item that owns it, spanning all kinds. When
+/// `--repo` is given, matches are filtered by the repo parsed from
+/// each owner's PR URL; ambiguity (the same number in >1 repo) and
+/// not-found are surfaced as clear errors.
+async fn run_by_pr(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: ByPrArgs,
+) -> Result<(), CliError> {
+    if args.pr_number <= 0 {
+        return Err(CliError::usage("PR number must be a positive integer"));
+    }
+    let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
+    let matches = find_work_items_by_pr(client, args.pr_number).await?;
+
+    // Repo filter (when given) matches against the repo parsed from the
+    // owner's PR URL — the PR URL, not the work item's repo override, is
+    // what authoritatively places the PR in a repo.
+    let matches: Vec<PrWorkItemMatch> = match repo_selector.as_ref() {
+        Some(selector) => matches
+            .into_iter()
+            .filter(|m| {
+                m.owner
+                    .pr_url
+                    .as_deref()
+                    .is_some_and(|url| selector.matches(Some(repo_url_from_pr_url(url))))
+            })
+            .collect(),
+        None => matches,
+    };
+
+    match matches.len() {
+        0 => {
+            let scope = match args.repo.as_deref() {
+                Some(repo) => format!(" in a repo matching {repo:?}"),
+                None => String::new(),
+            };
+            Err(CliError::not_found(format!(
+                "no work item bound to PR #{}{scope}",
+                args.pr_number,
+            )))
+        }
+        1 => {
+            let matched = with_display_pr_match(
+                matches.into_iter().next().expect("len checked == 1"),
+            );
+            print_entity(ctx, &serde_json::json!({ "match": &matched }), || {
+                print_pr_match(&matched);
+            })
+        }
+        _ => {
+            let repos: Vec<String> = matches
+                .iter()
+                .map(|m| {
+                    m.owner
+                        .pr_url
+                        .as_deref()
+                        .map(repo_url_from_pr_url)
+                        .unwrap_or("<unknown>")
+                        .to_owned()
+                })
+                .collect();
+            Err(CliError::usage(format!(
+                "PR #{} exists in repos {}; pass --repo to disambiguate",
+                args.pr_number,
+                repos.join(", "),
+            )))
+        }
     }
 }
 
@@ -8781,6 +8971,37 @@ mod tests {
             "mono"
         );
         assert_eq!(short_name_for("https://github.com/foo/bar"), "bar");
+    }
+
+    #[test]
+    fn repo_url_from_pr_url_strips_pull_segment() {
+        assert_eq!(
+            super::repo_url_from_pr_url("https://github.com/spinyfin/mono/pull/959"),
+            "https://github.com/spinyfin/mono",
+        );
+        // Query/fragment after the number stay attached to the dropped
+        // tail, so the base is still clean.
+        assert_eq!(
+            super::repo_url_from_pr_url("https://github.com/foo/bar/pull/12?x=1#c"),
+            "https://github.com/foo/bar",
+        );
+        // No /pull/ segment → returned unchanged.
+        assert_eq!(
+            super::repo_url_from_pr_url("https://github.com/foo/bar"),
+            "https://github.com/foo/bar",
+        );
+    }
+
+    /// The `--repo` short-name selector matches against the repo parsed
+    /// out of a PR URL, so `by-pr 959 --repo mono` resolves a
+    /// `…/spinyfin/mono/pull/959` owner.
+    #[test]
+    fn repo_selector_matches_repo_parsed_from_pr_url() {
+        let sel = RepoSelector::parse("mono").unwrap();
+        let base = super::repo_url_from_pr_url("https://github.com/spinyfin/mono/pull/959");
+        assert!(sel.matches(Some(base)));
+        let other = super::repo_url_from_pr_url("https://github.com/spinyfin/other/pull/959");
+        assert!(!sel.matches(Some(other)));
     }
 
     #[test]

@@ -96,6 +96,7 @@ rust_library(
         "src/work/tests/t04.rs",
         "src/work/tests/t05.rs",
         "src/work/tests/t06.rs",
+        "src/work/tests/t07.rs",
         "src/work/updates.rs",
         "src/work/workitems.rs",
         "src/work_dependencies.rs",
