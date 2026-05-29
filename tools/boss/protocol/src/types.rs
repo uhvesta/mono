@@ -1818,6 +1818,8 @@ pub struct AutomationRun {
 /// the engine stamps `id`, `short_id`, `created_at`, `updated_at`, and the
 /// initial scheduler bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateAutomationInput {
     pub product_id: String,
     pub name: String,
@@ -1826,11 +1828,13 @@ pub struct CreateAutomationInput {
     pub trigger: AutomationTrigger,
     pub standing_instruction: String,
     #[serde(default = "default_open_task_limit")]
+    #[builder(default = default_open_task_limit())]
     pub open_task_limit: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catch_up_window_secs: Option<i64>,
     /// When `false`, the automation is created disabled. Defaults to `true`.
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_via: Option<String>,
@@ -1839,6 +1843,8 @@ pub struct CreateAutomationInput {
 /// Input to `UpdateAutomation`. All fields are `Option`; `None` means
 /// "leave unchanged."
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct AutomationPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
