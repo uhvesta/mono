@@ -3,16 +3,17 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
-    AddDependencyInput, CiBudgetSnapshot, CiRemediation, CommentAnchor, ConflictResolution,
-    CreateAttentionItemInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
-    CreateInvestigationInput, ResolvedComment, WorkComment,
+    AddDependencyInput, Attention, AttentionGroup, CiBudgetSnapshot, CiRemediation,
+    CommentAnchor, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
+    CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
     EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
     Product, Project, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task,
-    TaskRuntime, WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    ResolvedComment, SetProductExternalTrackerInput, SetProjectDesignDocInput,
+    SetTaskInvestigationDocInput, Task, TaskRuntime, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    WorkRun,
 };
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
@@ -246,6 +247,79 @@ pub enum FrontendRequest {
     },
     ListAttentionItemsForWorkItem {
         work_item_id: String,
+    },
+    /// List attention groups for a product, with optional filters.
+    /// Replies with [`FrontendEvent::AttentionGroupsList`].
+    ListAttentionGroups {
+        product_id: String,
+        /// Filter to groups associated with this project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        /// Filter to groups associated with this task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        /// Filter by kind (`"question"` | `"followup"`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// Filter by state. Defaults to open + partially_answered when
+        /// `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
+    /// Fetch one attention group by id (`atg_…` or `A<n>` short id).
+    /// Replies with [`FrontendEvent::AttentionGroupResult`].
+    GetAttentionGroup {
+        id: String,
+    },
+    /// Create a new attention (question or followup member). The engine
+    /// finds or creates the owning group based on the association and
+    /// source fields in the input. Replies with
+    /// [`FrontendEvent::AttentionCreated`].
+    CreateAttention {
+        #[serde(flatten)]
+        input: CreateAttentionInput,
+    },
+    /// Record the human's answer for one attention member (`atn_…`).
+    /// Replies with [`FrontendEvent::AttentionGroupUpdated`] carrying
+    /// the group's updated state.
+    AnswerAttention {
+        /// The individual attention id (`atn_…`).
+        id: String,
+        /// The captured answer. Shape depends on the attention's
+        /// `question_type`: `"yes"`/`"no"` for `yes_no`; the chosen
+        /// value for `multiple_choice`; free text for `prompt`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<String>,
+        /// Mark this member `skipped` rather than `answered`.
+        #[serde(default)]
+        skip: bool,
+        /// Mark this member `dismissed` without answering.
+        #[serde(default)]
+        dismiss: bool,
+    },
+    /// Action an open/partially-answered attention group — produce the
+    /// downstream artifact (one revision, one design task, or a batch
+    /// of new tasks) and transition the group to `actioned`. Replies
+    /// with [`FrontendEvent::AttentionGroupActioned`].
+    ActionAttentionGroup {
+        /// Group id (`atg_…`) or `A<n>` short id.
+        id: String,
+        /// When `true`, mark every unanswered member as `skipped`
+        /// before actioning so the caller doesn't need to touch every
+        /// row explicitly.
+        #[serde(default)]
+        skip_unanswered: bool,
+    },
+    /// Dismiss an attention group or a single member without producing a
+    /// downstream artifact. Accepts both `atg_…` group ids and `atn_…`
+    /// member ids; the engine discriminates by prefix. Replies with
+    /// [`FrontendEvent::AttentionGroupUpdated`].
+    DismissAttention {
+        /// `atg_…` to dismiss the whole group; `atn_…` to dismiss one
+        /// member.
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// App self-identifies as the singleton app session. The engine
     /// rejects this unless `LOCAL_PEERPID` matches the app's pid (the
@@ -1026,6 +1100,34 @@ pub enum FrontendEvent {
     AttentionItemsForWorkItemList {
         work_item_id: String,
         items: Vec<WorkAttentionItem>,
+    },
+    /// Reply for [`FrontendRequest::ListAttentionGroups`].
+    AttentionGroupsList {
+        product_id: String,
+        groups: Vec<AttentionGroup>,
+    },
+    /// Reply for [`FrontendRequest::GetAttentionGroup`].
+    AttentionGroupResult {
+        group: AttentionGroup,
+    },
+    /// Reply for [`FrontendRequest::CreateAttention`]. Also pushed as a
+    /// live-update event on the owning product's work-tree topic so the
+    /// Notifications window and doc viewer update without polling.
+    AttentionCreated {
+        attention: Attention,
+        group: AttentionGroup,
+    },
+    /// Pushed whenever a group's state or a member's answer_state
+    /// changes (e.g. after [`FrontendRequest::AnswerAttention`] or
+    /// [`FrontendRequest::DismissAttention`]).
+    AttentionGroupUpdated {
+        group: AttentionGroup,
+    },
+    /// Pushed after [`FrontendRequest::ActionAttentionGroup`] succeeds.
+    /// Carries the group in its terminal `actioned` state plus the
+    /// produced artifact reference so the UI can render a jump link.
+    AttentionGroupActioned {
+        group: AttentionGroup,
     },
     WorkItemDeleted {
         id: String,

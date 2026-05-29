@@ -5158,6 +5158,21 @@ async fn handle_frontend_connection(
                     }
                 }
             }
+            // --- Attentions (task 1: wire stubs; handlers land in task 2/3) ---
+            FrontendRequest::ListAttentionGroups { .. }
+            | FrontendRequest::GetAttentionGroup { .. }
+            | FrontendRequest::CreateAttention { .. }
+            | FrontendRequest::AnswerAttention { .. }
+            | FrontendRequest::ActionAttentionGroup { .. }
+            | FrontendRequest::DismissAttention { .. } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: "attentions: handlers not yet implemented".to_string(),
+                    },
+                );
+            }
             FrontendRequest::RegisterAppSession => {
                 // Trust the peer if any of:
                 //   (a) it matches the declared app pid exactly. The

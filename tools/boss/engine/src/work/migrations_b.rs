@@ -1124,3 +1124,77 @@ pub(crate) fn migrate_tasks_source_automation_id(conn: &Connection) -> Result<()
     )?;
     Ok(())
 }
+
+/// Create the `attention_groups` and `attentions` tables for the
+/// Attentions feature (design: `tools/boss/docs/designs/attentions.md`).
+///
+/// `attention_groups` (`atg_…` ids, per-product `A<n>` short id) is the
+/// human-actionable unit; `attentions` (`atn_…` ids) are its members.
+/// Idempotent — all DDL uses `IF NOT EXISTS`.
+///
+/// Unique index on `(grouping_key, generation)` is the reconciliation
+/// upsert target: re-running a design worker that emits the same questions
+/// is a no-op. Partial-unique index on `(product_id, short_id)` mirrors
+/// the tasks/projects pattern. FK `attentions.group_id → attention_groups`
+/// with `ON DELETE CASCADE` keeps orphan rows from accumulating.
+pub(crate) fn migrate_attentions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS attention_groups (
+             id                         TEXT PRIMARY KEY,
+             product_id                 TEXT NOT NULL REFERENCES products(id),
+             short_id                   INTEGER,
+             kind                       TEXT NOT NULL,
+             association_project_id     TEXT REFERENCES projects(id),
+             association_task_id        TEXT REFERENCES tasks(id),
+             source_kind                TEXT NOT NULL,
+             source_task_id             TEXT,
+             source_run_id              TEXT,
+             source_doc_path            TEXT,
+             source_doc_repo_remote_url TEXT,
+             source_doc_branch          TEXT,
+             grouping_key               TEXT NOT NULL,
+             generation                 INTEGER NOT NULL DEFAULT 0,
+             state                      TEXT NOT NULL DEFAULT 'open',
+             produced_artifact_kind     TEXT,
+             produced_artifact_ref      TEXT,
+             created_at                 TEXT NOT NULL,
+             actioned_at                TEXT,
+             dismissed_at               TEXT,
+             CHECK (
+                 (association_project_id IS NOT NULL AND association_task_id IS NULL)
+                 OR (association_project_id IS NULL  AND association_task_id IS NOT NULL)
+             )
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS attention_groups_grouping_key_idx
+             ON attention_groups(grouping_key, generation);
+         CREATE UNIQUE INDEX IF NOT EXISTS attention_groups_product_short_id_idx
+             ON attention_groups(product_id, short_id)
+             WHERE short_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS attention_groups_product_state_idx
+             ON attention_groups(product_id, state, created_at);
+
+         CREATE TABLE IF NOT EXISTS attentions (
+             id                  TEXT PRIMARY KEY,
+             group_id            TEXT NOT NULL
+                                     REFERENCES attention_groups(id) ON DELETE CASCADE,
+             ordinal             INTEGER NOT NULL,
+             source_anchor       TEXT,
+             answer_state        TEXT NOT NULL DEFAULT 'open',
+             created_at          TEXT NOT NULL,
+             answered_at         TEXT,
+             question_type       TEXT,
+             prompt_text         TEXT,
+             choice_options      TEXT,
+             answer              TEXT,
+             proposed_name       TEXT,
+             proposed_description TEXT,
+             proposed_effort     TEXT,
+             proposed_work_kind  TEXT,
+             rationale           TEXT,
+             confidence_source   TEXT NOT NULL DEFAULT 'structured'
+         );
+         CREATE INDEX IF NOT EXISTS attentions_group_idx
+             ON attentions(group_id, ordinal);",
+    )?;
+    Ok(())
+}
