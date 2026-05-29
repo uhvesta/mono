@@ -16,8 +16,12 @@ struct BossMacApp: App {
                 .task {
                     appDelegate.liveWorkerStates = chatModel.liveWorkerStates
                 }
+                .task {
+                    updateModel.startPollingIfNeeded()
+                }
         }
         .environmentObject(chatModel)
+        .environmentObject(updateModel)
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1060, height: 680)
         .commands {

@@ -59,6 +59,18 @@ public final class UpdateModel: ObservableObject {
         return UpdateModel(checker: checker)
     }
 
+    /// Returns a no-op model used when the bundle is unavailable (e.g. SwiftUI previews).
+    /// Badge is never shown; checks are no-ops.
+    public static func placeholder() -> UpdateModel {
+        UpdateModel(
+            checker: UpdateChecker(
+                currentVersionString: "0.0.0",
+                fullVersionString: "0.0.0-dev-placeholder",
+                fetcher: .noop
+            )
+        )
+    }
+
     /// Designated initializer. `defaults` and `jitterRange` are injectable for testing.
     init(
         checker: UpdateChecker,
