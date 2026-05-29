@@ -2641,6 +2641,24 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Periodic stale-worker liveness backstop: detects worker slots whose
+    // `claude` process is still alive but has made no transcript progress
+    // (no hook event) for longer than the staleness threshold while
+    // `activity=working` with no tool in flight. This is the wedged-
+    // dependency hang from issue #976 — a worker that backgrounded its
+    // pre-push bazel build and idled "until the gate is green" forever
+    // when bazel never completed. The dead-PID sweep cannot catch it
+    // (the process is alive), so this reaps the execution and releases
+    // the slot for redispatch. Runs every 60s and fires on boot.
+    let _stale_worker_sweep_handle = crate::stale_worker_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        Duration::from_secs(60),
+        crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
+    );
+
     // Periodic transient-recovery reconciler: detects workers wedged by
     // a transient Claude API error (the interactive `claude` session
     // printed the error, ended its turn, and sits Idle while the chore
