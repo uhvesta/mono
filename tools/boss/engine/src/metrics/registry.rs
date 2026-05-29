@@ -700,6 +700,8 @@ mod tests {
             "merge_poller.pr_recheck_unresolved",
             "merge_poller.merge_queue_rebounced",
             "merge_poller.late_pr_recovered",
+            "merge_poller.revision_invalidated",
+            "merge_poller.worker_stopped_on_review",
         ] {
             assert!(
                 names.contains(&expected.to_owned()),
@@ -728,7 +730,7 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        assert_eq!(names.len(), 40, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 8 merge_poller + 16 external_tracker counters");
+        assert_eq!(names.len(), 41, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 9 merge_poller + 16 external_tracker counters");
         // Phase 3: dep_unblock gauge.
         let gauge_names: Vec<_> = registry
             .gauge_snapshots()
