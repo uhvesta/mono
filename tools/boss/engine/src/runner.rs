@@ -333,11 +333,20 @@ impl ExecutionRunner for PaneSpawnRunner {
         // updated with the diagnosis JSON pre-spawn. Look it up by
         // work_item_id so the prompt composer renders the templated
         // markdown surface regardless of how the row got there.
+        //
+        // For revision_implementation executions with a merge-conflict
+        // provenance, look up the linked attempt by the id embedded in
+        // created_via (format: "merge-conflict:<crz_id>") so
+        // compose_revision_directive can inject the conflict fragment.
         let conflict_attempt = if execution.kind == "conflict_resolution" {
             self.work_db
                 .active_conflict_resolution_for_work_item(&execution.work_item_id)
                 .ok()
                 .flatten()
+        } else if execution.kind == "revision_implementation" {
+            work_item_created_via(work_item)
+                .and_then(|cv| cv.strip_prefix("merge-conflict:"))
+                .and_then(|id| self.work_db.get_conflict_resolution(id).ok().flatten())
         } else {
             None
         };
@@ -388,11 +397,20 @@ impl ExecutionRunner for PaneSpawnRunner {
         // The attempt row is created at CI-failure detection time
         // (`ci_watch::on_ci_failure_detected`) and updated by the
         // coordinator's `collect_ci_log_excerpt_pre_spawn` before spawn.
+        //
+        // For revision_implementation executions with a ci-fix provenance,
+        // look up the linked attempt by the id embedded in created_via
+        // (format: "ci-fix:<crm_id>") so compose_revision_directive can
+        // inject the CI remediation fragment.
         let ci_attempt = if execution.kind == "ci_remediation" {
             self.work_db
                 .active_ci_remediation_for_work_item(&execution.work_item_id)
                 .ok()
                 .flatten()
+        } else if execution.kind == "revision_implementation" {
+            work_item_created_via(work_item)
+                .and_then(|cv| cv.strip_prefix("ci-fix:"))
+                .and_then(|id| self.work_db.get_ci_remediation(id).ok().flatten())
         } else {
             None
         };
@@ -736,7 +754,7 @@ fn compose_execution_prompt(
             prompt.push_str(&compose_investigation_directive(work_item));
         }
         "revision_implementation" => {
-            prompt.push_str(&compose_revision_directive(execution, work_item, workspace_path));
+            prompt.push_str(&compose_revision_directive(execution, work_item, workspace_path, conflict_attempt, ci_attempt));
         }
         "task_implementation" | "chore_implementation" => {
             prompt.push_str(
@@ -920,10 +938,18 @@ fn compose_investigation_directive(work_item: &WorkItem) -> String {
 /// the PR owned by the parent task's chain root.  The revision worker must
 /// NOT open a new PR.  The parent's PR URL is carried in
 /// `execution.pr_url` (set at dispatch time).
+///
+/// When `conflict_attempt` or `ci_attempt` is `Some`, a signal-specific
+/// diagnostic fragment is appended (design Q3 of
+/// `unify-pr-remediation-on-revisions.md`): the existing diagnosis/log
+/// rendering from the bespoke composers is lifted into the shared revision
+/// directive rather than duplicated across three nearly-identical prompts.
 fn compose_revision_directive(
     execution: &crate::work::WorkExecution,
     work_item: &WorkItem,
     workspace_path: &Path,
+    conflict_attempt: Option<&ConflictResolution>,
+    ci_attempt: Option<&CiRemediation>,
 ) -> String {
     let description = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => task.description.trim().to_owned(),
@@ -981,6 +1007,12 @@ fn compose_revision_directive(
          - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
          - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, stop and explain.\n"
     ));
+    if let Some(attempt) = conflict_attempt {
+        out.push_str(&compose_conflict_resolution_fragment(attempt));
+    }
+    if let Some(attempt) = ci_attempt {
+        out.push_str(&compose_ci_remediation_fragment(attempt));
+    }
     out
 }
 
@@ -1006,6 +1038,303 @@ fn canonical_design_doc_path_line(parent_project: Option<&Project>) -> Option<St
     Some(format!(
         "- the project's `design_doc_path` pointer is not yet set. Place the doc at `docs/designs/{slug}.md` (the repo's convention; adjust to the product's docs layout if the repo already has one — e.g. `tools/boss/docs/designs/{slug}.md` for the Boss product). After you create the file, set the pointer with `boss project set-design-doc --project <id> --path <path>` so the next run resolves it directly.\n",
     ))
+}
+
+/// Signal-specific fragment appended to `compose_revision_directive` when the
+/// revision was created with `created_via = "merge-conflict:<crz_id>"`.
+///
+/// Provides the conflict context and diagnosis that the worker needs to
+/// resolve the merge conflict — identical in content to the bespoke
+/// `compose_conflict_resolution_prompt` except that the branch/push spine
+/// is already covered by the shared revision directive, so this fragment
+/// covers only the signal-specific parts: the diagnosis block, rebase
+/// instructions, stop conditions, and post-resolution PR comment template.
+fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String {
+    let mut out = String::new();
+    out.push_str("\n---\n\n");
+    out.push_str(&format!(
+        "## Conflict resolution context: PR #{pr_num} against `{base}`\n\n",
+        pr_num = attempt.pr_number,
+        base = attempt.base_branch,
+    ));
+    out.push_str(&format!(
+        "**Branch**: `{}` based off `{}`\n",
+        attempt.head_branch, attempt.base_branch,
+    ));
+    if let Some(base_sha) = attempt.base_sha_at_trigger.as_deref() {
+        out.push_str(&format!(
+            "**Base sha at conflict detection**: `{base_sha}` (current `{}` may be ahead)\n",
+            attempt.base_branch,
+        ));
+    }
+    out.push_str(&format!("**Attempt id**: `{}`\n\n", attempt.id));
+    out.push_str(
+        "This PR was in code review when `main` moved under it. The PR's diff against\n\
+         the current `main` does not apply cleanly. Your task in step 3 above is to\n\
+         resolve the conflicts — **you are not adding new work to this PR.**\n\n",
+    );
+    out.push_str("### Rebase steps (replaces step 3)\n\n");
+    out.push_str(&format!("1. `jj edit {}`\n", attempt.head_branch));
+    out.push_str(&format!(
+        "2. `jj rebase -d {} -b {}`\n",
+        attempt.base_branch, attempt.head_branch,
+    ));
+    out.push_str(
+        "3. If the rebase reports a conflict:\n\
+            - Inspect with `jj st`, `jj resolve --list <file>`.\n\
+            - Resolve each conflict. Read the conflict diagnosis below for what was\n  \
+              touched on the upstream side.\n\n",
+    );
+    out.push_str("### Conflict diagnosis (from the engine's pre-spawn pass)\n\n");
+    match attempt
+        .conflict_diagnosis
+        .as_deref()
+        .map(serde_json::from_str::<ConflictDiagnosis>)
+    {
+        Some(Ok(diagnosis)) => out.push_str(&render_diagnosis_markdown(&diagnosis)),
+        Some(Err(err)) => {
+            out.push_str(&format!(
+                "_Engine could not re-parse the diagnosis JSON (error: {err}). The\n\
+                 raw blob is on `conflict_resolutions.conflict_diagnosis` if you need it._\n",
+            ));
+        }
+        None => {
+            out.push_str(
+                "_No engine-collected diagnosis is available for this attempt. Use\n\
+                 `jj st` and `jj resolve --list` after the rebase to discover the\n\
+                 conflicts directly._\n",
+            );
+        }
+    }
+    out.push_str("\n### Stop conditions\n\n");
+    out.push_str(
+        "If any of the following applies, comment on the PR explaining the situation,\n\
+         do NOT push, and run `boss engine conflicts mark-failed <attempt-id> --reason <r>`\n\
+         with the appropriate reason — the engine will mark the attempt `failed`:\n\n\
+            1. **Semantic obsolescence** — the upstream change accomplished what this PR\n   \
+            was trying to do. Reason: `obsolescence_suspected`.\n\
+            2. **Product decision required** — the conflict needs a human choice between\n   \
+            two valid resolutions. Reason: `product_decision_required`.\n\
+            3. **Architectural mismatch** — the upstream removed an abstraction this PR\n   \
+            was extending. Reason: `architectural_mismatch`.\n\n\
+         Do NOT close the PR yourself. Closing is the human's call.\n\n",
+    );
+    out.push_str("### Post-resolution PR comment template\n\n");
+    out.push_str(
+        "```\n\
+         🤖 boss resolved merge conflicts on this PR after `main` moved.\n\n\
+         Resolutions:\n\
+         - <per-file resolution summary>\n\n\
+         Branch force-pushed; per branch protection, prior approvals have been dismissed.\n\
+         Re-review when ready.\n\
+         ```\n\n",
+    );
+    out
+}
+
+/// Signal-specific fragment appended to `compose_revision_directive` when the
+/// revision was created with `created_via = "ci-fix:<crm_id>"`.
+///
+/// Provides the CI remediation context (failing checks, log excerpt, playbook)
+/// that the worker needs to fix the failing CI — identical in content to the
+/// bespoke `compose_ci_remediation_prompt` except that the branch/push spine
+/// is already covered by the shared revision directive.
+fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
+    let is_rebounce = attempt
+        .failure_kind
+        .as_deref()
+        .map_or(false, |k| k == "merge_queue_rebounce");
+
+    let mut out = String::new();
+    out.push_str("\n---\n\n");
+
+    if is_rebounce {
+        out.push_str(&format!(
+            "## CI remediation context: PR #{pr_num} ({kind}) — merge-queue FAILED_CHECKS\n\n",
+            pr_num = attempt.pr_number,
+            kind = attempt.attempt_kind,
+        ));
+        out.push_str(
+            "> **Important**: this is a **merge-queue rebounce**, not a per-PR CI failure.\n\
+             > - The PR's own required checks are **green** on its head SHA. Do NOT look at them.\n\
+             > - The failure happened on the **synthetic merge commit** GitHub assembled when the PR\n\
+             >   entered the queue. See `Synthetic merge SHA` below.\n\
+             > - Root cause: something landed on `main` between this PR's CI run and its queue turn\n\
+             >   that is semantically incompatible. After fixing, **re-enqueue** the PR.\n\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "## CI remediation context: PR #{pr_num} ({kind}) — required checks failing\n\n",
+            pr_num = attempt.pr_number,
+            kind = attempt.attempt_kind,
+        ));
+    }
+
+    if !attempt.head_branch.is_empty() {
+        out.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
+    }
+    if is_rebounce {
+        if let Some(ref sha) = attempt.before_commit_sha {
+            out.push_str(&format!(
+                "**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "**Head sha at trigger**: `{}`\n",
+        attempt.head_sha_at_trigger,
+    ));
+    out.push_str(&format!("**Attempt id**: `{}`\n\n", attempt.id));
+
+    out.push_str("### Failing required checks\n\n");
+    match render_failed_checks_markdown(&attempt.failed_checks) {
+        Some(md) => out.push_str(&md),
+        None => out.push_str(
+            "_The engine did not record a parseable `failed_checks` blob for this attempt. \
+             Read `gh pr checks` to enumerate the failing required checks before deciding the fix._\n",
+        ),
+    }
+    out.push('\n');
+
+    if attempt.attempt_kind == "retrigger" {
+        out.push_str("### Action: retrigger the failing build\n\n");
+        out.push_str(
+            "The engine has pre-classified this failure as infra (every failing check has \
+             `conclusion ∈ {STARTUP_FAILURE, CANCELLED}`). No log read or code change is needed.\n\n",
+        );
+        out.push_str(
+            "1. Re-run the failing build via the per-provider CLI (`bk build retry <build-id>` \
+             for Buildkite or `gh run rerun <run-id> --failed` for GitHub Actions). The failing \
+             check's `target_url` above carries the right id.\n\
+             2. Call `boss engine ci mark-retriggered --attempt-id <attempt-id> --new-id <new-build-or-run-id>` \
+             so the engine records the new run id and stays out of the budget path. Do NOT call \
+             `mark-failed` or push code.\n\
+             3. Stop. The merge-poller will observe the re-run's outcome on the next sweep.\n\n",
+        );
+    } else {
+        if is_rebounce {
+            out.push_str("### Action: rebase onto current main, then fix the semantic conflict\n\n");
+            out.push_str(
+                "A merge-queue rebounce almost always means something landed on `main` between \
+                 this PR's CI run and its queue turn that is **semantically incompatible**.\n\
+                 Fix is: rebase, look at the CI failure on the synthetic merge SHA, add a focused \
+                 fix, push, and re-enqueue the PR.\n\n",
+            );
+        } else {
+            out.push_str("### Action: rebase first, then fix\n\n");
+            out.push_str(
+                "Many CI failures on long-running PRs are caused by `main` moving. The cheapest \
+                 experiment is rebasing onto `main` HEAD before changing any code — if CI goes \
+                 green after the rebase, no fix-attempt slot is consumed.\n\n",
+            );
+        }
+        out.push_str("**Step 1 — Rebase onto base HEAD and force-push** (replaces step 3 above).\n\n");
+        out.push_str(&format!(
+            "```\n\
+             jj edit {branch}\n\
+             jj rebase -d main -b {branch}\n\
+             # then push via step 5 of the revision directive\n\
+             ```\n\n",
+            branch = if attempt.head_branch.is_empty() {
+                "<branch>"
+            } else {
+                attempt.head_branch.as_str()
+            },
+        ));
+        if is_rebounce {
+            out.push_str(
+                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
+                 - **If post-rebase CI is green**, call \
+                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. \
+                 Then re-enqueue the PR (`gh pr merge --auto --squash`). The engine flips the \
+                 attempt to `succeeded` and the budget slot is not consumed.\n\
+                 - **If post-rebase CI is still red**, the semantic conflict requires a code fix — \
+                 continue to Step 2.\n\n",
+            );
+        } else {
+            out.push_str(
+                "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
+                 - **If post-rebase CI is green**, call \
+                 `boss engine ci mark-succeeded-via-rebase --attempt-id <attempt-id>` and stop. The \
+                 engine flips the attempt to `succeeded`, sets `consumes_budget = 0`, and decrements \
+                 `tasks.ci_attempts_used` so this attempt does not count against the PR's budget.\n\
+                 - **If post-rebase CI is still red**, continue to Step 2. The budget slot is now \
+                 consumed; this is the fix attempt the engine pre-classified.\n\n",
+            );
+        }
+
+        out.push_str("**Step 2 — Read the log, classify, fix, push.**\n\n");
+        if is_rebounce {
+            let sha_hint = attempt
+                .before_commit_sha
+                .as_deref()
+                .unwrap_or("<synthetic-merge-sha>");
+            out.push_str(&format!(
+                "Fetch CI logs from the **synthetic merge SHA `{sha_hint}`**, not the PR head \
+                 (whose checks are green). Use the per-provider CLI:\n\n\
+                 - Buildkite: `bk job log <job-id>` (job id from the failing check URL)\n\
+                 - GitHub Actions: `gh run view --log-failed --job <job-id>` (job id from failing check URL)\n\n",
+            ));
+        } else {
+            out.push_str("Engine-collected log excerpt (failing job tail):\n\n");
+            match attempt.log_excerpt.as_deref().map(str::trim) {
+                Some(tail) if !tail.is_empty() => {
+                    out.push_str("```\n");
+                    out.push_str(tail);
+                    out.push_str("\n```\n\n");
+                }
+                _ => {
+                    out.push_str(
+                        "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
+                         Shell out to the per-provider CLI (`bk job log <job-id>` / \
+                         `gh run view --log-failed --job <job-id>`) from the failing check's `target_url`._\n\n",
+                    );
+                }
+            }
+        }
+        out.push_str(
+            "1. Classify the failure with `boss engine ci classify --attempt-id <attempt-id> --class <tractable|flaky_or_infra|unfixable>`.\n   \
+                - `tractable` → there's a clear code change that resolves it. Make it. Push.\n   \
+                - `flaky_or_infra` → the failure is environmental. Pivot to the retrigger playbook \
+                (re-run the failing build via the provider CLI and call `mark-retriggered`).\n   \
+                - `unfixable` → the failure is real and out of scope. Call \
+                `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
+                and stop. Do NOT push.\n",
+        );
+        out.push_str(
+            "2. No `test_command` context is available here; rely on CI to verify the push.\n",
+        );
+        out.push_str(&format!(
+            "3. Push your fix via step 5 of the revision directive (push to the parent branch \
+                `{branch}`). The merge-poller will observe the new head sha and re-evaluate CI on \
+                the next sweep — when green it flips the attempt to `succeeded` and unblocks the parent.\n\n",
+            branch = if attempt.head_branch.is_empty() {
+                "<branch>"
+            } else {
+                attempt.head_branch.as_str()
+            },
+        ));
+        if is_rebounce {
+            out.push_str(
+                "**Step 3 (after CI is green) — Re-enqueue the PR.**\n\n\
+                 The merge queue does **not** auto-retry after a dequeue. After your push produces \
+                 green CI, re-add the PR to the merge queue:\n\n\
+                 ```\n\
+                 gh pr merge --auto --squash  # or --merge / --rebase per repo policy\n\
+                 ```\n\n",
+            );
+        }
+    }
+
+    out.push_str("### Stop conditions\n\n");
+    out.push_str(
+        "- **You are not adding scope.** The only allowed change is one that makes the failing \
+         required checks pass (rebase, infra retrigger, or a focused fix).\n\
+         - **Do not close the PR yourself.** Closing is the human's call.\n\
+         - **Always pass `-m \"…\"` to `jj describe` / `jj squash`.** The worker \
+         environment has no usable `$EDITOR`.\n\n",
+    );
+    out
 }
 
 /// Templated prompt for the `conflict_resolution` execution kind
@@ -1491,6 +1820,15 @@ fn work_item_id(work_item: &WorkItem) -> &str {
 fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
     match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => Some(&task.kind),
+        WorkItem::Product(_) | WorkItem::Project(_) => None,
+    }
+}
+
+/// Return the `created_via` provenance string for task work items.
+/// Returns `None` for products and projects.
+fn work_item_created_via(work_item: &WorkItem) -> Option<&str> {
+    match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => Some(&task.created_via),
         WorkItem::Product(_) | WorkItem::Project(_) => None,
     }
 }
@@ -2562,6 +2900,207 @@ mod compose_prompt_tests {
                 "`{marker}` at the root must be recognized as a Bazel workspace",
             );
         }
+    }
+
+    // Helpers shared by revision fragment tests.
+
+    fn revision_task_with_created_via(pr_url: Option<&str>, created_via: &str) -> WorkItem {
+        let mut task = crate::work::Task::builder()
+            .id("task-rev-1")
+            .product_id("prod-1")
+            .kind("revision")
+            .name("Revision task")
+            .description("Fix the merge conflict.")
+            .status("doing")
+            .created_at("2026-05-15T00:00:00Z")
+            .updated_at("2026-05-15T00:00:00Z")
+            .autostart(false)
+            .created_via(created_via)
+            .build();
+        task.pr_url = pr_url.map(|s| s.to_owned());
+        WorkItem::Task(task)
+    }
+
+    fn sample_conflict_attempt() -> crate::work::ConflictResolution {
+        use crate::conflict_diagnosis::{ConflictDiagnosis, ConflictedFile};
+        let diag = ConflictDiagnosis {
+            schema_version: 1,
+            base_sha: "aaa111".into(),
+            head_sha: "bbb222".into(),
+            files: vec![ConflictedFile {
+                path: "src/lib.rs".into(),
+                marker_count: Some(1),
+                shape: "content".into(),
+            }],
+            error: None,
+        };
+        crate::work::ConflictResolution {
+            id: "crz_frag_01".into(),
+            product_id: "prod-1".into(),
+            work_item_id: "task-rev-1".into(),
+            pr_url: "https://github.com/org/repo/pull/77".into(),
+            pr_number: 77,
+            head_branch: "feature/frag".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("aaa111".into()),
+            head_sha_before: None,
+            head_sha_after: None,
+            status: "running".into(),
+            failure_reason: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            worker_id: None,
+            conflict_diagnosis: Some(serde_json::to_string(&diag).unwrap()),
+            created_at: "2026-05-15T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            revision_task_id: Some("task-rev-1".into()),
+        }
+    }
+
+    fn sample_ci_attempt() -> crate::work::CiRemediation {
+        crate::work::CiRemediation {
+            id: "crm_frag_01".into(),
+            product_id: "prod-1".into(),
+            work_item_id: "task-rev-1".into(),
+            pr_url: "https://github.com/org/repo/pull/77".into(),
+            pr_number: 77,
+            head_branch: "feature/frag".into(),
+            head_sha_at_trigger: "ccc333".into(),
+            head_sha_after: None,
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: r#"[{"name":"ci/test","conclusion":"FAILURE","target_url":"https://buildkite.com/builds/123","provider":"buildkite","provider_job_id":"job-456"}]"#.into(),
+            triage_class: None,
+            log_excerpt: Some("ERROR: test failed at line 42".into()),
+            status: "running".into(),
+            failure_reason: None,
+            cube_lease_id: None,
+            cube_workspace_id: None,
+            worker_id: None,
+            created_at: "2026-05-15T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            failure_kind: None,
+            before_commit_sha: None,
+            revision_task_id: Some("task-rev-1".into()),
+        }
+    }
+
+    #[test]
+    fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
+        let work_item = revision_task_with_created_via(
+            None,
+            "merge-conflict:crz_frag_01",
+        );
+        let attempt = sample_conflict_attempt();
+        let prompt = compose_execution_prompt(
+            &revision_execution("https://github.com/org/repo/pull/77"),
+            &work_item,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            Some(&attempt),
+            None,
+            None,
+        );
+        // Must contain the conflict-resolution section header.
+        assert!(
+            prompt.contains("## Conflict resolution context"),
+            "conflict fragment must be injected into revision directive:\n{prompt}",
+        );
+        // Must embed the attempt id.
+        assert!(
+            prompt.contains("`crz_frag_01`"),
+            "conflict fragment must include the attempt id:\n{prompt}",
+        );
+        // Must embed the diagnosis file.
+        assert!(
+            prompt.contains("`src/lib.rs`"),
+            "conflict fragment must render the conflict diagnosis:\n{prompt}",
+        );
+        // Must include the stop conditions.
+        assert!(
+            prompt.contains("boss engine conflicts mark-failed"),
+            "conflict fragment must include the mark-failed stop condition:\n{prompt}",
+        );
+        // Must still contain the base revision directive spine.
+        assert!(
+            prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+            "base revision directive must still be present:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn revision_directive_with_ci_fix_provenance_injects_ci_fragment() {
+        let work_item = revision_task_with_created_via(
+            None,
+            "ci-fix:crm_frag_01",
+        );
+        let attempt = sample_ci_attempt();
+        let prompt = compose_execution_prompt(
+            &revision_execution("https://github.com/org/repo/pull/77"),
+            &work_item,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            Some(&attempt),
+        );
+        // Must contain the CI remediation section header.
+        assert!(
+            prompt.contains("## CI remediation context"),
+            "CI fragment must be injected into revision directive:\n{prompt}",
+        );
+        // Must embed the attempt id.
+        assert!(
+            prompt.contains("`crm_frag_01`"),
+            "CI fragment must include the attempt id:\n{prompt}",
+        );
+        // Must embed the failing check name.
+        assert!(
+            prompt.contains("`ci/test`"),
+            "CI fragment must render the failing check list:\n{prompt}",
+        );
+        // Must embed the log excerpt.
+        assert!(
+            prompt.contains("ERROR: test failed at line 42"),
+            "CI fragment must include the log excerpt:\n{prompt}",
+        );
+        // Must still contain the base revision directive spine.
+        assert!(
+            prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+            "base revision directive must still be present:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn revision_directive_without_provenance_has_no_fragment() {
+        // Operator-triggered revision: no conflict or CI attempt → no fragment.
+        let work_item = revision_task_with_created_via(None, "operator");
+        let prompt = compose_execution_prompt(
+            &revision_execution("https://github.com/org/repo/pull/77"),
+            &work_item,
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("## Conflict resolution context"),
+            "no conflict fragment for operator revision:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("## CI remediation context"),
+            "no CI fragment for operator revision:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
+            "base revision directive must still be present:\n{prompt}",
+        );
     }
 }
 
