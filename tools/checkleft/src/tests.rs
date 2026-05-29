@@ -31,7 +31,7 @@ fn human_output_includes_line_and_column() {
 
     assert!(output.contains("error[typo]: Found typo `teh`; use `the` instead."));
     assert!(output.contains("  --> docs/CHECKS.toml:12:5"));
-    assert!(output.contains("   = help: Replace typo."));
+    assert!(output.contains("   = to resolve: Replace typo."));
 }
 
 #[test]

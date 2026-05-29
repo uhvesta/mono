@@ -511,7 +511,7 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
         } else {
             out.push_str(&format!(
                 "   = {}: {}\n",
-                style.paint_help_label("help"),
+                style.paint_help_label("to resolve"),
                 style.paint_help_body(remediation)
             ));
         }
