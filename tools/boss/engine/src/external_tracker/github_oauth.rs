@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use tokio::time::sleep;
 
@@ -124,9 +124,9 @@ pub struct DeviceCodeInfo {
     pub interval_secs: u64,
 }
 
-/// Captured token with identity metadata.  T-3 will persist this in the
-/// macOS keychain.
-#[derive(Debug, Clone)]
+/// Captured token with identity metadata.  Persisted in the macOS keychain
+/// by [`KeychainTokenStore`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenRecord {
     pub token: String,
     pub login: String,
@@ -674,6 +674,135 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+// ── KeychainTokenStore ────────────────────────────────────────────────────────
+
+/// OS keychain coordinates for the stored OAuth token.
+pub(crate) const KEYCHAIN_SERVICE: &str = "dev.spinyfin.boss.github";
+pub(crate) const KEYCHAIN_ACCOUNT: &str = "oauth-user-token@github.com";
+
+/// Error type for [`KeychainTokenStore`] operations.
+#[derive(Debug, thiserror::Error)]
+pub enum TokenStoreError {
+    #[error("keychain error: {0}")]
+    Keychain(#[from] keyring::Error),
+    #[error("token record (de)serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// Low-level storage backend abstraction.  The production impl uses
+/// [`keyring::Entry`]; tests inject [`FakeStore`] to avoid touching the
+/// real keychain.
+pub(crate) trait KeystoreBackend: Send + Sync {
+    fn get_raw(&self) -> Result<Option<String>, TokenStoreError>;
+    fn set_raw(&self, value: &str) -> Result<(), TokenStoreError>;
+    fn delete_raw(&self) -> Result<(), TokenStoreError>;
+}
+
+/// Production backend: delegates to the OS keychain via `keyring::Entry`.
+struct KeyringBackend;
+
+impl KeystoreBackend for KeyringBackend {
+    fn get_raw(&self) -> Result<Option<String>, TokenStoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        match entry.get_password() {
+            Ok(s) => Ok(Some(s)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(TokenStoreError::Keychain(e)),
+        }
+    }
+
+    fn set_raw(&self, value: &str) -> Result<(), TokenStoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        entry.set_password(value).map_err(TokenStoreError::Keychain)
+    }
+
+    fn delete_raw(&self) -> Result<(), TokenStoreError> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(TokenStoreError::Keychain(e)),
+        }
+    }
+}
+
+/// Stores and retrieves a [`TokenRecord`] in the OS keychain.
+///
+/// The value at rest is a JSON blob serialised from / into [`TokenRecord`].
+/// Production code constructs this with [`KeychainTokenStore::new`]; tests
+/// supply a [`FakeStore`] via [`KeychainTokenStore::with_backend`].
+pub struct KeychainTokenStore {
+    backend: Box<dyn KeystoreBackend>,
+}
+
+impl KeychainTokenStore {
+    /// Creates a store backed by the real OS keychain.
+    pub fn new() -> Self {
+        Self { backend: Box::new(KeyringBackend) }
+    }
+
+    /// Creates a store backed by the given test fake.  Only available in
+    /// `#[cfg(test)]` builds.
+    #[cfg(test)]
+    pub(crate) fn with_backend(backend: impl KeystoreBackend + 'static) -> Self {
+        Self { backend: Box::new(backend) }
+    }
+
+    /// Returns the stored [`TokenRecord`], or `None` if no token is present.
+    pub fn get(&self) -> Result<Option<TokenRecord>, TokenStoreError> {
+        match self.backend.get_raw()? {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persists a [`TokenRecord`] in the keychain, overwriting any prior value.
+    pub fn set(&self, record: &TokenRecord) -> Result<(), TokenStoreError> {
+        let s = serde_json::to_string(record)?;
+        self.backend.set_raw(&s)
+    }
+
+    /// Removes the stored token.  A no-op if none is present.
+    pub fn delete(&self) -> Result<(), TokenStoreError> {
+        self.backend.delete_raw()
+    }
+}
+
+// ── FakeStore (test-only) ─────────────────────────────────────────────────────
+
+/// In-memory [`KeystoreBackend`] for tests.  Never touches the real keychain.
+#[cfg(test)]
+pub(crate) struct FakeStore(std::sync::Mutex<Option<String>>);
+
+#[cfg(test)]
+impl FakeStore {
+    pub(crate) fn empty() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    pub(crate) fn prefilled(record: &TokenRecord) -> Self {
+        let s = serde_json::to_string(record).expect("TokenRecord should serialize");
+        Self(std::sync::Mutex::new(Some(s)))
+    }
+}
+
+#[cfg(test)]
+impl KeystoreBackend for FakeStore {
+    fn get_raw(&self) -> Result<Option<String>, TokenStoreError> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+
+    fn set_raw(&self, value: &str) -> Result<(), TokenStoreError> {
+        *self.0.lock().unwrap() = Some(value.to_owned());
+        Ok(())
+    }
+
+    fn delete_raw(&self) -> Result<(), TokenStoreError> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -682,6 +811,61 @@ mod tests {
 
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sample_record() -> TokenRecord {
+        TokenRecord {
+            token: "gho_sample".to_owned(),
+            login: "octocat".to_owned(),
+            granted_scopes: vec!["repo".to_owned(), "project".to_owned()],
+            obtained_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn keychain_store_round_trips_token_record() {
+        let store = KeychainTokenStore::with_backend(FakeStore::empty());
+        assert!(store.get().unwrap().is_none());
+
+        let record = sample_record();
+        store.set(&record).unwrap();
+
+        let got = store.get().unwrap().expect("should have a record");
+        assert_eq!(got.token, record.token);
+        assert_eq!(got.login, record.login);
+        assert_eq!(got.granted_scopes, record.granted_scopes);
+        assert_eq!(got.obtained_at, record.obtained_at);
+    }
+
+    #[test]
+    fn keychain_store_delete_removes_record() {
+        let store = KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record()));
+        assert!(store.get().unwrap().is_some());
+
+        store.delete().unwrap();
+        assert!(store.get().unwrap().is_none());
+    }
+
+    #[test]
+    fn keychain_store_delete_is_idempotent_when_empty() {
+        let store = KeychainTokenStore::with_backend(FakeStore::empty());
+        store.delete().unwrap(); // should not error
+    }
+
+    #[test]
+    fn keychain_store_set_overwrites_existing_record() {
+        let store = KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record()));
+        let new_record = TokenRecord {
+            token: "gho_new_token".to_owned(),
+            login: "newuser".to_owned(),
+            granted_scopes: vec!["repo".to_owned()],
+            obtained_at: 1_800_000_000,
+        };
+        store.set(&new_record).unwrap();
+
+        let got = store.get().unwrap().expect("should have a record");
+        assert_eq!(got.token, "gho_new_token");
+        assert_eq!(got.login, "newuser");
+    }
 
     // Install rustls crypto provider once per test process.
     fn test_client() -> reqwest::Client {

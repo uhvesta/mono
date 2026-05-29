@@ -252,6 +252,7 @@ dependencies = [
  "boss-protocol",
  "clap",
  "fastrand 2.3.0",
+ "keyring",
  "libc",
  "regex",
  "reqwest",

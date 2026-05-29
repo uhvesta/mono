@@ -1,8 +1,12 @@
 //! Credential resolution for external trackers.
 //!
-//! The v1 implementation relies on the ambient `gh` login: `gh auth status`
-//! confirms the user is authenticated; every subsequent `gh api` call inherits
-//! that credential implicitly. No PAT is stored in Boss state.
+//! Two resolvers are provided:
+//!
+//! - [`GhAuthStatusResolver`] — v1: delegates to `gh auth status` and returns
+//!   an ambient credential (no stored token).
+//! - [`KeychainOAuthResolver`] — v2: checks the OS keychain for a stored OAuth
+//!   token first, and falls back to [`GhAuthStatusResolver`] when none is
+//!   present.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,6 +16,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use super::TrackerCredential;
+use super::github_oauth::KeychainTokenStore;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -110,6 +115,61 @@ impl TrackerCredentialResolver for GhAuthStatusResolver {
     }
 }
 
+// ── KeychainOAuthResolver ─────────────────────────────────────────────────────
+
+/// Resolves a [`TrackerCredential`] by consulting the OS keychain first.
+///
+/// When a stored OAuth token is present for GitHub, it is returned directly.
+/// When absent (or if the keychain is unavailable), the resolver delegates to
+/// [`GhAuthStatusResolver`] which relies on the ambient `gh` login.
+///
+/// # Keychain errors
+/// A keychain access failure is treated as "no stored token" — a warning is
+/// logged and the fallback resolver is used.  This keeps sync working on
+/// machines where the engine process cannot access the keychain (e.g. headless
+/// CI without a login keychain unlocked).
+pub struct KeychainOAuthResolver {
+    store: KeychainTokenStore,
+    fallback: GhAuthStatusResolver,
+}
+
+impl KeychainOAuthResolver {
+    pub fn new(store: KeychainTokenStore) -> Self {
+        Self { store, fallback: GhAuthStatusResolver::default() }
+    }
+
+    /// Test constructor: supply a custom fallback resolver (e.g. one pointing
+    /// at a fake `gh` binary).
+    #[cfg(test)]
+    pub(crate) fn with_fallback(store: KeychainTokenStore, fallback: GhAuthStatusResolver) -> Self {
+        Self { store, fallback }
+    }
+}
+
+#[async_trait]
+impl TrackerCredentialResolver for KeychainOAuthResolver {
+    async fn resolve(
+        &self,
+        kind: &str,
+        config: &serde_json::Value,
+    ) -> Result<TrackerCredential, TrackerCredentialError> {
+        if kind == "github" {
+            match self.store.get() {
+                Ok(Some(record)) => return Ok(TrackerCredential { token: record.token }),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boss_engine::external_tracker::credentials",
+                        error = %e,
+                        "keychain unavailable; falling back to ambient gh for GitHub sync"
+                    );
+                }
+            }
+        }
+        self.fallback.resolve(kind, config).await
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -117,6 +177,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    use crate::external_tracker::github_oauth::{FakeStore, KeychainTokenStore, TokenRecord};
 
     /// Write a shell script to a temp file, close the write fd, and make it executable.
     ///
@@ -178,6 +240,69 @@ mod tests {
             .resolve("jira", &serde_json::Value::Null)
             .await
             .expect_err("should fail");
+        assert!(
+            matches!(err, TrackerCredentialError::UnsupportedKind(ref k) if k == "jira"),
+            "expected UnsupportedKind(jira), got {err:?}"
+        );
+    }
+
+    fn sample_record() -> TokenRecord {
+        TokenRecord {
+            token: "gho_resolver_test_token".to_owned(),
+            login: "testuser".to_owned(),
+            granted_scopes: vec!["repo".to_owned()],
+            obtained_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn keychain_resolver_returns_stored_token_when_present() {
+        let store = KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record()));
+        let resolver = KeychainOAuthResolver::new(store);
+        let cred = resolver
+            .resolve("github", &serde_json::Value::Null)
+            .await
+            .expect("should succeed");
+        assert_eq!(cred.token, "gho_resolver_test_token");
+    }
+
+    #[tokio::test]
+    async fn keychain_resolver_falls_back_to_ambient_when_no_stored_token() {
+        let fake_gh = make_fake_gh("exit 0");
+        let store = KeychainTokenStore::with_backend(FakeStore::empty());
+        let fallback = GhAuthStatusResolver::with_gh_binary(&*fake_gh);
+        let resolver = KeychainOAuthResolver::with_fallback(store, fallback);
+        let cred = resolver
+            .resolve("github", &serde_json::Value::Null)
+            .await
+            .expect("should succeed");
+        assert_eq!(cred.token, ""); // ambient credential
+    }
+
+    #[tokio::test]
+    async fn keychain_resolver_falls_back_and_propagates_gh_error_when_gh_fails() {
+        let fake_gh = make_fake_gh("echo 'not logged in' >&2; exit 1");
+        let store = KeychainTokenStore::with_backend(FakeStore::empty());
+        let fallback = GhAuthStatusResolver::with_gh_binary(&*fake_gh);
+        let resolver = KeychainOAuthResolver::with_fallback(store, fallback);
+        let err = resolver
+            .resolve("github", &serde_json::Value::Null)
+            .await
+            .expect_err("should fail when both keychain and gh are unavailable");
+        assert!(
+            matches!(err, TrackerCredentialError::AuthFailed { .. }),
+            "expected AuthFailed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keychain_resolver_delegates_non_github_kind_to_fallback() {
+        let store = KeychainTokenStore::with_backend(FakeStore::empty());
+        let resolver = KeychainOAuthResolver::new(store);
+        let err = resolver
+            .resolve("jira", &serde_json::Value::Null)
+            .await
+            .expect_err("should fail for non-github kind");
         assert!(
             matches!(err, TrackerCredentialError::UnsupportedKind(ref k) if k == "jira"),
             "expected UnsupportedKind(jira), got {err:?}"

@@ -19,6 +19,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 shlex = { workspace = true }
 rusqlite = { workspace = true }
 regex = { workspace = true }
+keyring = { workspace = true, features = ["apple-native"] }
 reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
 sha2 = { workspace = true }
