@@ -64,11 +64,14 @@ pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
 pub const CI_CHURN_LIMIT: i64 = 5;
 
 pub use boss_protocol::{
-    AddDependencyInput, BlockedSignal, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN,
-    CiBudgetSnapshot, CiRemediation, ConflictResolution, CreateAttentionItemInput,
-    CreateChoreInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
-    DependencyDirection, DependencyEdge, DependencyFilter, EffortLevel, EngineAttemptListEntry,
+    AddDependencyInput, BlockedSignal, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED,
+    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_UNKNOWN,
+    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution, ConflictResolution,
+    CreateAttentionItemInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge,
+    DependencyFilter, EffortLevel, EngineAttemptListEntry, RESOLVED_WITH_EXACT,
+    RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, ResolvedComment, WorkComment,
     ExecutionReconcileResult, ListDependenciesInput, Product, Project, ProjectDesignDocState,
     RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedDesignDoc,
     ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem,
@@ -158,6 +161,7 @@ impl Clone for WorkDb {
 mod audit_misc;
 mod blocking;
 mod chain_helpers;
+mod comments;
 mod conflict_res;
 mod create_entities;
 mod dep_helpers;

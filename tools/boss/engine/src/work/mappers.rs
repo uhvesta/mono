@@ -55,6 +55,35 @@ pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+/// Maps a `work_comments` row. Column order must match the SELECT used by
+/// every comment query in `work/comments.rs`:
+/// `id, artifact_kind, artifact_id, doc_version, anchor_json, body, author,
+///  status, status_actor, last_resolved_with, plain_text_projection_version,
+///  created_at, updated_at, dismissed_at`.
+/// A corrupt `anchor_json` degrades to an empty anchor (the comment still
+/// lists; it simply orphans on the next resolve) rather than failing the
+/// whole list query.
+pub(crate) fn map_comment(row: &Row<'_>) -> rusqlite::Result<WorkComment> {
+    let anchor_json: String = row.get(4)?;
+    let anchor: CommentAnchor = serde_json::from_str(&anchor_json).unwrap_or_default();
+    Ok(WorkComment {
+        id: row.get(0)?,
+        artifact_kind: row.get(1)?,
+        artifact_id: row.get(2)?,
+        doc_version: row.get(3)?,
+        anchor,
+        body: row.get(5)?,
+        author: row.get(6)?,
+        status: row.get(7)?,
+        status_actor: row.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
+        last_resolved_with: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
+        plain_text_projection_version: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        dismissed_at: row.get::<_, Option<String>>(13)?.filter(|s| !s.is_empty()),
+    })
+}
+
 pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     let effort_raw: Option<String> = row.get(19)?;
     let effort_level = match effort_raw.as_deref() {

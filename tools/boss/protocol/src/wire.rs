@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
-    AddDependencyInput, CiBudgetSnapshot, CiRemediation, ConflictResolution,
-    CreateAttentionItemInput, CreateChoreInput, CreateExecutionInput, CreateInvestigationInput,
+    AddDependencyInput, CiBudgetSnapshot, CiRemediation, CommentAnchor, ConflictResolution,
+    CreateAttentionItemInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput,
+    CreateInvestigationInput, ResolvedComment, WorkComment,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
     EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
@@ -39,6 +40,14 @@ pub fn execution_topic(execution_id: &str) -> String {
 /// queued probe and watches the next Stop boundary land.
 pub fn probe_topic(run_id: &str) -> String {
     format!("probes.{run_id}")
+}
+
+/// Per-artifact comment topic. Fires whenever any comment row on the
+/// artifact changes (create / status flip / re-anchor); subscribers
+/// refetch via `comments_list` / `comments_resolve`. Grammar:
+/// `comments.artifact.<artifact_kind>:<artifact_id>`.
+pub fn comment_topic(artifact_kind: &str, artifact_id: &str) -> String {
+    format!("comments.artifact.{artifact_kind}:{artifact_id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -836,6 +845,59 @@ pub enum FrontendRequest {
     /// immediately with a [`FrontendEvent::GitHubAuthState`] push
     /// reflecting the latest known state.
     GitHubAuthStatus,
+
+    // --- Comments in the markdown viewer (design:
+    // comments-in-markdown-viewer.md, Phase 2). All user-tier. ---
+    /// Create an `active` comment on an artifact. Returns the row.
+    CommentsCreate {
+        #[serde(flatten)]
+        input: CreateCommentInput,
+    },
+    /// List comments for an artifact. Excludes `resolved` / `dismissed`
+    /// (and `orphaned` unless `include_resolved`) by default.
+    CommentsList {
+        artifact_kind: String,
+        artifact_id: String,
+        #[serde(default)]
+        include_resolved: bool,
+    },
+    /// Resolve every active comment on an artifact against the renderer's
+    /// current plain-text projection. The engine runs the
+    /// `TextQuoteSelector` resolver, persists fuzzy re-anchors (setting
+    /// `last_resolved_with = 'fuzzy'`) and flips unresolvable comments to
+    /// `orphaned`, then returns each comment with its [`CommentResolution`].
+    CommentsResolve {
+        artifact_kind: String,
+        artifact_id: String,
+        /// The doc's current rendered plain-text projection.
+        plain_text: String,
+        #[serde(default)]
+        plain_text_projection_version: i64,
+    },
+    /// Soft-dismiss: transition a comment to `resolved`.
+    CommentsDismiss {
+        comment_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+    },
+    /// General status transition (`active` / `resolved` / `orphaned`).
+    /// Re-activation is accepted; hard delete is not exposed.
+    CommentsSetStatus {
+        comment_id: String,
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+    },
+    /// Renderer callback after a fuzzy re-resolve: persists the new anchor
+    /// coordinates so subsequent loads exact-match. Records the fuzzy
+    /// outcome on the row.
+    CommentsUpdateAnchor {
+        comment_id: String,
+        anchor: CommentAnchor,
+        new_doc_version: String,
+        #[serde(default)]
+        plain_text_projection_version: i64,
+    },
     /// App asks the engine to lease a workspace for the given Review-
     /// column work item, fetch the PR branch, and create a fresh jj
     /// commit off `<branch>@origin`. The engine replies with
@@ -1510,6 +1572,26 @@ pub enum FrontendEvent {
     /// renders whatever state the engine pushes without polling.
     GitHubAuthState {
         state: GitHubAuthStateDto,
+    },
+
+    // --- Comments in the markdown viewer (Phase 2) replies. ---
+    /// Reply to `comments_create` / `comments_dismiss` /
+    /// `comments_set_status` / `comments_update_anchor`.
+    CommentResult {
+        comment: WorkComment,
+    },
+    /// Reply to `comments_list`.
+    CommentsList {
+        artifact_kind: String,
+        artifact_id: String,
+        comments: Vec<WorkComment>,
+    },
+    /// Reply to `comments_resolve`: each active comment paired with its
+    /// resolution against the supplied plain text.
+    CommentsResolved {
+        artifact_kind: String,
+        artifact_id: String,
+        comments: Vec<ResolvedComment>,
     },
     /// Response to [`FrontendRequest::OpenReviewTerminal`]: the engine
     /// has leased a workspace, fetched the PR branch, and created a new

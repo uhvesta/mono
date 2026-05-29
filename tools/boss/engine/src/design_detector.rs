@@ -79,6 +79,11 @@ pub async fn on_design_pr_detected(
     // branch names round-trip correctly through the Swift URL parser.
     let head_ref_name = scan.head_ref_name;
     let branch = head_ref_name.as_deref();
+    // Captured for the cross-doc comment migration below; the Ok(false)
+    // arm of the match moves `head_ref_name`.
+    let migration_branch = head_ref_name.clone();
+    let migration_repo = repo_remote_url.clone();
+    let migration_path = path.clone();
     match work_db.sync_project_design_doc_from_detector(
         project_id,
         repo_remote_url.as_deref(),
@@ -144,6 +149,36 @@ pub async fn on_design_pr_detected(
                 ?err,
                 "design detector: failed to write design-doc pointer (in_review)"
             );
+        }
+    }
+
+    // Cross-doc comment migration (design § "Comments on PR-backed docs").
+    // Re-key the work item's active comments to the new
+    // `pr_doc:<repo>:<branch>:<path>` artifact so they travel with the doc;
+    // the originals are soft-resolved for the trail. Re-anchoring against the
+    // PR's doc text is deferred to the renderer's next load (the engine can't
+    // render markdown to plain text), so `new_plain_text` is `None`. No-op
+    // when the work item has no active comments. Idempotent on repeated
+    // `in_review` polls: once migrated the originals are `resolved`, so a
+    // later call finds nothing active to migrate.
+    if let (Some(repo), Some(branch)) = (migration_repo.as_deref(), migration_branch.as_deref()) {
+        let artifact_id = format!("pr_doc:{repo}:{branch}:{migration_path}");
+        let config = crate::comments_anchor::CommentFuzzyConfig::from_env();
+        match work_db.migrate_work_item_comments_to_pr_doc(task_id, &artifact_id, None, 0, &config) {
+            Ok(n) if n > 0 => tracing::info!(
+                task_id,
+                project_id,
+                artifact_id,
+                migrated = n,
+                "design detector: migrated work-item comments to pr_doc artifact (in_review)"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                task_id,
+                project_id,
+                ?err,
+                "design detector: failed to migrate work-item comments to pr_doc artifact"
+            ),
         }
     }
 }

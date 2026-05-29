@@ -31,7 +31,8 @@ use crate::protocol::{
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
     InterruptWorkerPaneInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput,
     RevealWorkItemInput, SendToPaneInput, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
-    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic, work_product_topic,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic,
+    execution_topic, probe_topic, work_product_topic,
 };
 use crate::external_tracker::github_oauth::{
     DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
@@ -7510,6 +7511,189 @@ async fn handle_frontend_connection(
                 });
                 // fire-and-forget: no reply sent
             }
+
+            // --- Comments in the markdown viewer (Phase 2). User-tier; no
+            // authorize_rpc gate (every local client may read/write). ---
+            FrontendRequest::CommentsCreate { input } => {
+                let artifact_kind = input.artifact_kind.clone();
+                let artifact_id = input.artifact_id.clone();
+                match work_db.create_comment(input) {
+                    Ok(comment) => {
+                        let revision = publish_comment_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            &artifact_kind,
+                            &artifact_id,
+                            "comment_created",
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::CommentResult { comment },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::CommentsList {
+                artifact_kind,
+                artifact_id,
+                include_resolved,
+            } => match work_db.list_comments(&artifact_kind, &artifact_id, include_resolved) {
+                Ok(comments) => send_response_with_revision(
+                    &sink,
+                    &request_id,
+                    server_state.current_work_revision(),
+                    FrontendEvent::CommentsList {
+                        artifact_kind,
+                        artifact_id,
+                        comments,
+                    },
+                ),
+                Err(err) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                ),
+            },
+            FrontendRequest::CommentsResolve {
+                artifact_kind,
+                artifact_id,
+                plain_text,
+                plain_text_projection_version,
+            } => {
+                let config = crate::comments_anchor::CommentFuzzyConfig::from_env();
+                match work_db.resolve_comments(
+                    &artifact_kind,
+                    &artifact_id,
+                    &plain_text,
+                    plain_text_projection_version,
+                    &config,
+                ) {
+                    Ok(comments) => send_response_with_revision(
+                        &sink,
+                        &request_id,
+                        server_state.current_work_revision(),
+                        FrontendEvent::CommentsResolved {
+                            artifact_kind,
+                            artifact_id,
+                            comments,
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::CommentsDismiss { comment_id, actor } => {
+                match work_db.dismiss_comment(&comment_id, actor.as_deref()) {
+                    Ok(comment) => {
+                        let revision = publish_comment_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            &comment.artifact_kind,
+                            &comment.artifact_id,
+                            "comment_dismissed",
+                        )
+                        .await;
+                        send_response_with_revision(
+                            &sink,
+                            &request_id,
+                            revision,
+                            FrontendEvent::CommentResult { comment },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::CommentsSetStatus {
+                comment_id,
+                status,
+                actor,
+            } => match work_db.set_comment_status(&comment_id, &status, actor.as_deref()) {
+                Ok(comment) => {
+                    let revision = publish_comment_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        &comment.artifact_kind,
+                        &comment.artifact_id,
+                        "comment_status_changed",
+                    )
+                    .await;
+                    send_response_with_revision(
+                        &sink,
+                        &request_id,
+                        revision,
+                        FrontendEvent::CommentResult { comment },
+                    );
+                }
+                Err(err) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                ),
+            },
+            FrontendRequest::CommentsUpdateAnchor {
+                comment_id,
+                anchor,
+                new_doc_version,
+                plain_text_projection_version,
+            } => match work_db.update_comment_anchor(
+                &comment_id,
+                &anchor,
+                &new_doc_version,
+                plain_text_projection_version,
+            ) {
+                Ok(comment) => {
+                    let revision = publish_comment_invalidation(
+                        &server_state,
+                        &session_id,
+                        &request_id,
+                        &comment.artifact_kind,
+                        &comment.artifact_id,
+                        "comment_anchor_updated",
+                    )
+                    .await;
+                    send_response_with_revision(
+                        &sink,
+                        &request_id,
+                        revision,
+                        FrontendEvent::CommentResult { comment },
+                    );
+                }
+                Err(err) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                ),
+            },
         }
     }
 
@@ -7872,6 +8056,43 @@ async fn publish_work_invalidation(
             .await;
     }
 
+    revision
+}
+
+/// Publish a comment-artifact invalidation on the `comments.artifact.*`
+/// topic so other subscribers refetch. Deliberately lighter than
+/// [`publish_work_invalidation`]: comment changes never touch the
+/// work-item / execution graph, so this skips the product-execution
+/// reconcile + coordinator kick. Reuses the `WorkInvalidated` payload
+/// (invalidation-not-patch) carrying the artifact id as the sole item id.
+async fn publish_comment_invalidation(
+    server_state: &ServerState,
+    origin_session_id: &str,
+    origin_request_id: &str,
+    artifact_kind: &str,
+    artifact_id: &str,
+    reason: &str,
+) -> u64 {
+    let revision = server_state.bump_work_revision();
+    let topic = comment_topic(artifact_kind, artifact_id);
+    let event = FrontendEvent::TopicEvent {
+        topic: topic.clone(),
+        revision,
+        origin_session_id: origin_session_id.to_owned(),
+        origin_request_id: Some(origin_request_id.to_owned()),
+        event: TopicEventPayload::WorkInvalidated {
+            reason: reason.to_owned(),
+            product_id: None,
+            item_ids: vec![artifact_id.to_owned()],
+        },
+    };
+    server_state
+        .topic_broker
+        .publish(
+            &topic,
+            FrontendEventEnvelope::push_with_revision(revision, event),
+        )
+        .await;
     revision
 }
 
