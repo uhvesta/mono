@@ -40,6 +40,9 @@ pub struct CheckConfig {
     pub check: String,
     pub id: String,
     pub source_path: PathBuf,
+    /// Directory containing the CHECKS.toml that declared this check, relative to repo root.
+    /// Empty path means the repo root itself.
+    pub config_dir: PathBuf,
     pub origin: CheckConfigOrigin,
     pub implementation: Option<ExternalCheckImplementationRef>,
     pub enabled: bool,
@@ -234,14 +237,18 @@ impl ConfigResolver {
     }
 
     fn apply_local_config(&self, resolved: &mut ResolvedChecks, relative_dir: &Path) {
-        let config_dir = self.root.join(relative_dir);
-        let Some(config_path) = resolve_checks_file_path(&config_dir) else {
+        let config_abs_dir = self.root.join(relative_dir);
+        let Some(config_path) = resolve_checks_file_path(&config_abs_dir) else {
             return;
         };
         info!(path = %config_path.display(), "loading checks config");
         let config_relative_path = config_path
             .strip_prefix(&self.root)
             .unwrap_or(config_path.as_path())
+            .to_path_buf();
+        let check_config_dir = config_relative_path
+            .parent()
+            .unwrap_or(Path::new(""))
             .to_path_buf();
 
         let checks_file = match parse_checks_file(&config_path, &config_relative_path) {
@@ -254,7 +261,7 @@ impl ConfigResolver {
         apply_local_settings(
             resolved,
             &checks_file.settings,
-            config_dir == self.root,
+            config_abs_dir == self.root,
             &config_relative_path,
         );
         for check in checks_file.checks {
@@ -294,6 +301,7 @@ impl ConfigResolver {
                 check: check.check.unwrap_or_else(|| configured_id.clone()),
                 id: configured_id,
                 source_path: config_relative_path.clone(),
+                config_dir: check_config_dir.clone(),
                 origin: CheckConfigOrigin::Local,
                 implementation,
                 enabled: check.enabled,
@@ -656,6 +664,7 @@ fn apply_external_checks_file(
             check: check.check.clone().unwrap_or_else(|| configured_id.clone()),
             id: configured_id,
             source_path: external_checks_file.source_path.clone(),
+            config_dir: PathBuf::new(),
             origin: external_checks_file.origin,
             implementation,
             enabled: check.enabled,

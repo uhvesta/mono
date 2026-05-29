@@ -13,6 +13,16 @@ use crate::output::{CheckResult, Finding, Location, Severity};
 #[derive(Debug, Default)]
 pub struct ForbiddenPathsCheck;
 
+impl ForbiddenPathsCheck {
+    fn configure_with_dir(
+        &self,
+        config: &toml::Value,
+        config_dir: &Path,
+    ) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(parse_config(config, config_dir)?))
+    }
+}
+
 #[async_trait]
 impl Check for ForbiddenPathsCheck {
     fn id(&self) -> &str {
@@ -24,7 +34,15 @@ impl Check for ForbiddenPathsCheck {
     }
 
     fn configure(&self, config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
-        Ok(Arc::new(parse_config(config)?))
+        self.configure_with_dir(config, Path::new(""))
+    }
+
+    fn configure_scoped(
+        &self,
+        config: &toml::Value,
+        config_dir: Option<&Path>,
+    ) -> Result<Arc<dyn ConfiguredCheck>> {
+        self.configure_with_dir(config, config_dir.unwrap_or_else(|| Path::new("")))
     }
 }
 
@@ -40,7 +58,7 @@ impl ConfiguredCheck for CompiledForbiddenPathsConfig {
                 }
 
                 let Some((matched_path, matched_pattern)) =
-                    first_match(rule, changed_file, self.exclude_globs.as_ref())
+                    first_match(rule, changed_file, self.exclude_files.as_ref(), &self.config_dir)
                 else {
                     continue;
                 };
@@ -74,8 +92,8 @@ impl ConfiguredCheck for CompiledForbiddenPathsConfig {
 struct ForbiddenPathsConfig {
     #[serde(default)]
     rules: Vec<ForbiddenPathRuleConfig>,
-    #[serde(default)]
-    exclude_globs: Vec<String>,
+    #[serde(default, alias = "exclude_globs")]
+    exclude_files: Vec<String>,
     #[serde(default)]
     severity: Option<String>,
 }
@@ -91,7 +109,8 @@ struct ForbiddenPathRuleConfig {
 
 struct CompiledForbiddenPathsConfig {
     rules: Vec<CompiledForbiddenPathRule>,
-    exclude_globs: Option<GlobSet>,
+    exclude_files: Option<GlobSet>,
+    config_dir: PathBuf,
     severity: Severity,
 }
 
@@ -102,7 +121,7 @@ struct CompiledForbiddenPathRule {
     patterns: GlobSet,
 }
 
-fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenPathsConfig> {
+fn parse_config(config: &toml::Value, config_dir: &Path) -> Result<CompiledForbiddenPathsConfig> {
     let parsed: ForbiddenPathsConfig = config
         .clone()
         .try_into()
@@ -137,15 +156,16 @@ fn parse_config(config: &toml::Value) -> Result<CompiledForbiddenPathsConfig> {
         });
     }
 
-    let exclude_globs = if parsed.exclude_globs.is_empty() {
+    let exclude_files = if parsed.exclude_files.is_empty() {
         None
     } else {
-        Some(compile_globset("exclude_globs", &parsed.exclude_globs)?)
+        Some(compile_globset("exclude_files", &parsed.exclude_files)?)
     };
 
     Ok(CompiledForbiddenPathsConfig {
         rules,
-        exclude_globs,
+        exclude_files,
+        config_dir: config_dir.to_path_buf(),
         severity: Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error),
     })
 }
@@ -166,10 +186,11 @@ fn compile_globset(field_name: &str, patterns: &[String]) -> Result<GlobSet> {
 fn first_match<'a>(
     rule: &'a CompiledForbiddenPathRule,
     changed_file: &'a ChangedFile,
-    exclude_globs: Option<&GlobSet>,
+    exclude_files: Option<&GlobSet>,
+    config_dir: &Path,
 ) -> Option<(PathBuf, &'a str)> {
     for candidate in candidate_paths(changed_file) {
-        if exclude_globs.is_some_and(|globs| globs.is_match(candidate)) {
+        if exclude_files.is_some_and(|globs| is_excluded(candidate, globs, config_dir)) {
             continue;
         }
 
@@ -182,6 +203,15 @@ fn first_match<'a>(
     }
 
     None
+}
+
+/// Returns true if `path` is within `config_dir` and matches `globs` (relative to config_dir).
+/// Files outside the config_dir subtree are never excluded.
+fn is_excluded(path: &Path, globs: &GlobSet, config_dir: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(config_dir) else {
+        return false;
+    };
+    globs.is_match(relative)
 }
 
 fn candidate_paths(changed_file: &ChangedFile) -> Vec<&Path> {
@@ -375,6 +405,30 @@ mod tests {
                 &tree,
                 &toml::Value::Table(toml::toml! {
                     rules = [{ remediation = "Generated artifacts must not be committed.", when = ["added"], patterns = ["**/.build/**"] }]
+                    exclude_files = ["mobile/ios/.build/**"]
+                }),
+            )
+            .await
+            .expect("run check");
+
+        assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exclude_globs_alias_still_works() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let result = check
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("mobile/ios/.build/workspace-state.json").to_path_buf(),
+                    kind: ChangeKind::Added,
+                    old_path: None,
+                }]),
+                &tree,
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "Generated artifacts must not be committed.", when = ["added"], patterns = ["**/.build/**"] }]
                     exclude_globs = ["mobile/ios/.build/**"]
                 }),
             )
@@ -382,6 +436,39 @@ mod tests {
             .expect("run check");
 
         assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exclude_files_does_not_apply_outside_config_dir_subtree() {
+        let temp = tempdir().expect("create temp dir");
+        let check = ForbiddenPathsCheck;
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+
+        // Pattern "ios/.build/**" from context "mobile" should NOT exclude "other/.build/foo"
+        let configured = check
+            .configure_with_dir(
+                &toml::Value::Table(toml::toml! {
+                    rules = [{ remediation = "No build artifacts.", when = ["added"], patterns = ["**/.build/**"] }]
+                    exclude_files = ["ios/.build/**"]
+                }),
+                Path::new("mobile"),
+            )
+            .expect("configure check");
+
+        let result = configured
+            .run(
+                &ChangeSet::new(vec![ChangedFile {
+                    path: Path::new("other/.build/foo").to_path_buf(),
+                    kind: ChangeKind::Added,
+                    old_path: None,
+                }]),
+                &tree,
+            )
+            .await
+            .expect("run check");
+
+        // "other/.build/foo" is outside "mobile", so exclude_files pattern doesn't apply
+        assert_eq!(result.findings.len(), 1, "file outside config_dir should not be excluded");
     }
 
     #[tokio::test]

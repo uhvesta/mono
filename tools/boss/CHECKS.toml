@@ -4,38 +4,39 @@ id = "rust-giant-structs-use-builder"
 [checks.config]
 builder = "bon"
 # Grandfathered files containing structs with 6+ named fields and no bon::Builder.
-# `exclude_globs` skips the WHOLE file, so a new giant struct added to one of these
+# `exclude_files` skips the WHOLE file, so a new giant struct added to one of these
 # files is never examined. Prefer `exclude_structs` (below) for ordinary grandfathering:
 # it keeps the file in scope and exempts only the named legacy structs, so new
 # violators are still caught. Migrate files off this list onto `exclude_structs`.
 # TODO: Convert each listed struct to use bon::Builder and shrink both lists to empty.
-exclude_globs = [
-  "tools/boss/bossctl/src/main.rs",
-  "tools/boss/cli/src/main.rs",
-  "tools/boss/client/src/lib.rs",
-  "tools/boss/engine/src/app.rs",
-  "tools/boss/engine/src/audit.rs",
-  "tools/boss/engine/src/completion.rs",
-  "tools/boss/engine/src/coordinator.rs",
-  "tools/boss/engine/src/dispatch_events.rs",
-  "tools/boss/engine/src/dispatch_reader.rs",
-  "tools/boss/engine/src/external_tracker/github.rs",
-  "tools/boss/engine/src/external_tracker/mod.rs",
-  "tools/boss/engine/src/external_tracker/reconcile.rs",
-  "tools/boss/engine/src/host_adapter.rs",
-  "tools/boss/engine/src/host_registry.rs",
-  "tools/boss/engine/src/live_status_loop.rs",
-  "tools/boss/engine/src/merge_poller.rs",
-  "tools/boss/engine/src/settings.rs",
-  "tools/boss/engine/src/spawn_flow.rs",
-  "tools/boss/engine/src/work/audit_misc.rs",
-  "tools/boss/engine/src/work/mappers.rs",
-  "tools/boss/engine/src/worker_registry.rs",
-  "tools/boss/engine/src/worker_setup.rs",
-  "tools/boss/protocol/src/engine_app.rs",
-  "tools/boss/protocol/src/live_status_debug.rs",
-  "tools/boss/protocol/src/live_worker_state.rs",
-  "tools/boss/protocol/src/wire.rs",
+# Paths are relative to this CHECKS.toml's directory (tools/boss/).
+exclude_files = [
+  "bossctl/src/main.rs",
+  "cli/src/main.rs",
+  "client/src/lib.rs",
+  "engine/src/app.rs",
+  "engine/src/audit.rs",
+  "engine/src/completion.rs",
+  "engine/src/coordinator.rs",
+  "engine/src/dispatch_events.rs",
+  "engine/src/dispatch_reader.rs",
+  "engine/src/external_tracker/github.rs",
+  "engine/src/external_tracker/mod.rs",
+  "engine/src/external_tracker/reconcile.rs",
+  "engine/src/host_adapter.rs",
+  "engine/src/host_registry.rs",
+  "engine/src/live_status_loop.rs",
+  "engine/src/merge_poller.rs",
+  "engine/src/settings.rs",
+  "engine/src/spawn_flow.rs",
+  "engine/src/work/audit_misc.rs",
+  "engine/src/work/mappers.rs",
+  "engine/src/worker_registry.rs",
+  "engine/src/worker_setup.rs",
+  "protocol/src/engine_app.rs",
+  "protocol/src/live_status_debug.rs",
+  "protocol/src/live_worker_state.rs",
+  "protocol/src/wire.rs",
 ]
 # Grandfathered struct NAMES. The file is still scanned, so any NEW giant struct added
 # alongside these is flagged. `tools/boss/protocol/src/types.rs` was migrated here off
