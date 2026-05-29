@@ -124,6 +124,8 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // (get_work_tree); they are never stored as columns.
         revision_seq: None,
         revision_parent_pr_url: None,
+        // Computed by attach_in_progress_revision_flag in get_work_tree.
+        has_in_progress_revision: false,
     })
 }
 

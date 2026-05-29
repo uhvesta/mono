@@ -1284,7 +1284,8 @@ final class EngineClient: @unchecked Sendable {
             investigationDocBranch: payload["investigation_doc_branch"] as? String,
             parentTaskId: payload["parent_task_id"] as? String,
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,
-            revisionParentPrUrl: payload["revision_parent_pr_url"] as? String
+            revisionParentPrUrl: payload["revision_parent_pr_url"] as? String,
+            hasInProgressRevision: (payload["has_in_progress_revision"] as? Bool) ?? false
         )
     }
 
