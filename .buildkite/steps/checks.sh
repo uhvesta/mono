@@ -25,23 +25,22 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
     CHECKLEFT_ARGS=(run --base-ref="origin/${base_branch}")
 elif [[ "${BUILDKITE_BRANCH:-}" == gh-readonly-queue/* ]]; then
     # GitHub merge-queue build. HEAD is a merge commit created by GitHub:
-    #   HEAD^1 = accumulated queue state before this PR
+    #   HEAD^1 = the main tip this PR is being merged onto
     #   HEAD^2 = this PR's original head
     #
-    # Using git merge-base HEAD origin/main is wrong here: when HEAD^2 is a
-    # descendant of HEAD^1 (the PR was based on a more recent main than what
-    # the queue was seeded from), the common ancestor predates the PR's own
-    # base, causing checkleft to scope over intermediate commits from other
-    # PRs (including their Rust files) and flag phantom violations.
+    # The correct base is HEAD^1 — the main tip the PR is merged onto.
+    # Scoping HEAD^1..HEAD captures exactly what this PR contributes and
+    # nothing else.
     #
-    # Fix: scope to git merge-base HEAD^2 origin/main, which is the commit
-    # where this PR's branch diverged from main — ignoring unrelated commits
-    # that were ahead of the queue seed point.
+    # Using git merge-base HEAD^1 HEAD^2 is WRONG: it returns the fork point
+    # where the PR branched off main, which is potentially many commits behind
+    # HEAD^1. That sweeps in every unrelated change other PRs merged to main
+    # since this PR branched, inflating the diff with files this PR never
+    # touched (e.g. github_oauth.rs in T774/PR#910).
     parent_count=$(git log -1 --format="%P" HEAD | wc -w | tr -d ' ')
     if [[ "$parent_count" -ge 2 ]]; then
-        pr_head=$(git rev-parse HEAD^2)
-        merge_base=$(git merge-base "$pr_head" origin/main)
-        echo "[checks] merge-queue build — scoping to PR changes since ${merge_base}"
+        merge_base=$(git rev-parse HEAD^1)
+        echo "[checks] merge-queue build — scoping to PR changes against HEAD^1 (${merge_base})"
     else
         # Unexpected: queue HEAD is not a merge commit. Fall back to the
         # naive merge-base so we still produce a useful scope.
