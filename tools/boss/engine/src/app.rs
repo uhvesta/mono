@@ -28,10 +28,13 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
-    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, InterruptWorkerPaneInput,
-    ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput,
-    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic,
-    work_product_topic,
+    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
+    InterruptWorkerPaneInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput,
+    RevealWorkItemInput, SendToPaneInput, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
+    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, execution_topic, probe_topic, work_product_topic,
+};
+use crate::external_tracker::github_oauth::{
+    DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
 };
 use crate::repo_slug;
 use crate::work::{DuplicateTaskError, GhPrStateChecker, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
@@ -41,6 +44,19 @@ use tokio::time::{Duration, timeout};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
+
+/// Shared HTTP client for the GitHub OAuth device flow. Installs the rustls
+/// ring crypto provider lazily (the first TLS handshake panics otherwise,
+/// mirroring `live_status::http_client`) and applies a per-request timeout —
+/// the device-flow poll loop manages its own cadence, so this only bounds an
+/// individual round-trip, never the overall flow.
+fn github_oauth_http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("reqwest::Client build should not fail with default config")
+}
 
 #[async_trait]
 impl LiveStatusBroadcaster for ServerState {
@@ -429,6 +445,13 @@ struct ServerState {
     /// same way. Shared between the periodic spawn loop and the
     /// on-demand `SyncProductExternalTracker` handler.
     tracker_registry: Arc<crate::external_tracker::TrackerRegistry>,
+    /// Single per-host (github.com) GitHub OAuth device-flow controller.
+    /// Owns the auth state machine, the poll loop, and keychain persistence.
+    /// The `GitHubAuthStart/Cancel/Disconnect/Status` handlers drive it; a
+    /// forwarder task spawned in `serve` watches its state and pushes
+    /// [`FrontendEvent::GitHubAuthState`] on [`TOPIC_GITHUB_AUTH`] plus runs
+    /// the org/SSO probe. See the OAuth device-flow design (§3, §4, §7).
+    github_auth: Arc<GitHubAuthController>,
     /// Shared kick signal for the merge-poller loop. The macOS app
     /// fires [`FrontendRequest::KickPrReconcilers`] on window
     /// activation; the handler calls `notify_one()` here so the
@@ -769,6 +792,15 @@ impl ServerState {
         let tracker_registry = Arc::new(tracker_registry);
         let tracker_registry_for_state = tracker_registry.clone();
 
+        // GitHub OAuth device-flow controller (single per-host: github.com).
+        // Backed by the OS keychain; the forwarder spawned in `serve` restores
+        // any persisted token at boot and pushes state transitions to the app.
+        let (github_auth_controller, _github_auth_rx) = GitHubAuthController::with_store(
+            DeviceFlow::production(github_oauth_http_client()),
+            Arc::new(KeychainTokenStore::new()),
+        );
+        let github_auth_for_state = Arc::new(github_auth_controller);
+
         let ci_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -866,6 +898,7 @@ impl ServerState {
                 metrics: metrics_for_state,
                 pr_reconciler_kick: pr_reconciler_kick_for_state,
                 tracker_registry: tracker_registry_for_state,
+                github_auth: github_auth_for_state,
                 control_token: control_token_for_state,
                 shutdown_trigger: shutdown_trigger_for_state,
             }
@@ -1254,6 +1287,16 @@ impl ServerState {
         self.topic_broker
             .publish(TOPIC_WORKER_LIVE_STATES, envelope)
             .await;
+    }
+
+    /// Push the current GitHub OAuth auth state on the `github.auth` topic.
+    /// Called by the auth forwarder on every state transition so subscribed
+    /// frontends re-render the issue-sync "GitHub account" section as the
+    /// device flow advances. The DTO is display-safe — the token and the
+    /// private device code never appear in it.
+    pub async fn broadcast_github_auth_state(&self, state: GitHubAuthStateDto) {
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::GitHubAuthState { state });
+        self.topic_broker.publish(TOPIC_GITHUB_AUTH, envelope).await;
     }
 
     /// Set the Boss session's shell pid (the second trust root). Any
@@ -2122,6 +2165,58 @@ pub fn process_is_alive(pid: libc::pid_t) -> bool {
     errno == libc::EPERM
 }
 
+/// Spawn the GitHub OAuth auth-state forwarder.
+///
+/// At boot it restores any keychain-persisted token (so the status surface
+/// reflects a prior connection across engine restarts), then subscribes to the
+/// controller's state channel and, for every transition:
+/// - pushes the display-safe [`GitHubAuthStateDto`] on the `github.auth` topic
+///   so subscribed frontends re-render, and
+/// - when the state is freshly `Authorized` with an unresolved `org_state`,
+///   runs the org/SSO probe ([`probe_and_record_org_state`]) and records the
+///   result via `update_org_state` — which itself produces the next transition
+///   the loop then broadcasts.
+///
+/// The probe only fires while `org_state` is `Unknown`, so resolving it to
+/// `Ok`/`NeedsOrgApproval`/`NeedsSso` does not re-trigger a probe; a probe that
+/// returns `Unknown` (transient / no org binding) leaves the state unchanged,
+/// so the loop simply waits for the next real transition rather than spinning.
+fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let controller = server_state.github_auth.clone();
+        // Restore a persisted token (if any) before subscribing, so the first
+        // loop iteration sees the restored `Authorized { Unknown }` state and
+        // runs the org probe.
+        controller.restore_from_store();
+
+        let flow = controller.device_flow();
+        let work_db = server_state.work_db.clone();
+        let mut rx = controller.subscribe();
+        loop {
+            let state = rx.borrow_and_update().clone();
+            server_state
+                .broadcast_github_auth_state(state.to_dto())
+                .await;
+
+            if let GitHubAuthState::Authorized {
+                record,
+                org_state: OrgAuthState::Unknown,
+            } = &state
+            {
+                let token = record.token.clone();
+                let resolved =
+                    probe_and_record_org_state(work_db.as_ref(), flow.as_ref(), &token).await;
+                controller.update_org_state(resolved);
+            }
+
+            if rx.changed().await.is_err() {
+                // Sender dropped — the engine is shutting down.
+                break;
+            }
+        }
+    })
+}
+
 /// Run the frontend server until the listener fails.
 ///
 /// `socket_path` is bound exclusively (the file is removed first if it exists).
@@ -2576,6 +2671,12 @@ pub async fn serve(
             server_state.metrics.clone(),
             server_state.clone(),
         );
+
+    // GitHub OAuth auth-state forwarder: restores any persisted token at boot,
+    // then watches the controller's state machine and (a) pushes every
+    // transition on the `github.auth` topic and (b) runs the org/SSO probe on
+    // each freshly-Authorized state. See the OAuth device-flow design §3/§7.
+    let _github_auth_handle = spawn_github_auth_forwarder(server_state.clone());
 
     // Dependency-unblock safety-net sweeper: periodically re-evaluates
     // every dependency-blocked work item and unblocks any whose gating
@@ -7201,17 +7302,71 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
-            FrontendRequest::GitHubAuthStart
-            | FrontendRequest::GitHubAuthCancel
-            | FrontendRequest::GitHubAuthDisconnect
-            | FrontendRequest::GitHubAuthStatus => {
+            FrontendRequest::GitHubAuthStart => {
+                // Begin (or restart) the device flow. The controller transitions
+                // to `RequestingCode` synchronously and drives the rest in a
+                // background task; the forwarder pushes each subsequent state on
+                // the `github.auth` topic. Reply with the immediate state so the
+                // request completes.
+                server_state.github_auth.start_flow().await;
                 send_response(
                     &sink,
                     &request_id,
-                    FrontendEvent::WorkError {
-                        message: "github auth not yet implemented (T-2)".to_owned(),
+                    FrontendEvent::GitHubAuthState {
+                        state: server_state.github_auth.current_state().to_dto(),
                     },
                 );
+            }
+            FrontendRequest::GitHubAuthCancel => {
+                server_state.github_auth.cancel().await;
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::GitHubAuthState {
+                        state: server_state.github_auth.current_state().to_dto(),
+                    },
+                );
+            }
+            FrontendRequest::GitHubAuthDisconnect => {
+                // Deletes the keychain token and drops to `Disconnected`.
+                server_state.github_auth.disconnect().await;
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::GitHubAuthState {
+                        state: server_state.github_auth.current_state().to_dto(),
+                    },
+                );
+            }
+            FrontendRequest::GitHubAuthStatus => {
+                let current = server_state.github_auth.current_state();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::GitHubAuthState {
+                        state: current.to_dto(),
+                    },
+                );
+                // "Re-check" (design §7): when connected, re-run the org/SSO
+                // probe so an org-approval / SSO banner clears on its own once
+                // the owner approves or the user SSO-authorizes — no full
+                // re-auth needed. `update_org_state` only notifies on a real
+                // change, which the forwarder then pushes on `github.auth`.
+                if let GitHubAuthState::Authorized { record, .. } = current {
+                    let server_state = server_state.clone();
+                    let token = record.token.clone();
+                    tokio::spawn(async move {
+                        let controller = server_state.github_auth.clone();
+                        let flow = controller.device_flow();
+                        let resolved = probe_and_record_org_state(
+                            server_state.work_db.as_ref(),
+                            flow.as_ref(),
+                            &token,
+                        )
+                        .await;
+                        controller.update_org_state(resolved);
+                    });
+                }
             }
             FrontendRequest::OpenReviewTerminal { work_item_id } => {
                 let item = match work_db.get_work_item(&work_item_id) {

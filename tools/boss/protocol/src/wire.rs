@@ -16,6 +16,14 @@ use crate::types::{
 
 pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
 
+/// Global topic carrying GitHub OAuth auth-state pushes
+/// ([`FrontendEvent::GitHubAuthState`]). Unlike work topics this is not
+/// per-product: the engine owns a single per-host (github.com) auth state and
+/// fans every transition out on this one topic. The macOS app subscribes to it
+/// to render the issue-sync "GitHub account" section as the device flow
+/// advances. See the OAuth device-flow design (§3 state machine, §4 RPC).
+pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }
