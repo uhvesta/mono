@@ -1761,6 +1761,12 @@ async fn sweep_one(
         PrLifecycleState::Merged => {
             if mark_merged(work_db, publisher, completion_handler, candidate, &probe_result).await {
                 outcome.merged += 1;
+                // Clean up any pending/running ci_remediations rows and emit
+                // CiFailureCleared so the macOS kanban clears the "ci failing"
+                // badge. Without this, a task that was blocked on CI when its
+                // PR merged leaves a pending row that causes the badge to
+                // reappear on every app restart / list-refresh.
+                ci_watch::on_pr_merged(work_db, publisher, candidate).await;
             }
             // Invalidate any in-flight revision executions whose parent
             // just merged.  `block_pending_revisions_on_parent_close`
@@ -5450,5 +5456,146 @@ mod tests {
             }
         }"#;
         assert!(parse_dequeue_events_response(body).is_empty());
+    }
+
+    /// Acceptance test for T831 / the CI-status invalidation gap: once a
+    /// failure is recorded (`ci_required_state = "fail"`, `blocked: ci_failure`),
+    /// a subsequent clean probe must propagate the recovery transition — the
+    /// `blocked_ci` re-poll set must re-check the PR and update the task's
+    /// `ci_required_state` to `"success"` so the kanban CI indicator clears.
+    #[tokio::test]
+    async fn ci_required_state_clears_when_rollup_recovers_to_success() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/702";
+        let (product, chore) = make_chore_in_review(&db, "C-ci-state-clear", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Pass 1: statusCheckRollup reports a FAILURE — simulates the initial
+        // detection sweep that blocks the task.
+        probe.states.lock().unwrap().insert(
+            pr.to_owned(),
+            Ok(probe_ci_failing(pr, "head-1")),
+        );
+        let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(out1.ci_flagged, 1, "first sweep must detect and block on CI failure");
+
+        // ci_required_state should reflect the failing rollup after detection.
+        let ci_state_after_fail = match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => t.ci_required_state,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            ci_state_after_fail.as_deref(),
+            Some("fail"),
+            "ci_required_state must be 'fail' once the failing rollup is recorded",
+        );
+
+        // Pass 2: statusCheckRollup flips to SUCCESS — simulates CI recovering
+        // (developer fixed the issue or flaky test re-ran green). The
+        // blocked_ci re-poll set must re-check this PR and propagate the
+        // recovery, clearing both the block and the CI indicator.
+        probe.states.lock().unwrap().insert(
+            pr.to_owned(),
+            Ok(probe_ci_clean(pr, "head-1")),
+        );
+        let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(out2.ci_cleared, 1, "clean probe must retire the ci_failure block");
+
+        let t = match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(t.status, "in_review", "task must be back in_review after CI recovery");
+        assert!(t.blocked_reason.is_none(), "blocked_reason must be cleared");
+        assert_eq!(
+            t.ci_required_state.as_deref(),
+            Some("success"),
+            "ci_required_state must be 'success' after the rollup recovers — \
+             this drives the PrCiIndicator green checkmark on the kanban card",
+        );
+
+        // A pr_poll_state_updated event must have been emitted so the macOS
+        // kanban refreshes the CI indicator without waiting for a user action.
+        let all_events = publisher.work_events.lock().await.clone();
+        let has_poll_update = all_events
+            .iter()
+            .any(|(p, w, r)| p == &product && w == &chore && r == "pr_poll_state_updated");
+        assert!(
+            has_poll_update,
+            "pr_poll_state_updated must be emitted when ci_required_state changes; \
+             got: {all_events:?}",
+        );
+    }
+
+    /// When a task is `blocked: ci_failure` at the time its PR is merged, any
+    /// pending `ci_remediations` rows must be abandoned so the macOS kanban
+    /// clears the "ci failing" badge. Without this cleanup the pending row
+    /// causes the badge to reappear on every `sendListCiRemediations` call
+    /// (T831 repro path).
+    #[tokio::test]
+    async fn merge_of_ci_blocked_pr_clears_badge() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/703";
+        let (_product, chore) = make_chore_in_review(&db, "C-merge-clears-badge", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Pass 1: CI fails — chore flips to blocked: ci_failure with a pending
+        // ci_remediations row.
+        probe.states.lock().unwrap().insert(
+            pr.to_owned(),
+            Ok(probe_ci_failing(pr, "head-1")),
+        );
+        let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(out1.ci_flagged, 1);
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "blocked"),
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // Verify the pending ci_remediations row exists (its presence is what
+        // drives the badge via sendListCiRemediations).
+        let active = db.active_ci_remediation_for_work_item(&chore).unwrap();
+        assert!(active.is_some(), "a pending ci_remediations row must exist after detection");
+
+        // Pass 2: GitHub reports the PR as MERGED while CI is still failing on
+        // the head branch (force-merge / merge-queue scenario). The sweep must
+        // mark the pending row abandoned so it no longer shows up as
+        // pending/running in the remediations list.
+        probe.states.lock().unwrap().insert(
+            pr.to_owned(),
+            Ok(PrLifecycleProbe {
+                url: pr.to_owned(),
+                state: PrLifecycleState::Merged,
+                base_ref_oid: None,
+                head_ref_oid: None,
+                head_ref_name: None,
+                base_ref_name: None,
+                labels: vec![],
+                review: PrReviewState::Unknown,
+                in_merge_queue: false,
+            }),
+        );
+        let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(out2.merged, 1, "merge must be detected");
+
+        // Task must be done.
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "done"),
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // The pending ci_remediations row must now be abandoned — a pending
+        // row here would cause sendListCiRemediations to re-set the "ci
+        // failing" badge on every app restart even though the task is done.
+        let still_active = db.active_ci_remediation_for_work_item(&chore).unwrap();
+        assert!(
+            still_active.is_none(),
+            "pending ci_remediations row must be abandoned on PR merge; \
+             badge would persist on app restart otherwise",
+        );
     }
 }

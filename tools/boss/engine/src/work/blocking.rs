@@ -1389,6 +1389,32 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Abandon all `pending` or `running` `ci_remediations` rows for
+    /// `work_item_id` in one shot. Called when the parent PR is marked
+    /// merged so any in-flight or queued fix attempts are retired cleanly
+    /// rather than left in a non-terminal state.
+    ///
+    /// Returns the number of rows affected. A return value of `0` means
+    /// there were no active attempts (normal when CI had already resolved
+    /// before the merge).
+    pub fn abandon_active_ci_remediations_for_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE ci_remediations
+                SET status         = 'abandoned',
+                    failure_reason = 'pr_merged',
+                    finished_at    = COALESCE(finished_at, ?2)
+              WHERE work_item_id = ?1
+                AND status IN ('pending', 'running')",
+            params![work_item_id, now],
+        )?;
+        Ok(rows)
+    }
+
     /// Engine-side abandon for a `ci_remediations` attempt. Used for
     /// the budget-exhausted / opt-out / suppression paths — the
     /// engine declined to spawn, so the attempt row never ran.
