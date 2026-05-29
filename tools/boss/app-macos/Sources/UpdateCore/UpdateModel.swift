@@ -3,6 +3,17 @@ import os.log
 
 private let modelLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
 
+// MARK: - ManualUpdateFeedback
+
+/// Transient feedback state surfaced only by a user-initiated "Check for Updates" action.
+/// Background polling never sets this — only ``UpdateModel/presentUpdateSheet()`` does.
+public enum ManualUpdateFeedback: Equatable, Sendable {
+    case checking
+    case upToDate
+    case networkError(String)
+    case rateLimited(Date)
+}
+
 // MARK: - UpdateMode
 
 /// The three update-operation modes, ordered by escalating automation.
@@ -42,8 +53,12 @@ public final class UpdateModel: ObservableObject {
     @Published public private(set) var isChecking: Bool = false
     /// Set to `true` to present the update-result sheet. Dismissed when the user closes the sheet.
     @Published public var showUpdateSheet: Bool = false
+    /// Transient toast state set only by ``presentUpdateSheet()``. `nil` when no toast is visible.
+    @Published public private(set) var manualCheckFeedback: ManualUpdateFeedback? = nil
 
     // MARK: - Private
+
+    private var toastDismissTask: Task<Void, Never>?
 
     private enum StorageKeys {
         static let mode = "boss.update.mode"
@@ -114,12 +129,39 @@ public final class UpdateModel: ObservableObject {
         )
     }
 
-    /// Shows the update-result sheet and starts a fresh check.
-    /// Safe to call from a synchronous button action — the check runs in a detached Task.
+    /// Starts a manual update check and surfaces transient toast feedback.
+    /// Shows the result sheet only when an update is available; all other outcomes
+    /// (up-to-date, error, rate-limited) show a self-dismissing toast instead.
     public func presentUpdateSheet() {
         modelLog.info("update check triggered: source=manual-menu")
-        showUpdateSheet = true
-        Task { await checkNow() }
+        toastDismissTask?.cancel()
+        manualCheckFeedback = .checking
+        Task {
+            let result = await checkNow()
+            switch result {
+            case .upToDate:
+                manualCheckFeedback = .upToDate
+                scheduleFeedbackDismissal()
+            case .available:
+                manualCheckFeedback = nil
+                showUpdateSheet = true
+            case .networkError(let message):
+                manualCheckFeedback = .networkError(message)
+                scheduleFeedbackDismissal()
+            case .rateLimited(let retryAfter):
+                manualCheckFeedback = .rateLimited(retryAfter)
+                scheduleFeedbackDismissal()
+            }
+        }
+    }
+
+    private func scheduleFeedbackDismissal() {
+        toastDismissTask?.cancel()
+        toastDismissTask = Task {
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            manualCheckFeedback = nil
+        }
     }
 
     /// Starts the polling scheduler if the current mode enables it.

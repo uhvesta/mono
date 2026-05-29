@@ -290,6 +290,15 @@ struct ContentView: View {
             UpdateResultSheet()
                 .environmentObject(updateModel)
         }
+        .overlay(alignment: .topTrailing) {
+            if let feedback = updateModel.manualCheckFeedback {
+                UpdateStatusToast(feedback: feedback)
+                    .padding(.top, 52)
+                    .padding(.trailing, 16)
+                    .transition(.opacity.combined(with: .offset(y: -8)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: updateModel.manualCheckFeedback)
     }
 
     private var sidebar: some View {
