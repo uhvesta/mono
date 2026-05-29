@@ -13,6 +13,7 @@ rust_library(
         "src/ci_log_reader.rs",
         "src/ci_watch.rs",
         "src/cli.rs",
+        "src/comments_anchor.rs",
         "src/completion.rs",
         "src/config.rs",
         "src/conflict_diagnosis.rs",
@@ -65,6 +66,7 @@ rust_library(
         "src/work/audit_misc.rs",
         "src/work/blocking.rs",
         "src/work/chain_helpers.rs",
+        "src/work/comments.rs",
         "src/work/conflict_res.rs",
         "src/work/create_entities.rs",
         "src/work/dep_helpers.rs",
@@ -272,6 +274,26 @@ rust_test(
     name = "work_crud_test",
     srcs = ["tests/work_crud.rs"],
     edition = "2024",
+    deps = [
+        ":engine_lib",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+rust_test(
+    name = "comments_crud_test",
+    srcs = ["tests/comments_crud.rs"],
+    edition = "2024",
+    size = "small",
+    timeout = "moderate",
     deps = [
         ":engine_lib",
         "//tools/boss/client",

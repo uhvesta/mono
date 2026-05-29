@@ -5,6 +5,7 @@ pub mod build_info;
 pub mod ci_log_reader;
 pub mod ci_watch;
 pub mod cli;
+pub mod comments_anchor;
 pub mod completion;
 pub mod config;
 pub mod conflict_diagnosis;

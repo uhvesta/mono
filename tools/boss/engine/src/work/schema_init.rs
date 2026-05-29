@@ -283,6 +283,11 @@ impl WorkDb {
         // Additive only — bespoke conflict/CI flows are untouched.
         migrate_conflict_resolutions_revision_task_id(&conn)?;
         migrate_ci_remediations_revision_task_id(&conn)?;
+        // Comments in the markdown viewer (Phase 2): engine-backed comment
+        // rows with W3C TextQuoteSelector anchors. Independent of every
+        // other table; `CREATE TABLE IF NOT EXISTS` so order is irrelevant.
+        // Design: tools/boss/docs/designs/comments-in-markdown-viewer.md
+        migrate_work_comments_table(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '12')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

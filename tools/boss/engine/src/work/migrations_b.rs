@@ -1008,3 +1008,42 @@ pub(crate) fn migrate_ci_remediations_revision_task_id(conn: &Connection) -> Res
     }
     Ok(())
 }
+
+/// Create the `work_comments` table for the comments-in-markdown-viewer
+/// feature (Phase 2). Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`,
+/// safe to re-run on every engine start. Schema follows design
+/// `comments-in-markdown-viewer.md` § "Engine schema", extended with two
+/// Phase-2 columns the design flagged for implementation:
+///
+/// - `last_resolved_with` records the most recent anchor-resolution mode
+///   (`exact` / `fuzzy` / `orphan`) so the sidebar can show the ⚠ glyph when
+///   a comment re-anchored fuzzily (§ Risks mitigation).
+/// - `plain_text_projection_version` records the renderer's projection
+///   algorithm version so a future projection upgrade can mass re-anchor
+///   (§ Risks mitigation).
+///
+/// `anchor_json` holds the serialised `{exact, prefix, suffix}` selector.
+/// Timestamps are TEXT epoch-seconds, matching every other table.
+pub(crate) fn migrate_work_comments_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS work_comments (
+             id                            TEXT PRIMARY KEY,
+             artifact_kind                 TEXT NOT NULL,
+             artifact_id                   TEXT NOT NULL,
+             doc_version                   TEXT NOT NULL,
+             anchor_json                   TEXT NOT NULL,
+             body                          TEXT NOT NULL,
+             author                        TEXT NOT NULL,
+             status                        TEXT NOT NULL,
+             status_actor                  TEXT,
+             last_resolved_with            TEXT,
+             plain_text_projection_version INTEGER NOT NULL DEFAULT 0,
+             created_at                    TEXT NOT NULL,
+             updated_at                    TEXT NOT NULL,
+             dismissed_at                  TEXT
+         );
+         CREATE INDEX IF NOT EXISTS work_comments_by_artifact
+             ON work_comments(artifact_kind, artifact_id, status);",
+    )?;
+    Ok(())
+}

@@ -1767,6 +1767,151 @@ pub enum OrgAuthState {
     Unknown,
 }
 
+// ===========================================================================
+// Comments in the markdown viewer (design:
+// tools/boss/docs/designs/comments-in-markdown-viewer.md). Phase 2 adds the
+// engine-backed persistence + W3C-Web-Annotation-style resilient anchoring.
+// ===========================================================================
+
+/// W3C Web Annotation Data Model [`TextQuoteSelector`][wadm], serialised
+/// inline on each comment row. The three fields are taken from the
+/// rendered *plain-text projection* of the markdown (not the raw source)
+/// because the user selects on rendered text.
+///
+/// `prefix`/`suffix` default to 64 chars each at the authoring path; they
+/// disambiguate the `exact` quote when it recurs in the doc, and let the
+/// fuzzy resolver re-anchor through edits that touch the surrounding text.
+///
+/// [wadm]: https://www.w3.org/TR/annotation-model/#text-quote-selector
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CommentAnchor {
+    /// The verbatim selected text.
+    pub exact: String,
+    /// Up to ~64 chars of plain text immediately preceding `exact`.
+    /// Empty when the selection begins at the start of the doc.
+    #[serde(default)]
+    pub prefix: String,
+    /// Up to ~64 chars of plain text immediately following `exact`.
+    /// Empty when the selection ends at the end of the doc.
+    #[serde(default)]
+    pub suffix: String,
+}
+
+impl CommentAnchor {
+    /// The full context string the resolver matches against:
+    /// `prefix + exact + suffix`.
+    pub fn context(&self) -> String {
+        format!("{}{}{}", self.prefix, self.exact, self.suffix)
+    }
+}
+
+/// Comment status values. `active` is the authored state; `resolved` is the
+/// soft-dismiss outcome (hidden from the active sidebar but kept for the
+/// history surface); `orphaned` is derived — the renderer reports that an
+/// anchor could no longer resolve, and the engine records the flip so the
+/// sidebar can group it. `dismissed` is reserved for a future hard-dismiss.
+pub const COMMENT_STATUS_ACTIVE: &str = "active";
+pub const COMMENT_STATUS_RESOLVED: &str = "resolved";
+pub const COMMENT_STATUS_ORPHANED: &str = "orphaned";
+pub const COMMENT_STATUS_DISMISSED: &str = "dismissed";
+
+/// How the comment's anchor last resolved against the doc's plain-text
+/// projection: `exact`, `fuzzy` (drives the ⚠ sidebar glyph), or `orphan`.
+pub const RESOLVED_WITH_EXACT: &str = "exact";
+pub const RESOLVED_WITH_FUZZY: &str = "fuzzy";
+pub const RESOLVED_WITH_ORPHAN: &str = "orphan";
+
+pub fn default_comment_status() -> String {
+    COMMENT_STATUS_ACTIVE.to_owned()
+}
+
+/// An engine-persisted comment row (`work_comments` table). Anchored to an
+/// artifact (`work_item:<id>` or `pr_doc:<repo>:<branch>:<path>`) via a
+/// [`CommentAnchor`]. 13 fields → uses the builder pattern per the project's
+/// `boss-protocol` convention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct WorkComment {
+    pub id: String,
+    /// `work_item` (engine-owned description) or `pr_doc` (markdown on a
+    /// PR branch).
+    pub artifact_kind: String,
+    /// The work-item id, or the synthetic `pr_doc:<repo>:<branch>:<path>`
+    /// composite key.
+    pub artifact_id: String,
+    /// SHA-256 (or other opaque digest) of the plain-text projection the
+    /// comment was authored against. Used only for equality (magic-wand
+    /// CAS in a later phase); never parsed.
+    pub doc_version: String,
+    /// The W3C `TextQuoteSelector` anchor. Stored as `anchor_json` in the DB.
+    pub anchor: CommentAnchor,
+    pub body: String,
+    /// `user:<email>` for human-authored comments; `magic_wand:<id>` reserved.
+    pub author: String,
+    /// `active` | `resolved` | `orphaned` | `dismissed`.
+    #[serde(default = "default_comment_status")]
+    #[builder(default = default_comment_status())]
+    pub status: String,
+    /// Who flipped status last (`user:<email>`, `engine_design_detector`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_actor: Option<String>,
+    /// `exact` | `fuzzy` | `orphan` — how the anchor last resolved. `None`
+    /// until the renderer reports a resolution. Drives the ⚠ glyph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resolved_with: Option<String>,
+    /// Version of the renderer's plain-text-projection algorithm the anchor
+    /// was authored against. A future projection upgrade can mass re-anchor
+    /// every comment whose value is stale (design § Risks mitigation).
+    #[serde(default)]
+    #[builder(default)]
+    pub plain_text_projection_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_at: Option<String>,
+}
+
+/// `comments_create` request body. The renderer supplies `doc_version` (it
+/// hashes the plain-text projection) so the engine and renderer agree on the
+/// authoring input without the engine having to render markdown itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateCommentInput {
+    pub artifact_kind: String,
+    pub artifact_id: String,
+    pub doc_version: String,
+    pub anchor: CommentAnchor,
+    pub body: String,
+    pub author: String,
+    #[serde(default)]
+    pub plain_text_projection_version: i64,
+}
+
+/// The outcome of resolving one comment's anchor against a doc's current
+/// plain-text projection. `start`/`length` are character offsets (Unicode
+/// scalar count) of the `exact` span within the plain text; both are `None`
+/// for an orphan. `score` is the fuzzy match score (only set for `fuzzy`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommentResolution {
+    /// `exact` | `fuzzy` | `orphan`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+/// A comment paired with its resolution against the supplied plain text.
+/// Returned by `comments_resolve`. The comment carries any side-effects the
+/// resolve persisted (a fuzzy re-anchor, or a flip to `orphaned`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedComment {
+    pub comment: WorkComment,
+    pub resolution: CommentResolution,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
