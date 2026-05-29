@@ -118,7 +118,6 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // has run. Until then the protocol field carries None.
         external_ref: None,
         investigation_doc_path: None,
-        investigation_doc_repo_remote_url: None,
         investigation_doc_branch: None,
         parent_task_id: None,
         // Revision projections are computed in attach_revision_projections
@@ -129,16 +128,28 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
 }
 
 /// Like [`map_task`] but also reads a trailing `parent_task_id` column
-/// (index 30, i.e. appended right after `merge_queue_state`). Used by the
-/// narrow single-row lookups (`query_task`, `get_work_item_by_short_id`)
-/// that back `boss task show` / `boss chore show`, so a revision's parent
-/// linkage is present in that projection instead of always coming back
-/// `null`. The wider `map_task_with_external_ref_and_investigation_doc`
-/// variant populates `parent_task_id` from a different column index
-/// (38); this helper is only for the 30-column SELECT + one extra column.
+/// (index 30, i.e. appended right after `merge_queue_state`). Internal
+/// building-block used by [`map_task_with_parent_and_investigation_doc`]
+/// and the wider `map_task_with_external_ref_and_investigation_doc`
+/// (which populates `parent_task_id` from index 38 instead).
 pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     task.parent_task_id = row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
+/// Like [`map_task_with_parent`] but also reads columns 31–32 carrying the
+/// investigation-doc path and branch. Used by `query_task` and
+/// `get_work_item_by_short_id` so every `WorkItemUpdated` event carries the
+/// correct investigation-doc fields rather than always-null values.
+/// The doc's repo is always derived from the task's `repo_remote_url`
+/// (already present in `map_task`) rather than a stored pointer column.
+pub(crate) fn map_task_with_parent_and_investigation_doc(
+    row: &Row<'_>,
+) -> rusqlite::Result<Task> {
+    let mut task = map_task_with_parent(row)?;
+    task.investigation_doc_path = row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty());
+    task.investigation_doc_branch = row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
@@ -182,18 +193,18 @@ pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task
     Ok(task)
 }
 
-/// Like [`map_task_with_external_ref`] but also reads columns 35–38
-/// carrying the investigation-doc pointer fields and `parent_task_id`.
+/// Like [`map_task_with_external_ref`] but also reads columns 35–37
+/// carrying the investigation-doc path and branch, plus `parent_task_id`.
 /// Used in `get_work_tree` where the SELECT explicitly includes those columns.
+/// The doc's repo is always derived from the task's `repo_remote_url`
+/// (already present in `map_task`) rather than a stored pointer column.
 pub(crate) fn map_task_with_external_ref_and_investigation_doc(
     row: &Row<'_>,
 ) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref(row)?;
     task.investigation_doc_path = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
-    task.investigation_doc_repo_remote_url =
-        row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
-    task.investigation_doc_branch = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
-    task.parent_task_id = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
+    task.investigation_doc_branch = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
+    task.parent_task_id = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 

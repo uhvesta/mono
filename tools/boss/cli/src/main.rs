@@ -1371,16 +1371,12 @@ struct SetInvestigationDocArgs {
     #[arg(long)]
     path: Option<String>,
 
-    /// Remote URL of the repo hosting the doc. Omit to inherit the
-    /// product's `docs_repo`.
-    #[arg(long)]
-    repo: Option<String>,
-
     /// PR branch name. Set this to the branch the doc PR was opened on.
     #[arg(long)]
     branch: Option<String>,
 
-    /// Clear all three pointer columns (path, repo, branch).
+    /// Clear both pointer columns (path + branch). The doc repo is always
+    /// derived from the task's own repo and is never stored separately.
     #[arg(long, default_value_t = false)]
     unset: bool,
 }
@@ -4510,7 +4506,6 @@ async fn run_set_investigation_doc(
     let input = SetTaskInvestigationDocInput {
         task_id,
         investigation_doc_path: args.path,
-        investigation_doc_repo_remote_url: args.repo,
         investigation_doc_branch: args.branch,
         unset,
     };

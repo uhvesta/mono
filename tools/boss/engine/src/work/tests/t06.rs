@@ -568,7 +568,6 @@ fn upgrade_from_schema_without_revision_columns_yields_same_shape() {
                 external_ref_synced_at TEXT,
                 external_ref_unbound_at TEXT,
                 investigation_doc_path TEXT,
-                investigation_doc_repo_remote_url TEXT,
                 investigation_doc_branch TEXT
                 -- parent_task_id intentionally absent
              );

@@ -221,7 +221,6 @@ impl WorkDb {
             conn.execute(
                 "UPDATE tasks
                  SET investigation_doc_path = NULL,
-                     investigation_doc_repo_remote_url = NULL,
                      investigation_doc_branch = NULL,
                      updated_at = ?2
                  WHERE id = ?1",
@@ -234,18 +233,14 @@ impl WorkDb {
                 }
                 Some(p) => p.to_owned(),
             };
-            let repo = input
-                .investigation_doc_repo_remote_url
-                .filter(|s| !s.is_empty());
             let branch = input.investigation_doc_branch.filter(|s| !s.is_empty());
             conn.execute(
                 "UPDATE tasks
                  SET investigation_doc_path = ?2,
-                     investigation_doc_repo_remote_url = ?3,
-                     investigation_doc_branch = ?4,
-                     updated_at = ?5
+                     investigation_doc_branch = ?3,
+                     updated_at = ?4
                  WHERE id = ?1",
-                params![input.task_id, path, repo, branch, now],
+                params![input.task_id, path, branch, now],
             )?;
         }
         query_task(&conn, &input.task_id)?

@@ -506,9 +506,6 @@ struct WorkTask: Identifiable, Hashable {
     /// worker. `nil` until the worker calls `boss task set-investigation-doc`.
     /// Only meaningful on `kind == "investigation"` rows.
     var investigationDocPath: String? = nil
-    /// Remote URL of the repo hosting the investigation doc. `nil` means
-    /// "resolve from product docs_repo or BOSS_USER_DOCS_REPO at set time."
-    var investigationDocRepoRemoteUrl: String? = nil
     /// PR branch the investigation doc was opened on. Used to construct the
     /// in-review GitHub URL while the PR is open.
     var investigationDocBranch: String? = nil
@@ -546,13 +543,14 @@ struct WorkTask: Identifiable, Hashable {
     }
 
     /// GitHub web URL for the investigation doc, derived at render time
-    /// from the stored `(repo, branch, path)` pointer. Returns `nil`
-    /// when the pointer is not yet set or the repo URL can't be parsed.
+    /// from the task's `repoRemoteURL`, `investigationDocBranch`, and
+    /// `investigationDocPath`. Returns `nil` when the path is not yet set
+    /// or the task has no repo URL.
     /// Uses `investigationDocBranch` while the PR is open; falls back to
     /// `"main"` after merge (branch field cleared by future tooling).
     var investigationDocWebURL: String? {
         guard let path = investigationDocPath, !path.isEmpty,
-              let repo = investigationDocRepoRemoteUrl, !repo.isEmpty else {
+              let repo = repoRemoteURL, !repo.isEmpty else {
             return nil
         }
         let branch = investigationDocBranch ?? "main"
