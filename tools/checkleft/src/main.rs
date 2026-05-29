@@ -491,7 +491,7 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
         "{}[{}]: {}\n",
         style.paint_severity(finding.severity),
         result.check_id,
-        finding.message
+        style.paint_message(&finding.message)
     ));
 
     let location = finding
@@ -502,17 +502,26 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
     out.push_str(&format!("  --> {location}\n"));
 
     if let Some(remediation) = &finding.remediation {
-        out.push_str(&format!(
-            "   = {}: {remediation}\n",
-            style.paint_help_label("help")
-        ));
+        let lines: Vec<&str> = remediation.lines().collect();
+        if lines.len() > 1 {
+            out.push_str(&format!("   = {}:\n", style.paint_help_label("to resolve")));
+            for line in lines {
+                out.push_str(&format!("   - {}\n", style.paint_help_body(line)));
+            }
+        } else {
+            out.push_str(&format!(
+                "   = {}: {}\n",
+                style.paint_help_label("help"),
+                style.paint_help_body(remediation)
+            ));
+        }
     }
 
     if let Some(suggested_fix) = &finding.suggested_fix {
         out.push_str(&format!(
             "   = {}: {}\n",
             style.paint_help_label("fix"),
-            format_fix_summary(suggested_fix)
+            style.paint_help_body(&format_fix_summary(suggested_fix))
         ));
     }
 
@@ -542,37 +551,73 @@ fn format_fix_summary(suggested_fix: &SuggestedFix) -> String {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorLevel {
+    None,
+    Basic,
+    Color256,
+    TrueColor,
+}
+
 #[derive(Clone, Copy)]
 struct OutputStyle {
-    color: bool,
+    level: ColorLevel,
 }
 
 impl OutputStyle {
     fn detect_for_stdout() -> Self {
         let no_color = std::env::var_os("NO_COLOR").is_some();
-        Self {
-            color: std::io::stdout().is_terminal() && !no_color,
+        if !std::io::stdout().is_terminal() || no_color {
+            return Self { level: ColorLevel::None };
         }
+
+        if let Ok(colorterm) = std::env::var("COLORTERM") {
+            let ct = colorterm.to_ascii_lowercase();
+            if ct == "truecolor" || ct == "24bit" {
+                return Self { level: ColorLevel::TrueColor };
+            }
+        }
+
+        if let Ok(term) = std::env::var("TERM") {
+            if term.contains("256color") {
+                return Self { level: ColorLevel::Color256 };
+            }
+        }
+
+        Self { level: ColorLevel::Basic }
     }
 
     fn paint_bold(self, text: &str) -> String {
-        self.paint(text, "1")
+        self.paint_ansi(text, "1")
     }
 
     fn paint_error(self, text: &str) -> String {
-        self.paint(text, "1;31")
+        self.paint_ansi(text, "1;31")
     }
 
     fn paint_warning(self, text: &str) -> String {
-        self.paint(text, "1;33")
+        self.paint_ansi(text, "1;33")
     }
 
     fn paint_info(self, text: &str) -> String {
-        self.paint(text, "1;36")
+        self.paint_ansi(text, "1;36")
     }
 
     fn paint_help_label(self, text: &str) -> String {
-        self.paint(text, "1;32")
+        self.paint_ansi(text, "1;32")
+    }
+
+    fn paint_message(self, text: &str) -> String {
+        self.paint_ansi(text, "1")
+    }
+
+    fn paint_help_body(self, text: &str) -> String {
+        match self.level {
+            ColorLevel::None => text.to_owned(),
+            ColorLevel::Basic => format!("\u{1b}[2m{text}\u{1b}[0m"),
+            ColorLevel::Color256 => format!("\u{1b}[38;5;244m{text}\u{1b}[0m"),
+            ColorLevel::TrueColor => format!("\u{1b}[38;2;150;150;150m{text}\u{1b}[0m"),
+        }
     }
 
     fn paint_severity(self, severity: Severity) -> String {
@@ -583,8 +628,8 @@ impl OutputStyle {
         }
     }
 
-    fn paint(self, text: &str, code: &str) -> String {
-        if self.color {
+    fn paint_ansi(self, text: &str, code: &str) -> String {
+        if self.level != ColorLevel::None {
             format!("\u{1b}[{code}m{text}\u{1b}[0m")
         } else {
             text.to_owned()
