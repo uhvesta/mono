@@ -2,6 +2,10 @@ import AppKit
 import SwiftUI
 
 private let workBoardColumnWidth: CGFloat = 280
+private let workBoardColumnWidthWide: CGFloat = 340
+private let workBoardColumnWidthMax: CGFloat = 420
+private let workBoardWideThreshold: CGFloat = 1400
+private let workBoardUltraWideThreshold: CGFloat = 1800
 private let workBoardColumnSpacing: CGFloat = 12
 private let workBoardHorizontalPadding: CGFloat = 20
 private let workBossPanelDefaultExpandedWidth: CGFloat = 380
@@ -686,20 +690,31 @@ struct ContentView: View {
     }
 
     private func workBoard() -> some View {
-        ScrollView(.horizontal) {
-            HStack(alignment: .top, spacing: workBoardColumnSpacing) {
-                ForEach(WorkBoardColumnKey.allCases) { column in
-                    workColumn(column)
+        GeometryReader { geometry in
+            let columnWidth: CGFloat = {
+                if geometry.size.width >= workBoardUltraWideThreshold {
+                    return workBoardColumnWidthMax
+                } else if geometry.size.width >= workBoardWideThreshold {
+                    return workBoardColumnWidthWide
+                } else {
+                    return workBoardColumnWidth
                 }
+            }()
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: workBoardColumnSpacing) {
+                    ForEach(WorkBoardColumnKey.allCases) { column in
+                        workColumn(column, width: columnWidth)
+                    }
+                }
+                .padding(.horizontal, workBoardHorizontalPadding)
+                .padding(.top, workBoardHorizontalPadding)
+                .frame(maxHeight: .infinity, alignment: .top)
             }
-            .padding(.horizontal, workBoardHorizontalPadding)
-            .padding(.top, workBoardHorizontalPadding)
-            .frame(maxHeight: .infinity, alignment: .top)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func workColumn(_ column: WorkBoardColumnKey) -> some View {
+    private func workColumn(_ column: WorkBoardColumnKey, width: CGFloat = workBoardColumnWidth) -> some View {
         let sections = model.workSections(in: column)
         let itemCount = sections.reduce(0) { $0 + $1.items.count }
 
@@ -746,7 +761,7 @@ struct ContentView: View {
             }
         }
         .padding(14)
-        .frame(width: workBoardColumnWidth, alignment: .topLeading)
+        .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
