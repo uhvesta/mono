@@ -1047,3 +1047,80 @@ pub(crate) fn migrate_work_comments_table(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Create the `automations` and `automation_runs` tables plus the
+/// `automation_short_id_sequences` counter table. Idempotent — all
+/// DDL uses `CREATE TABLE IF NOT EXISTS` / `CREATE … IF NOT EXISTS`.
+///
+/// Design: `tools/boss/docs/designs/maintenance-tasks.md` §"Data model".
+pub(crate) fn migrate_automations_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automations (
+             id                    TEXT PRIMARY KEY,
+             short_id              INTEGER,
+             product_id            TEXT NOT NULL REFERENCES products(id),
+             name                  TEXT NOT NULL,
+             repo_remote_url       TEXT,
+             trigger_kind          TEXT NOT NULL,
+             trigger_config        TEXT NOT NULL,
+             standing_instruction  TEXT NOT NULL,
+             open_task_limit       INTEGER NOT NULL DEFAULT 1,
+             catch_up_window_secs  INTEGER,
+             enabled               INTEGER NOT NULL DEFAULT 1,
+             created_via           TEXT NOT NULL DEFAULT 'unknown',
+             created_at            TEXT NOT NULL,
+             updated_at            TEXT NOT NULL,
+             last_fired_at         TEXT,
+             last_outcome          TEXT,
+             next_due_at           TEXT
+         );
+
+         CREATE UNIQUE INDEX IF NOT EXISTS automations_product_short_id_idx
+             ON automations(product_id, short_id) WHERE short_id IS NOT NULL;
+
+         CREATE INDEX IF NOT EXISTS automations_due_idx
+             ON automations(enabled, next_due_at);
+
+         CREATE TABLE IF NOT EXISTS automation_runs (
+             id                   TEXT PRIMARY KEY,
+             automation_id        TEXT NOT NULL REFERENCES automations(id),
+             scheduled_for        TEXT NOT NULL,
+             started_at           TEXT NOT NULL,
+             finished_at          TEXT,
+             triage_execution_id  TEXT,
+             outcome              TEXT NOT NULL,
+             produced_task_id     TEXT REFERENCES tasks(id),
+             detail               TEXT
+         );
+
+         CREATE INDEX IF NOT EXISTS automation_runs_by_automation_idx
+             ON automation_runs(automation_id, scheduled_for);
+
+         CREATE TABLE IF NOT EXISTS automation_short_id_sequences (
+             product_id  TEXT PRIMARY KEY REFERENCES products(id),
+             next_value  INTEGER NOT NULL DEFAULT 1
+         );",
+    )?;
+    Ok(())
+}
+
+/// Add `tasks.source_automation_id` — a soft FK to `automations.id`
+/// that marks tasks produced by the automations triage flow. `NULL` for
+/// every existing task row; non-`NULL` only on tasks created via
+/// `boss task create --automation`. The partial index enables cheap
+/// open-task-count queries and backlog/kanban exclusion filters.
+pub(crate) fn migrate_tasks_source_automation_id(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "source_automation_id")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN source_automation_id TEXT REFERENCES automations(id)",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS tasks_source_automation_idx
+             ON tasks(source_automation_id, status)
+          WHERE source_automation_id IS NOT NULL",
+        [],
+    )?;
+    Ok(())
+}

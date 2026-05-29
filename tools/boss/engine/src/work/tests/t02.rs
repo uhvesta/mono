@@ -2286,7 +2286,7 @@ fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "12");
+    assert_eq!(version, "13");
 
     let _ = std::fs::remove_file(path);
 }

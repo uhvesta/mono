@@ -28,6 +28,27 @@ pub(crate) fn allocate_short_id(conn: &Connection, product_id: &str) -> Result<i
     Ok(current)
 }
 
+/// Parallel to [`allocate_short_id`] for the `A<n>` automation namespace.
+/// Reads and advances `automation_short_id_sequences` for `product_id`.
+/// Must be called inside the same transaction as the `automations` row insert.
+/// See `tools/boss/docs/designs/maintenance-tasks.md` §"Short-id namespace".
+pub(crate) fn allocate_automation_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    let current: i64 = conn
+        .query_row(
+            "SELECT next_value FROM automation_short_id_sequences WHERE product_id = ?1",
+            [product_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1);
+    conn.execute(
+        "INSERT INTO automation_short_id_sequences(product_id, next_value) VALUES(?1, ?2)
+         ON CONFLICT(product_id) DO UPDATE SET next_value = excluded.next_value",
+        params![product_id, current + 1],
+    )?;
+    Ok(current)
+}
+
 /// Validate the `(execution_id, work_item_id)` discriminant on a
 /// `CreateAttentionItemInput` and return the canonical pair to write.
 /// Exactly one of the two must be set; both-set or neither-set is a
