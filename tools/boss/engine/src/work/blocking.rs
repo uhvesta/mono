@@ -98,6 +98,14 @@ impl WorkDb {
     ///
     /// `ci_failure_exhausted` rows are excluded — the budget is spent and
     /// those tasks must not be automatically re-dispatched.
+    ///
+    /// Post-cutover (Phase 4): rows with `revision_task_id` set are owned by
+    /// the revision substrate — the `fix`-kind CI producer now delivers via
+    /// an engine-triggered `revision_implementation`, not a bespoke
+    /// `ci_remediation` execution. Excluding them keeps this rescue path from
+    /// resurrecting the dormant dispatch for a row that already has a revision
+    /// fix-vehicle; only legacy / `retrigger` / `merge_queue_rebounce` pending
+    /// rows (all `revision_task_id IS NULL`) are recovered.
     pub fn list_stranded_ci_remediation_attempts(
         &self,
     ) -> Result<Vec<StrandedCiRemediationAttempt>> {
@@ -106,6 +114,7 @@ impl WorkDb {
             "SELECT cr.id, cr.work_item_id, cr.product_id, cr.pr_url
              FROM ci_remediations cr
              WHERE cr.status = 'pending'
+               AND cr.revision_task_id IS NULL
                AND EXISTS (
                    SELECT 1 FROM tasks t
                    WHERE t.id = cr.work_item_id
@@ -1399,6 +1408,40 @@ impl WorkDb {
               WHERE id = ?1
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_ci_remediation(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Stamp the soft-FK from a `ci_remediations` trigger-ledger row to the
+    /// `kind=revision` task the CI-fix producer spawned (design Q2 reverse
+    /// link / Phase 4 cutover). Mirrors
+    /// [`Self::set_conflict_resolution_revision_task_id`]. Set by
+    /// `ci_watch::on_ci_failure_detected` immediately after `create_revision`
+    /// succeeds. Idempotent — a second call with the same id overwrites;
+    /// `Ok(None)` when the attempt id is unknown.
+    ///
+    /// Once set, this row is owned by the revision substrate: the dormant
+    /// `ci_remediation` rescue path skips it (its query filters
+    /// `revision_task_id IS NULL`), so the old execution kind is never
+    /// re-dispatched for a revision-backed `fix` attempt.
+    pub fn set_ci_remediation_revision_task_id(
+        &self,
+        attempt_id: &str,
+        revision_task_id: &str,
+    ) -> Result<Option<CiRemediation>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "UPDATE ci_remediations
+                SET revision_task_id = ?2
+              WHERE id = ?1",
+            params![attempt_id, revision_task_id],
         )?;
         if rows == 0 {
             tx.commit()?;

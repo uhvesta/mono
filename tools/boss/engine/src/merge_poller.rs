@@ -1831,9 +1831,16 @@ async fn sweep_one(
                     // says, because the chore is currently `in_review`
                     // (no signal in the table yet) on the first failure.
                     if let OpenPrCiStatus::Failing { failures } = ci {
+                        // Phase 4 cutover: the `fix`-kind CI producer creates
+                        // an engine-triggered revision via the shared
+                        // `create_revision` gate (R4 reuse). We are inside the
+                        // `Open` arm with `mergeability = Clean`, so the PR is
+                        // known-open; feed that observation to the gate via a
+                        // static checker rather than a redundant `gh pr view`.
                         if ci_watch::on_ci_failure_detected(
                             work_db,
                             publisher,
+                            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
                             candidate,
                             &probe_result,
                             failures,

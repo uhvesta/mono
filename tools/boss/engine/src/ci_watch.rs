@@ -34,14 +34,14 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::FrontendEvent;
+use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, FrontendEvent};
 use serde::Serialize;
 
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
 use crate::work::{
-    CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck,
-    StrandedCiRemediationAttempt, WorkDb,
+    CiRemediation, CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck,
+    PrStateChecker, StrandedCiRemediationAttempt, WorkDb,
 };
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
@@ -141,9 +141,22 @@ struct FailedCheckRecord<'a> {
 /// `failures` is the list the probe collected from `statusCheckRollup`
 /// (design §Q1's predicate); it is also persisted as the row's
 /// `failed_checks` JSON for the worker prompt.
+///
+/// Phase 4 cutover (design Q1/Q5): on a genuinely-new `fix`-kind attempt
+/// the fix vehicle is now an **engine-triggered revision** (`parent =
+/// chore`, `created_via = "ci-fix:<crm_id>"`) created via the shared
+/// `create_revision` gate, rather than a bespoke `ci_remediation`
+/// execution. `retrigger` produces no commit, so it stays on the bespoke
+/// dispatch (design Q6). The CI budget is enforced *before* create
+/// (unchanged): an exhausted PR flips to `ci_failure_exhausted` and never
+/// reaches the revision-spawn path. `pr_checker` supplies the create-time
+/// gate's PR-state probe (`&StaticPrStateChecker(Open)` in production —
+/// the poller has just observed this PR open at clean mergeability — and a
+/// fake in tests), reusing `assert_parent_revisable` (R4).
 pub async fn on_ci_failure_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
     failures: &[RequiredCheckFailure],
@@ -384,6 +397,26 @@ pub async fn on_ci_failure_detected(
         }
     };
 
+    // Phase 4 cutover (design Q1/Q5): on a genuinely-new live `fix` attempt
+    // the fix vehicle is an engine-triggered revision, NOT a bespoke
+    // `ci_remediation` execution. The `revision_task_id` soft-FK is the
+    // idempotency latch (a same-triplet repeat probe hits `Ok(None)` on the
+    // insert above, so `attempt` is `None` and this branch is skipped) and
+    // the marker that hides the row from the dormant `ci_remediation` rescue
+    // path. Decoupled from `task_transitioned` (mirrors
+    // `conflict_watch::on_conflict_detected`) so a fresh failing head_sha
+    // that lands while the parent is already `blocked: ci_failure` still gets
+    // a revision rather than stranding into the bespoke rescue dispatch.
+    // `retrigger` produces no commit (design Q6) — it stays on the bespoke
+    // path handled in the `task_transitioned` block below. Budget exhaustion
+    // was already handled above (no insert, no attempt), so an exhausted PR
+    // never reaches here.
+    if let Some(ref a) = attempt {
+        if a.attempt_kind == "fix" && a.status == "pending" && a.revision_task_id.is_none() {
+            maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await;
+        }
+    }
+
     if task_transitioned {
         // Bump the budget counter only when the row actually
         // transitioned AND we created a fix-kind attempt — the design
@@ -409,37 +442,39 @@ pub async fn on_ci_failure_detected(
             )
             .await;
         if let Some(attempt) = attempt.as_ref() {
-            // Phase 9 #24: a fresh `ci_remediations` row needs a
-            // matching `work_executions` row for the dispatcher to pick
-            // up. Mirror the `conflict_resolution` wiring — create a
-            // `kind = 'ci_remediation'` execution in `ready` state and
-            // kick the scheduler. The unique key on `ci_remediations`
-            // already gated us, so a second probe with the same triplet
-            // sees `attempt = None` above and skips this branch.
-            match work_db.create_execution(CreateExecutionInput {
-                work_item_id: candidate.work_item_id.clone(),
-                kind: "ci_remediation".to_owned(),
-                status: Some("ready".to_owned()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            }) {
-                Ok(_) => publisher.kick_scheduler(),
-                Err(err) => {
-                    tracing::warn!(
-                        work_item_id = %candidate.work_item_id,
-                        attempt_id = %attempt.id,
-                        ?err,
-                        "ci_watch: failed to create ci_remediation execution; worker will not be dispatched",
-                    );
+            // `retrigger` attempts produce no commit, so they stay on the
+            // bespoke `ci_remediation` execution kind (design Q6): create a
+            // `ready` execution and kick the scheduler. `fix` attempts ride
+            // the engine-triggered revision spawned above and must NOT get a
+            // bespoke execution (the cutover). The unique key already gated
+            // us, so a second probe with the same triplet sees
+            // `attempt = None` and skips this branch entirely.
+            if attempt.attempt_kind == "retrigger" {
+                match work_db.create_execution(CreateExecutionInput {
+                    work_item_id: candidate.work_item_id.clone(),
+                    kind: "ci_remediation".to_owned(),
+                    status: Some("ready".to_owned()),
+                    repo_remote_url: None,
+                    cube_repo_id: None,
+                    cube_lease_id: None,
+                    cube_workspace_id: None,
+                    workspace_path: None,
+                    priority: None,
+                    preferred_workspace_id: None,
+                    started_at: None,
+                    finished_at: None,
+                    prefer_is_soft: false,
+                    pr_url: None,
+                }) {
+                    Ok(_) => publisher.kick_scheduler(),
+                    Err(err) => {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            attempt_id = %attempt.id,
+                            ?err,
+                            "ci_watch: failed to create ci_remediation retrigger execution; worker will not be dispatched",
+                        );
+                    }
                 }
             }
             publisher
@@ -467,6 +502,128 @@ pub async fn on_ci_failure_detected(
     } else {
         false
     }
+}
+
+/// Build the short, one-line revision card title from the failing checks
+/// (design Q3 / R5: generated from check *names*, never the log body).
+/// Shows up to the first three check names, e.g.
+/// `Fix failing CI: ci/test, ci/lint`; with more than three it appends a
+/// `(+N more)` tail so the Review-lane card stays one line. The long worker
+/// directive (log excerpt, failed-check table, rebase recipe) is injected at
+/// dispatch by `compose_revision_directive`, keyed off the `ci-fix:`
+/// `created_via` (Phase 2).
+fn ci_revision_description(failures: &[RequiredCheckFailure]) -> String {
+    const MAX_NAMES: usize = 3;
+    let names: Vec<&str> = failures
+        .iter()
+        .map(|f| f.name.as_str())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.is_empty() {
+        return "Fix failing CI".to_owned();
+    }
+    let shown = names.iter().take(MAX_NAMES).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > MAX_NAMES {
+        format!("Fix failing CI: {shown} (+{} more)", names.len() - MAX_NAMES)
+    } else {
+        format!("Fix failing CI: {shown}")
+    }
+}
+
+/// Create the engine-triggered revision that delivers the CI fix and stamp
+/// the trigger-ledger row's `revision_task_id` back-pointer (design
+/// Q1/Q2/Q5). Mirror of `conflict_watch::maybe_spawn_conflict_revision`.
+///
+/// `attempt` is the just-inserted, live (`pending`), `fix`-kind
+/// `ci_remediations` row. On success the reconcile loop picks up the new
+/// `kind=revision` task and dispatches a `revision_implementation` execution
+/// into the chain root's warm workspace; the `ci-fix:` provenance makes
+/// `runner.rs` inject the CI log excerpt + failed-check fragment into the
+/// worker directive (Phase 2). On failure — almost always the create-time
+/// gate (`assert_parent_revisable`, R4) refusing a parent whose PR has since
+/// merged/closed — the ledger row is marked `abandoned` so it never strands
+/// as a `pending` attempt with no fix vehicle. The parent stays
+/// `blocked: ci_failure`; the poller's merged/closed handling reconciles it
+/// on a later sweep.
+async fn maybe_spawn_ci_revision(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    failures: &[RequiredCheckFailure],
+    attempt: &CiRemediation,
+) {
+    let description = ci_revision_description(failures);
+    let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}{}", attempt.id);
+
+    let revision = match work_db.create_revision(
+        CreateRevisionInput {
+            parent_task_id: candidate.work_item_id.clone(),
+            description,
+            name: None,
+            priority: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+            created_via: Some(created_via),
+        },
+        pr_checker,
+    ) {
+        Ok(rev) => rev,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                attempt_id = %attempt.id,
+                error = %format!("{err:#}"),
+                "ci_watch: create_revision failed (parent likely no longer revisable); abandoning attempt",
+            );
+            if let Err(abandon_err) =
+                work_db.mark_ci_remediation_abandoned(&attempt.id, "revision_create_failed")
+            {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?abandon_err,
+                    "ci_watch: failed to abandon attempt after create_revision failure",
+                );
+            }
+            return;
+        }
+    };
+
+    // Stamp the reverse link. This is the idempotency latch (repeat probes at
+    // the same head sha find it set and skip) and the marker that tells the
+    // dormant rescue path to leave this row alone.
+    match work_db.set_ci_remediation_revision_task_id(&attempt.id, &revision.id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                revision_task_id = %revision.id,
+                "ci_watch: attempt row vanished before revision_task_id could be stamped",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                attempt_id = %attempt.id,
+                revision_task_id = %revision.id,
+                ?err,
+                "ci_watch: failed to stamp revision_task_id; revision will still run",
+            );
+        }
+    }
+
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        attempt_id = %attempt.id,
+        revision_task_id = %revision.id,
+        "ci_watch: spawned engine-triggered revision for CI failure",
+    );
+
+    // Nudge the scheduler so the reconcile loop dispatches the revision's
+    // `revision_implementation` execution promptly.
+    publisher.kick_scheduler();
 }
 
 /// Entry point for merge-queue rebounce detection.
@@ -1237,6 +1394,15 @@ mod tests {
         }
     }
 
+    /// The create-time revision gate's PR-state probe for tests. The
+    /// production CI producer feeds `StaticPrStateChecker(Open)` (the poller
+    /// just observed the PR open at clean mergeability); tests use the fake
+    /// so `create_revision`'s `assert_parent_revisable` sees an open PR
+    /// without a `gh` round-trip.
+    fn fix_checker() -> crate::work::FakePrStateChecker {
+        crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open)
+    }
+
     #[tokio::test]
     async fn detection_flips_in_review_to_blocked_ci_failure() {
         let dir = tempdir().unwrap();
@@ -1248,6 +1414,7 @@ mod tests {
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1283,6 +1450,7 @@ mod tests {
         let first = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1291,6 +1459,7 @@ mod tests {
         let second = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1337,6 +1506,7 @@ mod tests {
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1377,6 +1547,7 @@ mod tests {
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1405,6 +1576,7 @@ mod tests {
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1438,6 +1610,7 @@ mod tests {
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe_with_labels(pr, "head-1", &["boss/no-auto-rebase"]),
             &one_failure(),
@@ -1461,6 +1634,7 @@ mod tests {
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &p,
             &one_failure(),
@@ -1485,6 +1659,7 @@ mod tests {
         let detected = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1549,6 +1724,7 @@ mod tests {
         on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1594,6 +1770,7 @@ mod tests {
         on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1806,6 +1983,7 @@ mod tests {
         on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1916,20 +2094,26 @@ mod tests {
         assert_eq!(super::classify_pre_triage(&[]), "fix");
     }
 
-    // ----- Phase 9 #24: a fix-kind detection creates a ci_remediation execution -----
+    // ----- Phase 4 cutover: engine-triggered revision as the fix vehicle -----
 
     #[tokio::test]
-    async fn detection_creates_ci_remediation_execution() {
+    async fn detection_spawns_revision_and_stamps_attempt() {
+        // A genuinely-new `fix`-kind CI failure creates a `kind=revision`
+        // task (parent = chore, ci-fix provenance), stamps the ledger row's
+        // `revision_task_id`, and creates NO bespoke ci_remediation
+        // execution — the dormant path stays dormant and the row is hidden
+        // from the rescue recovery query.
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("boss.db");
         let db = WorkDb::open(db_path.clone()).unwrap();
         let pr = "https://github.com/foo/bar/pull/100";
-        let (product, chore) = make_in_review(&db, "C-exec", pr);
+        let (product, chore) = make_in_review(&db, "C-rev-spawn", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
@@ -1937,7 +2121,28 @@ mod tests {
         .await;
         assert!(flipped);
 
-        // Exactly one work_executions row with kind = 'ci_remediation'.
+        let attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("a pending attempt row must exist");
+        assert_eq!(attempt.status, "pending");
+        assert_eq!(attempt.attempt_kind, "fix");
+        let rev_id = attempt
+            .revision_task_id
+            .clone()
+            .expect("the producer must stamp revision_task_id on the attempt");
+
+        let revision = match db.get_work_item(&rev_id).unwrap() {
+            WorkItem::Task(t) => t,
+            other => panic!("expected revision task, got {other:?}"),
+        };
+        assert_eq!(revision.kind, "revision");
+        assert_eq!(revision.parent_task_id.as_deref(), Some(chore.as_str()));
+        assert_eq!(revision.created_via, format!("ci-fix:{}", attempt.id));
+        assert_eq!(revision.description, "Fix failing CI: ci/test");
+
+        // No bespoke ci_remediation execution: the revision rides the
+        // reconcile loop's revision_implementation dispatch instead.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let count: i64 = conn
             .query_row(
@@ -1946,7 +2151,126 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "expected a single ci_remediation execution row");
+        assert_eq!(count, 0, "cutover must not create a ci_remediation execution");
+
+        // The revision-backed row is invisible to the dormant rescue path.
+        assert!(
+            db.list_stranded_ci_remediation_attempts().unwrap().is_empty(),
+            "revision-backed attempt must be excluded from the rescue query",
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_idempotent_does_not_double_spawn_revision() {
+        // Re-firing on the same head sha reuses the existing attempt (whose
+        // revision_task_id is already set) and spawns no second revision.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/101";
+        let (product, chore) = make_in_review(&db, "C-rev-idem", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+        // Reset to in_review so the second probe re-enters the primary flip
+        // path with the same head sha (UNIQUE collision on the ledger).
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+
+        let attempts = db
+            .list_ci_remediations(None, &[], Some(&chore), None)
+            .unwrap();
+        assert_eq!(attempts.len(), 1, "same head sha must not stack attempts");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let revisions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
+                rusqlite::params![&chore],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revisions, 1, "same head sha must not stack revisions");
+    }
+
+    #[tokio::test]
+    async fn retrigger_creates_bespoke_execution_and_no_revision() {
+        // `retrigger` produces no commit, so it stays on the bespoke
+        // ci_remediation execution kind (design Q6) and never spawns a
+        // revision or consumes budget.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("boss.db");
+        let db = WorkDb::open(db_path.clone()).unwrap();
+        let pr = "https://github.com/foo/bar/pull/102";
+        let (product, chore) = make_in_review(&db, "C-retrigger", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // All-infra failures classify as `retrigger`.
+        let infra = vec![failure("ci/flaky", "STARTUP_FAILURE")];
+        let flipped = on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &infra,
+        )
+        .await;
+        assert!(flipped);
+
+        let attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("a pending attempt row must exist");
+        assert_eq!(attempt.attempt_kind, "retrigger");
+        assert!(
+            attempt.revision_task_id.is_none(),
+            "retrigger must not spawn a revision",
+        );
+
+        // Exactly one bespoke ci_remediation execution; no revision task.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let exec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_executions WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+                rusqlite::params![&chore],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exec_count, 1, "retrigger must park a ci_remediation execution");
+        let revisions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE kind = 'revision'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revisions, 0, "retrigger must not create a revision");
+
+        // Retrigger does not consume the fix budget.
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
     }
 
     // ----- Reconciled 2026-05-17 layered design call: rebase-first success ----
@@ -1963,6 +2287,7 @@ mod tests {
         let flipped = on_ci_failure_detected(
             &db,
             pub_.as_ref(),
+            &fix_checker(),
             &candidate(&product, &chore, pr),
             &probe(pr, "head-1"),
             &one_failure(),
