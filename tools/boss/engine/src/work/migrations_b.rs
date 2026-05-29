@@ -979,3 +979,32 @@ pub(crate) fn migrate_metrics_tables(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Add `revision_task_id` to `conflict_resolutions` — the soft FK from a
+/// trigger-ledger row to the `kind=revision` task the merge-conflict producer
+/// spawned. `NULL` for rows written before Phase 2 of the unify-pr-remediation
+/// design (`unify-pr-remediation-on-revisions.md`) and for attempts that were
+/// retired without creating a revision.
+pub(crate) fn migrate_conflict_resolutions_revision_task_id(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "conflict_resolutions", "revision_task_id")? {
+        conn.execute(
+            "ALTER TABLE conflict_resolutions ADD COLUMN revision_task_id TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Add `revision_task_id` to `ci_remediations` — the soft FK from a
+/// trigger-ledger row to the `kind=revision` task the CI-failure producer
+/// spawned. `NULL` for rows written before Phase 2 of the unify-pr-remediation
+/// design and for `retrigger` kind attempts (which never spawn a revision).
+pub(crate) fn migrate_ci_remediations_revision_task_id(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "ci_remediations", "revision_task_id")? {
+        conn.execute(
+            "ALTER TABLE ci_remediations ADD COLUMN revision_task_id TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}

@@ -277,6 +277,12 @@ impl WorkDb {
         // differs from description (e.g. manually patched via `boss task edit`)
         // are intentionally skipped.
         migrate_revision_names_to_first_line(&conn)?;
+        // Phase 1 of `unify-pr-remediation-on-revisions.md`: add the
+        // `revision_task_id` reverse link to both attempt side-tables so
+        // Phase 2+ can stamp the FK when a producer creates a revision.
+        // Additive only — bespoke conflict/CI flows are untouched.
+        migrate_conflict_resolutions_revision_task_id(&conn)?;
+        migrate_ci_remediations_revision_task_id(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '12')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

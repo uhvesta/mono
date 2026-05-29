@@ -323,6 +323,7 @@ pub(crate) fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<Conflic
         created_at: row.get(16)?,
         started_at: row.get(17)?,
         finished_at: row.get(18)?,
+        revision_task_id: row.get(19)?,
     })
 }
 
@@ -334,7 +335,7 @@ pub(crate) fn query_conflict_resolution(
         "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
                 base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
                 cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                created_at, started_at, finished_at
+                created_at, started_at, finished_at, revision_task_id
          FROM conflict_resolutions
          WHERE id = ?1",
     )?;
@@ -437,6 +438,7 @@ pub(crate) fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediatio
         finished_at: row.get(20)?,
         failure_kind: row.get(21)?,
         before_commit_sha: row.get(22)?,
+        revision_task_id: row.get(23)?,
     })
 }
 
@@ -448,7 +450,7 @@ pub(crate) fn query_ci_remediation(conn: &Connection, id: &str) -> Result<Option
                 triage_class, log_excerpt, status, failure_reason,
                 cube_lease_id, cube_workspace_id, worker_id,
                 created_at, started_at, finished_at,
-                failure_kind, before_commit_sha
+                failure_kind, before_commit_sha, revision_task_id
          FROM ci_remediations
          WHERE id = ?1",
     )?;

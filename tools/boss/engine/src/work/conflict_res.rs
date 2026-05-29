@@ -170,7 +170,7 @@ impl WorkDb {
             "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
                     base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at, revision_task_id
              FROM conflict_resolutions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -196,7 +196,7 @@ impl WorkDb {
             "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
                     base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at, revision_task_id
              FROM conflict_resolutions
              WHERE work_item_id = ?1
                AND status IN ('pending', 'running')
@@ -228,7 +228,8 @@ impl WorkDb {
                     cr.head_branch, cr.base_branch, cr.base_sha_at_trigger,
                     cr.head_sha_before, cr.head_sha_after, cr.status, cr.failure_reason,
                     cr.cube_lease_id, cr.cube_workspace_id, cr.worker_id,
-                    cr.conflict_diagnosis, cr.created_at, cr.started_at, cr.finished_at
+                    cr.conflict_diagnosis, cr.created_at, cr.started_at, cr.finished_at,
+                    cr.revision_task_id
              FROM conflict_resolutions cr
              WHERE cr.status = 'pending'
                AND NOT EXISTS (
@@ -416,7 +417,7 @@ impl WorkDb {
             "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
                     base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id, conflict_diagnosis,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at, revision_task_id
              FROM conflict_resolutions WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();

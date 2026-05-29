@@ -441,6 +441,14 @@ pub const CREATED_VIA_MAC_APP: &str = "mac_app";
 pub const CREATED_VIA_ENGINE_AUTO: &str = "engine_auto";
 pub const CREATED_VIA_EXTERNAL_TRACKER_SYNC: &str = "external_tracker_sync";
 pub const CREATED_VIA_UNKNOWN: &str = "unknown";
+/// Prefix for engine-triggered revisions spawned by the merge-conflict
+/// watcher: `merge-conflict:<conflict_resolutions.id>`. The attempt id is
+/// the back-pointer; `(repo, pr#)` is recoverable from the chain root.
+/// Design: `tools/boss/docs/designs/unify-pr-remediation-on-revisions.md` Q2.
+pub const CREATED_VIA_MERGE_CONFLICT_PREFIX: &str = "merge-conflict:";
+/// Prefix for engine-triggered revisions spawned by the CI-failure watcher:
+/// `ci-fix:<ci_remediations.id>`. Mirrors `CREATED_VIA_MERGE_CONFLICT_PREFIX`.
+pub const CREATED_VIA_CI_FIX_PREFIX: &str = "ci-fix:";
 
 /// Documented `created_via` values. The engine canonicalises caller-
 /// supplied strings against this set; values outside it are stored
@@ -454,11 +462,15 @@ pub const KNOWN_CREATED_VIA: &[&str] = &[
     CREATED_VIA_UNKNOWN,
 ];
 
-/// `true` when `value` is one of the documented `created_via` strings.
-/// Engine writes for unknown values still go through, but a warning is
-/// logged at the insert site.
+/// `true` when `value` is one of the documented `created_via` strings
+/// or matches a documented prefix pattern (`merge-conflict:*`,
+/// `ci-fix:*`, `pr-comment:*`). Engine writes for unknown values still
+/// go through, but a warning is logged at the insert site.
 pub fn is_known_created_via(value: &str) -> bool {
     KNOWN_CREATED_VIA.contains(&value)
+        || value.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
+        || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
+        || value.starts_with("pr-comment:")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -764,6 +776,13 @@ pub struct ConflictResolution {
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// Soft FK to the `tasks.id` of the `kind=revision` task this attempt
+    /// spawned, or `None` until the producer creates the revision. Set when
+    /// the merge-conflict producer calls the revision-create path
+    /// (Phase 2+ of `unify-pr-remediation-on-revisions.md`); `None` for
+    /// all pre-unification rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_task_id: Option<String>,
 }
 
 /// One active or historical blocked-reason for a work item — the
@@ -890,6 +909,13 @@ pub struct CiRemediation {
     /// attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_commit_sha: Option<String>,
+    /// Soft FK to the `tasks.id` of the `kind=revision` task this attempt
+    /// spawned, or `None` until the producer creates the revision. Set when
+    /// the CI-failure producer calls the revision-create path for `fix` kind
+    /// attempts (Phase 2+ of `unify-pr-remediation-on-revisions.md`);
+    /// `None` for all pre-unification rows and for `retrigger` attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2164,6 +2190,7 @@ mod tests {
             created_at: "1747000000".into(),
             started_at: Some("1747000010".into()),
             finished_at: Some("1747000100".into()),
+            revision_task_id: None,
         };
         let raw = serde_json::to_value(&attempt).unwrap();
         let back: ConflictResolution = serde_json::from_value(raw).unwrap();
@@ -2192,6 +2219,7 @@ mod tests {
             created_at: "1747000000".into(),
             started_at: None,
             finished_at: None,
+            revision_task_id: None,
         };
         let encoded = serde_json::to_value(&attempt).unwrap();
         let obj = encoded.as_object().unwrap();
@@ -2485,6 +2513,7 @@ mod tests {
             finished_at: Some("1747000100".into()),
             failure_kind: Some("pr_branch_ci".into()),
             before_commit_sha: None,
+            revision_task_id: None,
         };
         let raw = serde_json::to_value(&attempt).unwrap();
         let back: CiRemediation = serde_json::from_value(raw).unwrap();
@@ -2618,6 +2647,7 @@ mod tests {
             finished_at: None,
             failure_kind: None,
             before_commit_sha: None,
+            revision_task_id: None,
         };
         let encoded = serde_json::to_value(&attempt).unwrap();
         let obj = encoded.as_object().unwrap();
@@ -2633,6 +2663,7 @@ mod tests {
             "finished_at",
             "failure_kind",
             "before_commit_sha",
+            "revision_task_id",
         ] {
             assert!(
                 !obj.contains_key(absent),
@@ -2806,5 +2837,23 @@ mod tests {
             let back: GitHubAuthStateDto = serde_json::from_value(raw).unwrap();
             assert_eq!(auth, back);
         }
+    }
+
+    #[test]
+    fn is_known_created_via_recognises_engine_trigger_prefixes() {
+        // Exact-match values
+        assert!(is_known_created_via(CREATED_VIA_CLI));
+        assert!(is_known_created_via(CREATED_VIA_ENGINE_AUTO));
+        assert!(is_known_created_via(CREATED_VIA_UNKNOWN));
+
+        // Prefix-based values — engine-triggered revisions
+        assert!(is_known_created_via("merge-conflict:crz_abc123"));
+        assert!(is_known_created_via("ci-fix:crm_def456"));
+        // Pre-existing prefix used by Source B
+        assert!(is_known_created_via("pr-comment:owner/repo#42:comment_id"));
+
+        // Unknown values still return false
+        assert!(!is_known_created_via("something_undocumented"));
+        assert!(!is_known_created_via(""));
     }
 }

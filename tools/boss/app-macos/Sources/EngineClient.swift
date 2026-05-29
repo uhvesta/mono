@@ -1342,7 +1342,8 @@ final class EngineClient: @unchecked Sendable {
             conflictDiagnosis: payload["conflict_diagnosis"] as? String,
             createdAt: createdAt,
             startedAt: payload["started_at"] as? String,
-            finishedAt: payload["finished_at"] as? String
+            finishedAt: payload["finished_at"] as? String,
+            revisionTaskId: payload["revision_task_id"] as? String
         )
     }
 
@@ -1383,7 +1384,8 @@ final class EngineClient: @unchecked Sendable {
             workerID: payload["worker_id"] as? String,
             createdAt: createdAt,
             startedAt: payload["started_at"] as? String,
-            finishedAt: payload["finished_at"] as? String
+            finishedAt: payload["finished_at"] as? String,
+            revisionTaskId: payload["revision_task_id"] as? String
         )
     }
 

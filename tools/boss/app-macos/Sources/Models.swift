@@ -1435,6 +1435,9 @@ struct WorkConflictResolution: Identifiable, Hashable {
     var createdAt: String
     var startedAt: String?
     var finishedAt: String?
+    /// Soft FK to the `tasks.id` of the revision task spawned by this attempt.
+    /// `nil` for pre-unification rows and attempts retired before a revision was created.
+    var revisionTaskId: String? = nil
 }
 
 /// PR-card chip state for the CI auto-fix flow (design Q11 / Phase
@@ -1490,6 +1493,10 @@ struct WorkCiRemediation: Identifiable, Hashable {
     var createdAt: String
     var startedAt: String?
     var finishedAt: String?
+    /// Soft FK to the `tasks.id` of the revision task spawned by this attempt.
+    /// `nil` for pre-unification rows, retrigger attempts, and attempts retired
+    /// before a revision was created.
+    var revisionTaskId: String? = nil
 }
 
 /// Discriminator for the unified Engine-tab attempt feed. Phase 5 #14

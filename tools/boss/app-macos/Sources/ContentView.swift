@@ -1668,6 +1668,9 @@ struct WorkBoardCardView: View {
             if task.kind == "revision", let seq = task.revisionSeq {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     RevisionBadge(seq: seq)
+                    if let origin = EngineRevisionOrigin(createdVia: task.createdVia) {
+                        EngineRevisionBadge(origin: origin)
+                    }
                     if let parentID = parentShortID {
                         Text("revises T\(parentID)")
                             .font(.caption)
@@ -1993,6 +1996,67 @@ private struct RevisionBadge: View {
         .padding(.vertical, 2)
         .background(Color.accentColor.opacity(0.75), in: Capsule())
         .accessibilityLabel("Revision \(seq)")
+    }
+}
+
+/// Discriminates the engine-triggered origin of a revision task from its
+/// `created_via` field. `nil` when the revision is operator- or comment-driven.
+/// Design: `tools/boss/docs/designs/unify-pr-remediation-on-revisions.md` Q2.
+private enum EngineRevisionOrigin {
+    case mergeConflict
+    case ciFix
+
+    init?(createdVia: String) {
+        if createdVia.hasPrefix("merge-conflict:") {
+            self = .mergeConflict
+        } else if createdVia.hasPrefix("ci-fix:") {
+            self = .ciFix
+        } else {
+            return nil
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .mergeConflict: return "conflict fix"
+        case .ciFix: return "CI fix"
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .mergeConflict: return "Engine-triggered revision: auto-generated to resolve a merge conflict."
+        case .ciFix: return "Engine-triggered revision: auto-generated to fix a CI failure."
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .mergeConflict: return "Engine-triggered conflict fix"
+        case .ciFix: return "Engine-triggered CI fix"
+        }
+    }
+}
+
+/// Subtle chrome indicating an engine-triggered revision (merge-conflict or
+/// CI-fix origin). Shown inline with [[RevisionBadge]] on revision cards
+/// whose `created_via` matches one of the engine-trigger prefixes.
+private struct EngineRevisionBadge: View {
+    let origin: EngineRevisionOrigin
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "gear")
+                .font(.caption2)
+            Text(origin.label)
+                .font(.caption.weight(.medium))
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(Color.secondary.opacity(0.12), in: Capsule())
+        .help(origin.helpText)
+        .accessibilityLabel(origin.accessibilityLabel)
     }
 }
 

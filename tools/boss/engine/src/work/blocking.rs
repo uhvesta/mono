@@ -706,7 +706,7 @@ impl WorkDb {
                     triage_class, log_excerpt, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id,
                     created_at, started_at, finished_at,
-                    failure_kind, before_commit_sha
+                    failure_kind, before_commit_sha, revision_task_id
              FROM ci_remediations WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1119,7 +1119,7 @@ impl WorkDb {
                     triage_class, log_excerpt, status, failure_reason,
                     cube_lease_id, cube_workspace_id, worker_id,
                     created_at, started_at, finished_at,
-                    failure_kind, before_commit_sha
+                    failure_kind, before_commit_sha, revision_task_id
              FROM ci_remediations
              WHERE work_item_id = ?1
                AND status IN ('pending', 'running')

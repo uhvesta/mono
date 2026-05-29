@@ -1714,6 +1714,7 @@ mod conflict_resolution_prompt_tests {
             created_at: "1700000000".into(),
             started_at: Some("1700000010".into()),
             finished_at: None,
+            revision_task_id: None,
         }
     }
 
