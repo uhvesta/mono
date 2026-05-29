@@ -357,6 +357,23 @@ final class ChatViewModel: ObservableObject {
     /// Guards against a second click while the engine is still leasing.
     private var openingReviewTerminalIDs: Set<String> = []
 
+    /// Work item IDs for which `merge_when_ready` has been sent but
+    /// `merge_when_ready_accepted` (or `work_error`) has not yet arrived.
+    /// Guards against a duplicate tap while the engine is running the merge.
+    private var mergingWhenReadyIDs: Set<String> = []
+
+    /// Ask the engine to merge (or queue for merging) the PR for the given
+    /// Review-column task. Guards against a duplicate tap while the RPC is
+    /// in flight. The engine runs `gh pr merge --auto --squash` and kicks
+    /// the PR-reconciler so the kanban state updates promptly on success.
+    func mergeWhenReady(for task: WorkTask) {
+        guard let prURL = task.prURL, !prURL.isEmpty else { return }
+        _ = prURL  // consumed by the engine; kept here for the guard above
+        guard !mergingWhenReadyIDs.contains(task.id) else { return }
+        mergingWhenReadyIDs.insert(task.id)
+        engine.sendMergeWhenReady(workItemID: task.id)
+    }
+
     /// Ask the engine to lease a workspace for the given Review-column
     /// task's PR branch and open a terminal there. Opens the window
     /// immediately with a loading spinner; the terminal becomes live once
@@ -1723,10 +1740,12 @@ final class ChatViewModel: ObservableObject {
             }
         case .workError(let message):
             workErrorMessage = message
-            // Allow the user to retry any in-flight review terminal request
-            // that failed — the specific work_error message is shown in the
-            // modal, so clearing in-flight state here is safe.
+            // Allow the user to retry any in-flight review terminal or
+            // merge-when-ready request that failed — the specific
+            // work_error message is shown in the modal, so clearing
+            // in-flight state here is safe.
             openingReviewTerminalIDs.removeAll()
+            mergingWhenReadyIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
             }
@@ -1898,6 +1917,13 @@ final class ChatViewModel: ObservableObject {
                 // Release the lease immediately since nobody will consume it.
                 engine.sendReleaseReviewTerminal(leaseID: leaseID)
             }
+        case .mergeWhenReadyAccepted(let workItemID, _, _):
+            // Engine successfully initiated the merge. Clear the in-flight
+            // guard so the button re-enables if the user wants to retry.
+            // The PR-reconciler was kicked on the engine side, so a
+            // WorkItemUpdated event carrying the new merge-queue / merged
+            // state will arrive shortly.
+            mergingWhenReadyIDs.remove(workItemID)
         case .gitHubAuthState(let state):
             // The engine pushes this on every device-flow transition (and
             // as the reply to a `git_hub_auth_*` request). The settings

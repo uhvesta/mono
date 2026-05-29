@@ -898,6 +898,21 @@ pub enum FrontendRequest {
         #[serde(default)]
         plain_text_projection_version: i64,
     },
+    /// User-initiated "Merge When Ready" for a Review-lane task's PR.
+    /// The engine resolves the task's PR, determines the repo's merge
+    /// mechanism, and fires the appropriate GitHub operation:
+    /// - repo has a merge queue → enqueue the PR
+    /// - no merge queue, checks passing → merge directly
+    /// - no merge queue, checks pending → enable auto-merge
+    ///
+    /// Pre-flight guards: the task must be a task/chore (not a project),
+    /// have `status == "in_review"`, and carry a non-empty `pr_url`.
+    /// Any failure returns [`FrontendEvent::WorkError`]. On success,
+    /// replies with [`FrontendEvent::MergeWhenReadyAccepted`] and kicks
+    /// the PR-reconciler so the kanban reflects the new state promptly.
+    MergeWhenReady {
+        work_item_id: String,
+    },
     /// App asks the engine to lease a workspace for the given Review-
     /// column work item, fetch the PR branch, and create a fresh jj
     /// commit off `<branch>@origin`. The engine replies with
@@ -1603,6 +1618,19 @@ pub enum FrontendEvent {
         work_item_id: String,
         workspace_path: String,
         lease_id: String,
+    },
+    /// Response to [`FrontendRequest::MergeWhenReady`]: the engine has
+    /// successfully initiated the merge process for the PR. `action`
+    /// identifies what happened: `"enqueued"` (PR added to the repo's
+    /// merge queue), `"auto_merge_enabled"` (auto-merge enabled; PR
+    /// will merge once required checks pass), or `"merged"` (PR was
+    /// merged directly because all checks were already passing). The
+    /// PR-reconciler is kicked on the engine side so the kanban state
+    /// refreshes promptly without waiting for the next periodic sweep.
+    MergeWhenReadyAccepted {
+        work_item_id: String,
+        pr_url: String,
+        action: String,
     },
 }
 

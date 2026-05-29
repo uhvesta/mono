@@ -215,6 +215,12 @@ enum EngineEvent {
     /// atop `<branch>@origin`. The app should open a Ghostty terminal
     /// window rooted at `workspacePath`.
     case reviewTerminalReady(workItemID: String, workspacePath: String, leaseID: String)
+    /// Response to `merge_when_ready` — the engine has successfully
+    /// initiated the merge process for the PR. `action` is one of:
+    /// `"enqueued"` (merge queue), `"auto_merge_enabled"` (will merge
+    /// when checks pass), `"merged"` (directly merged). The PR-reconciler
+    /// is kicked on the engine side so the kanban state refreshes promptly.
+    case mergeWhenReadyAccepted(workItemID: String, prURL: String, action: String)
     /// GitHub OAuth auth-state push (OAuth device-flow design §4).
     /// Delivered both as the immediate reply to a `git_hub_auth_*`
     /// request and proactively on the `github.auth` topic as the
@@ -415,6 +421,18 @@ final class EngineClient: @unchecked Sendable {
     func sendOpenReviewTerminal(workItemID: String) {
         sendLine([
             "type": "open_review_terminal",
+            "work_item_id": workItemID,
+        ])
+    }
+
+    /// Ask the engine to merge (or queue for merging) the PR associated
+    /// with `workItemID`. The task must be `in_review` and carry a PR URL;
+    /// any violation is surfaced as a `workError` event. On success the
+    /// engine replies with a `mergeWhenReadyAccepted` event and kicks the
+    /// PR-reconciler so the kanban state updates promptly.
+    func sendMergeWhenReady(workItemID: String) {
+        sendLine([
+            "type": "merge_when_ready",
             "work_item_id": workItemID,
         ])
     }
@@ -1211,6 +1229,17 @@ final class EngineClient: @unchecked Sendable {
                         workItemID: workItemID,
                         workspacePath: workspacePath,
                         leaseID: leaseID
+                    ))
+                }
+            case "merge_when_ready_accepted":
+                let workItemID = payload["work_item_id"] as? String ?? ""
+                let prURL = payload["pr_url"] as? String ?? ""
+                let action = payload["action"] as? String ?? ""
+                if !workItemID.isEmpty {
+                    emit(.mergeWhenReadyAccepted(
+                        workItemID: workItemID,
+                        prURL: prURL,
+                        action: action
                     ))
                 }
             case "git_hub_auth_state":
