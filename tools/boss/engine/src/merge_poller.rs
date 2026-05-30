@@ -133,6 +133,11 @@ crate::register_counter!(
     "merge_poller.revision_invalidated",
     "Pending/active revision executions stopped because their parent PR merged or closed in one sweep."
 );
+crate::register_counter!(
+    WORKER_STOPPED_ON_REVIEW,
+    "merge_poller.worker_stopped_on_review",
+    "Live worker executions stopped because their task auto-transitioned to in_review (CI detected green) in one sweep."
+);
 
 /// Register all merge-poller counter handles with `registry`. Called
 /// from [`crate::metrics::init_all`] at engine startup.
@@ -145,6 +150,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&MERGE_QUEUE_REBOUNCED);
     registry.register_counter(&LATE_PR_RECOVERED);
     registry.register_counter(&REVISION_INVALIDATED);
+    registry.register_counter(&WORKER_STOPPED_ON_REVIEW);
 }
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -1285,6 +1291,13 @@ pub struct SweepOutcome {
     /// task that was already blocked in the same DB transaction that
     /// transitioned the parent to `done`.
     pub revision_invalidated: usize,
+    /// Number of live worker executions force-stopped because their task
+    /// auto-transitioned back to `in_review` after the engine detected
+    /// the PR's CI had gone green. The worker (typically still polling CI
+    /// to see whether its own fix landed) has nothing useful left to do
+    /// once the task reaches Review, so leaving it alive only ties up a
+    /// slot (issue #898).
+    pub worker_stopped_on_review: usize,
 }
 
 impl SweepOutcome {
@@ -1299,6 +1312,7 @@ impl SweepOutcome {
             + self.ci_remediation_redispatched
             + self.late_pr_recovered
             + self.revision_invalidated
+            + self.worker_stopped_on_review
     }
 }
 
@@ -1538,6 +1552,56 @@ async fn stop_active_revision_executions(
             }
         }
     }
+}
+
+/// Stop the live worker execution for `work_item_id` after its task
+/// auto-transitioned back to `in_review` because the engine detected its
+/// PR's CI had gone green (`on_ci_resolved`).
+///
+/// The worker that was running the task has nothing useful left to do:
+/// the task reaching Review means its job is done. In the observed bug
+/// (issue #898) the worker sat in `waiting_for_input`, polling CI checks
+/// for the very fix the engine had already observed as green, holding a
+/// worker slot indefinitely. We force-stop it regardless of what it is
+/// doing — cancel the execution row and release its cube lease + pane.
+///
+/// [`WorkerCompletionHandler::force_stop_execution`] only demotes a task
+/// that is still `active`; since the task is now `in_review`, that guard
+/// does not fire and the task stays in Review. Idempotent: a no-op when
+/// no live execution exists or `completion_handler` is `None` (tests /
+/// cold-path wiring).
+async fn stop_worker_on_review_transition(
+    work_db: &WorkDb,
+    completion_handler: Option<&WorkerCompletionHandler>,
+    work_item_id: &str,
+    outcome: &mut SweepOutcome,
+) {
+    let Some(handler) = completion_handler else {
+        return;
+    };
+    // `exclude_id = ""` matches no real execution, so this returns the
+    // genuinely-live worker for the task (not a phantom terminal row left
+    // by a re-dispatch storm — see `get_live_execution_for_work_item`).
+    let execution = match work_db.get_live_execution_for_work_item(work_item_id, "") {
+        Ok(Some(exec)) => exec,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                ?err,
+                "merge poller: failed to look up live execution to stop after Review transition; \
+                 task is in_review but a worker may still be holding a slot",
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        execution_id = %execution.id,
+        work_item_id,
+        "merge poller: stopping worker — task auto-transitioned to in_review (CI green)",
+    );
+    handler.force_stop_execution(&execution.id).await;
+    outcome.worker_stopped_on_review += 1;
 }
 
 /// Re-run PR detection against an execution that the on-Stop hook
@@ -1797,6 +1861,7 @@ async fn sweep_one(
                         work_db,
                         publisher,
                         cube_client,
+                        completion_handler,
                         candidate,
                         &probe_result.labels,
                         ci,
@@ -1900,6 +1965,7 @@ async fn maybe_clear_blocked(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
+    completion_handler: Option<&WorkerCompletionHandler>,
     candidate: &PendingMergeCheck,
     labels: &[String],
     ci: &OpenPrCiStatus,
@@ -1979,6 +2045,19 @@ async fn maybe_clear_blocked(
                 }
                 if ci_watch::on_ci_resolved(work_db, publisher, candidate, labels).await {
                     outcome.ci_cleared += 1;
+                    // The task just auto-transitioned back to `in_review`
+                    // because its PR's CI went green. Stop the worker that
+                    // was running it — it has nothing useful left to do (it
+                    // is typically still polling CI for the very fix the
+                    // engine already observed) and otherwise holds its slot
+                    // indefinitely (issue #898).
+                    stop_worker_on_review_transition(
+                        work_db,
+                        completion_handler,
+                        &candidate.work_item_id,
+                        outcome,
+                    )
+                    .await;
                 }
             }
             other => {
@@ -2219,6 +2298,8 @@ pub fn spawn_loop(
             MERGE_QUEUE_REBOUNCED.inc_by(&metrics, outcome.merge_queue_rebounced as u64);
             LATE_PR_RECOVERED.inc_by(&metrics, outcome.late_pr_recovered as u64);
             REVISION_INVALIDATED.inc_by(&metrics, outcome.revision_invalidated as u64);
+            WORKER_STOPPED_ON_REVIEW
+                .inc_by(&metrics, outcome.worker_stopped_on_review as u64);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -2231,6 +2312,7 @@ pub fn spawn_loop(
                     merge_queue_rebounced = outcome.merge_queue_rebounced,
                     late_pr_recovered = outcome.late_pr_recovered,
                     revision_invalidated = outcome.revision_invalidated,
+                    worker_stopped_on_review = outcome.worker_stopped_on_review,
                     "merge poller: sweep transitions",
                 );
             }
@@ -5075,6 +5157,138 @@ mod tests {
             outcome.late_pr_recovered, 0,
             "late_pr_recovered must be 0 when no handler is wired",
         );
+    }
+
+    /// Build a chore that is `blocked: ci_failure` with a PR and a live
+    /// worker execution still attached (status `running`). Mirrors the
+    /// issue-#898 scenario: a worker that fixed CI but is left polling.
+    /// Returns `(product_id, chore_id, execution_id)`.
+    fn make_blocked_ci_chore_with_live_worker(
+        db: &WorkDb,
+        name: &str,
+        pr: &str,
+    ) -> (String, String, String) {
+        let (product_id, chore) = make_chore_in_review(db, name, pr);
+        db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
+        let exec = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("ready".into()),
+                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
+            })
+            .unwrap();
+        let (exec, _run) = db
+            .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")
+            .unwrap();
+        // Precondition: the worker is live for the task.
+        assert!(
+            db.get_live_execution_for_work_item(&chore, "")
+                .unwrap()
+                .is_some(),
+            "setup: worker should be live before the sweep",
+        );
+        (product_id, chore, exec.id)
+    }
+
+    /// Issue #898: when the engine auto-transitions a `blocked: ci_failure`
+    /// task back to `in_review` (CI detected green), the live worker that
+    /// was running it must be force-stopped — it has nothing useful left
+    /// to do and otherwise holds its slot indefinitely. The task itself
+    /// stays in Review (force-stop's demotion guard only fires on
+    /// `active`).
+    #[tokio::test]
+    async fn ci_resolved_stops_live_worker_and_keeps_task_in_review() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let pr = "https://github.com/foo/bar/pull/898";
+        let (_product_id, chore, exec_id) =
+            make_blocked_ci_chore_with_live_worker(&db, "C-898-stop", pr);
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            Arc::new(FixedPrDetector(None)),
+            Arc::new(NoopCubeClient),
+            publisher.clone(),
+            Arc::new(NoopPaneReleaser),
+            Arc::new(NoopProbeQueuer),
+        );
+
+        let outcome = run_one_pass(
+            db.as_ref(),
+            probe.as_ref(),
+            publisher.as_ref(),
+            None,
+            Some(&handler),
+        )
+        .await;
+
+        assert_eq!(outcome.ci_cleared, 1, "ci_failure retired to in_review");
+        assert_eq!(
+            outcome.worker_stopped_on_review, 1,
+            "the live worker for the task was force-stopped, got: {outcome:?}",
+        );
+
+        // Task stays in Review — NOT demoted back to todo.
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // The worker execution is now terminal and no longer live.
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, "cancelled");
+        assert!(
+            db.get_live_execution_for_work_item(&chore, "")
+                .unwrap()
+                .is_none(),
+            "no live worker should remain for the task",
+        );
+    }
+
+    /// Without a completion handler wired (tests / cold-path), the CI
+    /// retire path still fires but the worker-stop is a no-op — the
+    /// counter stays 0 and the execution is left untouched.
+    #[tokio::test]
+    async fn ci_resolved_without_handler_does_not_stop_worker() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let pr = "https://github.com/foo/bar/pull/899";
+        let (_product_id, chore, exec_id) =
+            make_blocked_ci_chore_with_live_worker(&db, "C-898-nohandler", pr);
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+
+        let outcome = run_one_pass(
+            db.as_ref(),
+            probe.as_ref(),
+            publisher.as_ref(),
+            None,
+            None, // no handler
+        )
+        .await;
+
+        assert_eq!(outcome.ci_cleared, 1, "ci_failure still retires");
+        assert_eq!(
+            outcome.worker_stopped_on_review, 0,
+            "no worker-stop without a handler, got: {outcome:?}",
+        );
+        // Execution untouched — still live.
+        assert_eq!(db.get_execution(&exec_id).unwrap().status, "running");
     }
 
     // ----- parse_dequeue_events_response (merge-queue reason case T770/T771) -----
