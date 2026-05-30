@@ -1958,7 +1958,11 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
             .and_then(|v| v.as_str())
         {
             let url = url.to_string();
-            return RunResult::new(url.clone(), json!({"url": url, "created": false}));
+            let number = pr_number_from_url(&url);
+            return RunResult::new(
+                url.clone(),
+                json!({"action": "exists", "url": url, "number": number}),
+            );
         }
     }
 
@@ -1998,7 +2002,11 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
             "gh pr create produced no output — PR may not have been created".to_string(),
         ));
     }
-    RunResult::new(url.clone(), json!({"url": url, "created": true}))
+    let number = pr_number_from_url(&url);
+    RunResult::new(
+        url.clone(),
+        json!({"action": "created", "url": url, "number": number}),
+    )
 }
 
 /// Parse the first recognisable `owner/repo` slug from `jj git remote list` output.
@@ -2030,6 +2038,16 @@ fn parse_github_slug(remote_url: &str) -> Option<String> {
     let owner = parts.next().filter(|s| !s.is_empty())?;
     let repo = parts.next().filter(|s| !s.is_empty())?;
     Some(format!("{owner}/{repo}"))
+}
+
+/// Extract the PR number from a GitHub pull request URL.
+///
+/// Returns `None` if the URL does not end with a numeric segment.
+fn pr_number_from_url(url: &str) -> Option<u64> {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
 }
 
 /// Detect the first bookmark name on the current jj commit (`@`).
@@ -10175,5 +10193,118 @@ steps:
         // Body file must not be modified — backticks and $(...) survive verbatim.
         let body_on_disk = std::fs::read_to_string(tmp.path()).expect("read body");
         assert_eq!(body_on_disk, body_content);
+    }
+
+    // --- ensure_pr JSON output shape tests ---
+
+    #[test]
+    fn ensure_pr_created_json_has_action_url_number() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", "my-feature", "--allow-new"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                ],
+                "[]",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "create", "-R", "spinyfin/mono", "--head", "my-feature", "--base",
+                    "main", "--title", "New PR",
+                ],
+                "https://github.com/spinyfin/mono/pull/42",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr created");
+        runner.assert_exhausted();
+
+        assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/42");
+        assert_eq!(result.payload["action"], "created");
+        assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/42");
+        assert_eq!(result.payload["number"], 42);
+    }
+
+    #[test]
+    fn ensure_pr_exists_json_has_action_url_number() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "push", "-b", "my-feature", "--allow-new"],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                ],
+                r#"[{"url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "Existing PR",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr exists");
+        runner.assert_exhausted();
+
+        assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/7");
+        assert_eq!(result.payload["action"], "exists");
+        assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/7");
+        assert_eq!(result.payload["number"], 7);
+    }
+
+    // --- pr_number_from_url tests ---
+
+    #[test]
+    fn pr_number_from_url_parses_standard_url() {
+        assert_eq!(
+            super::pr_number_from_url("https://github.com/owner/repo/pull/123"),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn pr_number_from_url_parses_url_with_trailing_slash() {
+        assert_eq!(
+            super::pr_number_from_url("https://github.com/owner/repo/pull/456/"),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn pr_number_from_url_returns_none_for_non_numeric_suffix() {
+        assert_eq!(
+            super::pr_number_from_url("https://github.com/owner/repo/pull/"),
+            None
+        );
     }
 }
