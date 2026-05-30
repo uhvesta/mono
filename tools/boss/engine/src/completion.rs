@@ -1028,6 +1028,37 @@ impl WorkerCompletionHandler {
                     .await;
             }
             ShaDeltaGateOutcome::Inapplicable => {
+                // `revision_implementation` executions with a captured
+                // `pr_head_before` snapshot: the gate returned Inapplicable
+                // because the GitHub API fetch failed transiently, not because
+                // no baseline exists. The cold-path branch-keyed detector
+                // always returns None for revisions (they push commits to the
+                // parent PR's branch and never open their own PR), so the only
+                // cold-path outcome is: bound PR found via
+                // resolve_bound_pr_url → nudge "push to existing PR". That
+                // nudge loops: each Stop re-triggers the same probe (T939
+                // regression: Crusher was stuck in waiting_for_input). Return
+                // AwaitingInput silently instead; the merge poller's
+                // recheck_for_pr will finalize via the SHA-delta gate once the
+                // API recovers.
+                if execution.kind == "revision_implementation"
+                    && execution
+                        .pr_head_before
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_some()
+                {
+                    if let Some(bound_pr_url) = self.resolve_bound_pr_url(&execution) {
+                        tracing::info!(
+                            execution_id,
+                            %bound_pr_url,
+                            "stop event: revision_implementation with pr_head_before set but \
+                             SHA-delta fetch failed — skipping cold-path nudge to avoid \
+                             probe loop; recheck_for_pr will finalize when API recovers"
+                        );
+                        return StopOutcome::AwaitingInput;
+                    }
+                }
                 // No bound `chore.pr_url`, or the snapshot/fetch was
                 // unavailable. Fall through to the existing
                 // branch-keyed cold-path detector (new-PR flow).
@@ -6737,6 +6768,148 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "lease must stay held when revision is not done",
         );
         assert!(probes.snapshot().is_empty(), "recheck must not nudge");
+    }
+
+    // -----------------------------------------------------------
+    // T939 regression: revision on_stop with pr_head_before set
+    //
+    // When on_stop fires for a revision_implementation execution in
+    // waiting_human status with pr_head_before captured at execution start:
+    //   1. SHA-delta Contributed (worker pushed) → finalize directly, no nudge.
+    //   2. SHA-delta Inapplicable due to transient API failure → return quietly,
+    //      no nudge (avoids the probe loop: probe → response → Stop → nudge →
+    //      repeat that kept Crusher stuck in T939).
+    // The merge poller's recheck_for_pr handles case 2 when the API recovers.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn revision_on_stop_sha_delta_contributed_finalizes_with_no_nudge() {
+        // T939 ideal path: the revision worker pushed commits to the parent PR
+        // branch (head SHA moved). on_stop detects the contribution via the
+        // SHA-delta gate and finalizes without queuing any nudge probe.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1032";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Branch verifier: SHA moved (worker pushed revision commit).
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()))
+            .await;
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "on_stop must finalize revision when SHA-delta detects contribution; got {outcome:?}",
+        );
+        // No probe must be queued — the revision is done.
+        assert!(
+            probes.snapshot().is_empty(),
+            "no probe must fire when revision is finalised via SHA-delta; got {:?}",
+            probes.snapshot(),
+        );
+        // Revision task must be in_review; task.pr_url stays NULL (parent owns it).
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) => {
+                assert_eq!(t.status, "in_review", "revision must move to in_review");
+                assert!(t.pr_url.is_none(), "revision task.pr_url must stay NULL");
+            }
+            other => panic!("expected task, got {other:?}"),
+        }
+        // Execution must be completed with pr_url populated (= parent PR URL).
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "completed");
+        assert_eq!(
+            execution.pr_url.as_deref(),
+            Some(parent_pr_url),
+            "execution.pr_url must be populated with parent PR URL after finalization",
+        );
+        // Cube lease must be released.
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "cube lease must be released after revision finalises",
+        );
+        // Work-item invalidation must fire.
+        let work_events = publisher.work_events.lock().await.clone();
+        assert!(
+            work_events.iter().any(|(p, w, _)| p == &product_id && w == &revision_id),
+            "work-item invalidation must fire for the revision, got {work_events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_on_stop_sha_delta_api_failure_does_not_nudge() {
+        // T939 regression fix: when on_stop fires for a revision_implementation
+        // execution in waiting_human with pr_head_before set, but the GitHub
+        // API fails transiently (SHA-delta gate → Inapplicable), the engine
+        // must NOT queue a nudge probe. Queuing a probe causes the worker to
+        // respond, which fires another Stop, which nudges again — an infinite
+        // loop. Return AwaitingInput silently; the merge poller's recheck_for_pr
+        // will finalize once the API recovers.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1032";
+        let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, _revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head_before);
+        // Branch verifier: fetch_pr_head_oid fails — simulates transient GitHub API failure.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .set_head_oid(Err("transient GitHub API error".to_owned()))
+            .await;
+        // Cold-path detector returns None — revision has no branch of its own.
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "revision with pr_head_before set but transient SHA-delta failure must return \
+             AwaitingInput silently (no nudge loop); got {outcome:?}",
+        );
+        // CRITICAL: no probe must be queued.
+        assert!(
+            probes.snapshot().is_empty(),
+            "revision must NOT be nudged when SHA-delta fails with pr_head_before set \
+             (T939 regression guard); got {:?}",
+            probes.snapshot(),
+        );
+        // Execution must still be waiting_human — not completed, not parked.
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            execution.status, "waiting_human",
+            "execution must remain in waiting_human until merge poller finalizes it",
+        );
     }
 
     // -----------------------------------------------------------
