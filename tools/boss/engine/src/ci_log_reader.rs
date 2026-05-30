@@ -226,6 +226,27 @@ pub fn parse_buildkite_build_id(url: &str) -> Option<String> {
     if id.is_empty() { None } else { Some(id.to_owned()) }
 }
 
+/// Extract the Buildkite pipeline slug from a `targetUrl`. Buildkite
+/// job pages look like
+/// `https://buildkite.com/<org>/<pipeline>/builds/<n>#<job-uuid>`;
+/// the pipeline slug is the path segment immediately after the org.
+/// Returns `None` when the URL doesn't match the canonical shape.
+pub fn parse_buildkite_pipeline_slug(url: &str) -> Option<String> {
+    let path = url
+        .strip_prefix("https://buildkite.com/")
+        .or_else(|| url.strip_prefix("http://buildkite.com/"))?;
+    let mut parts = path.splitn(4, '/');
+    let _org = parts.next()?;
+    let pipeline = parts.next()?;
+    // Confirm we are looking at a builds URL to avoid matching unrelated paths.
+    let next = parts.next()?;
+    if next.starts_with("builds") && !pipeline.is_empty() {
+        Some(pipeline.to_owned())
+    } else {
+        None
+    }
+}
+
 /// Extract the Buildkite job UUID from a `targetUrl`. Job UUIDs ride
 /// in the URL fragment (`…/builds/<n>#<job-uuid>`).
 pub fn parse_buildkite_job_id(url: &str) -> Option<String> {
@@ -318,6 +339,31 @@ mod tests {
     fn buildkite_build_id_returns_none_for_non_buildkite_url() {
         assert!(parse_buildkite_build_id("https://example.com/foo").is_none());
         assert!(parse_buildkite_build_id("").is_none());
+    }
+
+    #[test]
+    fn buildkite_pipeline_slug_parses_from_canonical_url() {
+        let url = "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid";
+        assert_eq!(
+            parse_buildkite_pipeline_slug(url).as_deref(),
+            Some("mypipeline"),
+        );
+    }
+
+    #[test]
+    fn buildkite_pipeline_slug_parses_without_fragment() {
+        let url = "https://buildkite.com/myorg/mypipeline/builds/1329";
+        assert_eq!(
+            parse_buildkite_pipeline_slug(url).as_deref(),
+            Some("mypipeline"),
+        );
+    }
+
+    #[test]
+    fn buildkite_pipeline_slug_returns_none_for_non_canonical_url() {
+        assert!(parse_buildkite_pipeline_slug("https://example.com/foo").is_none());
+        assert!(parse_buildkite_pipeline_slug("https://buildkite.com/org").is_none());
+        assert!(parse_buildkite_pipeline_slug("").is_none());
     }
 
     #[test]

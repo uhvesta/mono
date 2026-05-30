@@ -6,6 +6,7 @@ use std::time::Duration as StdDuration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 
+use crate::ci_log_reader::{parse_buildkite_build_id, parse_buildkite_pipeline_slug};
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis::ConflictDiagnosis;
 use crate::coordinator::slot_id_from_worker_id;
@@ -1222,6 +1223,10 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     }
     out.push('\n');
 
+    if let Some(bk_cmds) = render_bk_log_commands(&attempt.failed_checks) {
+        out.push_str(&bk_cmds);
+    }
+
     if attempt.attempt_kind == "retrigger" {
         out.push_str("### Action: retrigger the failing build\n\n");
         out.push_str(
@@ -1298,7 +1303,9 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
             out.push_str(&format!(
                 "Fetch CI logs from the **synthetic merge SHA `{sha_hint}`**, not the PR head \
                  (whose checks are green). Use the per-provider CLI:\n\n\
-                 - Buildkite: `bk job log <job-id>` (job id from the failing check URL)\n\
+                 - Buildkite: `bk job log --pipeline <slug> --build-number <N> <job-uuid>` \
+                 (slug and build number are in the check's `target_url`; job UUIDs come from \
+                 `bk build view <N> --pipeline <slug>`)\n\
                  - GitHub Actions: `gh run view --log-failed --job <job-id>` (job id from failing check URL)\n\n",
             ));
         } else {
@@ -1312,8 +1319,8 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 _ => {
                     out.push_str(
                         "_The engine's pre-spawn log fetch did not produce an excerpt for this attempt. \
-                         Shell out to the per-provider CLI (`bk job log <job-id>` / \
-                         `gh run view --log-failed --job <job-id>`) from the failing check's `target_url`._\n\n",
+                         Use the ready-to-run commands above (`bk job log --pipeline …`) or \
+                         `gh run view --log-failed --job <job-id>` (job id from the failing check URL)._\n\n",
                     );
                 }
             }
@@ -1442,6 +1449,69 @@ fn compose_ci_remediation_prompt(
     prompt.push_str("Respond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
+}
+
+/// Build a block of ready-to-run `bk` CLI commands for every Buildkite
+/// entry in the `failed_checks` JSON. Returns `None` when the JSON
+/// contains no Buildkite entries or the target URLs lack enough
+/// information to construct pre-filled commands.
+///
+/// Emits two commands per failing Buildkite job:
+///   `bk build view <N> --pipeline <slug>`  — enumerate all jobs in the build
+///   `bk job log --pipeline <slug> --build-number <N> <job-uuid>`
+fn render_bk_log_commands(failed_checks_json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        target_url: String,
+        provider: String,
+        #[serde(default)]
+        provider_job_id: Option<String>,
+    }
+    let entries: Vec<Entry> = serde_json::from_str(failed_checks_json).ok()?;
+
+    let mut commands = String::new();
+    for e in &entries {
+        if e.provider != "buildkite" {
+            continue;
+        }
+        let Some(pipeline) = parse_buildkite_pipeline_slug(&e.target_url) else {
+            continue;
+        };
+        let Some(build_num) = parse_buildkite_build_id(&e.target_url) else {
+            continue;
+        };
+        commands.push_str(&format!(
+            "bk build view {build_num} --pipeline {pipeline}\n",
+        ));
+        match e.provider_job_id.as_deref() {
+            Some(job_id) => {
+                commands.push_str(&format!(
+                    "bk job log --pipeline {pipeline} --build-number {build_num} {job_id}\n",
+                ));
+            }
+            None => {
+                commands.push_str(&format!(
+                    "# (replace <job-uuid> with an id from `bk build view` above)\n\
+                     bk job log --pipeline {pipeline} --build-number {build_num} <job-uuid>\n",
+                ));
+            }
+        }
+    }
+
+    if commands.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str("### Ready-to-run Buildkite log commands\n\n");
+    out.push_str(
+        "`bk` is the Buildkite CLI. These commands are pre-filled with the \
+         pipeline, build number, and job id — no argument guessing required:\n\n",
+    );
+    out.push_str("```\n");
+    out.push_str(&commands);
+    out.push_str("```\n\n");
+    Some(out)
 }
 
 /// Render the `failed_checks` JSON blob (one entry per failing required
@@ -2541,7 +2611,7 @@ mod compose_prompt_tests {
             head_sha_after: None,
             attempt_kind: "fix".into(),
             consumes_budget: 1,
-            failed_checks: r#"[{"name":"ci/test","conclusion":"FAILURE","target_url":"https://buildkite.com/builds/123","provider":"buildkite","provider_job_id":"job-456"}]"#.into(),
+            failed_checks: r#"[{"name":"ci/test","conclusion":"FAILURE","target_url":"https://buildkite.com/myorg/mypipeline/builds/1329","provider":"buildkite","provider_job_id":"job-uuid-456"}]"#.into(),
             triage_class: None,
             log_excerpt: Some("ERROR: test failed at line 42".into()),
             status: "running".into(),
@@ -2638,6 +2708,15 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("ERROR: test failed at line 42"),
             "CI fragment must include the log excerpt:\n{prompt}",
+        );
+        // Must contain the pre-filled bk commands block.
+        assert!(
+            prompt.contains("bk build view 1329 --pipeline mypipeline"),
+            "CI fragment must include pre-filled bk build view command:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("bk job log --pipeline mypipeline --build-number 1329 job-uuid-456"),
+            "CI fragment must include pre-filled bk job log command:\n{prompt}",
         );
         // Must still contain the base revision directive spine.
         assert!(
