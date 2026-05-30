@@ -2751,11 +2751,12 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_drives_full_conflict_resolve_cycle() {
-        // End-to-end through `run_one_pass`: in_review → conflict
-        // (probe says Conflict) → resolved (probe flips to Clean on
-        // next pass). The poller picks the row up from the
-        // in_review slice for the first pass and from the
-        // blocked-conflict slice for the second.
+        // End-to-end through `run_one_pass`: conflict detected (parent stays
+        // in Review — revision in Doing) → probe goes Clean → attempt retired.
+        //
+        // New-model behavior: parent never leaves in_review when a revision
+        // fix vehicle is in flight. The poller picks the row up from the
+        // in_review slice on every pass; blocked-conflict slice is empty.
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/500";
@@ -2763,7 +2764,7 @@ mod tests {
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
 
-        // Pass 1: probe reports Conflict; row flips to blocked.
+        // Pass 1: probe reports Conflict; revision spawned, parent stays in_review.
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.conflict_flagged, 1);
@@ -2771,20 +2772,20 @@ mod tests {
         assert_eq!(outcome.merged, 0);
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "blocked");
-                assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+                // New-model: parent stays in_review while revision is in flight.
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
         }
 
-        // Pass 2 with no change: idempotent — probe still reports
-        // Conflict, but row is already blocked, so the
-        // mark-conflict UPDATE matches zero rows.
+        // Pass 2 with no change: idempotent — active revision already in flight,
+        // pre-flight early-exit fires, zero transitions.
         let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome2.total_transitions(), 0);
 
-        // Pass 3: probe flips to Clean; the blocked-conflict slice
-        // picks the row up and clears it back to in_review.
+        // Pass 3: probe flips to Clean; on_resolved retires the attempt and
+        // clears the signal. Parent was already in_review — no status flip.
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
         let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome3.conflict_cleared, 1);
@@ -2797,12 +2798,12 @@ mod tests {
             }
             other => panic!("expected chore, got {other:?}"),
         }
-        // Pass 4 with no change: the clear is also idempotent.
+        // Pass 4 with no change: clear is also idempotent.
         let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome4.total_transitions(), 0);
 
-        // Event trail: blocked → resolved, plus the noop-passes
-        // emitted nothing (poll-state events are excluded).
+        // Event trail: conflict in flight → (no work-item event on resolve since
+        // parent didn't change status). Poll-state events excluded.
         let reasons: Vec<String> = publisher
             .work_events
             .lock()
@@ -2813,10 +2814,8 @@ mod tests {
             .collect();
         assert_eq!(
             reasons,
-            vec![
-                "blocked_merge_conflict".to_owned(),
-                "merge_conflict_resolved".to_owned(),
-            ],
+            vec!["conflict_revision_in_flight".to_owned()],
+            "only conflict_revision_in_flight event expected (parent never blocked)",
         );
     }
 
@@ -3118,12 +3117,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_promotes_merged_pr_even_when_row_was_blocked() {
-        // A blocked-on-conflict row whose PR was force-merged via
-        // GitHub's branch-protection override should be promoted by
-        // the sweep, not left in `blocked`. The Merged branch of the
-        // dispatch runs regardless of which candidate list found the
-        // row.
+    async fn sweep_promotes_merged_pr_even_when_row_was_in_review_with_conflict() {
+        // A row whose PR was force-merged while a conflict-resolution revision
+        // was in flight should be promoted by the sweep. With the new model the
+        // parent stays in_review (not blocked) while the revision is in Doing.
+        // The Merged branch of the dispatch runs from the in_review candidate list.
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/501";
@@ -3131,11 +3129,11 @@ mod tests {
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
 
-        // First pass: flip to blocked.
+        // First pass: conflict detected; parent stays in_review (revision spawned).
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
         run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "blocked"),
+            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
             other => panic!("expected chore, got {other:?}"),
         }
 
@@ -4156,19 +4154,17 @@ mod tests {
     /// without any prior poller activity.
     #[tokio::test]
     async fn startup_sweep_picks_up_offline_conflict_transition() {
+        // New-model: at startup, a CONFLICTING in_review PR spawns a revision
+        // and the parent stays in_review (not blocked). The conflict_flagged
+        // counter still increments (something happened).
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/800";
-        // Seed the chore in `in_review` with a PR, mirroring the
-        // post-restart state of a chore whose PR went CONFLICTING
-        // while the engine was down.
         let (_product, chore) = make_chore_in_review(&db, "C-offline-conflict", pr);
         let probe = StubProbe::new();
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
         let publisher = Arc::new(RecordingPublisher::default());
 
-        // No prior probe activity — this is the very first sweep,
-        // exactly what runs at engine startup.
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(
             outcome.conflict_flagged, 1,
@@ -4177,8 +4173,9 @@ mod tests {
 
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "blocked");
-                assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+                // New-model: parent stays in_review while revision is in flight.
+                assert_eq!(t.status, "in_review");
+                assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
         }
@@ -4300,9 +4297,10 @@ mod tests {
 
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
 
-        // The sweep must NOT count this as a new conflict_flagged
-        // (the task didn't flip from in_review — it was already blocked).
-        assert_eq!(outcome.conflict_flagged, 0, "no new flip expected");
+        // New-model: re-arm dispatches a fresh revision; the parent is
+        // reconciled back to in_review. conflict_flagged = 1 because a state
+        // transition occurred (blocked → in_review via reconcile path).
+        assert_eq!(outcome.conflict_flagged, 1, "stale-base re-arm must count as a new event");
 
         // A new crz must exist with base_sha_at_trigger = "sha-new".
         let crz_rows = db
@@ -4355,13 +4353,14 @@ mod tests {
             "merge_conflict signal must be active after re-arm; got {signals:?}",
         );
 
-        // tasks.blocked_reason must still be merge_conflict.
+        // New-model: parent is reconciled back to in_review (revision in flight).
         let task_after = match db.get_work_item(&chore).unwrap() {
             crate::work::WorkItem::Chore(t) => t,
             other => panic!("expected Chore, got {other:?}"),
         };
-        assert_eq!(task_after.status, "blocked");
-        assert_eq!(task_after.blocked_reason.as_deref(), Some("merge_conflict"));
+        assert_eq!(task_after.status, "in_review",
+            "stale-base re-arm must reconcile parent to in_review (revision in flight)");
+        assert!(task_after.blocked_reason.is_none());
     }
 
     /// Complement test: a `failed` crz must NOT be re-armed (churn guard

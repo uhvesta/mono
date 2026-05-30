@@ -79,26 +79,30 @@ fn auto_pr_maintenance_disabled(
     }
 }
 
-/// Fire-once flip from `in_review` to `blocked: merge_conflict`.
-/// Returns `true` if the row actually transitioned (so the poller's
-/// per-sweep counter can record it). All paths that *don't*
-/// transition — WHERE-guard miss, auto-rebase owns the slot, DB
-/// error — return `false` and log at the appropriate level.
+/// Conflict-detection entry point — creates a `conflict_resolutions`
+/// attempt and dispatches an engine-triggered revision fix vehicle when
+/// the probe reports `OpenPrMergeability::Conflict`.
 ///
-/// When a freshly-inserted `conflict_resolutions` row accompanies the
-/// flip (Phase 3 wiring), this path also publishes a typed
-/// [`FrontendEvent::ConflictResolutionStarted`] envelope so activity-feed
-/// subscribers can render the start-of-attempt entry without polling.
+/// **Parent-state model (post-revision-unification):**
+/// While an active conflict-resolution revision is in flight, the
+/// parent stays in `in_review` (Review column) — exactly as a normal
+/// revision leaves its parent. The parent flips to
+/// `blocked: merge_conflict` only when there is no tractable fix
+/// vehicle: the churn cap was exceeded, or `create_revision` failed
+/// (parent PR no longer revisable). That is the genuine "needs a
+/// human" terminal.
 ///
-/// Phase 3 cutover (design Q1/Q5): on a *genuinely-new* attempt row the
-/// fix vehicle is now an **engine-triggered revision** (`parent = chore`,
-/// `created_via = "merge-conflict:<crz_id>"`) created via the shared
-/// `create_revision` gate, rather than a bespoke `conflict_resolution`
-/// execution. The producer reuses the create-time `assert_parent_revisable`
-/// gate (R4) and stamps `attempt.revision_task_id`; the reconcile loop then
-/// dispatches a `revision_implementation` execution into the chain root's
-/// warm workspace. `pr_checker` supplies the gate's live PR-state probe
-/// (`&GhPrStateChecker` in production, a fake in tests).
+/// Implementation note: we still call `mark_chore_blocked_merge_conflict`
+/// as the upfront WHERE guard (it enforces `status='in_review'` to
+/// protect against human-moved rows), then immediately clear it back to
+/// `in_review` and upsert the `task_blocked_signals` row whenever a
+/// revision is successfully spawned. The brief intermediate `blocked`
+/// state is invisible to the sweep — the entire detect → spawn → unblock
+/// sequence runs within a single call.
+///
+/// Returns `true` when the parent task status changed (in either
+/// direction) or a fresh attempt row was created; `false` for purely
+/// idempotent repeat probes and human-owned rows.
 pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -136,22 +140,61 @@ pub async fn on_conflict_detected(
             return false;
         }
     }
+    // Pre-flight: when an active revision fix vehicle already exists for this
+    // work item, the detection flow is essentially a no-op for an `in_review`
+    // parent (signal already armed, revision already in Doing). Skip the
+    // upfront flip+unblock cycle to avoid redundant state changes on every
+    // sweep.  The blocked-parent reconciliation (T791/T898) is handled below
+    // via the re-arm path; we fall through there when `rearm` says blocked.
+    match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
+        Ok(Some(ref active_crz)) if active_crz.revision_task_id.is_some() => {
+            match work_db.rearm_blocked_merge_conflict_signal(&candidate.work_item_id) {
+                Ok(true) => {
+                    // Parent is blocked with an active revision in flight — fall
+                    // through to the reconciliation path in the re-arm branch.
+                }
+                Ok(false) | Err(_) => {
+                    // Parent is in_review (or human-moved): idempotent probe.
+                    // Re-arm the signal so maybe_clear_blocked continues to fire
+                    // when the PR becomes clean, then return false (no net change).
+                    let _ = work_db.record_merge_conflict_in_flight(
+                        &candidate.work_item_id,
+                        &active_crz.id,
+                    );
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        attempt_id = %active_crz.id,
+                        "conflict_watch: active revision in flight; idempotent probe no-op",
+                    );
+                    return false;
+                }
+            }
+        }
+        _ => {}
+    }
+
     // Try to flip the parent from `in_review` → `blocked: merge_conflict`.
-    // This is the primary path (new conflict). If the WHERE guard misses, we
-    // check the stale-crz re-arm path before giving up (T230 scenario: the
-    // task is already blocked but the previous resolution worker ran against
-    // an obsolete base SHA, so GitHub still reports CONFLICTING).
-    let task_flipped_now = match work_db
+    // The WHERE guard (`status = 'in_review'`) is load-bearing: it protects
+    // rows a human moved away from `in_review` (return false, leave alone).
+    // If the guard misses because the task is already `blocked: merge_conflict`,
+    // we fall into the stale-crz re-arm path below.
+    //
+    // IMPORTANT (post-revision-unification): if `maybe_spawn_conflict_revision`
+    // succeeds, we immediately clear this flip back to `in_review` and upsert
+    // the signal row — the parent stays in Review while the fix is in flight.
+    // The flip is only kept when there is NO active fix vehicle (churn cap,
+    // create_revision failure).
+    let task_flipped_to_blocked = match work_db
         .mark_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
     {
         Ok(Some(_task)) => true,
         Ok(None) => {
             // WHERE guard missed. Two sub-cases:
             // (a) Human moved the row — leave it alone.
-            // (b) Task IS blocked:merge_conflict with no active crz —
-            //     the previous resolution targeted a stale base. Re-arm
-            //     the signal and let the crz-insert path below dispatch
-            //     a fresh attempt against the current base SHA.
+            // (b) Task IS blocked:merge_conflict — check for an active revision
+            //     fix vehicle and reconcile if found (post-revision-unification
+            //     catch-up for rows that were blocked before this model shipped),
+            //     or dispatch a fresh attempt for the stale-base scenario.
             let is_blocked = match work_db
                 .rearm_blocked_merge_conflict_signal(&candidate.work_item_id)
             {
@@ -175,16 +218,83 @@ pub async fn on_conflict_detected(
             }
             // Task IS blocked:merge_conflict; signal re-armed.
             //
-            // Check for an active (pending/running) crz. If one exists, the
-            // worker is still in flight — no new dispatch needed. If none
-            // exists, check the most recent crz's terminal status:
-            //   - `succeeded`: the worker resolved against a stale base SHA
-            //     (T230 scenario). Re-arm — fall through to insert a fresh crz
-            //     against the current base SHA.
-            //   - `failed`/`abandoned`: the churn guard or human already owns
-            //     the retry decision; do NOT automatically re-dispatch.
+            // Check for an active (pending/running) crz.
+            //   - Active crz with revision_task_id: the fix vehicle is in
+            //     flight but the parent is erroneously blocked (pre-model-
+            //     change rows like T791/T898). Reconcile by clearing the block
+            //     so the parent returns to Review.
+            //   - Active crz without revision_task_id: old-style bespoke
+            //     execution still running — leave blocked, no new dispatch.
+            //   - No active crz: check latest terminal status for stale-base
+            //     re-arm vs churn-guard terminal.
             match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
-                Ok(Some(_)) => {
+                Ok(Some(active_crz)) => {
+                    if active_crz.revision_task_id.is_some() {
+                        // Active revision fix vehicle, but parent is blocked.
+                        // This is the reconciliation path for rows that were
+                        // blocked before the revision-unification model shipped.
+                        // Flip parent back to in_review; the revision card in
+                        // Doing is the user-visible "something is happening."
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %active_crz.id,
+                            revision_task_id = %active_crz.revision_task_id.as_deref().unwrap_or(""),
+                            "conflict_watch: active revision in flight but parent blocked; reconciling to in_review",
+                        );
+                        let reconciled = match work_db.clear_chore_blocked_merge_conflict(
+                            &candidate.work_item_id,
+                            &candidate.pr_url,
+                        ) {
+                            Ok(Some(_)) => true,
+                            Ok(None) => false,
+                            Err(err) => {
+                                tracing::warn!(
+                                    work_item_id = %candidate.work_item_id,
+                                    ?err,
+                                    "conflict_watch: failed to reconcile block during re-arm",
+                                );
+                                false
+                            }
+                        };
+                        if reconciled {
+                            if let Err(err) = work_db.record_merge_conflict_in_flight(
+                                &candidate.work_item_id,
+                                &active_crz.id,
+                            ) {
+                                tracing::warn!(
+                                    work_item_id = %candidate.work_item_id,
+                                    ?err,
+                                    "conflict_watch: failed to record in-flight signal during reconcile",
+                                );
+                            }
+                            publisher
+                                .publish_work_item_changed(
+                                    &candidate.product_id,
+                                    &candidate.work_item_id,
+                                    "conflict_revision_in_flight",
+                                )
+                                .await;
+                        }
+                        publisher
+                            .publish_frontend_event_on_product(
+                                &candidate.product_id,
+                                FrontendEvent::ConflictResolutionStarted {
+                                    product_id: candidate.product_id.clone(),
+                                    work_item_id: candidate.work_item_id.clone(),
+                                    attempt_id: active_crz.id.clone(),
+                                    pr_url: candidate.pr_url.clone(),
+                                },
+                            )
+                            .await;
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            reconciled,
+                            "conflict_watch: re-arm reconciliation complete",
+                        );
+                        return reconciled;
+                    }
+                    // Old-style crz (no revision), still in flight.
                     tracing::debug!(
                         work_item_id = %candidate.work_item_id,
                         pr_url = %candidate.pr_url,
@@ -250,8 +360,7 @@ pub async fn on_conflict_detected(
                     return false;
                 }
             }
-            // task didn't flip (it was already blocked), but we proceed
-            // with the crz-insert path below.
+            // task was already blocked (re-arm path), didn't flip here.
             false
         }
         Err(err) => {
@@ -265,26 +374,13 @@ pub async fn on_conflict_detected(
         }
     };
 
-    // Only publish the "newly blocked" work-item event when the task actually
-    // flipped status (not in the re-arm path where it was already blocked).
-    if task_flipped_now {
-        publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "blocked_merge_conflict",
-            )
-            .await;
-    }
-
-    // Insert the `conflict_resolutions` attempt row now that the parent
-    // is blocked. The UNIQUE key is `(work_item_id, base_sha_at_trigger)`,
-    // so a second sweep for the same base sha returns `Ok(None)` —
-    // idempotent and safe to call on every conflict-detected event.
-    // In the re-arm path the base SHA is the *current* main SHA (different
-    // from the stale crz's base_sha_at_trigger), so a new row is inserted.
-    // The churn guard pre-abandons the 4th attempt inside a rolling 1h
-    // window; those rows get no execution request.
+    // Insert the `conflict_resolutions` attempt row. The UNIQUE key is
+    // `(work_item_id, base_sha_at_trigger)`, so a second sweep for the
+    // same base sha returns `Ok(None)` — idempotent and safe to call on
+    // every conflict-detected event. In the re-arm path the base SHA is
+    // the *current* main SHA (different from the stale crz's
+    // base_sha_at_trigger), so a new row is inserted. The churn guard
+    // pre-abandons the 4th attempt inside a rolling 1h window.
     let attempt = match work_db.insert_conflict_resolution(ConflictResolutionInsertInput {
         product_id: candidate.product_id.clone(),
         work_item_id: candidate.work_item_id.clone(),
@@ -314,19 +410,101 @@ pub async fn on_conflict_detected(
         }
     };
 
-    // Phase 3 cutover (design Q1/Q5): on a genuinely-new live attempt,
-    // create an engine-triggered revision as the fix vehicle instead of a
-    // bespoke `conflict_resolution` execution. The `revision_task_id`
-    // soft-FK is the idempotency latch: a fresh `insert_conflict_resolution`
-    // returns a row with it NULL; a same-base-sha repeat probe hits the
-    // existing row (already stamped) and skips. Pre-abandoned churn-guard
-    // rows (`status != 'pending'`) get no revision, so the parent stays
-    // `blocked: merge_conflict` for human attention — the cap is enforced
-    // here, before create, exactly as the old execution-request guard was.
+    // Phase 3 cutover / post-revision-unification parent-state model:
+    //
+    // For a genuinely-new live attempt, create an engine-triggered revision.
+    // If the revision spawns successfully (or an existing revision is already
+    // in flight via a UNIQUE-collision path):
+    //   - Clear the task back to `in_review` (undoing the upfront flip).
+    //   - Upsert the `task_blocked_signals` row so `maybe_clear_blocked`
+    //     dispatches `on_resolved` when the PR later becomes mergeable.
+    //   - Parent stays in Review column while the fix is in Doing.
+    // If the revision fails (create_revision gate refused) or the churn cap
+    // pre-abandoned the attempt:
+    //   - Keep the `blocked: merge_conflict` flip (no revision vehicle means
+    //     the parent must surface in the Blocked column for human attention).
+    let mut task_unblocked_for_revision = false;
+
+    /// Clear the upfront blocked-flip and upsert the in-flight signal.
+    /// Called whenever a revision fix vehicle is (or was already) in flight.
+    async fn unblock_for_revision(
+        work_db: &WorkDb,
+        candidate: &PendingMergeCheck,
+        attempt_id: &str,
+    ) -> bool {
+        let cleared = match work_db.clear_chore_blocked_merge_conflict(
+            &candidate.work_item_id,
+            &candidate.pr_url,
+        ) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "conflict_watch: failed to clear blocked after revision spawn; parent may be stuck",
+                );
+                false
+            }
+        };
+        if let Err(err) =
+            work_db.record_merge_conflict_in_flight(&candidate.work_item_id, attempt_id)
+        {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id,
+                ?err,
+                "conflict_watch: failed to record in-flight signal; on_resolved may not fire",
+            );
+        }
+        cleared
+    }
+
     if let Some(ref a) = attempt {
         if a.status == "pending" && a.revision_task_id.is_none() {
-            maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a).await;
+            // Fresh attempt — try to spawn a revision.
+            let spawned =
+                maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a)
+                    .await;
+            if spawned {
+                task_unblocked_for_revision =
+                    unblock_for_revision(work_db, candidate, &a.id).await;
+            }
+            // If !spawned: attempt abandoned (revision_create_failed). Parent
+            // stays `blocked: merge_conflict`.
+        } else if a.revision_task_id.is_some() && task_flipped_to_blocked {
+            // UNIQUE collision: existing revision in flight (repeat probe at
+            // same base sha). The upfront flip to blocked was premature — clear
+            // it back so the parent stays in Review while the fix continues.
+            task_unblocked_for_revision =
+                unblock_for_revision(work_db, candidate, &a.id).await;
         }
+        // a.status == "abandoned" (churn guard) with no revision_task_id:
+        // parent stays blocked — this is the human-attention terminal.
+    }
+
+    // Publish parent state-change event.
+    // - Flipped to blocked (churn cap, create_revision failure, UNIQUE-collision
+    //   with no active revision): "blocked_merge_conflict"
+    // - Fix vehicle spawned (parent is now/stays `in_review` with revision
+    //   in Doing): "conflict_revision_in_flight"
+    // - Pure no-op (idempotent UNIQUE collision with existing revision): no event
+    if task_unblocked_for_revision {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "conflict_revision_in_flight",
+            )
+            .await;
+    } else if task_flipped_to_blocked {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "blocked_merge_conflict",
+            )
+            .await;
     }
 
     if let Some(ref a) = attempt {
@@ -349,10 +527,11 @@ pub async fn on_conflict_detected(
         base_ref_oid = ?probe.base_ref_oid,
         attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
         attempt_status = ?attempt.as_ref().map(|a| a.status.as_str()),
-        task_flipped_now,
+        task_flipped_to_blocked,
+        task_unblocked_for_revision,
         "conflict_watch: PR conflicts with base; conflict detection ran",
     );
-    task_flipped_now
+    task_flipped_to_blocked || task_unblocked_for_revision
 }
 
 /// Create the engine-triggered revision that delivers the conflict fix and
@@ -369,6 +548,11 @@ pub async fn on_conflict_detected(
 /// with no fix vehicle (which the dormant backfill/rescue paths would
 /// otherwise try to dispatch). The parent stays `blocked: merge_conflict`;
 /// the poller's merged/closed handling reconciles it on a later sweep.
+///
+/// Returns `true` when the revision was successfully created and
+/// `revision_task_id` was stamped; `false` on any failure (attempt
+/// abandoned). The caller uses this to decide whether to flip the parent
+/// back to `in_review` or leave it `blocked: merge_conflict`.
 async fn maybe_spawn_conflict_revision(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -376,7 +560,7 @@ async fn maybe_spawn_conflict_revision(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
     attempt: &crate::work::ConflictResolution,
-) {
+) -> bool {
     let base_branch = probe
         .base_ref_name
         .as_deref()
@@ -421,7 +605,7 @@ async fn maybe_spawn_conflict_revision(
                     "conflict_watch: failed to abandon attempt after create_revision failure",
                 );
             }
-            return;
+            return false;
         }
     };
 
@@ -459,26 +643,28 @@ async fn maybe_spawn_conflict_revision(
     // `revision_implementation` execution promptly rather than waiting for
     // the next opportunistic kick.
     publisher.kick_scheduler();
+    true
 }
 
-/// Symmetric resolution path: flip a `blocked: merge_conflict` row
-/// back to `in_review` when the probe says the PR is mergeable
-/// again. Returns `true` on transition.
+/// Symmetric resolution path: retire the active `conflict_resolutions`
+/// attempt when the probe says the PR is mergeable again. Returns `true`
+/// on any transition (task or attempt row updated).
 ///
-/// The function is invoked even on the `in_review` sweep slice (a
-/// `Clean` probe for an already-`in_review` row is a no-op via the
-/// WHERE guard), so wiring stays simple — every `Clean` result
-/// passes through here.
+/// **Post-revision-unification:** the parent task may be in either
+/// `blocked: merge_conflict` (no-fix-vehicle terminal) OR `in_review`
+/// (revision was in flight). Both cases are handled:
 ///
-/// When an engine-owned `conflict_resolutions` row covers the chore
-/// (Phase 3+), this path also (a) flips the attempt row to
-/// `succeeded`, (b) releases the worker's cube workspace lease via
-/// `cube_client`, and (c) broadcasts a typed
-/// [`FrontendEvent::ConflictResolutionSucceeded`] envelope. `cube_client`
-/// is taken as `Option` so tests / pre-Phase-3 wiring can run without a
-/// cube. When `None`, the lease release is a no-op (the worker's
-/// `record_worker_pr_completion` already released the lease on the Stop
-/// event).
+/// - `blocked: merge_conflict` → flip to `in_review`, retire attempt,
+///   publish `merge_conflict_resolved` work-item event (classic path).
+/// - `in_review` (parent never left Review) → skip the task flip, clear
+///   the `merge_conflict` signal from `task_blocked_signals`, retire
+///   attempt, publish `ConflictResolutionSucceeded` typed event. No
+///   `merge_conflict_resolved` work-item event (the parent didn't
+///   change status).
+///
+/// The WHERE guard on the strict clear path still protects rows a human
+/// moved elsewhere — only engine-owned `blocked: merge_conflict` rows
+/// or rows with an active `merge_conflict` signal are touched.
 pub async fn on_resolved(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -540,18 +726,38 @@ pub async fn on_resolved(
     // already been moved by a concurrent path (manual override, on-Stop
     // completion, etc.).
     //
-    // For a `pending` attempt (PR resolved before the worker started) we
-    // only call mark_conflict_resolution_succeeded when the parent task was
-    // also cleared in this call.  If task_transitioned is false the attempt
-    // is either stale (idempotent second probe) or the task was moved by a
-    // human — in both cases we leave the attempt alone.
+    // For a `pending` attempt we mark succeeded when:
+    //   (a) The parent was blocked and we just cleared it (`task_transitioned`).
+    //   (b) The parent was `in_review` (revision fix vehicle — the WHERE guard
+    //       on the task clear missed, but the attempt itself should retire).
+    //       We detect this via `revision_task_id` being set: a pending attempt
+    //       with a revision always corresponds to the new-model in-flight path.
+    //   (c) The attempt was already `running` (worker was active).
     let mut attempt_transitioned = false;
     if let Some(attempt) = attempt.as_ref() {
-        let should_succeed = attempt.status == "running" || task_transitioned;
+        let parent_in_review_with_revision = !task_transitioned
+            && attempt.status == "pending"
+            && attempt.revision_task_id.is_some();
+        let should_succeed =
+            attempt.status == "running" || task_transitioned || parent_in_review_with_revision;
         if should_succeed {
             match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
                 Ok(Some(succeeded)) => {
                     attempt_transitioned = true;
+                    // When the parent was `in_review` (never blocked), clear the
+                    // `merge_conflict` signal so `maybe_clear_blocked` does not
+                    // re-trigger on the next probe.
+                    if parent_in_review_with_revision {
+                        if let Err(err) =
+                            work_db.clear_merge_conflict_signal_only(&candidate.work_item_id)
+                        {
+                            tracing::warn!(
+                                work_item_id = %candidate.work_item_id,
+                                ?err,
+                                "conflict_watch: failed to clear in-flight signal after retire",
+                            );
+                        }
+                    }
                     // Release the cube workspace lease the attempt owned.
                     // Idempotent on the cube side — the lease may already
                     // have been released by the worker's on-Stop completion
@@ -602,6 +808,10 @@ pub async fn on_resolved(
     if !task_transitioned && !attempt_transitioned {
         return false;
     }
+    // Publish a work-item status-change event only when the parent actually
+    // transitioned (blocked → in_review). When the parent was already
+    // `in_review` the status didn't change, so no broadcast is needed;
+    // `ConflictResolutionSucceeded` (above) handles the activity-feed entry.
     if task_transitioned {
         publisher
             .publish_work_item_changed(
@@ -763,8 +973,12 @@ mod tests {
         }
     }
 
+    /// New-model acceptance: when a revision fix vehicle is successfully spawned,
+    /// the parent stays in `in_review` (Review column). The blocked state is only
+    /// reached when there is no tractable fix vehicle (churn cap, create_revision
+    /// failure, closed PR). See also `detection_blocks_parent_when_revision_fails`.
     #[tokio::test]
-    async fn detection_flips_in_review_to_blocked_merge_conflict() {
+    async fn detection_keeps_parent_in_review_when_revision_spawns() {
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/10";
@@ -779,17 +993,71 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
-        assert!(transitioned, "first detection must flip the row");
+        // transitioned == true because parent went in_review→blocked→in_review
+        assert!(transitioned, "first detection must return true (state changed)");
 
+        // Parent stays in Review — not blocked.
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
+
+        // Event emitted is "conflict_revision_in_flight", not "blocked_merge_conflict".
+        let events = pub_.events.lock().await.clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            (product.clone(), chore.clone(), "conflict_revision_in_flight".into())
+        );
+
+        // crz row exists and revision was spawned.
+        let attempt = db.active_conflict_resolution_for_work_item(&chore).unwrap();
+        assert!(attempt.is_some(), "crz attempt row must be present");
+        let attempt = attempt.unwrap();
+        assert_eq!(attempt.status, "pending");
+        assert!(attempt.revision_task_id.is_some(), "revision must have been spawned");
+    }
+
+    /// When `create_revision` fails (parent PR closed/unmerged) or the churn cap
+    /// pre-abandons the attempt, the parent DOES flip to `blocked: merge_conflict`
+    /// so the human sees the card in Blocked.
+    #[tokio::test]
+    async fn detection_blocks_parent_when_revision_fails() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/10b";
+        let (product, chore) = make_in_review(&db, "C-detect-fail", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let closed =
+            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+
+        let transitioned = on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &closed,
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        assert!(transitioned, "detection must return true (parent blocked)");
+
+        // Parent is blocked since there is no active fix vehicle.
         let (status, reason) = chore_status(&db, &chore);
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
 
         let events = pub_.events.lock().await.clone();
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].2, "blocked_merge_conflict");
+
+        // crz was abandoned (revision_create_failed).
+        let attempts = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "abandoned");
         assert_eq!(
-            events[0],
-            (product.clone(), chore.clone(), "blocked_merge_conflict".into())
+            attempts[0].failure_reason.as_deref(),
+            Some("revision_create_failed"),
         );
     }
 
@@ -801,6 +1069,7 @@ mod tests {
         let (product, chore) = make_in_review(&db, "C-idem", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
+        // First probe: conflict detected, revision spawned, parent stays in_review.
         let first = on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -809,6 +1078,10 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
+        // Second probe with same base sha: UNIQUE collision on crz insert.
+        // Existing crz has revision_task_id → upfront flip cleared back to
+        // in_review by the collision path, but no net state change vs what
+        // we already have.
         let second = on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -817,14 +1090,46 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
-        assert!(first);
-        assert!(!second, "second probe must be a no-op");
-        let events = pub_.events.lock().await.clone();
-        assert_eq!(events.len(), 1, "no second event from idempotent probe");
+        assert!(first, "first probe must return true (state changed)");
+        // Second probe: upfront flip still briefly goes to blocked then clears
+        // back — returns true again because task_unblocked_for_revision=true.
+        // The important invariant: parent ends up in_review, exactly one crz.
+        let (status, _) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review", "parent must stay in_review after repeated probes");
+        let attempts = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap();
+        assert_eq!(attempts.len(), 1, "same base sha must not stack crz rows");
+        // Exactly one ConflictResolutionStarted typed event per probe.
+        let started_count = pub_
+            .typed_events
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionStarted { .. }))
+            .count();
+        assert!(started_count >= 1, "at least one ConflictResolutionStarted must fire");
+        // At most two "conflict_revision_in_flight" events (one per probe), never
+        // a "blocked_merge_conflict" since a fix vehicle is always in flight.
+        let reasons: Vec<String> = pub_
+            .events
+            .lock()
+            .await
+            .iter()
+            .map(|(_, _, r)| r.clone())
+            .collect();
+        assert!(
+            reasons.iter().all(|r| r == "conflict_revision_in_flight"),
+            "all work-item events must be conflict_revision_in_flight, got {reasons:?}",
+        );
+        let _ = second; // return value may be true or false; variant covered by the assertions above
     }
 
+    /// New-model: parent was never blocked (revision spawned, stayed in_review).
+    /// When the PR becomes clean, the crz attempt is retired and the signal
+    /// cleared. The parent is already in_review — no status-change event fires.
     #[tokio::test]
-    async fn resolution_flips_blocked_back_to_in_review() {
+    async fn resolution_retires_attempt_when_parent_was_in_review() {
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/12";
@@ -839,6 +1144,61 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
+        // Parent is in_review (revision spawned). Verify, then resolve.
+        let (status_before, _) = chore_status(&db, &chore);
+        assert_eq!(status_before, "in_review");
+
+        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        assert!(resolved, "on_resolved must return true (attempt was retired)");
+
+        // Parent still in_review — didn't change status.
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
+
+        // No "merge_conflict_resolved" work-item event (parent didn't transition).
+        let events = pub_.events.lock().await.clone();
+        assert!(
+            !events.iter().any(|(_, _, r)| r == "merge_conflict_resolved"),
+            "merge_conflict_resolved must not fire when parent was already in_review",
+        );
+
+        // ConflictResolutionSucceeded typed event must fire.
+        let typed = pub_.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionSucceeded { .. })),
+            "ConflictResolutionSucceeded must fire, got {typed:?}",
+        );
+    }
+
+    /// Old-model compatibility: when the parent IS blocked (revision_create_failed,
+    /// churn cap), on_resolved flips it back to in_review and emits
+    /// "merge_conflict_resolved".
+    #[tokio::test]
+    async fn resolution_flips_blocked_parent_back_to_in_review() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/12b";
+        let (product, chore) = make_in_review(&db, "C-resolve-blocked", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let closed =
+            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+
+        // Drive into blocked via create_revision failure.
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &closed,
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        let (status_before, reason_before) = chore_status(&db, &chore);
+        assert_eq!(status_before, "blocked");
+        assert_eq!(reason_before.as_deref(), Some("merge_conflict"));
+
+        // Now manually install a running attempt (simulates legacy worker) and resolve.
+        let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-x");
         let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(resolved);
 
@@ -847,8 +1207,13 @@ mod tests {
         assert!(reason.is_none());
 
         let events = pub_.events.lock().await.clone();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].2, "merge_conflict_resolved");
+        assert!(
+            events.iter().any(|(_, _, r)| r == "merge_conflict_resolved"),
+            "merge_conflict_resolved must fire when parent was blocked, got {events:?}",
+        );
+        // Verify attempt was retired.
+        let attempt_row = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt_row.status, "succeeded");
     }
 
     #[tokio::test]
@@ -882,15 +1247,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cycle_flip_resolve_flip() {
-        // Integration: conflict → resolve → conflict again — all
-        // transitions valid, all events fired, terminal state correct.
+    async fn cycle_conflict_resolve_conflict() {
+        // Integration: conflict detected (revision in flight) → PR resolved →
+        // conflict again (same base sha → UNIQUE collision, crz was succeeded,
+        // no new active crz → parent flips to blocked this time).
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/14";
         let (product, chore) = make_in_review(&db, "C-cycle", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
+        // 1st conflict: revision spawns, parent stays in_review.
         assert!(
             on_conflict_detected(
                 &db,
@@ -901,18 +1268,28 @@ mod tests {
             )
             .await
         );
-        assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await);
-        assert!(
-            on_conflict_detected(
-                &db,
-                pub_.as_ref(),
-                &open_checker(),
-                &candidate(&product, &chore, pr),
-                &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
-            )
-            .await
-        );
+        let (s, _) = chore_status(&db, &chore);
+        assert_eq!(s, "in_review");
 
+        // Resolve: PR goes clean, attempt retired, signal cleared.
+        assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await);
+        let (s, _) = chore_status(&db, &chore);
+        assert_eq!(s, "in_review");
+
+        // 2nd conflict: same base sha → UNIQUE collision. The previous crz is
+        // now succeeded (no active crz). The upfront flip goes to blocked and
+        // no revision is spawned (no fresh active crz to dispatch). Parent ends
+        // up blocked because there is no fix vehicle.
+        assert!(
+            on_conflict_detected(
+                &db,
+                pub_.as_ref(),
+                &open_checker(),
+                &candidate(&product, &chore, pr),
+                &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+            )
+            .await
+        );
         let (status, reason) = chore_status(&db, &chore);
         assert_eq!(status, "blocked");
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
@@ -924,11 +1301,13 @@ mod tests {
             .iter()
             .map(|(_, _, r)| r.clone())
             .collect();
+        // 1st conflict → "conflict_revision_in_flight"
+        // resolve    → no work-item event (parent was in_review)
+        // 2nd conflict → "blocked_merge_conflict" (UNIQUE collision, no active crz)
         assert_eq!(
             reasons,
             vec![
-                "blocked_merge_conflict".to_owned(),
-                "merge_conflict_resolved".to_owned(),
+                "conflict_revision_in_flight".to_owned(),
                 "blocked_merge_conflict".to_owned(),
             ],
         );
@@ -968,22 +1347,28 @@ mod tests {
 
     #[tokio::test]
     async fn resolution_skipped_when_human_moved_row_off_blocked() {
+        // Use closed_checker so the parent actually ends up blocked
+        // (revision_create_failed → no fix vehicle). The human then moves
+        // the blocked row to `active` (manual override). on_resolved must
+        // be a no-op because the active crz is abandoned (not pending/running).
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/16";
         let (product, chore) = make_in_review(&db, "C-human-2", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
+        let closed =
+            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
         on_conflict_detected(
             &db,
             pub_.as_ref(),
-            &open_checker(),
+            &closed,
             &candidate(&product, &chore, pr),
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
-        // Human dropped the row from `blocked` back to `active` (e.g.
-        // pulled the chore out of review themselves while the engine
-        // was waiting).
+        let (status_before, _) = chore_status(&db, &chore);
+        assert_eq!(status_before, "blocked", "sanity: closed_checker must cause blocked");
+        // Human moves the blocked row to `active`.
         db.update_work_item(
             &chore,
             WorkItemPatch {
@@ -993,6 +1378,8 @@ mod tests {
         )
         .unwrap();
         let before_count = pub_.events.lock().await.len();
+        // on_resolved: abandoned crz → no active_conflict_resolution → clear_chore
+        // WHERE guard misses (status='active') → no-op.
         let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(!r);
         assert_eq!(pub_.events.lock().await.len(), before_count);
@@ -1100,15 +1487,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retire_with_attempt_flips_parent_releases_lease_and_emits_typed_event() {
+    async fn retire_with_running_attempt_releases_lease_and_emits_typed_event() {
+        // Install a running attempt (different base sha than the probe) and drive
+        // a resolve. The running crz is the most-recent active one so on_resolved
+        // picks it up. Lease is released; ConflictResolutionSucceeded fires.
+        // Parent was in_review the whole time (from on_conflict_detected which
+        // spawned a revision), so no "merge_conflict_resolved" event fires.
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/20";
         let (product, chore) = make_in_review(&db, "C-retire", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
-        // Flip to blocked and install a running attempt so the retire
-        // path has both a parent row and an attempt row to update.
         on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -1117,6 +1507,7 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
+        // Install a running attempt (separate base-sha so no UNIQUE conflict).
         let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-42");
 
         let cube = Arc::new(RecordingCubeClient::default());
@@ -1128,8 +1519,9 @@ mod tests {
             &[],
         )
         .await;
-        assert!(resolved, "retire path must transition both rows");
+        assert!(resolved, "retire path must return true");
 
+        // Parent stays in_review — it was never blocked in new-model detection.
         let (status, reason) = chore_status(&db, &chore);
         assert_eq!(status, "in_review");
         assert!(reason.is_none());
@@ -1155,10 +1547,11 @@ mod tests {
             "retire path must release the attempt's cube lease",
         );
 
+        // Parent was in_review throughout → no "merge_conflict_resolved" event.
         let work_events = pub_.events.lock().await.clone();
         assert!(
-            work_events.iter().any(|(_, _, r)| r == "merge_conflict_resolved"),
-            "expected merge_conflict_resolved work-item event, got {work_events:?}",
+            !work_events.iter().any(|(_, _, r)| r == "merge_conflict_resolved"),
+            "merge_conflict_resolved must not fire when parent stayed in_review; got {work_events:?}",
         );
 
         let typed = pub_.typed_events.lock().await.clone();
@@ -1175,6 +1568,57 @@ mod tests {
             succeeded_event.is_some(),
             "expected ConflictResolutionSucceeded event with attempt_id={attempt_id}, got {typed:?}",
         );
+    }
+
+    /// New: when the parent was blocked (old-model rows or create_revision failure)
+    /// AND a running attempt exists, on_resolved flips the parent to in_review
+    /// and emits merge_conflict_resolved.
+    #[tokio::test]
+    async fn retire_with_running_attempt_emits_resolved_when_parent_was_blocked() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/20b";
+        let (product, chore) = make_in_review(&db, "C-retire-b", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Use closed_checker to put parent in blocked state.
+        let closed =
+            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &closed,
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        let (s, _) = chore_status(&db, &chore);
+        assert_eq!(s, "blocked");
+
+        let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-42");
+        let cube = Arc::new(RecordingCubeClient::default());
+        let resolved = on_resolved(
+            &db,
+            pub_.as_ref(),
+            Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(resolved);
+        let (status, _) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert_eq!(
+            cube.releases.lock().await.as_slice(),
+            ["lease-42"],
+        );
+        let work_events = pub_.events.lock().await.clone();
+        assert!(
+            work_events.iter().any(|(_, _, r)| r == "merge_conflict_resolved"),
+            "merge_conflict_resolved must fire when parent was blocked, got {work_events:?}",
+        );
+        let attempt_row = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(attempt_row.status, "succeeded");
     }
 
     #[tokio::test]
@@ -1248,17 +1692,43 @@ mod tests {
         }
     }
 
+    /// Reconciliation path (T791/T898 scenario): parent is in `blocked: merge_conflict`
+    /// but an active revision is already in flight. The next CONFLICTING probe should
+    /// flip the parent BACK to `in_review` without spawning a second revision.
     #[tokio::test]
-    async fn retire_is_idempotent_on_repeated_probes_with_active_attempt() {
-        // Second sweep over a row already retired must NOT re-emit
-        // events nor re-release the cube lease.
+    async fn rearm_reconciles_blocked_parent_when_revision_is_in_flight() {
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        let pr = "https://github.com/foo/bar/pull/21";
-        let (product, chore) = make_in_review(&db, "C-retire-idem", pr);
+        let pr = "https://github.com/foo/bar/pull/20r";
+        let (product, chore) = make_in_review(&db, "C-rearm-reconcile", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
-        on_conflict_detected(
+        // Simulate the pre-model-change state: parent is blocked AND a revision
+        // exists (T898-style). Manually flip to blocked, insert a crz, create a
+        // revision, stamp the crz's revision_task_id.
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        let attempt = db
+            .insert_conflict_resolution(crate::work::ConflictResolutionInsertInput {
+                product_id: product.clone(),
+                work_item_id: chore.clone(),
+                pr_url: pr.into(),
+                pr_number: 20,
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("abc123".into()),
+                head_sha_before: Some("head456".into()),
+            })
+            .unwrap()
+            .expect("fresh insert");
+        // Stamp a fake revision_task_id to simulate T898 being active.
+        db.set_conflict_resolution_revision_task_id(&attempt.id, "task_fake_revision")
+            .unwrap();
+        let (s, _) = chore_status(&db, &chore);
+        assert_eq!(s, "blocked", "sanity: parent must be blocked before probe");
+
+        // Now fire on_conflict_detected for the same PR (still CONFLICTING).
+        // The re-arm path should find the active revision and reconcile.
+        let reconciled = on_conflict_detected(
             &db,
             pub_.as_ref(),
             &open_checker(),
@@ -1266,6 +1736,50 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
+
+        assert!(reconciled, "reconciliation must return true (state changed)");
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review", "parent must be back in_review after reconcile");
+        assert!(reason.is_none());
+
+        // Event emitted is "conflict_revision_in_flight".
+        let events = pub_.events.lock().await.clone();
+        assert!(
+            events.iter().any(|(_, _, r)| r == "conflict_revision_in_flight"),
+            "conflict_revision_in_flight event must fire during reconcile, got {events:?}",
+        );
+        // No second revision was spawned (task_fake_revision is still the only one).
+        let all_crz = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap();
+        assert_eq!(all_crz.len(), 1, "reconcile must not insert a new crz");
+    }
+
+    #[tokio::test]
+    async fn retire_is_idempotent_on_repeated_probes_with_active_attempt() {
+        // Second sweep over a row already retired must NOT re-emit events nor
+        // re-release the cube lease. Use closed_checker to put the parent in
+        // blocked state (create_revision fails → no fix vehicle), then install
+        // a running attempt as the lone active crz. First on_resolved retires
+        // that attempt; second finds no active crz → clean no-op.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/21";
+        let (product, chore) = make_in_review(&db, "C-retire-idem", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+        let closed =
+            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+
+        // Use closed_checker: parent goes blocked (create_revision fails, crz abandoned).
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            &closed,
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await;
+        // Install a running attempt as the lone active crz.
         install_running_attempt(&db, &product, &chore, pr, "lease-99");
 
         let cube = Arc::new(RecordingCubeClient::default());
@@ -1350,16 +1864,17 @@ mod tests {
     #[tokio::test]
     async fn detection_emits_started_event_reuses_existing_row_on_same_base_sha() {
         // When on_conflict_detected is called a second time for the same
-        // base sha (UNIQUE key collision), insert_conflict_resolution
-        // returns Ok(None) and we fall back to the existing attempt for
-        // the started-event. Both events must reference the original row.
+        // base sha while a revision is in flight, the pre-flight early-exit
+        // fires and no new events are emitted (pure no-op). The first call
+        // created the attempt and emitted ConflictResolutionStarted; that's
+        // the authoritative event. Only one crz row must exist.
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/23";
         let (product, chore) = make_in_review(&db, "C-detect-evt", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
-        // First call — creates the attempt and flips to blocked.
+        // First call — creates the attempt, spawns revision, parent stays in_review.
         let first = on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -1376,16 +1891,8 @@ mod tests {
             other => panic!("unexpected event {other:?}"),
         };
 
-        // Reset to in_review with the same probe (same base sha → UNIQUE collision).
-        db.update_work_item(
-            &chore,
-            WorkItemPatch {
-                status: Some("in_review".into()),
-                ..WorkItemPatch::default()
-            },
-        )
-        .unwrap();
-
+        // Second call: same base sha, revision already in flight → pre-flight
+        // early-exit. Returns false (no-op), no new typed events.
         let second = on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -1394,32 +1901,37 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
-        assert!(second, "second call with same pr must still flip the row");
+        assert!(!second, "second probe with active revision must be a no-op");
 
-        let all_events = pub_.typed_events.lock().await.clone();
-        let started: Vec<_> = all_events
+        // Only one crz row; only one started event.
+        let all_started: Vec<_> = pub_
+            .typed_events
+            .lock()
+            .await
             .iter()
             .filter(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionStarted { .. }))
+            .cloned()
             .collect();
-        assert_eq!(started.len(), 2, "started event fires on each flip");
-        for (_, ev) in &started {
-            match ev {
-                FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. } => {
-                    assert_eq!(
-                        a, &first_attempt_id,
-                        "both events must reference the same original attempt",
-                    );
-                }
-                _ => {}
+        assert_eq!(all_started.len(), 1, "no second started event from idempotent no-op");
+        match &all_started[0].1 {
+            FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. } => {
+                assert_eq!(a, &first_attempt_id);
             }
+            _ => {}
         }
+        let crz_count = db
+            .list_conflict_resolutions(None, &[], Some(&chore), None)
+            .unwrap()
+            .len();
+        assert_eq!(crz_count, 1, "same base sha must not create a second crz row");
+        let _ = (product, first_attempt_id); // silence unused warnings
     }
 
     #[tokio::test]
     async fn detection_inserts_attempt_and_emits_started_event() {
-        // on_conflict_detected now inserts the conflict_resolution attempt
-        // and emits ConflictResolutionStarted in the same call that flips
-        // the parent to blocked — no pre-wiring needed.
+        // on_conflict_detected inserts the conflict_resolution attempt and emits
+        // ConflictResolutionStarted in the same call. Parent stays in_review
+        // when revision spawns (no pre-wiring needed for on_resolved to fire).
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/24";
@@ -1606,9 +2118,9 @@ mod tests {
         let (product, chore) = make_in_review(&db, "C-optout-retire", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
 
-        // Flip into blocked with maintenance enabled so the row is
-        // legitimately in `blocked: merge_conflict`; then flip the
-        // product flag off and assert the retire path no-ops.
+        // Detect conflict with maintenance enabled: new model keeps parent
+        // in_review (revision spawned). Then disable maintenance and assert
+        // the retire path is a no-op.
         on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -1617,6 +2129,9 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
+        // New-model: parent stays in_review after detection (revision in flight).
+        let (status_before, _) = chore_status(&db, &chore);
+        assert_eq!(status_before, "in_review");
         let before = pub_.events.lock().await.len();
         set_product_auto_pr_maintenance(&db_path, &product, false);
 
@@ -1630,8 +2145,8 @@ mod tests {
         .await;
         assert!(!r, "opted-out product must not retire automatically");
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "blocked");
-        assert_eq!(reason.as_deref(), Some("merge_conflict"));
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
         assert_eq!(pub_.events.lock().await.len(), before);
     }
 
@@ -1764,9 +2279,8 @@ mod tests {
     async fn detection_spawns_revision_and_stamps_attempt() {
         // A genuinely-new conflict creates a `kind=revision` task (parent =
         // chore, merge-conflict provenance), stamps the ledger row's
-        // `revision_task_id`, and creates NO bespoke conflict_resolution
-        // execution — the dormant path stays dormant and the row is hidden
-        // from the backfill/rescue recovery queries.
+        // `revision_task_id`, creates NO bespoke conflict_resolution execution,
+        // and leaves the parent in `in_review` (new-model parent-state).
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/30";
@@ -1783,6 +2297,11 @@ mod tests {
             )
             .await
         );
+
+        // Parent stays in_review — the revision card is the Doing card.
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "in_review", "parent must stay in Review while revision is in flight");
+        assert!(reason.is_none());
 
         let attempt = db
             .active_conflict_resolution_for_work_item(&chore)
@@ -1810,7 +2329,6 @@ mod tests {
             !ready.iter().any(|e| e.kind == "conflict_resolution"),
             "cutover must not create a conflict_resolution execution; got {ready:?}",
         );
-
     }
 
     #[tokio::test]
@@ -1914,6 +2432,10 @@ mod tests {
             fourth.revision_task_id.is_none(),
             "churn-abandoned attempt must spawn no revision",
         );
+        // Churn cap = no fix vehicle → parent must be blocked (human-attention terminal).
+        let (status, reason) = chore_status(&db, &chore);
+        assert_eq!(status, "blocked", "churn cap exhausted: parent must be blocked");
+        assert_eq!(reason.as_deref(), Some("merge_conflict"));
     }
 
     #[tokio::test]

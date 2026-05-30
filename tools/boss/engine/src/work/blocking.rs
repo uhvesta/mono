@@ -275,6 +275,52 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
+    /// Upsert the `merge_conflict` signal into `task_blocked_signals`
+    /// without changing the parent task's `status` column. Called when
+    /// an engine-triggered conflict-resolution revision is in flight and
+    /// the parent should stay `in_review` (post-revision-unification
+    /// parent-state model, §Q2 reconciliation).
+    ///
+    /// The active signal ensures `maybe_clear_blocked` dispatches
+    /// `conflict_watch::on_resolved` when the PR later becomes
+    /// mergeable, even though the parent's status never moved to
+    /// `blocked`. Idempotent — a second call for the same
+    /// `(work_item_id, attempt_id)` re-arms `cleared_at = NULL`.
+    pub fn record_merge_conflict_in_flight(
+        &self,
+        work_item_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let now = now_string();
+        upsert_task_blocked_signal(&conn, work_item_id, "merge_conflict", Some(attempt_id), &now)?;
+        Ok(())
+    }
+
+    /// Clear the `merge_conflict` signal from `task_blocked_signals`
+    /// without requiring or modifying the parent task's `status`
+    /// column. Used by `conflict_watch::on_resolved` when the parent
+    /// was `in_review` the entire time (the conflict-resolution
+    /// revision resolved the conflict while the parent stayed in
+    /// Review). The task status is left unchanged; only the side-table
+    /// row is cleared so `maybe_clear_blocked` doesn't re-fire.
+    ///
+    /// Returns `true` if a row was cleared, `false` if no active
+    /// `merge_conflict` signal existed (idempotent on repeat calls).
+    pub fn clear_merge_conflict_signal_only(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE task_blocked_signals
+                SET cleared_at = ?2
+              WHERE work_item_id = ?1
+                AND reason = 'merge_conflict'
+                AND cleared_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// WHERE-guarded flip of a chore/project_task from `in_review` to
     /// `blocked: ci_failure`. Mirrors
     /// [`Self::mark_chore_blocked_merge_conflict`] but for the CI

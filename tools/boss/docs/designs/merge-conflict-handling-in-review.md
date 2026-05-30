@@ -2263,6 +2263,44 @@ Sized as bite-sized, independently mergeable chores. Each row in this table shou
 
 - **Test-run flake detection on the worker side.** The worker's triage step 5 runs the project's `test_command` locally and expects green before pushing. If the local test run *itself* flakes (e.g. a test that passed locally fails on CI), the worker has no signal to distinguish that from a real fix. Currently we trust the worker's judgement; the user reviews the PR comment afterwards. A future enhancement: the worker re-runs the failing test N times locally before declaring green. Defer.
 
+## Post-Unification Reconciliation — Revision-Based Parent-State Model
+
+This section records the reconciliation applied when `unify-pr-remediation-on-revisions` (P707, phases 3+, PR #971) moved the conflict-resolution fix vehicle from a bespoke ephemeral `conflict_resolution` execution to a real `revision` task. The original design assumed a non-task fix vehicle — the whole reason Q3 chose a side-table approach was to avoid polluting the kanban. Once the fix vehicle IS a task (a `kind=revision` row in Doing), the parent no longer needs to leave the Review column to signal "something is happening here." The revision card in Doing is that signal.
+
+### The original parent-state model (pre-unification)
+
+Detection flipped `in_review → blocked: merge_conflict` immediately on conflict detection, before any fix vehicle existed. The human saw a Blocked badge and could drill into `blocked_attempt_id` to find the `conflict_resolutions` row. This made sense when the fix vehicle was ephemeral and not visible on the kanban; "why is this card stuck" needed an explicit blocked state.
+
+### Reconciled parent-state model (post-unification)
+
+**While an active conflict-resolution revision is in flight, the parent stays in `in_review`.** The conflict revision shows as its own Doing card. The human sees both. The parent flips to `blocked: merge_conflict` only when there is no tractable fix vehicle:
+
+- Churn cap exhausted (`churn_threshold_exceeded`).
+- `create_revision` refused (parent PR is no longer revisable — merged, closed, or otherwise ineligible).
+- Revision terminated without resolving (future: on-Stop handler marks crz `failed`; the human-attention terminal).
+
+### Implementation shape
+
+`on_conflict_detected` (`conflict_watch.rs`) still calls `mark_chore_blocked_merge_conflict` as an upfront gate (the `status='in_review'` WHERE clause is the correct protection against human-moved rows). If a revision is then successfully spawned, the function immediately clears the flip via `clear_chore_blocked_merge_conflict` and upserts the `merge_conflict` signal into `task_blocked_signals` without touching `tasks.status`. The brief intermediate `blocked` state is invisible to the sweep — the detect-spawn-unblock sequence runs within a single call.
+
+`task_blocked_signals` still carries an active `merge_conflict` row throughout the fix (cleared_at IS NULL). This ensures `maybe_clear_blocked` dispatches `on_resolved` when the PR becomes mergeable, even though the parent's status column reads `in_review` instead of `blocked`.
+
+`on_resolved` handles both cases:
+- Parent was `blocked: merge_conflict` (churn terminal, create_revision failure, or pre-unification row) → flip to `in_review`, clear signal, emit `merge_conflict_resolved` work-item event.
+- Parent was already `in_review` (fix vehicle in flight) → skip the status flip, clear the signal, retire the attempt, emit `ConflictResolutionSucceeded` typed event only. No `merge_conflict_resolved` work-item event (parent didn't change status).
+
+### Reconciliation sweep for pre-existing blocked rows (T791/T898)
+
+Rows that were blocked before this model shipped (or blocked by the old code path before the next deploy) are reconciled on the next CONFLICTING probe. The re-arm path in `on_conflict_detected` checks `active_conflict_resolution_for_work_item`: if it finds an active crz with `revision_task_id.is_some()`, it calls `clear_chore_blocked_merge_conflict` to flip the parent back to `in_review` and records the in-flight signal. No new revision is spawned. The parent returns to Review in one sweep.
+
+### Merge-protection invariant
+
+A conflicting PR is never auto-merged; GitHub's own branch protection blocks the merge button regardless of the parent's kanban column. The engine's merge poller only watches `in_review` and `blocked` rows; no path marks a `blocked: merge_conflict` parent as `done` automatically. An `in_review` parent with an active conflict-revision is on the same `list_chores_pending_merge_check` list as any other in_review item; if its PR is probed and returns Merged (force-merge override), the normal `mark_chore_pr_merged` path fires without any special conflict-state handling needed.
+
+### CI-failure flow parity note
+
+The `ci_failure` remediation follows the same state machine. Now that the `fix`-kind CI remediation also delivers via an engine-triggered `revision_implementation` (Phase 4 cutover), the same parent-stays-in-review treatment applies. The `retrigger`-kind path (which does NOT create a revision) continues to block the parent — a retrigger is ephemeral and invisible on the kanban, mirroring the original pre-unification reason for blocking. Full parity for the `fix` kind is deferred to a follow-up chore.
+
 ## Related Designs
 
 - [`work-taxonomy`](work-taxonomy.md) — domain model for products, projects, tasks, chores.
