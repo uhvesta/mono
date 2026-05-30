@@ -9,11 +9,16 @@ set -euo pipefail
 
 echo "--- [integrity-tag-update] starting"
 
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  echo "[integrity-tag-update] ERROR: GITHUB_TOKEN is unset; cannot push tag" >&2
+  exit 1
+fi
+
 LAST_RUN_TAG="mono-integrity-last-run"
 HEAD_SHA=$(git rev-parse HEAD)
 echo "[integrity-tag-update] advancing ${LAST_RUN_TAG} → ${HEAD_SHA:0:12}"
 
 git tag -f "${LAST_RUN_TAG}" HEAD
-git push origin -f "refs/tags/${LAST_RUN_TAG}"
+git push "https://x-access-token:${GITHUB_TOKEN}@github.com/spinyfin/mono" -f "refs/tags/${LAST_RUN_TAG}"
 
 echo "[integrity-tag-update] done"

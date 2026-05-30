@@ -67,6 +67,8 @@ steps:
     command: ".buildkite/steps/integrity-tag-update.sh"
     agents:
       queue: "bazel-any"
+    secrets:
+      - GITHUB_TOKEN
 PIPELINE
 
 echo "[commit-delta] steps uploaded"
