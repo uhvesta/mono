@@ -4870,28 +4870,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let product = db
-            .create_product(CreateProductInput {
-                name: "Boss".to_owned(),
-                description: None,
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                design_repo: None,
-                docs_repo: None,
-                worker_branch_prefix: None,
-            })
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Resume me".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Resume me")
+                    .autostart(false)
+                    .build(),
+            )
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
         // autostart=false means reconcile won't auto-create an execution;

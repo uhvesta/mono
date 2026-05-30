@@ -2298,28 +2298,21 @@ fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
 /// other t02 reconcile tests use.
 fn make_chore_execution_962(db: &WorkDb, label: &str) -> String {
     let product = db
-        .create_product(CreateProductInput {
-            name: format!("Prod-{label}"),
-            description: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            design_repo: None,
-            docs_repo: None,
-            worker_branch_prefix: None,
-        })
+        .create_product(
+            CreateProductInput::builder()
+                .name(format!("Prod-{label}"))
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: format!("Chore-{label}"),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(format!("Chore-{label}"))
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     db.create_execution(CreateExecutionInput {
         work_item_id: chore.id.clone(),
