@@ -222,7 +222,8 @@ pub struct CubeChangeHandle {
     pub change_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CubeWorkspaceStatus {
     pub workspace_id: String,
     pub workspace_path: PathBuf,
@@ -3204,16 +3205,16 @@ mod tests {
                 .lock()
                 .await
                 .push(workspace_path.to_path_buf());
-            Ok(CubeWorkspaceStatus {
-                workspace_id: "mono-agent-001".to_owned(),
-                workspace_path: workspace_path.to_path_buf(),
-                state: "leased".to_owned(),
-                lease_id: Some("lease-1".to_owned()),
-                holder: Some("boss/0".to_owned()),
-                task: Some("test task".to_owned()),
-                leased_at_epoch_s: Some(1_700_000_000),
-                lease_expires_at_epoch_s: Some(1_700_001_800),
-            })
+            Ok(CubeWorkspaceStatus::builder()
+                .workspace_id("mono-agent-001")
+                .workspace_path(workspace_path.to_path_buf())
+                .state("leased")
+                .lease_id("lease-1")
+                .holder("boss/0")
+                .task("test task")
+                .leased_at_epoch_s(1_700_000_000)
+                .lease_expires_at_epoch_s(1_700_001_800)
+                .build())
         }
 
         async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
@@ -4923,16 +4924,15 @@ mod tests {
 
         // Cube reports mono-agent-003 still leased to the dead lease.
         let cube = Arc::new(FakeCubeClient::default().with_list_workspaces(vec![
-            CubeWorkspaceStatus {
-                workspace_id: "mono-agent-003".to_owned(),
-                workspace_path: PathBuf::from("/tmp/mono-agent-003"),
-                state: "leased".to_owned(),
-                lease_id: Some("lease-dead".to_owned()),
-                holder: Some("dead@host:1".to_owned()),
-                task: Some("resume".to_owned()),
-                leased_at_epoch_s: Some(1_700_000_000),
-                lease_expires_at_epoch_s: None,
-            },
+            CubeWorkspaceStatus::builder()
+                .workspace_id("mono-agent-003")
+                .workspace_path(PathBuf::from("/tmp/mono-agent-003"))
+                .state("leased")
+                .lease_id("lease-dead")
+                .holder("dead@host:1")
+                .task("resume")
+                .leased_at_epoch_s(1_700_000_000)
+                .build(),
         ]));
         let coordinator = Arc::new(ExecutionCoordinator::new(
             db.clone(),
@@ -5007,16 +5007,15 @@ mod tests {
         // Cube reports the workspace leased to a lease the engine has no
         // terminal execution record for.
         let cube = Arc::new(FakeCubeClient::default().with_list_workspaces(vec![
-            CubeWorkspaceStatus {
-                workspace_id: "mono-agent-007".to_owned(),
-                workspace_path: PathBuf::from("/tmp/mono-agent-007"),
-                state: "leased".to_owned(),
-                lease_id: Some("lease-unknown".to_owned()),
-                holder: Some("someone@host:9".to_owned()),
-                task: Some("other".to_owned()),
-                leased_at_epoch_s: Some(1_700_000_000),
-                lease_expires_at_epoch_s: None,
-            },
+            CubeWorkspaceStatus::builder()
+                .workspace_id("mono-agent-007")
+                .workspace_path(PathBuf::from("/tmp/mono-agent-007"))
+                .state("leased")
+                .lease_id("lease-unknown")
+                .holder("someone@host:9")
+                .task("other")
+                .leased_at_epoch_s(1_700_000_000)
+                .build(),
         ]));
         let coordinator = Arc::new(ExecutionCoordinator::new(
             db.clone(),

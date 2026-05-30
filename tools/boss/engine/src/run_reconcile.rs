@@ -342,16 +342,16 @@ mod tests {
         lease_id: Option<&str>,
         expires_at: Option<i64>,
     ) -> CubeWorkspaceStatus {
-        CubeWorkspaceStatus {
-            workspace_id: workspace_id.to_owned(),
-            workspace_path: PathBuf::from(format!("/tmp/{workspace_id}")),
-            state: state.to_owned(),
-            lease_id: lease_id.map(str::to_owned),
-            holder: Some("user@host:1234".to_owned()),
-            task: Some("test".to_owned()),
-            leased_at_epoch_s: Some(1_700_000_000),
-            lease_expires_at_epoch_s: expires_at,
-        }
+        CubeWorkspaceStatus::builder()
+            .workspace_id(workspace_id)
+            .workspace_path(PathBuf::from(format!("/tmp/{workspace_id}")))
+            .state(state)
+            .maybe_lease_id(lease_id)
+            .holder("user@host:1234")
+            .task("test")
+            .leased_at_epoch_s(1_700_000_000)
+            .maybe_lease_expires_at_epoch_s(expires_at)
+            .build()
     }
 
     #[tokio::test]

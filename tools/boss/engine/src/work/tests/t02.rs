@@ -2314,22 +2314,14 @@ fn make_chore_execution_962(db: &WorkDb, label: &str) -> String {
                 .build(),
         )
         .unwrap();
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("ready".to_owned()),
-        repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-        cube_repo_id: None,
-        cube_lease_id: None,
-        cube_workspace_id: None,
-        workspace_path: None,
-        priority: None,
-        preferred_workspace_id: None,
-        started_at: None,
-        finished_at: None,
-        prefer_is_soft: false,
-        pr_url: None,
-    })
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build(),
+    )
     .unwrap()
     .id
 }
