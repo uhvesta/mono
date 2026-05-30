@@ -1,5 +1,8 @@
 import CryptoKit
 import Foundation
+import os.log
+
+private let downloaderLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
 
 // MARK: - Manifest
 
@@ -307,8 +310,13 @@ actor UpdateDownloader {
         let versionStr = version.description
         let finalDir = updatesDirectory.appendingPathComponent(versionStr, isDirectory: true)
 
+        downloaderLog.info(
+            "update download: starting version=\(versionStr, privacy: .public) url=\(update.assetURL.absoluteString, privacy: .public) size=\(update.assetSize, privacy: .public) bytes"
+        )
+
         // Short-circuit if a verified bundle for this version is already staged.
         if let existing = readyStagedUpdate(at: finalDir, expected: version) {
+            downloaderLog.info("update download: version \(versionStr, privacy: .public) already staged — skipping download")
             return .alreadyStaged(existing)
         }
 
@@ -355,6 +363,7 @@ actor UpdateDownloader {
         guard actualSize == update.assetSize else {
             return fail(workDir, &manifest, "size mismatch: expected \(update.assetSize) bytes, got \(actualSize)")
         }
+        downloaderLog.info("update download: size verified \(actualSize, privacy: .public) bytes")
 
         // Record the digest (bookkeeping / future checksum-asset verification).
         manifest.sha256 = sha256Hex(of: zipURL)
@@ -369,6 +378,7 @@ actor UpdateDownloader {
         } catch {
             return fail(workDir, &manifest, "extraction failed: \(error.localizedDescription)")
         }
+        downloaderLog.info("update download: archive extracted")
 
         guard let extractedBundle = locateBundle(in: extractDir) else {
             return fail(workDir, &manifest, "no Boss.app found in archive")
@@ -380,6 +390,7 @@ actor UpdateDownloader {
         } catch {
             return fail(workDir, &manifest, "code signature verification failed: \(error.localizedDescription)")
         }
+        downloaderLog.info("update download: code signature verified")
 
         let stagedTeamID: String?
         do {
@@ -393,6 +404,9 @@ actor UpdateDownloader {
                 "Team ID mismatch: staged \(stagedTeamID ?? "none"), running \(runningTeamID ?? "none")"
             )
         }
+        downloaderLog.info(
+            "update download: Team ID match — staged=\(stagedTeamID ?? "none", privacy: .public) running=\(self.runningTeamID ?? "none", privacy: .public)"
+        )
 
         // Move the verified bundle to its canonical slot, drop the scratch extract dir.
         let bundleURL = workDir.appendingPathComponent("Boss.app", isDirectory: true)
@@ -410,6 +424,7 @@ actor UpdateDownloader {
         } catch {
             return fail(workDir, &manifest, "quarantine strip failed: \(error.localizedDescription)")
         }
+        downloaderLog.info("update download: quarantine stripped")
 
         // Mark ready, then atomically promote.
         manifest.state = .ready
@@ -430,6 +445,7 @@ actor UpdateDownloader {
             return .failed(reason: "atomic promotion to \(finalDir.path) failed: \(error.localizedDescription)")
         }
 
+        downloaderLog.info("update download: version \(versionStr, privacy: .public) staged and ready at \(finalDir.path, privacy: .public)")
         cleanup()
 
         return .ready(StagedUpdate(
@@ -517,6 +533,7 @@ actor UpdateDownloader {
     /// Mark the staging directory `.failed`, persist the reason for the next
     /// `cleanup()` to reap, and return a `.failed` outcome.
     private func fail(_ workDir: URL, _ manifest: inout UpdateManifest, _ reason: String) -> DownloadOutcome {
+        downloaderLog.error("update download failed: \(reason, privacy: .public)")
         manifest.state = .failed
         manifest.failureReason = reason
         writeManifest(manifest, to: workDir)

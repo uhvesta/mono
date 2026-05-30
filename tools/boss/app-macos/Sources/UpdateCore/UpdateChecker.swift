@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 // MARK: - Version types
 
@@ -101,6 +102,8 @@ private struct GitHubAsset: Decodable, Sendable {
     }
 }
 
+private let checkerLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
+
 // MARK: - UpdateChecker actor
 
 /// Polls the unauthenticated GitHub Releases API for newer Boss releases.
@@ -155,6 +158,11 @@ actor UpdateChecker {
     }
 
     func checkForUpdates() async -> UpdateCheckResult {
+        let usingETag = storedETag != nil
+        checkerLog.info(
+            "update check: current=\(self.currentVersion.description, privacy: .public) url=\(Self.releasesURL.absoluteString, privacy: .public) conditionalRequest=\(usingETag, privacy: .public)"
+        )
+
         var request = URLRequest(url: Self.releasesURL)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -168,6 +176,7 @@ actor UpdateChecker {
         do {
             (data, response) = try await fetcher.fetch(request)
         } catch {
+            checkerLog.error("update check: network error — \(error.localizedDescription, privacy: .public)")
             return .networkError(error.localizedDescription)
         }
 
@@ -176,18 +185,24 @@ actor UpdateChecker {
             if let etag = response.value(forHTTPHeaderField: "ETag") {
                 storedETag = etag
             }
+            checkerLog.info("update check: HTTP 200 — parsing release feed")
             let result = parseReleases(from: data)
             lastResult = result
             return result
 
         case 304:
-            // Conditional request hit — nothing changed since our last check.
+            checkerLog.info("update check: HTTP 304 (cache hit, feed unchanged since last check)")
             return lastResult
 
         case 403, 429:
-            return .rateLimited(retryAfter: parseRateLimitReset(from: response))
+            let retryAfter = parseRateLimitReset(from: response)
+            checkerLog.warning(
+                "update check: rate limited (HTTP \(response.statusCode, privacy: .public)) — retry after \(retryAfter.description, privacy: .public)"
+            )
+            return .rateLimited(retryAfter: retryAfter)
 
         default:
+            checkerLog.error("update check: unexpected HTTP \(response.statusCode, privacy: .public)")
             return .networkError("HTTP \(response.statusCode)")
         }
     }
@@ -199,18 +214,29 @@ actor UpdateChecker {
         do {
             releases = try JSONDecoder().decode([GitHubRelease].self, from: data)
         } catch {
+            checkerLog.error("update check: JSON decode failed — \(error.localizedDescription, privacy: .public)")
             return .networkError("JSON decode failed: \(error.localizedDescription)")
         }
 
+        checkerLog.info("update check: parsed \(releases.count, privacy: .public) releases from feed")
+
         guard let (latestVersion, release, asset) = selectBestRelease(from: releases) else {
+            checkerLog.info("update check: no qualifying boss-v* release found — up-to-date")
             return .upToDate
         }
         guard latestVersion > currentVersion else {
+            checkerLog.info(
+                "update check: latest=\(latestVersion.description, privacy: .public) current=\(self.currentVersion.description, privacy: .public) — up-to-date"
+            )
             return .upToDate
         }
         guard let assetURL = URL(string: asset.browserDownloadURL) else {
+            checkerLog.error("update check: invalid asset URL '\(asset.browserDownloadURL, privacy: .public)'")
             return .networkError("Invalid asset URL: \(asset.browserDownloadURL)")
         }
+        checkerLog.info(
+            "update check: update available — latest=\(latestVersion.description, privacy: .public) current=\(self.currentVersion.description, privacy: .public) tag=\(release.tagName, privacy: .public) assetSize=\(asset.size, privacy: .public) bytes"
+        )
         return .available(AvailableUpdate(
             tagName: release.tagName,
             version: latestVersion,

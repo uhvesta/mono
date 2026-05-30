@@ -1,6 +1,9 @@
 import AppKit
 import SwiftUI
 import UpdateCore
+import os.log
+
+private let appUpdateLog = Logger(subsystem: "dev.spinyfin.bossmacapp", category: "updater")
 
 @main
 struct BossMacApp: App {
@@ -129,7 +132,10 @@ struct BossMacApp: App {
 private struct CheckForUpdatesCommand: View {
     var body: some View {
         Button("Check for Updates…") {
-            guard let model = (NSApp.delegate as? AppDelegate)?.updateModel else { return }
+            guard let model = (NSApp.delegate as? AppDelegate)?.updateModel else {
+                appUpdateLog.error("Check for Updates: updateModel unavailable on AppDelegate — menu action is a no-op")
+                return
+            }
             model.presentUpdateSheet()
         }
     }
