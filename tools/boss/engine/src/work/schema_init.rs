@@ -299,8 +299,13 @@ impl WorkDb {
         // agent-raised, human-actionable notifications (questions +
         // followups). Design: tools/boss/docs/designs/attentions.md.
         migrate_attentions(&conn)?;
+        // Editorial controls (P576, chore #1): per-product editorial_rules JSON
+        // column, branch_naming snapshot on work_executions, and editorial_actions
+        // audit table. Ships dark — no behaviour change until a product opts in.
+        // Design: tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md
+        migrate_editorial_controls_schema(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '13')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '14')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
