@@ -7,9 +7,104 @@ use tempfile::tempdir;
 use crate::external::ExternalCheckImplementationRef;
 use crate::output::Severity;
 
-use super::ConfigResolver;
+use super::{ConfigResolver, StaleExclusionMode};
 
 mod yaml;
+
+#[test]
+fn stale_exclusion_severity_defaults_to_warn_and_inherits() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[settings]
+stale_exclusion_severity = "error"
+
+[[checks]]
+id = "rust-giant-structs-use-builder"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    // The root setting is inherited by descendant directories.
+    let checks = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect("resolve checks");
+    assert_eq!(checks.stale_exclusion_mode(), StaleExclusionMode::Error);
+
+    // A repo with no setting defaults to Warn.
+    let bare = tempdir().expect("create temp dir");
+    fs::write(
+        bare.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust-giant-structs-use-builder\"\n",
+    )
+    .expect("write config");
+    let bare_resolver = ConfigResolver::new(bare.path()).expect("create resolver");
+    assert_eq!(
+        bare_resolver
+            .resolve_for_file(Path::new("a.rs"))
+            .expect("resolve")
+            .stale_exclusion_mode(),
+        StaleExclusionMode::Warn
+    );
+}
+
+#[test]
+fn per_check_stale_exclusion_severity_override_is_parsed() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "rust-giant-structs-use-builder"
+
+[checks.policy]
+stale_exclusion_severity = "off"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("a.rs"))
+        .expect("resolve checks");
+    let check = checks
+        .get("rust-giant-structs-use-builder")
+        .expect("check present");
+    assert_eq!(
+        check.policy.stale_exclusion_mode,
+        Some(StaleExclusionMode::Off)
+    );
+}
+
+#[test]
+fn invalid_stale_exclusion_severity_produces_diagnostic() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[settings]
+stale_exclusion_severity = "loud"
+
+[[checks]]
+id = "rust-giant-structs-use-builder"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("a.rs"))
+        .expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("stale_exclusion_severity")),
+        "expected a diagnostic about the invalid severity, got {diagnostics:?}"
+    );
+}
 
 #[test]
 fn resolves_single_config_file() {

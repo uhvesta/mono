@@ -62,6 +62,46 @@ pub struct CheckPolicyConfig {
     pub severity: Option<Severity>,
     pub allow_bypass: Option<bool>,
     pub bypass_name: Option<String>,
+    /// Per-check override of the stale-exclusion audit mode. `None` inherits the
+    /// resolved global default (see [`ResolvedChecks::stale_exclusion_mode`]).
+    pub stale_exclusion_mode: Option<StaleExclusionMode>,
+}
+
+/// How the stale-exclusion audit reports a dead exclusion. Defaults to
+/// [`Warn`](StaleExclusionMode::Warn); a repo can set it to
+/// [`Error`](StaleExclusionMode::Error) to fail CI on dead exclusions, or
+/// [`Off`](StaleExclusionMode::Off) to disable the audit entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleExclusionMode {
+    Off,
+    Warn,
+    Error,
+}
+
+impl Default for StaleExclusionMode {
+    fn default() -> Self {
+        Self::Warn
+    }
+}
+
+impl StaleExclusionMode {
+    /// The finding severity for this mode, or `None` when the audit is disabled.
+    pub fn severity(self) -> Option<Severity> {
+        match self {
+            Self::Off => None,
+            Self::Warn => Some(Severity::Warning),
+            Self::Error => Some(Severity::Error),
+        }
+    }
+}
+
+fn parse_stale_exclusion_mode(raw: &str) -> Result<StaleExclusionMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" => Ok(StaleExclusionMode::Off),
+        "warn" | "warning" => Ok(StaleExclusionMode::Warn),
+        "error" => Ok(StaleExclusionMode::Error),
+        _ => bail!("expected one of `off`, `warning`, or `error`"),
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -69,6 +109,7 @@ pub struct ResolvedChecks {
     checks_by_id: BTreeMap<String, CheckConfig>,
     diagnostics: Vec<ConfigDiagnostic>,
     include_config_files: bool,
+    stale_exclusion_mode: StaleExclusionMode,
 }
 
 impl ResolvedChecks {
@@ -90,6 +131,12 @@ impl ResolvedChecks {
 
     pub fn include_config_files(&self) -> bool {
         self.include_config_files
+    }
+
+    /// The resolved global default mode for the stale-exclusion audit at this point in
+    /// the config hierarchy. Per-check `policy.stale_exclusion_severity` overrides it.
+    pub fn stale_exclusion_mode(&self) -> StaleExclusionMode {
+        self.stale_exclusion_mode
     }
 
     fn upsert(&mut self, check: CheckConfig) {
@@ -326,6 +373,8 @@ struct ParsedSettings {
     include_config_files: Option<bool>,
     #[serde(default)]
     external_checks_url: Option<String>,
+    #[serde(default)]
+    stale_exclusion_severity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -351,6 +400,8 @@ struct ParsedCheckPolicyConfig {
     allow_bypass: Option<bool>,
     #[serde(default)]
     bypass_name: Option<String>,
+    #[serde(default)]
+    stale_exclusion_severity: Option<String>,
 }
 
 #[derive(Debug)]
@@ -466,10 +517,21 @@ fn parse_policy_config(
         .clone()
         .map(|raw| normalize_bypass_name(raw, check_id));
 
+    let stale_exclusion_mode = match policy.stale_exclusion_severity.as_deref() {
+        Some(raw) => Some(parse_stale_exclusion_mode(raw).with_context(|| match config_source {
+            Some(config_source) => format!(
+                "invalid `policy.stale_exclusion_severity` for check `{check_id}` in {config_source}"
+            ),
+            None => format!("invalid `policy.stale_exclusion_severity` for check `{check_id}`"),
+        })?),
+        None => None,
+    };
+
     Ok(CheckPolicyConfig {
         severity,
         allow_bypass: policy.allow_bypass,
         bypass_name,
+        stale_exclusion_mode,
     })
 }
 
@@ -600,6 +662,23 @@ fn apply_local_settings(
         resolved.include_config_files = include_config_files;
     }
 
+    if let Some(raw) = settings.stale_exclusion_severity.as_deref() {
+        match parse_stale_exclusion_mode(raw) {
+            Ok(mode) => resolved.stale_exclusion_mode = mode,
+            Err(error) => resolved.push_diagnostic(config_file_diagnostic(
+                CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+                source_path.to_path_buf(),
+                format!("invalid `settings.stale_exclusion_severity`: {error}"),
+                None,
+                None,
+                Some(
+                    "Set `settings.stale_exclusion_severity` to `off`, `warning`, or `error`."
+                        .to_owned(),
+                ),
+            )),
+        }
+    }
+
     let Some(external_checks_url) = settings.external_checks_url.as_deref() else {
         return;
     };
@@ -634,6 +713,20 @@ fn apply_external_checks_file(
 ) -> Result<()> {
     if let Some(include_config_files) = external_checks_file.parsed.settings.include_config_files {
         resolved.include_config_files = include_config_files;
+    }
+
+    if let Some(raw) = external_checks_file
+        .parsed
+        .settings
+        .stale_exclusion_severity
+        .as_deref()
+    {
+        resolved.stale_exclusion_mode = parse_stale_exclusion_mode(raw).with_context(|| {
+            format!(
+                "invalid `settings.stale_exclusion_severity` in {}",
+                external_checks_file.source_label
+            )
+        })?;
     }
 
     for check in &external_checks_file.parsed.checks {

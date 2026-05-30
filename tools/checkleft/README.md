@@ -43,6 +43,38 @@ checks:
     check: typo
 ```
 
+## Stale-exclusion auditing
+
+Exclusions in `CHECKS.toml` (e.g. a check's `exclude_structs` / `exclude_files`
+list) are easy to add and easy to forget. Once the reason an exclusion existed
+goes away — the excluded struct gains a builder, a referenced file is deleted —
+the entry becomes dead weight that quietly weakens coverage.
+
+`checkleft` audits for this. When a file an exclusion depends on changes in the
+diff, the owning check re-evaluates that exclusion as if it were not present; if
+the rule now passes without it, `checkleft` reports a finding **on the
+`CHECKS.toml` entry itself** telling you the exclusion can be removed. The audit
+is diff-gated (it only re-evaluates exclusions whose dependencies changed) and
+fails safe (an exclusion whose dependency can't be pinned to concrete files is
+never flagged).
+
+Severity is configurable, globally via `[settings]` and per-check via
+`[checks.policy]`. The default is `warning`; set `error` to fail CI on dead
+exclusions, or `off` to disable the audit:
+
+```toml
+[settings]
+# Global default for every check in this subtree (off | warning | error).
+stale_exclusion_severity = "error"
+
+[[checks]]
+id = "rust-giant-structs-use-builder"
+
+[checks.policy]
+# Per-check override of the global default.
+stale_exclusion_severity = "warning"
+```
+
 ## Notes
 
 - `checkleft` shells out to `git` or `jj` to discover repository state.

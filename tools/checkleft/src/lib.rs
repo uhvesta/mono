@@ -7,6 +7,7 @@ pub mod bypass;
 pub mod check;
 pub mod checks;
 pub mod config;
+pub mod exclusion;
 pub mod external;
 pub mod ifchange;
 pub mod input;

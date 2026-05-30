@@ -5,12 +5,37 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
+use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::input::{ChangeSet, SourceTree};
 use crate::output::CheckResult;
 
 #[async_trait]
 pub trait ConfiguredCheck: Send + Sync {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult>;
+
+    /// Exclusions this configured check honors that are eligible for stale-exclusion
+    /// auditing (see [`crate::exclusion`]). Each carries the inputs it depends on;
+    /// checkleft re-evaluates an exclusion only when one of those inputs changes in the
+    /// diff. The default returns none, so a check opts into auditing simply by
+    /// overriding this.
+    fn declared_exclusions(&self) -> Vec<DeclaredExclusion> {
+        Vec::new()
+    }
+
+    /// Re-evaluate a single declared exclusion as if it were not configured, to decide
+    /// whether it is still load-bearing. The runner only calls this for exclusions whose
+    /// declared dependencies intersect the changeset.
+    ///
+    /// Implementations must fail safe: when staleness cannot be proven (file unreadable,
+    /// ambiguous target, entry not recognized), return [`ExclusionStatus::Unknown`]
+    /// rather than guessing [`ExclusionStatus::Stale`]. The default returns `Unknown`.
+    async fn evaluate_exclusion(
+        &self,
+        _exclusion: &DeclaredExclusion,
+        _tree: &dyn SourceTree,
+    ) -> Result<ExclusionStatus> {
+        Ok(ExclusionStatus::Unknown)
+    }
 }
 
 #[async_trait]

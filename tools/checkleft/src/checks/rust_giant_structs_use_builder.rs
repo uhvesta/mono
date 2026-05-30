@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::check::{Check, ConfiguredCheck};
+use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -69,6 +70,30 @@ struct ParsedConfig {
     /// Directory of the CHECKS.toml that owns this config (repo-root-relative).
     /// `None` means no scope: simple-name exclusions apply to any file (backward compat).
     config_dir: Option<PathBuf>,
+    /// Exclusion entries eligible for stale-exclusion auditing, each pinned to the single
+    /// file it depends on. Only entries whose dependency resolves to one concrete file are
+    /// listed: qualified `path::Struct` entries and literal-path `exclude_files` entries.
+    /// Simple-name struct entries and glob file patterns are deliberately omitted — their
+    /// dependency cannot be pinned, so they are never audited (fail safe).
+    auditable_exclusions: Vec<AuditableExclusion>,
+}
+
+/// One exclusion entry the stale-exclusion audit can re-evaluate.
+struct AuditableExclusion {
+    /// Raw entry text exactly as written in CHECKS.toml (used to locate it and report it).
+    entry: String,
+    /// The single file (repo-root-relative) this exclusion depends on.
+    path: PathBuf,
+    kind: AuditKind,
+}
+
+enum AuditKind {
+    /// A `path::Struct` exclusion: dead once the named struct no longer violates in
+    /// `path` (gained a builder, dropped below the field threshold, or was removed).
+    Struct(String),
+    /// A literal-path `exclude_files` exclusion: dead once the file no longer exists
+    /// (dangling reference). A present whole-file exclude is left load-bearing.
+    File,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +229,87 @@ impl ConfiguredCheck for ParsedConfig {
             check_id: CHECK_ID.to_owned(),
             findings,
         })
+    }
+
+    fn declared_exclusions(&self) -> Vec<DeclaredExclusion> {
+        self.auditable_exclusions
+            .iter()
+            .map(|exclusion| {
+                DeclaredExclusion::new(exclusion.entry.clone(), vec![exclusion.path.clone()])
+            })
+            .collect()
+    }
+
+    async fn evaluate_exclusion(
+        &self,
+        exclusion: &DeclaredExclusion,
+        tree: &dyn SourceTree,
+    ) -> Result<ExclusionStatus> {
+        let Some(spec) = self
+            .auditable_exclusions
+            .iter()
+            .find(|candidate| candidate.entry == exclusion.entry)
+        else {
+            // Entry we don't recognize — fail safe.
+            return Ok(ExclusionStatus::Unknown);
+        };
+
+        match &spec.kind {
+            AuditKind::File => {
+                // Whole-file exclude: dead only when the referenced file is gone.
+                if tree.exists(&spec.path) {
+                    Ok(ExclusionStatus::LoadBearing)
+                } else {
+                    Ok(ExclusionStatus::Stale {
+                        reason: format!(
+                            "the excluded file `{}` no longer exists",
+                            spec.path.display()
+                        ),
+                    })
+                }
+            }
+            AuditKind::Struct(name) => {
+                if !tree.exists(&spec.path) {
+                    return Ok(ExclusionStatus::Stale {
+                        reason: format!("the file `{}` no longer exists", spec.path.display()),
+                    });
+                }
+                let Ok(contents) = tree.read_file(&spec.path) else {
+                    return Ok(ExclusionStatus::Unknown);
+                };
+                let Ok(source) = std::str::from_utf8(&contents) else {
+                    return Ok(ExclusionStatus::Unknown);
+                };
+                let Ok(parsed_file) = syn::parse_file(source) else {
+                    // Can't parse it now — don't claim the exclusion is dead.
+                    return Ok(ExclusionStatus::Unknown);
+                };
+
+                // Re-run the rule against this file with the exclusion lifted (empty
+                // exclude set). If the struct is still flagged, the exclusion is doing
+                // work; otherwise it is no longer needed.
+                let no_exclusions: HashSet<String> = HashSet::new();
+                let violations = collect_violations(
+                    &parsed_file.items,
+                    false,
+                    &self.builder,
+                    self.max_fields,
+                    &no_exclusions,
+                );
+                if violations.iter().any(|violation| violation == name) {
+                    return Ok(ExclusionStatus::LoadBearing);
+                }
+
+                // Not a violation anymore. Distinguish "gained a builder / shrank" from
+                // "the struct is gone" for a clearer message.
+                let reason = if struct_declaration_line(source, name).is_some() {
+                    format!("`{name}` now satisfies the builder rule without the exclusion")
+                } else {
+                    format!("`{name}` is no longer defined in `{}`", spec.path.display())
+                };
+                Ok(ExclusionStatus::Stale { reason })
+            }
+        }
     }
 }
 
@@ -349,11 +455,11 @@ fn has_required_builder(attrs: &[syn::Attribute], builder: &BuilderKind) -> bool
     false
 }
 
-/// Find the 1-based line number where `struct <name>` is declared.
-/// Handles a leading visibility modifier (`pub`, `pub(crate)`, `pub(super)`,
-/// `pub(in path)`) so that `pub struct Foo` resolves to the right line rather
-/// than falling back to 1. Returns 1 if the declaration can't be located.
-fn find_struct_line(source: &str, struct_name: &str) -> u32 {
+/// Find the 1-based line number where `struct <name>` is declared, or `None` if the
+/// declaration can't be located. Handles a leading visibility modifier (`pub`,
+/// `pub(crate)`, `pub(super)`, `pub(in path)`) so that `pub struct Foo` resolves to the
+/// right line.
+fn struct_declaration_line(source: &str, struct_name: &str) -> Option<u32> {
     let search = format!("struct {struct_name}");
     for (i, line) in source.lines().enumerate() {
         let candidate = strip_visibility(line.trim_start());
@@ -362,11 +468,17 @@ fn find_struct_line(source: &str, struct_name: &str) -> u32 {
             if after.is_empty()
                 || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '('))
             {
-                return (i + 1) as u32;
+                return Some((i + 1) as u32);
             }
         }
     }
-    1
+    None
+}
+
+/// Like [`struct_declaration_line`] but falls back to line 1 when the declaration can't
+/// be located, for use as a finding location.
+fn find_struct_line(source: &str, struct_name: &str) -> u32 {
+    struct_declaration_line(source, struct_name).unwrap_or(1)
 }
 
 /// Strip a leading `pub` / `pub(...)` visibility modifier (and following
@@ -410,24 +522,51 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
 
     let mut exclude_structs: HashSet<String> = HashSet::new();
     let mut exclude_structs_qualified: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut auditable_exclusions: Vec<AuditableExclusion> = Vec::new();
 
+    let resolve = |path_part: &str| -> PathBuf {
+        match config_dir {
+            Some(dir) => dir.join(path_part),
+            None => PathBuf::from(path_part),
+        }
+    };
+
+    let raw_exclude_files = raw.exclude_files.clone().unwrap_or_default();
     for entry in raw.exclude_structs.unwrap_or_default() {
         // Qualified form: `relative/path.rs::StructName`
         // Path is relative to the CHECKS.toml directory (config_dir).
         if let Some(sep) = entry.rfind("::") {
             let path_part = &entry[..sep];
             let name_part = entry[sep + 2..].to_owned();
-            let resolved = match config_dir {
-                Some(dir) => dir.join(path_part),
-                None => PathBuf::from(path_part),
-            };
+            let resolved = resolve(path_part);
+            // A qualified entry pins exactly one file and one struct, so it is auditable:
+            // re-evaluate `name_part` in `resolved` with the exclusion lifted.
+            auditable_exclusions.push(AuditableExclusion {
+                entry: entry.clone(),
+                path: resolved.clone(),
+                kind: AuditKind::Struct(name_part.clone()),
+            });
             exclude_structs_qualified
                 .entry(resolved)
                 .or_default()
                 .insert(name_part);
         } else {
-            // Simple form: scoped to the config subtree at runtime.
+            // Simple form: scoped to the config subtree at runtime. The struct could live
+            // in any file in the subtree, so the dependency can't be pinned — not audited.
             exclude_structs.insert(entry);
+        }
+    }
+
+    // Literal-path `exclude_files` entries depend on exactly one file and go stale when
+    // that file is deleted. Glob patterns can't be pinned to a single path, so they are
+    // not audited.
+    for pattern in &raw_exclude_files {
+        if is_literal_path(pattern) {
+            auditable_exclusions.push(AuditableExclusion {
+                entry: pattern.clone(),
+                path: resolve(pattern),
+                kind: AuditKind::File,
+            });
         }
     }
 
@@ -438,7 +577,13 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
         exclude_structs,
         exclude_structs_qualified,
         config_dir: config_dir.map(|p| p.to_path_buf()),
+        auditable_exclusions,
     })
+}
+
+/// A pattern with no glob metacharacters resolves to a single concrete file path.
+fn is_literal_path(pattern: &str) -> bool {
+    !pattern.contains(['*', '?', '[', ']', '{', '}', '!'])
 }
 
 fn parse_exclude_files(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
@@ -477,7 +622,8 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::check::Check;
+    use crate::check::{Check, ConfiguredCheck};
+    use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
     use crate::output::Finding;
     use crate::source_tree::LocalSourceTree;
@@ -1212,5 +1358,196 @@ pub struct ServerState {
             .collect();
         assert_eq!(messages.len(), 1, "expected ServerState flagged in the wrong file, got {messages:?}");
         assert!(messages[0].contains("ServerState"));
+    }
+
+    // --- Stale-exclusion auditing tests ---
+
+    const SIX_FIELD_STRUCT: &str = r#"
+pub struct Big {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+
+    const SIX_FIELD_STRUCT_WITH_BUILDER: &str = r#"
+#[derive(bon::Builder)]
+pub struct Big {
+    a: String, b: String, c: String, d: String, e: String, f: String,
+}
+"#;
+
+    fn configured(
+        config: toml::Value,
+        config_dir: Option<&Path>,
+    ) -> std::sync::Arc<dyn ConfiguredCheck> {
+        RustGiantStructsUseBuilderCheck
+            .configure_scoped(&config, config_dir)
+            .expect("configure_scoped")
+    }
+
+    fn sorted_entries(declared: &[DeclaredExclusion]) -> Vec<String> {
+        let mut entries: Vec<String> = declared.iter().map(|d| d.entry.clone()).collect();
+        entries.sort();
+        entries
+    }
+
+    /// Only qualified struct entries and literal-path file entries are auditable. Simple
+    /// names (dependency can't be pinned) and glob file patterns are omitted (fail safe).
+    #[test]
+    fn declared_exclusions_lists_only_pinnable_entries() {
+        let config = toml::Value::Table(toml::toml! {
+            exclude_structs = ["SimpleName", "a.rs::Qualified"]
+            exclude_files = ["literal.rs", "generated/*.rs"]
+        });
+        let check = configured(config, Some(Path::new("sub")));
+        let declared = check.declared_exclusions();
+
+        assert_eq!(
+            sorted_entries(&declared),
+            vec!["a.rs::Qualified".to_owned(), "literal.rs".to_owned()],
+        );
+
+        // Dependency paths resolve relative to the config_dir.
+        let qualified = declared
+            .iter()
+            .find(|d| d.entry == "a.rs::Qualified")
+            .expect("qualified entry declared");
+        assert_eq!(qualified.depends_on, vec![Path::new("sub/a.rs").to_path_buf()]);
+        let literal = declared
+            .iter()
+            .find(|d| d.entry == "literal.rs")
+            .expect("literal file entry declared");
+        assert_eq!(literal.depends_on, vec![Path::new("sub/literal.rs").to_path_buf()]);
+    }
+
+    /// A struct exclusion is load-bearing while the struct still violates without it.
+    #[tokio::test]
+    async fn evaluate_exclusion_load_bearing_when_struct_still_violates() {
+        let temp = tempdir().expect("create temp dir");
+        fs::write(temp.path().join("test.rs"), SIX_FIELD_STRUCT).expect("write file");
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let check = configured(
+            toml::Value::Table(toml::toml! { exclude_structs = ["test.rs::Big"] }),
+            Some(Path::new("")),
+        );
+        let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
+        let status = check
+            .evaluate_exclusion(&exclusion, &tree)
+            .await
+            .expect("evaluate");
+        assert_eq!(status, ExclusionStatus::LoadBearing);
+    }
+
+    /// Once the struct gains a builder, the exclusion is stale (semantic case 2).
+    #[tokio::test]
+    async fn evaluate_exclusion_stale_when_struct_gains_builder() {
+        let temp = tempdir().expect("create temp dir");
+        fs::write(temp.path().join("test.rs"), SIX_FIELD_STRUCT_WITH_BUILDER).expect("write file");
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let check = configured(
+            toml::Value::Table(toml::toml! { exclude_structs = ["test.rs::Big"] }),
+            Some(Path::new("")),
+        );
+        let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
+        let status = check
+            .evaluate_exclusion(&exclusion, &tree)
+            .await
+            .expect("evaluate");
+        match status {
+            ExclusionStatus::Stale { reason } => {
+                assert!(reason.contains("satisfies"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected stale, got {other:?}"),
+        }
+    }
+
+    /// A struct exclusion whose file was deleted is stale (dangling reference).
+    #[tokio::test]
+    async fn evaluate_exclusion_stale_when_struct_file_deleted() {
+        let temp = tempdir().expect("create temp dir");
+        // Do not create test.rs — it was deleted in the diff.
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let check = configured(
+            toml::Value::Table(toml::toml! { exclude_structs = ["test.rs::Big"] }),
+            Some(Path::new("")),
+        );
+        let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
+        let status = check
+            .evaluate_exclusion(&exclusion, &tree)
+            .await
+            .expect("evaluate");
+        match status {
+            ExclusionStatus::Stale { reason } => {
+                assert!(reason.contains("no longer exists"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected stale, got {other:?}"),
+        }
+    }
+
+    /// A struct exclusion whose named struct no longer appears is stale.
+    #[tokio::test]
+    async fn evaluate_exclusion_stale_when_struct_removed() {
+        let temp = tempdir().expect("create temp dir");
+        fs::write(temp.path().join("test.rs"), "pub struct Other { a: u8 }\n").expect("write file");
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let check = configured(
+            toml::Value::Table(toml::toml! { exclude_structs = ["test.rs::Big"] }),
+            Some(Path::new("")),
+        );
+        let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
+        let status = check
+            .evaluate_exclusion(&exclusion, &tree)
+            .await
+            .expect("evaluate");
+        match status {
+            ExclusionStatus::Stale { reason } => {
+                assert!(reason.contains("no longer defined"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected stale, got {other:?}"),
+        }
+    }
+
+    /// A literal `exclude_files` entry is load-bearing while the file exists, and stale
+    /// once it is deleted (dangling reference, case 1).
+    #[tokio::test]
+    async fn evaluate_exclusion_file_entry_tracks_existence() {
+        let temp = tempdir().expect("create temp dir");
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let check = configured(
+            toml::Value::Table(toml::toml! { exclude_files = ["gen.rs"] }),
+            Some(Path::new("")),
+        );
+        let exclusion = DeclaredExclusion::new("gen.rs", vec!["gen.rs".into()]);
+
+        // Missing file => stale.
+        let status = check
+            .evaluate_exclusion(&exclusion, &tree)
+            .await
+            .expect("evaluate");
+        assert!(matches!(status, ExclusionStatus::Stale { .. }));
+
+        // Present file => load-bearing.
+        fs::write(temp.path().join("gen.rs"), "// generated\n").expect("write file");
+        let status = check
+            .evaluate_exclusion(&exclusion, &tree)
+            .await
+            .expect("evaluate");
+        assert_eq!(status, ExclusionStatus::LoadBearing);
+    }
+
+    /// An entry the check does not recognize is never reported (fail safe).
+    #[tokio::test]
+    async fn evaluate_exclusion_unknown_for_unrecognized_entry() {
+        let temp = tempdir().expect("create temp dir");
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let check = configured(
+            toml::Value::Table(toml::toml! { exclude_structs = ["test.rs::Big"] }),
+            Some(Path::new("")),
+        );
+        let exclusion = DeclaredExclusion::new("nope.rs::Ghost", vec!["nope.rs".into()]);
+        let status = check
+            .evaluate_exclusion(&exclusion, &tree)
+            .await
+            .expect("evaluate");
+        assert_eq!(status, ExclusionStatus::Unknown);
     }
 }

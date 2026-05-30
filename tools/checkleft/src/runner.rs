@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::{CheckRegistry, ConfiguredCheck};
 use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver};
+use crate::exclusion::ExclusionStatus;
 use crate::external::{
     EXTERNAL_CHECK_EXEC_RUNTIME_V1, ExternalCheckExecutor, ExternalCheckPackage,
     ExternalCheckPackageImplementation, ExternalCheckPackageProvider, NoopExternalCheckExecutor,
@@ -246,8 +247,167 @@ impl Runner {
             }
         }
 
+        results.extend(self.audit_stale_exclusions(changeset).await?);
+
         results.sort_by(|left, right| left.check_id.cmp(&right.check_id));
         Ok(results)
+    }
+
+    /// Diff-gated stale-exclusion audit (see [`crate::exclusion`]).
+    ///
+    /// Unlike the normal pass, this reports on `CHECKS.toml` files that did *not*
+    /// change: an exclusion goes stale because a file it depends on changed. For every
+    /// changed file we resolve the checks that govern it, ask each built-in check for
+    /// its declared exclusions, and re-evaluate only those whose declared dependencies
+    /// intersect the changeset. A `Stale` verdict becomes a finding anchored on the
+    /// exclusion's line in the owning `CHECKS.toml`.
+    async fn audit_stale_exclusions(&self, changeset: &ChangeSet) -> Result<Vec<CheckResult>> {
+        // Every path the diff touches, including deletions and rename sources: a stale
+        // exclusion is triggered by a change to a file it depends on, and a deletion is
+        // exactly the dangling-reference case the audit must catch.
+        let mut changed_paths: HashSet<PathBuf> = HashSet::new();
+        for changed_file in &changeset.changed_files {
+            changed_paths.insert(changed_file.path.clone());
+            if let Some(old_path) = &changed_file.old_path {
+                changed_paths.insert(old_path.clone());
+            }
+        }
+        if changed_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // De-duplicate (check instance, owning config, entry): the same exclusion is
+        // reachable through every changed file it depends on, but must be audited once.
+        let mut audited: HashSet<(String, PathBuf, String)> = HashSet::new();
+        // Cache CHECKS.toml contents read to locate entry lines.
+        let mut config_text_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
+        let mut findings_by_check: BTreeMap<String, Vec<Finding>> = BTreeMap::new();
+
+        for changed_file in &changeset.changed_files {
+            let resolved = self.resolver.resolve_for_file(&changed_file.path)?;
+            let default_mode = resolved.stale_exclusion_mode();
+
+            for check in resolved.enabled() {
+                // External checks audit through their own protocol, which is out of
+                // scope here; only built-in checks participate.
+                if check.implementation.is_some() {
+                    continue;
+                }
+                let mode = check.policy.stale_exclusion_mode.unwrap_or(default_mode);
+                let Some(severity) = mode.severity() else {
+                    continue; // audit disabled for this check
+                };
+                let Some(built_in) = self.registry.get(&check.check) else {
+                    continue;
+                };
+                let Ok(configured) =
+                    built_in.configure_scoped(&check.config, check.source_path.parent())
+                else {
+                    // Misconfiguration is surfaced by the normal pass; stay quiet here.
+                    continue;
+                };
+                let declared = configured.declared_exclusions();
+                if declared.is_empty() {
+                    continue;
+                }
+
+                for exclusion in declared {
+                    // Empty dependency set => dependency unknown => never audit (fail safe).
+                    if exclusion.depends_on.is_empty() {
+                        continue;
+                    }
+                    if !exclusion
+                        .depends_on
+                        .iter()
+                        .any(|dependency| changed_paths.contains(dependency))
+                    {
+                        continue;
+                    }
+                    let dedupe_key = (
+                        check.id.clone(),
+                        check.source_path.clone(),
+                        exclusion.entry.clone(),
+                    );
+                    if !audited.insert(dedupe_key) {
+                        continue;
+                    }
+
+                    let status = match configured
+                        .evaluate_exclusion(&exclusion, self.source_tree.as_ref())
+                        .await
+                    {
+                        Ok(status) => status,
+                        Err(err) => {
+                            // Fail safe: an evaluation error is never reported as stale.
+                            info!(
+                                check_id = %check.id,
+                                entry = %exclusion.entry,
+                                error = %err,
+                                "stale-exclusion audit failed; skipping entry"
+                            );
+                            continue;
+                        }
+                    };
+                    let ExclusionStatus::Stale { reason } = status else {
+                        continue;
+                    };
+
+                    let line = self.locate_exclusion_line(
+                        &check.source_path,
+                        &exclusion.entry,
+                        &mut config_text_cache,
+                    );
+                    findings_by_check
+                        .entry(check.id.clone())
+                        .or_default()
+                        .push(Finding {
+                            severity,
+                            message: format!(
+                                "exclusion `{}` is no longer needed: {reason}; remove this entry.",
+                                exclusion.entry
+                            ),
+                            location: Some(Location {
+                                path: check.source_path.clone(),
+                                line,
+                                column: None,
+                            }),
+                            remediation: Some(format!(
+                                "Remove `{}` from this check's exclusions in {}.",
+                                exclusion.entry,
+                                check.source_path.display()
+                            )),
+                            suggested_fix: None,
+                        });
+                }
+            }
+        }
+
+        Ok(findings_by_check
+            .into_iter()
+            .map(|(check_id, findings)| CheckResult { check_id, findings })
+            .collect())
+    }
+
+    /// Find the 1-based line of `entry` in the `CHECKS.toml` at `source_path`, reading
+    /// (and caching) the file through the source tree. Returns `None` if the file can't
+    /// be read or the entry text isn't found — the finding then points at the file
+    /// without a line.
+    fn locate_exclusion_line(
+        &self,
+        source_path: &Path,
+        entry: &str,
+        cache: &mut HashMap<PathBuf, Option<String>>,
+    ) -> Option<u32> {
+        let contents = cache
+            .entry(source_path.to_path_buf())
+            .or_insert_with(|| {
+                self.source_tree
+                    .read_file(source_path)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .as_ref()?;
+        locate_entry_line(contents, entry)
     }
 
     pub fn list_configured_checks(&self, changeset: &ChangeSet) -> Result<Vec<String>> {
@@ -528,6 +688,17 @@ fn format_config_diagnostic(diagnostic: &ConfigDiagnostic) -> String {
         diagnostic.location.path.display(),
         diagnostic.message
     )
+}
+
+/// Return the 1-based line number of the first line containing `entry`, or `None`.
+/// Used to anchor a stale-exclusion finding on the exact `CHECKS.toml` line that holds
+/// the dead entry (e.g. `"engine/src/app.rs::ServerState"`).
+fn locate_entry_line(contents: &str, entry: &str) -> Option<u32> {
+    contents
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(entry))
+        .map(|(index, _)| (index + 1) as u32)
 }
 
 fn is_checks_config_file(path: &std::path::Path) -> bool {
