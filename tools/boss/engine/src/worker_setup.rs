@@ -313,6 +313,51 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
         }));
     }
 
+    // Block a worker from *launching Boss itself* — the macOS app or its
+    // bundled engine. A worker that starts Boss attaches to the operator's
+    // live engine on `/tmp/boss-engine.sock` (the dev build defaults to that
+    // socket), collides with the running engine, and triggers repeated macOS
+    // permission prompts. This is the route-independent guard: it blocks the
+    // launch *action* regardless of how it's reached (a `verify`-style
+    // "run the app" step, a direct `open`, `bazel run`, `swift run`, etc.),
+    // so we keep skills like `verify` enabled while making "run the real
+    // Boss" impossible from a sandboxed worker.
+    //
+    // Blocks (matcher `Bash`, inspecting the command string):
+    //   - `open` of a Boss.app bundle / `-a Boss` / `-b dev.spinyfin.bossmacapp`
+    //   - executing the bundled app or engine binary
+    //     (`Boss.app/Contents/MacOS/Boss`, `…/Resources/bin/engine`)
+    //   - `bazel run` of `//tools/boss/app-macos` or `//tools/boss/engine`
+    //   - `swift run`
+    //
+    // Deliberately does NOT block `bazel test`/`swift test` of app-macos:
+    // those targets are `macos_unit_test`s with no test_host, so they run
+    // pure view-model/logic unit tests and do not launch the app or engine
+    // (a dedicated regression test, TestSourcesDoNotCallRealOpenerTests, even
+    // fails the build if a test reaches a real OS opener). Blocking them would
+    // only cost app-macos workers their pre-push test gate for no safety gain.
+    // `bazel build` is likewise allowed. Mirrors the inline-Python decision
+    // hook used by the revision `gh pr create` guard below.
+    let boss_launch_guard_command = concat!(
+        "python3 -c \"",
+        "import json,sys,re; ",
+        "inp=json.load(sys.stdin); ",
+        "cmd=inp.get('tool_input',{}).get('command',''); ",
+        r#"m=re.search(r'(\bopen\b[^\n]*(Boss\.app|-a\s+Boss\b|-b\s+dev\.spinyfin\.bossmacapp))|Boss\.app/Contents/MacOS/Boss|Boss\.app/Contents/Resources/bin/engine|((bazel|bazelisk)\s+run\b[^\n]*tools/boss/(app-macos|engine))|(\bswift\s+run\b)',cmd); "#,
+        "msg='Workers must not launch or run Boss itself. This command would start the Boss app or its bundled engine, which attaches to the operator live engine on /tmp/boss-engine.sock, collides with the running engine, and triggers OS permission prompts. Building and unit tests are fine (bazel build, bazel test); launching/running the app or engine is not. Runtime and UI verification are the coordinator job.'; ",
+        "print(json.dumps({'decision':'block','reason':msg}) if m else json.dumps({'decision':'approve'})); ",
+        "\""
+    );
+    pre_tool_use_hooks.push(serde_json::json!({
+        "matcher": "Bash",
+        "hooks": [
+            {
+                "type": "command",
+                "command": boss_launch_guard_command,
+            }
+        ],
+    }));
+
     let is_revision = input.execution_kind == "revision_implementation"
         || input.task_kind.as_deref() == Some("revision");
     if is_revision {
@@ -1062,8 +1107,9 @@ mod tests {
             let entries = hooks.get(name).unwrap().as_array().unwrap();
             // The boss-event shim is always the first entry for every
             // hook event. `PreToolUse` carries extra entries (the
-            // deterministic path guard, plus a revision-only guard); the
-            // other six events are wired exactly once.
+            // deterministic path guard, the always-on boss-launch guard,
+            // plus a revision-only guard); the other six events are wired
+            // exactly once.
             assert!(!entries.is_empty(), "{name} has no hook entries");
             assert_eq!(entries[0]["matcher"], "*");
             if name != "PreToolUse" {
@@ -1744,18 +1790,20 @@ mod tests {
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
-        // Must have 3 entries: the shim, the deterministic path guard,
-        // and the revision-only gh-pr-create guard.
+        // Must have 4 entries: the shim, the deterministic path guard, the
+        // always-on boss-launch guard, and the revision-only gh-pr-create guard.
         assert_eq!(
             pre.len(),
-            3,
-            "revision_implementation PreToolUse must have shim + path guard + pr guard, got {pre:?}",
+            4,
+            "revision_implementation PreToolUse must have shim + path guard + boss-launch guard + pr guard, got {pre:?}",
         );
-        // The revision guard is the Bash-matcher entry.
+        // The revision pr-guard is the Bash-matcher entry whose command
+        // inspects `gh pr create`; the boss-launch guard is also Bash-matched,
+        // so disambiguate by content.
         let pr_guard = pre
             .iter()
-            .find(|e| e["matcher"] == serde_json::Value::String("Bash".into()))
-            .expect("revision PreToolUse must include a Bash-matcher guard");
+            .find(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("create"))
+            .expect("revision PreToolUse must include a gh-pr-create guard");
         // Guard command must reference the deny decision and both gh pr create and cube pr ensure.
         let guard_cmd = pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
         assert!(
@@ -1780,12 +1828,12 @@ mod tests {
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
-        // chore: [boss-event shim, deterministic path guard]. The
-        // revision-only `gh pr create` guard must NOT be present.
+        // chore: [boss-event shim, deterministic path guard, boss-launch
+        // guard]. The revision-only `gh pr create` guard must NOT be present.
         assert_eq!(
             pre.len(),
-            2,
-            "chore_implementation PreToolUse must have shim + path guard, got {pre:?}",
+            3,
+            "chore_implementation PreToolUse must have shim + path guard + boss-launch guard, got {pre:?}",
         );
         assert_eq!(
             pre[0]["matcher"],
@@ -1803,6 +1851,55 @@ mod tests {
             assert!(
                 !cmd.contains("ensure"),
                 "chore must not carry the revision gh-pr-create guard: {cmd}",
+            );
+        }
+    }
+
+    /// Every worker session — regardless of kind — must carry a PreToolUse
+    /// guard that blocks *launching Boss itself*: the macOS app, its bundled
+    /// engine, or an app-macos test that can spawn the real app. `bazel build`
+    /// must stay allowed. The guard is a Bash-matcher inline-Python decision
+    /// hook (distinct from the revision gh-pr-create Bash guard).
+    #[test]
+    fn every_worker_blocks_launching_boss_in_pre_tool_use() {
+        for kind in ["chore_implementation", "revision_implementation"] {
+            let mut input = sample_input();
+            input.execution_kind = kind.into();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&render_settings_json(&input)).unwrap();
+            let pre = parsed["hooks"]["PreToolUse"]
+                .as_array()
+                .expect("PreToolUse must be an array");
+            // Disambiguate from the gh-pr-create guard by content.
+            let guard = pre
+                .iter()
+                .find(|e| {
+                    // The guard's regex escapes the dot (`Boss\.app`), so match
+                    // on backslash-free substrings of the command.
+                    let c = e["hooks"][0]["command"].as_str().unwrap_or("");
+                    c.contains("Contents/MacOS/Boss") && c.contains("app-macos")
+                })
+                .unwrap_or_else(|| panic!("{kind} PreToolUse must include a boss-launch guard"));
+            assert_eq!(
+                guard["matcher"], "Bash",
+                "{kind} boss-launch guard must match the Bash tool",
+            );
+            let cmd = guard["hooks"][0]["command"].as_str().unwrap_or("");
+            // Covers app launch (open / bundle binary), engine binary,
+            // bazel run of app-macos/engine, and swift run — and blocks.
+            // Must NOT reference `swift test` or `bazel test` (those run the
+            // app-macos unit suite, which has no test_host and is allowed).
+            assert!(
+                cmd.contains("Contents/MacOS/Boss")
+                    && cmd.contains("Resources/bin/engine")
+                    && cmd.contains("app-macos")
+                    && cmd.contains(r"swift\s+run")
+                    && cmd.contains("block"),
+                "{kind} boss-launch guard must block app/engine/run launches: {cmd}",
+            );
+            assert!(
+                !cmd.contains(r"swift\s+(run|test)") && !cmd.contains("test\\b[^\\n]*tools/boss/app-macos"),
+                "{kind} boss-launch guard must NOT block app-macos unit tests: {cmd}",
             );
         }
     }
@@ -1827,13 +1924,13 @@ mod tests {
 
         assert_eq!(
             pre.len(),
-            3,
-            "revision task_kind must add the pr guard (shim + path guard + pr guard) even when execution_kind is wrong, got {pre:?}",
+            4,
+            "revision task_kind must add the pr guard (shim + path guard + boss-launch guard + pr guard) even when execution_kind is wrong, got {pre:?}",
         );
         let pr_guard = pre
             .iter()
-            .find(|e| e["matcher"] == serde_json::Value::String("Bash".into()))
-            .expect("revision task_kind must include a Bash-matcher guard");
+            .find(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("create"))
+            .expect("revision task_kind must include a gh-pr-create guard");
         let guard_cmd = pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
         assert!(
             guard_cmd.contains("block"),
