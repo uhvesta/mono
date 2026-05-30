@@ -1672,8 +1672,10 @@ async fn sweep_pending_pr(
         | StopOutcome::RunningNoStagedPr
         | StopOutcome::FallbackDisabledByFlag
         // `recheck_for_pr` never parks via the breaker (only the on-Stop
-        // path nudges); covered here for exhaustiveness.
+        // path nudges); covered here for exhaustiveness. SignalAlreadyCleared
+        // is also only reachable via on-Stop, not recheck_for_pr.
         | StopOutcome::NudgeBreakerParked { .. }
+        | StopOutcome::SignalAlreadyCleared { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -1719,8 +1721,9 @@ async fn sweep_late_pr(
         | StopOutcome::RunningNoStagedPr
         | StopOutcome::FallbackDisabledByFlag
         // `recheck_for_pr_late` never parks via the breaker; covered for
-        // exhaustiveness.
+        // exhaustiveness. SignalAlreadyCleared is only reachable via on-Stop.
         | StopOutcome::NudgeBreakerParked { .. }
+        | StopOutcome::SignalAlreadyCleared { .. }
         | StopOutcome::DbError => {}
     }
 }
