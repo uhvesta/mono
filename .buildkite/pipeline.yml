@@ -1,18 +1,15 @@
 # Boss/mono Buildkite CI pipeline.
 #
-# Shape:
-#   bootstrap → [bazel-build, mac-app-build, checks] → [bazel-test]
-#
-# Each steps/*.sh script contains all logic; no inline shell here.
-# Queue: linux-amd64 — Default cluster queue for Linux agents.
-# Queue: macos-arm64 — Zakalwe-1 agent for macOS Swift targets.
+# Override queues when testing agents:
+#   BUILDKITE_ANY_QUEUE=agent-test
+#   BUILDKITE_MACOS_QUEUE=macos-test
 
 steps:
   - label: ":boot: bootstrap"
     key: "bootstrap"
     command: ".buildkite/steps/bootstrap.sh"
     agents:
-      queue: "bazel-any"
+      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
       - github_commit_status:
           context: "buildkite/mono/bootstrap"
@@ -24,7 +21,7 @@ steps:
     artifact_paths:
       - "bazel-out/**/extra_action_outputs/**/*"
     agents:
-      queue: "bazel-any"
+      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
       - github_commit_status:
           context: "buildkite/mono/bazel-build"
@@ -34,7 +31,7 @@ steps:
     command: ".buildkite/steps/mac-app-build.sh"
     depends_on: "bootstrap"
     agents:
-      queue: "macos-arm64"
+      queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
     notify:
       - github_commit_status:
           context: "buildkite/mono/mac-app-build"
@@ -44,7 +41,7 @@ steps:
     command: ".buildkite/steps/checks.sh"
     depends_on: "bootstrap"
     agents:
-      queue: "bazel-any"
+      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
       - github_commit_status:
           context: "buildkite/mono/checks"
@@ -59,25 +56,18 @@ steps:
       - "bazel-testlogs/**/test.log"
       - "bazel-testlogs/**/test.xml"
     agents:
-      queue: "bazel-any"
+      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
       - github_commit_status:
           context: "buildkite/mono/bazel-test"
 
-  # Scheduled/manual only: build Boss.app with shake credentials embedded and
-  # publish a GitHub Release tagged boss-v1.0.N.  Fires on hourly cron runs
-  # and on manual triggers (BK UI, API, or `boss release` CLI); skipped on
-  # per-merge webhook builds.  The script itself detects whether Boss-affecting
-  # changes exist since the last tag and exits 0 silently when nothing to do.
-  # Credentials are read from Buildkite's secret store; see:
-  #   tools/boss/docs/buildkite-release-setup.md
   - label: ":rocket: boss-release"
     key: "boss-release"
     if: build.branch == "main" && (build.source == "schedule" || build.source == "ui" || build.source == "api")
     command: ".buildkite/steps/boss-release.sh"
     depends_on: "bazel-test"
     agents:
-      queue: "macos-arm64"
+      queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
     retry:
       automatic: false
     notify:
