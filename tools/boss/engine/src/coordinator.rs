@@ -2747,6 +2747,7 @@ fn work_item_product_id(item: &WorkItem) -> String {
 /// back from JSON. Mirrors `ci_watch::FailedCheckRecord` on the read side;
 /// kept here as a separate owned type so the coordinator doesn't depend
 /// on ci_watch's private serialization shape.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct FailedCheckJson {
     #[allow(dead_code)]
@@ -2763,6 +2764,7 @@ struct FailedCheckJson {
 /// TIMED_OUT > CANCELLED > everything else. Returns `None` when the
 /// JSON is empty / malformed / has no entry with an identifiable
 /// provider job id at all.
+#[cfg(test)]
 fn pick_worst_failing_check(failed_checks_json: &str) -> Option<FailedCheckJson> {
     let parsed: Vec<FailedCheckJson> = serde_json::from_str(failed_checks_json).ok()?;
     if parsed.is_empty() {
