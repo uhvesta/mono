@@ -4,7 +4,19 @@
 <dict>
     <!-- The engine binary is plain Rust with no JIT and no foreign dylibs;
          it needs no additional entitlements beyond the hardened runtime
-         default. This file is a placeholder so release.sh can pass
-         --entitlements consistently for all Mach-Os. -->
+         default. -->
+    <!-- Stable data-protection keychain access group so the engine can store
+         the GitHub OAuth token in the data-protection keychain (same group as
+         the app).  Items stored there use entitlement-based ACLs rather than
+         per-binary ACLs, so a new (re-signed) engine build can access them
+         without triggering a fresh keychain prompt (see app.entitlements for
+         the same rationale applied to ANTHROPIC_API_KEY).  RELEASE ONLY: this
+         is an Apple restricted entitlement that AMFI SIGKILLs on ad-hoc
+         builds; the engine runtime falls back to file storage when the
+         entitlement is absent. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>dev.spinyfin.bossmacapp</string>
+    </array>
 </dict>
 </plist>
