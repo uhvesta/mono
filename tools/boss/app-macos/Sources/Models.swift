@@ -1262,6 +1262,30 @@ struct WorkItemDependency: Hashable {
     let relation: String
 }
 
+/// One execution of a task, mirroring `boss_protocol::WorkExecution`.
+/// Used by the transcript viewer's execution list.
+struct ExecutionVM: Identifiable, Hashable {
+    let id: String
+    let kind: String
+    let status: String
+    let model: String?
+    let runId: String?
+    let startedAt: String?
+    let endedAt: String?
+}
+
+/// Window-open payload for the `"transcript-viewer"` scene. Keyed by
+/// `taskId` only (custom `Hashable`/`Equatable`) so re-invoking "View
+/// transcripts" for the same task focuses the existing window rather
+/// than spawning a second one with a different preselection.
+struct TranscriptViewerRef: Codable, Hashable {
+    var taskId: String
+    var preselectExecutionId: String?
+
+    func hash(into hasher: inout Hasher) { hasher.combine(taskId) }
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.taskId == rhs.taskId }
+}
+
 /// Resolved dependency row used by the card detail Dependencies
 /// subsection. Joins the raw edge against the product's tasks /
 /// chores / projects so the popover can render the prereq's title

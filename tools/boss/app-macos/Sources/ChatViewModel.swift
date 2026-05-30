@@ -65,6 +65,10 @@ final class ChatViewModel: ObservableObject {
     /// Attention items keyed by work-item id (product id for external-tracker
     /// items). Populated on product selection and on every workTree refresh.
     @Published var attentionItemsByWorkItemID: [String: [WorkAttentionItem]] = [:]
+    /// Historical execution rows keyed by task id. Populated on demand when
+    /// the transcript viewer window sends `list_executions`. Cleared per-task
+    /// before each fresh fetch so the viewer never shows stale rows.
+    @Published var executionsByTaskID: [String: [ExecutionVM]] = [:]
     @Published var selectedWorkProductID: String? {
         didSet { invalidateWorkCache() }
     }
@@ -396,6 +400,15 @@ final class ChatViewModel: ObservableObject {
     /// `ReviewTerminalView.onDisappear` handler.
     func releaseReviewTerminal(leaseID: String) {
         engine.sendReleaseReviewTerminal(leaseID: leaseID)
+    }
+
+    /// Fetch the execution history for `taskId` from the engine.
+    /// Clears any cached rows first so the viewer shows a loading state.
+    /// The engine replies with an `executions_list` event that populates
+    /// [[executionsByTaskID]].
+    func loadExecutions(taskId: String) {
+        executionsByTaskID[taskId] = nil
+        engine.sendListExecutions(taskId: taskId)
     }
 
     /// Toggle the live-status summarizer for `slotId`. Sends the
@@ -1941,6 +1954,8 @@ final class ChatViewModel: ObservableObject {
             // as the reply to a `git_hub_auth_*` request). The settings
             // subsection observes `gitHubAuthState` and re-renders.
             gitHubAuthState = state
+        case .executionsList(let taskId, let executions):
+            executionsByTaskID[taskId] = executions
         }
     }
 

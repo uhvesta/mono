@@ -103,6 +103,19 @@ struct BossMacApp: App {
         // to a live Ghostty surface once the engine finishes leasing the
         // workspace and checking out the PR branch (async-markdown-viewer
         // pattern).
+        // Transcript viewer: shows all historical executions for one task
+        // on the left and the selected execution's transcript on the right.
+        // Keyed by TranscriptViewerRef (Hashable on taskId only) so
+        // re-invoking "View transcripts" for the same task focuses the
+        // existing window instead of spawning a duplicate.
+        WindowGroup("Transcripts", id: "transcript-viewer", for: TranscriptViewerRef.self) { $ref in
+            if let ref {
+                TranscriptViewerView(ref: ref)
+                    .environmentObject(chatModel)
+            }
+        }
+        .defaultSize(width: 900, height: 640)
+
         Window("Review Terminal", id: "review-terminal") {
             ReviewTerminalView()
         }
