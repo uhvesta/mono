@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
-    AddDependencyInput, Attention, AttentionGroup, CiBudgetSnapshot, CiRemediation,
-    CommentAnchor, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
-    CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
+    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
+    CiBudgetSnapshot, CiRemediation, CommentAnchor, ConflictResolution, CreateAttentionInput,
+    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
+    CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
     EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
@@ -1034,6 +1035,52 @@ pub enum FrontendRequest {
     ExecutionTranscript {
         execution_id: String,
     },
+
+    // --- Automations CRUD (maintenance-tasks.md T2) ---
+    /// Create a new automation for a product. Replies with
+    /// [`FrontendEvent::AutomationCreated`] on success.
+    CreateAutomation {
+        #[serde(flatten)]
+        input: CreateAutomationInput,
+    },
+    /// List all automations for a product, ordered `created_at ASC`.
+    /// Replies with [`FrontendEvent::AutomationsList`].
+    ListAutomations {
+        product_id: String,
+    },
+    /// Fetch a single automation by its canonical `auto_…` id.
+    /// Replies with [`FrontendEvent::AutomationResult`] or
+    /// [`FrontendEvent::WorkError`] when not found.
+    GetAutomation {
+        id: String,
+    },
+    /// Apply an `AutomationPatch` to an automation. `None` fields are
+    /// left unchanged. Replies with [`FrontendEvent::AutomationUpdated`].
+    UpdateAutomation {
+        id: String,
+        patch: AutomationPatch,
+    },
+    /// Set `enabled = true` on an automation. Idempotent.
+    /// Replies with [`FrontendEvent::AutomationUpdated`].
+    EnableAutomation {
+        id: String,
+    },
+    /// Set `enabled = false` on an automation. Idempotent.
+    /// Replies with [`FrontendEvent::AutomationUpdated`].
+    DisableAutomation {
+        id: String,
+    },
+    /// Permanently delete an automation and its run history.
+    /// Replies with [`FrontendEvent::AutomationDeleted`].
+    DeleteAutomation {
+        id: String,
+    },
+    /// Return the count of open tasks produced by an automation.
+    /// "Open" = `status IN (todo, ready, doing, in_review, blocked)`.
+    /// Replies with [`FrontendEvent::AutomationOpenTaskCount`].
+    GetAutomationOpenTaskCount {
+        automation_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1797,6 +1844,41 @@ pub enum FrontendEvent {
         work_item_id: String,
         pr_url: String,
         action: String,
+    },
+
+    // --- Automation replies (maintenance-tasks.md T2) ---
+    /// Response to [`FrontendRequest::CreateAutomation`].
+    AutomationCreated {
+        automation: Automation,
+    },
+    /// Response to [`FrontendRequest::ListAutomations`].
+    AutomationsList {
+        product_id: String,
+        automations: Vec<Automation>,
+    },
+    /// Response to [`FrontendRequest::GetAutomation`].
+    AutomationResult {
+        automation: Automation,
+    },
+    /// Response to [`FrontendRequest::UpdateAutomation`],
+    /// [`FrontendRequest::EnableAutomation`], or
+    /// [`FrontendRequest::DisableAutomation`].
+    AutomationUpdated {
+        automation: Automation,
+    },
+    /// Response to [`FrontendRequest::DeleteAutomation`].
+    AutomationDeleted {
+        automation_id: String,
+    },
+    /// Response to [`FrontendRequest::GetAutomationOpenTaskCount`].
+    AutomationOpenTaskCount {
+        automation_id: String,
+        count: i64,
+    },
+    /// Snapshot of an `automation_runs` row. Used to surface individual
+    /// run records over the wire (e.g. for future CLI `boss automation runs`).
+    AutomationRunResult {
+        run: AutomationRun,
     },
 }
 

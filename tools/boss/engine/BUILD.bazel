@@ -66,6 +66,7 @@ rust_library(
         "src/transient_recovery.rs",
         "src/work.rs",
         "src/work/audit_misc.rs",
+        "src/work/automations.rs",
         "src/work/blocking.rs",
         "src/work/chain_helpers.rs",
         "src/work/comments.rs",

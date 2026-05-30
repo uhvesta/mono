@@ -7972,6 +7972,151 @@ async fn handle_frontend_connection(
                     },
                 ),
             },
+
+            // --- Automation CRUD (maintenance-tasks.md T2) ---
+            FrontendRequest::CreateAutomation { input } => {
+                match work_db.create_automation(input) {
+                    Ok(automation) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::AutomationCreated { automation },
+                        );
+                    }
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::ListAutomations { product_id } => {
+                match work_db.list_automations(&product_id) {
+                    Ok(automations) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationsList {
+                            product_id,
+                            automations,
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::GetAutomation { id } => {
+                match work_db.get_automation(&id) {
+                    Ok(Some(automation)) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationResult { automation },
+                    ),
+                    Ok(None) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!("unknown automation: {id}"),
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::UpdateAutomation { id, patch } => {
+                match work_db.update_automation(&id, patch) {
+                    Ok(automation) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationUpdated { automation },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::EnableAutomation { id } => {
+                match work_db.enable_automation(&id) {
+                    Ok(automation) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationUpdated { automation },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::DisableAutomation { id } => {
+                match work_db.disable_automation(&id) {
+                    Ok(automation) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationUpdated { automation },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::DeleteAutomation { id } => {
+                match work_db.delete_automation(&id) {
+                    Ok(()) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationDeleted { automation_id: id },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
+            FrontendRequest::GetAutomationOpenTaskCount { automation_id } => {
+                match work_db.count_open_tasks_for_automation(&automation_id) {
+                    Ok(count) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AutomationOpenTaskCount {
+                            automation_id,
+                            count,
+                        },
+                    ),
+                    Err(err) => send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    ),
+                }
+            }
         }
     }
 

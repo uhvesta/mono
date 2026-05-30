@@ -103,3 +103,357 @@ fn find_by_pr_returns_multiple_when_number_shared_across_repos() {
     let matches = db.find_work_items_by_pr(500).unwrap();
     assert_eq!(matches.len(), 2, "same number in two repos => two owners");
 }
+
+// ── automation CRUD ──────────────────────────────────────────────────────────
+
+fn make_schedule_trigger() -> AutomationTrigger {
+    AutomationTrigger::Schedule {
+        cron: "0 14 * * 1-5".to_owned(),
+        timezone: "America/Los_Angeles".to_owned(),
+    }
+}
+
+fn make_product(db: &WorkDb) -> Product {
+    db.create_product(CreateProductInput {
+        name: "Automation Test Co".to_owned(),
+        description: None,
+        repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+        design_repo: None,
+        docs_repo: None,
+        worker_branch_prefix: None,
+    })
+    .unwrap()
+}
+
+#[test]
+fn create_automation_round_trips() {
+    let db = WorkDb::open(temp_db_path("auto-create")).unwrap();
+    let product = make_product(&db);
+
+    let input = CreateAutomationInput {
+        product_id: product.id.clone(),
+        name: "Fix clippy".to_owned(),
+        repo_remote_url: None,
+        trigger: make_schedule_trigger(),
+        standing_instruction: "Fix any new clippy warnings.".to_owned(),
+        open_task_limit: 1,
+        catch_up_window_secs: None,
+        enabled: true,
+        created_via: Some("cli".to_owned()),
+    };
+
+    let auto = db.create_automation(input).unwrap();
+
+    assert!(auto.id.starts_with("auto_"));
+    assert_eq!(auto.product_id, product.id);
+    assert_eq!(auto.name, "Fix clippy");
+    assert_eq!(auto.open_task_limit, 1);
+    assert!(auto.enabled);
+    assert_eq!(auto.created_via, "cli");
+    assert_eq!(auto.short_id, Some(1));
+    assert!(auto.last_fired_at.is_none());
+    assert!(auto.next_due_at.is_none());
+
+    match &auto.trigger {
+        AutomationTrigger::Schedule { cron, timezone } => {
+            assert_eq!(cron, "0 14 * * 1-5");
+            assert_eq!(timezone, "America/Los_Angeles");
+        }
+    }
+}
+
+#[test]
+fn list_automations_returns_empty_for_new_product() {
+    let db = WorkDb::open(temp_db_path("auto-list-empty")).unwrap();
+    let product = make_product(&db);
+
+    let list = db.list_automations(&product.id).unwrap();
+    assert!(list.is_empty());
+}
+
+#[test]
+fn list_automations_returns_all_for_product() {
+    let db = WorkDb::open(temp_db_path("auto-list")).unwrap();
+    let product = make_product(&db);
+
+    let a1 = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "A one".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "inst1".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    let _a2 = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "A two".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "inst2".to_owned(),
+            open_task_limit: 2,
+            catch_up_window_secs: Some(900),
+            enabled: false,
+            created_via: None,
+        })
+        .unwrap();
+
+    let list = db.list_automations(&product.id).unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].id, a1.id);
+    assert_eq!(list[0].short_id, Some(1));
+    assert_eq!(list[1].short_id, Some(2));
+    assert_eq!(list[1].open_task_limit, 2);
+    assert!(!list[1].enabled);
+    assert_eq!(list[1].catch_up_window_secs, Some(900));
+}
+
+#[test]
+fn get_automation_returns_none_for_unknown_id() {
+    let db = WorkDb::open(temp_db_path("auto-get-none")).unwrap();
+    let result = db.get_automation("auto_unknown_000").unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn get_automation_returns_row_by_id() {
+    let db = WorkDb::open(temp_db_path("auto-get")).unwrap();
+    let product = make_product(&db);
+
+    let created = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Bump deps".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "Bump clean deps.".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    let fetched = db.get_automation(&created.id).unwrap().unwrap();
+    assert_eq!(fetched.id, created.id);
+    assert_eq!(fetched.name, "Bump deps");
+}
+
+#[test]
+fn update_automation_applies_patch() {
+    let db = WorkDb::open(temp_db_path("auto-update")).unwrap();
+    let product = make_product(&db);
+
+    let auto = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Original name".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "original".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    let updated = db
+        .update_automation(
+            &auto.id,
+            AutomationPatch {
+                name: Some("New name".to_owned()),
+                open_task_limit: Some(3),
+                enabled: Some(false),
+                ..AutomationPatch::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(updated.name, "New name");
+    assert_eq!(updated.open_task_limit, 3);
+    assert!(!updated.enabled);
+    assert_eq!(updated.standing_instruction, "original");
+}
+
+#[test]
+fn enable_disable_automation() {
+    let db = WorkDb::open(temp_db_path("auto-enable-disable")).unwrap();
+    let product = make_product(&db);
+
+    let auto = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Toggle me".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "inst".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    let disabled = db.disable_automation(&auto.id).unwrap();
+    assert!(!disabled.enabled);
+
+    let enabled = db.enable_automation(&auto.id).unwrap();
+    assert!(enabled.enabled);
+}
+
+#[test]
+fn delete_automation_removes_row() {
+    let db = WorkDb::open(temp_db_path("auto-delete")).unwrap();
+    let product = make_product(&db);
+
+    let auto = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "To be deleted".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "delete me".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    db.delete_automation(&auto.id).unwrap();
+
+    let fetched = db.get_automation(&auto.id).unwrap();
+    assert!(fetched.is_none());
+
+    let list = db.list_automations(&product.id).unwrap();
+    assert!(list.is_empty());
+}
+
+#[test]
+fn count_open_tasks_for_automation_zero_when_none() {
+    let db = WorkDb::open(temp_db_path("auto-count-zero")).unwrap();
+    let product = make_product(&db);
+
+    let auto = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Counter".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "count tasks".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    let count = db.count_open_tasks_for_automation(&auto.id).unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn count_open_tasks_counts_only_open_statuses() {
+    let db = WorkDb::open(temp_db_path("auto-count-open")).unwrap();
+    let product = make_product(&db);
+
+    let auto = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Count test".to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "test".to_owned(),
+            open_task_limit: 5,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    // Create a task and stamp source_automation_id directly (bypassing the
+    // not-yet-built create_task --automation flow for this unit test).
+    let task = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "chore from automation".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+
+    // Stamp the source_automation_id.
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+        rusqlite::params![auto.id, task.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Task is in 'todo' → counts as open.
+    assert_eq!(db.count_open_tasks_for_automation(&auto.id).unwrap(), 1);
+
+    // Move task to 'done' → no longer open.
+    db.update_work_item(
+        &task.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.count_open_tasks_for_automation(&auto.id).unwrap(), 0);
+}
+
+#[test]
+fn short_ids_are_allocated_per_product() {
+    let db = WorkDb::open(temp_db_path("auto-short-ids")).unwrap();
+    let p1 = make_product(&db);
+    let p2 = db
+        .create_product(CreateProductInput {
+            name: "Second Product".to_owned(),
+            description: None,
+            repo_remote_url: None,
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+
+    let make = |db: &WorkDb, product_id: &str, name: &str| {
+        db.create_automation(CreateAutomationInput {
+            product_id: product_id.to_owned(),
+            name: name.to_owned(),
+            repo_remote_url: None,
+            trigger: make_schedule_trigger(),
+            standing_instruction: "test".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap()
+    };
+
+    let a1p1 = make(&db, &p1.id, "P1 A1");
+    let a2p1 = make(&db, &p1.id, "P1 A2");
+    let a1p2 = make(&db, &p2.id, "P2 A1");
+
+    assert_eq!(a1p1.short_id, Some(1));
+    assert_eq!(a2p1.short_id, Some(2));
+    assert_eq!(a1p2.short_id, Some(1));
+}

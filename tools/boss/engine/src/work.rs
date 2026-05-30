@@ -161,6 +161,7 @@ impl Clone for WorkDb {
 
 // ---- module tree (see PR description for the split rationale) ----
 mod audit_misc;
+mod automations;
 mod blocking;
 mod chain_helpers;
 mod comments;
