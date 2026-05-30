@@ -351,7 +351,10 @@ final class GhosttyRuntime: @unchecked Sendable {
             }
 
         case .childExited(let exitCode):
-            resolved.host?.session.statusMessage = "Command exited (\(exitCode))"
+            // Suppress for sessions that handle their own restart (boss pane).
+            if resolved.host?.session.onChildExited == nil {
+                resolved.host?.session.statusMessage = "Command exited (\(exitCode))"
+            }
 
         case .ignored:
             break
@@ -403,7 +406,13 @@ final class GhosttyRuntime: @unchecked Sendable {
         guard let host = hostView(from: userdata) else { return }
         OperationQueue.main.addOperation {
             MainActor.assumeIsolated {
-                host.session.statusMessage = processAlive ? "Surface requested close" : "Surface closed"
+                if !processAlive, let onExit = host.session.onChildExited {
+                    // Boss pane: delegate to the restart callback instead of
+                    // showing a bare "Surface closed" message.
+                    onExit()
+                } else {
+                    host.session.statusMessage = processAlive ? "Surface requested close" : "Surface closed"
+                }
             }
         }
     }

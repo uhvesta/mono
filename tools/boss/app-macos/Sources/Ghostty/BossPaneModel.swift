@@ -49,7 +49,11 @@ final class BossPaneModel: ObservableObject {
             // custom vars), so we can re-prepend it via initialInput which runs
             // after init completes. The guard is a no-op in dev / bazel-run mode
             // where bossSessionEnv() returns [] and BOSS_BIN_DIR is unset.
-            initialInput: "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; \(bossPaneClaudeInvocation)\n",
+            // `exec` replaces the shell with claude so there is no shell
+            // process to fall back into when claude exits. A single Ctrl-C
+            // is handled by Claude Code itself (interrupt-current-turn) rather
+            // than by the shell (which would leave the user at a bare prompt).
+            initialInput: "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; exec \(bossPaneClaudeInvocation)\n",
             env: env
         )
         self.session = TerminalPaneSession(
@@ -57,6 +61,17 @@ final class BossPaneModel: ObservableObject {
             role: .boss,
             launchSpec: launchSpec
         )
+        // Restart the surface when claude exits so the coordinator is always
+        // running. The 1.5 s delay lets the "Picard restarting…" message be
+        // readable before the new surface blanks the screen.
+        self.session.onChildExited = { [weak self] in
+            guard let self else { return }
+            self.session.statusMessage = "Picard restarting…"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self else { return }
+                self.session.hostView?.restartSurface()
+            }
+        }
     }
 
     /// Env layered onto the Boss-session shell so `boss` / `bossctl`

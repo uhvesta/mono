@@ -434,6 +434,23 @@ final class GhosttyTerminalHostView: NSView {
         }
     }
 
+    /// Tear down and recreate the libghostty surface, restarting the
+    /// child process from the original launchSpec. Called by the Boss
+    /// pane's restart closure when Claude Code exits unexpectedly so
+    /// the coordinator relaunches without dropping the user to a shell.
+    func restartSurface() {
+        tearDown()
+        attemptSurfaceCreation()
+        // Re-apply focus so the restarted pane receives keyboard input
+        // immediately if it already owns first-responder status.
+        if let surface, window?.firstResponder === self {
+            let box = SurfaceBox(surface: surface)
+            Self.focusQueue.async {
+                ghostty_surface_set_focus(box.surface, true)
+            }
+        }
+    }
+
     override var acceptsFirstResponder: Bool { true }
 
     override func becomeFirstResponder() -> Bool {

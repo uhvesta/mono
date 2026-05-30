@@ -160,6 +160,9 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
 
     weak var hostView: GhosttyTerminalHostView?
     private var claudeMonitorTracker = ClaudeMonitorTracker()
+    /// Called on the main actor when the pane's child process exits.
+    /// Boss pane sets this to a restart closure; worker panes leave it nil.
+    var onChildExited: (() -> Void)?
 
     init(id: String, role: PaneRole, launchSpec: TerminalLaunchSpec) {
         self.id = id
