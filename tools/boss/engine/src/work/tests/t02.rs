@@ -2290,3 +2290,127 @@ fn migrate_backfill_autostart_consumed_clears_non_todo_rows() {
 
     let _ = std::fs::remove_file(path);
 }
+
+// ── stale-lease reclaim for UI-crash resume (issue #962) ──────────
+
+/// Helper: create a product + chore and a single ready execution under
+/// it, returning the execution id. Mirrors the in-flight setup the
+/// other t02 reconcile tests use.
+fn make_chore_execution_962(db: &WorkDb, label: &str) -> String {
+    let product = db
+        .create_product(CreateProductInput {
+            name: format!("Prod-{label}"),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: format!("Chore-{label}"),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    db.create_execution(CreateExecutionInput {
+        work_item_id: chore.id.clone(),
+        kind: "chore_implementation".to_owned(),
+        status: Some("ready".to_owned()),
+        repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+        cube_repo_id: None,
+        cube_lease_id: None,
+        cube_workspace_id: None,
+        workspace_path: None,
+        priority: None,
+        preferred_workspace_id: None,
+        started_at: None,
+        finished_at: None,
+        prefer_is_soft: false,
+        pr_url: None,
+    })
+    .unwrap()
+    .id
+}
+
+/// The mono-agent-003 scenario: a worker started a run, the app
+/// crashed, and the startup reaper marked the execution `orphaned`
+/// while preserving its lease columns. Cube still reports the
+/// workspace `leased` to that dead lease. The reclaim helper must
+/// surface that lease id so the dispatcher can force-release it before
+/// the resume re-leases the same workspace.
+#[test]
+fn stale_lease_reclaim_returns_lease_of_orphaned_owner() {
+    let db = WorkDb::open(temp_db_path("reclaim-orphaned")).unwrap();
+    let exec_id = make_chore_execution_962(&db, "reclaim-orphaned");
+    db.start_execution_run(&exec_id, "agent-1", "repo-1", "lease-dead", "ws-1", "/ws/ws-1")
+        .unwrap();
+    db.mark_execution_orphaned(&exec_id, "ui crash").unwrap();
+
+    let reclaim = db
+        .stale_lease_to_reclaim_for_workspace("ws-1", "lease-dead")
+        .unwrap();
+    assert_eq!(
+        reclaim.as_deref(),
+        Some("lease-dead"),
+        "orphaned owner's lease should be reclaimable"
+    );
+}
+
+/// Safety: never reclaim a lease while a live (`running`) execution
+/// still claims the workspace — that lease is genuinely in use.
+#[test]
+fn stale_lease_reclaim_skips_when_live_execution_claims_workspace() {
+    let db = WorkDb::open(temp_db_path("reclaim-live")).unwrap();
+    let exec_id = make_chore_execution_962(&db, "reclaim-live");
+    db.start_execution_run(&exec_id, "agent-1", "repo-1", "lease-live", "ws-1", "/ws/ws-1")
+        .unwrap();
+    // Execution is still `running` — its lease must not be reclaimed.
+    let reclaim = db
+        .stale_lease_to_reclaim_for_workspace("ws-1", "lease-live")
+        .unwrap();
+    assert_eq!(
+        reclaim, None,
+        "a live execution's lease must never be reclaimed"
+    );
+}
+
+/// Safety: never reclaim when cube's current lease id does not match
+/// the lease the engine recorded for the terminal execution — the slot
+/// has since been taken by an unrelated lease the engine doesn't own.
+#[test]
+fn stale_lease_reclaim_skips_when_lease_id_does_not_match() {
+    let db = WorkDb::open(temp_db_path("reclaim-mismatch")).unwrap();
+    let exec_id = make_chore_execution_962(&db, "reclaim-mismatch");
+    db.start_execution_run(&exec_id, "agent-1", "repo-1", "lease-old", "ws-1", "/ws/ws-1")
+        .unwrap();
+    db.mark_execution_orphaned(&exec_id, "ui crash").unwrap();
+
+    // Cube now reports a *different* lease holding the workspace.
+    let reclaim = db
+        .stale_lease_to_reclaim_for_workspace("ws-1", "lease-new")
+        .unwrap();
+    assert_eq!(
+        reclaim, None,
+        "only the dead execution's own recorded lease is eligible for reclaim"
+    );
+}
+
+/// A workspace the engine has no terminal record for must not be
+/// reclaimed (defensive default — never force-release an unknown lease).
+#[test]
+fn stale_lease_reclaim_skips_unknown_workspace() {
+    let db = WorkDb::open(temp_db_path("reclaim-unknown")).unwrap();
+    let reclaim = db
+        .stale_lease_to_reclaim_for_workspace("ws-nonexistent", "lease-x")
+        .unwrap();
+    assert_eq!(reclaim, None);
+}
