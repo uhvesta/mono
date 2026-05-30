@@ -354,6 +354,11 @@ struct ServerState {
     /// pane-titlebar summarizer continues to resolve the key
     /// per-spawn via `cfg.agent()`.
     anthropic_api_key: Option<String>,
+    /// Shared verdict from the `syspolicyd` CPU monitor. The sampler loop
+    /// (spawned in `serve`) writes it; [`build_engine_health_report`]
+    /// reads it to raise a banner when the daemon wedges and stalls all
+    /// builds. See [`crate::syspolicyd_monitor`].
+    syspolicyd_health: Arc<crate::syspolicyd_monitor::SyspolicydHealth>,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
     /// Pid of the process the engine trusts as the macOS app — must
@@ -876,6 +881,9 @@ impl ServerState {
                 ),
                 staged_pr_urls,
                 anthropic_api_key,
+                syspolicyd_health: Arc::new(
+                    crate::syspolicyd_monitor::SyspolicydHealth::new(),
+                ),
                 next_session_id: AtomicU64::new(1),
                 work_revision,
                 app_pid: StdMutex::new(app_pid),
@@ -2633,6 +2641,21 @@ pub async fn serve(
         server_state.dispatch_events.clone(),
         Duration::from_secs(60),
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
+    );
+
+    // Periodic syspolicyd CPU monitor: detects when macOS's `syspolicyd`
+    // daemon wedges in a ~100% CPU spin. While it is stuck it stops
+    // servicing code-signing assessments, so every `dlopen` of a
+    // signature-checked dylib blocks and ALL Bazel servers hang at JVM
+    // startup — a silent, machine-wide build outage that looks like
+    // "Bazel is broken" (issue #965). The monitor flips a shared flag
+    // once saturation is sustained; `build_engine_health_report` reads it
+    // to raise a banner naming the cause and the `sudo kill -9 <pid>`
+    // remedy. Detection only — the engine cannot safely kill the daemon
+    // unattended (SIP blocks `launchctl kickstart`).
+    let _syspolicyd_monitor_handle = crate::syspolicyd_monitor::spawn_loop(
+        server_state.syspolicyd_health.clone(),
+        crate::syspolicyd_monitor::DEFAULT_SAMPLE_INTERVAL,
     );
 
     // Periodic transient-recovery reconciler: detects workers wedged by
@@ -7974,6 +7997,41 @@ fn build_engine_health_report(server_state: &Arc<ServerState>) -> boss_protocol:
                    variable in your shell startup file, then quit and \
                    relaunch Boss to pick it up."
                 .to_owned(),
+        });
+    }
+
+    // macOS `syspolicyd` wedge: when the code-signing daemon is pinned at
+    // ~100% CPU it stalls every build machine-wide. Surface it as an
+    // error with the recovery steps so the operator doesn't waste time
+    // expunging Bazel caches (which won't help). See
+    // [`crate::syspolicyd_monitor`].
+    let syspolicyd = server_state.syspolicyd_health.snapshot();
+    if syspolicyd.wedged {
+        let pid_str = syspolicyd
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "<pid>".to_owned());
+        issues.push(EngineHealthIssue {
+            kind: "syspolicyd_wedged".to_owned(),
+            severity: "error".to_owned(),
+            title: "macOS syspolicyd is wedged — all builds are stalled".to_owned(),
+            body: format!(
+                "syspolicyd (pid {pid_str}) is pinned at ~{cpu:.0}% CPU and has stopped \
+                 servicing code-signing assessments. While it's stuck, every dlopen of a \
+                 signature-checked library blocks, so all Bazel servers hang at JVM startup \
+                 (\"Starting local Bazel server… still trying to connect\", then exit 37 \
+                 \"Server crashed during startup\") and every build on this machine stalls.\n\
+                 \n\
+                 This is a macOS fault, not a Boss bug — Boss's workload (rapidly launching \
+                 freshly-built, ad-hoc-signed binaries) reliably triggers it. Killing or \
+                 expunging Bazel will NOT help, because the bottleneck is the system daemon.\n\
+                 \n\
+                 Remedy: run `sudo kill -9 {pid_str}` — launchd will relaunch a fresh \
+                 syspolicyd (SIP blocks `launchctl kickstart` of it). A reboot is the \
+                 fallback. Note: Bazel servers already blocked in the kernel do NOT recover \
+                 when syspolicyd restarts — kill those hung servers individually.",
+                cpu = syspolicyd.cpu_pct,
+            ),
         });
     }
 

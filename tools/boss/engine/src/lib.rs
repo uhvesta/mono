@@ -48,6 +48,7 @@ pub mod settings;
 pub mod spawn_flow;
 pub mod ssh_transport;
 pub mod stale_worker_sweep;
+pub mod syspolicyd_monitor;
 pub mod transcript_tail;
 pub mod transient_error;
 pub mod transient_recovery;
