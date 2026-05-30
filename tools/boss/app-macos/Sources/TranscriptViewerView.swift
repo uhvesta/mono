@@ -161,6 +161,14 @@ struct TranscriptViewerView: View {
                     onRefresh: { chatModel.refreshTranscript(executionId: execId) }
                 )
                 .navigationTitle(transcriptTitle(for: execId))
+                .task(id: doc.isLive) {
+                    guard doc.isLive else { return }
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(5))
+                        guard !Task.isCancelled else { return }
+                        chatModel.refreshTranscript(executionId: execId)
+                    }
+                }
             case .unavailable(let reason):
                 ContentUnavailableView {
                     Label("Transcript Unavailable", systemImage: "doc.questionmark")
