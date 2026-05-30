@@ -230,6 +230,19 @@ enum EngineEvent {
     /// Response to `list_executions` — all historical execution rows for
     /// one task, newest-first. Drives the transcript viewer's left pane.
     case executionsList(taskId: String, executions: [ExecutionVM])
+    /// Reply to `execution_transcript` — the rendered, lazily-displayable
+    /// segments for one execution plus live/complete flags. Drives the
+    /// transcript viewer's right pane (transcript-viewer.md task 4).
+    case executionTranscriptResult(
+        executionId: String,
+        segments: [TranscriptSegmentVM],
+        isLive: Bool,
+        complete: Bool
+    )
+    /// Reply to `execution_transcript` when the transcript file is absent
+    /// (rotated, GC'd, or never recorded). `reason` is human-readable and
+    /// surfaced as a "transcript unavailable" state, never an error.
+    case executionTranscriptUnavailable(executionId: String, reason: String)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -603,11 +616,28 @@ final class EngineClient: @unchecked Sendable {
     }
 
     /// Ask the engine for all historical executions of `taskId`, newest-first.
-    /// The engine replies with `executions_list`.
+    /// The engine replies with `executions_list`. The wire field is
+    /// `work_item_id` — the engine's `ListExecutions` request and
+    /// `ExecutionsList` reply both key on it (a task id *is* a work-item
+    /// id); sending `task_id` here previously left the filter unset, so the
+    /// engine returned every task's executions and the reply (also keyed on
+    /// `work_item_id`) was dropped, leaving the viewer's left pane spinning.
     func sendListExecutions(taskId: String) {
         sendLine([
             "type": "list_executions",
-            "task_id": taskId,
+            "work_item_id": taskId,
+        ])
+    }
+
+    /// Ask the engine for the rendered transcript of one execution. The
+    /// engine resolves the durable `work_executions` row (stable, even for
+    /// finished/historical runs), reads the JSONL, and replies with
+    /// `execution_transcript_result` (segments + live/complete flags) or
+    /// `execution_transcript_unavailable` when the file is gone.
+    func sendExecutionTranscript(executionId: String) {
+        sendLine([
+            "type": "execution_transcript",
+            "execution_id": executionId,
         ])
     }
 
@@ -1264,11 +1294,37 @@ final class EngineClient: @unchecked Sendable {
                 }
                 emit(.gitHubAuthState(state: state))
             case "executions_list":
-                let taskId = payload["task_id"] as? String ?? ""
+                // Wire field is `work_item_id` (the engine's ExecutionsList
+                // reply keys on it); the task id and work-item id are the
+                // same value for a task.
+                let taskId = payload["work_item_id"] as? String ?? ""
                 let raw = payload["executions"] as? [[String: Any]] ?? []
                 let executions = raw.compactMap(parseExecutionVM)
                 if !taskId.isEmpty {
                     emit(.executionsList(taskId: taskId, executions: executions))
+                }
+            case "execution_transcript_result":
+                let executionId = payload["execution_id"] as? String ?? ""
+                let raw = payload["segments"] as? [[String: Any]] ?? []
+                let segments = raw.compactMap(parseTranscriptSegment)
+                let isLive = (payload["is_live"] as? NSNumber)?.boolValue ?? false
+                let complete = (payload["complete"] as? NSNumber)?.boolValue ?? !isLive
+                if !executionId.isEmpty {
+                    emit(.executionTranscriptResult(
+                        executionId: executionId,
+                        segments: segments,
+                        isLive: isLive,
+                        complete: complete
+                    ))
+                }
+            case "execution_transcript_unavailable":
+                let executionId = payload["execution_id"] as? String ?? ""
+                let reason = payload["reason"] as? String ?? "Transcript unavailable."
+                if !executionId.isEmpty {
+                    emit(.executionTranscriptUnavailable(
+                        executionId: executionId,
+                        reason: reason
+                    ))
                 }
             default:
                 break
@@ -1694,5 +1750,17 @@ final class EngineClient: @unchecked Sendable {
             startedAt: payload["started_at"] as? String,
             endedAt: payload["ended_at"] as? String
         )
+    }
+
+    /// Decode one wire `TranscriptSegment`. The segment shape is uniform
+    /// and snake_cased, so we re-serialize the dict and let `Codable` do
+    /// the field mapping (same approach as `parseAttentionItem`).
+    private func parseTranscriptSegment(_ payload: [String: Any]) -> TranscriptSegmentVM? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let seg = try? JSONDecoder().decode(TranscriptSegmentVM.self, from: data)
+        else {
+            return nil
+        }
+        return seg
     }
 }

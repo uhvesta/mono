@@ -69,6 +69,11 @@ final class ChatViewModel: ObservableObject {
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
     @Published var executionsByTaskID: [String: [ExecutionVM]] = [:]
+    /// Transcript load state keyed by execution id. Populated on demand when
+    /// the transcript viewer selects an execution (`execution_transcript`
+    /// RPC). A `nil` (absent) entry means "not requested yet"; live
+    /// executions can be re-fetched via [[refreshTranscript(executionId:)]].
+    @Published var transcriptsByExecutionID: [String: TranscriptLoadState] = [:]
     @Published var selectedWorkProductID: String? {
         didSet { invalidateWorkCache() }
     }
@@ -409,6 +414,24 @@ final class ChatViewModel: ObservableObject {
     func loadExecutions(taskId: String) {
         executionsByTaskID[taskId] = nil
         engine.sendListExecutions(taskId: taskId)
+    }
+
+    /// Fetch the rendered transcript for `executionId` the first time it is
+    /// requested. Selecting an execution in the viewer calls this; an
+    /// already-loaded, in-flight, or unavailable transcript is left
+    /// untouched so re-selecting a row doesn't re-hit the engine. Use
+    /// [[refreshTranscript(executionId:)]] to force a re-fetch.
+    func loadTranscript(executionId: String) {
+        if transcriptsByExecutionID[executionId] != nil { return }
+        transcriptsByExecutionID[executionId] = .loading
+        engine.sendExecutionTranscript(executionId: executionId)
+    }
+
+    /// Force a re-fetch of `executionId`'s transcript — the "Refresh"
+    /// affordance on a still-running (live) execution.
+    func refreshTranscript(executionId: String) {
+        transcriptsByExecutionID[executionId] = .loading
+        engine.sendExecutionTranscript(executionId: executionId)
     }
 
     /// Toggle the live-status summarizer for `slotId`. Sends the
@@ -1964,6 +1987,17 @@ final class ChatViewModel: ObservableObject {
             gitHubAuthState = state
         case .executionsList(let taskId, let executions):
             executionsByTaskID[taskId] = executions
+        case .executionTranscriptResult(let executionId, let segments, let isLive, let complete):
+            transcriptsByExecutionID[executionId] = .loaded(
+                TranscriptDoc(
+                    executionId: executionId,
+                    segments: segments,
+                    isLive: isLive,
+                    complete: complete
+                )
+            )
+        case .executionTranscriptUnavailable(let executionId, let reason):
+            transcriptsByExecutionID[executionId] = .unavailable(reason: reason)
         }
     }
 

@@ -105,12 +105,18 @@ struct TranscriptViewerView: View {
             executionList
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
         } detail: {
-            transcriptPlaceholder
+            transcriptDetail
         }
         .onAppear {
             chatModel.loadExecutions(taskId: ref.taskId)
             if let preselect = ref.preselectExecutionId {
                 selectedExecutionId = preselect
+                chatModel.loadTranscript(executionId: preselect)
+            }
+        }
+        .onChange(of: selectedExecutionId) { _, newValue in
+            if let execId = newValue {
+                chatModel.loadTranscript(executionId: execId)
             }
         }
         .navigationTitle("Transcripts")
@@ -143,22 +149,32 @@ struct TranscriptViewerView: View {
         .navigationTitle("Executions")
     }
 
-    // MARK: Right pane — transcript placeholder
+    // MARK: Right pane — transcript
 
     @ViewBuilder
-    private var transcriptPlaceholder: some View {
-        if let execId = selectedExecutionId,
-           let exec = executions.first(where: { $0.id == execId }) {
-            VStack(spacing: 12) {
-                Image(systemName: "text.bubble")
-                    .font(.system(size: 48))
-                    .foregroundStyle(.secondary)
-                Text("Transcript for \(exec.kind.replacingOccurrences(of: "_", with: " ").capitalized)")
-                    .font(.title2)
-                Text("The transcript renderer will be available in a future update.")
-                    .foregroundStyle(.secondary)
+    private var transcriptDetail: some View {
+        if let execId = selectedExecutionId {
+            switch chatModel.transcriptsByExecutionID[execId] {
+            case .loaded(let doc):
+                TranscriptView(
+                    doc: doc,
+                    onRefresh: { chatModel.refreshTranscript(executionId: execId) }
+                )
+                .navigationTitle(transcriptTitle(for: execId))
+            case .unavailable(let reason):
+                ContentUnavailableView {
+                    Label("Transcript Unavailable", systemImage: "doc.questionmark")
+                } description: {
+                    Text(reason)
+                }
+            case .loading, .none:
+                VStack {
+                    Spacer()
+                    ProgressView()
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ContentUnavailableView(
                 "No Execution Selected",
@@ -166,5 +182,12 @@ struct TranscriptViewerView: View {
                 description: Text("Select an execution from the list to view its transcript.")
             )
         }
+    }
+
+    private func transcriptTitle(for execId: String) -> String {
+        guard let exec = executions.first(where: { $0.id == execId }) else {
+            return "Transcript"
+        }
+        return exec.kind.replacingOccurrences(of: "_", with: " ").capitalized
     }
 }
