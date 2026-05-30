@@ -48,6 +48,17 @@ struct GhosttyTerminalView: NSViewRepresentable {
         view.syncGeometry()
         view.reconcileClaudeMonitor(enabled: claudeMonitorEnabled)
     }
+
+    /// SwiftUI removes the representable here — while it still holds a
+    /// strong reference to `view`, before the view is released. That makes
+    /// this (not `deinit`) the right place to free the libghostty surface:
+    /// the host view stays alive across the off-main free, so a surface
+    /// callback can't resolve a half-deallocated view. Freeing on the main
+    /// thread inside `deinit` is what deadlocked against the full
+    /// `App.Message` mailbox in #961 — see `GhosttyTerminalHostView.tearDown`.
+    static func dismantleNSView(_ view: GhosttyTerminalHostView, coordinator: ()) {
+        view.tearDown()
+    }
 }
 
 final class GhosttyTerminalHostView: NSView {
@@ -117,6 +128,26 @@ final class GhosttyTerminalHostView: NSView {
     /// executes during normal operation.
     private static let focusQueue = DispatchQueue(
         label: "boss.terminal.focus",
+        qos: .userInitiated
+    )
+
+    /// Serial background queue for `ghostty_surface_free` calls — see
+    /// `tearDown()` for why the free must not run on the main thread.
+    ///
+    /// `ghostty_surface_free` joins the surface's IO-reader threads
+    /// (`Surface.deinit` → `Thread.join`). Those readers can be parked
+    /// inside `BlockingQueue(App.Message, 64).push`: the app mailbox is
+    /// bounded at 64 slots and drained *only* by the main thread via
+    /// `ghostty_app_tick`. Freeing on the main thread makes the join
+    /// block the very thread that drains the mailbox — the readers can
+    /// never deliver their pending message, never reach their "should I
+    /// exit?" check, and the join never returns. That is the 250-second
+    /// beachball in #961.
+    ///
+    /// Separate from `focusQueue` so a long teardown join can't
+    /// head-of-line-block focus handshakes for other live panes.
+    private static let teardownQueue = DispatchQueue(
+        label: "boss.terminal.teardown",
         qos: .userInitiated
     )
 
@@ -327,21 +358,79 @@ final class GhosttyTerminalHostView: NSView {
         pendingGeometrySync?.cancel()
         claudeMonitorTimer?.invalidate()
         removeScreenObserver()
+        // The normal teardown path frees the surface off the main thread in
+        // `tearDown()` (driven by `GhosttyTerminalView.dismantleNSView` while
+        // SwiftUI still holds a strong reference to this view) and nils
+        // `surface`. If we still hold a surface here, `tearDown` was bypassed
+        // — e.g. the whole view tree was discarded at app exit without a
+        // dismantle pass. Free synchronously as a last resort: from `deinit`
+        // we cannot move the free off-thread, because the view is already
+        // being deallocated and can't be kept alive across an async free
+        // (the surface's `userdata` points back at it — see `tearDown`).
+        //
+        // This synchronous free carries the #961 deadlock risk (a join
+        // against the full App.Message mailbox), but it only runs on the
+        // bypass path; the in-session pane-close path that triggered the
+        // beachball goes through `tearDown`.
         if let surface {
-            // Drain any pending async focus call before freeing. focusQueue
-            // is a serial background queue so sync'ing to it here cannot
-            // deadlock (different thread from MainActor). In practice terminal
-            // views have app lifetime so this barrier is a no-op, but it
-            // ensures correctness if a view is ever torn down mid-flight.
             Self.focusQueue.sync {}
-            // Clear focus before freeing so libghostty's focused-surface
-            // bookkeeping doesn't dangle into a freed surface. Action
-            // callbacks fire on the main thread via ghostty_app_tick (see
-            // PR #209), and the focusQueue barrier above guarantees no
-            // async focus call is in progress, so the userdata pointer
-            // (this view) stays valid until deinit returns.
             ghostty_surface_set_focus(surface, false)
             ghostty_surface_free(surface)
+        }
+    }
+
+    /// Free the libghostty surface without blocking the main thread.
+    ///
+    /// Called from `GhosttyTerminalView.dismantleNSView` — i.e. while
+    /// SwiftUI is removing the representable but still holds a strong
+    /// reference to this view, so the view is fully alive (refcount ≥ 1),
+    /// unlike inside `deinit`.
+    ///
+    /// Why off the main thread: `ghostty_surface_free` joins the surface's
+    /// IO-reader threads, which can be parked inside the bounded
+    /// `App.Message` mailbox push (see `teardownQueue`). Freeing on the
+    /// background queue lets the main runloop keep ticking
+    /// (`ghostty_app_tick`) and draining that mailbox, so the readers make
+    /// forward progress, hit EOF on the closed pty, exit, and the join
+    /// returns. This mirrors the `focusQueue` precedent — another
+    /// libghostty call that blocks on the same mailbox and so is dispatched
+    /// off the main thread.
+    ///
+    /// Lifetime: the surface's `userdata` is this host view
+    /// (`Unmanaged.passUnretained`). An `App.Message` for this surface that
+    /// `ghostty_app_tick` processes while the free is in flight resolves
+    /// that pointer back to `self`, so `self` must outlive the free. The
+    /// teardown closure captures `self` strongly and releases that
+    /// reference back on the main thread (an NSView's `deinit` must run on
+    /// the main thread), so the surface can never outlive the host view and
+    /// the view never deallocates off-main.
+    ///
+    /// Idempotent: nils `surface` up front, so a subsequent
+    /// `dismantleNSView` or `deinit` is a no-op and the surface is never
+    /// double-freed.
+    func tearDown() {
+        guard let surface else { return }
+        self.surface = nil
+
+        pendingGeometrySync?.cancel()
+        pendingGeometrySync = nil
+        claudeMonitorTimer?.invalidate()
+        claudeMonitorTimer = nil
+        removeScreenObserver()
+
+        // Drain any in-flight async focus call (focusQueue is serial) before
+        // freeing so `ghostty_surface_set_focus` can't run on a freed
+        // surface, then clear focus so libghostty's focused-surface
+        // bookkeeping doesn't dangle into the surface we're about to free.
+        Self.focusQueue.sync {}
+        ghostty_surface_set_focus(surface, false)
+
+        let box = SurfaceBox(surface: surface)
+        Self.teardownQueue.async {
+            ghostty_surface_free(box.surface)
+            // Release the keep-alive reference on the main thread so this
+            // NSView's deinit runs on the main thread, never on teardownQueue.
+            DispatchQueue.main.async { withExtendedLifetime(self) {} }
         }
     }
 
