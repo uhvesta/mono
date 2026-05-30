@@ -58,6 +58,11 @@ struct ContentView: View {
                 DesignsView(chat: model)
             }
 
+            if model.navigationMode == .automations {
+                AutomationsView(model: model)
+                    .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
+            }
+
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             // Persistent chrome-level signal that the engine socket is
@@ -158,7 +163,7 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 270)
+                .frame(width: 360)
             }
 
             ToolbarItem {

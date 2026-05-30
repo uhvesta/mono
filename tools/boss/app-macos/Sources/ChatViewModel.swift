@@ -74,6 +74,13 @@ final class ChatViewModel: ObservableObject {
     /// RPC). A `nil` (absent) entry means "not requested yet"; live
     /// executions can be re-fetched via [[refreshTranscript(executionId:)]].
     @Published var transcriptsByExecutionID: [String: TranscriptLoadState] = [:]
+    /// Automations keyed by product id. Loaded when the Automations tab is
+    /// entered or the selected product changes while the tab is active.
+    @Published var automationsByProductID: [String: [AppAutomation]] = [:]
+    /// Open-task counts keyed by automation id. Refreshed alongside the list.
+    @Published var openTaskCountByAutomationID: [String: Int] = [:]
+    /// The automation currently selected in the Automations tab detail pane.
+    @Published var selectedAutomationID: String?
     @Published var selectedWorkProductID: String? {
         didSet { invalidateWorkCache() }
     }
@@ -525,6 +532,18 @@ final class ChatViewModel: ObservableObject {
         return product(withID: productID)
     }
 
+    /// Automations for the currently selected product, ordered by `created_at`.
+    var automationsForSelectedProduct: [AppAutomation] {
+        guard let productID = currentSelectedProductID else { return [] }
+        return automationsByProductID[productID] ?? []
+    }
+
+    /// The currently selected automation, looked up from the per-product list.
+    var selectedAutomation: AppAutomation? {
+        guard let id = selectedAutomationID else { return nil }
+        return automationsForSelectedProduct.first { $0.id == id }
+    }
+
     /// Unresolved attention items for the currently selected product.
     var selectedProductOpenAttentionItems: [WorkAttentionItem] {
         guard let productID = currentSelectedProductID else { return [] }
@@ -820,6 +839,9 @@ final class ChatViewModel: ObservableObject {
         defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
         if mode == .work {
             refreshWork()
+        }
+        if mode == .automations {
+            refreshAutomations()
         }
     }
 
@@ -1998,6 +2020,42 @@ final class ChatViewModel: ObservableObject {
             )
         case .executionTranscriptUnavailable(let executionId, let reason):
             transcriptsByExecutionID[executionId] = .unavailable(reason: reason)
+        // MARK: Automation events
+        case .automationsList(let productID, let automations):
+            automationsByProductID[productID] = automations
+            for automation in automations {
+                engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
+            }
+        case .automationCreated(let automation):
+            upsertAutomation(automation)
+            selectedAutomationID = automation.id
+            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
+        case .automationResult(let automation):
+            upsertAutomation(automation)
+        case .automationUpdated(let automation):
+            upsertAutomation(automation)
+            engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
+        case .automationDeleted(let automationID):
+            for productID in automationsByProductID.keys {
+                automationsByProductID[productID]?.removeAll { $0.id == automationID }
+            }
+            openTaskCountByAutomationID.removeValue(forKey: automationID)
+        case .automationOpenTaskCount(let automationID, let count):
+            openTaskCountByAutomationID[automationID] = count
+        }
+    }
+
+    private func upsertAutomation(_ automation: AppAutomation) {
+        let productID = automation.productID
+        if var list = automationsByProductID[productID] {
+            if let idx = list.firstIndex(where: { $0.id == automation.id }) {
+                list[idx] = automation
+            } else {
+                list.append(automation)
+            }
+            automationsByProductID[productID] = list
+        } else {
+            automationsByProductID[productID] = [automation]
         }
     }
 
@@ -2020,6 +2078,71 @@ final class ChatViewModel: ObservableObject {
     func refreshEngineAttempts() {
         engine.sendListConflictResolutions(limit: 200)
         engine.sendListCiRemediations(limit: 200)
+    }
+
+    // MARK: - Automation actions
+
+    /// Load automations for the currently selected product. No-op when
+    /// disconnected or no product is selected.
+    func refreshAutomations() {
+        guard isConnected, let productID = currentSelectedProductID else { return }
+        engine.sendListAutomations(productId: productID)
+    }
+
+    func createAutomation(
+        productID: String,
+        name: String,
+        cron: String,
+        timezone: String,
+        standingInstruction: String,
+        openTaskLimit: Int = 1,
+        enabled: Bool = true,
+        repoRemoteURL: String? = nil
+    ) {
+        engine.sendCreateAutomation(
+            productId: productID,
+            name: name,
+            cron: cron,
+            timezone: timezone,
+            standingInstruction: standingInstruction,
+            openTaskLimit: openTaskLimit,
+            enabled: enabled,
+            repoRemoteURL: repoRemoteURL
+        )
+    }
+
+    func updateAutomation(
+        id: String,
+        name: String? = nil,
+        cron: String? = nil,
+        timezone: String? = nil,
+        standingInstruction: String? = nil,
+        openTaskLimit: Int? = nil
+    ) {
+        var patch: [String: Any] = [:]
+        if let name { patch["name"] = name }
+        if let cron, let timezone {
+            patch["trigger"] = ["kind": "schedule", "cron": cron, "timezone": timezone]
+        }
+        if let standingInstruction { patch["standing_instruction"] = standingInstruction }
+        if let openTaskLimit { patch["open_task_limit"] = openTaskLimit }
+        guard !patch.isEmpty else { return }
+        engine.sendUpdateAutomation(id: id, patch: patch)
+    }
+
+    func enableAutomation(id: String) {
+        engine.sendEnableAutomation(id: id)
+    }
+
+    func disableAutomation(id: String) {
+        engine.sendDisableAutomation(id: id)
+    }
+
+    func deleteAutomation(id: String) {
+        if selectedAutomationID == id {
+            selectedAutomationID = nil
+        }
+        engine.sendDeleteAutomation(id: id)
     }
 
     // MARK: - Private Helpers

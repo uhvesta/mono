@@ -243,6 +243,19 @@ enum EngineEvent {
     /// (rotated, GC'd, or never recorded). `reason` is human-readable and
     /// surfaced as a "transcript unavailable" state, never an error.
     case executionTranscriptUnavailable(executionId: String, reason: String)
+    // MARK: Automation events (maintenance-tasks.md T7)
+    /// Response to `list_automations` — all automations for a product.
+    case automationsList(productID: String, automations: [AppAutomation])
+    /// Response to `create_automation` — the newly created automation.
+    case automationCreated(automation: AppAutomation)
+    /// Response to `get_automation` — a single automation row.
+    case automationResult(automation: AppAutomation)
+    /// Response to `update_automation`, `enable_automation`, or `disable_automation`.
+    case automationUpdated(automation: AppAutomation)
+    /// Response to `delete_automation` — the id of the deleted row.
+    case automationDeleted(automationID: String)
+    /// Response to `get_automation_open_task_count`.
+    case automationOpenTaskCount(automationID: String, count: Int)
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -639,6 +652,73 @@ final class EngineClient: @unchecked Sendable {
             "type": "execution_transcript",
             "execution_id": executionId,
         ])
+    }
+
+    // MARK: - Automation RPCs (maintenance-tasks.md T7)
+
+    /// Ask the engine for all automations for a product, ordered `created_at ASC`.
+    /// The engine replies with `automations_list`.
+    func sendListAutomations(productId: String) {
+        sendLine([
+            "type": "list_automations",
+            "product_id": productId,
+        ])
+    }
+
+    /// Create a new automation. The engine replies with `automation_created`.
+    func sendCreateAutomation(
+        productId: String,
+        name: String,
+        cron: String,
+        timezone: String,
+        standingInstruction: String,
+        openTaskLimit: Int = 1,
+        enabled: Bool = true,
+        repoRemoteURL: String? = nil
+    ) {
+        var input: [String: Any] = [
+            "product_id": productId,
+            "name": name,
+            "trigger": [
+                "kind": "schedule",
+                "cron": cron,
+                "timezone": timezone,
+            ] as [String: Any],
+            "standing_instruction": standingInstruction,
+            "open_task_limit": openTaskLimit,
+            "enabled": enabled,
+            "created_via": "mac_app",
+        ]
+        if let repoRemoteURL, !repoRemoteURL.isEmpty {
+            input["repo_remote_url"] = repoRemoteURL
+        }
+        sendLine(["type": "create_automation", "input": input])
+    }
+
+    /// Enable an automation (set `enabled = true`). Engine replies with `automation_updated`.
+    func sendEnableAutomation(id: String) {
+        sendLine(["type": "enable_automation", "id": id])
+    }
+
+    /// Disable an automation (set `enabled = false`). Engine replies with `automation_updated`.
+    func sendDisableAutomation(id: String) {
+        sendLine(["type": "disable_automation", "id": id])
+    }
+
+    /// Delete an automation and its run history. Engine replies with `automation_deleted`.
+    func sendDeleteAutomation(id: String) {
+        sendLine(["type": "delete_automation", "id": id])
+    }
+
+    /// Update an automation's mutable fields. Engine replies with `automation_updated`.
+    func sendUpdateAutomation(id: String, patch: [String: Any]) {
+        sendLine(["type": "update_automation", "id": id, "patch": patch])
+    }
+
+    /// Get the count of open tasks produced by an automation. Engine replies
+    /// with `automation_open_task_count`.
+    func sendGetAutomationOpenTaskCount(automationId: String) {
+        sendLine(["type": "get_automation_open_task_count", "automation_id": automationId])
     }
 
     /// Resolve a project's design-doc pointer. Engine replies with
@@ -1326,6 +1406,40 @@ final class EngineClient: @unchecked Sendable {
                         reason: reason
                     ))
                 }
+            // MARK: Automation responses
+            case "automations_list":
+                let productID = payload["product_id"] as? String ?? ""
+                let raw = payload["automations"] as? [[String: Any]] ?? []
+                let automations = raw.compactMap(parseAutomation)
+                if !productID.isEmpty {
+                    emit(.automationsList(productID: productID, automations: automations))
+                }
+            case "automation_created":
+                if let automationPayload = payload["automation"] as? [String: Any],
+                   let automation = parseAutomation(automationPayload) {
+                    emit(.automationCreated(automation: automation))
+                }
+            case "automation_result":
+                if let automationPayload = payload["automation"] as? [String: Any],
+                   let automation = parseAutomation(automationPayload) {
+                    emit(.automationResult(automation: automation))
+                }
+            case "automation_updated":
+                if let automationPayload = payload["automation"] as? [String: Any],
+                   let automation = parseAutomation(automationPayload) {
+                    emit(.automationUpdated(automation: automation))
+                }
+            case "automation_deleted":
+                let automationID = payload["automation_id"] as? String ?? ""
+                if !automationID.isEmpty {
+                    emit(.automationDeleted(automationID: automationID))
+                }
+            case "automation_open_task_count":
+                let automationID = payload["automation_id"] as? String ?? ""
+                let count = (payload["count"] as? NSNumber)?.intValue ?? 0
+                if !automationID.isEmpty {
+                    emit(.automationOpenTaskCount(automationID: automationID, count: count))
+                }
             default:
                 break
             }
@@ -1349,6 +1463,86 @@ final class EngineClient: @unchecked Sendable {
             }
             self.connect()
         }
+    }
+
+    // MARK: - Automation parsers
+
+    private func parseAutomation(_ payload: [String: Any]) -> AppAutomation? {
+        guard let id = payload["id"] as? String,
+              let productId = payload["product_id"] as? String,
+              let name = payload["name"] as? String,
+              let triggerPayload = payload["trigger"] as? [String: Any],
+              let triggerKind = triggerPayload["kind"] as? String,
+              let standingInstruction = payload["standing_instruction"] as? String,
+              let createdVia = payload["created_via"] as? String,
+              let createdAt = payload["created_at"] as? String,
+              let updatedAt = payload["updated_at"] as? String
+        else {
+            return nil
+        }
+
+        let enabled: Bool
+        if let e = payload["enabled"] as? Bool {
+            enabled = e
+        } else if let e = payload["enabled"] as? NSNumber {
+            enabled = e.boolValue
+        } else {
+            enabled = true
+        }
+
+        let trigger: AppAutomationTrigger
+        switch triggerKind {
+        case "schedule":
+            guard let cron = triggerPayload["cron"] as? String,
+                  let timezone = triggerPayload["timezone"] as? String
+            else { return nil }
+            trigger = .schedule(cron: cron, timezone: timezone)
+        default:
+            return nil
+        }
+
+        let openTaskLimit = (payload["open_task_limit"] as? NSNumber)?.intValue ?? 1
+
+        return AppAutomation(
+            id: id,
+            shortID: (payload["short_id"] as? NSNumber)?.intValue,
+            productID: productId,
+            name: name,
+            repoRemoteURL: payload["repo_remote_url"] as? String,
+            trigger: trigger,
+            standingInstruction: standingInstruction,
+            openTaskLimit: openTaskLimit,
+            catchUpWindowSecs: (payload["catch_up_window_secs"] as? NSNumber)?.intValue,
+            enabled: enabled,
+            createdVia: createdVia,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            lastFiredAt: payload["last_fired_at"] as? String,
+            lastOutcome: payload["last_outcome"] as? String,
+            nextDueAt: payload["next_due_at"] as? String
+        )
+    }
+
+    private func parseAutomationRun(_ payload: [String: Any]) -> AppAutomationRun? {
+        guard let id = payload["id"] as? String,
+              let automationID = payload["automation_id"] as? String,
+              let scheduledFor = payload["scheduled_for"] as? String,
+              let startedAt = payload["started_at"] as? String,
+              let outcome = payload["outcome"] as? String
+        else {
+            return nil
+        }
+        return AppAutomationRun(
+            id: id,
+            automationID: automationID,
+            scheduledFor: scheduledFor,
+            startedAt: startedAt,
+            finishedAt: payload["finished_at"] as? String,
+            triageExecutionID: payload["triage_execution_id"] as? String,
+            outcome: outcome,
+            producedTaskID: payload["produced_task_id"] as? String,
+            detail: payload["detail"] as? String
+        )
     }
 
     private func parseProduct(_ payload: [String: Any]) -> WorkProduct? {
