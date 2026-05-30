@@ -578,6 +578,47 @@ pub struct WorkExecution {
     pub transient_failure_count: i64,
 }
 
+/// Role/origin of a rendered transcript segment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentRole {
+    User,
+    Assistant,
+    Thinking,
+    Tool,
+    System,
+}
+
+/// Set when a tool result was truncated by the renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncationInfo {
+    pub shown_bytes: usize,
+    pub total_bytes: usize,
+}
+
+/// One rendered transcript segment, as returned by `executions.transcript`.
+///
+/// Structured for lazy per-segment rendering in the UI: each segment maps to
+/// one JSONL event (user turn, assistant turn, tool call, tool result, …) and
+/// carries its own markdown body so the renderer builds ASTs one at a time.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct TranscriptSegment {
+    pub seq: u64,
+    pub role: SegmentRole,
+    /// Short human-readable label (e.g. `"User"`, `"⚙ Bash"`, `"↳ result"`).
+    pub label: String,
+    pub timestamp: Option<String>,
+    pub model: Option<String>,
+    /// Rendered markdown body for this segment.
+    pub markdown: String,
+    #[builder(default)]
+    pub collapsible: bool,
+    #[builder(default)]
+    pub default_collapsed: bool,
+    pub truncated: Option<TruncationInfo>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkRun {
     pub id: String,
