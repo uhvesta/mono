@@ -1,0 +1,10 @@
+package(default_visibility = ["//visibility:private"])
+
+# The detached swap/relaunch watchdog script, bundled into the app's
+# Contents/Resources/ via macos_application's additional_contents. Invoked as
+# `/bin/sh relaunch-helper.sh …` so the executable bit need not survive bundling.
+filegroup(
+    name = "relaunch_helper",
+    srcs = ["relaunch-helper.sh"],
+    visibility = ["//tools/boss/app-macos:__pkg__"],
+)

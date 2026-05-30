@@ -1268,6 +1268,18 @@ final class ChatViewModel: ObservableObject {
 
     func startIfNeeded() {
         guard !didStart else { return }
+
+        // Swap-on-startup fallback (design doc §4): if a staged update is ready and
+        // the user is in automatic mode, replace the bundle *before* the engine
+        // launches (so the new engine binary is what gets spawned), then hand off to
+        // the detached relaunch helper and exit — it relaunches us into the new
+        // version. If no swap applies, this returns false and we continue normally.
+        // Placed here because this is the single chokepoint guaranteed to run before
+        // `processController.start()`. See [[UpdateLifecycle]].
+        if UpdateLifecycle.applyStartupSwapIfNeeded() {
+            exit(0)
+        }
+
         didStart = true
 
         let autostart = ProcessInfo.processInfo.environment["BOSS_ENGINE_AUTOSTART"] != "0"
