@@ -52,6 +52,7 @@ rust_library(
         "src/pane_summary.rs",
         "src/pr_url_capture.rs",
         "src/protocol.rs",
+        "src/recovery_backup.rs",
         "src/remote_wrapper.rs",
         "src/repo_slug.rs",
         "src/resolution_signal_capture.rs",

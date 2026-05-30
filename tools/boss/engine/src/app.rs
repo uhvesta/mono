@@ -2549,6 +2549,10 @@ pub async fn serve(
                     cube_workspace_id = ?execution.cube_workspace_id,
                     "startup reaper: marked execution orphaned (workspace preserved for re-lease)",
                 );
+                // Snapshot any uncommitted in-flight work to a durable
+                // patch before the workspace can be re-leased/reset.
+                // Best-effort and self-logging; never blocks the reaper.
+                crate::recovery_backup::backup_dead_execution(&execution);
             }
             Err(err) => {
                 // Already-terminal rows are benign here — a parallel

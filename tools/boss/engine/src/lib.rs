@@ -39,6 +39,7 @@ pub mod orphan_sweep;
 pub mod pane_summary;
 pub mod pr_url_capture;
 pub mod protocol;
+pub mod recovery_backup;
 pub mod remote_wrapper;
 pub mod repo_slug;
 pub mod resolution_signal_capture;

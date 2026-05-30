@@ -223,12 +223,23 @@ pub async fn run_one_pass(
             continue;
         }
 
+        // Snapshot the dead worker's uncommitted workspace work to a
+        // durable patch before the slot is released and the workspace
+        // becomes eligible for re-lease/reset. Best-effort: a failed or
+        // empty capture returns None and never blocks the reap.
+        let recovery_patch = crate::recovery_backup::backup_dead_execution(&execution);
+
         // Append [engine-reconcile] audit line to the task description
-        // so a human inspecting the chore can see why it was reset.
+        // so a human inspecting the chore can see why it was reset (and
+        // where to find the recovery patch, if one was captured).
         if let Some(work_item_id) = &state.work_item_id {
-            if let Err(err) =
-                append_reconcile_audit(work_db, work_item_id, execution_id, now_epoch_secs)
-            {
+            if let Err(err) = append_reconcile_audit(
+                work_db,
+                work_item_id,
+                execution_id,
+                now_epoch_secs,
+                recovery_patch.as_deref(),
+            ) {
                 tracing::warn!(
                     work_item_id,
                     ?err,
@@ -253,6 +264,9 @@ pub async fn run_one_pass(
                     .with_details(serde_json::json!({
                         "dead_pid": state.shell_pid,
                         "slot_id": state.slot_id,
+                        "recovery_patch": recovery_patch
+                            .as_deref()
+                            .map(|p| p.display().to_string()),
                     })),
             )
             .await;
@@ -274,6 +288,7 @@ fn append_reconcile_audit(
     work_item_id: &str,
     dead_execution_id: &str,
     now_epoch_secs: i64,
+    recovery_patch: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let item = work_db.get_work_item(work_item_id)?;
     let current_desc = match &item {
@@ -283,8 +298,12 @@ fn append_reconcile_audit(
             t.description.as_str()
         }
     };
+    let recovery_note = match recovery_patch {
+        Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
+        None => String::new(),
+    };
     let audit_line = format!(
-        "\n[engine-reconcile] epoch {now_epoch_secs}: dead worker (exec {dead_execution_id}) detected via PID probe; chore reset to todo for redispatch."
+        "\n[engine-reconcile] epoch {now_epoch_secs}: dead worker (exec {dead_execution_id}) detected via PID probe; chore reset to todo for redispatch.{recovery_note}"
     );
     let new_desc = format!("{current_desc}{audit_line}");
     work_db.update_work_item(

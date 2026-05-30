@@ -96,6 +96,55 @@ Once the predecessor is `orphaned`:
    the orphan was working on; from there it can push and open / update
    the PR as if no crash had happened.
 
+## Automatic workspace patch backup
+
+Preserving the lease keeps the in-flight work *reachable* only as long as
+the workspace's dirty working copy survives — it is still lost the moment
+that workspace is re-leased and reset, or if cube cannot reclaim it. As a
+precaution, every path that transitions a live execution to `orphaned`
+now also snapshots the workspace's uncommitted work to a durable patch
+**at death-detection time**, independent of whether the workspace can
+later be reclaimed.
+
+The capture is implemented in
+`tools/boss/engine/src/recovery_backup.rs` and invoked from all three
+at-death hooks:
+
+- `dead_pid_sweep` — worker PID probe reports the process is gone.
+- `stale_worker_sweep` — worker is wedged past the staleness threshold.
+- the startup reaper in `app.rs` — cube probe verdict `Dead` across an
+  engine/UI restart.
+
+Each hook runs `jj diff --git` against the dead worker's leased workspace
+(equivalent to `jj diff --git -R <ws>`) and, if the working copy is
+dirty, writes the git-format patch to:
+
+```
+$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch
+```
+
+(overridable via the `BOSS_RECOVERY_DIR` env var). The path is recorded
+in two places so a human or a resuming worker can find it: the
+`[engine-reconcile]` audit line appended to the work item's description
+(`Uncommitted work backed up to <path>.`), and the `recovery_patch`
+field of the `dead_pid_reconcile` / `stale_worker_reconcile` dispatch
+event.
+
+The capture is **best-effort and non-fatal**: a missing workspace path,
+an unavailable `jj`, or an empty diff is logged and swallowed, and the
+reap proceeds regardless. To replay the work into a fresh workspace:
+
+```
+git apply --3way "$HOME/Library/Application Support/Boss/recovery/<exec-id>.patch"
+```
+
+**Scope:** the patch captures *uncommitted* working-copy changes only.
+Local commits the worker already `jj describe`d into ancestors of `@`
+are not captured (capturing `trunk..@` is a possible future
+enhancement), and branches already pushed to origin are already durable
+there. Stale patches under `recovery/` are not yet garbage-collected —
+GC is a follow-up.
+
 ## Recovery cheat-sheet
 
 ```
