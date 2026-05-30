@@ -989,7 +989,7 @@ fn compose_revision_directive(
 
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
-    out.push_str("- This is a **REVISION** task. Your deliverable is a NEW COMMIT on an EXISTING pull request. Do NOT open a new PR. Do NOT create a `boss/exec_*` bookmark.\n");
+    out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. Do NOT open a new PR. Do NOT create a `boss/exec_*` bookmark.\n");
     out.push_str(&format!(
         "- The parent PR is #{pr_number} at {parent_pr_url}.\n"
     ));
@@ -1006,33 +1006,38 @@ fn compose_revision_directive(
     out.push_str("Steps:\n");
     out.push_str("1. `jj git fetch`   # the parent branch lives on GitHub; sync before editing.\n");
     out.push_str(&format!(
-        "2. `GIT_DIR=.jj/repo/store/git gh pr checkout {pr_number}`   # checks out the parent PR branch.\n"
+        "2. `GIT_DIR=.jj/repo/store/git gh pr checkout {pr_number}`   # checks out the parent PR branch tip.\n"
     ));
-    out.push_str("3. Make the requested change.\n");
-    out.push_str("4. `jj describe -m \"<short message describing the revision>\"`\n");
-    out.push_str("   Then identify the parent branch name from `jj log` and advance it:\n");
+    out.push_str("3. `jj new @`   # START A NEW COMMIT on top of the PR head — do NOT edit/amend/squash the existing commit.\n");
+    out.push_str("4. Make the requested change in this new commit.\n");
+    out.push_str("5. `jj describe -m \"<short message describing THIS revision's change>\"`\n");
+    out.push_str("   Then identify the parent branch name from `jj log` and advance it to the new commit:\n");
     out.push_str("   `jj bookmark set <parent-branch-name> -r @`\n");
     out.push_str(&format!(
-        "5. `GIT_DIR=.jj/repo/store/git jj git push -b <parent-branch-name>`   # NO --allow-new; the branch already exists.\n"
+        "6. `GIT_DIR=.jj/repo/store/git jj git push -b <parent-branch-name>`   # NO --allow-new; the branch already exists.\n"
     ));
     out.push_str(&format!(
-        "6. Confirm the new commit is on the PR: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`\n"
+        "7. Confirm the new commit is on the PR: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`\n"
     ));
     out.push_str(&format!(
-        "7. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
+        "8. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
     ));
+    out.push('\n');
+    out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
+    out.push('\n');
+    out.push_str("Rebase-only exception: if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces no new diff, it is perfectly valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change.\n");
     out.push('\n');
     out.push_str("Constraints:\n");
     out.push_str("- Do NOT run `gh pr create` — this revision has no PR of its own.\n");
     out.push_str("- Do NOT create a `boss/exec_*` bookmark — push to the existing parent branch.\n");
-    out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, stop and explain.\n");
+    out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and this is NOT a rebase-only revision, stop and explain.\n");
     out.push('\n');
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
-         - Push your commit to the parent branch (see step 5 above). Do NOT open a new PR.\n\
+         - Push your changes to the parent branch (see step 6 above). Do NOT open a new PR.\n\
          - Confirm the parent PR shows your new commit with `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`.\n\
          - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
-         - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, stop and explain.\n"
+         - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and no rebase was needed, stop and explain.\n"
     ));
     if let Some(attempt) = conflict_attempt {
         out.push_str(&compose_conflict_resolution_fragment(attempt));
