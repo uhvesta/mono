@@ -1016,6 +1016,15 @@ impl ServerState {
             );
             return;
         };
+        // Snapshot the worker's recorded shell pid *before* we drop the
+        // live-state entry further down — the engine-side reap backstop
+        // below needs it. `0` means "pid not reported by the app yet",
+        // which the reaper treats as a no-op.
+        let shell_pid = self
+            .live_worker_states
+            .get(slot_id)
+            .map(|state| state.shell_pid)
+            .unwrap_or(0);
         let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
             slot_id,
             kill_grace_seconds: 5,
@@ -1052,6 +1061,18 @@ impl ServerState {
                 tracing::warn!(?err, run_id, slot_id, "release_worker_pane: failed");
             }
         }
+        // Engine-side reap backstop. The app's pane teardown above is
+        // the primary reaper, but it cannot act when no app session is
+        // registered, when the app is unresponsive, or when a wedged
+        // surface reports no foreground pid — exactly the `bossctl
+        // agents stop` leak from #975, where the engine slot and the
+        // cube lease were freed but the worker's `claude` process kept
+        // running (orphaned, still holding bazel/swiftc locks). Signal
+        // the recorded shell pid's process group directly so the OS
+        // process tree goes down even when the app path can't reach it.
+        // Idempotent with the app's reap: a process already gone just
+        // yields `ESRCH`. The grace mirrors the app's `kill_grace_seconds`.
+        reap_worker_process_tree(shell_pid, Duration::from_secs(5));
         // The engine's WorkerPool slot was held for the lifetime of
         // the libghostty pane (the coordinator deferred its release
         // when `run_execution` returned with `slot_id = Some(N)`).
@@ -2976,6 +2997,74 @@ fn current_parent_pid() -> Option<libc::pid_t> {
 /// from the panic hook, where we must not touch the runtime. The
 /// loop keeps going past `EPERM` / `ESRCH` because the worker may
 /// already be dead (good) or owned by another uid (we can't help).
+/// Engine-side backstop reap of a worker's OS process tree on pane
+/// release. The macOS app's `releaseWorkerPane` (→ `WorkerProcessKiller`)
+/// is the primary reaper, but it cannot act when no app session is
+/// registered, when the app is unresponsive, or when a wedged surface
+/// reports no foreground pid. In those cases `release_worker_pane` used
+/// to free the engine slot and the cube lease while the worker's
+/// `claude` process kept running — the leak in #975, where `bossctl
+/// agents stop` cleared the slot but left the OS process alive.
+///
+/// Fires `SIGTERM` at the *process group* of `shell_pid` synchronously
+/// (so a `claude` and anything it spawned — e.g. an MCP stdio child —
+/// go too), then escalates to `SIGKILL` on a detached task after
+/// `grace` if the lead pid is still alive. A non-positive pid is a
+/// no-op so callers need not branch on "pid not reported yet".
+///
+/// Synchronous SIGTERM + detached SIGKILL (rather than a blocking
+/// ladder) keeps the release path — and the `bossctl agents stop`
+/// round-trip behind it — prompt: by the time it returns the worker
+/// has at minimum been asked to exit. Mirrors the app-side
+/// `WorkerProcessKiller` ladder and the `signal_shell_pids` shutdown
+/// fallback.
+fn reap_worker_process_tree(shell_pid: i32, grace: Duration) {
+    if shell_pid <= 0 {
+        return;
+    }
+    let pid = shell_pid as libc::pid_t;
+    let target = process_group_signal_target(pid);
+    // SAFETY: `pid` was recorded by us at spawn; a failed kill is not
+    // fatal (the process may already have exited).
+    let rc = unsafe { libc::kill(target, libc::SIGTERM) };
+    tracing::debug!(pid, target, rc, "reap_worker_process_tree: SIGTERM");
+    tokio::spawn(async move {
+        if grace > Duration::from_secs(0) {
+            tokio::time::sleep(grace).await;
+        }
+        if matches!(
+            crate::dead_pid_sweep::probe_pid(pid),
+            crate::dead_pid_sweep::PidStatus::Dead
+        ) {
+            tracing::debug!(pid, "reap_worker_process_tree: exited after SIGTERM");
+            return;
+        }
+        // SAFETY: same as above.
+        let rc = unsafe { libc::kill(target, libc::SIGKILL) };
+        tracing::info!(
+            pid,
+            target,
+            rc,
+            "reap_worker_process_tree: process survived SIGTERM grace; escalated to SIGKILL",
+        );
+    });
+}
+
+/// Resolve the `kill(2)` target for `pid`: the negated process group id
+/// when `getpgid` succeeds (so the whole group is signalled, reaching
+/// descendants), falling back to the bare pid when `getpgid` reports
+/// the process is already gone. Mirrors the app-side
+/// `WorkerProcessKiller.signalTarget`.
+fn process_group_signal_target(pid: libc::pid_t) -> libc::pid_t {
+    // SAFETY: `getpgid` only reads kernel state for `pid`.
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid > 0 {
+        -pgid
+    } else {
+        pid
+    }
+}
+
 fn signal_shell_pids(pids: &[libc::pid_t], grace: Duration) {
     if pids.is_empty() {
         return;
@@ -8917,6 +9006,81 @@ async fn read_transcript_tail(
 mod tests {
     use super::*;
     use crate::protocol::TopicEventPayload;
+
+    #[test]
+    fn process_group_signal_target_negates_pgid_for_live_pid() {
+        // Our own pid is alive and has a valid process group, so the
+        // reaper signals the whole group (negated pgid).
+        let me = std::process::id() as libc::pid_t;
+        let pgid = unsafe { libc::getpgid(me) };
+        assert!(pgid > 0, "own pgid should resolve");
+        assert_eq!(process_group_signal_target(me), -pgid);
+    }
+
+    #[test]
+    fn process_group_signal_target_falls_back_to_bare_pid_when_gone() {
+        // A pid that cannot exist has no process group; `getpgid` fails
+        // and we fall back to signalling the bare pid rather than the
+        // group (negating would otherwise target an unrelated group).
+        let bogus: libc::pid_t = i32::MAX;
+        assert_eq!(process_group_signal_target(bogus), bogus);
+    }
+
+    #[test]
+    fn reap_worker_process_tree_noop_for_unreported_pid() {
+        // `shell_pid <= 0` means the app never reported a pid; the
+        // reaper must early-return (no signal, no `tokio::spawn`, so no
+        // runtime required) rather than signal pid 0 / a negative pid.
+        reap_worker_process_tree(0, Duration::from_secs(5));
+        reap_worker_process_tree(-1, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn reap_worker_process_tree_kills_orphan_child() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        // Spawn a long sleeper in its OWN process group so our reap —
+        // which signals the process *group* — cannot touch the test
+        // runner's own group.
+        let mut child = unsafe {
+            Command::new("sleep")
+                .arg("300")
+                .pre_exec(|| {
+                    // setpgid(0, 0): become our own process group leader.
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("spawn sleep child")
+        };
+        let pid = child.id() as i32;
+        assert!(
+            matches!(
+                crate::dead_pid_sweep::probe_pid(pid),
+                crate::dead_pid_sweep::PidStatus::Alive
+            ),
+            "child should be alive before reap",
+        );
+
+        // SIGTERM fires synchronously; the SIGKILL escalation is
+        // detached. `sleep` terminates on SIGTERM, so the child dies
+        // either way.
+        reap_worker_process_tree(pid, Duration::from_millis(50));
+
+        // Block on the child's exit on a blocking thread so the detached
+        // escalation task keeps running on the test runtime.
+        let status = tokio::task::spawn_blocking(move || child.wait())
+            .await
+            .expect("join wait task")
+            .expect("wait on child");
+        assert!(
+            !status.success(),
+            "child should have been signalled to death, not exited cleanly",
+        );
+    }
 
     fn topic_envelope(topic: &str, revision: u64) -> FrontendEventEnvelope {
         FrontendEventEnvelope::push_with_revision(
