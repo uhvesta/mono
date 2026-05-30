@@ -3234,6 +3234,100 @@ private struct WorkEditSheet: View {
     }
 
     var body: some View {
+        if case .product = request.item {
+            productBody
+        } else {
+            sharedBody
+        }
+    }
+
+    @ViewBuilder
+    private var productBody: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Edit Product")
+                .font(.title3.weight(.semibold))
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .padding(.bottom, 4)
+
+            Form {
+                Section("Product") {
+                    TextField("Name", text: $name)
+                    TextField("Description", text: $description)
+                    Picker("Status", selection: $status) {
+                        ForEach(["active", "paused", "archived"], id: \.self) { s in
+                            Text(s.capitalized).tag(s)
+                        }
+                    }
+                    TextField("Repository URL", text: $repoRemoteURL)
+                    LabeledContent("Worker branch prefix") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            TextField("", text: $workerBranchPrefix, prompt: Text("e.g. bduff/"))
+                            Text(
+                                "Optional. Workers push to <prefix>exec_<id>. " +
+                                "Leave blank to use the default prefix boss/. " +
+                                "Trailing / is conventional."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
+                Section("External Tracker") {
+                    Picker("Kind", selection: $trackerKind) {
+                        Text("GitHub").tag("github")
+                    }
+                    if trackerKind == "github" {
+                        TextField("Owner / Organization", text: $trackerOrg)
+                        TextField("Repository", text: $trackerRepo)
+                        TextField("Project number", text: $trackerProjectNumber)
+                        Toggle("Reverse-close", isOn: $trackerReverseClose)
+                            .help(
+                                "When a work item is marked done without a merged PR, " +
+                                "close the upstream GitHub issue."
+                            )
+                        if initialTrackerBound {
+                            Button("Unset", role: .destructive) {
+                                onUnsetTracker?()
+                            }
+                        }
+                    }
+                }
+            }
+
+            GitHubAccountSection()
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                Button("Save") {
+                    onSave(
+                        name, description, status, repoRemoteURL, "", "", "", workerBranchPrefix
+                    )
+                    if trackerFormValid,
+                       let num = Int(trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        onSetTracker?(trackerKind, trackerOrg, trackerRepo, num, trackerReverseClose)
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(
+                    name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    trackerFieldsEntered && !trackerFormValid
+                )
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+            .padding(.top, 8)
+        }
+        .frame(width: 480)
+    }
+
+    @ViewBuilder
+    private var sharedBody: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title)
                 .font(.title3.weight(.semibold))
@@ -3242,34 +3336,6 @@ private struct WorkEditSheet: View {
             TextField("Description", text: $description)
 
             switch request.item {
-            case .product:
-                Picker("Status", selection: $status) {
-                    ForEach(["active", "paused", "archived"], id: \.self) { status in
-                        Text(status.capitalized).tag(status)
-                    }
-                }
-                TextField("Remote URL", text: $repoRemoteURL)
-                VStack(alignment: .leading, spacing: 4) {
-                    TextField("Worker branch prefix (e.g. bduff/)", text: $workerBranchPrefix)
-                    Text("Optional. Workers push to <prefix>exec_<id>. Leave blank to use the default prefix boss/. Trailing / is conventional.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Divider()
-                    .padding(.vertical, 2)
-
-                ExternalTrackerSection(
-                    trackerKind: $trackerKind,
-                    trackerOrg: $trackerOrg,
-                    trackerRepo: $trackerRepo,
-                    trackerProjectNumber: $trackerProjectNumber,
-                    trackerReverseClose: $trackerReverseClose,
-                    initialTrackerBound: initialTrackerBound,
-                    onUnsetTracker: onUnsetTracker
-                )
-
             case .project:
                 Picker("Status", selection: $status) {
                     ForEach(["planned", "active", "blocked", "done", "archived"], id: \.self) { status in
@@ -3294,6 +3360,8 @@ private struct WorkEditSheet: View {
                     }
                 }
                 TextField("PR URL", text: $prURL)
+            case .product:
+                EmptyView()
             }
 
             HStack {
@@ -3301,16 +3369,9 @@ private struct WorkEditSheet: View {
                 Button("Cancel", action: onCancel)
                 Button("Save") {
                     onSave(name, description, status, repoRemoteURL, goal, priority, prURL, workerBranchPrefix)
-                    if case .product = request.item, trackerFormValid,
-                       let num = Int(trackerProjectNumber.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                        onSetTracker?(trackerKind, trackerOrg, trackerRepo, num, trackerReverseClose)
-                    }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(
-                    name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                    trackerFieldsEntered && !trackerFormValid
-                )
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(20)
@@ -3346,52 +3407,6 @@ private struct WorkEditSheet: View {
     }
 }
 
-/// External tracker sub-form embedded in the product edit sheet.
-/// Mirrors the `boss product set-external-tracker` CLI surface.
-private struct ExternalTrackerSection: View {
-    @Binding var trackerKind: String
-    @Binding var trackerOrg: String
-    @Binding var trackerRepo: String
-    @Binding var trackerProjectNumber: String
-    @Binding var trackerReverseClose: Bool
-
-    let initialTrackerBound: Bool
-    let onUnsetTracker: (() -> Void)?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("External Tracker")
-                .font(.headline)
-
-            Picker("Kind", selection: $trackerKind) {
-                Text("GitHub").tag("github")
-            }
-
-            if trackerKind == "github" {
-                TextField("Organization", text: $trackerOrg)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Repository", text: $trackerRepo)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Project Number", text: $trackerProjectNumber)
-                    .textFieldStyle(.roundedBorder)
-                Toggle("Reverse-close", isOn: $trackerReverseClose)
-                    .help("When a work item is marked done without a merged PR, close the upstream GitHub issue.")
-
-                if initialTrackerBound {
-                    HStack {
-                        Button("Unset", role: .destructive) {
-                            onUnsetTracker?()
-                        }
-                        Spacer()
-                    }
-                }
-
-                GitHubAccountSection()
-            }
-        }
-    }
-
-}
 
 /// "GitHub account" subsection of the external-tracker settings — drives
 /// and renders the engine-owned OAuth device flow (OAuth device-flow design
