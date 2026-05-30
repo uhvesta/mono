@@ -4567,6 +4567,22 @@ async fn handle_frontend_connection(
                                 handler.force_release(&execution_id).await;
                             });
                         }
+                        // If the user dragged an active task/chore back
+                        // to Backlog (active → todo), stop the live
+                        // worker: cancel its execution row (so the orphan
+                        // sweep and reconciler won't re-dispatch it) and
+                        // release its pane + cube workspace. The task
+                        // status is already `todo` from the patch above;
+                        // autostart was cleared to 0 when the task first
+                        // entered Doing, so it will not be re-dispatched.
+                        if let Some(execution_id) =
+                            active_to_todo_execution(&work_db, &previous_task_status, &item)
+                        {
+                            let handler = server_state.completion_handler.clone();
+                            tokio::spawn(async move {
+                                handler.cancel_and_release(&execution_id).await;
+                            });
+                        }
                         // Kanban drop-into-Doing (and any other human
                         // path that flips a task/chore to `active` via
                         // UpdateWorkItem) must dispatch a worker — see
@@ -8938,6 +8954,43 @@ fn in_review_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Option<String
     }
 }
 
+/// If `item` is a task or chore whose status just changed from `active`
+/// to `todo` (i.e., the user dragged an agent-assigned Doing card back
+/// to Backlog), return the id of its most recent execution so the caller
+/// can cancel the worker and release its resources.
+///
+/// Returns `None` for non-task work items, when the current status is
+/// not `todo`, when the previous status was not `active`, and when the
+/// work item has no executions.
+fn active_to_todo_execution(
+    work_db: &WorkDb,
+    previous_status: &Option<String>,
+    item: &WorkItem,
+) -> Option<String> {
+    let task = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        _ => return None,
+    };
+    if task.status != "todo" {
+        return None;
+    }
+    if previous_status.as_deref() != Some("active") {
+        return None;
+    }
+    match work_db.latest_execution_for_work_item(&task.id) {
+        Ok(Some(execution)) => Some(execution.id),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %task.id,
+                ?err,
+                "active_to_todo_execution: failed to look up latest execution",
+            );
+            None
+        }
+    }
+}
+
 /// Return `(name, description)` for a task/chore id, or `None` when
 /// the id does not name a task/chore or cannot be read from the DB.
 /// Used by the `UpdateWorkItem` handler to snapshot the spec before an
@@ -12553,6 +12606,121 @@ mod tests {
         let item = WorkItem::Product(product_item);
         assert!(
             in_review_chore_execution(&db, &item).is_none(),
+            "must return None for non-task work items"
+        );
+    }
+
+    // ---- active_to_todo_execution ----
+
+    #[test]
+    fn active_to_todo_execution_returns_none_when_not_todo() {
+        use boss_protocol::WorkItemPatch;
+        let (db, _, chore_id) = make_work_db_with_chore();
+        let item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch { status: Some("active".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert!(
+            active_to_todo_execution(&db, &Some("todo".into()), &item).is_none(),
+            "must return None when the current status is not todo"
+        );
+    }
+
+    #[test]
+    fn active_to_todo_execution_returns_none_when_prev_not_active() {
+        use boss_protocol::WorkItemPatch;
+        let (db, _, chore_id) = make_work_db_with_chore();
+        let item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch { status: Some("todo".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert!(
+            active_to_todo_execution(&db, &Some("todo".into()), &item).is_none(),
+            "must return None when the previous status was not active"
+        );
+        assert!(
+            active_to_todo_execution(&db, &None, &item).is_none(),
+            "must return None when there is no previous status"
+        );
+    }
+
+    #[test]
+    fn active_to_todo_execution_returns_none_when_no_execution() {
+        use boss_protocol::WorkItemPatch;
+        let (db, _, chore_id) = make_work_db_with_chore();
+        let item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch { status: Some("todo".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert!(
+            active_to_todo_execution(&db, &Some("active".into()), &item).is_none(),
+            "must return None when the chore has no executions"
+        );
+    }
+
+    #[test]
+    fn active_to_todo_execution_returns_execution_id() {
+        use boss_protocol::WorkItemPatch;
+        use crate::work::CreateExecutionInput;
+        let (db, _, chore_id) = make_work_db_with_chore();
+        let execution = db
+            .create_execution(CreateExecutionInput {
+                work_item_id: chore_id.clone(),
+                kind: "chore_implementation".into(),
+                status: Some("running".into()),
+                repo_remote_url: None,
+                cube_repo_id: None,
+                cube_lease_id: None,
+                cube_workspace_id: None,
+                workspace_path: None,
+                priority: None,
+                preferred_workspace_id: None,
+                started_at: None,
+                finished_at: None,
+                prefer_is_soft: false,
+                pr_url: None,
+            })
+            .unwrap();
+        let item = db
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch { status: Some("todo".into()), ..Default::default() },
+            )
+            .unwrap();
+        let found = active_to_todo_execution(&db, &Some("active".into()), &item);
+        assert_eq!(
+            found.as_deref(),
+            Some(execution.id.as_str()),
+            "must return the execution id when the chore is moving from active to todo"
+        );
+    }
+
+    #[test]
+    fn active_to_todo_execution_returns_none_for_product() {
+        use crate::work::CreateProductInput;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product_item = db
+            .create_product(CreateProductInput {
+                name: "Prod".into(),
+                description: None,
+                repo_remote_url: None,
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let item = WorkItem::Product(product_item);
+        assert!(
+            active_to_todo_execution(&db, &Some("active".into()), &item).is_none(),
             "must return None for non-task work items"
         );
     }

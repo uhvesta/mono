@@ -26,6 +26,36 @@ impl WorkDb {
     ///
     /// Returns `(execution_cancelled, task_demoted)` so callers can
     /// log what actually changed.
+    /// Cancel a non-terminal execution without touching the task status.
+    /// Returns `true` if the execution was actually cancelled (was in a
+    /// non-terminal state), `false` if it was already terminal.
+    ///
+    /// Used by the `active` → Backlog kanban-drag path: the task status
+    /// has already been moved to `todo` by `update_work_item_as_actor`,
+    /// so we only need to mark the execution as cancelled before releasing
+    /// the pane and workspace.
+    pub fn cancel_running_execution(&self, execution_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let now = now_string();
+        let cancelled = if !execution_status_is_terminal(&execution.status) {
+            let affected = tx.execute(
+                "UPDATE work_executions
+                 SET status      = 'cancelled',
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE id = ?1",
+                params![execution_id, now],
+            )?;
+            affected > 0
+        } else {
+            false
+        };
+        tx.commit()?;
+        Ok(cancelled)
+    }
+
     pub fn cancel_running_execution_and_demote_task(
         &self,
         execution_id: &str,

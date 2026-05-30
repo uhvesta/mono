@@ -1831,6 +1831,34 @@ must not be asked to open one",
         }
     }
 
+    /// Stop a worker whose task was dragged back to Backlog by the user.
+    /// Cancels the execution row in the DB (so the orphan sweep and
+    /// reconciler won't re-dispatch it) then releases the pane and cube
+    /// workspace via `force_release`. Does NOT demote the task status —
+    /// the `UpdateWorkItem` handler already applied the user's `todo`
+    /// patch before this is called.
+    pub async fn cancel_and_release(&self, execution_id: &str) {
+        match self.work_db.cancel_running_execution(execution_id) {
+            Ok(true) => {
+                tracing::info!(execution_id, "cancel_and_release: execution cancelled");
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    execution_id,
+                    "cancel_and_release: execution already terminal; proceeding to release",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "cancel_and_release: failed to cancel execution; proceeding to release",
+                );
+            }
+        }
+        self.force_release(execution_id).await;
+    }
+
     /// Explicit human-initiated stop (`bossctl agents stop`). Unlike
     /// the normal `on_stop` hook path — which probes for a PR and
     /// waits for the worker to respond — this path is used when the

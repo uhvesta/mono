@@ -1191,10 +1191,11 @@ final class ChatViewModel: ObservableObject {
     ///   engine is idempotent — a non-terminal execution already
     ///   running for this work item won't get a duplicate.
     /// - Move OUT of Doing while a live worker is attached is
-    ///   blocked. The kanban must not show a card in a column whose
-    ///   status contradicts the live-worker reality. Terminal
-    ///   transitions (`done`, `archived`) are still allowed because
-    ///   those mirror the engine's own lifecycle resolutions.
+    ///   blocked — except for two intentional gestures:
+    ///   (a) Dragging back to Backlog (`todo`): engine stops the worker,
+    ///       releases the lease, and parks the card — no autostart.
+    ///   (b) Terminal transitions (`done`, `archived`): these mirror the
+    ///       engine's own lifecycle resolutions and are always allowed.
     func moveTask(_ taskID: String, to column: WorkBoardColumnKey) {
         guard let task = task(withID: taskID) else { return }
         let targetStatus = column.targetStatus
@@ -1202,6 +1203,7 @@ final class ChatViewModel: ObservableObject {
 
         if task.status == "active"
             && !Self.terminalKanbanStatuses.contains(targetStatus)
+            && column != .backlog  // backlog drag = stop+park: engine handles teardown
             && hasLiveWorker(forTaskID: taskID)
         {
             appendSystemMessage(
