@@ -299,7 +299,7 @@ pub(crate) fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
@@ -329,7 +329,7 @@ pub(crate) fn query_live_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
          FROM work_executions
          WHERE work_item_id = ?1
            AND status IN ('running', 'waiting_human')
@@ -398,6 +398,7 @@ pub(crate) fn reconcile_work_item_execution(
                     finished_at: None,
                     prefer_is_soft: false,
                     pr_url: None,
+                    allow_dirty: false,
                 },
             )?;
             result.created.push(created);
@@ -666,6 +667,7 @@ pub(crate) fn reconcile_revision_execution(
                     finished_at: None,
                     prefer_is_soft: true,
                     pr_url: Some(parent_pr_url),
+                    allow_dirty: false,
                 },
             )?;
             result.created.push(created);
@@ -688,6 +690,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // creates / refreshes a `ready` row the same way for both
         // forced and queued requests.
         force: _,
+        allow_dirty,
     } = input;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
@@ -989,6 +992,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             finished_at: None,
             prefer_is_soft: false,
             pr_url: revision_pr_url,
+            allow_dirty,
         },
     )
 }

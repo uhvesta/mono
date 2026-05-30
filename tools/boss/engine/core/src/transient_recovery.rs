@@ -635,6 +635,7 @@ mod tests {
             _: &str,
             _: &str,
             _: Option<&str>,
+            _: bool,
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
@@ -765,6 +766,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: Some("mono-agent-007".to_owned()),
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         db.start_execution_run(
@@ -1166,6 +1169,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: Some("mono-agent-007".to_owned()),
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         db.start_execution_run(

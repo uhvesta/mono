@@ -393,6 +393,7 @@ mod tests {
             _: &str,
             _: &str,
             _: Option<&str>,
+            _: bool,
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
@@ -496,6 +497,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let old_started_at = SystemTime::now()
@@ -641,6 +644,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         // Stamp started_at = NOW so the grace guard fires.
@@ -692,6 +697,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         // Do NOT force started_at — leave it NULL.

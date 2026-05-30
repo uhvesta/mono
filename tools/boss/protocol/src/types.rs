@@ -576,6 +576,16 @@ pub struct WorkExecution {
     #[serde(default)]
     #[builder(default)]
     pub transient_failure_count: i64,
+    /// When `true`, the cube lease call for this execution will include
+    /// `--allow-dirty`, causing cube to reclaim the named preferred workspace
+    /// with its uncommitted working copy intact rather than resetting it.
+    /// Set only on the orphan recovery re-dispatch path (when the predecessor
+    /// execution was `orphaned`) so the recovering worker lands on the exact
+    /// dirty workspace its predecessor left behind. Normal and transient-retry
+    /// dispatches leave this `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub allow_dirty: bool,
 }
 
 /// Role/origin of a rendered transcript segment.
@@ -1408,6 +1418,12 @@ pub struct CreateExecutionInput {
     /// the SHA-delta gate can snapshot and verify the parent PR HEAD.
     #[serde(default)]
     pub pr_url: Option<String>,
+    /// When `true`, cube will be invoked with `--allow-dirty` so it
+    /// reclaims the preferred workspace with uncommitted work intact.
+    /// Only set on the orphan recovery re-dispatch path.
+    #[serde(default)]
+    #[builder(default)]
+    pub allow_dirty: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1424,6 +1440,12 @@ pub struct RequestExecutionInput {
     /// slot is busy.
     #[serde(default)]
     pub force: bool,
+    /// Request cube to reclaim the preferred workspace with its dirty
+    /// working copy intact (passed through to `CreateExecutionInput`
+    /// and stored on the `work_executions` row). Set `true` on the
+    /// orphan recovery re-dispatch path; `false` everywhere else.
+    #[serde(default)]
+    pub allow_dirty: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

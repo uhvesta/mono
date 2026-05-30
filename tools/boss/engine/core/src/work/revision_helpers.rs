@@ -552,6 +552,7 @@ pub(crate) fn insert_execution(
     let started_at = normalize_optional_text(input.started_at);
     let finished_at = normalize_optional_text(input.finished_at);
     let prefer_is_soft: i64 = if input.prefer_is_soft { 1 } else { 0 };
+    let allow_dirty: i64 = if input.allow_dirty { 1 } else { 0 };
     let pr_url = normalize_optional_text(input.pr_url);
     // Freeze the owning product's worker branch prefix onto the
     // execution row, mirroring `repo_remote_url`. This keeps the
@@ -564,8 +565,9 @@ pub(crate) fn insert_execution(
         "INSERT INTO work_executions (
             id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
-            created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
+            allow_dirty
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             id,
             input.work_item_id,
@@ -584,6 +586,7 @@ pub(crate) fn insert_execution(
             prefer_is_soft,
             pr_url,
             worker_branch_prefix,
+            allow_dirty,
         ],
     )?;
 

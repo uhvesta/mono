@@ -246,9 +246,18 @@ impl WorkDb {
             // against `main` on an unrelated branch. Only fires for
             // orphaned predecessors; abandoned / failed / cancelled
             // ones are intentional throwaways and don't carry forward.
+            // When the predecessor was orphaned, carry forward both its
+            // workspace and the allow_dirty flag so the recovering worker
+            // reclaims the dirty workspace in place (uncommitted WIP
+            // intact) rather than cube resetting it or falling back to
+            // a fresh workspace that has no patch.
+            let is_orphaned_predecessor = existing
+                .as_ref()
+                .map(|prev| prev.status == "orphaned")
+                .unwrap_or(false);
             let preferred_workspace_id = existing
                 .as_ref()
-                .filter(|prev| prev.status == "orphaned")
+                .filter(|_| is_orphaned_predecessor)
                 .and_then(|prev| prev.cube_workspace_id.clone());
             request_execution_in_tx_with_live_check(
                 &tx,
@@ -257,6 +266,7 @@ impl WorkDb {
                     priority: None,
                     preferred_workspace_id,
                     force: false,
+                    allow_dirty: is_orphaned_predecessor,
                 },
                 |run_id| is_live(run_id),
             )?;
@@ -335,6 +345,7 @@ impl WorkDb {
                     priority: None,
                     preferred_workspace_id: None,
                     force: false,
+                    allow_dirty: false,
                 },
                 // `|_| true` keeps any non-terminal execution intact —
                 // the on-free rescan only ever fires this branch when
@@ -463,7 +474,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -476,7 +487,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -548,7 +559,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -578,7 +589,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2

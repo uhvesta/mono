@@ -836,6 +836,8 @@ fn creates_and_lists_execution_entities() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
     assert_eq!(
@@ -971,6 +973,8 @@ fn execution_requires_repo_remote_url_snapshot() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap_err();
     assert!(
@@ -995,6 +999,8 @@ fn execution_requires_repo_remote_url_snapshot() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
     assert_eq!(
@@ -1451,6 +1457,8 @@ fn request_execution_refuses_when_repo_unresolvable() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| true,
         )
@@ -1587,6 +1595,8 @@ fn starts_ready_execution_run_and_attaches_workspace() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -1780,6 +1790,8 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
     // Drive the chore into the Doing column by starting the run —
@@ -1856,6 +1868,8 @@ fn cancel_execution_preserves_in_review_and_done_status() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
     // The worker opened a PR before the human asked to cancel.
@@ -1950,6 +1964,8 @@ fn start_execution_does_not_downgrade_done_chores() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -2074,6 +2090,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
         kind: "chore_implementation".to_owned(),
         status: Some("failed".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -2136,6 +2153,7 @@ fn reconcile_skips_active_chore_with_live_execution() {
         kind: "chore_implementation".to_owned(),
         status: Some("waiting_human".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -2196,6 +2214,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
             kind: "chore_implementation".to_owned(),
             status: Some("waiting_human".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
 

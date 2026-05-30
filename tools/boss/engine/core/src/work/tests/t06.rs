@@ -310,6 +310,8 @@ fn get_live_execution_returns_waiting_human_execution_for_work_item() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -360,6 +362,8 @@ fn get_live_execution_returns_none_when_all_executions_are_terminal() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -1813,6 +1817,8 @@ fn request_execution_for_revision_task_produces_revision_implementation_kind() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| false,
         )
@@ -1853,6 +1859,8 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| false,
         )
@@ -1878,6 +1886,8 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| false,
         )

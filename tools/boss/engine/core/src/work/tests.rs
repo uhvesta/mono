@@ -103,6 +103,8 @@ fn product_task_execution_with_prefix(
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
     (product, execution)
@@ -217,6 +219,8 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
         finished_at: None,
         prefer_is_soft: false,
         pr_url: None,
+    
+        allow_dirty: false,
     })
     .unwrap()
 }
@@ -345,6 +349,8 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
     let (exec, run) = db

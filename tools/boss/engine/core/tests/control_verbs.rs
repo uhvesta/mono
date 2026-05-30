@@ -161,6 +161,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+                allow_dirty: false,
             },
         })
         .await?
@@ -1891,6 +1892,7 @@ async fn request_execution_accepts_tnnn_friendly_id() -> Result<()> {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+                allow_dirty: false,
             },
         })
         .await?;

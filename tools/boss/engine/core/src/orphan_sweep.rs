@@ -214,6 +214,8 @@ pub async fn run_one_pass(
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             is_live,
         ) {
@@ -295,6 +297,7 @@ mod tests {
             _: &str,
             _: &str,
             _: Option<&str>,
+            _: bool,
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!("orphan sweep tests don't invoke cube")
         }
@@ -461,6 +464,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let coordinator = make_coordinator(db.clone(), 1);

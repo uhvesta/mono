@@ -269,6 +269,7 @@ impl WorkDb {
         migrate_tasks_parent_task_id_column(&conn)?;
         migrate_work_executions_prefer_is_soft(&conn)?;
         migrate_work_executions_transient_failure_count(&conn)?;
+        migrate_work_executions_allow_dirty(&conn)?;
         // Revision card fix: update existing revision rows whose `name` was
         // set to the full description text (the original insertion behaviour).
         // The new insertion code uses only the first line; this backfill

@@ -265,6 +265,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         prefer_is_soft: row.get::<_, i64>(18)? != 0,
         worker_branch_prefix: row.get::<_, Option<String>>(19)?.filter(|s| !s.is_empty()),
         transient_failure_count: row.get(20)?,
+        allow_dirty: row.get::<_, i64>(21)? != 0,
     })
 }
 

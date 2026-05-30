@@ -52,6 +52,7 @@ pub trait HostAdapter: Send + Sync {
         repo_id: &str,
         task: &str,
         prefer_workspace_id: Option<&str>,
+        allow_dirty: bool,
     ) -> Result<CubeWorkspaceLease>;
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
@@ -132,9 +133,10 @@ impl HostAdapter for LocalHostAdapter {
         repo_id: &str,
         task: &str,
         prefer_workspace_id: Option<&str>,
+        allow_dirty: bool,
     ) -> Result<CubeWorkspaceLease> {
         self.cube_client
-            .lease_workspace(repo_id, task, prefer_workspace_id)
+            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty)
             .await
     }
 
@@ -268,6 +270,7 @@ impl HostAdapter for SshHostAdapter {
         repo_id: &str,
         task: &str,
         prefer_workspace_id: Option<&str>,
+        allow_dirty: bool,
     ) -> Result<CubeWorkspaceLease> {
         #[derive(Deserialize)]
         struct LeasePayload {
@@ -282,6 +285,9 @@ impl HostAdapter for SshHostAdapter {
         let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
         if let Some(prefer) = prefer_workspace_id {
             args.extend_from_slice(&["--prefer", prefer]);
+        }
+        if allow_dirty {
+            args.push("--allow-dirty");
         }
         let payload: LeasePayload = serde_json::from_value(self.run_cube_json(&args).await?)
             .context("decoding remote `cube workspace lease` payload")?;

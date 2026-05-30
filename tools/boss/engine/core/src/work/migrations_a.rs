@@ -162,6 +162,21 @@ pub(crate) fn migrate_work_executions_transient_failure_count(conn: &Connection)
     Ok(())
 }
 
+/// `allow_dirty`: boolean signal (stored as INTEGER 0/1) that tells the
+/// coordinator's `lease_workspace_with_fallback` to include `--allow-dirty`
+/// in the cube lease invocation, reclaiming the preferred workspace with its
+/// uncommitted working copy intact. Set only on the orphan recovery
+/// re-dispatch path. Defaults to 0 for all existing rows.
+pub(crate) fn migrate_work_executions_allow_dirty(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "allow_dirty")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN allow_dirty INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Canonicalize all timestamp columns to Unix epoch seconds (decimal
 /// string). Older rows in some databases hold ISO 8601 strings (e.g.
 /// `2026-05-07T18:55:45.000Z`) from a pre-canonical write path; this

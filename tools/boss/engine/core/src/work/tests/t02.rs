@@ -45,6 +45,7 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     db.start_execution_run(
@@ -80,6 +81,7 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
         kind: "chore_implementation".to_owned(),
         status: Some("ready".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -106,6 +108,7 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
         cube_workspace_id: Some("mono-agent-002".to_owned()),
         workspace_path: Some("/tmp/mono-agent-002".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -166,6 +169,7 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     db.start_execution_run(
@@ -198,6 +202,7 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     db.start_execution_run(
@@ -230,6 +235,7 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     db.start_execution_run(
@@ -330,6 +336,7 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
             kind: "chore_implementation".to_owned(),
             status: Some("waiting_human".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
 
@@ -340,6 +347,8 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| false,
         )
@@ -415,6 +424,7 @@ fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
             cube_lease_id: Some("lease-ci-old".to_owned()),
             workspace_path: Some("/ws/mono-agent-001".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
 
@@ -425,6 +435,8 @@ fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| false,
         )
@@ -535,6 +547,7 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
             cube_lease_id: Some("lease-ci-old".to_owned()),
             workspace_path: Some("/ws/mono-agent-001".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
 
@@ -545,6 +558,8 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| false,
         )
@@ -621,6 +636,7 @@ fn request_execution_suppressed_when_older_execution_is_live() {
             kind: "chore_implementation".to_owned(),
             status: Some("running".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     // A stalled re-dispatch that was orphaned: NEWER, terminal,
@@ -631,6 +647,7 @@ fn request_execution_suppressed_when_older_execution_is_live() {
             kind: "chore_implementation".to_owned(),
             status: Some("orphaned".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     // Sanity: the phantom is the latest row (the trap).
@@ -651,6 +668,8 @@ fn request_execution_suppressed_when_older_execution_is_live() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |exec_id| exec_id == live.id,
         )
@@ -713,6 +732,7 @@ fn request_execution_redispatches_when_live_execution_not_claimed() {
             kind: "chore_implementation".to_owned(),
             status: Some("running".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
 
@@ -723,6 +743,8 @@ fn request_execution_redispatches_when_live_execution_not_claimed() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| false,
         )
@@ -781,6 +803,7 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
             kind: "chore_implementation".to_owned(),
             status: Some("running".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     // Newer terminal phantom that detaches the card under the bug.
@@ -789,6 +812,7 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
         kind: "chore_implementation".to_owned(),
         status: Some("orphaned".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -841,6 +865,7 @@ fn mark_execution_orphaned_preserves_workspace_and_stamps_run() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     let (_running, run) = db
@@ -921,6 +946,7 @@ fn mark_execution_orphaned_errors_on_already_terminal() {
             kind: "chore_implementation".to_owned(),
             status: Some("completed".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
 
@@ -1063,6 +1089,7 @@ fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     db.start_execution_run(
@@ -1156,6 +1183,7 @@ fn reconcile_does_not_inherit_workspace_from_non_orphaned_terminal() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     db.start_execution_run(
@@ -1227,6 +1255,7 @@ fn request_execution_is_idempotent_when_existing_run_is_live() {
             kind: "chore_implementation".to_owned(),
             status: Some("waiting_human".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
 
@@ -1237,6 +1266,8 @@ fn request_execution_is_idempotent_when_existing_run_is_live() {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             },
             |_| true,
         )
@@ -1603,6 +1634,8 @@ fn cancel_running_execution_demotes_active_task() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -1676,6 +1709,7 @@ fn rescan_redispatches_active_chore_with_terminal_execution() {
         kind: "chore_implementation".to_owned(),
         status: Some("failed".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -1781,6 +1815,7 @@ fn rescan_skips_active_chore_with_live_execution() {
         kind: "chore_implementation".to_owned(),
         status: Some("ready".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -2073,6 +2108,7 @@ fn rescan_skips_no_autostart_active_chore() {
         kind: "chore_implementation".to_owned(),
         status: Some("failed".to_owned()),
         ..Default::default()
+    
     })
     .unwrap();
 
@@ -2134,6 +2170,7 @@ fn start_execution_run_clears_autostart() {
             kind: "chore_implementation".to_owned(),
             status: Some("ready".to_owned()),
             ..Default::default()
+        
         })
         .unwrap();
     db.start_execution_run(

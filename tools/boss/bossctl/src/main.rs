@@ -1362,6 +1362,7 @@ async fn agents_launch(
                 priority: None,
                 preferred_workspace_id,
                 force: true,
+                allow_dirty: false,
             },
         })
         .await
@@ -1395,6 +1396,7 @@ async fn work_start(
                 priority,
                 preferred_workspace_id,
                 force: false,
+                allow_dirty: false,
             },
         })
         .await

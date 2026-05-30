@@ -187,8 +187,8 @@ impl WorkDb {
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at, prefer_is_soft,
-                transient_failure_count, dispatch_not_before
-             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11)",
+                transient_failure_count, dispatch_not_before, allow_dirty
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12)",
             params![
                 new_id,
                 dead.work_item_id,
@@ -201,6 +201,7 @@ impl WorkDb {
                 dead.prefer_is_soft as i64,
                 new_count,
                 dispatch_not_before,
+                dead.allow_dirty as i64,
             ],
         )?;
 
@@ -321,7 +322,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
              FROM work_executions
              WHERE status = 'ready'
                AND (dispatch_not_before IS NULL
@@ -347,7 +348,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -377,7 +378,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'

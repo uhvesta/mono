@@ -188,6 +188,8 @@ fn records_failed_execution_start_attempt() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -259,6 +261,8 @@ fn finishes_active_run_into_waiting_human_with_attention() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -360,6 +364,8 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -1735,6 +1741,8 @@ fn request_execution_refuses_gated_work_item() {
             priority: None,
             preferred_workspace_id: None,
             force: false,
+        
+            allow_dirty: false,
         })
         .unwrap_err()
         .to_string();
@@ -1857,6 +1865,8 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
             priority: None,
             preferred_workspace_id: None,
             force: false,
+        
+            allow_dirty: false,
         })
         .expect("RequestExecution should succeed when all prereqs are done");
 

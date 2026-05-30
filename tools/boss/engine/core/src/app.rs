@@ -4649,6 +4649,8 @@ async fn handle_frontend_connection(
                                         priority: None,
                                         preferred_workspace_id: None,
                                         force: false,
+                                    
+                                        allow_dirty: false,
                                     };
                                     match work_db.request_execution_with_live_check(
                                         dispatch_input,
@@ -8738,7 +8740,7 @@ async fn open_review_terminal_async(
     // Step 2: lease workspace
     let task_label = format!("review terminal for {work_item_id}");
     let lease = cube_client
-        .lease_workspace(&repo.repo_id, &task_label, None)
+        .lease_workspace(&repo.repo_id, &task_label, None, false)
         .await
         .with_context(|| format!("cube workspace lease failed for repo {}", repo.repo_id))?;
 
@@ -10802,6 +10804,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let transcript_dir = tempfile::tempdir().unwrap();
@@ -11006,6 +11010,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let run = server_state
@@ -11133,6 +11139,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let run = server_state
@@ -11257,6 +11265,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let run = server_state
@@ -11374,6 +11384,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         // Drive the real `start_execution_run` path so the run is
@@ -11500,6 +11512,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         // Intentionally skip `start_execution_run` — the execution
@@ -11598,6 +11612,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let run = server_state
@@ -11780,6 +11796,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let run = server_state
@@ -11932,6 +11950,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, run) = server_state
@@ -12061,6 +12081,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, run) = server_state
@@ -12187,6 +12209,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, _run) = server_state
@@ -12274,6 +12298,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let (execution, run) = server_state
@@ -12632,6 +12658,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let item = db
@@ -12747,6 +12775,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let item = db
@@ -13044,6 +13074,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: false,
+            
+                allow_dirty: false,
             })
             .unwrap()
     }

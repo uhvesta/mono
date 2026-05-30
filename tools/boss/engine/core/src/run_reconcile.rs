@@ -276,6 +276,7 @@ mod tests {
             _repo_id: &str,
             _task: &str,
             _prefer: Option<&str>,
+            _allow_dirty: bool,
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!("not used by probe")
         }

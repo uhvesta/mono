@@ -257,6 +257,7 @@ pub trait CubeClient: Send + Sync {
         repo_id: &str,
         task: &str,
         prefer_workspace_id: Option<&str>,
+        allow_dirty: bool,
     ) -> Result<CubeWorkspaceLease>;
     async fn create_change(
         &self,
@@ -362,6 +363,7 @@ impl CubeClient for CommandCubeClient {
         repo_id: &str,
         task: &str,
         prefer_workspace_id: Option<&str>,
+        allow_dirty: bool,
     ) -> Result<CubeWorkspaceLease> {
         #[derive(Deserialize)]
         struct LeasePayload {
@@ -380,6 +382,9 @@ impl CubeClient for CommandCubeClient {
         ];
         if let Some(prefer) = prefer_workspace_id {
             args.extend_from_slice(&["--prefer", prefer]);
+        }
+        if allow_dirty {
+            args.push("--allow-dirty");
         }
         let payload: LeasePayload = serde_json::from_value(self.run_json(&args).await?)
             .context("failed to decode `cube workspace lease` payload")?;
@@ -1976,11 +1981,15 @@ impl ExecutionCoordinator {
         task: &str,
     ) -> Result<CubeWorkspaceLease> {
         let prefer = execution.preferred_workspace_id.as_deref();
+        let allow_dirty = execution.allow_dirty;
         // Soft-prefer (OQ5): revision_implementation executions set
         // prefer_is_soft = true so a missing or leased preferred workspace
         // degrades silently to any free workspace rather than failing hard.
         // Orphan-resume executions use the hard "none" policy (prefer_is_soft
         // = false) because their state lives only in that specific workspace.
+        // allow_dirty additionally suppresses the cube-side reset so the
+        // recovering worker lands on the dirty tree; it implies a hard-fail
+        // (no fallback) because the uncommitted work is only in that workspace.
         let fallback_policy = if prefer.is_none() || execution.prefer_is_soft {
             "any_free"
         } else {
@@ -2015,6 +2024,9 @@ impl ExecutionCoordinator {
         if let Some(p) = prefer {
             attempt1_args.extend_from_slice(&["--prefer", p]);
         }
+        if allow_dirty {
+            attempt1_args.push("--allow-dirty");
+        }
         let attempt1_repr = self.host_adapter.command_repr(&attempt1_args);
 
         // First attempt: use the preferred workspace if the caller
@@ -2036,6 +2048,7 @@ impl ExecutionCoordinator {
                     "attempt": 1,
                     "prefer_workspace_id": prefer,
                     "fallback_policy": fallback_policy,
+                    "allow_dirty": allow_dirty,
                     "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
                 })),
             )
@@ -2043,7 +2056,7 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         let first_err = match self
-            .invoke_lease(repo, task, prefer, CUBE_LEASE_TIMEOUT)
+            .invoke_lease(repo, task, prefer, allow_dirty, CUBE_LEASE_TIMEOUT)
             .await
         {
             Ok(lease) => {
@@ -2057,6 +2070,7 @@ impl ExecutionCoordinator {
                     worker_id,
                     cube_repo_id = %repo.repo_id,
                     prefer = ?prefer,
+                    allow_dirty,
                     reason,
                     error = format!("{err:#}"),
                     "cube workspace lease attempt failed"
@@ -2078,6 +2092,7 @@ impl ExecutionCoordinator {
                             "prefer_workspace_id": prefer,
                             "reason": reason,
                             "fallback_policy": fallback_policy,
+                            "allow_dirty": allow_dirty,
                         })),
                     )
                     .await;
@@ -2092,7 +2107,11 @@ impl ExecutionCoordinator {
         // With a hard prefer (prefer set + prefer_is_soft = false), the
         // caller needs that specific workspace (orphan-resume); silently
         // landing elsewhere would lose local commit state.
-        if prefer.is_some() && !execution.prefer_is_soft {
+        // allow_dirty additionally implies hard-fail: the uncommitted patch
+        // lives only in the named workspace, so landing elsewhere is
+        // meaningless and must surface an error rather than silently
+        // dispatching to a clean workspace.
+        if prefer.is_some() && (!execution.prefer_is_soft || allow_dirty) {
             CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
             return Err(first_err);
         }
@@ -2125,7 +2144,7 @@ impl ExecutionCoordinator {
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, None, CUBE_LEASE_TIMEOUT)
+            .invoke_lease(repo, task, None, false, CUBE_LEASE_TIMEOUT)
             .await
         {
             Ok(lease) => {
@@ -2178,12 +2197,13 @@ impl ExecutionCoordinator {
         repo: &CubeRepoHandle,
         task: &str,
         prefer_workspace_id: Option<&str>,
+        allow_dirty: bool,
         timeout: Duration,
     ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
         match tokio::time::timeout(
             timeout,
             self.host_adapter
-                .lease_workspace(&repo.repo_id, task, prefer_workspace_id),
+                .lease_workspace(&repo.repo_id, task, prefer_workspace_id, allow_dirty),
         )
         .await
         {
@@ -3071,7 +3091,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCubeClient {
         ensure_calls: Mutex<Vec<String>>,
-        lease_calls: Mutex<Vec<(String, String, Option<String>)>>,
+        lease_calls: Mutex<Vec<(String, String, Option<String>, bool)>>,
         create_calls: Mutex<Vec<(String, String)>>,
         release_calls: Mutex<Vec<String>>,
         status_calls: Mutex<Vec<PathBuf>>,
@@ -3141,6 +3161,7 @@ mod tests {
             repo_id: &str,
             task: &str,
             prefer_workspace_id: Option<&str>,
+            allow_dirty: bool,
         ) -> Result<CubeWorkspaceLease> {
             let mut calls = self.lease_calls.lock().await;
             let call_index = calls.len();
@@ -3148,6 +3169,7 @@ mod tests {
                 repo_id.to_owned(),
                 task.to_owned(),
                 prefer_workspace_id.map(str::to_owned),
+                allow_dirty,
             ));
             drop(calls);
             if self.fail_lease {
@@ -4779,6 +4801,8 @@ mod tests {
             priority: None,
             preferred_workspace_id: Some("mono-agent-003".to_owned()),
             force: false,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -4897,6 +4921,8 @@ mod tests {
             priority: None,
             preferred_workspace_id: None,
             force: false,
+
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -4921,6 +4947,7 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: Some("mono-agent-003".to_owned()),
                 force: false,
+                allow_dirty: false,
             })
             .unwrap();
 
@@ -5003,6 +5030,7 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: Some("mono-agent-007".to_owned()),
                 force: false,
+                allow_dirty: false,
             })
             .unwrap();
 
@@ -5080,6 +5108,7 @@ mod tests {
             priority: None,
             preferred_workspace_id: None,
             force: false,
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -5218,6 +5247,7 @@ mod tests {
             priority: None,
             preferred_workspace_id: None,
             force: false,
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -5469,6 +5499,8 @@ mod tests {
             priority: Some(10),
             preferred_workspace_id: None,
             force: false,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -5549,6 +5581,8 @@ mod tests {
             priority: None,
             preferred_workspace_id: Some("mono-agent-007".to_owned()),
             force: false,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -6053,6 +6087,8 @@ mod tests {
             priority: None,
             preferred_workspace_id: None,
             force: false,
+        
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -6089,6 +6125,8 @@ mod tests {
                 finished_at: None,
                 prefer_is_soft: false,
                 pr_url: None,
+            
+                allow_dirty: false,
             })
             .unwrap();
         db.start_execution_run(
@@ -6321,6 +6359,8 @@ mod tests {
                 priority: None,
                 preferred_workspace_id: None,
                 force: true,
+            
+                allow_dirty: false,
             })
             .unwrap();
         let worker_id = coordinator
@@ -6447,6 +6487,8 @@ mod tests {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+
+            allow_dirty: false,
         })
         .unwrap();
 
@@ -6553,6 +6595,7 @@ mod tests {
             finished_at: None,
             prefer_is_soft: false,
             pr_url: None,
+            allow_dirty: false,
         })
         .unwrap();
 

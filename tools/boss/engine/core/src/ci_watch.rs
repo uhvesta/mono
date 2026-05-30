@@ -465,6 +465,7 @@ pub async fn on_ci_failure_detected(
                     finished_at: None,
                     prefer_is_soft: false,
                     pr_url: None,
+                    allow_dirty: false,
                 }) {
                     Ok(_) => publisher.kick_scheduler(),
                     Err(err) => {
@@ -1347,6 +1348,7 @@ pub async fn rescue_stranded_ci_remediation_attempt(
         finished_at: None,
         prefer_is_soft: false,
         pr_url: None,
+        allow_dirty: false,
     }) {
         Ok(_) => {
             publisher.kick_scheduler();
