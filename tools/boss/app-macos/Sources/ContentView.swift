@@ -4186,7 +4186,6 @@ private struct EffortChip: View {
         Text(letter)
             .font(.caption.weight(.bold))
             .foregroundStyle(foregroundColor)
-            .frame(minWidth: 18)
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
             .background(backgroundColor)
@@ -4197,11 +4196,11 @@ private struct EffortChip: View {
 
     private var letter: String {
         switch effortLevel {
-        case "trivial": return "T"
+        case "trivial": return "XS"
         case "small": return "S"
         case "medium": return "M"
         case "large": return "L"
-        case "max": return "X"
+        case "max": return "XL"
         default: return effortLevel.prefix(1).uppercased()
         }
     }
