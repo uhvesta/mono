@@ -445,6 +445,44 @@ pub(crate) fn preferred_workspace_for_chain_root(
     .map_err(Into::into)
 }
 
+/// For a revision spawned by an engine-triggered conflict / CI-fix
+/// attempt (`created_via` = `merge-conflict:<crz_id>` or `ci-fix:<id>`),
+/// return that attempt's status *iff* it has already retired — i.e. it
+/// reached a terminal status and is no longer `pending` / `running`.
+///
+/// Returns `Ok(None)` when the revision was not engine-spawned, the
+/// `created_via` id is empty, the attempt row can't be found, or the
+/// attempt is still active. The dispatcher uses a `Some(_)` answer as the
+/// signal that the revision's fix vehicle is spent and must stop being
+/// re-dispatched. The table name is selected from a fixed prefix→table
+/// map (never from caller data), so the formatted query is not an
+/// injection surface.
+pub(crate) fn retired_spawning_attempt_status(
+    conn: &Connection,
+    task: &Task,
+) -> Result<Option<String>> {
+    let created_via = task.created_via.as_str();
+    let (table, attempt_id) =
+        if let Some(id) = created_via.strip_prefix(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
+            ("conflict_resolutions", id)
+        } else if let Some(id) = created_via.strip_prefix(CREATED_VIA_CI_FIX_PREFIX) {
+            ("ci_remediations", id)
+        } else {
+            return Ok(None);
+        };
+    if attempt_id.is_empty() {
+        return Ok(None);
+    }
+    let status: Option<String> = conn
+        .query_row(
+            &format!("SELECT status FROM {table} WHERE id = ?1"),
+            [attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(status.filter(|s| s.as_str() != "pending" && s.as_str() != "running"))
+}
+
 /// Dispatch arm for `kind = 'revision'` tasks.
 ///
 /// Dispatch-time cached gate: if the chain root is already `done` (PR
@@ -526,6 +564,59 @@ pub(crate) fn reconcile_revision_execution(
                          ?3)",
                 params![attn_id, task.id, now],
             )?;
+        }
+        return Ok(());
+    }
+
+    // Engine-spawned conflict / CI-fix revisions self-terminate once the
+    // attempt that spawned them has retired. The gates above only consult
+    // the chain root's `pr_url` / `status`, neither of which reflects a
+    // *resolved* conflict (or *cleared* CI) on a still-open PR — so a CLEAN,
+    // already-rebased PR keeps minting fresh `revision_implementation`
+    // executions on every reconcile tick (observed on T906 / PR #970: its
+    // `conflict_resolutions` attempt was `succeeded`, yet the revision was
+    // re-dispatched indefinitely). The retire paths
+    // (`conflict_watch::on_resolved`, `try_retire_cleared_blocking_signal`)
+    // mark the attempt terminal and clear the *chore's* signal but never
+    // settle the revision task, leaving it dispatchable here.
+    //
+    // Once the spawning attempt is terminal the fix vehicle is spent: drop
+    // any queued execution (a `ready` row would otherwise get picked up and
+    // `start_execution_run` would flip the revision straight back to
+    // `active`, since its guard does not protect `in_review`), then settle
+    // the revision to `in_review` — the same resting state the clean-stop
+    // retire path leaves a successful revision in. A live worker is left
+    // alone; it self-retires on Stop.
+    if let Some(attempt_status) = retired_spawning_attempt_status(conn, task)? {
+        let now = now_string();
+        conn.execute(
+            "UPDATE work_executions
+             SET status = 'abandoned',
+                 finished_at = COALESCE(finished_at, ?2)
+             WHERE work_item_id = ?1
+               AND status IN ('queued', 'ready', 'waiting_dependency')",
+            params![task.id, now],
+        )?;
+        if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
+            let settled = conn.execute(
+                "UPDATE tasks
+                 SET status = 'in_review',
+                     last_status_actor = 'engine',
+                     updated_at = ?2
+                 WHERE id = ?1
+                   AND status NOT IN ('in_review', 'done', 'archived')
+                   AND deleted_at IS NULL",
+                params![task.id, now],
+            )?;
+            if settled > 0 {
+                tracing::info!(
+                    task_id = %task.id,
+                    chain_root_id = %chain_root_task.id,
+                    attempt_status = %attempt_status,
+                    "reconcile_revision: spawning conflict/CI attempt retired; \
+                     settled revision to in_review (halting re-dispatch loop)",
+                );
+            }
         }
         return Ok(());
     }

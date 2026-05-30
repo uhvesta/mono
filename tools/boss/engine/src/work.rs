@@ -66,8 +66,9 @@ pub const CI_CHURN_LIMIT: i64 = 5;
 pub use boss_protocol::{
     AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
     AutomationTrigger, BlockedSignal, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED,
-    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ENGINE_AUTO,
-    CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution,
+    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_CI_FIX_PREFIX,
+    CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_UNKNOWN,
+    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution,
     ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
     CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
