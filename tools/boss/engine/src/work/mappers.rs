@@ -487,6 +487,7 @@ pub(crate) fn map_ci_remediation(row: &Row<'_>) -> rusqlite::Result<CiRemediatio
 ///  grouping_key(12), generation(13), state(14),
 ///  produced_artifact_kind(15), produced_artifact_ref(16),
 ///  created_at(17), actioned_at(18), dismissed_at(19)`.
+#[allow(dead_code)] // prepared for attention-group query handlers (app.rs stubs)
 pub(crate) fn map_attention_group(row: &Row<'_>) -> rusqlite::Result<AttentionGroup> {
     Ok(AttentionGroup {
         id: row.get(0)?,
@@ -520,6 +521,7 @@ pub(crate) fn map_attention_group(row: &Row<'_>) -> rusqlite::Result<AttentionGr
 ///  question_type(7), prompt_text(8), choice_options(9), answer(10),
 ///  proposed_name(11), proposed_description(12), proposed_effort(13),
 ///  proposed_work_kind(14), rationale(15), confidence_source(16)`.
+#[allow(dead_code)] // prepared for attention query handlers (app.rs stubs)
 pub(crate) fn map_attention(row: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
         id: row.get(0)?,
@@ -645,6 +647,7 @@ pub(crate) fn map_automation(
 /// Map a row from the canonical `automation_runs` SELECT column order:
 /// 0 id, 1 automation_id, 2 scheduled_for, 3 started_at, 4 finished_at,
 /// 5 triage_execution_id, 6 outcome, 7 produced_task_id, 8 detail
+#[allow(dead_code)] // prepared for automation_runs list queries not yet implemented
 pub(crate) fn map_automation_run(
     row: &Row<'_>,
 ) -> rusqlite::Result<boss_protocol::AutomationRun> {
