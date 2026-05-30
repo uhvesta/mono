@@ -1899,3 +1899,199 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
     );
     assert_eq!(second_exec.status, "ready");
 }
+
+// ── Conflict-resolution revision: stop re-dispatch once the attempt retires ──
+
+/// Insert a `kind=revision` task linked to a merge-conflict attempt.
+/// Mirrors what `conflict_watch::maybe_spawn_conflict_revision` produces:
+/// `created_via = "merge-conflict:<crz_id>"`, parent = the chore, and (as
+/// in the steady-state loop) the row already flipped to `active`.
+fn insert_conflict_revision_row(
+    db: &WorkDb,
+    product_id: &str,
+    parent_task_id: &str,
+    crz_id: &str,
+) -> String {
+    let conn = db.connect().unwrap();
+    let id = next_id("task");
+    let now = now_string();
+    let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{crz_id}");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Resolve merge conflict against main', '', 'active', ?3, ?3, 0, ?4, ?5)",
+        rusqlite::params![id, product_id, now, created_via, parent_task_id],
+    )
+    .unwrap();
+    id
+}
+
+/// (id, status) of every execution bound to `work_item_id`, oldest first.
+fn executions_for(db: &WorkDb, work_item_id: &str) -> Vec<(String, String)> {
+    let conn = db.connect().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, status FROM work_executions
+             WHERE work_item_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(rusqlite::params![work_item_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn task_status(db: &WorkDb, task_id: &str) -> String {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM tasks WHERE id = ?1",
+            rusqlite::params![task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+}
+
+/// Regression (T906 / PR #970): a merge-conflict revision must stop being
+/// re-dispatched once its `conflict_resolutions` attempt has retired
+/// (`succeeded`), even though the chore PR is still open + `in_review`.
+///
+/// Before the fix, `reconcile_revision_execution` only consulted the chain
+/// root's `pr_url`/`status` — neither of which reflects a *resolved*
+/// conflict on an open PR — so it minted a fresh `revision_implementation`
+/// execution on every reconcile tick. A queued `ready` row would then be
+/// picked up and `start_execution_run` would flip the revision from
+/// `in_review` straight back to `active`, defeating any operator attempt to
+/// move the card to Review. The attempt could accumulate 8+ executions.
+///
+/// After the fix: a retired attempt drops the queued execution and settles
+/// the revision to `in_review`; no new execution is created.
+#[test]
+fn merge_conflict_revision_stops_dispatch_after_attempt_succeeds() {
+    let db = WorkDb::open(temp_db_path("crz-revision-stop-dispatch")).unwrap();
+    let product_id = make_revision_product(&db, "crz-stop");
+    let pr_url = "https://github.com/spinyfin/mono/pull/970";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let crz = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product_id.clone(),
+            work_item_id: chore_id.clone(),
+            pr_url: pr_url.to_owned(),
+            pr_number: 970,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base-1".into()),
+            head_sha_before: Some("head-1".into()),
+        })
+        .unwrap()
+        .unwrap();
+    let revision_id = insert_conflict_revision_row(&db, &product_id, &chore_id, &crz.id);
+    db.set_conflict_resolution_revision_task_id(&crz.id, &revision_id)
+        .unwrap();
+
+    // First reconcile: attempt is still `pending`, so the revision dispatches
+    // normally — this is the behaviour the fix must preserve.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_first = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_first.len(),
+        1,
+        "a pending attempt must still dispatch the revision once: {after_first:?}",
+    );
+    assert_eq!(after_first[0].1, "ready");
+
+    // Conflict resolves: the PR is now CLEAN and the attempt retires. The
+    // `ready` execution from above is still queued (the exact race that
+    // makes a manual move-to-Review pointless).
+    db.mark_conflict_resolution_succeeded(&crz.id, None).unwrap();
+
+    // Second reconcile: the fix must NOT mint another execution.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_second = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_second.len(),
+        1,
+        "no new execution may be created once the attempt has retired: {after_second:?}",
+    );
+    assert_eq!(
+        after_second[0].1, "abandoned",
+        "the leftover queued execution must be abandoned so start_execution_run \
+         can't flip the revision back to active",
+    );
+    assert_eq!(
+        task_status(&db, &revision_id),
+        "in_review",
+        "the revision must be settled to in_review once its fix vehicle is spent",
+    );
+
+    // Third reconcile: idempotent — the in_review revision is no longer
+    // dispatchable, so nothing changes and the loop stays broken.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_third = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_third.len(),
+        1,
+        "reconcile must remain a no-op for a settled revision: {after_third:?}",
+    );
+    assert_eq!(task_status(&db, &revision_id), "in_review");
+}
+
+/// Guard against over-blocking: while the attempt is still active
+/// (`pending`/`running`), a revision whose previous execution died must
+/// still be re-dispatched. The fix only short-circuits *retired* attempts.
+#[test]
+fn merge_conflict_revision_still_redispatches_while_attempt_active() {
+    let db = WorkDb::open(temp_db_path("crz-revision-active-redispatch")).unwrap();
+    let product_id = make_revision_product(&db, "crz-active");
+    let pr_url = "https://github.com/spinyfin/mono/pull/971";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let crz = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product_id.clone(),
+            work_item_id: chore_id.clone(),
+            pr_url: pr_url.to_owned(),
+            pr_number: 971,
+            head_branch: "feature".into(),
+            base_branch: "main".into(),
+            base_sha_at_trigger: Some("base-1".into()),
+            head_sha_before: Some("head-1".into()),
+        })
+        .unwrap()
+        .unwrap();
+    let revision_id = insert_conflict_revision_row(&db, &product_id, &chore_id, &crz.id);
+    db.set_conflict_resolution_revision_task_id(&crz.id, &revision_id)
+        .unwrap();
+
+    // First dispatch, then simulate a dead worker (execution orphaned).
+    db.reconcile_product_executions(&product_id).unwrap();
+    let first = executions_for(&db, &revision_id);
+    assert_eq!(first.len(), 1);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'orphaned' WHERE id = ?1",
+            rusqlite::params![first[0].0],
+        )
+        .unwrap();
+
+    // Attempt is still pending → reconcile must re-dispatch a fresh execution.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let second = executions_for(&db, &revision_id);
+    assert_eq!(
+        second.len(),
+        2,
+        "an active attempt must still re-dispatch after a worker dies: {second:?}",
+    );
+    assert!(
+        second.iter().any(|(_, status)| status == "ready"),
+        "a fresh ready execution must exist while the attempt is active: {second:?}",
+    );
+    assert_eq!(
+        task_status(&db, &revision_id),
+        "active",
+        "the revision must stay dispatchable while its attempt is active",
+    );
+}
