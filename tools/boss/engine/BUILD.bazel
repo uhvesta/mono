@@ -62,6 +62,7 @@ rust_library(
         "src/spawn_flow.rs",
         "src/ssh_transport.rs",
         "src/stale_worker_sweep.rs",
+        "src/syspolicyd_monitor.rs",
         "src/transcript_tail.rs",
         "src/transient_error.rs",
         "src/transient_recovery.rs",
