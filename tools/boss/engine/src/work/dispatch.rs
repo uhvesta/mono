@@ -608,4 +608,74 @@ impl WorkDb {
         )?;
         Ok(())
     }
+
+    /// Find a *stale* cube lease that the engine recorded against
+    /// `workspace_id` and that is safe to force-release before a
+    /// resume re-leases the same workspace.
+    ///
+    /// This closes the lease-reclaim half of the UI-crash recovery
+    /// path (issue #962, the "mono-agent-003" scenario). When the app
+    /// crashes, the dead worker's execution is marked `orphaned` but
+    /// its cube workspace lease is intentionally left intact so the
+    /// resume worker can recover the in-flight jj checkout via
+    /// `cube workspace lease --prefer <workspace>`. The problem: cube
+    /// still sees that workspace as `leased` to the dead execution, so
+    /// the `--prefer` lease is refused and the hard-prefer resume fails
+    /// outright -- silently stranding the local work. The dispatcher
+    /// must therefore reclaim the dead lease first.
+    ///
+    /// Safety: returns `Some(lease_id)` **only** when the lease the
+    /// caller observed cube holding (`current_lease_id`) is recorded in
+    /// the engine's own `work_executions` table against a now-*terminal*
+    /// execution for `workspace_id`, AND no live (`running` /
+    /// `waiting_human`) execution currently claims that workspace. This
+    /// guarantees we never force-release a lease backing a genuinely
+    /// live worker -- only one whose owning execution the engine has
+    /// already reaped. Returns `None` (do not reclaim) otherwise.
+    pub fn stale_lease_to_reclaim_for_workspace(
+        &self,
+        workspace_id: &str,
+        current_lease_id: &str,
+    ) -> Result<Option<String>> {
+        if workspace_id.is_empty() || current_lease_id.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.connect()?;
+
+        // Never reclaim while a live execution still claims the
+        // workspace -- that lease is legitimately in use.
+        let live_holder: Option<String> = conn
+            .query_row(
+                "SELECT id FROM work_executions
+                 WHERE cube_workspace_id = ?1
+                   AND status IN ('running', 'waiting_human')
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                rusqlite::params![workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if live_holder.is_some() {
+            return Ok(None);
+        }
+
+        // The lease cube reports holding the workspace must match a
+        // terminal execution row the engine recorded against this same
+        // workspace. Matching on both the lease id and the workspace id
+        // ensures we only reclaim the dead worker's own lease, not an
+        // unrelated one that happens to occupy the slot.
+        let terminal_owner: Option<String> = conn
+            .query_row(
+                "SELECT id FROM work_executions
+                 WHERE cube_workspace_id = ?1
+                   AND cube_lease_id = ?2
+                   AND status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                rusqlite::params![workspace_id, current_lease_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(terminal_owner.map(|_| current_lease_id.to_owned()))
+    }
 }

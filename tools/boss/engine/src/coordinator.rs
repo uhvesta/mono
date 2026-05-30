@@ -222,7 +222,8 @@ pub struct CubeChangeHandle {
     pub change_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CubeWorkspaceStatus {
     pub workspace_id: String,
     pub workspace_path: PathBuf,
@@ -1835,6 +1836,116 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Reclaim a stale cube lease still held against `workspace_id` by a
+    /// dead (now-terminal) execution, so a hard-prefer resume can
+    /// re-lease that exact workspace and recover the in-flight jj
+    /// checkout. See [`crate::work::WorkDb::stale_lease_to_reclaim_for_workspace`]
+    /// and issue #962 for the full rationale.
+    ///
+    /// Best-effort: probes cube's live view (`list_workspaces`) for the
+    /// lease currently bound to `workspace_id`, cross-checks it against
+    /// the engine's own record (only a lease whose owning execution is
+    /// terminal and unclaimed is eligible), and force-releases it. Every
+    /// failure mode is logged and swallowed — the caller proceeds to the
+    /// normal lease attempt regardless, so a flaky cube probe never
+    /// blocks a resume.
+    async fn reclaim_stale_lease_for_resume(
+        &self,
+        execution: &WorkExecution,
+        worker_id: &str,
+        workspace_id: &str,
+    ) {
+        let snapshot = match self.host_adapter.list_workspaces().await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    workspace_id,
+                    error = format!("{err:#}"),
+                    "stale-lease reclaim: cube workspace list failed; proceeding to lease without reclaim",
+                );
+                return;
+            }
+        };
+        let Some(workspace) = snapshot.iter().find(|w| w.workspace_id == workspace_id) else {
+            // Cube doesn't list the workspace, or it's already free —
+            // nothing to reclaim, the lease attempt can proceed.
+            return;
+        };
+        if workspace.state != "leased" {
+            return;
+        }
+        let Some(current_lease_id) = workspace.lease_id.as_deref() else {
+            return;
+        };
+
+        // Only reclaim a lease the engine can prove belongs to a dead
+        // (terminal, unclaimed) execution for this workspace.
+        let stale_lease_id = match self
+            .work_db
+            .stale_lease_to_reclaim_for_workspace(workspace_id, current_lease_id)
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    workspace_id,
+                    current_lease_id,
+                    ?err,
+                    "stale-lease reclaim: DB lookup failed; proceeding to lease without reclaim",
+                );
+                return;
+            }
+        };
+
+        let reason = format!(
+            "boss engine: reclaiming stale lease for UI-crash resume of execution {} (workspace {workspace_id})",
+            execution.id,
+        );
+        match self
+            .host_adapter
+            .force_release_lease(&stale_lease_id, Some(reason.as_str()))
+            .await
+        {
+            Ok(()) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    worker_id,
+                    workspace_id,
+                    reclaimed_lease_id = %stale_lease_id,
+                    "stale-lease reclaim: force-released dead worker's lease so resume can re-lease its workspace",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::CubeWorkspaceLeaseAttempted,
+                            DispatchOutcome::Ok,
+                            &execution.id,
+                        )
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_details(serde_json::json!({
+                            "step": "stale_lease_reclaim",
+                            "workspace_id": workspace_id,
+                            "reclaimed_lease_id": stale_lease_id.as_str(),
+                        })),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    worker_id,
+                    workspace_id,
+                    stale_lease_id = %stale_lease_id,
+                    error = format!("{err:#}"),
+                    "stale-lease reclaim: force-release failed; proceeding to lease attempt anyway",
+                );
+            }
+        }
+    }
+
     /// Lease a cube workspace for `execution`, emitting a structured
     /// attempt/failure event for every try and falling back to "any
     /// free workspace" when an unprefixed lease fails.
@@ -1875,6 +1986,26 @@ impl ExecutionCoordinator {
         } else {
             "none"
         };
+
+        // Stale-lease reclaim (issue #962 — UI-crash resume).
+        //
+        // A hard-prefer resume targets the exact workspace the dead
+        // worker was leased into, because the in-flight jj checkout the
+        // human wants recovered lives only there. But after a UI crash
+        // the dead execution's cube lease is intentionally left intact
+        // (the startup reaper preserves it), so cube still reports that
+        // workspace as `leased` and will refuse a fresh
+        // `--prefer <workspace>` lease — failing the resume outright and
+        // stranding the local work. Before attempting the prefer lease,
+        // reclaim the dead lease if (and only if) the engine can prove
+        // it belongs to a now-terminal execution and no live execution
+        // claims the workspace. Best-effort: any probe/reclaim error is
+        // logged and we fall through to the normal lease attempt rather
+        // than blocking the resume.
+        if let Some(workspace_id) = prefer.filter(|_| !execution.prefer_is_soft) {
+            self.reclaim_stale_lease_for_resume(execution, worker_id, workspace_id)
+                .await;
+        }
 
         // Build the lease args for attempt 1 so we can attach the
         // exact command to both the attempted and failed events.
@@ -2970,6 +3101,10 @@ mod tests {
         fail_first_n_leases: usize,
         fail_create: bool,
         next_workspace_id: Mutex<Option<String>>,
+        /// Canned response for `list_workspaces` — lets a test model cube
+        /// reporting a workspace still leased to a dead worker so the
+        /// stale-lease reclaim path (issue #962) can be exercised.
+        list_workspaces_response: Mutex<Vec<CubeWorkspaceStatus>>,
     }
 
     impl FakeCubeClient {
@@ -2980,6 +3115,11 @@ mod tests {
 
         fn with_repos(self, repos: Vec<CubeRepoSummary>) -> Self {
             *self.repos.try_lock().expect("uncontended") = repos;
+            self
+        }
+
+        fn with_list_workspaces(self, rows: Vec<CubeWorkspaceStatus>) -> Self {
+            *self.list_workspaces_response.try_lock().expect("uncontended") = rows;
             self
         }
     }
@@ -3067,16 +3207,16 @@ mod tests {
                 .lock()
                 .await
                 .push(workspace_path.to_path_buf());
-            Ok(CubeWorkspaceStatus {
-                workspace_id: "mono-agent-001".to_owned(),
-                workspace_path: workspace_path.to_path_buf(),
-                state: "leased".to_owned(),
-                lease_id: Some("lease-1".to_owned()),
-                holder: Some("boss/0".to_owned()),
-                task: Some("test task".to_owned()),
-                leased_at_epoch_s: Some(1_700_000_000),
-                lease_expires_at_epoch_s: Some(1_700_001_800),
-            })
+            Ok(CubeWorkspaceStatus::builder()
+                .workspace_id("mono-agent-001")
+                .workspace_path(workspace_path.to_path_buf())
+                .state("leased")
+                .lease_id("lease-1")
+                .holder("boss/0")
+                .task("test task")
+                .leased_at_epoch_s(1_700_000_000)
+                .lease_expires_at_epoch_s(1_700_001_800)
+                .build())
         }
 
         async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
@@ -3100,7 +3240,7 @@ mod tests {
         }
 
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            Ok(Vec::new())
+            Ok(self.list_workspaces_response.lock().await.clone())
         }
 
         async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
@@ -4717,6 +4857,189 @@ mod tests {
         );
         assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
     }
+
+    /// Issue #962 -- the UI-crash resume reclaims a stale lease.
+    ///
+    /// A prior worker (the dead execution) was leased into
+    /// `mono-agent-003` and then orphaned by the startup reaper, which
+    /// preserved its `cube_lease_id` / `cube_workspace_id`. Cube still
+    /// reports that workspace `leased` to the dead `lease-dead`. When the
+    /// hard-prefer resume dispatches, the coordinator must force-release
+    /// the dead lease first so the `--prefer` re-lease can succeed and
+    /// recover the in-flight checkout -- instead of failing the resume
+    /// and stranding the local work.
+    #[tokio::test]
+    async fn hard_prefer_resume_reclaims_stale_lease_then_leases() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Resume me")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        // autostart=false means reconcile won't auto-create an execution;
+        // request one explicitly to seed the dead-predecessor record.
+        db.request_execution(RequestExecutionInput {
+            work_item_id: chore.id.clone(),
+            priority: None,
+            preferred_workspace_id: None,
+            force: false,
+        })
+        .unwrap();
+
+        // Dead predecessor: started a run on mono-agent-003 with
+        // lease-dead, then orphaned (lease columns preserved).
+        let dead_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+        db.start_execution_run(
+            &dead_id,
+            "agent-dead",
+            "mono",
+            "lease-dead",
+            "mono-agent-003",
+            "/tmp/mono-agent-003",
+        )
+        .unwrap();
+        db.mark_execution_orphaned(&dead_id, "ui crash").unwrap();
+
+        // Resume execution: hard prefer back onto mono-agent-003.
+        let resume = db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: Some("mono-agent-003".to_owned()),
+                force: false,
+            })
+            .unwrap();
+
+        // Cube reports mono-agent-003 still leased to the dead lease.
+        let cube = Arc::new(FakeCubeClient::default().with_list_workspaces(vec![
+            CubeWorkspaceStatus::builder()
+                .workspace_id("mono-agent-003")
+                .workspace_path(PathBuf::from("/tmp/mono-agent-003"))
+                .state("leased")
+                .lease_id("lease-dead")
+                .holder("dead@host:1")
+                .task("resume")
+                .leased_at_epoch_s(1_700_000_000)
+                .build(),
+        ]));
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        let repo = CubeRepoHandle {
+            repo_id: "mono".to_owned(),
+        };
+
+        let result = coordinator
+            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task")
+            .await;
+        assert!(result.is_ok(), "resume lease should succeed after reclaim");
+
+        // The dead lease was force-released exactly once.
+        let releases = cube.force_release_calls.lock().await;
+        assert_eq!(releases.len(), 1, "stale lease must be reclaimed once");
+        assert_eq!(releases[0].0, "lease-dead");
+        drop(releases);
+
+        // The prefer lease was then issued for the same workspace.
+        let calls = cube.lease_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2.as_deref(), Some("mono-agent-003"));
+    }
+
+    /// Safety: a hard-prefer resume must NOT force-release a lease that
+    /// cube reports holding a workspace the engine has no terminal
+    /// record for (e.g. a genuinely live worker in another slot). The
+    /// reclaim probe runs but finds nothing eligible, so the lease
+    /// attempt proceeds without any force-release.
+    #[tokio::test]
+    async fn hard_prefer_resume_does_not_reclaim_unowned_lease() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Resume me".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        let resume = db
+            .request_execution(RequestExecutionInput {
+                work_item_id: chore.id.clone(),
+                priority: None,
+                preferred_workspace_id: Some("mono-agent-007".to_owned()),
+                force: false,
+            })
+            .unwrap();
+
+        // Cube reports the workspace leased to a lease the engine has no
+        // terminal execution record for.
+        let cube = Arc::new(FakeCubeClient::default().with_list_workspaces(vec![
+            CubeWorkspaceStatus::builder()
+                .workspace_id("mono-agent-007")
+                .workspace_path(PathBuf::from("/tmp/mono-agent-007"))
+                .state("leased")
+                .lease_id("lease-unknown")
+                .holder("someone@host:9")
+                .task("other")
+                .leased_at_epoch_s(1_700_000_000)
+                .build(),
+        ]));
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        ));
+        let repo = CubeRepoHandle {
+            repo_id: "mono".to_owned(),
+        };
+
+        let _ = coordinator
+            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task")
+            .await;
+
+        let releases = cube.force_release_calls.lock().await;
+        assert!(
+            releases.is_empty(),
+            "must not reclaim a lease the engine doesn't own",
+        );
+    }
+
 
     /// When `preferred_workspace_id=null` and cube fails the first workspace
     /// (e.g. because it has uncommitted work from a prior crashed lease),
