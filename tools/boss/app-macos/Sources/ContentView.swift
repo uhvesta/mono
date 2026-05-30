@@ -1810,7 +1810,10 @@ struct WorkBoardCardView: View {
             if hasFooterContent {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        PriorityChip(priority: WorkPriority.parse(task.priority))
+                        let parsedPriority = WorkPriority.parse(task.priority)
+                        if parsedPriority == .high {
+                            PriorityChip(priority: parsedPriority)
+                        }
                         if let effortLevel = task.effortLevel {
                             EffortChip(effortLevel: effortLevel)
                         }
