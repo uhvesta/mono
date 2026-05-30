@@ -227,6 +227,9 @@ enum EngineEvent {
     /// engine's device-flow poll loop advances. The DTO is display-safe;
     /// the token and private device code never appear in it.
     case gitHubAuthState(state: GitHubAuthState)
+    /// Response to `list_executions` — all historical execution rows for
+    /// one task, newest-first. Drives the transcript viewer's left pane.
+    case executionsList(taskId: String, executions: [ExecutionVM])
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -596,6 +599,15 @@ final class EngineClient: @unchecked Sendable {
     func sendRegisterAppSession() {
         sendLine([
             "type": "register_app_session",
+        ])
+    }
+
+    /// Ask the engine for all historical executions of `taskId`, newest-first.
+    /// The engine replies with `executions_list`.
+    func sendListExecutions(taskId: String) {
+        sendLine([
+            "type": "list_executions",
+            "task_id": taskId,
         ])
     }
 
@@ -1251,6 +1263,13 @@ final class EngineClient: @unchecked Sendable {
                     break
                 }
                 emit(.gitHubAuthState(state: state))
+            case "executions_list":
+                let taskId = payload["task_id"] as? String ?? ""
+                let raw = payload["executions"] as? [[String: Any]] ?? []
+                let executions = raw.compactMap(parseExecutionVM)
+                if !taskId.isEmpty {
+                    emit(.executionsList(taskId: taskId, executions: executions))
+                }
             default:
                 break
             }
@@ -1655,6 +1674,25 @@ final class EngineClient: @unchecked Sendable {
             value: value,
             timestampMs: timestampMs,
             stale: stale
+        )
+    }
+
+    private func parseExecutionVM(_ payload: [String: Any]) -> ExecutionVM? {
+        guard let id = payload["id"] as? String,
+              !id.isEmpty,
+              let kind = payload["kind"] as? String,
+              let status = payload["status"] as? String
+        else {
+            return nil
+        }
+        return ExecutionVM(
+            id: id,
+            kind: kind,
+            status: status,
+            model: payload["model"] as? String,
+            runId: payload["run_id"] as? String,
+            startedAt: payload["started_at"] as? String,
+            endedAt: payload["ended_at"] as? String
         )
     }
 }
