@@ -786,6 +786,10 @@ fn compose_execution_prompt(
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
         }
+        // Issue #899: hand the worker the engine's CI-completion definition
+        // so it stops once CI is effectively green rather than polling
+        // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
+        prompt.push_str(&ci_monitoring_directive(execution));
     }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -833,6 +837,55 @@ fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
          If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit an `[effort-escalation]` marker in your final response with the failing/timed-out command and its output, and stop. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
             .to_string(),
     )
+}
+
+/// Post-PR CI-monitoring directive (issue #899). A worker that opens a
+/// PR and then sits in a `gh pr checks` poll-loop "until every check is
+/// green" never completes under CI models where some required checks are
+/// gated on a human action and never auto-resolve — LinkedIn's
+/// `Owner Approval` is the canonical case. The engine's merge poller
+/// already classifies CI correctly for these orgs: it partitions the
+/// human-gated checks out of the CI rollup
+/// (`merge_poller::review_signal_checks_for_owner`) before deciding the
+/// PR is "effectively green", and auto-transitions the task to Review.
+/// The worker had no share of that knowledge and so polled forever.
+///
+/// This block hands the worker the *same* CI-completion definition the
+/// engine uses, sourced from the *same* table — when the PR's org ships
+/// human-gated checks, they are named verbatim from
+/// `review_signal_checks_for_owner` so the worker's "don't wait on these"
+/// list and the engine's "these don't block CI-clean" set cannot drift.
+fn ci_monitoring_directive(execution: &WorkExecution) -> String {
+    let mut out = String::new();
+    out.push_str("\n## After the PR is open: do not babysit CI\n\n");
+    out.push_str(
+        "Once your branch is pushed and the PR exists, your deliverable is done — print the PR URL and stop. Do NOT sit in a loop polling `gh pr checks` / `gh pr view` waiting for every check to turn green. That loop can run forever and strands your slot.\n\n",
+    );
+    out.push_str(
+        "Why this is safe: the engine polls this PR's CI on its own cadence and auto-transitions the task to Review the moment CI is *effectively green*. \"Effectively green\" matches the engine's own definition — every required CI check has reached a passing terminal state (`SUCCESS`, `NEUTRAL`, or `SKIPPED`). It deliberately does NOT require checks that are gated on a human action and never resolve from CI alone; waiting on those is waiting forever.\n\n",
+    );
+    // Name the human-gated checks for this PR's org from the *same* table
+    // the engine's CI classifier reclassifies on, so the two lists are
+    // sourced once. Empty for orgs without review-signal rules — then the
+    // general guidance above stands on its own.
+    if let Ok(slug) = crate::completion::parse_repo_slug(&execution.repo_remote_url) {
+        let owner = slug.split('/').next().unwrap_or("");
+        let names = crate::merge_poller::review_signal_checks_for_owner(owner);
+        if !names.is_empty() {
+            let rendered = names
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "This PR's org (`{owner}`) ships required check(s) that are human-gated and never auto-resolve from CI: {rendered}. The engine's CI-completion check treats them as NOT blocking — they stay pending until a human approves. You must do the same: their pending/running state is not a reason to keep this run alive.\n\n",
+            ));
+        }
+    }
+    out.push_str(
+        "A required CI check that has genuinely *failed* (not merely pending) is different — fix it and push, or escalate per the build-gate rules above. But a still-running or human-gated check never blocks your completion.\n",
+    );
+    out
 }
 
 /// Directive block for the synthetic `kind = 'design'` task that the
@@ -1962,6 +2015,95 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("boss/exec_abc123_01"),
             "recovery block should mention the new expected branch name:\n{prompt}",
+        );
+    }
+
+    /// Like `base_execution` but pointed at a given repo remote, so the
+    /// CI-monitoring directive's org-specific branch can be exercised.
+    fn execution_for_remote(remote: &str) -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_abc123_01")
+            .work_item_id("task-1")
+            .kind("chore_implementation")
+            .status("pending")
+            .repo_remote_url(remote.to_string())
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
+    }
+
+    #[test]
+    fn ci_monitoring_directive_present_for_implementation_chore() {
+        // Issue #899: the worker must be told not to poll CI forever, and
+        // that the engine auto-transitions to Review once CI is effectively
+        // green. This general guidance applies regardless of org.
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("do not babysit CI"),
+            "missing CI-monitoring directive:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("effectively green"),
+            "directive should reference the engine's effectively-green definition:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn ci_monitoring_directive_names_human_gated_checks_for_linkedin_org() {
+        // The human-gated check name must be sourced from the engine's
+        // REVIEW_SIGNAL_RULES table (via review_signal_checks_for_owner),
+        // not re-hardcoded in the prompt — single sourcing is the fix.
+        let exec = execution_for_remote("git@github.com:linkedin-multiproduct/some-repo.git");
+        let prompt = compose_execution_prompt(
+            &exec,
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("Owner Approval"),
+            "directive should name the org's human-gated check:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("linkedin-multiproduct"),
+            "directive should name the org:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn ci_monitoring_directive_omits_human_gated_names_for_plain_org() {
+        // A non-LinkedIn org has no review-signal rules; the directive's
+        // general guidance stands alone without naming any check.
+        let prompt = compose_execution_prompt(
+            &execution_for_remote("git@github.com:org/repo.git"),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            prompt.contains("do not babysit CI"),
+            "general directive should still be present:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("Owner Approval"),
+            "no human-gated check should be named for a plain org:\n{prompt}",
         );
     }
 
