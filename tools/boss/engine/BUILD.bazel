@@ -43,6 +43,7 @@ rust_library(
         "src/live_status_redact.rs",
         "src/live_worker_state.rs",
         "src/merge_poller.rs",
+        "src/merge_when_ready.rs",
         "src/metrics/mod.rs",
         "src/metrics/persistence.rs",
         "src/metrics/registry.rs",

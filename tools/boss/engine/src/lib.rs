@@ -32,6 +32,7 @@ pub mod live_status_loop;
 pub mod live_status_redact;
 pub mod live_worker_state;
 pub mod merge_poller;
+pub mod merge_when_ready;
 pub mod metrics;
 pub mod nudge_breaker;
 pub mod orphan_sweep;

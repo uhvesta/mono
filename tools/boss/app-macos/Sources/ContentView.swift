@@ -1480,6 +1480,13 @@ private struct WorkBoardCardItem: View {
                     },
                     onOpenReviewTerminal: ((column == .review || column == .done) && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
                         ? { model.openReviewTerminal(for: task) }
+                        : nil,
+                    onMergeWhenReady: (column == .review &&
+                                       task.status == "in_review" &&
+                                       task.prURL != nil &&
+                                       !(task.prURL?.isEmpty ?? true) &&
+                                       task.mergeQueueState != "queued")
+                        ? { model.mergeWhenReady(for: task) }
                         : nil
                 )
             }
@@ -1703,8 +1710,14 @@ struct WorkBoardCardView: View {
     /// card. `nil` hides the button — callers only pass a closure when
     /// `column == .review && task.prURL != nil`.
     var onOpenReviewTerminal: (() -> Void)? = nil
+    /// Invoked after the user confirms the "Merge When Ready" button on a
+    /// Review-column card. `nil` hides the button — callers only pass a
+    /// closure when the card is in the Review lane, has a PR URL, and the
+    /// PR is not already in the merge queue (`mergeQueueState != "queued"`).
+    var onMergeWhenReady: (() -> Void)? = nil
 
     @State private var isHovered: Bool = false
+    @State private var showMergeConfirmation: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1879,6 +1892,30 @@ struct WorkBoardCardView: View {
                             }
                             .buttonStyle(.plain)
                             .help("Open terminal on PR branch")
+                        }
+                        if onMergeWhenReady != nil {
+                            Button {
+                                showMergeConfirmation = true
+                            } label: {
+                                Image(systemName: "arrow.triangle.merge")
+                                    .font(.caption)
+                                    .foregroundStyle(Color.secondary)
+                                    .accessibilityLabel("Merge when ready")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
+                            .confirmationDialog(
+                                "Merge When Ready",
+                                isPresented: $showMergeConfirmation,
+                                titleVisibility: .visible
+                            ) {
+                                Button("Confirm Merge When Ready") {
+                                    onMergeWhenReady?()
+                                }
+                                Button("Cancel", role: .cancel) {}
+                            } message: {
+                                Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
+                            }
                         }
                     }
                     if stacksStatusBadges {

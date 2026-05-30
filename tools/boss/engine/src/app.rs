@@ -26,6 +26,7 @@ use crate::live_status_loop::{
 };
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
+use crate::merge_when_ready;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
@@ -7371,6 +7372,100 @@ async fn handle_frontend_connection(
                         controller.update_org_state(resolved);
                     });
                 }
+            }
+            FrontendRequest::MergeWhenReady { work_item_id } => {
+                // Pre-flight: task must exist and be a Task/Chore.
+                let item = match work_db.get_work_item(&work_item_id) {
+                    Ok(item) => item,
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "merge_when_ready: unknown work item: {err}"
+                                ),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let (pr_url, task_status) = match &item {
+                    WorkItem::Task(task) | WorkItem::Chore(task) => {
+                        (task.pr_url.clone(), task.status.clone())
+                    }
+                    _ => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: "merge_when_ready: only supported for tasks/chores"
+                                    .to_owned(),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                if task_status != "in_review" {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: format!(
+                                "merge_when_ready: task is not in review (status: {task_status})"
+                            ),
+                        },
+                    );
+                    continue;
+                }
+                let pr_url = match pr_url.filter(|s| !s.is_empty()) {
+                    Some(u) => u,
+                    None => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: "merge_when_ready: task has no PR URL".to_owned(),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                // Spawn the GitHub interaction so the main loop isn't blocked.
+                let sink2 = sink.clone();
+                let request_id2 = request_id.clone();
+                let work_item_id2 = work_item_id.clone();
+                let pr_url2 = pr_url.clone();
+                let kick = server_state.pr_reconciler_kick.clone();
+                tokio::spawn(async move {
+                    match merge_when_ready::gh_merge_when_ready(&pr_url2).await {
+                        Ok(action) => {
+                            // Kick the PR reconciler so the kanban state
+                            // reflects the new merge-queue / auto-merge
+                            // state promptly without waiting for the next
+                            // periodic sweep.
+                            kick.notify_one();
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::MergeWhenReadyAccepted {
+                                    work_item_id: work_item_id2,
+                                    pr_url: pr_url2,
+                                    action: action.as_str().to_owned(),
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            send_response(
+                                &sink2,
+                                &request_id2,
+                                FrontendEvent::WorkError {
+                                    message: format!("merge_when_ready failed: {err:#}"),
+                                },
+                            );
+                        }
+                    }
+                });
             }
             FrontendRequest::OpenReviewTerminal { work_item_id } => {
                 let item = match work_db.get_work_item(&work_item_id) {
