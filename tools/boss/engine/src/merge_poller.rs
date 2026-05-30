@@ -930,7 +930,13 @@ const REVIEW_SIGNAL_RULES: &[(&str, &[&str])] = &[
 /// The list of status-check `context` names to reclassify for `owner`.
 /// Empty slice for unconfigured owners — the call site partitions on
 /// that and the rollup is classified normally.
-fn review_signal_checks_for_owner(owner: &str) -> &'static [&'static str] {
+///
+/// `pub(crate)` so the worker-prompt composer (`runner.rs`) can name the
+/// same human-gated checks the CI classifier here reclassifies. That
+/// single sourcing is the point of issue #899: the worker's
+/// "don't wait on these checks" guidance and the engine's
+/// "these checks don't block CI-clean" detection must not drift apart.
+pub(crate) fn review_signal_checks_for_owner(owner: &str) -> &'static [&'static str] {
     for (org, names) in REVIEW_SIGNAL_RULES {
         if org.eq_ignore_ascii_case(owner) {
             return names;
