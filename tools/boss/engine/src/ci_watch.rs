@@ -1013,6 +1013,122 @@ pub async fn on_ci_in_flight(
     target_bucket
 }
 
+/// Issue #901: a newer in-progress CI run supersedes an older failing
+/// result. When the probe reports `InFlight` for a PR whose chore is
+/// still parked in `blocked: ci_failure` (or `ci_failure_exhausted`)
+/// from a prior run, that failing result is stale — `classify_ci` only
+/// yields `InFlight` when *no* required check is currently failing
+/// (Fail dominates InFlight in the rollup collapse), so the card must
+/// not keep asserting a failure while CI is being re-evaluated. Flip the
+/// chore back to `in_review` and emit `CiFailureCleared` so the UI drops
+/// the stale "ci failing" badge. The yellow-clock indicator is written
+/// separately by `update_pr_poll_state` (`ci_required_state =
+/// in_progress`) in the same sweep, so once this clears the card shows a
+/// single, coherent "in progress" state instead of the contradictory
+/// pair the issue reported.
+///
+/// Guards:
+///   * An *active* `ci_remediations` attempt owns the slot: its own fix
+///     push is what re-triggered CI, and its in-flight chip legitimately
+///     reads "ci failing (used/budget)" — i.e. "auto-fix running". We
+///     leave that case to the attempt's terminal transition
+///     (`on_ci_resolved` → `CiRemediationSucceeded`, or a fresh
+///     `Failing` probe), so an in-flight remediation is never cleared
+///     here.
+///   * The same `auto_pr_maintenance` opt-out as the detect / retire
+///     paths is respected.
+///   * Unlike `on_ci_resolved`, we do NOT reset the CI budget counter:
+///     the run has not passed yet, so a subsequent failure must keep
+///     consuming the remaining budget. Only a confirmed Clean transition
+///     earns a fresh budget.
+///
+/// Returns `true` when the chore actually transitioned back to
+/// `in_review` on this call; `false` (cheap no-op) when there was no
+/// stale failure to supersede, a remediation is active, or the opt-out
+/// is set.
+pub async fn on_ci_in_flight_supersedes_failure(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    labels: &[String],
+) -> bool {
+    if auto_pr_maintenance_disabled(work_db, candidate, labels) {
+        return false;
+    }
+
+    // An active remediation attempt's own re-run must not clear its
+    // in-flight tracking — only a genuinely stale failure (no attempt in
+    // flight) is superseded here.
+    match work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) {
+        Ok(Some(_)) => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "ci_watch: InFlight with active remediation; leaving the in-flight badge \
+                 to the attempt's terminal transition",
+            );
+            return false;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to look up active ci_remediation; skipping InFlight supersede",
+            );
+            return false;
+        }
+    }
+
+    let task_transitioned = match work_db
+        .clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url)
+    {
+        Ok(Some(_)) => true,
+        // Common path: the chore is already `in_review` (no stale failure
+        // to supersede). Cheap WHERE-guard no-op.
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to clear stale blocked: ci_failure on InFlight",
+            );
+            return false;
+        }
+    };
+
+    if !task_transitioned {
+        return false;
+    }
+
+    publisher
+        .publish_work_item_changed(
+            &candidate.product_id,
+            &candidate.work_item_id,
+            "ci_failure_superseded_in_progress",
+        )
+        .await;
+    publisher
+        .publish_frontend_event_on_product(
+            &candidate.product_id,
+            FrontendEvent::CiFailureCleared {
+                product_id: candidate.product_id.clone(),
+                work_item_id: candidate.work_item_id.clone(),
+                pr_url: candidate.pr_url.clone(),
+            },
+        )
+        .await;
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        "ci_watch: newer in-progress CI run superseded a stale ci_failure; \
+         chore returned to in_review",
+    );
+    true
+}
+
 /// Symmetric retire path: flip a `blocked: ci_failure` (or
 /// `ci_failure_exhausted`) row back to `in_review` when the probe
 /// says CI is green again. Returns `true` on transition.
@@ -1861,6 +1977,165 @@ mod tests {
             )),
             "CiRemediationSucceeded must NOT be emitted when there is no active attempt"
         );
+    }
+
+    /// Issue #901: a chore left in `blocked: ci_failure` from a prior
+    /// run is superseded once CI re-enters InFlight (no active
+    /// remediation). The chore returns to `in_review`, `CiFailureCleared`
+    /// is emitted so the UI drops the stale badge, and the CI budget
+    /// counter is preserved (the run hasn't passed yet).
+    #[tokio::test]
+    async fn in_flight_supersedes_stale_ci_failure() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/901";
+        let (product, chore) = make_in_review(&db, "C-supersede", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // 1. Detect failure → blocked: ci_failure, budget=1, attempt
+        //    created. Then mark the attempt failed so no active
+        //    remediation remains (a worker that ran but couldn't push).
+        on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+        let attempt = db
+            .active_ci_remediation_for_work_item(&chore)
+            .unwrap()
+            .expect("attempt row");
+        db.mark_ci_remediation_failed(&attempt.id, "no_push_no_classification")
+            .unwrap();
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+
+        // 2. CI re-runs (InFlight) — the stale failure is superseded.
+        let cleared = on_ci_in_flight_supersedes_failure(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(cleared, "stale ci_failure must be superseded by InFlight");
+
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(reason.is_none());
+
+        let typed = pub_.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(_, ev)| matches!(
+                ev,
+                FrontendEvent::CiFailureCleared { pr_url, .. } if pr_url == pr
+            )),
+            "CiFailureCleared must drop the stale badge",
+        );
+        let events = pub_.events.lock().await.clone();
+        assert!(
+            events
+                .iter()
+                .any(|(_, _, r)| r == "ci_failure_superseded_in_progress"),
+        );
+
+        // Budget is NOT reset — the re-run hasn't passed yet, so a fresh
+        // failure must keep consuming the remaining allotment.
+        assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
+    }
+
+    /// An *active* remediation attempt owns the slot: its own fix push is
+    /// what re-triggered CI, so its in-flight chip must not be cleared.
+    /// The supersede path declines and the chore stays blocked.
+    #[tokio::test]
+    async fn in_flight_supersede_skips_when_active_remediation() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/902";
+        let (product, chore) = make_in_review(&db, "C-active-rem", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        // Detection leaves a pending (active) remediation attempt.
+        on_ci_failure_detected(
+            &db,
+            pub_.as_ref(),
+            &fix_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, "head-1"),
+            &one_failure(),
+        )
+        .await;
+        assert!(
+            db.active_ci_remediation_for_work_item(&chore)
+                .unwrap()
+                .is_some(),
+            "attempt must be active before the supersede check",
+        );
+
+        let cleared = on_ci_in_flight_supersedes_failure(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(!cleared, "active remediation must not be superseded");
+
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
+    }
+
+    /// No stale failure to supersede (chore already `in_review`): the
+    /// supersede path is a cheap WHERE-guard no-op and emits nothing.
+    #[tokio::test]
+    async fn in_flight_supersede_noop_when_in_review() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/903";
+        let (product, chore) = make_in_review(&db, "C-noop", pr);
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        let cleared = on_ci_in_flight_supersedes_failure(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &[],
+        )
+        .await;
+        assert!(!cleared, "an in_review chore has no stale failure to clear");
+
+        let (status, _) = chore_state(&db, &chore);
+        assert_eq!(status, "in_review");
+        assert!(pub_.typed_events.lock().await.is_empty());
+        assert!(pub_.events.lock().await.is_empty());
+    }
+
+    /// The opt-out label suppresses the supersede just like the detect /
+    /// retire paths: a stale ci_failure on an opted-out PR is left alone.
+    #[tokio::test]
+    async fn in_flight_supersede_skipped_when_pr_has_opt_out_label() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/904";
+        let (product, chore) = make_in_review(&db, "C-supersede-optout", pr);
+        db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
+        let pub_ = Arc::new(RecordingPublisher::default());
+
+        let cleared = on_ci_in_flight_supersedes_failure(
+            &db,
+            pub_.as_ref(),
+            &candidate(&product, &chore, pr),
+            &["boss/no-auto-rebase".to_owned()],
+        )
+        .await;
+        assert!(!cleared, "opt-out label must suppress the supersede");
+
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(status, "blocked");
+        assert_eq!(reason.as_deref(), Some("ci_failure"));
     }
 
     /// First InFlight probe records `first_observed_at` but emits

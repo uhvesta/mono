@@ -1908,6 +1908,25 @@ async fn sweep_one(
                     // how long the same head sha has been sitting in
                     // InFlight and emits a warn at 30m / alert at 2h.
                     if matches!(ci, OpenPrCiStatus::InFlight) {
+                        // Issue #901: a newer in-progress run supersedes
+                        // an older failing result. The polymorphic clear
+                        // dispatch above only retires on `Clean`, so a
+                        // chore still parked in `blocked: ci_failure` from
+                        // the previous run keeps its stale "ci failing"
+                        // badge even though CI is now re-running. Clear it
+                        // here so the card shows a single coherent
+                        // "in progress" state rather than asserting a
+                        // failure that is actively being re-evaluated.
+                        if ci_watch::on_ci_in_flight_supersedes_failure(
+                            work_db,
+                            publisher,
+                            candidate,
+                            &probe_result.labels,
+                        )
+                        .await
+                        {
+                            outcome.ci_cleared += 1;
+                        }
                         ci_watch::on_ci_in_flight(
                             work_db,
                             publisher,
