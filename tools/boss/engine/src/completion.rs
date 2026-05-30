@@ -47,11 +47,14 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use boss_protocol::FrontendEvent;
+use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, FrontendEvent};
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
-use crate::merge_poller::{MergeProbe, NoopMergeProbe, update_pr_poll_state};
+use crate::merge_poller::{
+    MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState,
+    update_pr_poll_state,
+};
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
@@ -996,6 +999,16 @@ impl WorkerCompletionHandler {
                     .await;
             }
             ShaDeltaGateOutcome::NoContribution { pr_url } => {
+                // Before nudging, check whether the blocking signal (conflict /
+                // CI) is already cleared — e.g. a sibling resolver fixed the
+                // conflict before this run started. If so, retire the attempt
+                // and finalise the execution without nudging.
+                if let Some(outcome) = self
+                    .try_retire_cleared_blocking_signal(execution_id, &execution, &pr_url)
+                    .await
+                {
+                    return outcome;
+                }
                 tracing::info!(
                     execution_id,
                     bound_pr_url = %pr_url,
@@ -1718,6 +1731,9 @@ must not be asked to open one",
             // Breaker parked the execution for a human; don't mark the
             // attempt failed (that risks a retrigger that re-loops).
             StopOutcome::NudgeBreakerParked { .. } => false,
+            // Signal was already cleared before this worker ran — the
+            // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
+            StopOutcome::SignalAlreadyCleared { .. } => false,
             // Catch-all branches: worker exited without evidence of a
             // push and without classifying via `mark-failed`.
             StopOutcome::AwaitingInput
@@ -2198,6 +2214,278 @@ must not be asked to open one",
         );
     }
 
+    /// Check whether the blocking signal for a conflict-resolution or
+    /// CI-failure revision is already cleared even though the worker
+    /// did not push any new commits (the `NoContribution` SHA-delta
+    /// outcome). Returns `Some(outcome)` to short-circuit the nudge
+    /// path on success; `None` falls through to the normal nudge.
+    ///
+    /// Probe result: if the merge probe is unavailable (e.g.
+    /// [`NoopMergeProbe`] in tests, transient `gh` failure), the
+    /// method returns `None` so the nudge fires as before — safe
+    /// fallback.
+    ///
+    /// Anti-re-entrancy: the attempt is marked `succeeded` before
+    /// `finalize_pr_transition` runs, so a concurrent sweep cannot
+    /// dispatch a new attempt for the same parent-chore signal.
+    async fn try_retire_cleared_blocking_signal(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+    ) -> Option<StopOutcome> {
+        // Determine the parent chore ID that owns the conflict_resolutions /
+        // ci_remediations attempt rows.
+        //
+        // Old-style kinds: `execution.work_item_id` IS the parent chore.
+        // New-style `revision_implementation` (Phase 3+): `work_item_id` is
+        // the revision task; the chore is its `parent_task_id`.
+        let (parent_chore_id, product_id) = match execution.kind.as_str() {
+            "conflict_resolution" | "ci_remediation" => {
+                // work_item_id is the chore directly.
+                let product_id = match self.work_db.get_work_item(&execution.work_item_id) {
+                    Ok(WorkItem::Task(t) | WorkItem::Chore(t)) => t.product_id.clone(),
+                    _ => return None,
+                };
+                (execution.work_item_id.clone(), product_id)
+            }
+            "revision_implementation" => {
+                // work_item_id is the revision task. Only process it when
+                // the revision was created by an engine-triggered conflict /
+                // CI-fix attempt (`created_via` prefix).
+                let task = match self.work_db.get_work_item(&execution.work_item_id) {
+                    Ok(WorkItem::Task(t)) if t.kind == "revision" => t,
+                    _ => return None,
+                };
+                let created_via = task.created_via.as_str();
+                if !created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
+                    && !created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX)
+                {
+                    return None;
+                }
+                let parent_id = task.parent_task_id?;
+                (parent_id, task.product_id.clone())
+            }
+            _ => return None,
+        };
+
+        // Check for an active conflict-resolution or CI-remediation attempt.
+        let conflict_attempt = self
+            .work_db
+            .active_conflict_resolution_for_work_item(&parent_chore_id)
+            .unwrap_or(None);
+        let ci_attempt = self
+            .work_db
+            .active_ci_remediation_for_work_item(&parent_chore_id)
+            .unwrap_or(None);
+
+        if conflict_attempt.is_none() && ci_attempt.is_none() {
+            return None;
+        }
+
+        // Probe the bound PR to check if the blocking signal is cleared.
+        let probe = match self.merge_probe.probe(bound_pr_url).await {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url,
+                    ?err,
+                    "stop event: signal-cleared check: PR probe failed; \
+                     falling through to nudge",
+                );
+                return None;
+            }
+        };
+        let open_status = match probe.state {
+            PrLifecycleState::Open(ref s) => s.clone(),
+            // PR merged or closed — not a signal-cleared case here.
+            _ => return None,
+        };
+
+        // --- Conflict signal check ---
+        if let Some(ref attempt) = conflict_attempt {
+            if open_status.mergeability != OpenPrMergeability::Conflict {
+                tracing::info!(
+                    execution_id,
+                    attempt_id = %attempt.id,
+                    bound_pr_url,
+                    "stop event: conflict already cleared — retiring attempt without nudging"
+                );
+                // Mark the attempt succeeded.
+                match self
+                    .work_db
+                    .mark_conflict_resolution_succeeded(&attempt.id, None)
+                {
+                    Ok(Some(succeeded)) => {
+                        // Release old-style cube lease on the attempt (null for
+                        // new Phase 3 revision-backed attempts).
+                        if let Some(lease_id) = succeeded.cube_lease_id.as_deref() {
+                            if let Err(err) =
+                                self.cube_client.release_workspace(lease_id).await
+                            {
+                                tracing::debug!(
+                                    attempt_id = %attempt.id,
+                                    lease_id,
+                                    ?err,
+                                    "signal-cleared: conflict lease release failed \
+                                     (likely already released)",
+                                );
+                            }
+                        }
+                        self.publisher
+                            .publish_frontend_event_on_product(
+                                &product_id,
+                                FrontendEvent::ConflictResolutionSucceeded {
+                                    product_id: product_id.clone(),
+                                    work_item_id: parent_chore_id.clone(),
+                                    attempt_id: succeeded.id.clone(),
+                                    pr_url: bound_pr_url.to_owned(),
+                                },
+                            )
+                            .await;
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            attempt_id = %attempt.id,
+                            "signal-cleared: conflict attempt already terminal"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            ?err,
+                            "signal-cleared: failed to mark conflict_resolution succeeded"
+                        );
+                    }
+                }
+                // Snap parent chore back to in_review.
+                match self.work_db.clear_chore_blocked_merge_conflict_for_attempt(
+                    &parent_chore_id,
+                    bound_pr_url,
+                    &attempt.id,
+                ) {
+                    Ok(Some(_)) => {
+                        self.publisher
+                            .publish_work_item_changed(
+                                &product_id,
+                                &parent_chore_id,
+                                "merge_conflict_resolved",
+                            )
+                            .await;
+                    }
+                    Ok(None) => {
+                        // WHERE guard missed — parent was already moved (e.g.
+                        // by a concurrent sweep or human). Fine.
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            work_item_id = %parent_chore_id,
+                            ?err,
+                            "signal-cleared: failed to clear blocked: merge_conflict"
+                        );
+                    }
+                }
+                let outcome = self
+                    .finalize_pr_transition(
+                        execution_id,
+                        bound_pr_url.to_owned(),
+                        WorkerPrCompletionTarget::InReview,
+                        "stop_conflict_cleared",
+                    )
+                    .await;
+                // Return the distinct outcome so tests and logs can identify this path.
+                return Some(match outcome {
+                    StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
+                        StopOutcome::SignalAlreadyCleared { pr_url }
+                    }
+                    other => other,
+                });
+            }
+        }
+
+        // --- CI signal check ---
+        if let Some(ref attempt) = ci_attempt {
+            if open_status.ci == OpenPrCiStatus::Clean {
+                tracing::info!(
+                    execution_id,
+                    attempt_id = %attempt.id,
+                    bound_pr_url,
+                    "stop event: CI already cleared — retiring attempt without nudging"
+                );
+                match self
+                    .work_db
+                    .mark_ci_remediation_succeeded(&attempt.id, None)
+                {
+                    Ok(Some(_)) => {
+                        self.publisher
+                            .publish_frontend_event_on_product(
+                                &product_id,
+                                FrontendEvent::CiRemediationSucceeded {
+                                    product_id: product_id.clone(),
+                                    work_item_id: parent_chore_id.clone(),
+                                    attempt_id: attempt.id.clone(),
+                                    pr_url: bound_pr_url.to_owned(),
+                                },
+                            )
+                            .await;
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            attempt_id = %attempt.id,
+                            "signal-cleared: CI attempt already terminal"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            ?err,
+                            "signal-cleared: failed to mark ci_remediation succeeded"
+                        );
+                    }
+                }
+                match self
+                    .work_db
+                    .clear_chore_blocked_ci_failure(&parent_chore_id, bound_pr_url)
+                {
+                    Ok(Some(_)) => {
+                        self.publisher
+                            .publish_work_item_changed(
+                                &product_id,
+                                &parent_chore_id,
+                                "ci_failure_resolved",
+                            )
+                            .await;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            work_item_id = %parent_chore_id,
+                            ?err,
+                            "signal-cleared: failed to clear blocked: ci_failure"
+                        );
+                    }
+                }
+                let outcome = self
+                    .finalize_pr_transition(
+                        execution_id,
+                        bound_pr_url.to_owned(),
+                        WorkerPrCompletionTarget::InReview,
+                        "stop_ci_cleared",
+                    )
+                    .await;
+                return Some(match outcome {
+                    StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
+                        StopOutcome::SignalAlreadyCleared { pr_url }
+                    }
+                    other => other,
+                });
+            }
+        }
+
+        None
+    }
+
     /// Evaluate the resume-bounce SHA-delta gate. The gate uses the
     /// chore's bound `pr_url` (set by an earlier run's on-Stop
     /// machinery) as the authoritative PR identifier — never
@@ -2461,6 +2749,14 @@ pub enum StopOutcome {
     /// instead of being nudged again. `reason` is the human-readable
     /// explanation recorded on the attention item.
     NudgeBreakerParked { reason: String },
+    /// The worker is a conflict-resolution or CI-failure revision that
+    /// stopped without pushing, but the blocking signal was already
+    /// cleared (conflict: PR `mergeable`; CI: required checks green)
+    /// before this run started. The active `conflict_resolutions` or
+    /// `ci_remediations` attempt is retired as `succeeded`, the parent
+    /// task is snapped back to `in_review`, and the execution is
+    /// finalised. No nudge is sent.
+    SignalAlreadyCleared { pr_url: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }
@@ -2496,6 +2792,7 @@ mod tests {
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
         CubeWorkspaceStatus,
     };
+    use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
     use crate::work::{
         CreateChoreInput, CreateExecutionInput, CreateProductInput, WorkDb, WorkItem,
     };
@@ -6412,5 +6709,332 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "lease must stay held when revision is not done",
         );
         assert!(probes.snapshot().is_empty(), "recheck must not nudge");
+    }
+
+    // -----------------------------------------------------------
+    // Signal-already-cleared gate tests
+    //
+    // The gate fires in the NoContribution arm: conflict/CI revision worker
+    // stops without pushing, but the blocking signal is already cleared.
+    // Expected: attempt retired as succeeded, parent snapped to in_review,
+    // execution finalised, NO nudge.
+    // -----------------------------------------------------------
+
+    /// Build a conflict-resolution revision fixture. The parent chore is
+    /// `blocked: merge_conflict`. A `conflict_resolutions` row is inserted
+    /// in `running` state (simulating an active attempt). A revision task is
+    /// created for the fix; a `revision_implementation` execution is left in
+    /// `waiting_human` with `pr_head_before = head_before` (the SHA-delta
+    /// snapshot). `created_via` is set to `"merge-conflict:<attempt_id>"`.
+    ///
+    /// Returns `(db, product_id, parent_chore_id, revision_id, execution_id, attempt_id, pr_url)`.
+    #[allow(clippy::too_many_arguments)]
+    fn conflict_revision_fixture(
+        workspace_path: &Path,
+        parent_pr_url: &str,
+        head_before: &str,
+    ) -> (Arc<WorkDb>, String, String, String, String, String) {
+        use boss_protocol::CreateRevisionInput;
+        use crate::work::{ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss-conflict-rev-test")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        // Parent chore: blocked:merge_conflict with a bound pr_url.
+        let parent = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Parent chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', blocked_reason = 'merge_conflict', \
+                 pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![parent.id, parent_pr_url],
+            )
+            .unwrap();
+        }
+        // Insert a conflict_resolutions attempt (Phase 3 style: `pending`,
+        // no cube_lease_id — the fix vehicle is a revision_implementation
+        // execution, not a bespoke conflict_resolution execution).
+        let attempt = db
+            .insert_conflict_resolution(ConflictResolutionInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: parent.id.clone(),
+                pr_url: parent_pr_url.to_owned(),
+                pr_number: 966,
+                head_branch: "my-feature".into(),
+                base_branch: "main".into(),
+                base_sha_at_trigger: Some("base_sha_1".into()),
+                head_sha_before: Some(head_before.into()),
+            })
+            .unwrap()
+            .unwrap();
+        // Revision task with created_via = "merge-conflict:<attempt_id>".
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent.id.clone())
+                    .description("Resolve merge conflict against main")
+                    .created_via(format!("merge-conflict:{}", attempt.id))
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        // Stamp the reverse link (as conflict_watch::on_conflict_detected does).
+        db.set_conflict_resolution_revision_task_id(&attempt.id, &revision.id)
+            .unwrap();
+        // Execution: revision_implementation with pr_url = parent PR URL.
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id.clone())
+                    .kind("revision_implementation")
+                    .status("ready")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .prefer_is_soft(true)
+                    .pr_url(parent_pr_url)
+                    .build(),
+            )
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-033",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned conflict-resolution worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        db.set_execution_pr_head_before(&execution.id, head_before)
+            .unwrap();
+        (
+            db,
+            product.id,
+            parent.id,
+            revision.id,
+            execution.id,
+            attempt.id,
+        )
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_signal_cleared_retires_attempt_and_finalises() {
+        // Riker scenario (T927 / exec_18b431dc9b016e88_1a regression):
+        // conflict-resolution revision worker stops without pushing because
+        // the conflict was already resolved by a sibling. The SHA-delta gate
+        // returns NoContribution; the signal-cleared gate must detect the PR
+        // is now mergeable, retire the attempt as succeeded, snap the parent
+        // back to in_review, and finalise the execution — no nudge.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None); // no branch-keyed PR
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        // SHA-delta gate: head unchanged → NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        // MergeProbe: PR is now mergeable (conflict cleared).
+        struct CleanMergeProbe;
+        #[async_trait]
+        impl MergeProbe for CleanMergeProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe {
+                    url: url.to_owned(),
+                    state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::clean()),
+                    base_ref_oid: None,
+                    head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
+                    labels: Vec::new(),
+                    review: crate::merge_poller::PrReviewState::Unknown,
+                    in_merge_queue: false,
+                })
+            }
+        }
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(Arc::new(CleanMergeProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::SignalAlreadyCleared { ref pr_url } if pr_url == parent_pr_url),
+            "signal-cleared gate must short-circuit the nudge; got {outcome:?}",
+        );
+
+        // Conflict attempt must be succeeded.
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "succeeded",
+            "conflict_resolutions attempt must be retired as succeeded",
+        );
+
+        // Parent chore must be snapped back to in_review.
+        let parent = match db.get_work_item(&parent_chore_id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            parent.status, "in_review",
+            "parent chore must be snapped back to in_review",
+        );
+
+        // Execution must be finalised (completed, lease released).
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "completed");
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "execution cube lease must be released",
+        );
+        assert!(
+            !pane.calls.lock().await.is_empty(),
+            "pane must be released after finalisation",
+        );
+
+        // No probe must be queued — the worker is done.
+        assert!(
+            probes.snapshot().is_empty(),
+            "no nudge probe must fire on signal-cleared path; got {:?}",
+            probes.snapshot(),
+        );
+
+        // ConflictResolutionSucceeded frontend event must have been published.
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(pid, ev)| {
+                pid == &product_id
+                    && matches!(
+                        ev,
+                        FrontendEvent::ConflictResolutionSucceeded {
+                            work_item_id,
+                            ..
+                        } if work_item_id == &parent_chore_id
+                    )
+            }),
+            "ConflictResolutionSucceeded must be published; typed events: {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_signal_still_active_nudges_as_before() {
+        // Regression guard: if the conflict is STILL active when the worker
+        // stops without pushing, the normal nudge path must still fire —
+        // the signal-cleared gate must not suppress it.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        // SHA-delta gate: head unchanged → NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        // MergeProbe: PR is STILL conflicting.
+        struct ConflictingMergeProbe;
+        #[async_trait]
+        impl MergeProbe for ConflictingMergeProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                Ok(PrLifecycleProbe {
+                    url: url.to_owned(),
+                    state: PrLifecycleState::Open(
+                        crate::merge_poller::OpenPrStatus::conflict_only(),
+                    ),
+                    base_ref_oid: None,
+                    head_ref_oid: None,
+                    head_ref_name: None,
+                    base_ref_name: None,
+                    labels: Vec::new(),
+                    review: crate::merge_poller::PrReviewState::Unknown,
+                    in_merge_queue: false,
+                })
+            }
+        }
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(Arc::new(ConflictingMergeProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        // Signal still active → normal nudge, NOT SignalAlreadyCleared.
+        assert!(
+            matches!(outcome, StopOutcome::AwaitingInput),
+            "signal still active must fall through to normal nudge; got {outcome:?}",
+        );
+
+        // Conflict attempt must NOT be retired (still pending — Phase 3 style).
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_ne!(
+            attempt.status, "succeeded",
+            "conflict attempt must NOT be retired when signal is still active",
+        );
+
+        // Probe must have been queued (the nudge fired).
+        let queued = probes.snapshot();
+        assert_eq!(
+            queued.len(),
+            1,
+            "exactly one nudge probe must be queued; got {queued:?}",
+        );
     }
 }
