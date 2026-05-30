@@ -96,6 +96,18 @@ pub enum WorkspaceCommand {
         /// back to the first free workspace in the repo.
         #[arg(long)]
         prefer: Option<String>,
+        /// Reclaim the `--prefer` workspace *with its dirty working copy
+        /// intact*, for recovery of stranded in-flight work. The normal
+        /// lease path skips a dirty workspace and provisions a fresh one;
+        /// with this flag cube claims the named workspace as-is and
+        /// suppresses the `jj git fetch && jj new main` reset so the
+        /// uncommitted tree is handed to the new lease-holder. Requires
+        /// `--prefer`. Unlike the best-effort `--prefer`, this never
+        /// falls back: if the named workspace is missing, leased, or has
+        /// no repo, the lease fails loudly rather than routing the
+        /// recovering worker away from the only copy of the work.
+        #[arg(long, requires = "prefer")]
+        allow_dirty: bool,
     },
     /// Release a workspace lease.
     ///
@@ -424,11 +436,13 @@ mod tests {
                         repo,
                         task,
                         prefer,
+                        allow_dirty,
                     },
             } => {
                 assert_eq!(repo, "mono");
                 assert_eq!(task, "implement parser");
                 assert!(prefer.is_none());
+                assert!(!allow_dirty);
             }
             _ => panic!("expected workspace lease command"),
         }
@@ -454,14 +468,60 @@ mod tests {
                         repo,
                         task,
                         prefer,
+                        allow_dirty,
                     },
             } => {
                 assert_eq!(repo, "mono");
                 assert_eq!(task, "resume parser work");
                 assert_eq!(prefer.as_deref(), Some("mono-agent-007"));
+                assert!(!allow_dirty);
             }
             _ => panic!("expected workspace lease command"),
         }
+    }
+
+    #[test]
+    fn workspace_lease_accepts_allow_dirty_with_prefer() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "recover stranded work",
+            "--prefer",
+            "mono-agent-007",
+            "--allow-dirty",
+        ]);
+
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Lease {
+                        prefer,
+                        allow_dirty,
+                        ..
+                    },
+            } => {
+                assert_eq!(prefer.as_deref(), Some("mono-agent-007"));
+                assert!(allow_dirty);
+            }
+            _ => panic!("expected workspace lease command"),
+        }
+    }
+
+    #[test]
+    fn workspace_lease_allow_dirty_requires_prefer() {
+        let result = Cli::try_parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "recover stranded work",
+            "--allow-dirty",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

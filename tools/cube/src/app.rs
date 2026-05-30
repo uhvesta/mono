@@ -875,7 +875,12 @@ fn run_workspace(
     };
 
     match command {
-        WorkspaceCommand::Lease { repo, task, prefer } => {
+        WorkspaceCommand::Lease {
+            repo,
+            task,
+            prefer,
+            allow_dirty,
+        } => {
             let repo_record = store
                 .get_repo(&repo)?
                 .ok_or_else(|| CubeError::RepoNotFound(repo.clone()))?;
@@ -927,6 +932,124 @@ fn run_workspace(
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
             let lease_expires_at = Some(leased_at_epoch_s + DEFAULT_LEASE_TTL_SECS);
+
+            // ── Dirty-recovery phase ────────────────────────────────────────
+            // `--allow-dirty` (always paired with `--prefer`, enforced by
+            // clap) reclaims the named workspace *with its working copy
+            // intact* so a recovery re-dispatch can land back on the only
+            // copy of a crashed worker's unpushed work. This deliberately
+            // bypasses everything the normal path does to a dirty
+            // workspace — it is NOT health-skipped, and the destructive
+            // `jj git fetch && jj new main` reset is suppressed so the
+            // uncommitted tree survives the lease.
+            //
+            // Unlike best-effort `--prefer`, this never silently falls
+            // back to a fresh workspace: routing the recovering worker
+            // away from the dirty tree is exactly the bug this flag
+            // exists to fix (spinyfin/mono#963). If the named workspace
+            // cannot be reclaimed as-is, fail loudly.
+            if allow_dirty {
+                let pref = prefer
+                    .as_deref()
+                    .expect("clap enforces --prefer when --allow-dirty is set");
+
+                let target = store
+                    .list_workspaces_filtered(&WorkspaceListFilter {
+                        repo: Some(&repo),
+                        workspace_id: Some(pref),
+                        ..Default::default()
+                    })?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| CubeError::WorkspaceNotFound(pref.to_string()))?;
+
+                if target.state == WorkspaceState::Leased {
+                    // Held by a live worker (or an unexpired lease). We must
+                    // not stomp on it; the operator should force-release
+                    // first if the holder is genuinely gone.
+                    return Err(CubeError::InvalidArgument(format!(
+                        "workspace `{pref}` is currently leased; cannot reclaim it dirty. \
+                         Use `cube workspace force-release` first if the prior holder is gone."
+                    )));
+                }
+
+                if !workspace_path_exists(&target) {
+                    return Err(CubeError::WorkspaceNotFound(pref.to_string()));
+                }
+                // A directory with neither .jj/ nor .git/ holds no
+                // recoverable work — there is nothing dirty to reclaim.
+                if !target.workspace_path.join(".jj").is_dir()
+                    && !target.workspace_path.join(".git").is_dir()
+                {
+                    return Err(CubeError::InvalidArgument(format!(
+                        "workspace `{pref}` has neither a .jj nor a .git directory; \
+                         there is no in-flight work to reclaim with --allow-dirty."
+                    )));
+                }
+
+                let mut workspace = store
+                    .claim_specific_workspace(
+                        &repo,
+                        pref,
+                        &holder,
+                        &task,
+                        &lease_id,
+                        leased_at_epoch_s,
+                        lease_expires_at,
+                    )?
+                    .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
+
+                // No reset: the working copy is handed over exactly as the
+                // prior holder left it. Record whatever `@` currently is so
+                // the registry's head_commit reflects the recovered state.
+                let head_commit =
+                    current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
+                store.update_workspace_head_commit(&lease_id, Some(&head_commit))?;
+                workspace.head_commit = Some(head_commit);
+
+                audit!(
+                    database_path,
+                    "lease.acquired_dirty",
+                    repo = workspace.repo,
+                    workspace_id = workspace.workspace_id,
+                    lease_id = lease_id,
+                    holder = holder,
+                    task = task,
+                    head_commit = workspace.head_commit,
+                );
+
+                let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
+
+                let lease_message = format!(
+                    "Reclaimed {} (dirty) at {}.",
+                    workspace.workspace_id,
+                    workspace.workspace_path.display()
+                );
+
+                if let Some(failure) = setup_report.first_failure() {
+                    let StepStatus::Failed { error } = &failure.status else {
+                        unreachable!("first_failure returned non-failure step");
+                    };
+                    return Err(CubeError::SetupStepFailed {
+                        step: failure.id.clone(),
+                        error: error.clone(),
+                    });
+                }
+
+                let message = format_lease_message(&lease_message, &setup_report);
+                return RunResult::new(
+                    message,
+                    json!({
+                        "workspace": workspace,
+                        "setup": setup_report,
+                        "health_check": [json!({
+                            "workspace_id": pref,
+                            "allow_dirty": true,
+                            "reset_skipped": true,
+                        })],
+                    }),
+                );
+            }
 
             // ── Health-check phase ──────────────────────────────────────────
             // Before claiming any workspace, inspect each free candidate:
@@ -5354,6 +5477,192 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
+    }
+
+    #[test]
+    fn workspace_lease_allow_dirty_reclaims_named_workspace_without_reset() {
+        // --allow-dirty must claim the preferred workspace as-is and run
+        // NO health check, NO `jj git fetch`, and NO `jj new main` — the
+        // dirty tree is handed to the new lease-holder intact. The only jj
+        // call is the head-commit read.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+        let dirty_path = workspace_root.join("mono-agent-005");
+        std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // Seed the registry rows and mark mono-agent-005 dirty, mimicking a
+        // crashed worker whose unpushed work was left behind. The normal
+        // lease path would skip this workspace; --allow-dirty must not.
+        {
+            use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[
+                        WorkspaceCandidate {
+                            workspace_id: "mono-agent-004".to_string(),
+                            workspace_path: workspace_root.join("mono-agent-004"),
+                        },
+                        WorkspaceCandidate {
+                            workspace_id: "mono-agent-005".to_string(),
+                            workspace_path: dirty_path.clone(),
+                        },
+                    ],
+                )
+                .unwrap();
+            store
+                .update_workspace_health("mono", "mono-agent-005", WorkspaceHealth::Dirty)
+                .unwrap();
+        }
+
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            dirty_path.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+            "dead789",
+        )]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "recover stranded work",
+                "--prefer",
+                "mono-agent-005",
+                "--allow-dirty",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        // assert_exhausted proves no fetch/new-main/status ran — reset skipped.
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
+        assert_eq!(
+            result.payload["workspace"]["workspace_path"],
+            dirty_path.display().to_string()
+        );
+        assert_eq!(result.payload["workspace"]["head_commit"], "dead789");
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        assert_eq!(hc.len(), 1);
+        assert_eq!(hc[0]["allow_dirty"], true);
+        assert_eq!(hc[0]["reset_skipped"], true);
+
+        // The row is now leased to this holder.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ws = store.get_workspace_by_path(&dirty_path).unwrap().unwrap();
+        assert_eq!(ws.state, crate::metadata::WorkspaceState::Leased);
+    }
+
+    #[test]
+    fn workspace_lease_allow_dirty_errors_when_preferred_missing() {
+        // --allow-dirty must never silently fall back to a fresh
+        // workspace: if the named workspace is unknown, fail loudly so the
+        // recovering worker is not routed away from the dirty tree.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let runner = FakeRunner::new(vec![]);
+        let err = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "recover stranded work",
+                "--prefer",
+                "mono-agent-999",
+                "--allow-dirty",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("expected lease to fail for unknown preferred workspace");
+        runner.assert_exhausted();
+        assert!(matches!(err, CubeError::WorkspaceNotFound(_)));
+    }
+
+    #[test]
+    fn workspace_lease_allow_dirty_errors_when_preferred_leased() {
+        // A live lease on the preferred workspace must block dirty reclaim
+        // rather than stomping the active holder's working copy.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let busy_path = workspace_root.join("mono-agent-004");
+        std::fs::create_dir_all(busy_path.join(".jj")).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // First lease takes mono-agent-004.
+        let first_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(busy_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(busy_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(busy_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                busy_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "live0001",
+            ),
+        ]);
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "live work"]),
+            Some(&database_path),
+            &first_runner,
+        )
+        .expect("first lease");
+        first_runner.assert_exhausted();
+
+        let runner = FakeRunner::new(vec![]);
+        let err = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "recover stranded work",
+                "--prefer",
+                "mono-agent-004",
+                "--allow-dirty",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("expected lease to fail for leased preferred workspace");
+        runner.assert_exhausted();
+        assert!(matches!(err, CubeError::InvalidArgument(_)));
     }
 
     #[test]
