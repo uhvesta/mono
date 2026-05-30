@@ -3234,6 +3234,80 @@ private struct WorkCreateSheet: View {
     }
 }
 
+/// Shared layout metrics for the redesigned Edit Product dialog (#982).
+///
+/// One source of truth for the dialog's grid so the Product, External
+/// Tracker, and GitHub-account sections all inset to the same left margin
+/// and share one label column. The label column is sized for the longest
+/// label in the form ("Worker branch prefix" / "Owner / Organization") so
+/// no label clips or runs past the dialog edge the way the first
+/// `Form`-based pass did.
+private enum ProductDialogMetrics {
+    /// Dialog width. Wide enough that a 160pt label column still leaves a
+    /// comfortable field column; a deliberate, modest bump over #982's 480.
+    static let width: CGFloat = 520
+    /// Outer inset for the title, section stack, and footer button bar.
+    /// Full-bleed dividers ignore it so the header/content/footer read as
+    /// distinct bands.
+    static let horizontalPadding: CGFloat = 24
+    /// Fixed width of the leading label column. Fits the longest label at
+    /// the body font with margin to spare, which is the whole point of the
+    /// redesign — every row's field starts at the same x.
+    static let labelColumnWidth: CGFloat = 160
+    /// Gap between the label column and the field column.
+    static let labelFieldGap: CGFloat = 12
+    /// Vertical gap between rows inside one section.
+    static let rowSpacing: CGFloat = 12
+    /// Vertical gap between a section header and its first row.
+    static let headerRowGap: CGFloat = 10
+    /// Vertical gap between sections.
+    static let sectionGap: CGFloat = 22
+}
+
+/// `LabeledContentStyle` that lays every form row out on the shared grid:
+/// a fixed-width, leading-aligned label column followed by a field column
+/// that fills the remaining width. Applied once to the whole form so all
+/// rows — across all three sections — line up. A label-less row
+/// (`LabeledContent { ... } label: { EmptyView() }`) still reserves the
+/// column, which is how the Reverse-close toggle and Unset button align to
+/// the field column instead of floating.
+private struct ProductFixedLabelStyle: LabeledContentStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: ProductDialogMetrics.labelFieldGap) {
+            configuration.label
+                .frame(width: ProductDialogMetrics.labelColumnWidth, alignment: .leading)
+            configuration.content
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// A titled group in the Edit Product dialog: a real, left-aligned section
+/// header (the first pass rendered these as centered, stray-looking labels)
+/// over a consistently-spaced stack of rows. All three sections use this so
+/// their headers and content share one alignment grid.
+private struct ProductFormSection<Content: View>: View {
+    private let title: String
+    private let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: ProductDialogMetrics.headerRowGap) {
+            Text(title)
+                .font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.isHeader)
+            VStack(alignment: .leading, spacing: ProductDialogMetrics.rowSpacing) {
+                content
+            }
+        }
+    }
+}
+
 private struct WorkEditSheet: View {
     let request: WorkEditRequest
     let onCancel: () -> Void
@@ -3353,22 +3427,40 @@ private struct WorkEditSheet: View {
     @ViewBuilder
     private var productBody: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // Header band.
             Text("Edit Product")
                 .font(.title3.weight(.semibold))
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .padding(.bottom, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, ProductDialogMetrics.horizontalPadding)
+                .padding(.top, ProductDialogMetrics.horizontalPadding)
+                .padding(.bottom, 12)
 
-            Form {
-                Section("Product") {
-                    TextField("Name", text: $name)
-                    TextField("Description", text: $description)
-                    Picker("Status", selection: $status) {
-                        ForEach(["active", "paused", "archived"], id: \.self) { s in
-                            Text(s.capitalized).tag(s)
-                        }
+            Divider()
+
+            // Content band: three sections on one shared label/field grid.
+            VStack(alignment: .leading, spacing: ProductDialogMetrics.sectionGap) {
+                ProductFormSection("Product") {
+                    LabeledContent("Name") {
+                        TextField("", text: $name, prompt: Text("Product name"))
                     }
-                    TextField("Repository URL", text: $repoRemoteURL)
+                    LabeledContent("Description") {
+                        TextField("", text: $description, prompt: Text("Optional"))
+                    }
+                    LabeledContent("Status") {
+                        Picker("Status", selection: $status) {
+                            ForEach(["active", "paused", "archived"], id: \.self) { s in
+                                Text(s.capitalized).tag(s)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 200, alignment: .leading)
+                    }
+                    LabeledContent("Repository URL") {
+                        TextField(
+                            "", text: $repoRemoteURL,
+                            prompt: Text("https://github.com/org/repo")
+                        )
+                    }
                     LabeledContent("Worker branch prefix") {
                         VStack(alignment: .leading, spacing: 4) {
                             TextField("", text: $workerBranchPrefix, prompt: Text("e.g. bduff/"))
@@ -3384,32 +3476,56 @@ private struct WorkEditSheet: View {
                     }
                 }
 
-                Section("External Tracker") {
-                    Picker("Kind", selection: $trackerKind) {
-                        Text("GitHub").tag("github")
+                ProductFormSection("External Tracker") {
+                    LabeledContent("Kind") {
+                        Picker("Kind", selection: $trackerKind) {
+                            Text("GitHub").tag("github")
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 200, alignment: .leading)
                     }
                     if trackerKind == "github" {
-                        TextField("Owner / Organization", text: $trackerOrg)
-                        TextField("Repository", text: $trackerRepo)
-                        TextField("Project number", text: $trackerProjectNumber)
-                        Toggle("Reverse-close", isOn: $trackerReverseClose)
-                            .help(
-                                "When a work item is marked done without a merged PR, " +
-                                "close the upstream GitHub issue."
-                            )
-                        if initialTrackerBound {
-                            Button("Unset", role: .destructive) {
-                                onUnsetTracker?()
+                        LabeledContent("Owner / Organization") {
+                            TextField("", text: $trackerOrg, prompt: Text("e.g. spinyfin"))
+                        }
+                        LabeledContent("Repository") {
+                            TextField("", text: $trackerRepo, prompt: Text("e.g. mono"))
+                        }
+                        LabeledContent("Project number") {
+                            TextField("", text: $trackerProjectNumber, prompt: Text("e.g. 7"))
+                        }
+                        // Label-less row: toggle + Unset align to the field
+                        // column rather than floating under the fields.
+                        LabeledContent {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Toggle("Reverse-close", isOn: $trackerReverseClose)
+                                    .help(
+                                        "When a work item is marked done without a merged PR, " +
+                                        "close the upstream GitHub issue."
+                                    )
+                                if initialTrackerBound {
+                                    Button("Unset", role: .destructive) {
+                                        onUnsetTracker?()
+                                    }
+                                }
                             }
+                        } label: {
+                            EmptyView()
                         }
                     }
                 }
+
+                ProductFormSection("GitHub account") {
+                    GitHubAccountSection()
+                }
             }
+            .labeledContentStyle(ProductFixedLabelStyle())
+            .padding(.horizontal, ProductDialogMetrics.horizontalPadding)
+            .padding(.vertical, ProductDialogMetrics.sectionGap)
 
-            GitHubAccountSection()
-                .padding(.horizontal, 20)
-                .padding(.bottom, 8)
+            Divider()
 
+            // Footer band: dialog-level actions.
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)
@@ -3428,11 +3544,10 @@ private struct WorkEditSheet: View {
                     trackerFieldsEntered && !trackerFormValid
                 )
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 20)
-            .padding(.top, 8)
+            .padding(.horizontal, ProductDialogMetrics.horizontalPadding)
+            .padding(.vertical, 16)
         }
-        .frame(width: 480)
+        .frame(width: ProductDialogMetrics.width)
     }
 
     @ViewBuilder
@@ -3534,13 +3649,10 @@ private struct GitHubAccountSection: View {
     }
 
     var body: some View {
+        // The enclosing `ProductFormSection("GitHub account")` now renders the
+        // header and supplies the section's spacing, so this view is just the
+        // account status/flow content.
         VStack(alignment: .leading, spacing: 8) {
-            Divider()
-                .padding(.vertical, 2)
-
-            Text("GitHub account")
-                .font(.subheadline.weight(.semibold))
-
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 if presentation.isBusy {
                     ProgressView()
