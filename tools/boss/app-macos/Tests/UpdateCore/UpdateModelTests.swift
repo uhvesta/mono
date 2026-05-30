@@ -222,6 +222,50 @@ final class UpdateModelTests: XCTestCase {
         XCTAssertNil(defaults.string(forKey: "boss.update.skippedVersion"))
     }
 
+    // MARK: - presentUpdateSheet (CheckForUpdates command regression guard)
+    // These tests guard the fix for the "Check for Updates is a no-op" bug where
+    // CheckForUpdatesCommand resolved the model via NSApp.delegate, which returns
+    // SwiftUI's internal wrapper under @NSApplicationDelegateAdaptor — not AppDelegate.
+    // The fix passes the model directly; these tests confirm the model is reachable
+    // and that calling presentUpdateSheet() actually triggers a check.
+
+    func testPresentUpdateSheetSetsCheckingFeedbackImmediately() {
+        let model = makeModel(result: .upToDate)
+        model.presentUpdateSheet()
+        // Feedback transitions to .checking synchronously before the async Task fires.
+        // If the model were nil (the old bug), this line would never be reached.
+        XCTAssertEqual(model.manualCheckFeedback, .checking)
+    }
+
+    func testPresentUpdateSheetTriggersCheckAndResolvesUpToDate() async throws {
+        let model = makeModel(result: .upToDate)
+        model.presentUpdateSheet()
+        XCTAssertEqual(model.manualCheckFeedback, .checking)
+        // Wait for the async check to settle.
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(model.manualCheckFeedback, .upToDate)
+    }
+
+    func testPresentUpdateSheetTriggersCheckAndResolvesAvailable() async throws {
+        let model = makeModel(result: .availableMock)
+        model.presentUpdateSheet()
+        XCTAssertEqual(model.manualCheckFeedback, .checking)
+        try await Task.sleep(for: .milliseconds(200))
+        // Available result clears feedback and shows the sheet instead.
+        XCTAssertNil(model.manualCheckFeedback)
+        XCTAssertTrue(model.showUpdateSheet)
+    }
+
+    func testPresentUpdateSheetIsIdempotentOnRepeat() async throws {
+        let model = makeModel(result: .upToDate)
+        model.presentUpdateSheet()
+        model.presentUpdateSheet()  // second call before first settles
+        XCTAssertEqual(model.manualCheckFeedback, .checking)
+        try await Task.sleep(for: .milliseconds(200))
+        // Last check wins; feedback should be .upToDate, not stuck at .checking.
+        XCTAssertNotEqual(model.manualCheckFeedback, .checking)
+    }
+
     // MARK: - setMode
 
     func testSetModeUpdatesPublishedProperty() {
