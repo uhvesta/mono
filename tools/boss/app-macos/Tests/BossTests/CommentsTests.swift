@@ -271,6 +271,81 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertTrue(isHighlighted(at: secondOffset, in: result), "Second 'alpha' must be highlighted")
     }
 
+    /// Returns true if the run containing the character at `charOffset` in `plain`
+    /// carries an underline attribute (the clobber-proof marker for inline-code spans).
+    private func isUnderlined(at charOffset: Int, in result: AttributedString) -> Bool {
+        let idx = result.characters.index(result.characters.startIndex, offsetBy: charOffset)
+        return result.runs.contains { run in
+            run.range.contains(idx) && run.swiftUI.underlineStyle != nil
+        }
+    }
+
+    /// A multi-line selection: the quoted text the user copied uses a space where the
+    /// rendered projection has a paragraph-internal soft break (or vice-versa). Exact
+    /// `range(of:)` would fail; whitespace-tolerant matching must still resolve it.
+    /// Regression for "comment anchors invisible" — the long quoted sentence never
+    /// highlighted because its whitespace didn't match the rendered text byte-for-byte.
+    func testHighlightingParserMatchesAcrossWhitespaceDifferences() throws {
+        // Source wraps the sentence across two lines (soft break -> rendered space).
+        let source = "Moving a design between projects\nhas flavor-specific invariants and is scoped out."
+        // Quoted text uses single spaces throughout, as a pasteboard copy typically does.
+        let quoted = "Moving a design between projects has flavor-specific invariants and is scoped out."
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(quotedText: quoted, occurrenceIndex: 0)]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+
+        guard let movingRange = plain.range(of: "Moving") else {
+            return XCTFail("'Moving' not found in rendered plain text")
+        }
+        let offset = plain.distance(from: plain.startIndex, to: movingRange.lowerBound)
+        XCTAssertTrue(
+            isHighlighted(at: offset, in: result),
+            "Whitespace-tolerant matching must resolve a multi-line quoted selection"
+        )
+    }
+
+    /// `flexibleMatchRanges` finds each occurrence in document order and tolerates
+    /// collapsed/expanded interior whitespace.
+    func testFlexibleMatchRangesToleratesWhitespaceRuns() {
+        let plain = "the   quick\nbrown fox and the quick brown cat"
+        let ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: "quick brown", in: plain)
+        XCTAssertEqual(ranges.count, 2, "Both 'quick brown' occurrences must match across varied whitespace")
+    }
+
+    /// A single-token needle keeps exact, ordered, non-overlapping occurrence semantics.
+    func testFlexibleMatchRangesSingleTokenMatchesEachOccurrence() {
+        let plain = "alpha beta alpha gamma alpha"
+        let ranges = HighlightingMarkdownParser.flexibleMatchRanges(of: "alpha", in: plain)
+        XCTAssertEqual(ranges.count, 3)
+    }
+
+    /// A comment anchored to an inline-code span must emit the clobber-proof underline
+    /// marker so it stays visible after the Boss inline style overwrites the code span's
+    /// background. Regression for the invisible `` `flavor` `` anchor.
+    func testHighlightingParserUnderlinesInlineCodeAnchor() throws {
+        let source = "The new `flavor` column replaces the old type."
+        let parser = HighlightingMarkdownParser(
+            highlightedAnchors: [CommentAnchor(quotedText: "flavor", occurrenceIndex: 0)]
+        )
+        let result = try parser.attributedString(for: source)
+        let plain = String(result.characters)
+
+        guard let range = plain.range(of: "flavor") else {
+            return XCTFail("'flavor' not found in rendered plain text")
+        }
+        let offset = plain.distance(from: plain.startIndex, to: range.lowerBound)
+        XCTAssertTrue(
+            isHighlighted(at: offset, in: result),
+            "Inline-code anchor must carry a backgroundColor at parse time"
+        )
+        XCTAssertTrue(
+            isUnderlined(at: offset, in: result),
+            "Inline-code anchor must also carry the clobber-proof underline marker"
+        )
+    }
+
     /// An anchor whose occurrenceIndex exceeds the number of matches applies no highlight
     /// (silent no-op; safer than highlighting the wrong span after a doc edit).
     func testHighlightingParserOutOfRangeOccurrenceIndexIsNoOp() throws {
