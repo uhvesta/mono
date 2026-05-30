@@ -297,7 +297,7 @@ fn append_reconcile_audit(
     Ok(())
 }
 
-enum PidStatus {
+pub(crate) enum PidStatus {
     Alive,
     Dead,
     PermissionDenied,
@@ -309,7 +309,7 @@ enum PidStatus {
 /// - Returns `Dead` when `ESRCH` (no such process).
 /// - Returns `PermissionDenied` when `EPERM` (process exists, not ours).
 /// - Returns `Unknown` on any other error; caller skips conservatively.
-fn probe_pid(pid: i32) -> PidStatus {
+pub(crate) fn probe_pid(pid: i32) -> PidStatus {
     // SAFETY: kill(pid, 0) sends no signal; it only checks whether
     // the process exists and we have permission to signal it. The
     // `pid` value comes from the OS-reported shell_pid at spawn time.
