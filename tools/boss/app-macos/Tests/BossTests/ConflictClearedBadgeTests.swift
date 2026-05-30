@@ -106,6 +106,62 @@ final class ConflictClearedBadgeTests: XCTestCase {
         XCTAssertTrue(model.showsConflictClearedBadge(forPR: prURL))
     }
 
+    /// T778: once a PR is cleared, a fresh `conflictResolutionStarted`
+    /// (re-conflict / resolver re-dispatched) must remove the badge so
+    /// the card shows "resolving", not "cleared".
+    func testReConflictClearsBadge() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/778"
+
+        // 1. First resolution succeeds — badge should appear.
+        model.applyEventForTest(.conflictResolutionSucceeded(
+            productID: "prd_1",
+            workItemID: "task_1",
+            attemptID: "crz_1",
+            prURL: prURL
+        ))
+        XCTAssertTrue(model.showsConflictClearedBadge(forPR: prURL), "badge should show after first success")
+
+        // 2. PR re-conflicts and a new resolver is dispatched.
+        model.applyEventForTest(.conflictResolutionStarted(
+            productID: "prd_1",
+            workItemID: "task_1",
+            attemptID: "crz_2",
+            prURL: prURL
+        ))
+        XCTAssertFalse(model.showsConflictClearedBadge(forPR: prURL), "badge must be cleared when resolution restarts (T778)")
+    }
+
+    /// T778 corollary: after the badge is cleared by a re-conflict start,
+    /// a new successful resolution brings it back.
+    func testBadgeReappearsAfterNewSuccessFollowingReConflict() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/778b"
+
+        model.applyEventForTest(.conflictResolutionSucceeded(
+            productID: "prd_1",
+            workItemID: "task_1",
+            attemptID: "crz_1",
+            prURL: prURL
+        ))
+        model.applyEventForTest(.conflictResolutionStarted(
+            productID: "prd_1",
+            workItemID: "task_1",
+            attemptID: "crz_2",
+            prURL: prURL
+        ))
+        XCTAssertFalse(model.showsConflictClearedBadge(forPR: prURL), "badge cleared by re-conflict")
+
+        // New resolution succeeds — badge should reappear.
+        model.applyEventForTest(.conflictResolutionSucceeded(
+            productID: "prd_1",
+            workItemID: "task_1",
+            attemptID: "crz_2",
+            prURL: prURL
+        ))
+        XCTAssertTrue(model.showsConflictClearedBadge(forPR: prURL), "badge must reappear after new successful resolution")
+    }
+
     // MARK: - Helpers
 
     private func makeModel() -> ChatViewModel {

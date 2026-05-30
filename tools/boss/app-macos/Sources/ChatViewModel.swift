@@ -1832,11 +1832,17 @@ final class ChatViewModel: ObservableObject {
             designDocStateByProjectID[output.projectID] = output.state
         case .conflictResolutionsList(let attempts):
             conflictResolutions = attempts
-        case .conflictResolutionStarted, .conflictResolutionFailed,
-             .conflictResolutionAbandoned:
-            // Any transition refreshes the engine-tab list so the
-            // status column re-renders. The badge state only updates
-            // on the `succeeded` arm.
+        case .conflictResolutionStarted(_, _, _, let prURL):
+            // A (re)dispatch of the conflict resolver means the PR is
+            // conflicting again — the prior "conflict cleared" badge is
+            // stale and must be removed (T778). Mirrors the ciRemediationStarted
+            // arm that clears recentlyClearedCIPRs for the same reason.
+            recentlyClearedConflictPRs.removeValue(forKey: prURL)
+            engine.sendListConflictResolutions(limit: 200)
+        case .conflictResolutionFailed, .conflictResolutionAbandoned:
+            // Refreshes the engine-tab list so the status column re-renders.
+            // These don't touch the badge: failure/abandon don't un-clear a
+            // previously cleared conflict — only a new start signals re-conflict.
             engine.sendListConflictResolutions(limit: 200)
         case .conflictResolutionSucceeded(_, _, _, let prURL):
             // Stamp the PR url so the kanban card shows the
