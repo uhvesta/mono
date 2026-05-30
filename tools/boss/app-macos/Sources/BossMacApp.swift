@@ -37,7 +37,7 @@ struct BossMacApp: App {
                 }
             }
             CommandGroup(after: .appInfo) {
-                CheckForUpdatesCommand()
+                CheckForUpdatesCommand(updateModel: appDelegate.updateModel)
             }
             CommandGroup(after: .windowList) {
                 Divider()
@@ -125,13 +125,11 @@ struct BossMacApp: App {
 }
 
 private struct CheckForUpdatesCommand: View {
+    let updateModel: UpdateModel
+
     var body: some View {
         Button("Check for Updates…") {
-            guard let model = (NSApp.delegate as? AppDelegate)?.updateModel else {
-                appUpdateLog.error("Check for Updates: updateModel unavailable on AppDelegate — menu action is a no-op")
-                return
-            }
-            model.presentUpdateSheet()
+            updateModel.presentUpdateSheet()
         }
     }
 }
@@ -214,9 +212,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// brief window between launch and first-render — treated as "no agents
     /// working" so a very-early Cmd-Q is never held hostage.
     var liveWorkerStates: LiveWorkerStateStore?
-    /// Owned here so CheckForUpdatesCommand can always reach it — initialized
-    /// at AppDelegate construction time, before any view renders or menu fires.
-    /// (Commands cannot reliably use @EnvironmentObject; AppDelegate is always reachable.)
+    /// Owned here so the App struct can inject it into CheckForUpdatesCommand and
+    /// environment objects before any view renders or menu fires.
     let updateModel: UpdateModel = UpdateModel.makeForApp()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
