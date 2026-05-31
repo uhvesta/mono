@@ -106,27 +106,10 @@ struct UpdateResultSheet: View {
             }
 
             // Release notes
-            if !update.releaseNotes.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Release Notes")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .textCase(.uppercase)
-
-                    ScrollView {
-                        StructuredText(markdown: update.releaseNotes)
-                            .bossMarkdown()
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
-                    }
-                    .frame(maxHeight: 200)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-                    )
-                }
+            if !update.changelog.isEmpty {
+                changelogView(update.changelog)
+            } else if !update.releaseNotes.isEmpty {
+                singleVersionNotesView(update.releaseNotes)
             }
 
             Divider()
@@ -153,6 +136,79 @@ struct UpdateResultSheet: View {
                 }
                 .keyboardShortcut(.defaultAction)
             }
+        }
+    }
+
+    // MARK: - Changelog helpers
+
+    @ViewBuilder
+    private func changelogView(_ changelog: [ReleaseNote]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Release Notes")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(changelog, id: \.version.description) { note in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text("Version \(note.version.description)")
+                                    .font(.subheadline.weight(.semibold))
+                                if let date = note.publishedAt {
+                                    Text("·")
+                                        .foregroundStyle(.secondary)
+                                    Text(date, format: .dateTime.month(.abbreviated).day().year())
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if note.notes.isEmpty {
+                                Text("No release notes.")
+                                    .font(.callout)
+                                    .foregroundStyle(.tertiary)
+                                    .italic()
+                            } else {
+                                StructuredText(markdown: note.notes)
+                                    .bossMarkdown()
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                }
+                .padding(12)
+            }
+            .frame(maxHeight: 300)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+            )
+        }
+    }
+
+    private func singleVersionNotesView(_ notes: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Release Notes")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+
+            ScrollView {
+                StructuredText(markdown: notes)
+                    .bossMarkdown()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+            }
+            .frame(maxHeight: 200)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+            )
         }
     }
 

@@ -148,6 +148,91 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertEqual(result, .upToDate)
     }
 
+    // MARK: Changelog aggregation
+
+    func testChangelogContainsSingleVersionWhenOneReleaseAhead() async {
+        let checker = makeChecker(
+            current: "1.0.27",
+            releases: [release(tag: "boss-v1.0.28")]
+        )
+        let result = await checker.checkForUpdates()
+        guard case .available(let update) = result else {
+            return XCTFail("expected .available, got \(result)")
+        }
+        XCTAssertEqual(update.changelog.count, 1)
+        XCTAssertEqual(update.changelog[0].version, VersionTuple(major: 1, minor: 0, patch: 28))
+        XCTAssertEqual(update.changelog[0].notes, "Release notes for 1.0.28")
+    }
+
+    func testChangelogContainsAllVersionsInRange() async {
+        // Installed: 1.0.25 — available: 1.0.26, 1.0.27, 1.0.28 (newest first in changelog)
+        let checker = makeChecker(
+            current: "1.0.25",
+            releases: [
+                release(tag: "boss-v1.0.28"),
+                release(tag: "boss-v1.0.27"),
+                release(tag: "boss-v1.0.26"),
+                release(tag: "boss-v1.0.25"),  // installed — must be excluded
+                release(tag: "boss-v1.0.24"),  // older — must be excluded
+            ]
+        )
+        let result = await checker.checkForUpdates()
+        guard case .available(let update) = result else {
+            return XCTFail("expected .available, got \(result)")
+        }
+        XCTAssertEqual(update.version, VersionTuple(major: 1, minor: 0, patch: 28))
+        XCTAssertEqual(update.changelog.count, 3)
+        XCTAssertEqual(update.changelog.map(\.version), [
+            VersionTuple(major: 1, minor: 0, patch: 28),
+            VersionTuple(major: 1, minor: 0, patch: 27),
+            VersionTuple(major: 1, minor: 0, patch: 26),
+        ], "changelog must be newest-first and exclude installed and older versions")
+    }
+
+    func testChangelogIncludesAssetlessIntermediateVersions() async {
+        // boss-v1.0.21 has no zip asset but its notes should appear in the changelog
+        // because it is in the range (1.0.19, 1.0.22].
+        let checker = makeChecker(
+            current: "1.0.19",
+            releases: [
+                release(tag: "boss-v1.0.22"),
+                releaseWithoutAsset(tag: "boss-v1.0.21"),
+                release(tag: "boss-v1.0.20"),
+            ]
+        )
+        let result = await checker.checkForUpdates()
+        guard case .available(let update) = result else {
+            return XCTFail("expected .available, got \(result)")
+        }
+        XCTAssertEqual(update.version, VersionTuple(major: 1, minor: 0, patch: 22))
+        XCTAssertEqual(update.changelog.count, 3,
+            "assetless intermediate version should appear in the changelog")
+        XCTAssertEqual(update.changelog.map(\.version), [
+            VersionTuple(major: 1, minor: 0, patch: 22),
+            VersionTuple(major: 1, minor: 0, patch: 21),
+            VersionTuple(major: 1, minor: 0, patch: 20),
+        ])
+    }
+
+    func testChangelogExcludesAssetlessVersionBeyondDownloadTarget() async {
+        // boss-v1.0.21 has no asset and IS the highest version, so the download target
+        // falls back to boss-v1.0.20. The changelog should only cover (1.0.19, 1.0.20].
+        let checker = makeChecker(
+            current: "1.0.19",
+            releases: [
+                releaseWithoutAsset(tag: "boss-v1.0.21"),
+                release(tag: "boss-v1.0.20"),
+            ]
+        )
+        let result = await checker.checkForUpdates()
+        guard case .available(let update) = result else {
+            return XCTFail("expected .available, got \(result)")
+        }
+        XCTAssertEqual(update.version, VersionTuple(major: 1, minor: 0, patch: 20))
+        XCTAssertEqual(update.changelog.count, 1)
+        XCTAssertEqual(update.changelog[0].version, VersionTuple(major: 1, minor: 0, patch: 20))
+    }
+
     // MARK: Tag filtering
 
     func testIgnoresDraftReleases() async {

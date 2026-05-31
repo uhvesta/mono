@@ -32,19 +32,44 @@ public struct VersionTuple: Comparable, Equatable, Sendable, CustomStringConvert
     }
 }
 
+/// One entry in the per-version changelog shown when multiple releases are available.
+public struct ReleaseNote: Equatable, Sendable {
+    public let version: VersionTuple
+    /// Release publish date sourced from the GitHub API `published_at` field; nil if unavailable.
+    public let publishedAt: Date?
+    public let notes: String
+
+    public init(version: VersionTuple, publishedAt: Date?, notes: String) {
+        self.version = version
+        self.publishedAt = publishedAt
+        self.notes = notes
+    }
+}
+
 public struct AvailableUpdate: Equatable, Sendable {
     public let tagName: String
     public let version: VersionTuple
     public let assetURL: URL
     public let assetSize: Int
     public let releaseNotes: String
+    /// Release notes for every version in (installedVersion, version], newest first.
+    /// Always contains at least one entry (for `version` itself) when returned by the checker.
+    public let changelog: [ReleaseNote]
 
-    public init(tagName: String, version: VersionTuple, assetURL: URL, assetSize: Int, releaseNotes: String) {
+    public init(
+        tagName: String,
+        version: VersionTuple,
+        assetURL: URL,
+        assetSize: Int,
+        releaseNotes: String,
+        changelog: [ReleaseNote] = []
+    ) {
         self.tagName = tagName
         self.version = version
         self.assetURL = assetURL
         self.assetSize = assetSize
         self.releaseNotes = releaseNotes
+        self.changelog = changelog
     }
 }
 
@@ -79,6 +104,7 @@ private struct GitHubRelease: Decodable, Sendable {
     let draft: Bool
     let prerelease: Bool
     let body: String?
+    let publishedAt: Date?
     let assets: [GitHubAsset]
 
     enum CodingKeys: String, CodingKey {
@@ -86,6 +112,7 @@ private struct GitHubRelease: Decodable, Sendable {
         case draft
         case prerelease
         case body
+        case publishedAt = "published_at"
         case assets
     }
 }
@@ -212,7 +239,9 @@ actor UpdateChecker {
     private func parseReleases(from data: Data) -> UpdateCheckResult {
         let releases: [GitHubRelease]
         do {
-            releases = try JSONDecoder().decode([GitHubRelease].self, from: data)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            releases = try decoder.decode([GitHubRelease].self, from: data)
         } catch {
             checkerLog.error("update check: JSON decode failed — \(error.localizedDescription, privacy: .public)")
             return .networkError("JSON decode failed: \(error.localizedDescription)")
@@ -234,15 +263,18 @@ actor UpdateChecker {
             checkerLog.error("update check: invalid asset URL '\(asset.browserDownloadURL, privacy: .public)'")
             return .networkError("Invalid asset URL: \(asset.browserDownloadURL)")
         }
+
+        let changelog = releaseChangelog(from: releases, above: currentVersion, upTo: latestVersion)
         checkerLog.info(
-            "update check: update available — latest=\(latestVersion.description, privacy: .public) current=\(self.currentVersion.description, privacy: .public) tag=\(release.tagName, privacy: .public) assetSize=\(asset.size, privacy: .public) bytes"
+            "update check: update available — latest=\(latestVersion.description, privacy: .public) current=\(self.currentVersion.description, privacy: .public) tag=\(release.tagName, privacy: .public) assetSize=\(asset.size, privacy: .public) bytes changelogEntries=\(changelog.count, privacy: .public)"
         )
         return .available(AvailableUpdate(
             tagName: release.tagName,
             version: latestVersion,
             assetURL: assetURL,
             assetSize: asset.size,
-            releaseNotes: release.body ?? ""
+            releaseNotes: release.body ?? "",
+            changelog: changelog
         ))
     }
 
@@ -273,6 +305,28 @@ actor UpdateChecker {
         }
 
         return best
+    }
+
+    /// Returns release notes for all boss-v* versions in `(lowerBound, upperBound]`, sorted
+    /// newest-first. Includes releases without downloadable assets — only the download target
+    /// requires an asset; intermediate versions without zips still carry meaningful notes.
+    private func releaseChangelog(
+        from releases: [GitHubRelease],
+        above lowerBound: VersionTuple,
+        upTo upperBound: VersionTuple
+    ) -> [ReleaseNote] {
+        var notes: [ReleaseNote] = []
+        for release in releases {
+            guard !release.draft, !release.prerelease else { continue }
+            guard let match = try? Self.bossTagRegex.wholeMatch(in: release.tagName),
+                  let major = Int(match.major),
+                  let minor = Int(match.minor),
+                  let patch = Int(match.patch) else { continue }
+            let version = VersionTuple(major: major, minor: minor, patch: patch)
+            guard version > lowerBound, version <= upperBound else { continue }
+            notes.append(ReleaseNote(version: version, publishedAt: release.publishedAt, notes: release.body ?? ""))
+        }
+        return notes.sorted { $0.version > $1.version }
     }
 
     private func parseRateLimitReset(from response: HTTPURLResponse) -> Date {
