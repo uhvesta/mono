@@ -112,6 +112,14 @@ struct UpdateResultSheet: View {
                 singleVersionNotesView(update.releaseNotes)
             }
 
+            // In-app download/stage status (release builds only).
+            if !isDevBuild, let note = downloadStatusNote(for: update) {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(downloadFailed(for: update) ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Divider()
 
             // Buttons
@@ -130,13 +138,85 @@ struct UpdateResultSheet: View {
                 Button("Later") { dismiss() }
                     .keyboardShortcut(.cancelAction)
 
-                Button("Download") {
-                    NSWorkspace.shared.open(update.assetURL)
+                primaryActionButton(update: update, isDevBuild: isDevBuild)
+            }
+        }
+    }
+
+    // MARK: - Primary action (download / install)
+
+    /// The trailing call-to-action. Dev builds keep the manual browser download (the
+    /// updater never swaps over a dev build, per design non-goals). Release builds run
+    /// the in-app pipeline: **Download** stages the verified bundle, then the button
+    /// becomes **Install & Relaunch**, which swaps it in and relaunches.
+    @ViewBuilder
+    private func primaryActionButton(update: AvailableUpdate, isDevBuild: Bool) -> some View {
+        if isDevBuild {
+            Button("Download") {
+                NSWorkspace.shared.open(update.assetURL)
+                dismiss()
+            }
+            .keyboardShortcut(.defaultAction)
+        } else {
+            switch updateModel.downloadState {
+            case .downloading(let v, _) where v == update.version:
+                Button {
+                } label: {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Downloading…")
+                    }
+                }
+                .disabled(true)
+
+            case .readyToInstall(let v) where v == update.version:
+                Button("Install & Relaunch") {
+                    if UpdateLifecycle.installStagedAndRelaunch() {
+                        // Swap applied + helper spawned; quit so it can relaunch us.
+                        NSApplication.shared.terminate(nil)
+                    } else {
+                        // Not writable (/Applications without admin) or swap failed —
+                        // fall back to the manual download so the user isn't stuck.
+                        NSWorkspace.shared.open(update.assetURL)
+                    }
                     dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+
+            case .failed(let v, _) where v == update.version:
+                Button("Retry Download") {
+                    updateModel.downloadAvailableUpdate()
+                }
+                .keyboardShortcut(.defaultAction)
+
+            default:
+                Button("Download") {
+                    updateModel.downloadAvailableUpdate()
                 }
                 .keyboardShortcut(.defaultAction)
             }
         }
+    }
+
+    /// One-line status under the release notes describing the current download/stage
+    /// for `update`. `nil` when idle (the button text carries the affordance).
+    private func downloadStatusNote(for update: AvailableUpdate) -> String? {
+        switch updateModel.downloadState {
+        case .downloading(let v, let fraction) where v == update.version:
+            let pct = Int((fraction * 100).rounded())
+            return pct > 0 ? "Downloading Boss \(update.version)… \(pct)%" : "Downloading Boss \(update.version)…"
+        case .readyToInstall(let v) where v == update.version:
+            return "Boss \(update.version) downloaded and verified. Install & Relaunch to apply it now."
+        case .failed(let v, let reason) where v == update.version:
+            return "Download failed: \(reason)"
+        default:
+            return nil
+        }
+    }
+
+    private func downloadFailed(for update: AvailableUpdate) -> Bool {
+        if case .failed(let v, _) = updateModel.downloadState, v == update.version { return true }
+        return false
     }
 
     // MARK: - Changelog helpers

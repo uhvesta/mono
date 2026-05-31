@@ -4752,6 +4752,15 @@ private struct UpdateBadgePopover: View {
                 Divider()
             }
 
+            if let note = downloadStatusNote {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(downloadFailed ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
+
             HStack(spacing: 8) {
                 Button("Skip This Version") {
                     updateModel.skipCurrentVersion()
@@ -4768,16 +4777,80 @@ private struct UpdateBadgePopover: View {
                 }
                 .keyboardShortcut(.cancelAction)
 
-                Button("Download") {
-                    NSWorkspace.shared.open(releasePageURL ?? update.assetURL)
-                    onDismiss()
-                }
-                .keyboardShortcut(.defaultAction)
+                primaryActionButton
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
         .frame(minWidth: 300, maxWidth: 360)
+    }
+
+    /// Trailing call-to-action mirroring ``UpdateResultSheet``: dev builds keep the
+    /// manual browser download; release builds stage the bundle in-app and then offer
+    /// "Install & Relaunch".
+    @ViewBuilder
+    private var primaryActionButton: some View {
+        if updateModel.isDevBuild {
+            Button("Download") {
+                NSWorkspace.shared.open(releasePageURL ?? update.assetURL)
+                onDismiss()
+            }
+            .keyboardShortcut(.defaultAction)
+        } else {
+            switch updateModel.downloadState {
+            case .downloading(let v, _) where v == update.version:
+                Button {
+                } label: {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Downloading…")
+                    }
+                }
+                .disabled(true)
+
+            case .readyToInstall(let v) where v == update.version:
+                Button("Install & Relaunch") {
+                    if UpdateLifecycle.installStagedAndRelaunch() {
+                        NSApplication.shared.terminate(nil)
+                    } else {
+                        NSWorkspace.shared.open(releasePageURL ?? update.assetURL)
+                    }
+                    onDismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+
+            case .failed(let v, _) where v == update.version:
+                Button("Retry Download") {
+                    updateModel.downloadAvailableUpdate()
+                }
+                .keyboardShortcut(.defaultAction)
+
+            default:
+                Button("Download") {
+                    updateModel.downloadAvailableUpdate()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+    }
+
+    private var downloadStatusNote: String? {
+        switch updateModel.downloadState {
+        case .downloading(let v, let fraction) where v == update.version:
+            let pct = Int((fraction * 100).rounded())
+            return pct > 0 ? "Downloading… \(pct)%" : "Downloading…"
+        case .readyToInstall(let v) where v == update.version:
+            return "Downloaded and verified. Install & Relaunch to apply."
+        case .failed(let v, let reason) where v == update.version:
+            return "Download failed: \(reason)"
+        default:
+            return nil
+        }
+    }
+
+    private var downloadFailed: Bool {
+        if case .failed(let v, _) = updateModel.downloadState, v == update.version { return true }
+        return false
     }
 
     private var releasePageURL: URL? {

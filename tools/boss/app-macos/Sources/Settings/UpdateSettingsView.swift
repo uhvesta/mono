@@ -46,9 +46,51 @@ struct UpdateSettingsView: View {
                     }
                 }
             }
+
+            if let download = downloadStatusLine {
+                Section {
+                    HStack(spacing: 6) {
+                        downloadStatusIcon
+                        Text(download)
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .padding()
+    }
+
+    // MARK: - Download status
+
+    /// Reflects the in-app download/stage step (``UpdateModel/downloadState``) so the
+    /// user can see "Automatic" actually downloading and the "will install on quit"
+    /// state. `nil` when idle.
+    private var downloadStatusLine: String? {
+        switch model.downloadState {
+        case .idle:
+            return nil
+        case .downloading(let version, let fraction):
+            let pct = Int((fraction * 100).rounded())
+            return pct > 0 ? "Downloading Boss \(version)… \(pct)%" : "Downloading Boss \(version)…"
+        case .readyToInstall(let version):
+            return "Boss \(version) downloaded — will install on quit or relaunch."
+        case .failed(let version, let reason):
+            return "Download of Boss \(version) failed: \(reason)"
+        }
+    }
+
+    @ViewBuilder
+    private var downloadStatusIcon: some View {
+        switch model.downloadState {
+        case .downloading:
+            ProgressView().controlSize(.small)
+        case .readyToInstall:
+            Image(systemName: "arrow.down.circle.fill").foregroundStyle(.green)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .idle:
+            EmptyView()
+        }
     }
 
     // MARK: - Mode picker

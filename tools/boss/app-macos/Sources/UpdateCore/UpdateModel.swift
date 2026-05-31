@@ -27,6 +27,84 @@ public enum UpdateMode: String, CaseIterable, Sendable {
     case automatic = "automatic"
 }
 
+// MARK: - UpdateDownloadState
+
+/// Lifecycle of the in-app download/stage step, surfaced to the UI so the Settings
+/// pane, badge popover, and result sheet can show progress and the
+/// "downloaded — will install on quit/relaunch" state.
+///
+/// This is distinct from ``UpdateCheckResult`` (which only reports *availability*).
+/// A check finding an update sets `lastCheckResult = .available`; staging the bundle
+/// for that update drives this enum from `.downloading` to `.readyToInstall`.
+public enum UpdateDownloadState: Equatable, Sendable {
+    /// No download in flight and nothing staged this session.
+    case idle
+    /// Actively downloading/verifying `version`. `fraction` is best-effort `0...1`.
+    case downloading(version: VersionTuple, fraction: Double)
+    /// `version` is downloaded, verified, and staged under `Updates/<version>/`; the
+    /// next safe boundary (quit/startup in automatic mode, or an explicit
+    /// "Install & Relaunch") swaps it in.
+    case readyToInstall(version: VersionTuple)
+    /// The download or one of its integrity checks failed.
+    case failed(version: VersionTuple, reason: String)
+}
+
+// MARK: - UpdateStager
+
+/// Seam over ``UpdateDownloader`` so ``UpdateModel`` can drive the download/stage
+/// step without a hard dependency on the network/filesystem at test time.
+///
+/// `.live` builds a real `UpdateDownloader` rooted at the default Updates directory
+/// and resolves the running bundle's signing Team ID lazily — the downloader rejects
+/// a staged bundle whose Team ID differs from the running one, so a swap can never
+/// move us to a differently-signed bundle (equal `nil`s — today's ad-hoc-signed
+/// reality — match). `.noop` never stages (placeholder/preview/non-bundle models);
+/// tests inject their own closure.
+struct UpdateStager: Sendable {
+    /// Download, verify, and stage `update`, reporting fractional progress. Returns
+    /// the staged version on success (freshly staged or already present), `nil` if
+    /// any step failed.
+    let stage: @Sendable (
+        _ update: AvailableUpdate,
+        _ onProgress: @Sendable @escaping (Double) -> Void
+    ) async -> VersionTuple?
+
+    /// Never stages. Used by placeholder/preview models and non-bundle launches.
+    static let noop = UpdateStager { _, _ in nil }
+
+    /// Live stager: a real `UpdateDownloader` rooted at
+    /// `~/Library/Application Support/Boss/Updates`, with the running bundle's Team ID
+    /// resolved once and cached.
+    static func live(currentVersion: VersionTuple) -> UpdateStager {
+        let teamID = RunningTeamIDCache()
+        return UpdateStager { update, onProgress in
+            let downloader = UpdateDownloader.live(
+                currentVersion: currentVersion,
+                runningTeamID: await teamID.resolve()
+            )
+            switch await downloader.download(update, onProgress: onProgress) {
+            case .ready(let staged), .alreadyStaged(let staged):
+                return staged.version
+            case .failed:
+                return nil
+            }
+        }
+    }
+}
+
+/// Resolves the running bundle's signing Team ID once and caches it. Reading the
+/// Team ID shells out to `codesign`, so we avoid repeating it on every download.
+private actor RunningTeamIDCache {
+    private var cached: String??
+
+    func resolve() async -> String? {
+        if let cached { return cached }
+        let value = (try? await BundleOperations.live.readTeamID(Bundle.main.bundleURL)) ?? nil
+        cached = .some(value)
+        return value
+    }
+}
+
 // MARK: - UpdateModel
 
 /// Observable model that owns update state and drives the polling scheduler.
@@ -55,10 +133,14 @@ public final class UpdateModel: ObservableObject {
     @Published public var showUpdateSheet: Bool = false
     /// Transient toast state set only by ``presentUpdateSheet()``. `nil` when no toast is visible.
     @Published public private(set) var manualCheckFeedback: ManualUpdateFeedback? = nil
+    /// State of the in-app download/stage step. Drives the badge/sheet/Settings
+    /// "downloading…" / "ready to install" affordances. See ``UpdateDownloadState``.
+    @Published public private(set) var downloadState: UpdateDownloadState = .idle
 
     // MARK: - Private
 
     private var toastDismissTask: Task<Void, Never>?
+    private var stagingTask: Task<Void, Never>?
 
     private enum StorageKeys {
         static let mode = "boss.update.mode"
@@ -68,15 +150,19 @@ public final class UpdateModel: ObservableObject {
 
     private let defaults: UserDefaults
     private let checker: UpdateChecker
+    private let stager: UpdateStager
     private let jitterRange: ClosedRange<TimeInterval>
     private var schedulerTask: Task<Void, Never>?
 
     // MARK: - Init
 
-    /// Convenience factory that reads version info from the running bundle.
+    /// Convenience factory that reads version info from the running bundle and wires
+    /// the live downloader so automatic mode can stage updates.
     public static func fromBundle() -> UpdateModel? {
         guard let checker = UpdateChecker.fromBundle() else { return nil }
-        return UpdateModel(checker: checker)
+        let current = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
+            .flatMap(VersionTuple.parse) ?? VersionTuple(major: 0, minor: 0, patch: 0)
+        return UpdateModel(checker: checker, stager: .live(currentVersion: current))
     }
 
     /// Returns a no-op model used when the bundle is unavailable (e.g. SwiftUI previews).
@@ -91,14 +177,18 @@ public final class UpdateModel: ObservableObject {
         )
     }
 
-    /// Designated initializer. `defaults` and `jitterRange` are injectable for testing.
+    /// Designated initializer. `defaults`, `jitterRange`, and `stager` are injectable
+    /// for testing. `stager` defaults to `.noop` so tests that don't exercise the
+    /// download path never touch the network/filesystem.
     init(
         checker: UpdateChecker,
         defaults: UserDefaults = .standard,
-        jitterRange: ClosedRange<TimeInterval> = 30...120
+        jitterRange: ClosedRange<TimeInterval> = 30...120,
+        stager: UpdateStager = .noop
     ) {
         self.defaults = defaults
         self.checker = checker
+        self.stager = stager
         self.jitterRange = jitterRange
 
         let modeRaw = defaults.string(forKey: StorageKeys.mode) ?? UpdateMode.notify.rawValue
@@ -120,12 +210,15 @@ public final class UpdateModel: ObservableObject {
     /// the bundle's `CFBundleShortVersionString` is unavailable (e.g. `swift run` without plist).
     public static func makeForApp() -> UpdateModel {
         if let model = fromBundle() { return model }
+        // No `.app` bundle (e.g. `swift run` / bazel-run local dev). This is always a
+        // dev build, which never auto-stages, so a `.noop` stager is correct.
         return UpdateModel(
             checker: UpdateChecker(
                 currentVersionString: "0.0.0",
                 fullVersionString: "0.0.0-dev-local",
                 fetcher: .live
-            )
+            ),
+            stager: .noop
         )
     }
 
@@ -216,6 +309,12 @@ public final class UpdateModel: ObservableObject {
             modelLog.error("update check complete: network error — \(message, privacy: .public)")
         }
 
+        // In automatic mode, a known-available update is downloaded and staged here
+        // so the next quit/startup boundary can swap it in. Without this step the
+        // installer's `newestReadyUpdate` never finds anything and the app stays on
+        // the running version forever even with "Automatic" selected.
+        maybeAutoStage(result)
+
         return result
     }
 
@@ -231,6 +330,68 @@ public final class UpdateModel: ObservableObject {
     public func clearSkippedVersion() {
         skippedVersion = ""
         defaults.removeObject(forKey: StorageKeys.skippedVersion)
+    }
+
+    // MARK: - Download / stage
+
+    /// User-initiated download of the currently-available update (the result sheet /
+    /// badge "Download" button). Stages regardless of mode — the user explicitly
+    /// asked for it. Dev builds never stage (auto-install is a non-goal for them);
+    /// no-op when no update is available.
+    public func downloadAvailableUpdate() {
+        guard !isDevBuild, case .available(let update) = lastCheckResult else { return }
+        beginStaging(update)
+    }
+
+    /// Automatic-mode auto-stage: begin downloading/staging an available update so a
+    /// later quit/startup boundary can swap it in. No-op for non-automatic modes, dev
+    /// builds, or non-`.available` results. Idempotent — see ``beginStaging(_:)``.
+    private func maybeAutoStage(_ result: UpdateCheckResult) {
+        guard mode == .automatic, !isDevBuild else { return }
+        guard case .available(let update) = result else { return }
+        beginStaging(update)
+    }
+
+    /// Kick off (or resume awareness of) a download for `update`. Idempotent: if we're
+    /// already downloading or have already staged this exact version, it does nothing,
+    /// so repeated checks (or a manual click on top of an auto-download) never restart
+    /// an in-flight or completed stage. A newer version supersedes an older in-flight one.
+    private func beginStaging(_ update: AvailableUpdate) {
+        let version = update.version
+        switch downloadState {
+        case .downloading(let v, _) where v == version: return
+        case .readyToInstall(let v) where v == version: return
+        default: break
+        }
+        stagingTask?.cancel()
+        downloadState = .downloading(version: version, fraction: 0)
+        modelLog.info("update download: staging version=\(version.description, privacy: .public)")
+        stagingTask = Task { [weak self] in
+            guard let self else { return }
+            let staged = await self.stager.stage(update) { [weak self] fraction in
+                Task { @MainActor in
+                    guard let self else { return }
+                    // Only advance progress if we're still on this version's download.
+                    if case .downloading(let v, _) = self.downloadState, v == version {
+                        self.downloadState = .downloading(version: version, fraction: fraction)
+                    }
+                }
+            }
+            guard !Task.isCancelled else { return }
+            if let staged {
+                modelLog.info("update download: staged and ready version=\(staged.description, privacy: .public)")
+                self.downloadState = .readyToInstall(version: staged)
+            } else {
+                modelLog.error("update download: staging failed version=\(version.description, privacy: .public)")
+                self.downloadState = .failed(version: version, reason: "Download or verification failed")
+            }
+        }
+    }
+
+    /// Test hook: await the in-flight staging task, if any, so tests can wait for the
+    /// background download to settle before asserting on ``downloadState``.
+    func awaitStagingForTesting() async {
+        await stagingTask?.value
     }
 
     // MARK: - Scheduler

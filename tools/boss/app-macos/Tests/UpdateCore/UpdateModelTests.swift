@@ -354,6 +354,154 @@ final class UpdateModelTests: XCTestCase {
         let countAfterNotify = await counter.value
         XCTAssertGreaterThan(countAfterNotify, 0)
     }
+
+    // MARK: - Auto-download / staging
+
+    private static let mockVersion = VersionTuple(major: 1, minor: 0, patch: 99)
+
+    func testDefaultDownloadStateIsIdle() {
+        let model = makeModel(result: .upToDate)
+        XCTAssertEqual(model.downloadState, .idle)
+    }
+
+    func testAutomaticModeStagesAvailableUpdate() async throws {
+        defaults.set("automatic", forKey: "boss.update.mode")
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager())
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .readyToInstall(version: Self.mockVersion))
+        let count = await recorder.count
+        XCTAssertEqual(count, 1, "automatic mode should download/stage exactly once")
+    }
+
+    func testNotifyModeDoesNotAutoStage() async throws {
+        // Default mode is .notify.
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager())
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .idle)
+        let count = await recorder.count
+        XCTAssertEqual(count, 0, "notify mode must only detect, never download")
+    }
+
+    func testManualModeDoesNotAutoStage() async throws {
+        defaults.set("manual", forKey: "boss.update.mode")
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager())
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .idle)
+        let count = await recorder.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testDevBuildDoesNotAutoStageInAutomaticMode() async throws {
+        defaults.set("automatic", forKey: "boss.update.mode")
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager(), dev: true)
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .idle, "dev builds never auto-install")
+        let count = await recorder.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testUpToDateDoesNotStage() async throws {
+        defaults.set("automatic", forKey: "boss.update.mode")
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .upToDate, stager: recorder.stager())
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .idle)
+        let count = await recorder.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testDownloadAvailableUpdateStagesRegardlessOfMode() async throws {
+        // Default mode is .notify, which does NOT auto-stage; an explicit user click
+        // (the sheet/badge "Download" button) must still stage.
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager())
+
+        await model.checkNow()
+        XCTAssertEqual(model.downloadState, .idle)
+
+        model.downloadAvailableUpdate()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .readyToInstall(version: Self.mockVersion))
+        let count = await recorder.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testDownloadAvailableUpdateIsNoOpWhenNoUpdate() async throws {
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .upToDate, stager: recorder.stager())
+
+        await model.checkNow()
+        model.downloadAvailableUpdate()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .idle)
+        let count = await recorder.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testDownloadAvailableUpdateIsNoOpForDevBuild() async throws {
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager(), dev: true)
+
+        await model.checkNow()
+        model.downloadAvailableUpdate()
+        await model.awaitStagingForTesting()
+
+        XCTAssertEqual(model.downloadState, .idle)
+        let count = await recorder.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testStagingFailureSetsFailedState() async throws {
+        defaults.set("automatic", forKey: "boss.update.mode")
+        // A stager that always fails.
+        let model = makeModel(result: .availableMock, stager: UpdateStager { _, _ in nil })
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        guard case .failed(let version, _) = model.downloadState else {
+            return XCTFail("expected .failed, got \(model.downloadState)")
+        }
+        XCTAssertEqual(version, Self.mockVersion)
+    }
+
+    func testReStagingSameReadyVersionIsIdempotent() async throws {
+        defaults.set("automatic", forKey: "boss.update.mode")
+        let recorder = StagedRecorder()
+        let model = makeModel(result: .availableMock, stager: recorder.stager())
+
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+        XCTAssertEqual(model.downloadState, .readyToInstall(version: Self.mockVersion))
+
+        // A second poll finds the same version; it must not re-download.
+        await model.checkNow()
+        await model.awaitStagingForTesting()
+
+        let count = await recorder.count
+        XCTAssertEqual(count, 1, "an already-ready version must not be re-staged")
+    }
 }
 
 // MARK: - Helpers
@@ -365,7 +513,21 @@ extension UpdateModelTests {
         return UpdateModel(checker: checker, defaults: defaults, jitterRange: 0...0)
     }
 
-    private func makeCheckerAndCounter(result: UpdateCheckResult) -> (UpdateChecker, FetchCounter) {
+    /// Builds a model with an injected stager (and optionally a dev-build checker) for
+    /// the auto-download/staging tests.
+    private func makeModel(
+        result: UpdateCheckResult,
+        stager: UpdateStager,
+        dev: Bool = false
+    ) -> UpdateModel {
+        let (checker, _) = makeCheckerAndCounter(result: result, dev: dev)
+        return UpdateModel(checker: checker, defaults: defaults, jitterRange: 0...0, stager: stager)
+    }
+
+    private func makeCheckerAndCounter(
+        result: UpdateCheckResult,
+        dev: Bool = false
+    ) -> (UpdateChecker, FetchCounter) {
         let counter = FetchCounter()
         let fetcher = HTTPFetcher { [result] _ in
             await counter.increment()
@@ -373,7 +535,7 @@ extension UpdateModelTests {
         }
         let checker = UpdateChecker(
             currentVersionString: "1.0.0",
-            fullVersionString: "1.0.0",
+            fullVersionString: dev ? "1.0.0-dev-abc1234" : "1.0.0",
             fetcher: fetcher
         )
         return (checker, counter)
@@ -437,4 +599,33 @@ private extension UpdateCheckResult {
 actor FetchCounter {
     private(set) var value: Int = 0
     func increment() { value += 1 }
+}
+
+// MARK: - Recording stager
+
+/// A fake ``UpdateStager`` that counts how many times it was asked to stage and
+/// reports a staged version (or `nil` to simulate failure). Lets the model tests
+/// assert both the resulting `downloadState` and that staging happened exactly the
+/// expected number of times, without any network or filesystem.
+actor StagedRecorder {
+    private(set) var count = 0
+    private let returns: VersionTuple?
+
+    /// `returns` is the version the stager reports on success; `nil` simulates a
+    /// failed download. Defaults to the mock feed's `1.0.99`.
+    init(returning returns: VersionTuple? = VersionTuple(major: 1, minor: 0, patch: 99)) {
+        self.returns = returns
+    }
+
+    private func record() { count += 1 }
+
+    nonisolated func stager() -> UpdateStager {
+        let returns = self.returns  // immutable Sendable capture
+        return UpdateStager { update, _ in
+            await self.record()
+            // Echo the requested version so the model's `.readyToInstall` carries the
+            // value the checker produced (rather than a hardcoded constant).
+            return returns == nil ? nil : update.version
+        }
+    }
 }

@@ -98,10 +98,24 @@ enum UpdateLifecycle {
         _ = applySwapIfNeeded(relaunch: false)
     }
 
+    /// Explicit, user-initiated install of the newest staged update — the result
+    /// sheet / badge "Install & Relaunch" action. Unlike the automatic quit/startup
+    /// paths this is **not** gated on automatic mode (the user asked for it directly),
+    /// but it still refuses to swap over a dev build. On success the swap is applied,
+    /// the detached relaunch helper is spawned, and `true` is returned so the caller
+    /// terminates the app and lets the helper relaunch into the new version. Returns
+    /// `false` (changing nothing) if there is nothing staged, the install location is
+    /// not writable, or the swap fails — the caller should fall back to a manual path.
+    @discardableResult
+    static func installStagedAndRelaunch() -> Bool {
+        applySwapIfNeeded(relaunch: true, userInitiated: true)
+    }
+
     // MARK: - Implementation
 
-    private static func applySwapIfNeeded(relaunch: Bool) -> Bool {
-        guard isAutomaticMode, !isDevBuild, let running = runningVersion else { return false }
+    private static func applySwapIfNeeded(relaunch: Bool, userInitiated: Bool = false) -> Bool {
+        guard userInitiated || isAutomaticMode else { return false }
+        guard !isDevBuild, let running = runningVersion else { return false }
         let installer = installer()
         guard let ready = installer.newestReadyUpdate(currentVersion: running) else { return false }
 
