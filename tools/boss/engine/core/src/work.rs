@@ -65,21 +65,22 @@ pub const CI_CHURN_LIMIT: i64 = 5;
 
 pub use boss_protocol::{
     AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
-    AutomationTrigger, BlockedSignal, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED,
-    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_CI_FIX_PREFIX,
-    CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_UNKNOWN,
-    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution,
+    AutomationTrigger, BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE,
+    COMMENT_STATUS_DISMISSED, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED,
+    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX,
+    CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution,
     ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
     CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    EffortLevel, EngineAttemptListEntry, ExecutionReconcileResult, ListDependenciesInput,
-    PrWorkItemMatch, Product, Project, ProjectDesignDocState, RESOLVED_WITH_EXACT,
-    RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind,
-    SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem, WorkComment, WorkExecution,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
+    EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionReconcileResult,
+    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState,
+    RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskRuntime, WorkAttentionItem,
+    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
+    is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses

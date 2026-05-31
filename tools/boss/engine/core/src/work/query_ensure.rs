@@ -22,6 +22,33 @@ pub(crate) fn resolve_execution_worker_branch_prefix(
     Ok(prefix)
 }
 
+/// Resolve the [`BranchNaming`] strategy for a new execution by reading
+/// the owning product's `editorial_rules` JSON blob. Falls back to
+/// [`BranchNaming::default`] (`BossExecPrefix`) when the product has no
+/// rules configured or the JSON does not contain a `branch_naming` key.
+/// The resolved value is snapshotted onto the execution row at spawn so
+/// it remains stable even if the product rule changes later.
+pub(crate) fn resolve_execution_branch_naming(
+    conn: &Connection,
+    work_item_id: &str,
+) -> Result<BranchNaming> {
+    let product_id = product_id_for_work_item(conn, work_item_id)?;
+    let rules_json: Option<String> = conn
+        .query_row(
+            "SELECT editorial_rules FROM products WHERE id = ?1",
+            [&product_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let naming = rules_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<EditorialRules>(s).ok())
+        .map(|r| r.branch_naming)
+        .unwrap_or_default();
+    Ok(naming)
+}
+
 pub(crate) fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
         "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo, worker_branch_prefix
@@ -64,7 +91,8 @@ pub(crate) fn query_execution(conn: &Connection, id: &str) -> Result<Option<Work
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count,
+                allow_dirty, branch_naming
          FROM work_executions
          WHERE id = ?1",
         [id],

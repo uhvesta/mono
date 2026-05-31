@@ -724,6 +724,15 @@ pub struct WorkExecution {
     #[serde(default)]
     #[builder(default)]
     pub allow_dirty: bool,
+    /// Branch-naming strategy snapshotted from the owning product's
+    /// `editorial_rules.branch_naming` at execution spawn time. Frozen
+    /// here so that the engine can reconstruct the expected branch name
+    /// from `state.db` alone, even after the product's rule changes.
+    /// `NULL` in the DB (pre-migration rows) deserialises as the default
+    /// [`BranchNaming::BossExecPrefix`], preserving historical behaviour.
+    #[serde(default)]
+    #[builder(default)]
+    pub branch_naming: BranchNaming,
 }
 
 /// Role/origin of a rendered transcript segment.

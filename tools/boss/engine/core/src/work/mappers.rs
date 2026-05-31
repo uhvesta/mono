@@ -232,6 +232,11 @@ pub(crate) fn map_task_with_external_ref_and_parent(
 }
 
 pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
+    let branch_naming: BranchNaming = row
+        .get::<_, Option<String>>(22)?
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     Ok(WorkExecution {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
@@ -255,6 +260,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         worker_branch_prefix: row.get::<_, Option<String>>(19)?.filter(|s| !s.is_empty()),
         transient_failure_count: row.get(20)?,
         allow_dirty: row.get::<_, i64>(21)? != 0,
+        branch_naming,
     })
 }
 

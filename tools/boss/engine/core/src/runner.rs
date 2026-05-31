@@ -350,8 +350,8 @@ impl ExecutionRunner for PaneSpawnRunner {
             ) {
                 Ok(Some(prior)) => {
                     let branch = crate::completion::expected_branch_name(
-                        prior.worker_branch_prefix.as_deref(),
                         &prior.id,
+                        &prior.branch_naming,
                     );
                     tracing::info!(
                         execution_id = %execution.id,
@@ -634,8 +634,8 @@ fn compose_execution_prompt(
         // from main — fall back cleanly if the branch doesn't exist on
         // the remote.
         let expected_branch_new = crate::completion::expected_branch_name(
-            execution.worker_branch_prefix.as_deref(),
             &execution.id,
+            &execution.branch_naming,
         );
         prompt.push_str(&format!(
             "## STARTUP RECOVERY\n\
@@ -660,8 +660,8 @@ fn compose_execution_prompt(
     }
 
     let expected_branch = crate::completion::expected_branch_name(
-        execution.worker_branch_prefix.as_deref(),
         &execution.id,
+        &execution.branch_naming,
     );
     prompt.push_str("Execution context:\n");
     prompt.push_str(&format!("- execution id: `{}`\n", execution.id));
@@ -2981,7 +2981,10 @@ mod pane_spawn_tests {
             workspace.path().join(".claude").join("initial-prompt.txt"),
         )
         .unwrap();
-        let expected_branch = crate::completion::expected_branch_name(None, "exec-test-1");
+        let expected_branch = crate::completion::expected_branch_name(
+            "exec-test-1",
+            &boss_protocol::BranchNaming::BossExecPrefix,
+        );
         assert!(
             prompt.contains(&expected_branch),
             "prompt must name the engine-supplied branch `{expected_branch}`, got: {prompt}",

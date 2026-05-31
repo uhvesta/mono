@@ -182,13 +182,15 @@ impl WorkDb {
 
         let new_id = next_id("exec");
         let dispatch_not_before = dispatch_not_before_epoch.to_string();
+        let branch_naming_json =
+            serde_json::to_string(&dead.branch_naming).unwrap_or_default();
         tx.execute(
             "INSERT INTO work_executions (
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at, prefer_is_soft,
-                transient_failure_count, dispatch_not_before, allow_dirty
-             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12)",
+                transient_failure_count, dispatch_not_before, allow_dirty, branch_naming
+             ) VALUES (?1, ?2, ?3, 'ready', ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12, ?13)",
             params![
                 new_id,
                 dead.work_item_id,
@@ -202,6 +204,7 @@ impl WorkDb {
                 new_count,
                 dispatch_not_before,
                 dead.allow_dirty as i64,
+                branch_naming_json,
             ],
         )?;
 
@@ -322,7 +325,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
              FROM work_executions
              WHERE status = 'ready'
                AND (dispatch_not_before IS NULL
@@ -348,7 +351,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -378,7 +381,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -1155,6 +1158,26 @@ impl WorkDb {
         conn.execute(
             "UPDATE work_executions SET transient_failure_count = ?2 WHERE id = ?1",
             params![execution_id, count],
+        )?;
+        Ok(())
+    }
+
+    /// Overwrite `branch_naming` for an execution row. Used in tests to
+    /// verify that the detector reconstructs the correct branch name from
+    /// the snapshotted strategy without needing to re-create the full
+    /// product/editorial-rules fixture.
+    #[cfg(test)]
+    pub fn force_branch_naming_for_test(
+        &self,
+        execution_id: &str,
+        naming: &BranchNaming,
+    ) -> Result<()> {
+        let json = serde_json::to_string(naming)
+            .with_context(|| format!("failed to serialise BranchNaming for {execution_id}"))?;
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET branch_naming = ?2 WHERE id = ?1",
+            params![execution_id, json],
         )?;
         Ok(())
     }

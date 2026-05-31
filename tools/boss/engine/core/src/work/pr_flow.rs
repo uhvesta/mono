@@ -223,7 +223,7 @@ impl WorkDb {
             .saturating_sub(lookback_secs)
             .to_string();
         let mut stmt = conn.prepare(
-            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.worker_branch_prefix
+            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming
              FROM work_executions we
              JOIN tasks t ON t.id = we.work_item_id
              WHERE we.status IN ('abandoned', 'completed', 'failed')
@@ -238,11 +238,16 @@ impl WorkDb {
              ORDER BY we.finished_at DESC, we.id DESC",
         )?;
         let rows = stmt.query_map([cutoff], |row| {
+            let branch_naming: BranchNaming = row
+                .get::<_, Option<String>>(3)?
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
             Ok(LatePrCandidate {
                 execution_id: row.get(0)?,
                 work_item_id: row.get(1)?,
                 repo_remote_url: row.get(2)?,
-                worker_branch_prefix: row.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
+                branch_naming,
             })
         })?;
         collect_rows(rows)

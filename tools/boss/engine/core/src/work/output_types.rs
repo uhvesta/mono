@@ -53,11 +53,13 @@ pub struct LatePrCandidate {
     pub execution_id: String,
     pub work_item_id: String,
     pub repo_remote_url: String,
-    /// Worker branch-name prefix frozen onto the execution row.
-    /// `None` → engine default `boss/`. Carried so the late-PR sweep
-    /// reconstructs the same `<prefix>exec_<id>` branch the worker
-    /// pushed to. See [`crate::completion::expected_branch_name`].
-    pub worker_branch_prefix: Option<String>,
+    /// Branch-naming strategy snapshotted from the product's
+    /// `editorial_rules.branch_naming` at execution spawn time. Carried so
+    /// the late-PR sweep reconstructs the correct expected branch name via
+    /// [`crate::completion::expected_branch_name`]. Defaults to
+    /// [`BranchNaming::BossExecPrefix`] for rows created before this column
+    /// existed (i.e. `NULL` in the DB).
+    pub branch_naming: BranchNaming,
 }
 
 /// Raw external-ref data as stored in the `tasks` table. Returned by
