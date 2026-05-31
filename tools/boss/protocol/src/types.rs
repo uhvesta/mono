@@ -2036,6 +2036,17 @@ pub struct AutomationRun {
     pub detail: Option<String>,
 }
 
+/// `automation_runs.outcome` discriminators. The scheduler writes
+/// `suppressed_at_limit`, `skipped` (stale catch-up skip), and the
+/// pessimistic `failed_will_retry` default at fire time; the triage
+/// outcome detector flips a fired run to `produced_task` / `skipped` /
+/// `failed_gave_up` once the worker reaches a decision (Maint task 6).
+pub const AUTOMATION_OUTCOME_PRODUCED_TASK: &str = "produced_task";
+pub const AUTOMATION_OUTCOME_SKIPPED: &str = "skipped";
+pub const AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT: &str = "suppressed_at_limit";
+pub const AUTOMATION_OUTCOME_FAILED_WILL_RETRY: &str = "failed_will_retry";
+pub const AUTOMATION_OUTCOME_FAILED_GAVE_UP: &str = "failed_gave_up";
+
 /// Input to `CreateAutomation`. Carries only the caller-supplied fields;
 /// the engine stamps `id`, `short_id`, `created_at`, `updated_at`, and the
 /// initial scheduler bookkeeping.

@@ -207,6 +207,7 @@ pub(crate) use revision_helpers::*;
 
 pub use audit_misc::AUDIT_ACTOR_DESIGN_DETECTOR;
 pub use audit_misc::AUDIT_ACTOR_HUMAN;
+pub use automations::AutomationFireRecord;
 pub use audit_misc::ProjectPropertyAuditEntry;
 pub use audit_misc::canonicalize_repo_remote_url;
 pub use audit_misc::canonicalize_worker_branch_prefix;

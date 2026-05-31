@@ -1,5 +1,33 @@
 use super::*;
 
+/// One scheduler decision to persist via
+/// [`WorkDb::record_automation_run_and_advance`]. All timestamps are UTC
+/// epoch seconds (stored as strings, matching the rest of the schema).
+///
+/// Uses the repo builder convention (`bon`) since it carries 8+ fields;
+/// `Option` fields default to `None`, so a caller only sets what applies to
+/// the decision it is recording.
+#[derive(Debug, Clone)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct AutomationFireRecord {
+    pub automation_id: String,
+    /// The cron occurrence this run satisfies (UTC epoch seconds). Doubles
+    /// as the at-most-once dedupe key with `automation_id`.
+    pub scheduled_for: i64,
+    /// When the scheduler recorded this decision (UTC epoch seconds).
+    pub started_at: i64,
+    /// One of the `AUTOMATION_OUTCOME_*` discriminators.
+    pub outcome: String,
+    pub triage_execution_id: Option<String>,
+    pub produced_task_id: Option<String>,
+    pub finished_at: Option<i64>,
+    pub detail: Option<String>,
+    /// `Some(next_occurrence)` advances `automations.next_due_at`; `None`
+    /// holds the current occurrence (used for transient-failure retry).
+    pub next_due_at: Option<i64>,
+}
+
 const AUTOMATION_SELECT: &str = "
     SELECT id, short_id, product_id, name, repo_remote_url,
            trigger_kind, trigger_config, standing_instruction,
@@ -270,6 +298,197 @@ impl WorkDb {
         )?;
         let rows = stmt.query_map([automation_id], map_task_with_source_automation_id)?;
         collect_rows(rows)
+    }
+
+    /// List automations the scheduler should evaluate this tick: enabled,
+    /// `trigger_kind = 'schedule'`, and either never-scheduled
+    /// (`next_due_at IS NULL`, needs initialisation) or due
+    /// (`next_due_at <= now_epoch`). Ordered oldest-first for stable
+    /// iteration. `now_epoch` is UTC seconds; `next_due_at` is stored as an
+    /// epoch-seconds string, so the comparison casts it to INTEGER.
+    pub fn list_due_automations(
+        &self,
+        now_epoch: i64,
+    ) -> Result<Vec<boss_protocol::Automation>> {
+        let conn = self.connect()?;
+        let sql = format!(
+            "{AUTOMATION_SELECT}
+              WHERE enabled = 1
+                AND trigger_kind = 'schedule'
+                AND (next_due_at IS NULL OR CAST(next_due_at AS INTEGER) <= ?1)
+              ORDER BY created_at ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([now_epoch], map_automation)?;
+        collect_rows(rows)
+    }
+
+    /// Initialise an automation's `next_due_at` (epoch seconds) without
+    /// recording a fire. Used the first time the scheduler sees an
+    /// automation whose `next_due_at` is still NULL: it computes the next
+    /// occurrence and parks it here so the next tick can fire on time.
+    /// Deliberately does NOT touch `updated_at` (which tracks user/config
+    /// edits) or the `last_*` fire bookkeeping.
+    pub fn initialize_automation_next_due_at(
+        &self,
+        id: &str,
+        next_due_epoch: i64,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE automations SET next_due_at = ?2 WHERE id = ?1",
+            params![id, next_due_epoch.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch the `automation_runs` row for a specific occurrence, if one
+    /// exists. The `(automation_id, scheduled_for)` pair is the
+    /// at-most-once dedupe key for a fired occurrence.
+    pub fn automation_run_for_occurrence(
+        &self,
+        automation_id: &str,
+        scheduled_for_epoch: i64,
+    ) -> Result<Option<boss_protocol::AutomationRun>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, automation_id, scheduled_for, started_at, finished_at,
+                    triage_execution_id, outcome, produced_task_id, detail
+               FROM automation_runs
+              WHERE automation_id = ?1 AND scheduled_for = ?2",
+            params![automation_id, scheduled_for_epoch.to_string()],
+            map_automation_run,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Record one scheduler decision and advance the automation's
+    /// bookkeeping, atomically.
+    ///
+    /// The `automation_runs` write is an **upsert** keyed on
+    /// `(automation_id, scheduled_for)`: a fresh occurrence inserts a row;
+    /// re-recording the same occurrence (e.g. a held `failed_will_retry`
+    /// the scheduler re-attempts) updates the existing row in place rather
+    /// than piling up duplicates — preserving the at-most-once-per-occurrence
+    /// invariant.
+    ///
+    /// `last_fired_at` and `last_outcome` are always updated to mirror this
+    /// decision. `next_due_at` advances only when `record.next_due_at` is
+    /// `Some` — a transient pre-start failure passes `None` to *hold* the
+    /// occurrence for retry rather than skip past it.
+    pub fn record_automation_run_and_advance(
+        &self,
+        record: AutomationFireRecord,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let scheduled_for = record.scheduled_for.to_string();
+        let started_at = record.started_at.to_string();
+        let finished_at = record.finished_at.map(|v| v.to_string());
+
+        let existing_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM automation_runs
+                  WHERE automation_id = ?1 AND scheduled_for = ?2",
+                params![record.automation_id, scheduled_for],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match existing_id {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE automation_runs
+                        SET started_at = ?2, finished_at = ?3,
+                            triage_execution_id = ?4, outcome = ?5,
+                            produced_task_id = ?6, detail = ?7
+                      WHERE id = ?1",
+                    params![
+                        id,
+                        started_at,
+                        finished_at,
+                        record.triage_execution_id,
+                        record.outcome,
+                        record.produced_task_id,
+                        record.detail,
+                    ],
+                )?;
+            }
+            None => {
+                let run_id = next_id("autorun");
+                tx.execute(
+                    "INSERT INTO automation_runs
+                         (id, automation_id, scheduled_for, started_at, finished_at,
+                          triage_execution_id, outcome, produced_task_id, detail)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        run_id,
+                        record.automation_id,
+                        scheduled_for,
+                        started_at,
+                        finished_at,
+                        record.triage_execution_id,
+                        record.outcome,
+                        record.produced_task_id,
+                        record.detail,
+                    ],
+                )?;
+            }
+        }
+
+        // Advance bookkeeping. `next_due_at` is only rewritten when the
+        // caller wants to move past this occurrence.
+        match record.next_due_at {
+            Some(next_due) => {
+                tx.execute(
+                    "UPDATE automations
+                        SET last_fired_at = ?2, last_outcome = ?3, next_due_at = ?4
+                      WHERE id = ?1",
+                    params![
+                        record.automation_id,
+                        record.started_at.to_string(),
+                        record.outcome,
+                        next_due.to_string(),
+                    ],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE automations
+                        SET last_fired_at = ?2, last_outcome = ?3
+                      WHERE id = ?1",
+                    params![
+                        record.automation_id,
+                        record.started_at.to_string(),
+                        record.outcome,
+                    ],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Stamp a task's `source_automation_id` (and status) directly. Used by
+    /// scheduler tests to drive the open-task-limit gate without the
+    /// `boss task create --automation` path (Maint task 6).
+    #[cfg(test)]
+    pub fn stamp_task_source_automation_for_test(
+        &self,
+        task_id: &str,
+        automation_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks SET source_automation_id = ?2, status = ?3
+              WHERE id = ?1 AND deleted_at IS NULL",
+            params![task_id, automation_id, status],
+        )?;
+        Ok(())
     }
 
     /// Return the `source_automation_id` for `work_item_id`, or `None` if the

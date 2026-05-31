@@ -2750,6 +2750,23 @@ pub async fn serve(
         Arc::new(move || coord_for_dep_unblock.kick()),
     );
 
+    // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,
+    // for every enabled `schedule` automation that is due, compute its
+    // cron/timezone occurrence, enforce the open-task gate, apply catch-up /
+    // skip-if-imminent, and write the decision to `automation_runs`. Fires
+    // immediately on boot so a daily occurrence elapsed while the engine was
+    // down is caught up without waiting a full interval. The triage
+    // *execution* itself (the `automation_triage` work_execution + outcome
+    // detector) is Maint task 6; until it lands the loop holds each due
+    // occurrence as `failed_will_retry` via `LoggingTriageDispatcher` rather
+    // than firing into the void. With zero automations configured the loop
+    // is inert.
+    let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
+        server_state.work_db.clone(),
+        Arc::new(crate::automation_scheduler::LoggingTriageDispatcher),
+        crate::automation_scheduler::AUTOMATION_SCHEDULER_INTERVAL,
+    );
+
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
     // by a dropped wakeup (the `status_transition` → `request_recorded`
     // stall class — see `exec_18af3ba5259d32a8_12`, 2026-05-13) is

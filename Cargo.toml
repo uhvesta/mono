@@ -29,6 +29,12 @@ edition = "2024"
 anyhow = "1.0.97"
 async-trait = "0.1.86"
 bon = "3.9.1"
+# chrono / chrono-tz: IANA-timezone-aware occurrence math for the
+# automation scheduler (maintenance-tasks.md). `clock` is intentionally
+# off — the scheduler injects "now" as epoch seconds, so we never need
+# `Local::now` or the platform tz lookup that `clock` pulls in.
+chrono = { version = "0.4.39", default-features = false, features = ["std"] }
+chrono-tz = "0.10.1"
 clap = "4.5.39"
 flate2 = "1.1.5"
 fs4 = "0.13"

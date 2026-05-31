@@ -8,6 +8,8 @@ anyhow = { workspace = true }
 boss-transcript-markdown = { path = "boss-transcript-markdown" }
 async-trait = { workspace = true }
 bon = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-editorial = { path = "../editorial" }
 boss-feature-flags = { path = "../feature-flags" }

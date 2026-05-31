@@ -9,6 +9,8 @@ rust_library(
         "src/app.rs",
         "src/audit.rs",
         "src/audit_effort.rs",
+        "src/automation_schedule.rs",
+        "src/automation_scheduler.rs",
         "src/blocking_signal.rs",
         "src/build_info.rs",
         "src/ci_log_reader.rs",
