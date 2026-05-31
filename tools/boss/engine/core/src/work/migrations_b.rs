@@ -608,22 +608,20 @@ pub(crate) fn migrate_work_executions_worker_branch_prefix(conn: &Connection) ->
     Ok(())
 }
 
-/// Add the `tasks.investigation_doc_path` and `tasks.investigation_doc_branch`
-/// pointer columns set by the worker after opening the doc PR. The doc's repo
-/// is always derived from the task's `repo_remote_url` at read time and is
-/// never stored as a separate column.
-pub(crate) fn migrate_tasks_investigation_doc_columns(conn: &Connection) -> Result<()> {
-    if !table_has_column(conn, "tasks", "investigation_doc_path")? {
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN investigation_doc_path TEXT",
-            [],
-        )?;
+/// Drop the bespoke `tasks.investigation_doc_path` / `investigation_doc_branch`
+/// pointer columns. The investigation-doc card affordance is now derived from
+/// the task's `pr_url` — exactly like the design-doc affordance — so the
+/// worker-set pointer triple is dead weight. Idempotent: a fresh database
+/// never had these columns (they were only ever added by migration, never in
+/// the `CREATE TABLE`), and an already-migrated database has them dropped here.
+/// Any stored pointer values are intentionally discarded; the affordance reads
+/// `pr_url` instead, so nothing downstream needs them.
+pub(crate) fn migrate_drop_tasks_investigation_doc_columns(conn: &Connection) -> Result<()> {
+    if table_has_column(conn, "tasks", "investigation_doc_path")? {
+        conn.execute("ALTER TABLE tasks DROP COLUMN investigation_doc_path", [])?;
     }
-    if !table_has_column(conn, "tasks", "investigation_doc_branch")? {
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN investigation_doc_branch TEXT",
-            [],
-        )?;
+    if table_has_column(conn, "tasks", "investigation_doc_branch")? {
+        conn.execute("ALTER TABLE tasks DROP COLUMN investigation_doc_branch", [])?;
     }
     Ok(())
 }
@@ -1125,6 +1123,54 @@ pub(crate) fn migrate_tasks_source_automation_id(conn: &Connection) -> Result<()
     Ok(())
 }
 
+/// Add editorial-controls schema (P576, chore #1).
+///
+/// - `products.editorial_rules` (TEXT, NULL): JSON blob of per-product
+///   editorial rules injected into worker prompts. NULL means no rules
+///   (all-defaults). Mirrors the opaque-JSON pattern used by
+///   `external_tracker_config`.
+/// - `work_executions.branch_naming` (TEXT, NULL): branch-naming
+///   convention snapshot taken at spawn time. NULL means the legacy
+///   default ("boss_exec_prefix"). Denormalised from product so the
+///   execution is self-describing even if the product is later edited.
+/// - `editorial_actions` table: append-only audit log of allow/rewrite/
+///   deny decisions made by the editorial pass (Phase 2+). Written dark
+///   in this migration — no engine code reads or writes it yet.
+///
+/// Idempotent: column additions are guarded by `table_has_column`;
+/// the table and index use `CREATE … IF NOT EXISTS`.
+///
+/// Design: `tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md`
+pub(crate) fn migrate_editorial_controls_schema(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "editorial_rules")? {
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN editorial_rules TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "work_executions", "branch_naming")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN branch_naming TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS editorial_actions (
+             id           INTEGER PRIMARY KEY,
+             product_id   TEXT NOT NULL REFERENCES products(id),
+             execution_id TEXT,
+             pr_url       TEXT,
+             tool_command TEXT NOT NULL,
+             action       TEXT NOT NULL CHECK (action IN ('allow', 'rewrite', 'deny')),
+             reason       TEXT,
+             created_at   TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_editorial_actions_product
+             ON editorial_actions(product_id, created_at DESC);",
+    )?;
+    Ok(())
+}
+
 /// Create the `attention_groups` and `attentions` tables for the
 /// Attentions feature (design: `tools/boss/docs/designs/attentions.md`).
 ///
@@ -1195,54 +1241,6 @@ pub(crate) fn migrate_attentions(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS attentions_group_idx
              ON attentions(group_id, ordinal);",
-    )?;
-    Ok(())
-}
-
-/// Add editorial-controls schema (P576, chore #1).
-///
-/// - `products.editorial_rules` (TEXT, NULL): JSON blob of per-product
-///   editorial rules injected into worker prompts. NULL means no rules
-///   (all-defaults). Mirrors the opaque-JSON pattern used by
-///   `external_tracker_config`.
-/// - `work_executions.branch_naming` (TEXT, NULL): branch-naming
-///   convention snapshot taken at spawn time. NULL means the legacy
-///   default ("boss_exec_prefix"). Denormalised from product so the
-///   execution is self-describing even if the product is later edited.
-/// - `editorial_actions` table: append-only audit log of allow/rewrite/
-///   deny decisions made by the editorial pass (Phase 2+). Written dark
-///   in this migration — no engine code reads or writes it yet.
-///
-/// Idempotent: column additions are guarded by `table_has_column`;
-/// the table and index use `CREATE … IF NOT EXISTS`.
-///
-/// Design: `tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md`
-pub(crate) fn migrate_editorial_controls_schema(conn: &Connection) -> Result<()> {
-    if !table_has_column(conn, "products", "editorial_rules")? {
-        conn.execute(
-            "ALTER TABLE products ADD COLUMN editorial_rules TEXT",
-            [],
-        )?;
-    }
-    if !table_has_column(conn, "work_executions", "branch_naming")? {
-        conn.execute(
-            "ALTER TABLE work_executions ADD COLUMN branch_naming TEXT",
-            [],
-        )?;
-    }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS editorial_actions (
-             id           INTEGER PRIMARY KEY,
-             product_id   TEXT NOT NULL REFERENCES products(id),
-             execution_id TEXT,
-             pr_url       TEXT,
-             tool_command TEXT NOT NULL,
-             action       TEXT NOT NULL CHECK (action IN ('allow', 'rewrite', 'deny')),
-             reason       TEXT,
-             created_at   TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_editorial_actions_product
-             ON editorial_actions(product_id, created_at DESC);",
     )?;
     Ok(())
 }

@@ -796,13 +796,6 @@ struct WorkTask: Identifiable, Hashable {
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil
-    /// Repo-relative path to the markdown doc produced by an investigation
-    /// worker. `nil` until the worker calls `boss task set-investigation-doc`.
-    /// Only meaningful on `kind == "investigation"` rows.
-    var investigationDocPath: String? = nil
-    /// PR branch the investigation doc was opened on. Used to construct the
-    /// in-review GitHub URL while the PR is open.
-    var investigationDocBranch: String? = nil
     /// Soft FK to the parent task for `kind == "revision"` rows. `nil`
     /// for non-revision rows. Mirrors `Task.parent_task_id` on the wire.
     var parentTaskId: String? = nil
@@ -844,22 +837,6 @@ struct WorkTask: Identifiable, Hashable {
                 .map { $0.prefix(1).uppercased() + $0.dropFirst() }
                 .joined(separator: " ")
         }
-    }
-
-    /// GitHub web URL for the investigation doc, derived at render time
-    /// from the task's `repoRemoteURL`, `investigationDocBranch`, and
-    /// `investigationDocPath`. Returns `nil` when the path is not yet set
-    /// or the task has no repo URL.
-    /// Uses `investigationDocBranch` while the PR is open; falls back to
-    /// `"main"` after merge (branch field cleared by future tooling).
-    var investigationDocWebURL: String? {
-        guard let path = investigationDocPath, !path.isEmpty,
-              let repo = repoRemoteURL, !repo.isEmpty else {
-            return nil
-        }
-        let branch = investigationDocBranch ?? "main"
-        let slug = ProjectDesignDocAffordancePresentation.repoSlug(from: repo)
-        return "https://github.com/\(slug)/blob/\(branch)/\(path)"
     }
 }
 

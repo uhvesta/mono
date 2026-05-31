@@ -51,7 +51,6 @@ use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
-use crate::investigation_detector;
 use crate::metrics::Registry;
 use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
 use boss_protocol;
@@ -2257,17 +2256,6 @@ async fn mark_merged(
             )
             .await;
         }
-    }
-    // Auto-register the investigation-doc pointer on merge for
-    // `kind=investigation` tasks. Errors are logged inside the detector.
-    if updated.kind == "investigation" {
-        investigation_detector::on_investigation_pr_merged(
-            work_db,
-            &updated.id,
-            &candidate.pr_url,
-            probe.base_ref_name.as_deref(),
-        )
-        .await;
     }
     true
 }

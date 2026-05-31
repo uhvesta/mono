@@ -454,13 +454,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     boss task create-investigation --product <p> [--project <proj>] --name "…" --description "…"
     ```
 
-    The worker writes the doc, opens a PR, and registers the pointer with:
-
-    ```
-    boss task set-investigation-doc --task <id> --path <path> --branch <branch>
-    ```
-
-    The Review-column card then shows a doc affordance.
+    The worker writes the doc and opens a PR. The Review-column card's doc link is derived automatically from the task's PR (the engine detects it when the PR opens) — exactly like a design task. There is no separate pointer to register.
 
     **When to reach for it (deliverable-based):**
 

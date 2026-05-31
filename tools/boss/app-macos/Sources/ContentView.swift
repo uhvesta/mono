@@ -1893,18 +1893,6 @@ struct WorkBoardCardView: View {
                             .buttonStyle(.plain)
                             .help(presentation.tooltip)
                         }
-                        if task.kind == "investigation",
-                           let webURL = task.investigationDocWebURL,
-                           let url = URL(string: webURL) {
-                            Link(destination: url) {
-                                Image(systemName: "doc.text")
-                                    .font(.caption)
-                                    .foregroundStyle(Color.secondary)
-                                    .accessibilityLabel("Open investigation doc")
-                            }
-                            .buttonStyle(.plain)
-                            .help("Open investigation doc: \(webURL)")
-                        }
                         if let openTerminal = onOpenReviewTerminal {
                             Button {
                                 openTerminal()

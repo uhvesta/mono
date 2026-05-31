@@ -712,7 +712,7 @@ fn compose_execution_prompt(
             prompt.push_str(&compose_design_directive(parent_project));
         }
         "investigation_implementation" => {
-            prompt.push_str(&compose_investigation_directive(work_item));
+            prompt.push_str(&compose_investigation_directive());
         }
         "revision_implementation" => {
             prompt.push_str(&compose_revision_directive(execution, work_item, workspace_path, conflict_attempt, ci_attempt));
@@ -940,16 +940,18 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
 ///   direct-push shortcut in the user's CLAUDE.md does NOT apply here:
 ///   the PR review window is the user's opportunity to edit the doc
 ///   before it is saved for posterity. Always open a PR.
-/// - The engine registers the doc pointer automatically on PR detection
-///   (`investigation_detector`); workers must not call
-///   `boss task set-investigation-doc`.
-fn compose_investigation_directive(_work_item: &WorkItem) -> String {
+///
+/// The kanban doc affordance is derived from the task's `pr_url`, which
+/// the engine auto-detects when the worker opens the PR — exactly like a
+/// design task. The worker does NOT register any doc pointer; opening the
+/// PR is the whole job.
+fn compose_investigation_directive() -> String {
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
     out.push_str("- the deliverable is a **markdown document**, not code. Do not edit source code, build files, or anything other than the investigation doc.\n");
     out.push_str("- the PR for this run contains **only the markdown doc** (one new file). If you find yourself touching `.rs`, `.ts`, `.swift`, build files, or anything else, stop — you are out of scope.\n");
     out.push_str("- choose a filename that reflects the topic (e.g. `docs/investigations/my-topic.md`). Use an `investigations/` subdirectory if one exists in the repo, or create it.\n");
-    out.push_str("- open a PR with the doc regardless of which repo it lands in. Do NOT push directly to `main` even on the user's personal docs repo (e.g. `brianduff/docs`). The PR is the user's edit window.\n");
+    out.push_str("- open a PR with the doc regardless of which repo it lands in. Do NOT push directly to `main` even on the user's personal docs repo (e.g. `brianduff/docs`). The PR is the user's edit window. The kanban card's doc link is derived from this PR automatically — there is no separate pointer to register.\n");
     out.push_str("- investigations do not touch code. If the description asks for both research and a code change, write only the investigation doc and note the follow-up code changes at the end of the doc for the user to file separately.\n");
     out
 }
@@ -1017,6 +1019,7 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "8. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
     ));
+    out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
     out.push_str("Rebase-only exception: if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces no new diff, it is perfectly valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change.\n");

@@ -617,6 +617,20 @@ fn upgrade_from_schema_without_revision_columns_yields_same_shape() {
         "upgraded tasks table must gain parent_task_id; columns = {task_cols:?}"
     );
 
+    // The bespoke investigation-doc pointer columns must be DROPPED on
+    // upgrade: the card affordance now derives from `pr_url`, mirroring the
+    // design-doc model, so the columns are dead weight. This legacy fixture
+    // creates them explicitly (matching the old `ADD COLUMN` migration), so a
+    // successful drop here proves the drop migration handles a populated DB.
+    assert!(
+        !task_cols.contains(&"investigation_doc_path".to_owned()),
+        "investigation_doc_path must be dropped on upgrade; columns = {task_cols:?}"
+    );
+    assert!(
+        !task_cols.contains(&"investigation_doc_branch".to_owned()),
+        "investigation_doc_branch must be dropped on upgrade; columns = {task_cols:?}"
+    );
+
     let index_exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master

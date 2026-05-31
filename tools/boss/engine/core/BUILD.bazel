@@ -34,7 +34,6 @@ rust_library(
         "src/host_adapter.rs",
         "src/host_registry.rs",
         "src/host_scheduling.rs",
-        "src/investigation_detector.rs",
         "src/ipc_log.rs",
         "src/lib.rs",
         "src/live_status.rs",

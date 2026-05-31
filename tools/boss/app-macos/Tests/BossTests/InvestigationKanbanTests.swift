@@ -95,12 +95,101 @@ final class InvestigationKanbanTests: XCTestCase {
         XCTAssertEqual(novel.kindLabel, "Spike Analysis")
     }
 
+    // MARK: - Doc affordance derives from pr_url (T928 / merged T927)
+
+    /// Regression anchor for T928 (reproducing the T903 vs T784 evidence):
+    /// an investigation task in Review whose only doc signal is `prURL`
+    /// (the bespoke `investigation_doc_*` triple is gone) must produce the
+    /// exact same PR-link label as a design task carrying the same `prURL`.
+    /// The card derives the doc affordance from `pr_url` for both kinds via
+    /// the shared `pullRequestLinkLabel` path — there is no kind-specific
+    /// branch any more.
+    func testInvestigationPRLinkMatchesDesignForSamePrURL() {
+        let prURL = "https://github.com/org/repo/pull/1026"
+        let investigation = makeInvestigation(id: "T903", status: "in_review", prURL: prURL)
+        let design = WorkTask(
+            id: "T784",
+            productID: "prod_test",
+            projectID: "proj_test",
+            kind: "design",
+            name: "Design",
+            description: "",
+            status: "in_review",
+            priority: "medium",
+            ordinal: 1,
+            prURL: prURL,
+            deletedAt: nil,
+            createdAt: "2026-05-30T00:00:00Z",
+            updatedAt: "2026-05-30T00:00:00Z"
+        )
+
+        // The card's PR-link branch (`if let prURL = task.prURL`) fires for
+        // both, and the derived label is identical — the link is live and
+        // derived, never a stored/stale pointer.
+        XCTAssertEqual(investigation.prURL, design.prURL)
+        XCTAssertEqual(
+            pullRequestLinkLabel(for: investigation.prURL ?? "", ambiguousRepoNames: []),
+            pullRequestLinkLabel(for: design.prURL ?? "", ambiguousRepoNames: [])
+        )
+        XCTAssertEqual(
+            pullRequestLinkLabel(for: investigation.prURL ?? "", ambiguousRepoNames: []),
+            "repo#1026"
+        )
+    }
+
+    /// T903 shape: an investigation with `pr_url` set and no doc-pointer
+    /// fields whatsoever (the columns are dropped engine-side). The PR link
+    /// must still resolve — never a blank/dead link when a doc PR exists.
+    func testInvestigationWithPrURLResolvesLinkWithoutDocPointer() {
+        let investigation = makeInvestigation(
+            id: "T903",
+            status: "in_review",
+            prURL: "https://github.com/org/repo/pull/1026"
+        )
+        let parsed = parseGitHubPRURL(investigation.prURL ?? "")
+        XCTAssertEqual(parsed?.repo, "repo")
+        XCTAssertEqual(parsed?.number, "1026")
+    }
+
+    /// T927 live-refresh requirement: when the engine auto-detects the doc
+    /// PR and emits an updated work tree, the app (a thin client) must pick
+    /// up the new `prURL` on re-render with no reload. Driving two reception
+    /// events proves the model reconverges on the engine's update.
+    func testInvestigationPrURLAppearsLiveOnEngineUpdate() {
+        let model = makeModel()
+
+        // First the engine knows the investigation but the PR is not open yet.
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeInvestigation(id: "T903", status: "active", prURL: nil)
+        ]))
+        XCTAssertNil(
+            model.workTask(withID: "T903")?.prURL,
+            "no PR yet → no link source"
+        )
+
+        // The worker opens the doc PR; the engine auto-detects `pr_url` and
+        // re-broadcasts. The app must now carry the link source — no restart.
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeInvestigation(
+                id: "T903",
+                status: "in_review",
+                prURL: "https://github.com/org/repo/pull/1026"
+            )
+        ]))
+        XCTAssertEqual(
+            model.workTask(withID: "T903")?.prURL,
+            "https://github.com/org/repo/pull/1026",
+            "engine-detected pr_url must appear live without an app reload"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeInvestigation(
         id: String,
         status: String,
-        kind: String = "investigation"
+        kind: String = "investigation",
+        prURL: String? = nil
     ) -> WorkTask {
         WorkTask(
             id: id,
@@ -112,7 +201,7 @@ final class InvestigationKanbanTests: XCTestCase {
             status: status,
             priority: "medium",
             ordinal: nil,
-            prURL: nil,
+            prURL: prURL,
             deletedAt: nil,
             createdAt: "2026-05-26T00:00:00Z",
             updatedAt: "2026-05-26T00:00:00Z"

@@ -225,7 +225,10 @@ impl WorkDb {
         migrate_products_docs_repo(&conn)?;
         migrate_products_worker_branch_prefix(&conn)?;
         migrate_work_executions_worker_branch_prefix(&conn)?;
-        migrate_tasks_investigation_doc_columns(&conn)?;
+        // The bespoke investigation-doc pointer columns are gone — the card
+        // affordance now derives from `pr_url`, mirroring the design-doc model.
+        // This drop is idempotent (fresh DBs never had the columns).
+        migrate_drop_tasks_investigation_doc_columns(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
         migrate_null_redundant_task_repo_remote_urls(&conn)?;

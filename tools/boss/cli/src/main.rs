@@ -17,7 +17,7 @@ use boss_protocol::{
     OrgAuthState, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    SetTaskInvestigationDocInput, Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
+    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -362,14 +362,6 @@ enum TaskCommand {
     /// `BOSS_USER_DOCS_REPO`). No code changes.
     #[command(name = "create-investigation")]
     CreateInvestigation(InvestigationCreateArgs),
-    /// Set (or clear) the investigation-doc pointer on a
-    /// `kind = 'investigation'` task so the kanban card shows a doc
-    /// affordance linking to the produced markdown file.
-    ///
-    /// Workers call this after opening the doc PR:
-    ///   boss task set-investigation-doc --task <id> --path <path> --branch <branch>
-    #[command(name = "set-investigation-doc")]
-    SetInvestigationDoc(SetInvestigationDocArgs),
     /// Create a `kind = 'revision'` task targeting an existing open PR.
     /// The worker's deliverable is a new commit on the *parent task's*
     /// existing PR branch — no new PR is opened. Gated: the parent task
@@ -1439,28 +1431,6 @@ struct RevisionCreateArgs {
 
     #[arg(long = "force-duplicate", default_value_t = false)]
     force_duplicate: bool,
-}
-
-/// Args for `boss task set-investigation-doc`.
-#[derive(Debug, Args)]
-struct SetInvestigationDocArgs {
-    /// Task id (`task_<hex>` or `T<short>`) of the investigation task.
-    #[arg(long)]
-    task: Option<String>,
-
-    /// Repo-relative path to the markdown file (e.g.
-    /// `docs/investigations/my-topic.md`).
-    #[arg(long)]
-    path: Option<String>,
-
-    /// PR branch name. Set this to the branch the doc PR was opened on.
-    #[arg(long)]
-    branch: Option<String>,
-
-    /// Clear both pointer columns (path + branch). The doc repo is always
-    /// derived from the task's own repo and is never stored separately.
-    #[arg(long, default_value_t = false)]
-    unset: bool,
 }
 
 /// Args for `boss task create-many`. The CLI reads a JSON array of
@@ -2943,9 +2913,6 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,
         TaskCommand::CreateInvestigation(args) => {
             run_create_investigation(&mut client, ctx, args).await
-        }
-        TaskCommand::SetInvestigationDoc(args) => {
-            run_set_investigation_doc(&mut client, ctx, args).await
         }
         TaskCommand::CreateRevision(args) => {
             run_create_revision(&mut client, ctx, args).await
@@ -4662,23 +4629,6 @@ async fn create_investigation(
     }
 }
 
-async fn set_task_investigation_doc(
-    client: &mut BossClient,
-    input: SetTaskInvestigationDocInput,
-) -> Result<Task, CliError> {
-    match client
-        .send_request(&FrontendRequest::SetTaskInvestigationDoc { input })
-        .await
-        .map_err(CliError::internal)?
-    {
-        FrontendEvent::WorkItemUpdated { item } => expect_task(item),
-        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-            Err(CliError::application(message))
-        }
-        other => Err(unexpected_event("task set-investigation-doc", &other)),
-    }
-}
-
 async fn run_create_investigation(
     client: &mut BossClient,
     ctx: &RunContext,
@@ -4809,33 +4759,6 @@ async fn run_create_revision(
                 task.short_id.unwrap_or(0),
                 description
             );
-        }
-    })?;
-    Ok(())
-}
-
-async fn run_set_investigation_doc(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: SetInvestigationDocArgs,
-) -> Result<(), CliError> {
-    let task_raw = required_text(args.task, "Task id", ctx)?;
-    let task_id = resolve_selector_to_primary_id(client, ctx, &task_raw, None).await?;
-    let unset = args.unset;
-    let input = SetTaskInvestigationDocInput {
-        task_id,
-        investigation_doc_path: args.path,
-        investigation_doc_branch: args.branch,
-        unset,
-    };
-    let task = set_task_investigation_doc(client, input).await?;
-    print_entity(ctx, &serde_json::json!({ "task": task }), || {
-        if !ctx.quiet {
-            if unset {
-                println!("cleared investigation-doc pointer on T{}", task.short_id.unwrap_or(0));
-            } else {
-                println!("set investigation-doc pointer on T{}", task.short_id.unwrap_or(0));
-            }
         }
     })?;
     Ok(())

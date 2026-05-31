@@ -27,7 +27,6 @@ pub use boss_feature_flags as feature_flags;
 pub mod host_adapter;
 pub mod host_registry;
 pub mod host_scheduling;
-pub mod investigation_detector;
 pub mod ipc_log;
 pub mod live_status;
 pub mod live_status_loop;

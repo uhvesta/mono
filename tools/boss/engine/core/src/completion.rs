@@ -51,7 +51,6 @@ use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX
 
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
-use crate::investigation_detector;
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState,
     update_pr_poll_state,
@@ -1625,28 +1624,6 @@ must not be asked to open one",
                         )
                         .await;
                     }
-                }
-            }
-            // Auto-register the investigation-doc pointer when the completed
-            // work item is a `kind=investigation` task. The engine owns this
-            // step — workers cannot perform it because they have no task id in
-            // their environment. Errors are logged inside the detector.
-            if task.kind == "investigation" {
-                if merged {
-                    investigation_detector::on_investigation_pr_merged(
-                        &self.work_db,
-                        &task.id,
-                        &pr_url,
-                        None,
-                    )
-                    .await;
-                } else {
-                    investigation_detector::on_investigation_pr_detected(
-                        &self.work_db,
-                        &task.id,
-                        &pr_url,
-                    )
-                    .await;
                 }
             }
         }

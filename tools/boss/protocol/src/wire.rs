@@ -14,7 +14,7 @@ use crate::types::{
     PrWorkItemMatch, Product, Project, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedComment, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task, TaskRuntime, TranscriptSegment,
+    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment,
     WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
@@ -546,15 +546,6 @@ pub enum FrontendRequest {
     CreateRevision {
         #[serde(flatten)]
         input: CreateRevisionInput,
-    },
-    /// Set (or clear) the investigation-doc pointer on a task. Persists
-    /// `tasks.investigation_doc_path` and `tasks.investigation_doc_branch`
-    /// per [`SetTaskInvestigationDocInput`]'s semantics and replies with the
-    /// updated `Task` row wrapped in a `WorkItemUpdated` event. The doc's
-    /// repo is always derived from the task's `repo_remote_url`.
-    SetTaskInvestigationDoc {
-        #[serde(flatten)]
-        input: SetTaskInvestigationDocInput,
     },
     /// Set (or clear) a project's design-doc pointer. Persists the
     /// three `projects.design_doc_*` columns per

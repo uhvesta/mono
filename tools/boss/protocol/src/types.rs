@@ -375,21 +375,6 @@ pub struct Task {
     /// when the upstream item leaves the product's configured scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<WorkItemExternalRef>,
-    /// Repo-relative path to the markdown doc produced by an
-    /// `investigation` worker (e.g. `docs/investigations/foo.md`).
-    /// `None` until the worker sets the pointer via
-    /// `boss task set-investigation-doc`. Only meaningful on
-    /// `kind = 'investigation'` rows; ignored on all other kinds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub investigation_doc_path: Option<String>,
-    /// Branch the investigation doc PR was opened against. `None` until
-    /// the worker sets the pointer. Used to construct the in-review
-    /// GitHub URL `…/blob/{branch}/{path}` while the PR is open; after
-    /// merge the UI falls back to `main`. The doc's repo is always
-    /// derived from the task's own `repo_remote_url` — no separate
-    /// stored repo pointer exists for investigation docs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub investigation_doc_branch: Option<String>,
     /// Soft FK to the `tasks.id` whose PR this revision targets. `None`
     /// for every non-`revision` row. Required (app-enforced) when
     /// `kind = 'revision'`; never set by `ALTER TABLE … ADD COLUMN`
@@ -1448,28 +1433,6 @@ pub struct CreateInvestigationInput {
     pub model_override: Option<String>,
     #[serde(default)]
     pub force_duplicate: bool,
-}
-
-/// Set (or clear) the investigation-doc pointer on a
-/// `kind = 'investigation'` task. Parallel to
-/// [`SetProjectDesignDocInput`] but lives on the task row rather than
-/// the project, because investigations are task-level deliverables.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SetTaskInvestigationDocInput {
-    pub task_id: String,
-    /// Repo-relative path to the markdown file (e.g.
-    /// `docs/investigations/my-topic.md`). Setting `Some("")` is
-    /// rejected — use `unset = true` to clear.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub investigation_doc_path: Option<String>,
-    /// PR branch name. `None` → infer from the task's `pr_url`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub investigation_doc_branch: Option<String>,
-    /// When `true`, clear both pointer columns (path + branch; set to NULL).
-    /// The doc's repo is always derived from the task's `repo_remote_url`
-    /// and is never stored separately.
-    #[serde(default)]
-    pub unset: bool,
 }
 
 /// Input for `boss task create-revision`. Creates a `kind = 'revision'`

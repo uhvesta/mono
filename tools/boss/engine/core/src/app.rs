@@ -6529,37 +6529,6 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
-            FrontendRequest::SetTaskInvestigationDoc { input } => {
-                match work_db.set_task_investigation_doc(input) {
-                    Ok(task) => {
-                        let item = WorkItem::Task(task);
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "task_investigation_doc_set",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemUpdated { item },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
             FrontendRequest::SetProjectDesignDoc { input } => {
                 match work_db.set_project_design_doc(input) {
                     Ok(project) => {

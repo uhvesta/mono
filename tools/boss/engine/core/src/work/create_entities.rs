@@ -198,55 +198,6 @@ impl WorkDb {
         Ok(task)
     }
 
-    /// Set (or clear) the investigation-doc pointer on a
-    /// `kind = 'investigation'` task. Stores the `(repo, branch, path)`
-    /// triple so the kanban affordance can construct a GitHub URL at
-    /// render time without a separate resolution RPC.
-    pub fn set_task_investigation_doc(
-        &self,
-        input: boss_protocol::SetTaskInvestigationDocInput,
-    ) -> Result<Task> {
-        let conn = self.connect()?;
-        let task = query_task(&conn, &input.task_id)?
-            .with_context(|| format!("unknown task: {}", input.task_id))?;
-        if task.kind != "investigation" {
-            bail!(
-                "task {} has kind '{}'; set-investigation-doc only applies to kind='investigation'",
-                input.task_id,
-                task.kind
-            );
-        }
-        let now = now_string();
-        if input.unset {
-            conn.execute(
-                "UPDATE tasks
-                 SET investigation_doc_path = NULL,
-                     investigation_doc_branch = NULL,
-                     updated_at = ?2
-                 WHERE id = ?1",
-                params![input.task_id, now],
-            )?;
-        } else {
-            let path = match input.investigation_doc_path.as_deref().map(str::trim) {
-                None | Some("") => {
-                    bail!("investigation_doc_path must be non-empty (use unset=true to clear)")
-                }
-                Some(p) => p.to_owned(),
-            };
-            let branch = input.investigation_doc_branch.filter(|s| !s.is_empty());
-            conn.execute(
-                "UPDATE tasks
-                 SET investigation_doc_path = ?2,
-                     investigation_doc_branch = ?3,
-                     updated_at = ?4
-                 WHERE id = ?1",
-                params![input.task_id, path, branch, now],
-            )?;
-        }
-        query_task(&conn, &input.task_id)?
-            .with_context(|| format!("missing task after update: {}", input.task_id))
-    }
-
     /// Create a chore and immediately bind it to an upstream tracker reference
     /// in a single SQLite transaction.
     ///
