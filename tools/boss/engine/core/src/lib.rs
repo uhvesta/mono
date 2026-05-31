@@ -42,6 +42,7 @@ pub mod metrics;
 pub mod nudge_breaker;
 pub mod orphan_sweep;
 pub mod pane_summary;
+pub use boss_pr_template as pr_template;
 pub mod pr_url_capture;
 pub mod protocol;
 pub mod recovery_backup;

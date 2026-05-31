@@ -270,6 +270,7 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-editorial",
  "boss-feature-flags",
+ "boss-pr-template",
  "boss-protocol",
  "boss-ssh-transport",
  "boss-transcript-markdown",
@@ -319,6 +320,13 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "boss-pr-template"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

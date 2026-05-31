@@ -13,6 +13,7 @@ chrono-tz = { workspace = true }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-editorial = { path = "../editorial" }
 boss-feature-flags = { path = "../feature-flags" }
+boss-pr-template = { path = "../pr-template" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
 boss-transcript-tail = { path = "../transcript-tail" }

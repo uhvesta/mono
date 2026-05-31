@@ -8,6 +8,7 @@ members = [
   "tools/boss/engine/core",
   "tools/boss/engine/editorial",
   "tools/boss/engine/core/boss-transcript-markdown",
+  "tools/boss/engine/pr-template",
   "tools/boss/event-shim",
   "tools/boss/engine/feature-flags",
   "tools/boss/protocol",

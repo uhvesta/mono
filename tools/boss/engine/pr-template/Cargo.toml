@@ -1,0 +1,8 @@
+[package]
+name = "boss-pr-template"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dev-dependencies]
+tempfile = { workspace = true }
