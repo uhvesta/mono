@@ -56,6 +56,7 @@ pub use boss_ssh_transport as ssh_transport;
 pub mod stale_worker_sweep;
 pub mod syspolicyd_monitor;
 pub use boss_transcript_tail as transcript_tail;
+pub mod trace_rotation;
 pub mod transient_error;
 pub mod transient_recovery;
 pub mod work;

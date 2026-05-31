@@ -13,6 +13,7 @@ use boss_engine::app;
 use boss_engine::audit::{self, StartContext};
 use boss_engine::build_info;
 use boss_engine::cli::Cli;
+use boss_engine::trace_rotation::{self, RotatingJsonlWriter, RotatingState};
 
 const DEFAULT_LOG_PATH: &str = "/tmp/boss-engine.log";
 
@@ -52,32 +53,6 @@ impl Write for DualLogWriter {
     }
 }
 
-/// Writer for the engine-trace JSONL file consumed by the macOS log viewer.
-/// Silently no-ops when `file` is `None` so the JSON layer can always be
-/// registered without a conditional layer setup.
-struct JsonlFileWriter {
-    file: Option<Arc<Mutex<File>>>,
-}
-
-impl Write for JsonlFileWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(ref f) = self.file {
-            if let Ok(mut guard) = f.lock() {
-                let _ = guard.write_all(buf);
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if let Some(ref f) = self.file {
-            if let Ok(mut guard) = f.lock() {
-                let _ = guard.flush();
-            }
-        }
-        Ok(())
-    }
-}
 
 /// Path for the structured-JSON engine trace file consumed by the Activity
 /// Log viewer in the macOS app. Lives alongside other Boss state files.
@@ -150,22 +125,34 @@ async fn main() -> Result<()> {
 
     // JSON layer: structured JSONL for the macOS Activity Log viewer.
     // Best-effort — silently skipped if the file cannot be opened.
-    let json_file_arc: Option<Arc<Mutex<File>>> = engine_trace_jsonl_path().and_then(|path| {
-        match open_log_file(&path) {
-            Ok(file) => Some(Arc::new(Mutex::new(file))),
-            Err(err) => {
-                eprintln!(
-                    "boss-engine: could not open engine-trace JSONL at {}: {err}",
-                    path.display()
-                );
-                None
-            }
+    // On startup the existing trace file (if any) is rotated to a
+    // timestamped backup; a size-based rotation fires mid-run when the
+    // threshold is crossed.
+    let (trace_max_bytes, trace_max_files) = trace_rotation::trace_rotation_config();
+    let (json_trace_path, json_state_arc) = match engine_trace_jsonl_path() {
+        None => (PathBuf::new(), Arc::new(Mutex::new(None))),
+        Some(path) => {
+            trace_rotation::rotate_on_startup(&path, trace_max_files);
+            let state = match trace_rotation::open_trace_file(&path) {
+                Ok(file) => Some(RotatingState::new(file)),
+                Err(err) => {
+                    eprintln!(
+                        "boss-engine: could not open engine-trace JSONL at {}: {err}",
+                        path.display()
+                    );
+                    None
+                }
+            };
+            (path, Arc::new(Mutex::new(state)))
         }
-    });
+    };
     let json_layer = tracing_subscriber::fmt::layer()
         .json()
-        .with_writer(move || JsonlFileWriter {
-            file: json_file_arc.clone(),
+        .with_writer(move || RotatingJsonlWriter {
+            path: json_trace_path.clone(),
+            state: json_state_arc.clone(),
+            max_bytes: trace_max_bytes,
+            max_files: trace_max_files,
         });
 
     tracing_subscriber::registry()
