@@ -383,23 +383,12 @@ pub(crate) fn reconcile_work_item_execution(
             };
             let created = insert_execution(
                 conn,
-                CreateExecutionInput {
-                    work_item_id: work_item_id.to_owned(),
-                    kind: kind.to_owned(),
-                    status: Some(effective_status.to_owned()),
-                    repo_remote_url: Some(repo_remote_url),
-                    cube_repo_id: None,
-                    cube_lease_id: None,
-                    cube_workspace_id: None,
-                    workspace_path: None,
-                    priority: None,
-                    preferred_workspace_id: None,
-                    started_at: None,
-                    finished_at: None,
-                    prefer_is_soft: false,
-                    pr_url: None,
-                    allow_dirty: false,
-                },
+                CreateExecutionInput::builder()
+                    .work_item_id(work_item_id)
+                    .kind(kind)
+                    .status(effective_status)
+                    .repo_remote_url(repo_remote_url)
+                    .build(),
             )?;
             result.created.push(created);
         }
@@ -652,23 +641,15 @@ pub(crate) fn reconcile_revision_execution(
                 preferred_workspace_for_chain_root(conn, &chain_root_task.id)?;
             let created = insert_execution(
                 conn,
-                CreateExecutionInput {
-                    work_item_id: task.id.clone(),
-                    kind: "revision_implementation".to_owned(),
-                    status: Some(effective_status.to_owned()),
-                    repo_remote_url: Some(repo_remote_url),
-                    cube_repo_id: None,
-                    cube_lease_id: None,
-                    cube_workspace_id: None,
-                    workspace_path: None,
-                    priority: None,
-                    preferred_workspace_id,
-                    started_at: None,
-                    finished_at: None,
-                    prefer_is_soft: true,
-                    pr_url: Some(parent_pr_url),
-                    allow_dirty: false,
-                },
+                CreateExecutionInput::builder()
+                    .work_item_id(task.id.clone())
+                    .kind("revision_implementation")
+                    .status(effective_status)
+                    .repo_remote_url(repo_remote_url)
+                    .maybe_preferred_workspace_id(preferred_workspace_id)
+                    .prefer_is_soft(true)
+                    .pr_url(parent_pr_url)
+                    .build(),
             )?;
             result.created.push(created);
         }
@@ -972,27 +953,15 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
 
     insert_execution(
         conn,
-        CreateExecutionInput {
-            work_item_id,
-            kind,
-            status: Some("ready".to_owned()),
-            // The early return above guarantees this is `Some(_)`;
-            // we pass it through explicitly so `insert_execution`
-            // doesn't redo the resolution and so per-row overrides
-            // stay authoritative even when `update_task` patches
-            // them between resolve and insert.
-            repo_remote_url: resolved_repo,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority,
-            preferred_workspace_id,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: revision_pr_url,
-            allow_dirty,
-        },
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id)
+            .kind(kind)
+            .status("ready")
+            .maybe_repo_remote_url(resolved_repo)
+            .maybe_priority(priority)
+            .maybe_preferred_workspace_id(preferred_workspace_id)
+            .maybe_pr_url(revision_pr_url)
+            .allow_dirty(allow_dirty)
+            .build(),
     )
 }

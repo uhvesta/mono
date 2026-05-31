@@ -156,13 +156,9 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
 
     let execution = match client
         .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-                allow_dirty: false,
-            },
+            input: RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
         })
         .await?
     {
@@ -1887,13 +1883,9 @@ async fn request_execution_accepts_tnnn_friendly_id() -> Result<()> {
     // resolve it and return the same execution row (idempotent path).
     let response = client
         .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput {
-                work_item_id: friendly_id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-                allow_dirty: false,
-            },
+            input: RequestExecutionInput::builder()
+                .work_item_id(friendly_id.clone())
+                .build(),
         })
         .await?;
 

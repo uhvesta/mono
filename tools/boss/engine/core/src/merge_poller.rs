@@ -5073,24 +5073,12 @@ mod tests {
             })
             .unwrap();
         let exec = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build())
             .unwrap();
         let (exec, run) = db
             .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")
@@ -5201,24 +5189,12 @@ mod tests {
         let (product_id, chore) = make_chore_in_review(db, name, pr);
         db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
         let exec = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build())
             .unwrap();
         let (exec, _run) = db
             .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")

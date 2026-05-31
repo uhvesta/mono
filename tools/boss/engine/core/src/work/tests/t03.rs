@@ -173,24 +173,11 @@ fn records_failed_execution_start_attempt() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
 
     let (execution, run) = db
@@ -246,24 +233,11 @@ fn finishes_active_run_into_waiting_human_with_attention() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
 
     let (execution, run) = db
@@ -349,24 +323,11 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
 
     let (execution, run) = db
@@ -1736,14 +1697,9 @@ fn request_execution_refuses_gated_work_item() {
     })
     .unwrap();
     let err = db
-        .request_execution(RequestExecutionInput {
-            work_item_id: a.id.clone(),
-            priority: None,
-            preferred_workspace_id: None,
-            force: false,
-        
-            allow_dirty: false,
-        })
+        .request_execution(RequestExecutionInput::builder()
+            .work_item_id(a.id.clone())
+            .build())
         .unwrap_err()
         .to_string();
     assert!(err.contains("gated by"), "unexpected error: {err}");
@@ -1860,14 +1816,9 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
     // RequestExecution (the user-override path) must succeed and
     // clear the stale block.
     let execution = db
-        .request_execution(RequestExecutionInput {
-            work_item_id: dependent.id.clone(),
-            priority: None,
-            preferred_workspace_id: None,
-            force: false,
-        
-            allow_dirty: false,
-        })
+        .request_execution(RequestExecutionInput::builder()
+            .work_item_id(dependent.id.clone())
+            .build())
         .expect("RequestExecution should succeed when all prereqs are done");
 
     assert_eq!(execution.status, "ready", "execution must be ready");

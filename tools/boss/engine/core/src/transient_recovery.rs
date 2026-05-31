@@ -761,14 +761,10 @@ mod tests {
     ) -> String {
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput {
-                work_item_id: work_item_id.to_owned(),
-                priority: None,
-                preferred_workspace_id: Some("mono-agent-007".to_owned()),
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .preferred_workspace_id("mono-agent-007")
+                .build())
             .unwrap();
         db.start_execution_run(
             &execution.id,
@@ -1164,14 +1160,10 @@ mod tests {
 
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput {
-                work_item_id: work_item_id.clone(),
-                priority: None,
-                preferred_workspace_id: Some("mono-agent-007".to_owned()),
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .preferred_workspace_id("mono-agent-007")
+                .build())
             .unwrap();
         db.start_execution_run(
             &execution.id,

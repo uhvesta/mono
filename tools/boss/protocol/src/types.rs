@@ -1543,6 +1543,8 @@ pub struct CreateExecutionInput {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct RequestExecutionInput {
     pub work_item_id: String,
     pub priority: Option<i64>,
@@ -1555,12 +1557,14 @@ pub struct RequestExecutionInput {
     /// the work item starts immediately even when every configured
     /// slot is busy.
     #[serde(default)]
+    #[builder(default)]
     pub force: bool,
     /// Request cube to reclaim the preferred workspace with its dirty
     /// working copy intact (passed through to `CreateExecutionInput`
     /// and stored on the `work_executions` row). Set `true` on the
     /// orphan recovery re-dispatch path; `false` everywhere else.
     #[serde(default)]
+    #[builder(default)]
     pub allow_dirty: bool,
 }
 

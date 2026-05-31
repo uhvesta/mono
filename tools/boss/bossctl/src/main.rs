@@ -1357,13 +1357,11 @@ async fn agents_launch(
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput {
-                work_item_id: work_item_id.clone(),
-                priority: None,
-                preferred_workspace_id,
-                force: true,
-                allow_dirty: false,
-            },
+            input: RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .maybe_preferred_workspace_id(preferred_workspace_id)
+                .force(true)
+                .build(),
         })
         .await
         .context("sending RequestExecution (force)")?;
@@ -1391,13 +1389,11 @@ async fn work_start(
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput {
-                work_item_id: work_item_id.clone(),
-                priority,
-                preferred_workspace_id,
-                force: false,
-                allow_dirty: false,
-            },
+            input: RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .maybe_priority(priority)
+                .maybe_preferred_workspace_id(preferred_workspace_id)
+                .build(),
         })
         .await
         .context("sending RequestExecution")?;

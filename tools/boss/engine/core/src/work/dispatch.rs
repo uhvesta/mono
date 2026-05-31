@@ -261,13 +261,11 @@ impl WorkDb {
                 .and_then(|prev| prev.cube_workspace_id.clone());
             request_execution_in_tx_with_live_check(
                 &tx,
-                RequestExecutionInput {
-                    work_item_id: work_item_id.clone(),
-                    priority: None,
-                    preferred_workspace_id,
-                    force: false,
-                    allow_dirty: is_orphaned_predecessor,
-                },
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .maybe_preferred_workspace_id(preferred_workspace_id)
+                    .allow_dirty(is_orphaned_predecessor)
+                    .build(),
                 |run_id| is_live(run_id),
             )?;
             redispatched.push(work_item_id);
@@ -340,13 +338,9 @@ impl WorkDb {
             }
             request_execution_in_tx_with_live_check(
                 &tx,
-                RequestExecutionInput {
-                    work_item_id: work_item_id.clone(),
-                    priority: None,
-                    preferred_workspace_id: None,
-                    force: false,
-                    allow_dirty: false,
-                },
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
                 // `|_| true` keeps any non-terminal execution intact —
                 // the on-free rescan only ever fires this branch when
                 // the latest execution is terminal anyway, so the

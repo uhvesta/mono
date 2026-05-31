@@ -40,13 +40,11 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
         })
         .unwrap();
     let exec_a = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore_a.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore_a.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     db.start_execution_run(
         &exec_a.id,
@@ -76,13 +74,11 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
             force_duplicate: false,
         })
         .unwrap();
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore_b.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("ready".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore_b.id.clone())
+        .kind("chore_implementation")
+        .status("ready")
+        .build())
     .unwrap();
 
     // (c) Terminal status — must NOT appear regardless of lease.
@@ -100,16 +96,14 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
             force_duplicate: false,
         })
         .unwrap();
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore_c.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("completed".to_owned()),
-        cube_lease_id: Some("lease-C".to_owned()),
-        cube_workspace_id: Some("mono-agent-002".to_owned()),
-        workspace_path: Some("/tmp/mono-agent-002".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore_c.id.clone())
+        .kind("chore_implementation")
+        .status("completed")
+        .cube_lease_id("lease-C")
+        .cube_workspace_id("mono-agent-002")
+        .workspace_path("/tmp/mono-agent-002")
+        .build())
     .unwrap();
 
     let in_flight = db.list_in_flight_executions().unwrap();
@@ -164,13 +158,11 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
         })
         .unwrap();
     let exec_live = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: live.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(live.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     db.start_execution_run(
         &exec_live.id,
@@ -197,13 +189,11 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
         })
         .unwrap();
     let exec_dead = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: dead.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(dead.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     db.start_execution_run(
         &exec_dead.id,
@@ -230,13 +220,11 @@ fn reconcile_with_mixed_verdicts_only_redispatches_dead_runs() {
         })
         .unwrap();
     let exec_unknown = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: unknown.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(unknown.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     db.start_execution_run(
         &exec_unknown.id,
@@ -331,25 +319,18 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
         })
         .unwrap();
     let stale = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("waiting_human".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("waiting_human")
+            .build())
         .unwrap();
 
     let new_exec = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
             |_| false,
         )
         .unwrap();
@@ -416,28 +397,21 @@ fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
     )
     .unwrap();
     let ci_exec = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "ci_remediation".to_owned(),
-            status: Some("waiting_human".to_owned()),
-            cube_workspace_id: Some("mono-agent-001".to_owned()),
-            cube_lease_id: Some("lease-ci-old".to_owned()),
-            workspace_path: Some("/ws/mono-agent-001".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("ci_remediation")
+            .status("waiting_human")
+            .cube_workspace_id("mono-agent-001")
+            .cube_lease_id("lease-ci-old")
+            .workspace_path("/ws/mono-agent-001")
+            .build())
         .unwrap();
 
     let requeued = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
             |_| false,
         )
         .unwrap();
@@ -539,28 +513,21 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
 
     // ci_remediation execution was created and ran, but worker is now gone.
     let ci_exec = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "ci_remediation".to_owned(),
-            status: Some("waiting_human".to_owned()),
-            cube_workspace_id: Some("mono-agent-001".to_owned()),
-            cube_lease_id: Some("lease-ci-old".to_owned()),
-            workspace_path: Some("/ws/mono-agent-001".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("ci_remediation")
+            .status("waiting_human")
+            .cube_workspace_id("mono-agent-001")
+            .cube_lease_id("lease-ci-old")
+            .workspace_path("/ws/mono-agent-001")
+            .build())
         .unwrap();
 
     let requeued = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
             |_| false,
         )
         .unwrap();
@@ -631,24 +598,20 @@ fn request_execution_suppressed_when_older_execution_is_live() {
 
     // The live run (La Forge): created first, so it is the OLDER row.
     let live = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("running".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("running")
+            .build())
         .unwrap();
     // A stalled re-dispatch that was orphaned: NEWER, terminal,
     // shadows `live` as the latest-by-created_at row.
     let phantom = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("orphaned".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("orphaned")
+            .build())
         .unwrap();
     // Sanity: the phantom is the latest row (the trap).
     assert_eq!(
@@ -663,14 +626,9 @@ fn request_execution_suppressed_when_older_execution_is_live() {
     // The live execution is genuinely claimed by a worker.
     let result = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
             |exec_id| exec_id == live.id,
         )
         .unwrap();
@@ -727,25 +685,18 @@ fn request_execution_redispatches_when_live_execution_not_claimed() {
         })
         .unwrap();
     let dead = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("running".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("running")
+            .build())
         .unwrap();
 
     let result = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
             |_| false,
         )
         .unwrap();
@@ -798,22 +749,18 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
         })
         .unwrap();
     let live = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("running".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("running")
+            .build())
         .unwrap();
     // Newer terminal phantom that detaches the card under the bug.
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("orphaned".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore.id.clone())
+        .kind("chore_implementation")
+        .status("orphaned")
+        .build())
     .unwrap();
 
     let runtime = db.get_task_runtime(&chore.id).unwrap();
@@ -860,13 +807,11 @@ fn mark_execution_orphaned_preserves_workspace_and_stamps_run() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     let (_running, run) = db
         .start_execution_run(
@@ -941,13 +886,11 @@ fn mark_execution_orphaned_errors_on_already_terminal() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("completed".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("completed")
+            .build())
         .unwrap();
 
     let err = db
@@ -1084,13 +1027,11 @@ fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
     )
     .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     db.start_execution_run(
         &execution.id,
@@ -1178,13 +1119,11 @@ fn reconcile_does_not_inherit_workspace_from_non_orphaned_terminal() {
     )
     .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     db.start_execution_run(
         &execution.id,
@@ -1250,25 +1189,18 @@ fn request_execution_is_idempotent_when_existing_run_is_live() {
         })
         .unwrap();
     let live = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("waiting_human".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("waiting_human")
+            .build())
         .unwrap();
 
     let returned = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
             |_| true,
         )
         .unwrap();
@@ -1619,24 +1551,12 @@ fn cancel_running_execution_demotes_active_task() {
     )
     .unwrap();
     let exec = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("running".to_owned()),
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("running")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build())
         .unwrap();
 
     // First call: should cancel execution + demote task.
@@ -1704,13 +1624,11 @@ fn rescan_redispatches_active_chore_with_terminal_execution() {
         },
     )
     .unwrap();
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("failed".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore.id.clone())
+        .kind("chore_implementation")
+        .status("failed")
+        .build())
     .unwrap();
 
     let redispatched = db.rescan_active_dispatch().unwrap();
@@ -1810,13 +1728,11 @@ fn rescan_skips_active_chore_with_live_execution() {
         },
     )
     .unwrap();
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("ready".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore.id.clone())
+        .kind("chore_implementation")
+        .status("ready")
+        .build())
     .unwrap();
 
     let redispatched = db.rescan_active_dispatch().unwrap();
@@ -2103,13 +2019,11 @@ fn rescan_skips_no_autostart_active_chore() {
         },
     )
     .unwrap();
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("failed".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore.id.clone())
+        .kind("chore_implementation")
+        .status("failed")
+        .build())
     .unwrap();
 
     let redispatched = db.rescan_active_dispatch().unwrap();
@@ -2165,13 +2079,11 @@ fn start_execution_run_clears_autostart() {
 
     // Place a ready execution so start_execution_run can run.
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     db.start_execution_run(
         &execution.id,

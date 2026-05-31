@@ -209,14 +209,9 @@ pub async fn run_one_pass(
         // will mark it `abandoned` and create a new `ready` row.
         let is_live = |exec_id: &str| claimed.contains(exec_id);
         let new_execution = match work_db.request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: work_item_id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .build(),
             is_live,
         ) {
             Ok(exec) => exec,
@@ -459,14 +454,9 @@ mod tests {
         // Insert a ready execution and claim it in the pool — this makes
         // the item appear "already queued" (no-candidate via DB query).
         let execution = db
-            .request_execution(RequestExecutionInput {
-                work_item_id: work_item_id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(work_item_id.clone())
+                .build())
             .unwrap();
         let coordinator = make_coordinator(db.clone(), 1);
         coordinator

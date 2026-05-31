@@ -3148,24 +3148,11 @@ mod tests {
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
 
         let (execution, run) = db
@@ -3259,24 +3246,11 @@ mod tests {
             .unwrap();
 
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "ci_remediation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("ci_remediation")
+                .status("ready")
+                .build())
             .unwrap();
         let (execution, run) = db
             .start_execution_run(
@@ -4222,24 +4196,11 @@ mod tests {
             })
             .unwrap();
         let exec = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
         let (_e, run) = db
             .start_execution_run(&exec.id, "worker", "mono", lease, workspace_id, workspace_path)
@@ -4382,24 +4343,11 @@ mod tests {
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
         // `start_execution_run` flips the row to `running`. Do not
         // follow up with `finish_execution_run` — we want the row to
@@ -4618,24 +4566,11 @@ PR #379. PR #379.";
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
         let (execution, run) = db
             .start_execution_run(
@@ -4760,24 +4695,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
         let (execution, run) = db
             .start_execution_run(
@@ -5116,24 +5038,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let exec2 = db
-            .create_execution(crate::work::CreateExecutionInput {
-                work_item_id: chore2.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore2.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
         let (exec2, run2) = db
             .start_execution_run(
@@ -5175,24 +5084,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let exec3 = db
-            .create_execution(crate::work::CreateExecutionInput {
-                work_item_id: chore3.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: None,
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore3.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .build())
             .unwrap();
         let (exec3, run3) = db
             .start_execution_run(
@@ -6430,24 +6326,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput {
-                work_item_id: chore.id.clone(),
-                kind: "chore_implementation".into(),
-                status: Some("ready".into()),
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build())
             .unwrap();
         let (execution, run) = db
             .start_execution_run(

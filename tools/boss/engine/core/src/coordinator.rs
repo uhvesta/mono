@@ -21,7 +21,8 @@ use crate::host_adapter::{HostAdapter, LocalHostAdapter};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome};
 use crate::work::{
-    CreateAttentionItemInput, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun,
+    CreateAttentionItemInput, CreateExecutionInput, PreStartFailureOutcome, WorkDb, WorkExecution,
+    WorkItem, WorkRun,
 };
 
 // Phase-3 counter handles for the cube workspace lease boundary.
@@ -3084,8 +3085,8 @@ mod tests {
     }
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
-        CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
-        RequestExecutionInput, WorkDb, WorkExecution, WorkItem,
+        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
+        CreateTaskInput, RequestExecutionInput, WorkDb, WorkExecution, WorkItem,
     };
 
     #[derive(Default)]
@@ -4796,14 +4797,10 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput {
-            work_item_id: chore.id.clone(),
-            priority: None,
-            preferred_workspace_id: Some("mono-agent-003".to_owned()),
-            force: false,
-        
-            allow_dirty: false,
-        })
+        db.request_execution(RequestExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .preferred_workspace_id("mono-agent-003")
+            .build())
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -4916,14 +4913,9 @@ mod tests {
         db.reconcile_product_executions(&product.id).unwrap();
         // autostart=false means reconcile won't auto-create an execution;
         // request one explicitly to seed the dead-predecessor record.
-        db.request_execution(RequestExecutionInput {
-            work_item_id: chore.id.clone(),
-            priority: None,
-            preferred_workspace_id: None,
-            force: false,
-
-            allow_dirty: false,
-        })
+        db.request_execution(RequestExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .build())
         .unwrap();
 
         // Dead predecessor: started a run on mono-agent-003 with
@@ -4942,13 +4934,10 @@ mod tests {
 
         // Resume execution: hard prefer back onto mono-agent-003.
         let resume = db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: Some("mono-agent-003".to_owned()),
-                force: false,
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .preferred_workspace_id("mono-agent-003")
+                .build())
             .unwrap();
 
         // Cube reports mono-agent-003 still leased to the dead lease.
@@ -5025,13 +5014,10 @@ mod tests {
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
         let resume = db
-            .request_execution(RequestExecutionInput {
-                work_item_id: chore.id.clone(),
-                priority: None,
-                preferred_workspace_id: Some("mono-agent-007".to_owned()),
-                force: false,
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .preferred_workspace_id("mono-agent-007")
+                .build())
             .unwrap();
 
         // Cube reports the workspace leased to a lease the engine has no
@@ -5103,13 +5089,9 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput {
-            work_item_id: chore.id.clone(),
-            priority: None,
-            preferred_workspace_id: None,
-            force: false,
-            allow_dirty: false,
-        })
+        db.request_execution(RequestExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .build())
         .unwrap();
 
         // First lease call fails (simulating a workspace with uncommitted
@@ -5242,13 +5224,9 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput {
-            work_item_id: chore.id.clone(),
-            priority: None,
-            preferred_workspace_id: None,
-            force: false,
-            allow_dirty: false,
-        })
+        db.request_execution(RequestExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .build())
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -5494,14 +5472,10 @@ mod tests {
 
         // Bump the later chore's priority — it should run first despite
         // the older one being in the queue first.
-        db.request_execution(RequestExecutionInput {
-            work_item_id: late.id.clone(),
-            priority: Some(10),
-            preferred_workspace_id: None,
-            force: false,
-        
-            allow_dirty: false,
-        })
+        db.request_execution(RequestExecutionInput::builder()
+            .work_item_id(late.id.clone())
+            .priority(10)
+            .build())
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -5576,14 +5550,10 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput {
-            work_item_id: chore.id.clone(),
-            priority: None,
-            preferred_workspace_id: Some("mono-agent-007".to_owned()),
-            force: false,
-        
-            allow_dirty: false,
-        })
+        db.request_execution(RequestExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .preferred_workspace_id("mono-agent-007")
+            .build())
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default().with_next_workspace_id("mono-agent-007"));
@@ -6082,14 +6052,9 @@ mod tests {
             },
         )
         .unwrap();
-        db.request_execution(RequestExecutionInput {
-            work_item_id: ghost_b.id.clone(),
-            priority: None,
-            preferred_workspace_id: None,
-            force: false,
-        
-            allow_dirty: false,
-        })
+        db.request_execution(RequestExecutionInput::builder()
+            .work_item_id(ghost_b.id.clone())
+            .build())
         .unwrap();
 
         // Real worker: started a run before the engine restarted,
@@ -6110,24 +6075,12 @@ mod tests {
             })
             .unwrap();
         let real_exec = db
-            .create_execution(crate::work::CreateExecutionInput {
-                work_item_id: real.id.clone(),
-                kind: "chore_implementation".to_owned(),
-                status: Some("ready".to_owned()),
-                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-                cube_repo_id: None,
-                cube_lease_id: None,
-                cube_workspace_id: None,
-                workspace_path: None,
-                priority: None,
-                preferred_workspace_id: None,
-                started_at: None,
-                finished_at: None,
-                prefer_is_soft: false,
-                pr_url: None,
-            
-                allow_dirty: false,
-            })
+            .create_execution(CreateExecutionInput::builder()
+                .work_item_id(real.id.clone())
+                .kind("chore_implementation")
+                .status("ready")
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build())
             .unwrap();
         db.start_execution_run(
             &real_exec.id,
@@ -6354,14 +6307,10 @@ mod tests {
         // then call the same coordinator entry point that `app.rs`
         // hits when `force = true`.
         let queued_exec = db
-            .request_execution(RequestExecutionInput {
-                work_item_id: queued.id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: true,
-            
-                allow_dirty: false,
-            })
+            .request_execution(RequestExecutionInput::builder()
+                .work_item_id(queued.id.clone())
+                .force(true)
+                .build())
             .unwrap();
         let worker_id = coordinator
             .force_dispatch(&queued_exec.id)
@@ -6472,24 +6421,12 @@ mod tests {
             },
         )
         .unwrap();
-        db.create_execution(crate::work::CreateExecutionInput {
-            work_item_id: stuck.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("failed".to_owned()),
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-
-            allow_dirty: false,
-        })
+        db.create_execution(CreateExecutionInput::builder()
+            .work_item_id(stuck.id.clone())
+            .kind("chore_implementation")
+            .status("failed")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build())
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -6580,23 +6517,12 @@ mod tests {
             },
         )
         .unwrap();
-        db.create_execution(crate::work::CreateExecutionInput {
-            work_item_id: parked.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("failed".to_owned()),
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-            allow_dirty: false,
-        })
+        db.create_execution(CreateExecutionInput::builder()
+            .work_item_id(parked.id.clone())
+            .kind("chore_implementation")
+            .status("failed")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build())
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());

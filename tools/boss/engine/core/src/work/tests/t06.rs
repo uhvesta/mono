@@ -295,24 +295,12 @@ fn get_live_execution_returns_waiting_human_execution_for_work_item() {
     // A second ready execution for the same chore (as would be created by
     // the orphan sweep).
     let exec_b = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore_id.clone(),
-            kind: "chore_implementation".into(),
-            status: Some("ready".into()),
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .repo_remote_url("git@github.com:foo/bar.git")
+            .build())
         .unwrap();
 
     // exec_b should see exec_a as live.
@@ -347,24 +335,12 @@ fn get_live_execution_returns_none_when_all_executions_are_terminal() {
     db.mark_execution_redundant(&exec_a_id).unwrap();
 
     let exec_b = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore_id.clone(),
-            kind: "chore_implementation".into(),
-            status: Some("ready".into()),
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .repo_remote_url("git@github.com:foo/bar.git")
+            .build())
         .unwrap();
 
     let live = db
@@ -1826,14 +1802,9 @@ fn request_execution_for_revision_task_produces_revision_implementation_kind() {
 
     let exec = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: revision_id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .build(),
             |_| false,
         )
         .unwrap();
@@ -1868,14 +1839,9 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
     // First dispatch.
     let first_exec = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: revision_id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .build(),
             |_| false,
         )
         .unwrap();
@@ -1895,14 +1861,9 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
     // with is_live returning false for the abandoned execution).
     let second_exec = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: revision_id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .build(),
             |_| false,
         )
         .unwrap();

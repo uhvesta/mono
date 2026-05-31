@@ -821,24 +821,13 @@ fn creates_and_lists_execution_entities() {
         .unwrap();
 
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: task.id.clone(),
-            kind: "task_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: Some("cube_repo_mono".to_owned()),
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: Some("/tmp/mono-agent-001".to_owned()),
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(task.id.clone())
+            .kind("task_implementation")
+            .status("ready")
+            .cube_repo_id("cube_repo_mono")
+            .workspace_path("/tmp/mono-agent-001")
+            .build())
         .unwrap();
     assert_eq!(
         execution.repo_remote_url,
@@ -958,24 +947,10 @@ fn execution_requires_repo_remote_url_snapshot() {
         .unwrap();
 
     let err = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: product.id.clone(),
-            kind: "project_design".to_owned(),
-            status: None,
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(product.id.clone())
+            .kind("project_design")
+            .build())
         .unwrap_err();
     assert!(
         err.to_string()
@@ -984,24 +959,11 @@ fn execution_requires_repo_remote_url_snapshot() {
     );
 
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: product.id.clone(),
-            kind: "project_design".to_owned(),
-            status: None,
-            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(product.id.clone())
+            .kind("project_design")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .build())
         .unwrap();
     assert_eq!(
         execution.repo_remote_url,
@@ -1452,14 +1414,9 @@ fn request_execution_refuses_when_repo_unresolvable() {
 
     let err = db
         .request_execution_with_live_check(
-            RequestExecutionInput {
-                work_item_id: chore_id.clone(),
-                priority: None,
-                preferred_workspace_id: None,
-                force: false,
-            
-                allow_dirty: false,
-            },
+            RequestExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .build(),
             |_| true,
         )
         .unwrap_err();
@@ -1580,24 +1537,11 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
 
     let (execution, run) = db
@@ -1775,24 +1719,11 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     // Drive the chore into the Doing column by starting the run —
     // this is the state cancel is supposed to undo.
@@ -1853,24 +1784,11 @@ fn cancel_execution_preserves_in_review_and_done_status() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("running".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("running")
+            .build())
         .unwrap();
     // The worker opened a PR before the human asked to cancel.
     db.update_work_item(
@@ -1949,24 +1867,11 @@ fn start_execution_does_not_downgrade_done_chores() {
     .unwrap();
 
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .build())
         .unwrap();
 
     db.start_execution_run(
@@ -2085,13 +1990,11 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
     .unwrap();
     // Create an existing execution and force it to a terminal
     // status so the reconcile sees "latest execution is terminal."
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("failed".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore.id.clone())
+        .kind("chore_implementation")
+        .status("failed")
+        .build())
     .unwrap();
 
     let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
@@ -2148,13 +2051,11 @@ fn reconcile_skips_active_chore_with_live_execution() {
     .unwrap();
     // A waiting_human execution counts as non-terminal — worker
     // is paused but the slot is still owned.
-    db.create_execution(CreateExecutionInput {
-        work_item_id: chore.id.clone(),
-        kind: "chore_implementation".to_owned(),
-        status: Some("waiting_human".to_owned()),
-        ..Default::default()
-    
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(chore.id.clone())
+        .kind("chore_implementation")
+        .status("waiting_human")
+        .build())
     .unwrap();
 
     let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
@@ -2209,13 +2110,11 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
     )
     .unwrap();
     let stale = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".to_owned(),
-            status: Some("waiting_human".to_owned()),
-            ..Default::default()
-        
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("waiting_human")
+            .build())
         .unwrap();
 
     // is_live=false → reconcile should treat the waiting_human

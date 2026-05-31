@@ -88,24 +88,11 @@ fn product_task_execution_with_prefix(
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: task.id.clone(),
-            kind: "task_implementation".to_owned(),
-            status: Some("ready".to_owned()),
-            repo_remote_url: None,
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(task.id.clone())
+            .kind("task_implementation")
+            .status("ready")
+            .build())
         .unwrap();
     (product, execution)
 }
@@ -204,24 +191,11 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
             force_duplicate: false,
         })
         .unwrap();
-    db.create_execution(CreateExecutionInput {
-        work_item_id: task.id,
-        kind: "task_implementation".to_owned(),
-        status: Some("ready".to_owned()),
-        repo_remote_url: None,
-        cube_repo_id: None,
-        cube_lease_id: None,
-        cube_workspace_id: None,
-        workspace_path: None,
-        priority: None,
-        preferred_workspace_id: None,
-        started_at: None,
-        finished_at: None,
-        prefer_is_soft: false,
-        pr_url: None,
-    
-        allow_dirty: false,
-    })
+    db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(task.id)
+        .kind("task_implementation")
+        .status("ready")
+        .build())
     .unwrap()
 }
 
@@ -334,24 +308,12 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
         })
         .unwrap();
     let exec = db
-        .create_execution(CreateExecutionInput {
-            work_item_id: chore.id.clone(),
-            kind: "chore_implementation".into(),
-            status: Some("ready".into()),
-            repo_remote_url: Some("git@github.com:foo/bar.git".into()),
-            cube_repo_id: None,
-            cube_lease_id: None,
-            cube_workspace_id: None,
-            workspace_path: None,
-            priority: None,
-            preferred_workspace_id: None,
-            started_at: None,
-            finished_at: None,
-            prefer_is_soft: false,
-            pr_url: None,
-        
-            allow_dirty: false,
-        })
+        .create_execution(CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind("chore_implementation")
+            .status("ready")
+            .repo_remote_url("git@github.com:foo/bar.git")
+            .build())
         .unwrap();
     let (exec, run) = db
         .start_execution_run(

@@ -450,23 +450,11 @@ pub async fn on_ci_failure_detected(
             // us, so a second probe with the same triplet sees
             // `attempt = None` and skips this branch entirely.
             if attempt.attempt_kind == "retrigger" {
-                match work_db.create_execution(CreateExecutionInput {
-                    work_item_id: candidate.work_item_id.clone(),
-                    kind: "ci_remediation".to_owned(),
-                    status: Some("ready".to_owned()),
-                    repo_remote_url: None,
-                    cube_repo_id: None,
-                    cube_lease_id: None,
-                    cube_workspace_id: None,
-                    workspace_path: None,
-                    priority: None,
-                    preferred_workspace_id: None,
-                    started_at: None,
-                    finished_at: None,
-                    prefer_is_soft: false,
-                    pr_url: None,
-                    allow_dirty: false,
-                }) {
+                match work_db.create_execution(CreateExecutionInput::builder()
+                    .work_item_id(candidate.work_item_id.clone())
+                    .kind("ci_remediation")
+                    .status("ready")
+                    .build()) {
                     Ok(_) => publisher.kick_scheduler(),
                     Err(err) => {
                         tracing::warn!(
@@ -1333,23 +1321,11 @@ pub async fn rescue_stranded_ci_remediation_attempt(
     publisher: &dyn ExecutionPublisher,
     attempt: &StrandedCiRemediationAttempt,
 ) -> bool {
-    match work_db.create_execution(CreateExecutionInput {
-        work_item_id: attempt.work_item_id.clone(),
-        kind: "ci_remediation".to_owned(),
-        status: Some("ready".to_owned()),
-        repo_remote_url: None,
-        cube_repo_id: None,
-        cube_lease_id: None,
-        cube_workspace_id: None,
-        workspace_path: None,
-        priority: None,
-        preferred_workspace_id: None,
-        started_at: None,
-        finished_at: None,
-        prefer_is_soft: false,
-        pr_url: None,
-        allow_dirty: false,
-    }) {
+    match work_db.create_execution(CreateExecutionInput::builder()
+        .work_item_id(attempt.work_item_id.clone())
+        .kind("ci_remediation")
+        .status("ready")
+        .build()) {
         Ok(_) => {
             publisher.kick_scheduler();
             tracing::info!(
