@@ -472,52 +472,6 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
-    /// CI analogue of [`Self::record_merge_conflict_in_flight`]. Upsert the
-    /// `ci_failure` signal into `task_blocked_signals` without changing the
-    /// parent task's `status` column. Called when an engine-triggered CI-fix
-    /// revision is in flight and the parent should stay `in_review` — the
-    /// #1007 parent-state model, now shared with the conflict path via
-    /// [`crate::blocking_signal::SignalKind`].
-    ///
-    /// The active signal ensures `maybe_clear_blocked` dispatches
-    /// `ci_watch::on_ci_resolved` when the PR's checks later go green, even
-    /// though the parent's status never moved to `blocked`. Idempotent — a
-    /// second call for the same `(work_item_id, attempt_id)` re-arms
-    /// `cleared_at = NULL`.
-    pub fn record_ci_failure_in_flight(
-        &self,
-        work_item_id: &str,
-        attempt_id: &str,
-    ) -> Result<()> {
-        let conn = self.connect()?;
-        let now = now_string();
-        upsert_task_blocked_signal(&conn, work_item_id, "ci_failure", Some(attempt_id), &now)?;
-        Ok(())
-    }
-
-    /// CI analogue of [`Self::clear_merge_conflict_signal_only`]. Clear the
-    /// `ci_failure` / `ci_failure_exhausted` signal from
-    /// `task_blocked_signals` without requiring or modifying the parent
-    /// task's `status` column. Used by `ci_watch::on_ci_resolved` when the
-    /// parent was `in_review` the entire time (the CI-fix revision cleared
-    /// the failure while the parent stayed in Review).
-    ///
-    /// Returns `true` if a row was cleared, `false` if no active CI signal
-    /// existed (idempotent on repeat calls).
-    pub fn clear_ci_failure_signal_only(&self, work_item_id: &str) -> Result<bool> {
-        let conn = self.connect()?;
-        let now = now_string();
-        let rows = conn.execute(
-            "UPDATE task_blocked_signals
-                SET cleared_at = ?2
-              WHERE work_item_id = ?1
-                AND reason IN ('ci_failure', 'ci_failure_exhausted')
-                AND cleared_at IS NULL",
-            params![work_item_id, now],
-        )?;
-        Ok(rows > 0)
-    }
-
     /// Effective CI attempt budget for `work_item_id`: per-PR override
     /// when set, falling back to the parent product's default (and
     /// finally the documented default of 3 if neither row carries a
@@ -607,40 +561,6 @@ impl WorkDb {
             return Ok(false);
         }
         upsert_task_blocked_signal(&tx, work_item_id, "merge_conflict", None, &now)?;
-        tx.commit()?;
-        Ok(true)
-    }
-
-    /// CI analogue of [`Self::rearm_blocked_merge_conflict_signal`]. Re-upsert
-    /// the `task_blocked_signals` row for the parent's current CI blocked
-    /// reason when the parent is already `blocked: ci_failure` (or
-    /// `ci_failure_exhausted`) but the signal row was cleared (e.g. by a
-    /// polymorphic-clear that ran prematurely against a stale probe).
-    ///
-    /// Returns `true` if the task IS `blocked: ci_failure[_exhausted]` (and
-    /// the signal was upserted); `false` when the task is not in that state,
-    /// which lets the caller distinguish a "human moved the row" miss from
-    /// the re-arm scenario. A `false` return means leave the row alone.
-    pub fn rearm_blocked_ci_failure_signal(&self, work_item_id: &str) -> Result<bool> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let now = now_string();
-        let reason: Option<String> = tx
-            .query_row(
-                "SELECT blocked_reason FROM tasks
-                 WHERE id = ?1
-                   AND status = 'blocked'
-                   AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
-                   AND deleted_at IS NULL",
-                params![work_item_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(reason) = reason else {
-            tx.commit()?;
-            return Ok(false);
-        };
-        upsert_task_blocked_signal(&tx, work_item_id, &reason, None, &now)?;
         tx.commit()?;
         Ok(true)
     }

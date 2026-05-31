@@ -28,7 +28,6 @@
 
 use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, FrontendEvent};
 
-use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
 use crate::work::{
@@ -424,10 +423,42 @@ pub async fn on_conflict_detected(
     // pre-abandoned the attempt:
     //   - Keep the `blocked: merge_conflict` flip (no revision vehicle means
     //     the parent must surface in the Blocked column for human attention).
-    // The "clear the upfront flip back to in_review + record the in-flight
-    // signal" sequence is the #1007 parent-state model, now written once in
-    // [`crate::blocking_signal`] and shared with the CI-failure path.
     let mut task_unblocked_for_revision = false;
+
+    /// Clear the upfront blocked-flip and upsert the in-flight signal.
+    /// Called whenever a revision fix vehicle is (or was already) in flight.
+    async fn unblock_for_revision(
+        work_db: &WorkDb,
+        candidate: &PendingMergeCheck,
+        attempt_id: &str,
+    ) -> bool {
+        let cleared = match work_db.clear_chore_blocked_merge_conflict(
+            &candidate.work_item_id,
+            &candidate.pr_url,
+        ) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "conflict_watch: failed to clear blocked after revision spawn; parent may be stuck",
+                );
+                false
+            }
+        };
+        if let Err(err) =
+            work_db.record_merge_conflict_in_flight(&candidate.work_item_id, attempt_id)
+        {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                attempt_id,
+                ?err,
+                "conflict_watch: failed to record in-flight signal; on_resolved may not fire",
+            );
+        }
+        cleared
+    }
 
     if let Some(ref a) = attempt {
         if a.status == "pending" && a.revision_task_id.is_none() {
@@ -436,12 +467,8 @@ pub async fn on_conflict_detected(
                 maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a)
                     .await;
             if spawned {
-                task_unblocked_for_revision = blocking_signal::unblock_for_revision(
-                    work_db,
-                    SignalKind::MergeConflict,
-                    candidate,
-                    &a.id,
-                );
+                task_unblocked_for_revision =
+                    unblock_for_revision(work_db, candidate, &a.id).await;
             }
             // If !spawned: attempt abandoned (revision_create_failed). Parent
             // stays `blocked: merge_conflict`.
@@ -449,12 +476,8 @@ pub async fn on_conflict_detected(
             // UNIQUE collision: existing revision in flight (repeat probe at
             // same base sha). The upfront flip to blocked was premature — clear
             // it back so the parent stays in Review while the fix continues.
-            task_unblocked_for_revision = blocking_signal::unblock_for_revision(
-                work_db,
-                SignalKind::MergeConflict,
-                candidate,
-                &a.id,
-            );
+            task_unblocked_for_revision =
+                unblock_for_revision(work_db, candidate, &a.id).await;
         }
         // a.status == "abandoned" (churn guard) with no revision_task_id:
         // parent stays blocked — this is the human-attention terminal.
