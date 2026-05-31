@@ -8160,6 +8160,18 @@ async fn handle_frontend_connection(
                     ),
                 }
             }
+
+            // Editorial controls — protocol types only; engine implementation is a follow-up.
+            FrontendRequest::SetProductEditorialRules { .. }
+            | FrontendRequest::ListEditorialActions { .. } => {
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: "editorial controls are not yet implemented".into(),
+                    },
+                );
+            }
         }
     }
 

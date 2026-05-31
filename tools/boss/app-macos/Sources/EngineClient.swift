@@ -1563,6 +1563,14 @@ final class EngineClient: @unchecked Sendable {
            let data = try? JSONSerialization.data(withJSONObject: configObj) {
             externalTrackerConfigString = String(data: data, encoding: .utf8)
         }
+
+        var editorialRules: EditorialRules? = nil
+        if let rulesObj = payload["editorial_rules"],
+           !(rulesObj is NSNull),
+           let data = try? JSONSerialization.data(withJSONObject: rulesObj) {
+            editorialRules = try? JSONDecoder().decode(EditorialRules.self, from: data)
+        }
+
         return WorkProduct(
             id: id,
             name: name,
@@ -1574,7 +1582,8 @@ final class EngineClient: @unchecked Sendable {
             updatedAt: updatedAt,
             externalTrackerKind: payload["external_tracker_kind"] as? String,
             externalTrackerConfig: externalTrackerConfigString,
-            workerBranchPrefix: payload["worker_branch_prefix"] as? String
+            workerBranchPrefix: payload["worker_branch_prefix"] as? String,
+            editorialRules: editorialRules
         )
     }
 

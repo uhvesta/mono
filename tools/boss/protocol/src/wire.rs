@@ -9,9 +9,11 @@ use crate::types::{
     CreateExecutionInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
-    EngineAttemptListEntry, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto,
+    LinkExternalRefInput, ListDependenciesInput,
     PrWorkItemMatch, Product, Project, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, SetProductExternalTrackerInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput,
     SetProjectDesignDocInput, SetTaskInvestigationDocInput, Task, TaskRuntime, TranscriptSegment,
     WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
@@ -1081,6 +1083,27 @@ pub enum FrontendRequest {
     GetAutomationOpenTaskCount {
         automation_id: String,
     },
+
+    // --- Editorial controls (editorial-controls-for-agent-authored-prs-and-github-comments.md) ---
+    /// Set (or clear) a product's editorial rules. `rules = None` in
+    /// the input clears the stored blob; the product reverts to the
+    /// engine defaults (strip known Boss identifiers, no template
+    /// enforcement). Returns [`FrontendEvent::WorkItemUpdated`] carrying
+    /// the updated product row, or [`FrontendEvent::WorkError`] if the
+    /// product is not found.
+    SetProductEditorialRules {
+        #[serde(flatten)]
+        input: SetProductEditorialRulesInput,
+    },
+    /// List recorded editorial-action audit rows for a product, ordered
+    /// `created_at DESC` (freshest first). `limit` caps the result set;
+    /// defaults to 50 when absent. Returns
+    /// [`FrontendEvent::EditorialActionsList`].
+    ListEditorialActions {
+        product_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1880,6 +1903,14 @@ pub enum FrontendEvent {
     AutomationRunResult {
         run: AutomationRun,
     },
+
+    // --- Editorial controls replies ---
+    /// Response to [`FrontendRequest::ListEditorialActions`]: the audit
+    /// rows for the product, ordered freshest-first.
+    EditorialActionsList {
+        product_id: String,
+        actions: Vec<EditorialAction>,
+    },
 }
 
 /// Snapshot of one feature flag's static metadata + current value.
@@ -2029,6 +2060,174 @@ pub struct MetricLiveEntry {
     /// True when this entry was rehydrated from `state.db` but no
     /// handle in the current binary matches its name.
     pub stale: bool,
+}
+
+#[cfg(test)]
+mod editorial_controls_tests {
+    use super::*;
+    use crate::types::{
+        BranchNaming, EditorialRules, RedactionKind, RedactionRule, TemplatePolicy, TrailerPolicy,
+    };
+
+    #[test]
+    fn editorial_rules_defaults_deserialize_from_empty_object() {
+        let json = "{}";
+        let rules: EditorialRules = serde_json::from_str(json).unwrap();
+        assert_eq!(rules, EditorialRules::default());
+        assert!(rules.instructions.is_none());
+        assert!(rules.redactions.is_empty());
+        assert_eq!(rules.template_policy, TemplatePolicy::Off);
+        assert_eq!(rules.branch_naming, BranchNaming::BossExecPrefix);
+        assert_eq!(rules.commit_trailer_policy, TrailerPolicy::Default);
+    }
+
+    #[test]
+    fn editorial_rules_round_trip() {
+        let rules = EditorialRules {
+            instructions: Some("Do not mention Boss.".into()),
+            redactions: vec![RedactionRule {
+                pattern: "exec_[0-9a-f]{16}".into(),
+                replacement: "<id>".into(),
+                kind: RedactionKind::Rewrite,
+            }],
+            template_policy: TemplatePolicy::Enforce,
+            branch_naming: BranchNaming::CustomPrefix { prefix: "bduff/".into() },
+            commit_trailer_policy: TrailerPolicy::NoAiTrailer,
+        };
+        let json = serde_json::to_string(&rules).unwrap();
+        let parsed: EditorialRules = serde_json::from_str(&json).unwrap();
+        assert_eq!(rules, parsed);
+    }
+
+    #[test]
+    fn set_product_editorial_rules_request_round_trips() {
+        let input = SetProductEditorialRulesInput {
+            product_id: "prod_123".into(),
+            rules: Some(EditorialRules {
+                template_policy: TemplatePolicy::Advise,
+                ..Default::default()
+            }),
+        };
+        let req = FrontendRequest::SetProductEditorialRules { input };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("set_product_editorial_rules"), "serialized: {json}");
+        assert!(json.contains("prod_123"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::SetProductEditorialRules { input } => {
+                assert_eq!(input.product_id, "prod_123");
+                let rules = input.rules.unwrap();
+                assert_eq!(rules.template_policy, TemplatePolicy::Advise);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_product_editorial_rules_clear_round_trips() {
+        let input = SetProductEditorialRulesInput {
+            product_id: "prod_456".into(),
+            rules: None,
+        };
+        let req = FrontendRequest::SetProductEditorialRules { input };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::SetProductEditorialRules { input } => {
+                assert_eq!(input.product_id, "prod_456");
+                assert!(input.rules.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_editorial_actions_request_round_trips() {
+        let req = FrontendRequest::ListEditorialActions {
+            product_id: "prod_789".into(),
+            limit: Some(25),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("list_editorial_actions"), "serialized: {json}");
+        let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendRequest::ListEditorialActions { product_id, limit } => {
+                assert_eq!(product_id, "prod_789");
+                assert_eq!(limit, Some(25));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn editorial_actions_list_event_round_trips() {
+        let action = EditorialAction {
+            id: "ea_001".into(),
+            product_id: "prod_789".into(),
+            execution_id: "exec_abc123".into(),
+            pr_url: Some("https://github.com/org/repo/pull/1".into()),
+            tool_command: "gh pr create --title foo --body bar".into(),
+            action: "redact".into(),
+            reason: "exec_ identifier stripped".into(),
+            created_at: "2026-05-30T00:00:00Z".into(),
+        };
+        let event = FrontendEvent::EditorialActionsList {
+            product_id: "prod_789".into(),
+            actions: vec![action.clone()],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("editorial_actions_list"), "serialized: {json}");
+        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            FrontendEvent::EditorialActionsList { product_id, actions } => {
+                assert_eq!(product_id, "prod_789");
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0], action);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_naming_custom_prefix_round_trips() {
+        let naming = BranchNaming::CustomPrefix { prefix: "bduff/".into() };
+        let json = serde_json::to_string(&naming).unwrap();
+        assert!(json.contains("custom_prefix"), "serialized: {json}");
+        assert!(json.contains("bduff/"), "serialized: {json}");
+        let parsed: BranchNaming = serde_json::from_str(&json).unwrap();
+        assert_eq!(naming, parsed);
+    }
+
+    #[test]
+    fn branch_naming_default_is_boss_exec_prefix() {
+        let naming = BranchNaming::default();
+        assert_eq!(naming, BranchNaming::BossExecPrefix);
+        let json = serde_json::to_string(&naming).unwrap();
+        assert!(json.contains("boss_exec_prefix"), "serialized: {json}");
+        let parsed: BranchNaming = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, BranchNaming::BossExecPrefix);
+    }
+
+    #[test]
+    fn product_with_editorial_rules_round_trips() {
+        let rules = EditorialRules {
+            instructions: Some("No Boss identifiers in PR body.".into()),
+            commit_trailer_policy: TrailerPolicy::NoAiTrailer,
+            ..Default::default()
+        };
+        // Verify the rules serialize correctly within a JSON blob and
+        // that `editorial_rules: null` from an absent product column
+        // deserialises to `None`.
+        let json_with = serde_json::json!({ "editorial_rules": rules });
+        let rules_back: EditorialRules =
+            serde_json::from_value(json_with["editorial_rules"].clone()).unwrap();
+        assert_eq!(rules_back, rules);
+
+        let json_null = serde_json::json!({ "editorial_rules": null });
+        let opt: Option<EditorialRules> =
+            serde_json::from_value(json_null["editorial_rules"].clone()).unwrap();
+        assert!(opt.is_none());
+    }
 }
 
 #[cfg(test)]

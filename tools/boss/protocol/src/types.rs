@@ -67,6 +67,13 @@ pub struct Product {
     /// tracker kinds can ship without a protocol version bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_tracker_config: Option<serde_json::Value>,
+    /// Per-product editorial rules that constrain what workers write
+    /// into GitHub-visible surfaces (PR bodies, comments, branch name,
+    /// commit messages). `None` means no rules are configured; the
+    /// engine uses its built-in defaults (strip known Boss identifier
+    /// patterns). See `editorial-controls-for-agent-authored-prs-and-github-comments.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editorial_rules: Option<EditorialRules>,
 }
 
 /// Allowed values for `tasks.effort_level`. Per design §"Naming" /
@@ -420,6 +427,152 @@ pub struct Task {
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+// ---------------------------------------------------------------------------
+// Editorial controls (editorial-controls-for-agent-authored-prs-and-github-comments.md)
+// ---------------------------------------------------------------------------
+
+/// What the editorial hook does when a redaction pattern matches: rewrite
+/// the matched substring in place, or block the `gh` invocation entirely.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionKind {
+    /// Replace the match with `RedactionRule::replacement`.
+    #[default]
+    Rewrite,
+    /// Reject the `gh` invocation outright with an actionable message.
+    Block,
+}
+
+/// One user-configured redaction rule applied to `gh pr|issue` bodies.
+/// `pattern` is a regex (Rust `regex` crate syntax); `replacement` is
+/// substituted for every match when `kind = Rewrite` and ignored when
+/// `kind = Block`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactionRule {
+    pub pattern: String,
+    pub replacement: String,
+    #[serde(default)]
+    pub kind: RedactionKind,
+}
+
+/// How strictly the product's `.github/PULL_REQUEST_TEMPLATE.md`
+/// conformance is enforced on PR bodies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplatePolicy {
+    /// No template enforcement — worker writes whatever it likes (today's
+    /// default behaviour).
+    #[default]
+    Off,
+    /// Inject the template as guidance in the worker prompt, but do not
+    /// block a non-conforming PR body.
+    Advise,
+    /// Block `gh pr create` / `gh pr edit` calls whose body does not
+    /// contain the mandatory template sections.
+    Enforce,
+}
+
+/// Which naming strategy to use for worker branches pushed to this
+/// product's repo. The execution-id suffix is always appended for
+/// uniqueness; only the leading prefix component varies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BranchNaming {
+    /// Engine default: `boss/exec_<id>`. Clearly identifies Boss-authored
+    /// branches; unwanted in repos with strict per-developer prefix rules.
+    #[default]
+    BossExecPrefix,
+    /// Replace the leading prefix with a short opaque hash so the branch
+    /// name gives no hint of its Boss origin while remaining unique by
+    /// construction.
+    OpaqueHash,
+    /// Use `<prefix>exec_<id>` instead of `boss/exec_<id>`. Satisfies
+    /// orgs that enforce per-developer branch prefixes (e.g. `bduff/`).
+    CustomPrefix { prefix: String },
+}
+
+/// Whether the worker should append an AI co-author trailer to commit
+/// messages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrailerPolicy {
+    /// Engine default: the worker follows whatever its CLAUDE.md says
+    /// (today that means appending `Co-Authored-By: Claude …`).
+    #[default]
+    Default,
+    /// Strip any AI co-author trailer before the worker calls `git
+    /// commit`. The worker is also instructed not to add it.
+    NoAiTrailer,
+}
+
+/// Per-product editorial rules constraining what workers write into
+/// GitHub-visible surfaces.
+///
+/// All fields carry `#[serde(default)]` so an absent or `null` JSON
+/// object deserialises to the identity value that preserves today's
+/// behaviour. The `Default` impl is therefore the "no rules configured"
+/// state and matches what unconfigured products experience.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EditorialRules {
+    /// Free-text instructions injected verbatim into the worker's
+    /// initial prompt beneath a `[editorial-rules]` header. `None` →
+    /// no free-text block injected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Ordered redaction rules applied to every `gh pr|issue
+    /// {create,edit,comment}` body before the call goes through.
+    /// Empty → no redaction pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redactions: Vec<RedactionRule>,
+    /// How strictly `.github/PULL_REQUEST_TEMPLATE.md` conformance is
+    /// enforced on PR bodies.
+    #[serde(default)]
+    pub template_policy: TemplatePolicy,
+    /// Branch-naming strategy for worker branches on this product.
+    #[serde(default)]
+    pub branch_naming: BranchNaming,
+    /// Whether AI co-author trailers should be stripped from commit
+    /// messages authored by workers on this product.
+    #[serde(default)]
+    pub commit_trailer_policy: TrailerPolicy,
+}
+
+/// One recorded enforcement action taken by the editorial-rules hook
+/// against a `gh` command invocation. Stored in `editorial_actions`
+/// for audit and debugging; surfaced via `ListEditorialActions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct EditorialAction {
+    pub id: String,
+    pub product_id: String,
+    pub execution_id: String,
+    /// The PR URL the action was taken on, when known at hook time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    /// Verbatim command the worker attempted (e.g. `gh pr create
+    /// --title "…" --body "…"`), truncated to 4 KiB for storage.
+    pub tool_command: String,
+    /// What the hook did: `"redact"` (body was rewritten in place),
+    /// `"block"` (invocation was rejected), or `"advise"` (warning
+    /// prepended to the prompt but the call was allowed through).
+    pub action: String,
+    /// Human-readable explanation produced by the hook (the matched
+    /// pattern name or the template section that was missing).
+    pub reason: String,
+    pub created_at: String,
+}
+
+/// Input for `SetProductEditorialRules`: replace or clear a product's
+/// editorial-rules blob. `rules = None` clears the column and reverts
+/// the product to the engine defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetProductEditorialRulesInput {
+    pub product_id: String,
+    /// The new rules to store. `None` clears the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<EditorialRules>,
 }
 
 fn default_true() -> bool {

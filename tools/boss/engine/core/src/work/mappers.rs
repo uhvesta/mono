@@ -32,6 +32,7 @@ pub(crate) fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
         dispatch_preamble: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
         external_tracker_kind,
         external_tracker_config,
+        editorial_rules: None,
     })
 }
 
