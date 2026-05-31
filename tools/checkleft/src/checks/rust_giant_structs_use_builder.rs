@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::GlobSet;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,8 +11,12 @@ use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
+use super::rust_giant_struct_common::{
+    BuilderKind, DEFAULT_MAX_FIELDS, collect_violations, find_struct_line, is_excluded,
+    is_literal_path, parse_exclude_files, struct_declaration_line,
+};
+
 const CHECK_ID: &str = "rust-giant-structs-use-builder";
-const DEFAULT_MAX_FIELDS: usize = 5;
 
 /// Flags Rust structs with more named fields than `max_fields` (default 5, meaning 6+)
 /// that do not carry the required builder derive. Tuple and unit structs are exempt.
@@ -96,27 +100,6 @@ enum AuditKind {
     File,
 }
 
-#[derive(Clone, Debug)]
-enum BuilderKind {
-    Bon,
-    DeriveBuilder,
-}
-
-impl BuilderKind {
-    fn derive_display(&self) -> &str {
-        match self {
-            Self::Bon => "bon::Builder",
-            Self::DeriveBuilder => "derive_builder::Builder",
-        }
-    }
-
-    fn crate_name(&self) -> &str {
-        match self {
-            Self::Bon => "bon",
-            Self::DeriveBuilder => "derive_builder",
-        }
-    }
-}
 
 #[async_trait]
 impl Check for RustGiantStructsUseBuilderCheck {
@@ -313,193 +296,6 @@ impl ConfiguredCheck for ParsedConfig {
     }
 }
 
-/// Recursively walk syn items, collecting the names of structs that violate the rule.
-/// Skips structs and modules that are annotated with `#[cfg(test)]`, and structs whose
-/// name is listed in `exclude_structs` (grandfathered violations).
-fn collect_violations(
-    items: &[syn::Item],
-    in_test_mod: bool,
-    builder: &BuilderKind,
-    max_fields: usize,
-    exclude_structs: &HashSet<String>,
-) -> Vec<String> {
-    let mut violations = Vec::new();
-
-    for item in items {
-        match item {
-            syn::Item::Struct(s) => {
-                if in_test_mod || has_cfg_test(&s.attrs) {
-                    continue;
-                }
-                let syn::Fields::Named(named) = &s.fields else {
-                    continue;
-                };
-                if named.named.len() <= max_fields {
-                    continue;
-                }
-                // Clap-derived structs are exempt: clap owns their construction.
-                if has_clap_derive(&s.attrs) {
-                    continue;
-                }
-                if has_required_builder(&s.attrs, builder) {
-                    continue;
-                }
-                let name = s.ident.to_string();
-                // Grandfathered by name: still scanned, but exempt. New giant structs
-                // in the same file are not exempt and will still be flagged.
-                if exclude_structs.contains(&name) {
-                    continue;
-                }
-                violations.push(name);
-            }
-            syn::Item::Mod(m) => {
-                let is_test = has_cfg_test(&m.attrs);
-                if let Some((_, sub_items)) = &m.content {
-                    violations.extend(collect_violations(
-                        sub_items,
-                        in_test_mod || is_test,
-                        builder,
-                        max_fields,
-                        exclude_structs,
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    violations
-}
-
-fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg")
-            && attr
-                .parse_args::<syn::Ident>()
-                .ok()
-                .map_or(false, |id| id == "test")
-    })
-}
-
-/// Returns true if the struct carries a clap argument-parser derive:
-/// `#[derive(Parser)]`, `#[derive(Args)]`, `#[derive(Subcommand)]`,
-/// or their fully-qualified forms `clap::Parser`, `clap::Args`,
-/// `clap::Subcommand`. Such structs are exempt from the builder
-/// requirement because clap owns their construction via its derive.
-fn has_clap_derive(attrs: &[syn::Attribute]) -> bool {
-    const CLAP_TRAITS: &[&str] = &["Parser", "Args", "Subcommand"];
-    for attr in attrs {
-        if !attr.path().is_ident("derive") {
-            continue;
-        }
-        let Ok(nested) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-        ) else {
-            continue;
-        };
-        for path in &nested {
-            let segs: Vec<_> = path.segments.iter().collect();
-            match segs.as_slice() {
-                // Unqualified: `Parser`, `Args`, `Subcommand`
-                [seg] if CLAP_TRAITS.contains(&seg.ident.to_string().as_str()) => return true,
-                // Qualified: `clap::Parser`, `clap::Args`, `clap::Subcommand`
-                [krate, trait_seg]
-                    if krate.ident == "clap"
-                        && CLAP_TRAITS.contains(&trait_seg.ident.to_string().as_str()) =>
-                {
-                    return true
-                }
-                _ => {}
-            }
-        }
-    }
-    false
-}
-
-fn has_required_builder(attrs: &[syn::Attribute], builder: &BuilderKind) -> bool {
-    for attr in attrs {
-        if !attr.path().is_ident("derive") {
-            continue;
-        }
-        let Ok(nested) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-        ) else {
-            continue;
-        };
-        for path in &nested {
-            let segs: Vec<_> = path.segments.iter().collect();
-            match builder {
-                BuilderKind::Bon => {
-                    if segs.len() == 2
-                        && segs[0].ident == "bon"
-                        && segs[1].ident == "Builder"
-                    {
-                        return true;
-                    }
-                }
-                BuilderKind::DeriveBuilder => {
-                    if segs.len() == 2
-                        && segs[0].ident == "derive_builder"
-                        && segs[1].ident == "Builder"
-                    {
-                        return true;
-                    }
-                    // Unqualified Builder is also accepted for derive_builder
-                    if segs.len() == 1 && segs[0].ident == "Builder" {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Find the 1-based line number where `struct <name>` is declared, or `None` if the
-/// declaration can't be located. Handles a leading visibility modifier (`pub`,
-/// `pub(crate)`, `pub(super)`, `pub(in path)`) so that `pub struct Foo` resolves to the
-/// right line.
-fn struct_declaration_line(source: &str, struct_name: &str) -> Option<u32> {
-    let search = format!("struct {struct_name}");
-    for (i, line) in source.lines().enumerate() {
-        let candidate = strip_visibility(line.trim_start());
-        if let Some(after) = candidate.strip_prefix(&search) {
-            // Ensure we matched the whole ident, not a prefix of a longer name.
-            if after.is_empty()
-                || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '('))
-            {
-                return Some((i + 1) as u32);
-            }
-        }
-    }
-    None
-}
-
-/// Like [`struct_declaration_line`] but falls back to line 1 when the declaration can't
-/// be located, for use as a finding location.
-fn find_struct_line(source: &str, struct_name: &str) -> u32 {
-    struct_declaration_line(source, struct_name).unwrap_or(1)
-}
-
-/// Strip a leading `pub` / `pub(...)` visibility modifier (and following
-/// whitespace) from an already-`trim_start`ed line. Leaves the line untouched
-/// when there is no visibility keyword (so `published` is not mistaken for `pub`).
-fn strip_visibility(line: &str) -> &str {
-    let Some(rest) = line.strip_prefix("pub") else {
-        return line;
-    };
-    match rest.chars().next() {
-        // Restricted visibility: `pub(crate)`, `pub(super)`, `pub(in path)`.
-        Some('(') => match rest.find(')') {
-            Some(close) => rest[close + 1..].trim_start(),
-            None => line,
-        },
-        // Plain `pub ` followed by whitespace.
-        Some(c) if c.is_whitespace() => rest.trim_start(),
-        // Something like `pubfoo` — not the visibility keyword.
-        _ => line,
-    }
-}
 
 fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<ParsedConfig> {
     let raw: RawConfig = config
@@ -581,39 +377,6 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
     })
 }
 
-/// A pattern with no glob metacharacters resolves to a single concrete file path.
-fn is_literal_path(pattern: &str) -> bool {
-    !pattern.contains(['*', '?', '[', ']', '{', '}', '!'])
-}
-
-fn parse_exclude_files(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
-    let Some(patterns) = patterns else {
-        return Ok(None);
-    };
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `exclude_files` pattern: {pattern}"))?;
-        builder.add(glob);
-    }
-    Ok(Some(
-        builder
-            .build()
-            .context("failed to compile `exclude_files` patterns")?,
-    ))
-}
-
-/// Returns true if `path` is within `config_dir` and matches `globs` (relative to config_dir).
-/// Files outside the config_dir subtree are never excluded.
-fn is_excluded(path: &Path, globs: &GlobSet, config_dir: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(config_dir) else {
-        return false;
-    };
-    globs.is_match(relative)
-}
 
 #[cfg(test)]
 mod tests {
