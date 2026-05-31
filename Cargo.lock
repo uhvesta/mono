@@ -243,6 +243,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-conflict-diagnosis"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "boss-engine"
 version = "0.1.0"
 dependencies = [
@@ -250,8 +259,12 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-client",
+ "boss-conflict-diagnosis",
+ "boss-feature-flags",
  "boss-protocol",
+ "boss-ssh-transport",
  "boss-transcript-markdown",
+ "boss-transcript-tail",
  "clap",
  "core-foundation 0.10.1",
  "core-foundation-sys",
@@ -288,6 +301,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-feature-flags"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "boss-protocol"
 version = "0.1.0"
 dependencies = [
@@ -298,12 +321,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-ssh-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boss-transcript-markdown"
 version = "0.1.0"
 dependencies = [
  "bon",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "boss-transcript-tail"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

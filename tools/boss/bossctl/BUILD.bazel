@@ -19,7 +19,7 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//tools/boss/client",
-        "//tools/boss/engine:engine_lib",
+        "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
@@ -31,7 +31,7 @@ rust_test(
     edition = "2024",
     deps = [
         "//tools/boss/client",
-        "//tools/boss/engine:engine_lib",
+        "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

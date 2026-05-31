@@ -1022,7 +1022,6 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "8. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
     ));
-    out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
     out.push_str("Rebase-only exception: if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces no new diff, it is perfectly valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change.\n");

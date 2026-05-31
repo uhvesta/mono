@@ -8,7 +8,11 @@ anyhow = { workspace = true }
 boss-transcript-markdown = { path = "boss-transcript-markdown" }
 async-trait = { workspace = true }
 bon = { workspace = true }
-boss-protocol = { path = "../protocol" }
+boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+boss-feature-flags = { path = "../feature-flags" }
+boss-protocol = { path = "../../protocol" }
+boss-ssh-transport = { path = "../ssh-transport" }
+boss-transcript-tail = { path = "../transcript-tail" }
 clap = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }
 libc = "0.2"
@@ -34,6 +38,6 @@ core-foundation = "0.10"
 core-foundation-sys = "0.8"
 
 [dev-dependencies]
-boss-client = { path = "../client" }
+boss-client = { path = "../../client" }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "boss-ssh-transport"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

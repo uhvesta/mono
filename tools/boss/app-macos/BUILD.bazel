@@ -75,7 +75,7 @@ macos_application(
     # Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
     # so they continue to resolve cube (and jj, gh, claude, etc.) from PATH.
     additional_contents = {
-        "//tools/boss/engine:engine": "Resources/bin",
+        "//tools/boss/engine/core:engine": "Resources/bin",
         "//tools/boss/cli:boss": "Resources/bin",
         "//tools/boss/bossctl:bossctl": "Resources/bin",
         "//tools/boss/event-shim:boss-event": "Resources/bin",

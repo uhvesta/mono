@@ -16,7 +16,6 @@ rust_library(
         "src/comments_anchor.rs",
         "src/completion.rs",
         "src/config.rs",
-        "src/conflict_diagnosis.rs",
         "src/conflict_watch.rs",
         "src/coordinator.rs",
         "src/dead_pid_sweep.rs",
@@ -32,7 +31,6 @@ rust_library(
         "src/external_tracker/github_oauth.rs",
         "src/external_tracker/mod.rs",
         "src/external_tracker/reconcile.rs",
-        "src/feature_flags.rs",
         "src/host_adapter.rs",
         "src/host_registry.rs",
         "src/host_scheduling.rs",
@@ -60,10 +58,8 @@ rust_library(
         "src/runner.rs",
         "src/settings.rs",
         "src/spawn_flow.rs",
-        "src/ssh_transport.rs",
         "src/stale_worker_sweep.rs",
         "src/syspolicyd_monitor.rs",
-        "src/transcript_tail.rs",
         "src/transient_error.rs",
         "src/transient_recovery.rs",
         "src/work.rs",
@@ -127,11 +123,14 @@ rust_library(
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/cli:__pkg__",
         "//tools/boss/client:__pkg__",
-        "//tools/boss/engine:__pkg__",
     ],
     deps = [
-        "//tools/boss/engine/boss-transcript-markdown:transcript_markdown",
+        "//tools/boss/engine/conflict-diagnosis",
+        "//tools/boss/engine/core/boss-transcript-markdown:transcript_markdown",
+        "//tools/boss/engine/feature-flags",
         "//tools/boss/protocol",
+        "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/transcript-tail",
     ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
@@ -142,7 +141,7 @@ rust_binary(
     edition = "2024",
     # Ship the boss-event hook shim alongside the engine binary so
     # PaneSpawnRunner can resolve it via runfiles at runtime. Without
-    # this dep, `bazel run //tools/boss/engine:engine` builds only
+    # this dep, `bazel run //tools/boss/engine/core:engine` builds only
     # the engine and worker `settings.json` ends up referencing
     # `boss-event` as a bare name that isn't on the worker's
     # sanitized PATH — every hook fires `command not found`.
@@ -196,7 +195,6 @@ rust_test(
         "app::",
         "dispatch_events::",
         "dispatch_reader::",
-        "conflict_diagnosis::",
         "conflict_watch::",
         "ci_log_reader::",
     ],
@@ -246,7 +244,6 @@ rust_test(
         "--skip", "app::",
         "--skip", "dispatch_events::",
         "--skip", "dispatch_reader::",
-        "--skip", "conflict_diagnosis::",
         "--skip", "conflict_watch::",
         "--skip", "ci_log_reader::",
         "--skip", "completion::",

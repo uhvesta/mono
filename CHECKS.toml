@@ -13,11 +13,11 @@ exclude_files = [
   "**/go.sum",
   "**/*.pb.rs",
   # Grandfathered oversized files — TODO: split each below 3000
-  "tools/boss/engine/src/app.rs",
-  "tools/boss/engine/src/completion.rs",
-  "tools/boss/engine/src/coordinator.rs",
-  "tools/boss/engine/src/merge_poller.rs",
-  "tools/boss/engine/src/runner.rs",
+  "tools/boss/engine/core/src/app.rs",
+  "tools/boss/engine/core/src/completion.rs",
+  "tools/boss/engine/core/src/coordinator.rs",
+  "tools/boss/engine/core/src/merge_poller.rs",
+  "tools/boss/engine/core/src/runner.rs",
   "tools/boss/cli/src/main.rs",
   "tools/cube/src/app.rs",
 ]

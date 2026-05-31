@@ -1,0 +1,13 @@
+[package]
+name = "boss-transcript-tail"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

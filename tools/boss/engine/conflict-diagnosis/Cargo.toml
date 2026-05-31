@@ -1,0 +1,12 @@
+[package]
+name = "boss-conflict-diagnosis"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
