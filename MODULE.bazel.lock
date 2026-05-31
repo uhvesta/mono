@@ -279,6 +279,27 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
+    "@@aspect_tools_telemetry+//:extension.bzl%telemetry": {
+      "general": {
+        "bzlTransitiveDigest": "gA7tPEdJXhskzPIEUxjX9IdDrM6+WjfbgXJ8Ez47umk=",
+        "usagesDigest": "MBAqHtEt735uRKywtJCnwD1RaLBpR/HmAoaNdVupgXc=",
+        "recordedInputs": [
+          "REPO_MAPPING:aspect_tools_telemetry+,aspect_bazel_lib aspect_bazel_lib+",
+          "REPO_MAPPING:aspect_tools_telemetry+,bazel_skylib bazel_skylib+"
+        ],
+        "generatedRepoSpecs": {
+          "aspect_tools_telemetry_report": {
+            "repoRuleId": "@@aspect_tools_telemetry+//:extension.bzl%tel_repository",
+            "attributes": {
+              "deps": {
+                "aspect_rules_js": "2.8.2",
+                "aspect_tools_telemetry": "0.2.8"
+              }
+            }
+          }
+        }
+      }
+    },
     "@@buildifier_prebuilt+//:defs.bzl%buildifier_prebuilt_deps_extension": {
       "general": {
         "bzlTransitiveDigest": "3SXpv/oaemUJfW9RAoTqenEgHJE2pkdbrrkPif6Vk00=",
