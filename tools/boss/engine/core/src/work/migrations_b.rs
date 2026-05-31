@@ -1183,6 +1183,10 @@ pub(crate) fn migrate_editorial_controls_schema(conn: &Connection) -> Result<()>
 /// is a no-op. Partial-unique index on `(product_id, short_id)` mirrors
 /// the tasks/projects pattern. FK `attentions.group_id → attention_groups`
 /// with `ON DELETE CASCADE` keeps orphan rows from accumulating.
+///
+/// `attention_group_short_id_sequences` is the per-product `A<n>` counter
+/// (parallel to `automation_short_id_sequences`), giving groups a dense
+/// per-product short id independent of the tasks/projects counter.
 pub(crate) fn migrate_attentions(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS attention_groups (
@@ -1240,7 +1244,11 @@ pub(crate) fn migrate_attentions(conn: &Connection) -> Result<()> {
              confidence_source   TEXT NOT NULL DEFAULT 'structured'
          );
          CREATE INDEX IF NOT EXISTS attentions_group_idx
-             ON attentions(group_id, ordinal);",
+             ON attentions(group_id, ordinal);
+         CREATE TABLE IF NOT EXISTS attention_group_short_id_sequences (
+             product_id  TEXT PRIMARY KEY REFERENCES products(id),
+             next_value  INTEGER NOT NULL DEFAULT 1
+         );",
     )?;
     Ok(())
 }

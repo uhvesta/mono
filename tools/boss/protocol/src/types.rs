@@ -1299,6 +1299,8 @@ pub struct CreateProductInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateProjectInput {
     pub product_id: String,
     pub name: String,
@@ -1313,6 +1315,7 @@ pub struct CreateProjectInput {
     /// Mirrors the chore/task `autostart` semantics — same gate,
     /// applied at the moment the design task is born.
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub autostart: bool,
     /// When `true`, skip creation of the auto-generated `kind=design`
     /// seed task entirely. The project is filed alone with zero child
@@ -1320,10 +1323,13 @@ pub struct CreateProjectInput {
     /// milestone aggregators, checklists) where the seed task is dead
     /// weight. Defaults to `false` to preserve existing behaviour.
     #[serde(default)]
+    #[builder(default)]
     pub no_design_task: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct CreateTaskInput {
     pub product_id: String,
     pub project_id: String,
@@ -1334,6 +1340,7 @@ pub struct CreateTaskInput {
     /// `waiting_dependency` so only the first incomplete task is ever
     /// `ready`. Defaults to `true`.
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub autostart: bool,
     /// One of `low` / `medium` / `high`. Omitted → engine default
     /// (`medium`), which is the right answer for the vast majority
@@ -1366,6 +1373,7 @@ pub struct CreateTaskInput {
     /// a second row unconditionally. Intended as a CLI escape hatch for
     /// operators who explicitly want a second task with the same name.
     #[serde(default)]
+    #[builder(default)]
     pub force_duplicate: bool,
 }
 

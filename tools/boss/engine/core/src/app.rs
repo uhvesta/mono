@@ -5283,18 +5283,160 @@ async fn handle_frontend_connection(
                     }
                 }
             }
-            // --- Attentions (task 1: wire stubs; handlers land in task 2/3) ---
-            FrontendRequest::ListAttentionGroups { .. }
-            | FrontendRequest::GetAttentionGroup { .. }
-            | FrontendRequest::CreateAttention { .. }
-            | FrontendRequest::AnswerAttention { .. }
-            | FrontendRequest::ActionAttentionGroup { .. }
-            | FrontendRequest::DismissAttention { .. } => {
+            // --- Attentions (task 2: store + CRUD/RPC + events).
+            //     ActionAttentionGroup remains stubbed until task 3. ---
+            FrontendRequest::ListAttentionGroups {
+                product_id,
+                project_id,
+                task_id,
+                kind,
+                state,
+            } => {
+                match work_db.list_attention_groups(
+                    &product_id,
+                    project_id.as_deref(),
+                    task_id.as_deref(),
+                    kind.as_deref(),
+                    state.as_deref(),
+                ) {
+                    Ok(groups) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::AttentionGroupsList { product_id, groups },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::GetAttentionGroup { id } => {
+                match work_db.get_attention_group(&id) {
+                    Ok(group) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::AttentionGroupResult { group },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::CreateAttention { input } => {
+                match work_db.create_attention(input) {
+                    Ok((attention, group)) => {
+                        // Live-update the Notifications window + doc viewer on
+                        // the owning product's work-tree topic.
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &group.product_id,
+                                FrontendEvent::AttentionCreated {
+                                    attention: attention.clone(),
+                                    group: group.clone(),
+                                },
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::AttentionCreated { attention, group },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::AnswerAttention {
+                id,
+                answer,
+                skip,
+                dismiss,
+            } => match work_db.answer_attention(&id, answer, skip, dismiss) {
+                Ok(group) => {
+                    server_state
+                        .publisher
+                        .publish_frontend_event_on_product(
+                            &group.product_id,
+                            FrontendEvent::AttentionGroupUpdated {
+                                group: group.clone(),
+                            },
+                        )
+                        .await;
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AttentionGroupUpdated { group },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
+            FrontendRequest::DismissAttention { id, reason } => {
+                match work_db.dismiss_attention(&id, reason) {
+                    Ok(group) => {
+                        server_state
+                            .publisher
+                            .publish_frontend_event_on_product(
+                                &group.product_id,
+                                FrontendEvent::AttentionGroupUpdated {
+                                    group: group.clone(),
+                                },
+                            )
+                            .await;
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::AttentionGroupUpdated { group },
+                        );
+                    }
+                    Err(err) => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: err.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            FrontendRequest::ActionAttentionGroup { .. } => {
                 send_response(
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: "attentions: handlers not yet implemented".to_string(),
+                        message: "attentions: ActionAttentionGroup is not yet implemented (task 3)"
+                            .to_string(),
                     },
                 );
             }
