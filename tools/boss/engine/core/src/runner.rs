@@ -1024,6 +1024,13 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str("Rebase-only exception: if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces no new diff, it is perfectly valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change.\n");
     out.push('\n');
+    out.push_str("PR description accuracy:\n");
+    out.push_str("After updating the code, check whether the existing PR description still accurately describes what the PR now does. If the revision changed the scope, behaviour, or approach significantly, the PR description has become stale and MUST be updated so reviewers see an accurate picture.\n");
+    out.push('\n');
+    out.push_str("- **When to update:** whenever the revision changes what the PR does at a semantic level — different algorithm, different scope, different user-visible behaviour, different design. A cosmetic/rebase-only revision that changes no observable behaviour needs no description update.\n");
+    out.push_str("- **How to update:** write the new body to a temp file and use `GIT_DIR=.jj/repo/store/git gh pr edit --body-file <file> -R <owner/repo>` (never pass the body as an inline `--body` argument — shell will evaluate backticks and `$(...)`). Retrieve the current body first with `GIT_DIR=.jj/repo/store/git gh pr view --json body -q .body` so you can build on it if needed.\n");
+    out.push_str("- **What to write:** rewrite the description so it is accurate and self-contained for reviewers NOW. Do not simply append a \"revision changelog\" that leaves a contradictory original summary above it. A short \"Changes since initial version\" note is acceptable in addition, but the main summary must describe the CURRENT state of the PR — what it does, not what it used to do.\n");
+    out.push('\n');
     out.push_str("Constraints:\n");
     out.push_str("- Do NOT run `gh pr create` — this revision has no PR of its own.\n");
     out.push_str("- Do NOT create a `boss/exec_*` bookmark — push to the existing parent branch.\n");
