@@ -1198,3 +1198,51 @@ pub(crate) fn migrate_attentions(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Add editorial-controls schema (P576, chore #1).
+///
+/// - `products.editorial_rules` (TEXT, NULL): JSON blob of per-product
+///   editorial rules injected into worker prompts. NULL means no rules
+///   (all-defaults). Mirrors the opaque-JSON pattern used by
+///   `external_tracker_config`.
+/// - `work_executions.branch_naming` (TEXT, NULL): branch-naming
+///   convention snapshot taken at spawn time. NULL means the legacy
+///   default ("boss_exec_prefix"). Denormalised from product so the
+///   execution is self-describing even if the product is later edited.
+/// - `editorial_actions` table: append-only audit log of allow/rewrite/
+///   deny decisions made by the editorial pass (Phase 2+). Written dark
+///   in this migration — no engine code reads or writes it yet.
+///
+/// Idempotent: column additions are guarded by `table_has_column`;
+/// the table and index use `CREATE … IF NOT EXISTS`.
+///
+/// Design: `tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md`
+pub(crate) fn migrate_editorial_controls_schema(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "editorial_rules")? {
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN editorial_rules TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "work_executions", "branch_naming")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN branch_naming TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS editorial_actions (
+             id           INTEGER PRIMARY KEY,
+             product_id   TEXT NOT NULL REFERENCES products(id),
+             execution_id TEXT,
+             pr_url       TEXT,
+             tool_command TEXT NOT NULL,
+             action       TEXT NOT NULL CHECK (action IN ('allow', 'rewrite', 'deny')),
+             reason       TEXT,
+             created_at   TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_editorial_actions_product
+             ON editorial_actions(product_id, created_at DESC);",
+    )?;
+    Ok(())
+}

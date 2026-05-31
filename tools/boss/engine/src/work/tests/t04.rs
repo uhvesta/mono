@@ -665,7 +665,7 @@ fn fresh_init_includes_external_tracker_schema() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "13");
+    assert_eq!(version, "14");
     let _ = std::fs::remove_file(path);
 }
 
@@ -764,7 +764,7 @@ fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "13");
+    assert_eq!(version, "14");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1219,7 +1219,7 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "13");
+    assert_eq!(version, "14");
 
     // After migration we can also write a fresh `blocked` row
     // and re-backfill is still a no-op (the existing rows
@@ -2301,6 +2301,97 @@ fn resolve_project_design_doc_returns_pr_head_branch_for_non_boss_product_path()
         web_url,
         "https://github.com/spinyfin/mono/blob/boss/exec_18b3fffb232a8060_ec/tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md",
     );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Fresh init and migration both land the editorial-controls schema
+/// (P576 chore #1): `products.editorial_rules`, `work_executions.branch_naming`,
+/// and the `editorial_actions` table + index. Existing rows must read
+/// back as NULL (all-defaults, no behaviour change).
+#[test]
+fn fresh_init_includes_editorial_controls_schema() {
+    let path = temp_db_path("editorial-fresh");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let conn = db.connect().unwrap();
+
+    assert!(
+        table_has_column(&conn, "products", "editorial_rules").unwrap(),
+        "missing products.editorial_rules",
+    );
+    assert!(
+        table_has_column(&conn, "work_executions", "branch_naming").unwrap(),
+        "missing work_executions.branch_naming",
+    );
+    let table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'editorial_actions'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_exists, 1, "editorial_actions table must exist");
+    let idx_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_editorial_actions_product'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx_exists, 1, "idx_editorial_actions_product must exist");
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Migration from a pre-editorial-controls schema adds the columns and
+/// table idempotently; pre-existing product rows read back as NULL.
+#[test]
+fn migration_adds_editorial_controls_columns() {
+    let path = disk_db_path("editorial-migrate");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE products (
+             id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+             description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
+             status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+         INSERT INTO products(id, name, slug, status, created_at, updated_at)
+         VALUES ('prod_e', 'Editorial', 'editorial', 'active', '1700000000', '1700000000');
+         INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let db = WorkDb::open(path.clone()).unwrap();
+    let conn = db.connect().unwrap();
+
+    assert!(
+        table_has_column(&conn, "products", "editorial_rules").unwrap(),
+        "migration must add products.editorial_rules",
+    );
+    assert!(
+        table_has_column(&conn, "work_executions", "branch_naming").unwrap(),
+        "migration must add work_executions.branch_naming",
+    );
+
+    // Pre-existing product row must read back as NULL (no behaviour change).
+    let editorial_rules: Option<String> = conn
+        .query_row(
+            "SELECT editorial_rules FROM products WHERE id = 'prod_e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        editorial_rules.is_none(),
+        "existing row must have NULL editorial_rules",
+    );
+
+    // Idempotency: a second open must not fail.
+    drop(conn);
+    let _db2 = WorkDb::open(path.clone()).unwrap();
 
     let _ = std::fs::remove_file(path);
 }
