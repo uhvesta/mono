@@ -1509,10 +1509,14 @@ extension WorkTask {
     ///
     /// Tasks/chores carry one of `todo`, `active`, `blocked`,
     /// `in_review`, `done` (plus `archived`, which is filtered out by
-    /// `deleted_at`). `blocked` belongs in Backlog: the worker can't
-    /// start a gated row, so from the user's perspective it sits with
-    /// the not-yet-active pile rather than with Doing. The card itself
-    /// surfaces the gating with an icon + "Blocked by …" subtitle.
+    /// `deleted_at`). `blocked` splits by reason:
+    ///   • Review-phase reasons (`merge_conflict`, `ci_failure`,
+    ///     `ci_failure_exhausted`, `review_feedback`) → Review. The item
+    ///     has an open PR; the block is transient and in-flight. The card
+    ///     shows the reason badge so the state is legible.
+    ///   • Everything else (dependency, nil, unknown) → Backlog: the item
+    ///     can't start yet, so from the user's perspective it sits with
+    ///     the not-yet-active pile.
     ///
     /// Dispatch-pending rows (`status=todo AND autostart=true`) route to
     /// Doing rather than Backlog. From the user's perspective these rows
@@ -1530,8 +1534,22 @@ extension WorkTask {
             return .done
         case "todo" where autostart:
             return .doing
+        case "blocked" where isReviewPhaseBlocked:
+            return .review
         default:
             return .backlog
+        }
+    }
+
+    /// `true` when this task is blocked for a review-phase reason —
+    /// it has an open PR and the block is transient (conflict resolution
+    /// or CI fix in progress). These tasks render in Review, not Backlog.
+    var isReviewPhaseBlocked: Bool {
+        switch blockedReason {
+        case "merge_conflict", "ci_failure", "ci_failure_exhausted", "review_feedback":
+            return true
+        default:
+            return false
         }
     }
 }

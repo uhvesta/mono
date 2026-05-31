@@ -1,10 +1,14 @@
 import XCTest
 @testable import Boss
 
-/// Covers the "resolving conflicts" kanban lane rule:
-/// a `blocked: merge_conflict` task with an active (`pending` or `running`)
-/// conflict resolution routes to the Doing column for the duration of the
-/// worker run, then returns to Backlog when the attempt finishes.
+/// Covers the kanban lane rules for review-phase blocked tasks:
+///
+/// • `blocked: merge_conflict` / `ci_failure` / `ci_failure_exhausted` /
+///   `review_feedback` → **Review** column (task has an open PR; block is
+///   transient). Card shows the reason badge so the state is legible.
+/// • When an active resolution/remediation worker is running → **Doing**
+///   (the engine is actively touching it right now).
+/// • `blocked: dependency` or `blocked` with no reason → **Backlog**.
 ///
 /// Tests exercise both the `effectiveBoardColumn(for:)` routing helper and
 /// the `workItems(in:)` integration so the card container and the column
@@ -12,7 +16,7 @@ import XCTest
 @MainActor
 final class ConflictResolutionKanbanTests: XCTestCase {
 
-    // MARK: effectiveBoardColumn routing
+    // MARK: effectiveBoardColumn routing — active worker → Doing
 
     func testBlockedMergeConflictWithPendingResolutionRoutesToDoing() {
         let model = makeModel()
@@ -28,30 +32,52 @@ final class ConflictResolutionKanbanTests: XCTestCase {
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
     }
 
-    func testBlockedMergeConflictWithNoResolutionStaysInBacklog() {
+    // MARK: effectiveBoardColumn routing — no active worker → Review
+
+    func testBlockedMergeConflictWithNoResolutionRoutesToReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.conflictResolutions = []
-        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
-    func testBlockedMergeConflictWithSucceededResolutionStaysInBacklog() {
+    func testBlockedMergeConflictWithSucceededResolutionRoutesToReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "succeeded")]
-        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
 
-    func testBlockedMergeConflictWithFailedResolutionStaysInBacklog() {
+    func testBlockedMergeConflictWithFailedResolutionRoutesToReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "failed")]
-        XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
     }
+
+    func testBlockedCIFailureRoutesToReview() {
+        let model = makeModel()
+        let task = makeTask(blockedReason: "ci_failure", attemptID: nil)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
+    }
+
+    func testBlockedCIFailureExhaustedRoutesToReview() {
+        let model = makeModel()
+        let task = makeTask(blockedReason: "ci_failure_exhausted", attemptID: nil)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
+    }
+
+    func testBlockedReviewFeedbackRoutesToReview() {
+        let model = makeModel()
+        let task = makeTask(blockedReason: "review_feedback", attemptID: nil)
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .review)
+    }
+
+    // MARK: effectiveBoardColumn routing — non-review blocked → Backlog
 
     func testPlainBlockedRowStaysInBacklog() {
         let model = makeModel()
-        // blocked without a merge_conflict reason
+        // blocked without a reason
         let task = makeTask(blockedReason: nil, attemptID: nil)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog)
     }
@@ -109,19 +135,23 @@ final class ConflictResolutionKanbanTests: XCTestCase {
                        "task with active resolution must NOT appear in Backlog")
     }
 
-    func testTaskWithFinishedResolutionStaysInBacklog() {
+    func testTaskWithFinishedResolutionStaysInReview() {
         let model = makeModel()
         let task = makeTask(blockedReason: "merge_conflict", attemptID: "crz_1")
         model.choresByProductID = ["prod_test": [task]]
         model.conflictResolutions = [makeResolution(id: "crz_1", workItemID: task.id, status: "failed")]
 
-        let backlogItems = model.workItems(in: .backlog)
-        XCTAssertTrue(backlogItems.contains(where: { $0.id == task.id }),
-                      "task with finished resolution should be in Backlog")
+        let reviewItems = model.workItems(in: .review)
+        XCTAssertTrue(reviewItems.contains(where: { $0.id == task.id }),
+                      "task with finished resolution should be in Review (not Backlog)")
 
         let doingItems = model.workItems(in: .doing)
         XCTAssertFalse(doingItems.contains(where: { $0.id == task.id }),
                        "task with finished resolution must NOT be in Doing")
+
+        let backlogItems = model.workItems(in: .backlog)
+        XCTAssertFalse(backlogItems.contains(where: { $0.id == task.id }),
+                       "task with finished resolution must NOT be in Backlog")
     }
 
     // MARK: - Helpers
