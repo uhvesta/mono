@@ -444,7 +444,7 @@ struct ContentView: View {
                         )
                         WorkSidebarFilterRow(
                             title: project.name,
-                            subtitle: project.shortID.map { "P\($0)" },
+                            subtitle: project.shortID.map { "P" + String($0) },
                             systemImage: isArchived ? "archivebox" : "folder",
                             isSelected: isOn,
                             trailing: nil,
@@ -820,7 +820,7 @@ struct ContentView: View {
                 defaultExpanded: section.defaultExpanded,
                 shortIDLabel: section.projectID
                     .flatMap { model.project(withID: $0)?.shortID }
-                    .map { "P\($0)" }
+                    .map { "P" + String($0) }
             ) {
                 workSectionItems(section.items, column: column)
             }
@@ -834,7 +834,7 @@ struct ContentView: View {
                         if let projectID = section.projectID,
                            let project = model.project(withID: projectID),
                            let id = project.shortID {
-                            Text("P\(id)")
+                            Text("P" + String(id))
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundStyle(.secondary)
                         }
@@ -1197,7 +1197,7 @@ private struct ProjectFilterPopover: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
                         if let id = project.shortID {
-                            Text("P\(id)")
+                            Text("P" + String(id))
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundStyle(.secondary)
                         }
@@ -1527,7 +1527,7 @@ private struct WorkBoardCardItem: View {
                     Button("Copy ID") {
                         let pb = NSPasteboard.general
                         pb.clearContents()
-                        pb.setString("T\(id)", forType: .string)
+                        pb.setString("T" + String(id), forType: .string)
                     }
                 }
                 Button("View transcripts…") {
@@ -1869,10 +1869,10 @@ struct WorkBoardCardView: View {
                         }
                         Spacer(minLength: 0)
                         if let id = task.shortID {
-                            Text("T\(id)")
+                            Text("T" + String(id))
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundStyle(.secondary)
-                                .accessibilityLabel("T\(id)")
+                                .accessibilityLabel("T" + String(id))
                                 .lineLimit(1)
                                 .fixedSize(horizontal: true, vertical: false)
                         }
@@ -2374,10 +2374,10 @@ private struct WorkCardPopoverView: View {
                         Text(task.name)
                             .font(.title3.weight(.semibold))
                         if let id = task.shortID {
-                            Text("T\(id)")
+                            Text("T" + String(id))
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(.secondary)
-                                .accessibilityLabel("T\(id)")
+                                .accessibilityLabel("T" + String(id))
                         }
                     }
                     Text(task.kindLabel)
