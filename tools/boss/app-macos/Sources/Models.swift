@@ -887,6 +887,19 @@ enum WorkBlockedBadge {
         default: return reason.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
+
+    /// True when the "conflict cleared" badge may show: `cleared` is set
+    /// AND the task is not simultaneously displaying an active "Merge
+    /// Conflict" blocked badge. The two badges are mutually exclusive states
+    /// (T795 / T626 analogue): if engine state is contradictory or empty,
+    /// the card shows neither rather than both.
+    static func conflictClearedVisible(forTask task: WorkTask, cleared: Bool, isResolvingConflicts: Bool) -> Bool {
+        guard cleared else { return false }
+        let activeConflict = !isResolvingConflicts
+            && task.status == "blocked"
+            && task.blockedReason == "merge_conflict"
+        return !activeConflict
+    }
 }
 
 /// Canonical priority vocabulary shared by tasks, chores, and

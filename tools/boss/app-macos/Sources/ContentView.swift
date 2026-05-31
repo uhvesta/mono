@@ -1854,7 +1854,7 @@ struct WorkBoardCardView: View {
                                 }
                         }
                         if !stacksStatusBadges {
-                            if showsConflictClearedBadge {
+                            if conflictClearedBadgeVisible {
                                 ConflictClearedBadge()
                             }
                             if showsCIAutoFixedBadge && ciFailureBadge == nil {
@@ -1932,7 +1932,7 @@ struct WorkBoardCardView: View {
                     }
                     if stacksStatusBadges {
                         HStack(spacing: 6) {
-                            if showsConflictClearedBadge {
+                            if conflictClearedBadgeVisible {
                                 ConflictClearedBadge()
                             }
                             if showsCIAutoFixedBadge && ciFailureBadge == nil {
@@ -2019,10 +2019,22 @@ struct WorkBoardCardView: View {
         true
     }
 
+    /// True when the "conflict cleared" badge may render: the cleared flag
+    /// is set AND no active "Merge Conflict" badge is showing. Enforces
+    /// the T795 mutual-exclusion invariant — the two states must never
+    /// co-render. Delegates to [[WorkBlockedBadge.conflictClearedVisible]].
+    private var conflictClearedBadgeVisible: Bool {
+        WorkBlockedBadge.conflictClearedVisible(
+            forTask: task,
+            cleared: showsConflictClearedBadge,
+            isResolvingConflicts: isResolvingConflicts
+        )
+    }
+
     /// Number of transient status badges (conflict cleared, ci auto-fixed,
     /// ci failure) that are currently visible on this card.
     private var statusBadgeCount: Int {
-        (showsConflictClearedBadge ? 1 : 0)
+        (conflictClearedBadgeVisible ? 1 : 0)
         + (showsCIAutoFixedBadge && ciFailureBadge == nil ? 1 : 0)
         + (ciFailureBadge != nil && !isRemediatingCI ? 1 : 0)
     }
