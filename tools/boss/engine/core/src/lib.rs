@@ -5,6 +5,7 @@ pub mod audit;
 pub mod audit_effort;
 pub mod automation_schedule;
 pub mod automation_scheduler;
+pub mod blocking_signal;
 pub mod build_info;
 pub mod ci_log_reader;
 pub mod ci_watch;
