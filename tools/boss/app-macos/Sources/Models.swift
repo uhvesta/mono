@@ -815,6 +815,11 @@ struct WorkTask: Identifiable, Hashable {
     /// rows or items where the engine emitted `null`). Mirrors
     /// `Task.effort_level` on the wire; absent means unset, NOT medium.
     var effortLevel: String? = nil
+    /// Non-null when this task was produced by an automation triage run.
+    /// Mirrors `Task.source_automation_id` on the wire. Used to exclude
+    /// automation-sourced tasks from the normal backlog/kanban view and
+    /// to route their execution to the automations pool.
+    var sourceAutomationId: String? = nil
 
     var isChore: Bool {
         kind == "chore"

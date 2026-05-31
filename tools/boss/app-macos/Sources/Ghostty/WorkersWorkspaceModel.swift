@@ -5,13 +5,24 @@ import GhosttyKit
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
     static let workerSlotCount = 8
+    /// Automation pool occupies slot IDs immediately above the main pool.
+    static let automationSlotCount = 3
+    static let automationSlotBase = workerSlotCount + 1   // 9
+    static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 9...11
 
     let runtime: GhosttyRuntime
     @Published private(set) var slots: [WorkerSlot]
+    /// Automation-pool slots. These are always idle until the engine wires
+    /// up automation pane spawning; the pool-switcher UI shows them so the
+    /// 3-slot grid is visible before any automation worker runs.
+    @Published private(set) var automationSlots: [WorkerSlot]
 
     init() {
         self.runtime = GhosttyRuntime.shared
         self.slots = (1...Self.workerSlotCount).map { slot in
+            WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
+        }
+        self.automationSlots = (Self.automationSlotBase...(Self.automationSlotBase + Self.automationSlotCount - 1)).map { slot in
             WorkerSlot(slotId: slot, idleFlavorCycle: Int.random(in: 0...10_000))
         }
     }
@@ -21,27 +32,33 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// truth for slot allocation: this method honors the requested
     /// slot or fails — it never picks a different slot.
     ///
+    /// Main-pool slots occupy 1...\(workerSlotCount); automation-pool
+    /// slots occupy \(automationSlotBase)...\(automationSlotBase + automationSlotCount - 1).
+    ///
     /// Returns:
-    ///  - `.failure(.internalFailure)` if `slotId` is outside
-    ///    `1...workerSlotCount` (engine asked for a slot that
-    ///    doesn't exist on this app).
+    ///  - `.failure(.internalFailure)` if `slotId` is outside the known
+    ///    ranges (engine asked for a slot that doesn't exist on this app).
     ///  - `.failure(.slotBusy)` if the requested slot already hosts
     ///    a session (engine and app disagree about what's free —
     ///    the engine should reconcile rather than retry blindly).
     func spawnWorkerPane(_ request: EngineSpawnRequest) -> EngineSpawnResult {
         let requestedSlot = request.slotId
-        guard requestedSlot >= 1, requestedSlot <= Self.workerSlotCount,
-              let index = slots.firstIndex(where: { $0.slotId == requestedSlot })
+        let isAutomation = Self.automationSlotRange.contains(Int(requestedSlot))
+        let targetSlots: [WorkerSlot] = isAutomation ? automationSlots : slots
+        guard requestedSlot >= 1,
+              (requestedSlot <= Self.workerSlotCount || isAutomation),
+              let index = targetSlots.firstIndex(where: { $0.slotId == Int(requestedSlot) })
         else {
+            let validRanges = "1...\(Self.workerSlotCount) or \(Self.automationSlotBase)...\(Self.automationSlotBase + Self.automationSlotCount - 1)"
             return .failure(.internalFailure(
-                "engine requested slot \(requestedSlot), valid range is 1...\(Self.workerSlotCount)"
+                "engine requested slot \(requestedSlot), valid ranges are \(validRanges)"
             ))
         }
-        guard slots[index].session == nil else {
+        guard targetSlots[index].session == nil else {
             return .failure(.slotBusy)
         }
 
-        let slotId = slots[index].slotId
+        let slotId = isAutomation ? automationSlots[index].slotId : slots[index].slotId
         let launchSpec = TerminalLaunchSpec(
             fontSize: 10.0,
             workingDirectory: request.workspacePath,
@@ -53,10 +70,17 @@ final class WorkersWorkspaceModel: ObservableObject {
             role: .worker(slot: slotId),
             launchSpec: launchSpec
         )
-        slots[index].session = session
-        slots[index].runId = request.runId
-        slots[index].summary = request.summary
-        slots[index].taskTitle = request.taskTitle
+        if isAutomation {
+            automationSlots[index].session = session
+            automationSlots[index].runId = request.runId
+            automationSlots[index].summary = request.summary
+            automationSlots[index].taskTitle = request.taskTitle
+        } else {
+            slots[index].session = session
+            slots[index].runId = request.runId
+            slots[index].summary = request.summary
+            slots[index].taskTitle = request.taskTitle
+        }
 
         // TODO: use proc_listpids(PROC_PPID_ONLY, ...)
         // right after surface init to find the shell pid. For now
@@ -95,23 +119,30 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// default, which would itself blow the engine's 5s round-trip
     /// budget).
     func releaseWorkerPane(slotId: Int, killGraceSeconds: UInt32) -> EngineReleaseResult {
-        guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
+        let isAutomation = Self.automationSlotRange.contains(slotId)
+        var targetSlots = isAutomation ? automationSlots : slots
+        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }
-        guard let session = slots[index].session else {
+        guard let session = targetSlots[index].session else {
             return .failure(.unknownSlot)
         }
 
         let foregroundPid = foregroundPid(for: session)
 
-        slots[index].session = nil
-        slots[index].runId = nil
-        slots[index].summary = nil
-        slots[index].taskTitle = nil
+        targetSlots[index].session = nil
+        targetSlots[index].runId = nil
+        targetSlots[index].summary = nil
+        targetSlots[index].taskTitle = nil
         // Re-roll the idle flavor so consecutive idle bouts on the same
         // slot don't show the same line — fresh recreation each time
         // the crew member clocks out.
-        slots[index].idleFlavorCycle &+= 1
+        targetSlots[index].idleFlavorCycle &+= 1
+        if isAutomation {
+            automationSlots = targetSlots
+        } else {
+            slots = targetSlots
+        }
 
         if let pid = foregroundPid {
             Task.detached(priority: .userInitiated) {
@@ -152,10 +183,11 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// land the prompt: libghostty's paste path delivers control
     /// characters as input-field content, not as a keystroke.
     func sendToPane(slotId: Int, text: String) -> EngineSendResult {
-        guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
+        let targetSlots = Self.automationSlotRange.contains(slotId) ? automationSlots : slots
+        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }
-        guard let session = slots[index].session else {
+        guard let session = targetSlots[index].session else {
             return .failure(.unknownSlot)
         }
         guard let host = session.hostView else {
@@ -172,10 +204,11 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// the window is visible if it was minimised or behind another
     /// app. Used by `bossctl agents focus`.
     func focusWorkerPane(slotId: Int) -> EngineFocusResult {
-        guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
+        let targetSlots = Self.automationSlotRange.contains(slotId) ? automationSlots : slots
+        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }
-        guard let session = slots[index].session else {
+        guard let session = targetSlots[index].session else {
             return .failure(.unknownSlot)
         }
         guard let host = session.hostView else {
@@ -205,10 +238,11 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// as an in-flight-turn cancel). Used by `bossctl agents
     /// interrupt`.
     func interruptWorkerPane(slotId: Int) -> EngineInterruptResult {
-        guard let index = slots.firstIndex(where: { $0.slotId == slotId }) else {
+        let targetSlots = Self.automationSlotRange.contains(slotId) ? automationSlots : slots
+        guard let index = targetSlots.firstIndex(where: { $0.slotId == slotId }) else {
             return .failure(.unknownSlot)
         }
-        guard let session = slots[index].session else {
+        guard let session = targetSlots[index].session else {
             return .failure(.unknownSlot)
         }
         guard let host = session.hostView else {

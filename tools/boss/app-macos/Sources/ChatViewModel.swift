@@ -658,6 +658,11 @@ final class ChatViewModel: ObservableObject {
             items.append(contentsOf: (productLevelRevisionsByProductID[productID] ?? []).sorted(by: taskSort))
         }
 
+        // Automation-sourced tasks are managed exclusively through the
+        // Automations tab. They must not appear in the normal kanban/backlog
+        // so the main board stays focused on human-filed work.
+        items = items.filter { $0.sourceAutomationId == nil }
+
         if showBlockedOnly {
             items = items.filter { $0.status == "blocked" }
         }

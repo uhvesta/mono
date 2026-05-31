@@ -1672,7 +1672,8 @@ final class EngineClient: @unchecked Sendable {
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,
             revisionParentPrUrl: payload["revision_parent_pr_url"] as? String,
             hasInProgressRevision: (payload["has_in_progress_revision"] as? Bool) ?? false,
-            effortLevel: payload["effort_level"] as? String
+            effortLevel: payload["effort_level"] as? String,
+            sourceAutomationId: payload["source_automation_id"] as? String
         )
     }
 

@@ -1,6 +1,21 @@
 import AppKit
 import SwiftUI
 
+/// Which worker pool the Agents tab is currently displaying.
+enum AgentPoolKind: String, CaseIterable, Identifiable {
+    case main
+    case automations
+
+    var id: String { rawValue }
+
+    func label(mainCount: Int, automationCount: Int) -> String {
+        switch self {
+        case .main: return "Main (\(mainCount))"
+        case .automations: return "Automations (\(automationCount))"
+        }
+    }
+}
+
 struct WorkersDetailView: View {
     @ObservedObject var workspace: WorkersWorkspaceModel
     @ObservedObject var liveStates: LiveWorkerStateStore
@@ -10,15 +25,40 @@ struct WorkersDetailView: View {
     /// `ChatViewModel`'s state.
     @ObservedObject var liveStatusModel: ChatViewModel
 
+    @State private var selectedPool: AgentPoolKind = .main
+
     var body: some View {
-        WorkerGrid(
-            runtime: workspace.runtime,
-            slots: workspace.slots,
-            liveStates: liveStates,
-            liveStatusModel: liveStatusModel
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 0) {
+            poolPickerHeader
+            Divider()
+            WorkerGrid(
+                runtime: workspace.runtime,
+                slots: selectedPool == .main ? workspace.slots : workspace.automationSlots,
+                liveStates: liveStates,
+                liveStatusModel: liveStatusModel
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
         .background(Color(nsColor: .separatorColor))
+    }
+
+    private var poolPickerHeader: some View {
+        HStack {
+            Picker("Pool", selection: $selectedPool) {
+                ForEach(AgentPoolKind.allCases) { pool in
+                    Text(pool.label(
+                        mainCount: WorkersWorkspaceModel.workerSlotCount,
+                        automationCount: WorkersWorkspaceModel.automationSlotCount
+                    )).tag(pool)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 280)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
@@ -226,7 +266,7 @@ private struct WorkerSlotView: View {
     /// or summarization failed, the engine sends the raw task title
     /// and this renders as `"<Name>: <title>"` (e.g. "Crusher:
     /// kanban: revision cards render broken") — grammatically correct
-    /// and clearly identifying the task without the gerund connector.
+    /// and identifying the task without the gerund connector.
     @ViewBuilder
     private var slotTaskLine: some View {
         let name = WorkerNames.name(forSlot: slot.slotId)
