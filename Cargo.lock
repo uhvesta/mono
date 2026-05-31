@@ -252,6 +252,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-editorial"
+version = "0.1.0"
+dependencies = [
+ "boss-protocol",
+ "regex",
+]
+
+[[package]]
 name = "boss-engine"
 version = "0.1.0"
 dependencies = [
@@ -260,6 +268,7 @@ dependencies = [
  "bon",
  "boss-client",
  "boss-conflict-diagnosis",
+ "boss-editorial",
  "boss-feature-flags",
  "boss-protocol",
  "boss-ssh-transport",

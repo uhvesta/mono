@@ -1,0 +1,9 @@
+[package]
+name = "boss-editorial"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+boss-protocol = { path = "../../protocol" }
+regex = { workspace = true }

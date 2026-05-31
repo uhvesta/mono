@@ -9,6 +9,7 @@ boss-transcript-markdown = { path = "boss-transcript-markdown" }
 async-trait = { workspace = true }
 bon = { workspace = true }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+boss-editorial = { path = "../editorial" }
 boss-feature-flags = { path = "../feature-flags" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
