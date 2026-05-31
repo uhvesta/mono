@@ -45,6 +45,10 @@ impl WorkDb {
         &self.path
     }
 
+    pub fn is_in_memory(&self) -> bool {
+        self.memory.is_some()
+    }
+
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(

@@ -2618,6 +2618,26 @@ pub async fn serve(
         }
     }
 
+    // Spawn the database backup loop. Fires immediately on boot (startup
+    // snapshot) and then every `backup_interval` (default: 1 hour).
+    // Uses SQLite's VACUUM INTO for a crash-safe, WAL-compatible copy.
+    // Interval and retention count are configurable via env vars; safe
+    // defaults apply when they are not set. In-memory databases (tests)
+    // are silently skipped.
+    let db_backup_state_root: PathBuf = cfg
+        .work
+        .db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cfg.work.cwd.clone());
+    let _db_backup_handle = crate::database_backup::spawn_loop(
+        server_state.work_db.clone(),
+        crate::database_backup::default_backup_dir(&db_backup_state_root),
+        crate::database_backup::backup_interval(),
+        crate::database_backup::retention_count(),
+    );
+
     // Spawn the merge-detection poller. Workers can land their PRs
     // long after their Stop event has fired (and lease has been
     // released), so the on-Stop completion path can't catch every
