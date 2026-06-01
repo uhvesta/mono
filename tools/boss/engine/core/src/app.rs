@@ -40,8 +40,8 @@ use crate::external_tracker::github_oauth::{
 };
 use crate::repo_slug;
 use crate::work::{
-    ActionedAttentionGroup, DuplicateTaskError, GhPrStateChecker, SetRunTranscriptPathOutcome,
-    Task, WorkDb, WorkItem,
+    ActionedAttentionGroup, COMMENT_STATUS_DISPATCHED, CreateChoreInput, DuplicateTaskError,
+    GhPrStateChecker, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -8259,148 +8259,333 @@ async fn handle_frontend_connection(
                     }
                 };
 
-                if comment.artifact_kind != "work_item" {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "magic-wand dispatch only supports artifact_kind = 'work_item' \
-                                 (Phase 3); got '{}'",
-                                comment.artifact_kind
-                            ),
-                        },
-                    );
-                    continue;
-                }
+                match comment.artifact_kind.as_str() {
+                    "work_item" => {
+                        // Phase 3: engine-owned doc → specialised, isolated Claude instance.
 
-                // Fetch the work-item description (the doc text).
-                let doc_text = match work_db.get_work_item(&comment.artifact_id) {
-                    Ok(item) => {
-                        use boss_protocol::WorkItem;
-                        match item {
-                            WorkItem::Task(t) | WorkItem::Chore(t) => t.description,
-                            _ => {
+                        // Fetch the work-item description (the doc text).
+                        let doc_text = match work_db.get_work_item(&comment.artifact_id) {
+                            Ok(item) => {
+                                use boss_protocol::WorkItem;
+                                match item {
+                                    WorkItem::Task(t) | WorkItem::Chore(t) => t.description,
+                                    _ => {
+                                        send_response(
+                                            &sink,
+                                            &request_id,
+                                            FrontendEvent::WorkError {
+                                                message: format!(
+                                                    "magic-wand dispatch: work item '{}' is not a \
+                                                     Task/Chore",
+                                                    comment.artifact_id
+                                                ),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::WorkError {
+                                        message: err.to_string(),
+                                    },
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Create the dispatch row (status = in_flight).
+                        let dispatch = match work_db.create_magic_wand_dispatch(
+                            &comment_id,
+                            &comment.artifact_kind,
+                            &comment.artifact_id,
+                            &comment.doc_version,
+                        ) {
+                            Ok(d) => d,
+                            Err(err) => {
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::WorkError {
+                                        message: err.to_string(),
+                                    },
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Reply immediately so the macOS app can subscribe to the dispatch topic.
+                        let dispatch_id = dispatch.id.clone();
+                        let anchor_exact = comment.anchor.exact.clone();
+                        let comment_body = comment.body.clone();
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::MagicWandDispatched { dispatch: dispatch.clone() },
+                        );
+
+                        // Spawn the async Claude call.
+                        let work_db2 = work_db.clone();
+                        let server_state2 = server_state.clone();
+                        tokio::spawn(async move {
+                            let topic = magic_wand_dispatch_topic(&dispatch_id);
+                            let result = crate::magic_wand::dispatch(
+                                &doc_text,
+                                &anchor_exact,
+                                &comment_body,
+                            )
+                            .await;
+                            let final_dispatch = match result {
+                                Ok(mw) => {
+                                    match work_db2.complete_magic_wand_dispatch(
+                                        &dispatch_id,
+                                        "returned",
+                                        Some(&mw.result_md),
+                                        None,
+                                        Some(mw.input_tokens),
+                                        Some(mw.output_tokens),
+                                        mw.anchor_warning,
+                                    ) {
+                                        Ok(d) => d,
+                                        Err(err) => {
+                                            tracing::error!(
+                                                dispatch_id = %dispatch_id,
+                                                err = %err,
+                                                "failed to record magic_wand returned status",
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    let (error_msg, error_kind) = err;
+                                    tracing::warn!(
+                                        dispatch_id = %dispatch_id,
+                                        error_kind = %error_kind,
+                                        error = %error_msg,
+                                        "magic_wand dispatch failed",
+                                    );
+                                    match work_db2.complete_magic_wand_dispatch(
+                                        &dispatch_id,
+                                        "failed",
+                                        None,
+                                        Some(error_kind),
+                                        None,
+                                        None,
+                                        false,
+                                    ) {
+                                        Ok(d) => d,
+                                        Err(db_err) => {
+                                            tracing::error!(
+                                                dispatch_id = %dispatch_id,
+                                                err = %db_err,
+                                                "failed to record magic_wand failed status",
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                            };
+                            let envelope =
+                                FrontendEventEnvelope::push(FrontendEvent::MagicWandResult {
+                                    dispatch: final_dispatch,
+                                });
+                            server_state2.topic_broker.publish(&topic, envelope).await;
+                        });
+                    }
+
+                    "pr_doc" => {
+                        // Phase 4: PR-backed doc → Boss chore worker.
+                        // Parse the artifact_id: "pr_doc:<repo_remote_url>:<branch>:<path>".
+                        // repo_remote_url may itself contain ':' (SSH git@ URLs), so we
+                        // split from the right into exactly 3 parts (path, branch, repo).
+                        let artifact_id = &comment.artifact_id;
+                        let suffix = artifact_id.strip_prefix("pr_doc:").unwrap_or("");
+                        let parts: Vec<&str> = suffix.rsplitn(3, ':').collect();
+                        if parts.len() != 3 {
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::WorkError {
+                                    message: format!(
+                                        "magic-wand: malformed pr_doc artifact_id '{artifact_id}'; \
+                                         expected 'pr_doc:<repo>:<branch>:<path>'"
+                                    ),
+                                },
+                            );
+                            continue;
+                        }
+                        let (pr_path, pr_branch, pr_repo) =
+                            (parts[0], parts[1], parts[2]);
+
+                        // Find the product that owns this repo.
+                        let product_id = match work_db
+                            .find_product_id_by_repo_remote_url(pr_repo)
+                        {
+                            Ok(Some(id)) => id,
+                            Ok(None) => {
                                 send_response(
                                     &sink,
                                     &request_id,
                                     FrontendEvent::WorkError {
                                         message: format!(
-                                            "magic-wand dispatch: work item '{}' is not a \
-                                             Task/Chore",
-                                            comment.artifact_id
+                                            "magic-wand: no product found for repo '{pr_repo}'; \
+                                             cannot spawn chore"
                                         ),
                                     },
                                 );
                                 continue;
                             }
-                        }
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-
-                // Create the dispatch row (status = in_flight).
-                let dispatch = match work_db.create_magic_wand_dispatch(
-                    &comment_id,
-                    &comment.artifact_kind,
-                    &comment.artifact_id,
-                    &comment.doc_version,
-                ) {
-                    Ok(d) => d,
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-
-                // Reply immediately so the macOS app can subscribe to the dispatch topic.
-                let dispatch_id = dispatch.id.clone();
-                let anchor_exact = comment.anchor.exact.clone();
-                let comment_body = comment.body.clone();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::MagicWandDispatched { dispatch: dispatch.clone() },
-                );
-
-                // Spawn the async Claude call.
-                let work_db2 = work_db.clone();
-                let server_state2 = server_state.clone();
-                tokio::spawn(async move {
-                    let topic = magic_wand_dispatch_topic(&dispatch_id);
-                    let result =
-                        crate::magic_wand::dispatch(&doc_text, &anchor_exact, &comment_body).await;
-                    let final_dispatch = match result {
-                        Ok(mw) => {
-                            match work_db2.complete_magic_wand_dispatch(
-                                &dispatch_id,
-                                "returned",
-                                Some(&mw.result_md),
-                                None,
-                                Some(mw.input_tokens),
-                                Some(mw.output_tokens),
-                                mw.anchor_warning,
-                            ) {
-                                Ok(d) => d,
-                                Err(err) => {
-                                    tracing::error!(
-                                        dispatch_id = %dispatch_id,
-                                        err = %err,
-                                        "failed to record magic_wand returned status",
-                                    );
-                                    return;
-                                }
+                            Err(err) => {
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::WorkError {
+                                        message: err.to_string(),
+                                    },
+                                );
+                                continue;
                             }
-                        }
-                        Err(err) => {
-                            let (error_msg, error_kind) = err;
-                            tracing::warn!(
-                                dispatch_id = %dispatch_id,
-                                error_kind = %error_kind,
-                                error = %error_msg,
-                                "magic_wand dispatch failed",
+                        };
+
+                        // Build the chore title: truncate the anchor quote to 60 chars.
+                        let short_quote = if comment.anchor.exact.len() > 60 {
+                            format!("{}…", &comment.anchor.exact[..60])
+                        } else {
+                            comment.anchor.exact.clone()
+                        };
+                        let chore_name =
+                            format!("Address comment on `{pr_path}`: `{short_quote}`");
+
+                        // Build the chore description (worker reads this as the directive).
+                        let chore_description = format!(
+                            "A reviewer left a comment on this PR's design doc.\n\n\
+                             File: {pr_path}\n\
+                             Branch: {pr_branch}\n\n\
+                             Quoted section:\n\
+                             > {anchor}\n\n\
+                             Comment:\n\
+                             > {body}\n\n\
+                             Please update the file accordingly and push to the existing PR \
+                             branch. Do not open a new PR; this branch already has one. \
+                             Use `git checkout {pr_branch}` (or `jj edit`) to land on the \
+                             branch before editing.",
+                            anchor = comment.anchor.exact,
+                            body = comment.body,
+                        );
+
+                        // Create the chore via the standard path.
+                        // `repo_remote_url` is inherited from the product
+                        // (which was resolved by `find_product_id_by_repo_remote_url`),
+                        // so we don't need to set it again here.
+                        let chore = match work_db.create_chore(CreateChoreInput {
+                            product_id: product_id.clone(),
+                            name: chore_name,
+                            description: Some(chore_description),
+                            autostart: true,
+                            priority: None,
+                            created_via: Some(format!(
+                                "comment_dispatch:{comment_id}"
+                            )),
+                            repo_remote_url: None,
+                            effort_level: None,
+                            model_override: None,
+                            force_duplicate: false,
+                        }) {
+                            Ok(c) => c,
+                            Err(err) => {
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::WorkError {
+                                        message: format!(
+                                            "magic-wand: failed to create chore: {err}"
+                                        ),
+                                    },
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Create the dispatch row (status = chore_created).
+                        let dispatch = match work_db.create_pr_backed_magic_wand_dispatch(
+                            &comment_id,
+                            &comment.artifact_kind,
+                            &comment.artifact_id,
+                            &comment.doc_version,
+                            &chore.id,
+                        ) {
+                            Ok(d) => d,
+                            Err(err) => {
+                                send_response(
+                                    &sink,
+                                    &request_id,
+                                    FrontendEvent::WorkError {
+                                        message: err.to_string(),
+                                    },
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Transition the comment to `dispatched`.
+                        let actor = format!("comment_dispatch:{comment_id}");
+                        if let Err(err) = work_db.set_comment_status(
+                            &comment_id,
+                            COMMENT_STATUS_DISPATCHED,
+                            Some(actor.as_str()),
+                        ) {
+                            tracing::error!(
+                                comment_id = %comment_id,
+                                chore_id = %chore.id,
+                                err = %err,
+                                "magic-wand: failed to transition comment to dispatched",
                             );
-                            match work_db2.complete_magic_wand_dispatch(
-                                &dispatch_id,
-                                "failed",
-                                None,
-                                Some(error_kind),
-                                None,
-                                None,
-                                false,
-                            ) {
-                                Ok(d) => d,
-                                Err(db_err) => {
-                                    tracing::error!(
-                                        dispatch_id = %dispatch_id,
-                                        err = %db_err,
-                                        "failed to record magic_wand failed status",
-                                    );
-                                    return;
-                                }
-                            }
                         }
-                    };
-                    let envelope = FrontendEventEnvelope::push(FrontendEvent::MagicWandResult {
-                        dispatch: final_dispatch,
-                    });
-                    server_state2.topic_broker.publish(&topic, envelope).await;
-                });
+
+                        // Publish work invalidation so the kanban sees the new chore.
+                        publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&product_id)],
+                            "comment_dispatch_chore_created",
+                            Some(product_id),
+                            vec![chore.id.clone()],
+                        )
+                        .await;
+
+                        tracing::info!(
+                            comment_id = %comment_id,
+                            chore_id = %chore.id,
+                            pr_repo = %pr_repo,
+                            pr_branch = %pr_branch,
+                            pr_path = %pr_path,
+                            "magic-wand: spawned chore for PR-backed doc comment",
+                        );
+
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::MagicWandDispatched { dispatch },
+                        );
+                    }
+
+                    other => {
+                        send_response(
+                            &sink,
+                            &request_id,
+                            FrontendEvent::WorkError {
+                                message: format!(
+                                    "magic-wand dispatch: unsupported artifact_kind '{other}'"
+                                ),
+                            },
+                        );
+                    }
+                }
             }
 
             FrontendRequest::CommentsApplyMagicWand {

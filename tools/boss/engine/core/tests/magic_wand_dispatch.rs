@@ -1,7 +1,7 @@
-//! Integration test: drive the Phase-3 magic-wand RPCs through the wire
-//! layer, verifying the dispatch/apply/discard/conflict flows against an
-//! in-process engine. Mirrors the test harness in `comments_crud.rs`.
-//! Design: tools/boss/docs/designs/comments-in-markdown-viewer.md § Phase 3.
+//! Integration test: drive the Phase-3 and Phase-4 magic-wand RPCs through
+//! the wire layer, verifying the dispatch/apply/discard/conflict flows
+//! against an in-process engine. Mirrors the test harness in `comments_crud.rs`.
+//! Design: tools/boss/docs/designs/comments-in-markdown-viewer.md §§ Phase 3, 4.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,8 +12,8 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    CommentAnchor, CreateCommentInput, FrontendEvent, FrontendRequest,
-    WorkComment,
+    COMMENT_STATUS_DISPATCHED, CommentAnchor, CreateCommentInput, CreateProductInput,
+    FrontendEvent, FrontendRequest, MAGIC_WAND_STATUS_CHORE_CREATED, WorkComment, WorkItem,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -222,6 +222,304 @@ async fn magic_wand_apply_unknown_id_returns_error() -> Result<()> {
         other => {
             panic!(
                 "expected WorkError for unknown dispatch, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ── Phase-4: PR-backed doc → Boss chore worker ────────────────────────────────
+
+async fn create_product_with_repo(
+    client: &mut BossClient,
+    repo_url: &str,
+) -> Result<boss_protocol::WorkItem> {
+    match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput {
+                name: "Test Product".to_owned(),
+                description: None,
+                repo_remote_url: Some(repo_url.to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated { item } => Ok(item),
+        other => Err(anyhow!(
+            "expected WorkItemCreated, got: {}",
+            serde_json::to_string(&other).unwrap_or_default()
+        )),
+    }
+}
+
+/// Phase 4 acceptance test: magic-wand on a `pr_doc` comment against an
+/// artifact whose repo is owned by a known product → spawns a chore worker,
+/// records a `chore_created` dispatch row, and transitions the comment to
+/// `dispatched`. Verifies the audit link (dispatch.chore_id == chore.id).
+#[tokio::test]
+async fn magic_wand_pr_doc_creates_chore_and_dispatches_comment() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // The repo URL must match a product so the engine can resolve product_id.
+    let repo_url = "https://github.com/test-org/test-repo.git";
+    let product = create_product_with_repo(&mut client, repo_url).await?;
+    let product_id = match &product {
+        WorkItem::Product(p) => p.id.clone(),
+        other => return Err(anyhow!("expected Product, got: {other:?}")),
+    };
+    assert!(!product_id.is_empty());
+
+    // Create a comment against a pr_doc artifact on that repo.
+    let branch = "boss/exec_test_phase4_a0";
+    let path = "tools/boss/docs/designs/some-design.md";
+    let artifact_id = format!("pr_doc:{repo_url}:{branch}:{path}");
+    let comment = match client
+        .send_request(&FrontendRequest::CommentsCreate {
+            input: CreateCommentInput {
+                artifact_kind: "pr_doc".to_owned(),
+                artifact_id: artifact_id.clone(),
+                doc_version: "v0".to_owned(),
+                anchor: CommentAnchor {
+                    exact: "the section that needs editing".to_owned(),
+                    prefix: "Before text. ".to_owned(),
+                    suffix: " After text.".to_owned(),
+                },
+                body: "Please clarify this paragraph with a concrete example.".to_owned(),
+                author: "user:test@example.com".to_owned(),
+                plain_text_projection_version: 1,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::CommentResult { comment } => comment,
+        other => {
+            return Err(anyhow!(
+                "expected CommentResult, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            ));
+        }
+    };
+    assert_eq!(comment.status, "active");
+
+    // Dispatch the magic wand.
+    let dispatch_event = client
+        .send_request(&FrontendRequest::CommentsDispatchMagicWand {
+            comment_id: comment.id.clone(),
+        })
+        .await?;
+
+    let dispatch = match dispatch_event {
+        FrontendEvent::MagicWandDispatched { dispatch } => dispatch,
+        FrontendEvent::WorkError { message } => {
+            return Err(anyhow!("unexpected WorkError from magic-wand dispatch: {message}"));
+        }
+        other => {
+            return Err(anyhow!(
+                "expected MagicWandDispatched, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            ));
+        }
+    };
+
+    // The dispatch row must be `chore_created` with a non-null chore_id.
+    assert_eq!(
+        dispatch.status,
+        MAGIC_WAND_STATUS_CHORE_CREATED,
+        "dispatch status should be chore_created"
+    );
+    let chore_id = dispatch
+        .chore_id
+        .clone()
+        .expect("dispatch.chore_id must be set for pr_doc path");
+    assert!(!chore_id.is_empty(), "chore_id must be non-empty");
+    assert_eq!(dispatch.comment_id, comment.id);
+    assert_eq!(dispatch.artifact_kind, "pr_doc");
+    assert_eq!(dispatch.artifact_id, artifact_id);
+    // No Claude result for chore-backed dispatch.
+    assert!(dispatch.result_md.is_none());
+    assert!(dispatch.error_kind.is_none());
+
+    // The comment must have transitioned to `dispatched`.
+    // Use CommentsList (include_resolved=true to see non-active statuses).
+    let list_event = client
+        .send_request(&FrontendRequest::CommentsList {
+            artifact_kind: "pr_doc".to_owned(),
+            artifact_id: artifact_id.clone(),
+            include_resolved: true,
+        })
+        .await?;
+    let comments: Vec<WorkComment> = match list_event {
+        FrontendEvent::CommentsList { comments, .. } => comments,
+        other => {
+            return Err(anyhow!(
+                "expected CommentsList, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            ));
+        }
+    };
+    let updated_comment = comments
+        .iter()
+        .find(|c| c.id == comment.id)
+        .ok_or_else(|| anyhow!("comment not found in list"))?;
+    assert_eq!(
+        updated_comment.status,
+        COMMENT_STATUS_DISPATCHED,
+        "comment status should be dispatched after magic-wand"
+    );
+
+    // The spawned chore must exist and carry the right shape.
+    let chore_event = client
+        .send_request(&FrontendRequest::GetWorkItem { id: chore_id.clone() })
+        .await?;
+    let chore_task = match chore_event {
+        FrontendEvent::WorkItemResult { item: WorkItem::Chore(t) } => t,
+        other => {
+            return Err(anyhow!(
+                "expected Chore WorkItemResult, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            ));
+        }
+    };
+    assert_eq!(chore_task.product_id, product_id);
+    assert_eq!(
+        chore_task.created_via,
+        format!("comment_dispatch:{}", comment.id)
+    );
+    // repo_remote_url on the chore is None — it's inherited from the product.
+    assert!(chore_task.repo_remote_url.is_none());
+    // The chore description must mention the branch and the comment body.
+    let desc = chore_task.description;
+    assert!(
+        desc.contains(branch),
+        "chore description must mention branch {branch}"
+    );
+    assert!(
+        desc.contains("Please clarify this paragraph with a concrete example."),
+        "chore description must include the comment body"
+    );
+    assert!(
+        desc.contains("the section that needs editing"),
+        "chore description must include the anchor quote"
+    );
+
+    Ok(())
+}
+
+/// Verify that dispatching against a `pr_doc` artifact whose repo is NOT
+/// owned by any product returns a `WorkError`.
+#[tokio::test]
+async fn magic_wand_pr_doc_unknown_repo_returns_error() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    // No product created → no matching repo.
+    let artifact_id =
+        "pr_doc:https://github.com/nobody/nowhere.git:boss/exec_x_a0:design.md".to_owned();
+    let comment = match client
+        .send_request(&FrontendRequest::CommentsCreate {
+            input: CreateCommentInput {
+                artifact_kind: "pr_doc".to_owned(),
+                artifact_id,
+                doc_version: "v0".to_owned(),
+                anchor: CommentAnchor {
+                    exact: "span".to_owned(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                body: "fix this".to_owned(),
+                author: "user:test@example.com".to_owned(),
+                plain_text_projection_version: 1,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::CommentResult { comment } => comment,
+        other => {
+            return Err(anyhow!(
+                "expected CommentResult, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            ));
+        }
+    };
+
+    let event = client
+        .send_request(&FrontendRequest::CommentsDispatchMagicWand {
+            comment_id: comment.id.clone(),
+        })
+        .await?;
+    match event {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("no product"),
+                "expected error about missing product, got: {message}"
+            );
+        }
+        other => {
+            panic!(
+                "expected WorkError for unknown repo, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify that dispatching against an unsupported `artifact_kind` returns a
+/// `WorkError` with a clear message.
+#[tokio::test]
+async fn magic_wand_unsupported_artifact_kind_returns_error() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let comment = match client
+        .send_request(&FrontendRequest::CommentsCreate {
+            input: CreateCommentInput {
+                artifact_kind: "unknown_kind".to_owned(),
+                artifact_id: "some_id".to_owned(),
+                doc_version: "v0".to_owned(),
+                anchor: CommentAnchor {
+                    exact: "span".to_owned(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                body: "fix this".to_owned(),
+                author: "user:test@example.com".to_owned(),
+                plain_text_projection_version: 1,
+            },
+        })
+        .await?
+    {
+        FrontendEvent::CommentResult { comment } => comment,
+        other => {
+            return Err(anyhow!(
+                "expected CommentResult, got: {}",
+                serde_json::to_string(&other).unwrap_or_default()
+            ));
+        }
+    };
+
+    let event = client
+        .send_request(&FrontendRequest::CommentsDispatchMagicWand {
+            comment_id: comment.id.clone(),
+        })
+        .await?;
+    match event {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("unsupported artifact_kind"),
+                "expected error about unsupported artifact_kind, got: {message}"
+            );
+        }
+        other => {
+            panic!(
+                "expected WorkError for unsupported kind, got: {}",
                 serde_json::to_string(&other).unwrap_or_default()
             );
         }

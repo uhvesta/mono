@@ -105,6 +105,7 @@ pub(crate) fn map_magic_wand_dispatch(row: &Row<'_>) -> rusqlite::Result<MagicWa
         anchor_warning: row.get::<_, i64>(10)? != 0,
         created_at: row.get(11)?,
         resolved_at: row.get::<_, Option<String>>(12)?.filter(|s| !s.is_empty()),
+        chore_id: row.get::<_, Option<String>>(13)?.filter(|s| !s.is_empty()),
     })
 }
 

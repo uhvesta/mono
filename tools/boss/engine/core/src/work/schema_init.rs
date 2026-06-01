@@ -294,6 +294,9 @@ impl WorkDb {
         migrate_work_comments_table(&conn)?;
         // Comments Phase 3: magic-wand dispatch audit trail.
         migrate_magic_wand_dispatches_table(&conn)?;
+        // Comments Phase 4: PR-backed doc → Boss chore worker. Adds `chore_id`
+        // to `magic_wand_dispatches` for audit linkage.
+        migrate_magic_wand_dispatches_add_chore_id(&conn)?;
         // Automations foundation (maintenance-tasks.md): `automations`,
         // `automation_runs`, `automation_short_id_sequences` tables plus
         // `tasks.source_automation_id` provenance column. Purely additive —

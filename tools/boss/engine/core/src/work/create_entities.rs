@@ -49,6 +49,15 @@ impl WorkDb {
         self.memory.is_some()
     }
 
+    /// Find the id of the first product whose `repo_remote_url` matches the
+    /// given canonical URL. Returns `None` when no product matches.
+    /// Used by the Phase-4 magic-wand PR-backed dispatch to resolve the
+    /// product for the spawned chore.
+    pub fn find_product_id_by_repo_remote_url(&self, url: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        find_product_by_repo_remote_url(&conn, url)
+    }
+
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(

@@ -1036,6 +1036,25 @@ pub(crate) fn migrate_magic_wand_dispatches_table(conn: &Connection) -> Result<(
     Ok(())
 }
 
+/// Add the `chore_id` column to `magic_wand_dispatches` for Phase 4 of
+/// comments-in-markdown-viewer (PR-backed doc → Boss chore worker).
+///
+/// Idempotent — uses `ALTER TABLE … ADD COLUMN IF NOT EXISTS` pattern via
+/// a guarded SELECT-from-pragma approach, because SQLite's `ADD COLUMN IF
+/// NOT EXISTS` syntax is not available until SQLite 3.37.0 and we prefer
+/// to stay on the safe side.
+pub(crate) fn migrate_magic_wand_dispatches_add_chore_id(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('magic_wand_dispatches') WHERE name = 'chore_id'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE magic_wand_dispatches ADD COLUMN chore_id TEXT;",
+        )?;
+    }
+    Ok(())
+}
+
 /// Create the `work_comments` table for the comments-in-markdown-viewer
 /// feature (Phase 2). Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`,
 /// safe to re-run on every engine start. Schema follows design

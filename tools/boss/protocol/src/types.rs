@@ -2454,6 +2454,10 @@ pub const COMMENT_STATUS_ACTIVE: &str = "active";
 pub const COMMENT_STATUS_RESOLVED: &str = "resolved";
 pub const COMMENT_STATUS_ORPHANED: &str = "orphaned";
 pub const COMMENT_STATUS_DISMISSED: &str = "dismissed";
+/// Phase 4: comment against a PR-backed doc whose magic-wand button dispatched
+/// a Boss chore worker. Transitions `active` → `dispatched` at chore creation,
+/// then `dispatched` → `resolved` when the chore's PR merges.
+pub const COMMENT_STATUS_DISPATCHED: &str = "dispatched";
 
 /// How the comment's anchor last resolved against the doc's plain-text
 /// projection: `exact`, `fuzzy` (drives the ⚠ sidebar glyph), or `orphan`.
@@ -2563,11 +2567,15 @@ pub const MAGIC_WAND_STATUS_APPLIED: &str = "applied";
 pub const MAGIC_WAND_STATUS_DISCARDED: &str = "discarded";
 pub const MAGIC_WAND_STATUS_CONFLICT: &str = "conflict";
 pub const MAGIC_WAND_STATUS_FAILED: &str = "failed";
+/// Phase 4 terminal status: a Boss chore worker was created to address the
+/// comment on a PR-backed doc. The `chore_id` column carries the spawned
+/// chore's id for audit linkage. There is no further engine-side Claude call.
+pub const MAGIC_WAND_STATUS_CHORE_CREATED: &str = "chore_created";
 
 /// An engine-persisted magic-wand dispatch row (`magic_wand_dispatches` table).
 /// Records the one-shot specialised Claude call dispatched when the user clicks
-/// the magic-wand button on a comment against a work-item description (Phase 3
-/// of comments-in-markdown-viewer.md). 12 fields → builder pattern per project
+/// the magic-wand button on a comment (Phase 3: engine-owned doc; Phase 4:
+/// PR-backed doc → Boss chore worker). 13+ fields → builder pattern per project
 /// convention.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[derive(bon::Builder)]
@@ -2580,14 +2588,15 @@ pub struct MagicWandDispatch {
     /// The `doc_version` from the comment — the plain-text-projection SHA the
     /// dispatch ran against. Used as the CAS value on Apply.
     pub doc_version: String,
-    /// `in_flight` | `returned` | `applied` | `discarded` | `conflict` | `failed`
+    /// `in_flight` | `returned` | `applied` | `discarded` | `conflict` |
+    /// `failed` | `chore_created`
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<i64>,
     /// The proposed updated markdown. `None` until the dispatch completes
-    /// successfully.
+    /// successfully (Phase 3 only; always `None` for `chore_created`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_md: Option<String>,
     /// Short error classification (`length_sanity` | `diff_sanity` | `api_error`
@@ -2603,6 +2612,11 @@ pub struct MagicWandDispatch {
     #[serde(default)]
     #[builder(default)]
     pub anchor_warning: bool,
+    /// Phase 4 only: the id of the Boss chore worker spawned to address this
+    /// comment. Set when `status = 'chore_created'`; `None` for all Phase 3
+    /// dispatches. Links the dispatch row to the chore for audit traceability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chore_id: Option<String>,
 }
 
 #[cfg(test)]

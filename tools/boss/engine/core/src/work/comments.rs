@@ -96,7 +96,8 @@ impl WorkDb {
             COMMENT_STATUS_ACTIVE
             | COMMENT_STATUS_RESOLVED
             | COMMENT_STATUS_ORPHANED
-            | COMMENT_STATUS_DISMISSED => {}
+            | COMMENT_STATUS_DISMISSED
+            | COMMENT_STATUS_DISPATCHED => {}
             other => bail!("invalid comment status: {other}"),
         }
         let conn = self.connect()?;
@@ -351,14 +352,14 @@ impl WorkDb {
         Ok(migrated)
     }
 
-    // --- Magic-wand dispatch (Phase 3: engine-owned docs) ---
+    // --- Magic-wand dispatch (Phase 3: engine-owned docs; Phase 4: PR-backed docs) ---
 
     /// Column list for every `magic_wand_dispatches` SELECT. Order must match
     /// [`map_magic_wand_dispatch`].
     fn magic_wand_columns() -> &'static str {
         "id, comment_id, artifact_kind, artifact_id, doc_version, status, \
          input_tokens, output_tokens, result_md, error_kind, anchor_warning, \
-         created_at, resolved_at"
+         created_at, resolved_at, chore_id"
     }
 
     /// Insert an `in_flight` dispatch row. Returns the inserted row.
@@ -385,6 +386,46 @@ impl WorkDb {
                 doc_version,
                 MAGIC_WAND_STATUS_IN_FLIGHT,
                 now,
+            ],
+        )?;
+        let cols = Self::magic_wand_columns();
+        let sql = format!("SELECT {cols} FROM magic_wand_dispatches WHERE id = ?1");
+        conn.query_row(&sql, [&id], map_magic_wand_dispatch)
+            .map_err(Into::into)
+    }
+
+    /// Insert a `chore_created` dispatch row for a Phase-4 PR-backed doc
+    /// dispatch. Unlike the Phase-3 `in_flight` row, this is immediately
+    /// terminal from the engine's perspective — no subsequent Claude call.
+    /// The spawned chore's id is recorded in `chore_id` for audit linkage.
+    ///
+    /// The caller is also responsible for transitioning the comment to
+    /// `dispatched` via `set_comment_status`.
+    pub fn create_pr_backed_magic_wand_dispatch(
+        &self,
+        comment_id: &str,
+        artifact_kind: &str,
+        artifact_id: &str,
+        doc_version: &str,
+        chore_id: &str,
+    ) -> Result<MagicWandDispatch> {
+        let conn = self.connect()?;
+        let id = next_id("mwd");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO magic_wand_dispatches \
+             (id, comment_id, artifact_kind, artifact_id, doc_version, status, \
+              anchor_warning, created_at, chore_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+            params![
+                id,
+                comment_id,
+                artifact_kind,
+                artifact_id,
+                doc_version,
+                MAGIC_WAND_STATUS_CHORE_CREATED,
+                now,
+                chore_id,
             ],
         )?;
         let cols = Self::magic_wand_columns();
