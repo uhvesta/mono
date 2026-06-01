@@ -1617,6 +1617,80 @@ private struct WorkDragRefusalBanner: View {
     }
 }
 
+/// A wrapping horizontal stack: lays subviews left-to-right and wraps to a
+/// new line as soon as the next subview would overflow the proposed width.
+///
+/// Used for the kanban card's metadata/badge cluster. A plain `HStack` of
+/// `.fixedSize` chips (effort, CI status, repo, work-item id, agent/action
+/// chips) cannot compress and has no wrap behaviour, so a full badge set on
+/// a card with a long title overflows past the lane's right edge and gets
+/// clipped — the recurring regression in #1172. Flowing the cluster instead
+/// constrains every chip to the lane width: the row grows downward rather
+/// than running off the side.
+struct FlowLayout: Layout {
+    /// Horizontal gap between chips on the same line.
+    var horizontalSpacing: CGFloat = 6
+    /// Vertical gap between wrapped lines.
+    var verticalSpacing: CGFloat = 3
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        let rows = computeRows(maxWidth: maxWidth, subviews: subviews)
+        let width = rows.map(\.width).max() ?? 0
+        let height = rows.reduce(0) { $0 + $1.height }
+            + verticalSpacing * CGFloat(max(0, rows.count - 1))
+        return CGSize(width: min(width, maxWidth), height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {
+        let rows = computeRows(maxWidth: bounds.width, subviews: subviews)
+        var y = bounds.minY
+        for row in rows {
+            var x = bounds.minX
+            for index in row.indices {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(
+                    at: CGPoint(x: x, y: y),
+                    anchor: .topLeading,
+                    proposal: ProposedViewSize(size)
+                )
+                x += size.width + horizontalSpacing
+            }
+            y += row.height + verticalSpacing
+        }
+    }
+
+    private struct Row {
+        var indices: [Int] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    private func computeRows(maxWidth: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(.unspecified)
+            let lead = current.indices.isEmpty ? 0 : horizontalSpacing
+            // Wrap when the chip would overflow — but never strand a chip on an
+            // empty line, so the first chip of a row always fits even if it is
+            // itself wider than the lane (it will clip, but that is degenerate).
+            if !current.indices.isEmpty && current.width + lead + size.width > maxWidth {
+                rows.append(current)
+                current = Row()
+            }
+            let gap = current.indices.isEmpty ? 0 : horizontalSpacing
+            current.width += gap + size.width
+            current.height = max(current.height, size.height)
+            current.indices.append(index)
+        }
+        if !current.indices.isEmpty {
+            rows.append(current)
+        }
+        return rows
+    }
+}
+
 struct WorkBoardCardView: View {
     let task: WorkTask
     let projectName: String?
@@ -1821,7 +1895,10 @@ struct WorkBoardCardView: View {
                             .help("\(prefix) \(blockedBy)")
                     }
                 }
-                Spacer(minLength: 0)
+                // Pin the title column to the remaining lane width so the
+                // title text wraps within the card instead of overflowing past
+                // the right edge on long, low-break-opportunity names (#1172).
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if let liveStatus, !liveStatus.isEmpty {
@@ -1842,134 +1919,121 @@ struct WorkBoardCardView: View {
             }
 
             if hasFooterContent {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        let parsedPriority = WorkPriority.parse(task.priority)
-                        if parsedPriority == .high {
-                            PriorityChip(priority: parsedPriority)
-                        }
-                        if let effortLevel = task.effortLevel,
-                           !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            EffortChip(effortLevel: effortLevel)
-                        }
-                        if let projectName, !projectName.isEmpty {
-                            WorkStatusBadge(text: projectName)
-                        }
-                        if isResolvingConflicts {
-                            ResolvingConflictsBadge()
-                        } else if isRemediatingCI {
-                            ResolvingCIFailureBadge()
-                        } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
-                            let isDependencyBadge = blockedText == WorkBlockedBadge.label(forReason: "dependency")
-                            WorkStatusBadge(text: blockedText)
-                                .onHover { hovering in
-                                    if isDependencyBadge {
-                                        onDepBadgeHover?(hovering)
-                                    }
-                                }
-                        }
-                        if isAutoBlocked {
-                            Image(systemName: "link")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.orange)
-                                .help(autoBlockTooltip)
-                                .accessibilityLabel("Auto-blocked by dependencies")
-                                .accessibilityValue(autoBlockTooltip)
-                                .onHover { hovering in
+                // Wrap the whole metadata cluster so a full badge set — effort,
+                // CI status, repo, work-item id, and the trailing action chips —
+                // flows onto additional lines within the lane width instead of
+                // overflowing past the card's right edge and clipping (#1172).
+                FlowLayout(horizontalSpacing: 6, verticalSpacing: 4) {
+                    let parsedPriority = WorkPriority.parse(task.priority)
+                    if parsedPriority == .high {
+                        PriorityChip(priority: parsedPriority)
+                    }
+                    if let effortLevel = task.effortLevel,
+                       !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        EffortChip(effortLevel: effortLevel)
+                    }
+                    if let projectName, !projectName.isEmpty {
+                        WorkStatusBadge(text: projectName)
+                    }
+                    if isResolvingConflicts {
+                        ResolvingConflictsBadge()
+                    } else if isRemediatingCI {
+                        ResolvingCIFailureBadge()
+                    } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
+                        let isDependencyBadge = blockedText == WorkBlockedBadge.label(forReason: "dependency")
+                        WorkStatusBadge(text: blockedText)
+                            .onHover { hovering in
+                                if isDependencyBadge {
                                     onDepBadgeHover?(hovering)
                                 }
-                        }
-                        if !stacksStatusBadges {
-                            if conflictClearedBadgeVisible {
-                                ConflictClearedBadge()
                             }
-                            if showsCIAutoFixedBadge && ciFailureBadge == nil {
-                                CIAutoFixedBadge()
-                            }
-                            if let ciFailureBadge, !isRemediatingCI {
-                                CIFailureChip(badge: ciFailureBadge)
-                            }
-                        }
-                        if let repoChip {
-                            RepoChipView(presentation: repoChip)
-                        }
-                        Spacer(minLength: 0)
-                        if let id = task.shortID {
-                            Text("T" + String(id))
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .accessibilityLabel("T" + String(id))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                        }
-                        if let extRef = externalRefLink {
-                            ExternalRefLinkView(presentation: extRef)
-                        }
-                        if task.kind == "design",
-                           let state = designDocState,
-                           let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
-                            Button {
-                                onOpenDesignDoc?()
-                            } label: {
-                                Image(systemName: presentation.systemImage)
-                                    .font(.caption)
-                                    .foregroundStyle(presentation.tint)
-                                    .accessibilityLabel(presentation.accessibilityLabel)
-                            }
-                            .buttonStyle(.plain)
-                            .help(presentation.tooltip)
-                        }
-                        if let openTerminal = onOpenReviewTerminal {
-                            Button {
-                                openTerminal()
-                            } label: {
-                                Image(systemName: "terminal")
-                                    .font(.caption)
-                                    .foregroundStyle(Color.secondary)
-                                    .accessibilityLabel("Open terminal on PR branch")
-                            }
-                            .buttonStyle(.plain)
-                            .help("Open terminal on PR branch")
-                        }
-                        if onMergeWhenReady != nil {
-                            Button {
-                                showMergeConfirmation = true
-                            } label: {
-                                Image(systemName: "arrow.triangle.merge")
-                                    .font(.caption)
-                                    .foregroundStyle(Color.secondary)
-                                    .accessibilityLabel("Merge when ready")
-                            }
-                            .buttonStyle(.plain)
-                            .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
-                            .confirmationDialog(
-                                "Merge When Ready",
-                                isPresented: $showMergeConfirmation,
-                                titleVisibility: .visible
-                            ) {
-                                Button("Confirm Merge When Ready") {
-                                    onMergeWhenReady?()
-                                }
-                                Button("Cancel", role: .cancel) {}
-                            } message: {
-                                Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
-                            }
-                        }
                     }
-                    if stacksStatusBadges {
-                        HStack(spacing: 6) {
-                            if conflictClearedBadgeVisible {
-                                ConflictClearedBadge()
+                    if isAutoBlocked {
+                        Image(systemName: "link")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .help(autoBlockTooltip)
+                            .accessibilityLabel("Auto-blocked by dependencies")
+                            .accessibilityValue(autoBlockTooltip)
+                            .onHover { hovering in
+                                onDepBadgeHover?(hovering)
                             }
-                            if showsCIAutoFixedBadge && ciFailureBadge == nil {
-                                CIAutoFixedBadge()
+                    }
+                    if conflictClearedBadgeVisible {
+                        ConflictClearedBadge()
+                    }
+                    if showsCIAutoFixedBadge && ciFailureBadge == nil {
+                        CIAutoFixedBadge()
+                    }
+                    if let ciFailureBadge, !isRemediatingCI {
+                        CIFailureChip(badge: ciFailureBadge)
+                    }
+                    if let repoChip {
+                        RepoChipView(presentation: repoChip)
+                    }
+                    if let id = task.shortID {
+                        Text("T" + String(id))
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("T" + String(id))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    if let extRef = externalRefLink {
+                        ExternalRefLinkView(presentation: extRef)
+                    }
+                    if task.kind == "design",
+                       let state = designDocState,
+                       let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+                        Button {
+                            onOpenDesignDoc?()
+                        } label: {
+                            Image(systemName: presentation.systemImage)
+                                .font(.caption)
+                                .foregroundStyle(presentation.tint)
+                                .accessibilityLabel(presentation.accessibilityLabel)
+                        }
+                        .buttonStyle(.plain)
+                        .help(presentation.tooltip)
+                    }
+                    if let openTerminal = onOpenReviewTerminal {
+                        Button {
+                            openTerminal()
+                        } label: {
+                            Image(systemName: "terminal")
+                                .font(.caption)
+                                .foregroundStyle(Color.secondary)
+                                .accessibilityLabel("Open terminal on PR branch")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open terminal on PR branch")
+                    }
+                    if onMergeWhenReady != nil {
+                        Button {
+                            showMergeConfirmation = true
+                        } label: {
+                            Image(systemName: "arrow.triangle.merge")
+                                .font(.caption)
+                                .foregroundStyle(Color.secondary)
+                                .accessibilityLabel("Merge when ready")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
+                        .confirmationDialog(
+                            "Merge When Ready",
+                            isPresented: $showMergeConfirmation,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Confirm Merge When Ready") {
+                                onMergeWhenReady?()
                             }
-                            if let ciFailureBadge, !isRemediatingCI {
-                                CIFailureChip(badge: ciFailureBadge)
-                            }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
                         }
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if let prURL = task.prURL, !prURL.isEmpty {
@@ -2059,18 +2123,6 @@ struct WorkBoardCardView: View {
             isResolvingConflicts: isResolvingConflicts
         )
     }
-
-    /// Number of transient status badges (conflict cleared, ci auto-fixed,
-    /// ci failure) that are currently visible on this card.
-    private var statusBadgeCount: Int {
-        (conflictClearedBadgeVisible ? 1 : 0)
-        + (showsCIAutoFixedBadge && ciFailureBadge == nil ? 1 : 0)
-        + (ciFailureBadge != nil && !isRemediatingCI ? 1 : 0)
-    }
-
-    /// When true, status badges overflow a single footer row and must be
-    /// pushed to a dedicated second row so the short_id is never clipped.
-    private var stacksStatusBadges: Bool { statusBadgeCount >= 2 }
 
     /// Tooltip body for the chain badge. Mirrors the CLI `show`
     /// output's prereq list so a hover tells the reader the same
