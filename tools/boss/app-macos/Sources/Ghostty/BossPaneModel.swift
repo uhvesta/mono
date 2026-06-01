@@ -221,9 +221,17 @@ private let bossFilingGuidanceDirect = """
     Workflow:
 
     1. Find the Boss product: `boss product list --json` — identify the product named "Boss" (or equivalent).
-    2. Create the chore: `boss chore create --product <id> --name "…" --description "$(cat <<'EOF'\\n…\\nEOF)" --effort <level>`.
-    3. Append an `[effort-classification]` audit line to the description per the effort-estimation rules.
-    4. Confirm the short_id and name to the user.
+    2. Create the chore with the `[effort-classification]` tag baked into the `--description` (one atomic write — do NOT do a separate update after create, as that races with autostart and produces a spurious worker re-read probe). Example:
+       ```sh
+       boss chore create --product <id> --name "…" --effort <level> \
+         --description "$(cat <<'EOF'
+       <brief>
+
+       [effort-classification] level=`<level>` matched-rule=`…` reasons="…"
+       EOF
+       )"
+       ```
+    3. Confirm the short_id and name to the user.
 
     **Exception:** if the user explicitly asks to file a GitHub issue instead, use `boss shake`:
 
@@ -309,7 +317,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Levels: `trivial | small | medium | large`. Never emit `max` — human-only.
 
-    At create time: run the heuristic, pass `--effort <level>`, and append the reasons string to the row's description as a tagged audit line (see "Audit trail on the row" below). The CLI has no `comment` verb; `--description` is the only durable text field on a chore/task.
+    At create time: run the heuristic, pass `--effort <level>`, and include the `[effort-classification]` audit tag directly in the `--description` you pass to the create call — one atomic write. Do NOT do a separate update after create; see "Audit trail on the row" below.
 
     ### Rules (top-to-bottom, first match wins)
 
@@ -332,11 +340,31 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     ### Audit trail on the row
 
-    The CLI has no first-class comment surface (no `boss chore comment add` / `boss task comment add`). Append audit entries to the row's `description` field instead, separated from the original brief by a blank line, and tag each entry so future re-classifications can find them:
+    The CLI has no first-class comment surface. Audit tags go into the `description` field, each on its own line separated from the preceding text by a blank line. **The write timing differs by tag type.**
+
+    #### `[effort-classification]` — bake into the initial create call (one atomic write)
+
+    Compose the tag into the `--description` you pass to `boss chore create` / `boss task create`:
+
+    ```sh
+    boss chore create --product <id> --name "…" --effort small \
+      --description "$(cat <<'EOF'
+    <the chore brief>
+
+    [effort-classification] level=`small` matched-rule=`rule 7 (short desc fallback)` reasons="single-clause title, description < 1500 B"
+    EOF
+    )"
+    ```
+
+    **Do NOT follow `boss chore create` / `boss task create` with a separate `boss task update` to append this tag.** `boss chore create` auto-dispatches a worker. A follow-up description edit lands after the worker is live, and the engine propagates it as a "[chore-update] re-read the spec" probe even when the only delta is the audit tag. (This two-write pattern raced with autostart and produced a spurious re-read probe on T1026 — root cause documented in T1027.)
+
+    #### `[effort-escalation]` — fetch-then-update after the worker's run
+
+    Escalation is a post-dispatch event: the worker has already finished before the marker fires, so a second write is safe. Use the fetch-then-update recipe:
 
     ```sh
     EXISTING=$(boss task show <row-id> --json | jq -r '.task.description // ""')
-    AUDIT='[effort-classification] level=`small` matched-rule=`rule 7 (short desc fallback)` reasons="single-clause title, description < 1500 B"'
+    AUDIT='[effort-escalation] original=`small` new=`large` matched-markers=`…` reason="…"'
     boss task update <row-id> --description "$EXISTING
 
     $AUDIT"
