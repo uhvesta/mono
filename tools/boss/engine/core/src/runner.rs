@@ -918,6 +918,19 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
         prompt.push_str(&ci_monitoring_directive(execution));
     }
+    // Attentions creation pipeline (design: attentions.md): implementation
+    // workers may surface out-of-scope follow-on work as a `FOLLOWUPS:` block
+    // the engine parses at completion. Design workers use the questions
+    // manifest instead, so they are excluded here.
+    if matches!(
+        execution.kind.as_str(),
+        "task_implementation"
+            | "chore_implementation"
+            | "investigation_implementation"
+            | "revision_implementation"
+    ) {
+        prompt.push_str(&followups_emission_block());
+    }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     prompt
@@ -1187,7 +1200,54 @@ fn compose_design_directive(parent_project: Option<&Project>) -> String {
     out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
     out.push_str("  - include items that are deferred or explicitly out of scope, marked as `future / not a v1 blocker` rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected.\n");
     out.push_str("  - This section is what P783's auto-populate will consume to materialise dependent tasks with edges, so completeness matters.\n");
+    out.push_str(&design_questions_manifest_block());
     out.push_str("- when the doc is ready for review, push it and open a PR (see the acceptance criterion below). Do not start implementation tasks — those come from follow-up work items the human files after the design is approved.\n");
+    out
+}
+
+/// Attentions question-manifest emission instruction (design:
+/// `tools/boss/docs/designs/attentions.md`, "Creation pipeline"). Appended
+/// to the `project_design` directive: a design worker that has genuine open
+/// questions for the human emits a sibling `<slug>.attentions.json` manifest
+/// next to the doc. The engine's `DesignDetector` parses it off the PR
+/// branch and upserts an inline question group the human answers in the doc
+/// viewer, batched into a single revision.
+fn design_questions_manifest_block() -> String {
+    let mut out = String::new();
+    out.push_str("- OPTIONAL — open questions for the human: if, while writing the doc, you have specific decisions you want a human to make (yes/no calls, multiple-choice forks, or free-text prompts), emit a **questions manifest** as a sibling file next to the design doc — the same path with the `.md` extension replaced by `.attentions.json` (e.g. `…/designs/<slug>.attentions.json`).\n");
+    out.push_str("  - The file is a JSON array. Each entry is an object:\n");
+    out.push_str("    - `question_type` (required): one of `yes_no` | `multiple_choice` | `prompt` (free text).\n");
+    out.push_str("    - `prompt` (required): the question shown to the human.\n");
+    out.push_str("    - `choices` (required only for `multiple_choice`): a JSON array of option strings.\n");
+    out.push_str("    - `anchor` (optional but encouraged): the heading slug the question is about, so it renders next to the relevant section.\n");
+    out.push_str("  - Example: `[{\"question_type\":\"yes_no\",\"prompt\":\"Gate extraction behind a flag?\",\"anchor\":\"rollout\"},{\"question_type\":\"multiple_choice\",\"prompt\":\"One table or two?\",\"choices\":[\"one\",\"two\"],\"anchor\":\"data-model\"}]`\n");
+    out.push_str("  - Only emit this when you genuinely need the human to decide something; omit the file entirely otherwise. Do NOT restate the doc's \"Risks / open questions\" prose here — the manifest is just the machine-actionable subset you want answered. The engine batches all entries into one group, so answering them yields a single doc revision.\n");
+    out
+}
+
+/// Followups emission instruction (design:
+/// `tools/boss/docs/designs/attentions.md`, "Creation pipeline"). Appended to
+/// the implementation-worker directive: a worker that notices concrete,
+/// out-of-scope follow-on work near task completion surfaces it as a
+/// `FOLLOWUPS:` sentinel + fenced JSON array. The engine parses the
+/// transcript tail and upserts a followup group keyed to this task; the
+/// human turns accepted entries into tasks with one gesture.
+fn followups_emission_block() -> String {
+    let mut out = String::new();
+    out.push_str("\n## Optional: surface follow-on work as FOLLOWUPS\n\n");
+    out.push_str(
+        "If, while completing this task, you noticed concrete follow-on work worth filing — a separate bug, a needed refactor, a missing test, a docs gap — that is OUT OF SCOPE for this PR, you may surface it for the human. This is OPTIONAL: only include genuine, actionable proposals, never invent work to fill it, and never list the change you just made.\n\n",
+    );
+    out.push_str(
+        "If (and only if) you have followups, append — after your `## Open Questions` section — a line containing exactly `FOLLOWUPS:` immediately followed by a fenced ```json code block holding a JSON array. Each element is an object:\n",
+    );
+    out.push_str("- `proposed_name` (required): a short task title.\n");
+    out.push_str("- `proposed_description` (required): one paragraph of scope.\n");
+    out.push_str("- `proposed_effort` (optional): one of `trivial` | `small` | `medium` | `large` | `max`.\n");
+    out.push_str("- `proposed_work_kind` (optional): one of `task` | `chore` | `project` (defaults to `task`).\n");
+    out.push_str("- `rationale` (optional): why it is worth doing.\n\n");
+    out.push_str("Example:\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Add retry/backoff to the X client\", \"proposed_description\": \"The X client fails hard on transient 5xx; add bounded retry with jitter.\", \"proposed_effort\": \"small\", \"proposed_work_kind\": \"task\", \"rationale\": \"Observed flakes during this task.\"}]\n```\n\n");
+    out.push_str("Omit the block entirely if you have no followups. Emitting it does not block this PR — it just files proposals for the human to review.\n");
     out
 }
 

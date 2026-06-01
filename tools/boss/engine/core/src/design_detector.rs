@@ -32,14 +32,14 @@ use crate::work::WorkDb;
 use boss_protocol::SetProjectDesignDocInput;
 
 /// Metadata extracted from `gh pr view --json files,headRefName,baseRefName`.
-struct PrScanResult {
+pub(crate) struct PrScanResult {
     /// The single design-doc path found in the PR, or `None` if zero
     /// or multiple design docs were present.
-    doc_path: Option<String>,
+    pub(crate) doc_path: Option<String>,
     /// Head branch name (e.g. `boss/exec_18b07a506d2518d0_1b`).
-    head_ref_name: Option<String>,
+    pub(crate) head_ref_name: Option<String>,
     /// Base branch name (e.g. `main`).
-    base_ref_name: Option<String>,
+    pub(crate) base_ref_name: Option<String>,
 }
 
 /// Fired by `completion::finalize_pr_transition` (target = `InReview`)
@@ -325,7 +325,7 @@ fn resolve_product_repo(work_db: &WorkDb, task_id: &str, product_id: &str) -> Op
 /// parse the result. `head_ref_name` carries the PR branch for open PRs;
 /// `base_ref_name` carries the target branch used on merge. Returns `None`
 /// on tool failures; warnings are logged internally.
-async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult> {
+pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult> {
     match do_scan_pr(pr_url).await {
         Ok(result) => Some(result),
         Err(err) => {

@@ -1,6 +1,7 @@
 pub use boss_transcript_markdown as transcript_markdown;
 
 pub mod app;
+pub mod attentions_detector;
 pub mod audit;
 pub mod audit_effort;
 pub mod automation_schedule;

@@ -49,10 +49,11 @@ use tokio::process::Command;
 
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
-    AUTOMATION_OUTCOME_SKIPPED, BranchNaming, CREATED_VIA_CI_FIX_PREFIX,
+    AUTOMATION_OUTCOME_SKIPPED, Attention, AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX,
     CREATED_VIA_MERGE_CONFLICT_PREFIX, FrontendEvent,
 };
 
+use crate::attentions_detector;
 use crate::automation_triage::{TriageDecision, parse_triage_decision};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
@@ -1862,9 +1863,48 @@ must not be asked to open one",
                         )
                         .await;
                     }
+
+                    // Attentions creation pipeline (design: attentions.md).
+                    // A design worker may ship a sibling `<slug>.attentions.json`
+                    // question manifest; parse it off the PR branch and upsert
+                    // the question group. Idempotent across re-detections.
+                    if let Some((group, created)) =
+                        attentions_detector::reconcile_design_doc_questions(
+                            &self.work_db,
+                            &task.id,
+                            project_id,
+                            &pr_url,
+                            merged,
+                        )
+                        .await
+                    {
+                        self.publish_attentions_created(&group, &created).await;
+                    }
                 }
             }
         }
+
+        // Followups: any completing implementation worker may emit a
+        // `FOLLOWUPS:` block near the end of its run. Parse the transcript
+        // tail and upsert a followup group keyed to the originating work
+        // item. A no-op (no transcript / no block) when absent; idempotent
+        // across re-runs via the store's content dedup.
+        let transcript_path = self
+            .work_db
+            .transcript_path_for_execution(execution_id)
+            .ok()
+            .flatten();
+        if let Some((group, created)) = attentions_detector::reconcile_task_followups(
+            &self.work_db,
+            &work_item_id,
+            execution_id,
+            transcript_path.as_deref(),
+        )
+        .await
+        {
+            self.publish_attentions_created(&group, &created).await;
+        }
+
         if merged {
             tracing::info!(
                 execution_id,
@@ -1916,6 +1956,24 @@ must not be asked to open one",
                 }
             });
             StopOutcome::PrDetected { pr_url }
+        }
+    }
+
+    /// Push an `AttentionCreated` event per newly-created member on the
+    /// owning product's work-tree topic so the Notifications window and the
+    /// design-doc viewer live-update (mirrors the `CreateAttention` RPC
+    /// handler). No-op for an empty `created` set.
+    async fn publish_attentions_created(&self, group: &AttentionGroup, created: &[Attention]) {
+        for attention in created {
+            self.publisher
+                .publish_frontend_event_on_product(
+                    &group.product_id,
+                    FrontendEvent::AttentionCreated {
+                        attention: attention.clone(),
+                        group: group.clone(),
+                    },
+                )
+                .await;
         }
     }
 

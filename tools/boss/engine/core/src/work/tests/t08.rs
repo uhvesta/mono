@@ -669,3 +669,132 @@ fn actioned_group_cannot_be_actioned_again() {
         "unexpected error: {err}"
     );
 }
+
+// --- reconcile_attentions (Attn 4 creation-pipeline upsert) --------------
+
+#[test]
+fn reconcile_empty_batch_is_noop() {
+    let (db, _product, _project_id, _task) = fixture();
+    assert!(db.reconcile_attentions(vec![]).unwrap().is_none());
+}
+
+#[test]
+fn reconcile_inserts_then_dedupes_identical_batch() {
+    let (db, _product, project_id, _task) = fixture();
+    let batch = || {
+        vec![
+            question(&project_id, "docs/x.md", "one table or two?"),
+            question(&project_id, "docs/x.md", "gate behind a flag?"),
+        ]
+    };
+
+    // First reconcile inserts both members into a fresh group.
+    let (group, created) = db.reconcile_attentions(batch()).unwrap().unwrap();
+    assert_eq!(created.len(), 2);
+    assert_eq!(group.generation, 0);
+    assert_eq!(db.list_attentions_for_group(&group.id).unwrap().len(), 2);
+
+    // Re-running the identical manifest adds nothing and stays in-place.
+    let (group2, created2) = db.reconcile_attentions(batch()).unwrap().unwrap();
+    assert_eq!(group2.id, group.id);
+    assert_eq!(group2.generation, 0);
+    assert!(created2.is_empty());
+    assert_eq!(db.list_attentions_for_group(&group.id).unwrap().len(), 2);
+}
+
+#[test]
+fn reconcile_appends_only_new_members() {
+    let (db, _product, project_id, _task) = fixture();
+    let (group, created) = db
+        .reconcile_attentions(vec![question(&project_id, "docs/x.md", "Q1")])
+        .unwrap()
+        .unwrap();
+    assert_eq!(created.len(), 1);
+
+    // A superset batch: Q1 dedupes, only Q2 is appended.
+    let (group2, created2) = db
+        .reconcile_attentions(vec![
+            question(&project_id, "docs/x.md", "Q1"),
+            question(&project_id, "docs/x.md", "Q2"),
+        ])
+        .unwrap()
+        .unwrap();
+    assert_eq!(group2.id, group.id);
+    assert_eq!(created2.len(), 1);
+    assert_eq!(created2[0].prompt_text.as_deref(), Some("Q2"));
+    let members = db.list_attentions_for_group(&group.id).unwrap();
+    assert_eq!(members.len(), 2);
+    // Ordinals stay monotonic across reconcile calls.
+    assert_eq!(members[0].ordinal, 1);
+    assert_eq!(members[1].ordinal, 2);
+}
+
+#[test]
+fn reconcile_dedupes_within_a_single_batch() {
+    let (db, _product, project_id, _task) = fixture();
+    let (group, created) = db
+        .reconcile_attentions(vec![
+            question(&project_id, "docs/x.md", "dup"),
+            question(&project_id, "docs/x.md", "dup"),
+        ])
+        .unwrap()
+        .unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(db.list_attentions_for_group(&group.id).unwrap().len(), 1);
+}
+
+#[test]
+fn reconcile_same_prompt_different_anchor_are_distinct() {
+    let (db, _product, project_id, _task) = fixture();
+    let mut a = question(&project_id, "docs/x.md", "same?");
+    a.source_anchor = Some("schema".to_owned());
+    let mut b = question(&project_id, "docs/x.md", "same?");
+    b.source_anchor = Some("api".to_owned());
+    let (group, created) = db.reconcile_attentions(vec![a, b]).unwrap().unwrap();
+    assert_eq!(created.len(), 2);
+    assert_eq!(db.list_attentions_for_group(&group.id).unwrap().len(), 2);
+}
+
+#[test]
+fn reconcile_after_terminal_starts_a_new_generation() {
+    let (db, _product, project_id, _task) = fixture();
+    let (group, _created) = db
+        .reconcile_attentions(vec![question(&project_id, "docs/x.md", "Q1")])
+        .unwrap()
+        .unwrap();
+    assert_eq!(group.generation, 0);
+
+    // Close the group; a re-emission must not reopen it.
+    let dismissed = db.dismiss_attention(&group.id, None).unwrap();
+    assert_eq!(dismissed.state, "dismissed");
+
+    let (group2, created2) = db
+        .reconcile_attentions(vec![question(&project_id, "docs/x.md", "Q1")])
+        .unwrap()
+        .unwrap();
+    assert_ne!(group2.id, group.id);
+    assert_eq!(group2.generation, 1);
+    assert_eq!(created2.len(), 1);
+    assert_eq!(group2.state, "open");
+}
+
+#[test]
+fn reconcile_followups_dedupe_on_proposed_name() {
+    let (db, _product, _project_id, task_id) = fixture();
+    let batch = || {
+        vec![
+            followup(&task_id, "wire retries"),
+            followup(&task_id, "add metrics"),
+        ]
+    };
+    let (group, created) = db.reconcile_attentions(batch()).unwrap().unwrap();
+    assert_eq!(group.kind, "followup");
+    assert_eq!(created.len(), 2);
+
+    // Same names re-emitted with a different description still dedupe.
+    let mut again = followup(&task_id, "wire retries");
+    again.proposed_description = Some("reworded".to_owned());
+    let (group2, created2) = db.reconcile_attentions(vec![again]).unwrap().unwrap();
+    assert_eq!(group2.id, group.id);
+    assert!(created2.is_empty());
+}

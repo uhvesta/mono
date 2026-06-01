@@ -18,6 +18,7 @@
 //! one revision" true across iteration.
 
 use super::*;
+use std::collections::HashSet;
 
 /// Canonical column order for `attention_groups` SELECTs. Must stay in
 /// lockstep with [`map_attention_group`].
@@ -38,6 +39,37 @@ const ATTN_COLS: &str = "id, group_id, ordinal, source_anchor, answer_state, \
 /// changed and new attentions for the same key form a fresh generation.
 fn group_is_terminal(state: &str) -> bool {
     matches!(state, "actioned" | "dismissed")
+}
+
+/// Stable content key used by [`WorkDb::reconcile_attentions`] for
+/// member-level dedup. Two members with the same key are "the same
+/// question / followup re-emitted" and the second is skipped, so a
+/// re-detected PR or a re-emitted `FOLLOWUPS:` block never appends
+/// duplicate members within a generation. The unit separator (`\u{1f}`)
+/// keeps the joined fields unambiguous.
+///
+/// - **question** → `question_type` + `prompt_text` + `source_anchor`
+///   (a worker may legitimately ask the same prompt about two different
+///   doc sections, so the anchor is part of the identity).
+/// - **followup** → `proposed_name` (the title is the human-meaningful
+///   identity; re-phrased descriptions of the same proposal collapse).
+fn content_key(
+    kind: &str,
+    question_type: Option<&str>,
+    prompt_text: Option<&str>,
+    source_anchor: Option<&str>,
+    proposed_name: Option<&str>,
+) -> String {
+    match kind {
+        "question" => format!(
+            "q\u{1f}{}\u{1f}{}\u{1f}{}",
+            question_type.unwrap_or_default(),
+            prompt_text.unwrap_or_default(),
+            source_anchor.unwrap_or_default(),
+        ),
+        "followup" => format!("f\u{1f}{}", proposed_name.unwrap_or_default()),
+        other => format!("{other}\u{1f}{}", prompt_text.unwrap_or_default()),
+    }
 }
 
 fn query_attention_group(conn: &Connection, id: &str) -> Result<Option<AttentionGroup>> {
@@ -288,6 +320,68 @@ fn create_group(
         .with_context(|| format!("missing attention group after insert: {id}"))
 }
 
+/// Next ordinal for a group: one past the current maximum (1-based).
+fn next_member_ordinal(conn: &Connection, group_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM attentions WHERE group_id = ?1",
+        [group_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Insert one member row into `group_id` at `ordinal` and return it.
+/// Shared by [`WorkDb::create_attention`] (single append) and
+/// [`WorkDb::reconcile_attentions`] (idempotent batch upsert). Callers are
+/// responsible for validating the member and for confirming the group is
+/// non-terminal before calling.
+fn insert_member(
+    conn: &Connection,
+    group_id: &str,
+    ordinal: i64,
+    input: &CreateAttentionInput,
+) -> Result<Attention> {
+    let id = next_id("atn");
+    let now = now_string();
+    let confidence_source = input
+        .confidence_source
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("structured");
+
+    conn.execute(
+        "INSERT INTO attentions (
+             id, group_id, ordinal, source_anchor, answer_state, created_at, answered_at,
+             question_type, prompt_text, choice_options, answer,
+             proposed_name, proposed_description, proposed_effort, proposed_work_kind,
+             rationale, confidence_source
+         ) VALUES (
+             ?1, ?2, ?3, ?4, 'open', ?5, NULL,
+             ?6, ?7, ?8, NULL,
+             ?9, ?10, ?11, ?12,
+             ?13, ?14
+         )",
+        params![
+            id,
+            group_id,
+            ordinal,
+            input.source_anchor,
+            now,
+            input.question_type,
+            input.prompt_text,
+            input.choice_options,
+            input.proposed_name,
+            input.proposed_description,
+            input.proposed_effort,
+            input.proposed_work_kind,
+            input.rationale,
+            confidence_source,
+        ],
+    )?;
+
+    query_attention(conn, &id)?.with_context(|| format!("missing attention after insert: {id}"))
+}
+
 /// Recompute and persist a non-terminal group's `state` from its members:
 /// `open` while every member is untouched, `partially_answered` once any
 /// member has reached a terminal answer-state. Terminal groups
@@ -352,51 +446,8 @@ impl WorkDb {
         }
         validate_member_input(&input)?;
 
-        let id = next_id("atn");
-        let now = now_string();
-        let ordinal: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM attentions WHERE group_id = ?1",
-            [&group.id],
-            |row| row.get(0),
-        )?;
-        let confidence_source = input
-            .confidence_source
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("structured");
-
-        tx.execute(
-            "INSERT INTO attentions (
-                 id, group_id, ordinal, source_anchor, answer_state, created_at, answered_at,
-                 question_type, prompt_text, choice_options, answer,
-                 proposed_name, proposed_description, proposed_effort, proposed_work_kind,
-                 rationale, confidence_source
-             ) VALUES (
-                 ?1, ?2, ?3, ?4, 'open', ?5, NULL,
-                 ?6, ?7, ?8, NULL,
-                 ?9, ?10, ?11, ?12,
-                 ?13, ?14
-             )",
-            params![
-                id,
-                group.id,
-                ordinal,
-                input.source_anchor,
-                now,
-                input.question_type,
-                input.prompt_text,
-                input.choice_options,
-                input.proposed_name,
-                input.proposed_description,
-                input.proposed_effort,
-                input.proposed_work_kind,
-                input.rationale,
-                confidence_source,
-            ],
-        )?;
-
-        let attention = query_attention(&tx, &id)?
-            .with_context(|| format!("missing attention after insert: {id}"))?;
+        let ordinal = next_member_ordinal(&tx, &group.id)?;
+        let attention = insert_member(&tx, &group.id, ordinal, &input)?;
         // A brand-new member is always `open`, so it cannot change the
         // group's `open`/`partially_answered` state; re-fetch only to return
         // a canonical group row.
@@ -404,6 +455,95 @@ impl WorkDb {
             .with_context(|| format!("missing attention group after insert: {}", group.id))?;
         tx.commit()?;
         Ok((attention, group))
+    }
+
+    /// Reconcile a batch of structured attentions — a design-doc question
+    /// manifest or a transcript `FOLLOWUPS:` block — into a single group.
+    ///
+    /// This is the content-idempotent counterpart to [`Self::create_attention`]
+    /// that the creation-pipeline detectors (design `<slug>.attentions.json`,
+    /// the followups sentinel) call. Group reconciliation is identical: the
+    /// batch joins the latest open / partially-answered group for its grouping
+    /// key, or — if that group is already `actioned`/`dismissed` (terminal) —
+    /// starts a fresh generation. On top of the group's
+    /// `(grouping_key, generation)` idempotency, member-level dedup keys on
+    /// [`content_key`] so re-running the same source (a re-detected PR, a
+    /// re-emitted block) does **not** append duplicate members.
+    ///
+    /// All `inputs` must share the same grouping identity (kind + association
+    /// + source); the group is resolved from the first input. Returns the
+    /// group plus the members **newly inserted on this call** (an empty `Vec`
+    /// when every member already existed), or `Ok(None)` for an empty batch so
+    /// callers can skip event publishing without a special case.
+    pub fn reconcile_attentions(
+        &self,
+        inputs: Vec<CreateAttentionInput>,
+    ) -> Result<Option<(AttentionGroup, Vec<Attention>)>> {
+        let Some(first) = inputs.first() else {
+            return Ok(None);
+        };
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+
+        let group = resolve_or_create_group(&tx, first)?;
+        // `resolve_or_create_group` always returns a non-terminal group (it
+        // bumps past a closed one), so members can be appended safely.
+        debug_assert!(!group_is_terminal(&group.state));
+
+        // Seed the dedup set + ordinal counter from the group's existing
+        // members so re-runs are no-ops and ordinals stay monotonic.
+        let existing = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {ATTN_COLS} FROM attentions WHERE group_id = ?1"
+            ))?;
+            collect_rows(stmt.query_map([group.id.as_str()], map_attention)?)?
+        };
+        let mut seen: HashSet<String> = existing
+            .iter()
+            .map(|a| {
+                content_key(
+                    &group.kind,
+                    a.question_type.as_deref(),
+                    a.prompt_text.as_deref(),
+                    a.source_anchor.as_deref(),
+                    a.proposed_name.as_deref(),
+                )
+            })
+            .collect();
+        let mut ordinal = existing.iter().map(|a| a.ordinal).max().unwrap_or(0);
+
+        let mut created = Vec::new();
+        for input in &inputs {
+            if input.kind != group.kind {
+                bail!(
+                    "attention kind {:?} does not match group {} kind {:?}",
+                    input.kind,
+                    group.id,
+                    group.kind
+                );
+            }
+            validate_member_input(input)?;
+            let key = content_key(
+                &group.kind,
+                input.question_type.as_deref(),
+                input.prompt_text.as_deref(),
+                input.source_anchor.as_deref(),
+                input.proposed_name.as_deref(),
+            );
+            // Skips both members already in the group and intra-batch dupes.
+            if !seen.insert(key) {
+                continue;
+            }
+            ordinal += 1;
+            created.push(insert_member(&tx, &group.id, ordinal, input)?);
+        }
+
+        recompute_group_state(&tx, &group.id)?;
+        let group = query_attention_group(&tx, &group.id)?
+            .with_context(|| format!("missing attention group after reconcile: {}", group.id))?;
+        tx.commit()?;
+        Ok(Some((group, created)))
     }
 
     /// List groups for `product_id`, newest first. Optional filters narrow

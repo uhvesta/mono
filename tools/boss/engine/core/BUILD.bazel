@@ -7,6 +7,7 @@ rust_library(
     crate_name = "boss_engine",
     srcs = [
         "src/app.rs",
+        "src/attentions_detector.rs",
         "src/audit.rs",
         "src/audit_effort.rs",
         "src/automation_schedule.rs",
