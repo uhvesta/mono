@@ -28,9 +28,11 @@ rust_library(
         "src/design_detector.rs",
         "src/dispatch_events.rs",
         "src/dispatch_reader.rs",
+        "src/editorial_hook.rs",
         "src/effort.rs",
         "src/engine_control.rs",
         "src/events_socket.rs",
+        "src/gh_invocation.rs",
         "src/external_tracker/credentials.rs",
         "src/external_tracker/github.rs",
         "src/external_tracker/github_oauth.rs",
@@ -293,6 +295,26 @@ rust_test(
     deps = [
         ":engine_lib",
         "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)
+
+rust_test(
+    name = "editorial_pretooluse_test",
+    srcs = ["tests/editorial_pretooluse.rs"],
+    edition = "2024",
+    size = "small",
+    timeout = "moderate",
+    deps = [
+        ":engine_lib",
+        "//tools/boss/engine/editorial",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

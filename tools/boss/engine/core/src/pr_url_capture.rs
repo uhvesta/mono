@@ -148,33 +148,34 @@ pub fn extract_pr_url_from_bash_response(tool_response: &serde_json::Value) -> O
 /// Check whether a Bash `tool_input` command is a deliberate `gh pr`
 /// invocation (create, view, list, or edit).
 ///
-/// Returns `true` only when the Bash command string contains a
-/// `gh pr <subcommand>` pattern, where the subcommand is one of the
+/// Returns `true` only when the Bash command string is a
+/// `gh pr <subcommand>` invocation, where the subcommand is one of the
 /// forms that can legitimately surface a PR URL for the worker's own
 /// PR. Handles environment-variable prefixes such as
-/// `GIT_DIR=.jj/repo/store/git gh pr create ...` by scanning the
-/// full command string rather than just the first token.
+/// `GIT_DIR=.jj/repo/store/git gh pr create ...` via the shared
+/// [`crate::gh_invocation::classify`] matcher.
 ///
 /// Use this as the Layer-1 gate in the PostToolUse capture path:
 /// arbitrary Bash commands whose output happens to contain a PR URL
 /// (file reads, test runs, chore descriptions echoed via shell) must
 /// not stage a wrong PR against the running execution.
 pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
-    let command = match tool_input.get("command").and_then(|v| v.as_str()) {
-        Some(c) => c,
-        None => return false,
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return false;
     };
-    const PR_SUBCOMMANDS: &[&str] = &[
-        "gh pr create",
-        "gh pr view",
-        "gh pr list",
-        "gh pr edit",
-        // `cube pr ensure` is the jj-aware create-or-reuse wrapper that
-        // outputs a PR URL as its only stdout line — treat it the same as
-        // `gh pr create` for capture purposes.
-        "cube pr ensure",
-    ];
-    PR_SUBCOMMANDS.iter().any(|sub| command.contains(sub))
+    // `cube pr ensure` is the jj-aware create-or-reuse wrapper that
+    // outputs a PR URL as its only stdout line — treat it the same as
+    // `gh pr create` for capture purposes. It is not a `gh` invocation,
+    // so the shared classifier doesn't see it; check it directly.
+    if command.contains("cube pr ensure") {
+        return true;
+    }
+    matches!(
+        crate::gh_invocation::classify(command),
+        Some(inv)
+            if inv.noun == crate::gh_invocation::GhNoun::Pr
+                && matches!(inv.subcommand.as_str(), "create" | "view" | "list" | "edit")
+    )
 }
 
 /// Outcome of [`StagedPrUrlCache::record_if_unset`].
