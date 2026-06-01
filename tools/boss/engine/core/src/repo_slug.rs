@@ -2,21 +2,27 @@
 //!
 //! `boss task create --repo <slug>` / `boss chore create --repo <slug>`
 //! let an operator name a repo by its registered cube slug (e.g.
-//! `bduff`) instead of a full git origin URL. The durable work-item row
-//! must carry a *dispatchable* origin URL, not the slug: at dispatch the
-//! engine hands `repo_remote_url` straight to `cube repo ensure --origin`,
-//! and cube rejects a bare slug that is already registered with a
-//! non-empty origin (`repo `bduff` is already configured for origin …`).
+//! `bduff`) instead of a full git origin URL. When the slug is *already
+//! registered* we rewrite the durable work-item row to the canonical
+//! origin URL at creation time, so the common dispatch path only ever
+//! sees URLs and cube never has to re-resolve a known slug.
 //!
 //! So at creation time we look the slug up against cube's registry and
 //! rewrite the field to the canonical origin. The chore row stays
-//! introspectable and the dispatch path stays dumb — it only ever sees
-//! URLs. See spinyfin/mono#861.
+//! introspectable. See spinyfin/mono#861.
 //!
 //! Best-effort: a value that already looks like a URL / scp remote /
 //! path, a slug cube doesn't know, or a failed registry round-trip all
 //! leave the field untouched and fall through to the pre-existing
 //! behaviour.
+//!
+//! A slug that has *no cube pool yet* but is resolvable through a
+//! configured `[[repo-resolvers]]` entry (e.g. `rdev-k8s`) can't be
+//! rewritten at creation time — it isn't in `cube repo list`. The field
+//! stays a bare slug and reaches dispatch verbatim. The dispatch path is
+//! therefore *not* URL-only: [`repo_ensure_args`] routes a bare slug to
+//! cube's resolver-aware positional `repo ensure <name>` form, and only a
+//! genuine URL to `--origin`. See spinyfin/mono#1156.
 
 use std::sync::Arc;
 
@@ -33,6 +39,29 @@ pub fn is_bare_repo_slug(value: &str) -> bool {
         && trimmed
             .chars()
             .all(|c| !matches!(c, ':' | '/' | '@') && !c.is_whitespace())
+}
+
+/// Build the argv tail for `cube repo ensure` from a repo reference that
+/// may be either a canonical origin URL or a bare cube slug.
+///
+/// A bare slug (e.g. `rdev-k8s` — a repo that has no cube pool yet but is
+/// resolvable through a configured `[[repo-resolvers]]` entry) is passed
+/// **positionally** so the bundled cube walks its resolver chain
+/// (registered slug → repo-resolvers → GitHub `<org>/<name>` fallback) and
+/// materializes the repo. A URL / scp remote / path is passed via
+/// `--origin` to bypass resolution and clone the URL directly.
+///
+/// Both forms are idempotent in the bundled cube: an already-registered
+/// repo short-circuits to its existing record rather than erroring. This
+/// is the dispatch-side counterpart to creation-time slug rewriting — it
+/// catches resolver-only slugs that had no pool to rewrite against. The
+/// returned slices borrow from `repo_ref`. See spinyfin/mono#1156.
+pub fn repo_ensure_args(repo_ref: &str) -> Vec<&str> {
+    if is_bare_repo_slug(repo_ref) {
+        vec!["--json", "repo", "ensure", repo_ref.trim()]
+    } else {
+        vec!["--json", "repo", "ensure", "--origin", repo_ref]
+    }
 }
 
 /// Rewrite a single `repo_remote_url` field in place: when it holds a
@@ -112,6 +141,61 @@ mod tests {
         assert!(!is_bare_repo_slug("foo/bar"));
         assert!(!is_bare_repo_slug("org-132020694@github.com:ls/bduff.git"));
         assert!(!is_bare_repo_slug("two words"));
+    }
+
+    #[test]
+    fn ensure_args_route_bare_slug_positionally() {
+        // A resolver-only slug (no cube pool yet) must reach cube as a
+        // positional reponame so the resolver chain is walked — NOT via
+        // `--origin`, which would make cube clone the literal string.
+        assert_eq!(
+            repo_ensure_args("rdev-k8s"),
+            vec!["--json", "repo", "ensure", "rdev-k8s"]
+        );
+        assert_eq!(
+            repo_ensure_args("bduff"),
+            vec!["--json", "repo", "ensure", "bduff"]
+        );
+    }
+
+    #[test]
+    fn ensure_args_route_urls_via_origin() {
+        assert_eq!(
+            repo_ensure_args("org-127256988@github.com:linkedin-multiproduct/rdev-k8s.git"),
+            vec![
+                "--json",
+                "repo",
+                "ensure",
+                "--origin",
+                "org-127256988@github.com:linkedin-multiproduct/rdev-k8s.git"
+            ]
+        );
+        assert_eq!(
+            repo_ensure_args("https://github.com/foo/bar.git"),
+            vec![
+                "--json",
+                "repo",
+                "ensure",
+                "--origin",
+                "https://github.com/foo/bar.git"
+            ]
+        );
+        // A bare `owner/name` slug carries a `/`, so it is not a bare cube
+        // slug; it flows through `--origin` and cube's GitHub fallback.
+        assert_eq!(
+            repo_ensure_args("spinyfin/mono"),
+            vec!["--json", "repo", "ensure", "--origin", "spinyfin/mono"]
+        );
+    }
+
+    #[test]
+    fn ensure_args_trim_positional_slug() {
+        // A slug with surrounding whitespace is still routed positionally,
+        // with the whitespace stripped so cube sees a clean reponame.
+        assert_eq!(
+            repo_ensure_args("  rdev-k8s  "),
+            vec!["--json", "repo", "ensure", "rdev-k8s"]
+        );
     }
 
     #[test]

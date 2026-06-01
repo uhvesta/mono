@@ -366,7 +366,7 @@ impl CubeClient for CommandCubeClient {
         }
 
         let payload: RepoEnsurePayload = serde_json::from_value(
-            self.run_json(&["--json", "repo", "ensure", "--origin", origin])
+            self.run_json(&crate::repo_slug::repo_ensure_args(origin))
                 .await?,
         )
         .context("failed to decode `cube repo ensure` payload")?;
@@ -1596,6 +1596,10 @@ impl ExecutionCoordinator {
             .with_context(|| format!("failed to resolve work item {}", execution.work_item_id))?;
         let task = execution_task_summary(execution, &work_item);
 
+        // Mirror the argv `ensure_repo` actually drives so the dispatch-event
+        // `cube_command` is reproducible from a terminal: a bare resolver
+        // slug goes positionally (`repo ensure <name>`), a URL via `--origin`.
+        let ensure_args = crate::repo_slug::repo_ensure_args(&execution.repo_remote_url);
         let repo = match tokio::time::timeout(
             CUBE_REPO_ENSURE_TIMEOUT,
             self.host_adapter.ensure_repo(&execution.repo_remote_url),
@@ -1604,9 +1608,7 @@ impl ExecutionCoordinator {
         {
             Ok(Ok(repo)) => repo,
             Ok(Err(err)) => {
-                let ensure_repr = self.host_adapter.command_repr(&[
-                    "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
-                ]);
+                let ensure_repr = self.host_adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -1636,9 +1638,7 @@ impl ExecutionCoordinator {
                     "cube `repo ensure` timed out after {}s",
                     CUBE_REPO_ENSURE_TIMEOUT.as_secs()
                 );
-                let ensure_repr = self.host_adapter.command_repr(&[
-                    "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
-                ]);
+                let ensure_repr = self.host_adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(
@@ -1675,9 +1675,7 @@ impl ExecutionCoordinator {
                     .with_work_item(&execution.work_item_id)
                     .with_worker(worker_id)
                     .with_cube_repo(&repo.repo_id)
-                    .with_cube_invocation(self.host_adapter.command_repr(&[
-                        "--json", "repo", "ensure", "--origin", &execution.repo_remote_url,
-                    ])),
+                    .with_cube_invocation(self.host_adapter.command_repr(&ensure_args)),
             )
             .await;
 

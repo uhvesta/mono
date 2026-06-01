@@ -439,7 +439,7 @@ impl HostAdapter for SshHostAdapter {
             repo_id: String,
         }
         let payload: RepoEnsurePayload = serde_json::from_value(
-            self.run_cube_json(&["--json", "repo", "ensure", "--origin", origin])
+            self.run_cube_json(&crate::repo_slug::repo_ensure_args(origin))
                 .await?,
         )
         .context("decoding remote `cube repo ensure` payload")?;
