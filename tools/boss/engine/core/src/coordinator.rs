@@ -2792,6 +2792,33 @@ impl ExecutionCoordinator {
                                 )
                                 .await;
                         }
+                        // A pane-spawn failure is terminal — the execution is
+                        // now `failed` and the workspace has been released. If
+                        // this was an automation triage run, the matching
+                        // `automation_runs` row is still sitting at the
+                        // pessimistic `failed_will_retry` that the scheduler
+                        // stamped when it dispatched the triage execution.
+                        // Flip it to `failed_gave_up` so the Automations tab
+                        // shows an accurate terminal state instead of implying
+                        // a self-healing retry is pending (it is not: a
+                        // pane-spawn failure like an invalid worker_id format
+                        // will not recover on its own).
+                        if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                            if let Err(finalize_err) =
+                                self.work_db.finalize_automation_triage_run(
+                                    &execution.id,
+                                    boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                                    None,
+                                    Some(&format!("pane spawn failed: {error_text}")),
+                                )
+                            {
+                                tracing::warn!(
+                                    execution_id = %execution.id,
+                                    ?finalize_err,
+                                    "failed to mark automation run failed_gave_up after pane-spawn failure",
+                                );
+                            }
+                        }
                     }
                     Err(record_err) => {
                         tracing::error!(
@@ -4558,6 +4585,108 @@ mod tests {
                 "stage `{expected}` missing from dispatch timeline; got {stages:?}",
             );
         }
+    }
+
+    /// When a pane-spawn fails for an `automation_triage` execution, the
+    /// matching `automation_runs` row must be flipped from the scheduler's
+    /// pessimistic `failed_will_retry` to `failed_gave_up`. Without this,
+    /// a non-self-healing failure (e.g. invalid worker_id format) leaves
+    /// the Automations tab showing a pending retry that will never happen.
+    #[tokio::test]
+    async fn pane_spawn_failure_finalises_automation_run_to_failed_gave_up() {
+        use crate::work::{AutomationFireRecord, CreateAutomationInput};
+        use boss_protocol::{AutomationTrigger, AUTOMATION_OUTCOME_FAILED_GAVE_UP};
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Nightly check".to_owned(),
+                repo_remote_url: None,
+                trigger: AutomationTrigger::Schedule {
+                    cron: "0 2 * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "audit the repo".to_owned(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+
+        // Create the triage execution that the scheduler would normally create.
+        let triage_exec = db
+            .create_automation_triage_execution(
+                &automation.id,
+                "git@github.com:spinyfin/mono.git",
+            )
+            .unwrap();
+
+        // Record the automation run at the pessimistic `failed_will_retry`
+        // that the scheduler stamps when it dispatches (schedule advanced).
+        let scheduled_for: i64 = 1_000_000;
+        db.record_automation_run_and_advance(
+            AutomationFireRecord::builder()
+                .automation_id(automation.id.clone())
+                .scheduled_for(scheduled_for)
+                .started_at(scheduled_for)
+                .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+                .triage_execution_id(triage_exec.id.clone())
+                .build(),
+        )
+        .unwrap();
+
+        // Confirm the run is `failed_will_retry` before we touch the coordinator.
+        let run_before = db
+            .automation_run_for_triage_execution(&triage_exec.id)
+            .unwrap()
+            .expect("automation run must exist");
+        assert_eq!(
+            run_before.outcome, "failed_will_retry",
+            "precondition: scheduler stamps failed_will_retry on dispatch"
+        );
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            fail: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        );
+        // Wire in a 1-slot automation pool so the triage execution gets
+        // dispatched (it targets the automation pool, not the main pool).
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+        wait_for_execution_status(db.as_ref(), &triage_exec.id, "failed").await;
+
+        // The automation run must now show `failed_gave_up`, not `failed_will_retry`.
+        let run_after = db
+            .automation_run_for_triage_execution(&triage_exec.id)
+            .unwrap()
+            .expect("automation run must still exist");
+        assert_eq!(
+            run_after.outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+            "pane-spawn failure must finalize automation run to failed_gave_up; \
+             got {:?} — the Automations tab would show a phantom pending retry",
+            run_after.outcome,
+        );
     }
 
     /// The `pane_spawned: ok` event must carry the resolved spawn
