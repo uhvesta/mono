@@ -43,7 +43,7 @@ impl ConfiguredCheck for StaticFindingCheck {
                     line: Some(1),
                     column: Some(1),
                 }),
-                remediation: self.remediation.clone(),
+                remediations: self.remediation.iter().cloned().collect(),
                 suggested_fix: None,
             }],
         })
@@ -200,10 +200,9 @@ allow_bypass = true
     assert_eq!(results[0].findings.len(), 1);
     assert!(
         results[0].findings[0]
-            .remediation
-            .as_deref()
-            .unwrap_or_default()
-            .contains("never use bypasses for convenience")
+            .remediations
+            .iter()
+            .any(|r| r.contains("never use bypasses for convenience"))
     );
 }
 
@@ -252,10 +251,8 @@ bypass_name = "BYPASS_LEGACY_POLICY_CHECK"
         .expect("run checks");
     assert_eq!(results_without_bypass[0].findings[0].severity, Severity::Error);
     assert_eq!(
-        results_without_bypass[0].findings[0]
-            .remediation
-            .as_deref(),
-        Some("fix me")
+        results_without_bypass[0].findings[0].remediations,
+        vec!["fix me".to_owned()]
     );
 
     let results_with_bypass = runner

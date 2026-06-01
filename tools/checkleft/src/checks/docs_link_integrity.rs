@@ -83,10 +83,10 @@ impl ConfiguredCheck for DocsLinkIntegrityCheck {
                             line: Some((line_index + 1) as u32),
                             column: Some((matched.start() + 1) as u32),
                         }),
-                        remediation: Some(
+                        remediations: vec![
                             "Fix or remove the broken link target in this markdown file."
                                 .to_owned(),
-                        ),
+                        ],
                         suggested_fix: None,
                     });
                 }

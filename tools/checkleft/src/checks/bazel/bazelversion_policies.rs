@@ -142,12 +142,12 @@ impl CompiledAllowedVersionPatternsRule {
                 line: Some(1),
                 column: Some(1),
             }),
-            remediation: Some(self.remediation.clone().unwrap_or_else(|| {
+            remediations: vec![self.remediation.clone().unwrap_or_else(|| {
                 format!(
                     "Update `.bazelversion` so it matches one of the approved patterns: {}.",
                     self.pattern_strings.join(", ")
                 )
-            })),
+            })],
             suggested_fix: None,
         })
     }

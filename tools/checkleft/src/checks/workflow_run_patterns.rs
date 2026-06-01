@@ -62,10 +62,10 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
                             line: None,
                             column: None,
                         }),
-                        remediation: Some(
+                        remediations: vec![
                             "Fix YAML syntax so checks can validate workflow `run:` blocks."
                                 .to_owned(),
-                        ),
+                        ],
                         suggested_fix: None,
                     });
                     continue;
@@ -88,7 +88,7 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
                             line: None,
                             column: None,
                         }),
-                        remediation: Some(rule.remediation.clone()),
+                        remediations: vec![rule.remediation.clone()],
                         suggested_fix: None,
                     });
                 }

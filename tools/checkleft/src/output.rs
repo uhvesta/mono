@@ -13,7 +13,8 @@ pub struct Finding {
     pub severity: Severity,
     pub message: String,
     pub location: Option<Location>,
-    pub remediation: Option<String>,
+    #[serde(default)]
+    pub remediations: Vec<String>,
     pub suggested_fix: Option<SuggestedFix>,
 }
 

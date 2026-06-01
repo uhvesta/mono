@@ -537,19 +537,18 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
         .unwrap_or_else(|| "<unknown>".to_owned());
     out.push_str(&format!("  --> {location}\n"));
 
-    if let Some(remediation) = &finding.remediation {
-        let lines: Vec<&str> = remediation.lines().collect();
-        if lines.len() > 1 {
+    if !finding.remediations.is_empty() {
+        if finding.remediations.len() > 1 {
             out.push_str(&format!("   = {}:\n", style.paint_help_label("to resolve")));
             let bullet = style.resolution_bullet();
-            for line in lines {
-                out.push_str(&format!("   {bullet} {}\n", style.paint_help_body(line)));
+            for item in &finding.remediations {
+                out.push_str(&format!("   {bullet} {}\n", style.paint_help_body(item)));
             }
         } else {
             out.push_str(&format!(
                 "   = {}: {}\n",
                 style.paint_help_label("to resolve"),
-                style.paint_help_body(remediation)
+                style.paint_help_body(&finding.remediations[0])
             ));
         }
     }

@@ -171,10 +171,10 @@ impl Runner {
                                 line: None,
                                 column: None,
                             }),
-                            remediation: Some(
+                            remediations: vec![
                                 "Register this check implementation in the binary or fix `check = ...` in CHECKS.yaml."
                                     .to_owned(),
-                            ),
+                            ],
                             suggested_fix: None,
                         }],
                     });
@@ -218,7 +218,7 @@ impl Runner {
                                 line: None,
                                 column: None,
                             }),
-                            remediation,
+                            remediations: remediation.into_iter().collect(),
                             suggested_fix: None,
                         }],
                     });
@@ -236,7 +236,7 @@ impl Runner {
                             severity: Severity::Error,
                             message: format!("check execution failed: {err}"),
                             location: None,
-                            remediation: None,
+                            remediations: vec![],
                             suggested_fix: None,
                         }],
                     });
@@ -371,11 +371,11 @@ impl Runner {
                                 line,
                                 column: None,
                             }),
-                            remediation: Some(format!(
+                            remediations: vec![format!(
                                 "Remove `{}` from this check's exclusions in {}.",
                                 exclusion.entry,
                                 check.source_path.display()
-                            )),
+                            )],
                             suggested_fix: None,
                         });
                 }
@@ -675,7 +675,7 @@ fn config_diagnostic_result(diagnostic: &ConfigDiagnostic) -> CheckResult {
             severity: Severity::Error,
             message: diagnostic.message.clone(),
             location: Some(diagnostic.location.clone()),
-            remediation: diagnostic.remediation.clone(),
+            remediations: diagnostic.remediation.iter().cloned().collect(),
             suggested_fix: None,
         }],
     }
@@ -731,10 +731,7 @@ fn apply_policy_to_result(
 
         let guidance = bypass_failure_guidance(&policy.bypass_name);
         for finding in &mut result.findings {
-            finding.remediation = Some(match finding.remediation.take() {
-                Some(remediation) => format!("{remediation} {guidance}"),
-                None => guidance.clone(),
-            });
+            finding.remediations.push(guidance.clone());
         }
     }
 

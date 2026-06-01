@@ -53,10 +53,10 @@ impl ConfiguredCheck for RustTestRuleCoverageCheck {
                     line: None,
                     column: None,
                 }),
-                remediation: Some(
+                remediations: vec![
                     "Add a Bazel `rust_test(...)` target in the nearest BUILD/BUILD.bazel package."
                         .to_owned(),
-                ),
+                ],
                 suggested_fix: None,
             });
         }

@@ -61,10 +61,10 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                             line: None,
                             column: None,
                         }),
-                        remediation: Some(
+                        remediations: vec![
                             "Fix YAML syntax so checks can validate `uses:` action versions."
                                 .to_owned(),
-                        ),
+                        ],
                         suggested_fix: None,
                     });
                     continue;
@@ -87,7 +87,7 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                         line: None,
                         column: None,
                     }),
-                    remediation: Some(self.remediation.clone()),
+                    remediations: vec![self.remediation.clone()],
                     suggested_fix: None,
                 });
             }

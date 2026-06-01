@@ -75,7 +75,7 @@ impl ConfiguredCheck for CompiledForbiddenPathsConfig {
                         line: None,
                         column: None,
                     }),
-                    remediation: Some(rule.remediation.clone()),
+                    remediations: vec![rule.remediation.clone()],
                     suggested_fix: None,
                 });
             }
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].severity, Severity::Error);
         assert_eq!(
-            result.findings[0].remediation.as_deref(),
+            result.findings[0].remediations.first().map(String::as_str),
             Some("Generated artifacts must not be committed. Remove them from the change.")
         );
         assert!(result.findings[0].message.contains("**/.build/**"));
@@ -327,7 +327,7 @@ mod tests {
 
         assert_eq!(result.findings.len(), 1);
         assert_eq!(
-            result.findings[0].remediation.as_deref(),
+            result.findings[0].remediations.first().map(String::as_str),
             Some("Compatibility config must not be removed. Restore the file to the change.")
         );
         assert_eq!(

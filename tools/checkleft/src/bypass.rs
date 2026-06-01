@@ -93,9 +93,9 @@ pub fn bypass_applied_finding(
         severity: Severity::Warning,
         message: format!("check was bypassed via `{bypass_name}`"),
         location,
-        remediation: Some(format!(
+        remediations: vec![format!(
             "Bypass reason: {reason}. Keep bypasses rare and only for legitimate exceptions."
-        )),
+        )],
         suggested_fix: None,
     }
 }
@@ -223,10 +223,9 @@ mod tests {
         assert!(finding.message.contains("BYPASS_API_BREAKING_SURFACE"));
         assert!(
             finding
-                .remediation
-                .as_deref()
-                .unwrap_or_default()
-                .contains("No public API surface changed.")
+                .remediations
+                .iter()
+                .any(|r| r.contains("No public API surface changed."))
         );
     }
 

@@ -62,10 +62,10 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
                             line: None,
                             column: None,
                         }),
-                        remediation: Some(
+                        remediations: vec![
                             "Fix YAML syntax so checks can validate `run:` script blocks."
                                 .to_owned(),
-                        ),
+                        ],
                         suggested_fix: None,
                     });
                     continue;
@@ -84,10 +84,10 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
                         line: None,
                         column: None,
                     }),
-                    remediation: Some(
+                    remediations: vec![
                         "Add `set -euo pipefail` as the first non-comment line in each `run:` script block."
                             .to_owned(),
-                    ),
+                    ],
                     suggested_fix: None,
                 });
             }

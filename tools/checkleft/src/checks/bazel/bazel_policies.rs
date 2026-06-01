@@ -301,10 +301,10 @@ fn collect_findings_forbidden_rule_calls(
                 line: Some(location.line),
                 column: Some(location.column),
             }),
-            remediation: Some(rule.remediation.clone().unwrap_or_else(|| {
+            remediations: vec![rule.remediation.clone().unwrap_or_else(|| {
                 "Replace the forbidden Bazel rule or macro call with an approved alternative."
                     .to_owned()
-            })),
+            })],
             suggested_fix: None,
         });
     }
@@ -350,10 +350,10 @@ fn collect_findings_forbidden_default_visibility(
                 line: Some(location.line),
                 column: Some(location.column),
             }),
-            remediation: Some(rule.remediation.clone().unwrap_or_else(|| {
+            remediations: vec![rule.remediation.clone().unwrap_or_else(|| {
                 "Remove the package default visibility or narrow visibility on individual targets."
                     .to_owned()
-            })),
+            })],
             suggested_fix: None,
         });
     }
@@ -497,8 +497,8 @@ def make_demo(name):
             Some(3)
         );
         assert_eq!(
-            result.findings[0].remediation.as_deref(),
-            Some("Replace the forbidden Bazel rule or macro call with an approved alternative.")
+            result.findings[0].remediations,
+            vec!["Replace the forbidden Bazel rule or macro call with an approved alternative."]
         );
     }
 

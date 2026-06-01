@@ -62,7 +62,7 @@ impl ConfiguredCheck for CompiledApiBreakingSurfaceConfig {
                     line: None,
                     column: None,
                 }),
-                remediation: Some(self.remediation.clone()),
+                remediations: vec![self.remediation.clone()],
                 suggested_fix: None,
             })
             .collect();

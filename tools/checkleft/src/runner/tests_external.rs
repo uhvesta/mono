@@ -142,7 +142,7 @@ allow_bypass = true
                 severity: Severity::Warning,
                 message: "external ran".to_owned(),
                 location: None,
-                remediation: None,
+                remediations: vec![],
                 suggested_fix: None,
             }],
         }),
@@ -216,7 +216,7 @@ implementation = "generated:domain-typo-check"
                 severity: Severity::Warning,
                 message: "local exec ran".to_owned(),
                 location: None,
-                remediation: None,
+                remediations: vec![],
                 suggested_fix: None,
             }],
         }),
@@ -291,7 +291,7 @@ severity = "error"
                 severity: Severity::Warning,
                 message: "external warning".to_owned(),
                 location: None,
-                remediation: None,
+                remediations: vec![],
                 suggested_fix: None,
             }],
         }),
@@ -362,7 +362,7 @@ allow_bypass = true
                 severity: Severity::Error,
                 message: "external error".to_owned(),
                 location: None,
-                remediation: None,
+                remediations: vec![],
                 suggested_fix: None,
             }],
         }),
@@ -392,10 +392,9 @@ allow_bypass = true
     assert_eq!(results[0].findings[0].severity, Severity::Warning);
     assert!(
         results[0].findings[0]
-            .remediation
-            .as_deref()
-            .unwrap_or_default()
-            .contains("temporary external parity coverage")
+            .remediations
+            .iter()
+            .any(|r| r.contains("temporary external parity coverage"))
     );
 }
 
@@ -629,7 +628,7 @@ checks:
                 severity: Severity::Warning,
                 message: "external file exec ran".to_owned(),
                 location: None,
-                remediation: None,
+                remediations: vec![],
                 suggested_fix: None,
             }],
         }),

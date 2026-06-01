@@ -100,10 +100,10 @@ impl ConfiguredCheck for ParsedFileSizeConfig {
                     line: Some((self.max_lines.saturating_add(1)) as u32),
                     column: Some(1),
                 }),
-                remediation: Some(
+                remediations: vec![
                     "Split the file or refactor into smaller modules to reduce line count."
                         .to_owned(),
-                ),
+                ],
                 suggested_fix: None,
             });
         }

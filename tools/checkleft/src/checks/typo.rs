@@ -124,12 +124,12 @@ fn run_typo_check(
                         line: Some((index + 1) as u32),
                         column: Some(column as u32),
                     }),
-                    remediation: Some(format!(
+                    remediations: vec![format!(
                         "Replace `{}` with `{}`. {}",
                         compiled_rule.rule.typo,
                         compiled_rule.rule.canonical,
                         compiled_rule.rule.guidance
-                    )),
+                    )],
                     suggested_fix: None,
                 });
 

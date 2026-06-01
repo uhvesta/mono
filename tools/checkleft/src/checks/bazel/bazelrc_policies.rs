@@ -175,7 +175,7 @@ impl CompiledRequiredFlagRule {
                 line: None,
                 column: None,
             }),
-            remediation: Some(
+            remediations: vec![
                 self.remediation
                     .clone()
                     .unwrap_or_else(|| match &self.value {
@@ -190,7 +190,7 @@ impl CompiledRequiredFlagRule {
                             self.flag,
                         ),
                     }),
-            ),
+            ],
             suggested_fix: None,
         }]
     }
@@ -240,12 +240,12 @@ impl CompiledForbiddenFlagRule {
                     line: Some(entry.line),
                     column: Some(entry.column),
                 }),
-                remediation: Some(self.remediation.clone().unwrap_or_else(|| {
+                remediations: vec![self.remediation.clone().unwrap_or_else(|| {
                     format!(
                         "Remove the `--{}` flag or switch to the approved alternative.",
                         self.flag
                     )
-                })),
+                })],
                 suggested_fix: None,
             })
             .collect()

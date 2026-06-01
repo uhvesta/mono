@@ -198,11 +198,13 @@ impl ConfiguredCheck for ParsedConfig {
                         line: Some(line),
                         column: Some(1),
                     }),
-                    remediation: Some(format!(
-                        "Add `#[derive({}::Builder)]` (and `#[builder(on(String, into))]` per the project convention) above the struct.\n\
-                        Permanently exempt a file by adding it to `exclude_files` in `CHECKS.toml`.",
-                        self.builder.crate_name(),
-                    )),
+                    remediations: vec![
+                        format!(
+                            "Add `#[derive({}::Builder)]` (and `#[builder(on(String, into))]` per the project convention) above the struct.",
+                            self.builder.crate_name(),
+                        ),
+                        "Permanently exempt a file by adding it to `exclude_files` in `CHECKS.toml`.".to_owned(),
+                    ],
                     suggested_fix: None,
                 });
             }

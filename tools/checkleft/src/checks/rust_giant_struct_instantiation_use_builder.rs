@@ -159,13 +159,18 @@ impl ConfiguredCheck for ParsedConfig {
                      use a builder (`{name}::builder()…build()`); \
                      add a builder derive if it doesn't have one"
                 );
-                let remediation = Some(format!(
-                    "Replace this struct literal with a builder call: \
-                     `{name}::builder()…build()`.\n\
-                     Add `#[derive(bon::Builder)]` (and `#[builder(on(String, into))]` per \
-                     the project convention) if the struct does not already have a builder.\n\
-                     Permanently exempt a struct by adding it to `exclude_structs` in `CHECKS.toml`."
-                ));
+                let remediations = vec![
+                    format!(
+                        "Replace this struct literal with a builder call: \
+                         `{name}::builder()…build()`."
+                    )
+                    .to_owned(),
+                    "Add `#[derive(bon::Builder)]` (and `#[builder(on(String, into))]` per \
+                     the project convention) if the struct does not already have a builder."
+                        .to_owned(),
+                    "Permanently exempt a struct by adding it to `exclude_structs` in `CHECKS.toml`."
+                        .to_owned(),
+                ];
 
                 let lines = find_struct_literal_lines(source, name);
                 for line in lines {
@@ -177,7 +182,7 @@ impl ConfiguredCheck for ParsedConfig {
                             line: Some(line),
                             column: Some(1),
                         }),
-                        remediation: remediation.clone(),
+                        remediations: remediations.clone(),
                         suggested_fix: None,
                     });
                 }

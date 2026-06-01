@@ -49,7 +49,7 @@ pub(super) fn analyze_java_file(
                 line: Some(matched.location.line),
                 column: Some(matched.location.column),
             }),
-            remediation: matched.rule.remediation.clone(),
+            remediations: matched.rule.remediation.iter().cloned().collect(),
             suggested_fix: None,
         })
         .collect()

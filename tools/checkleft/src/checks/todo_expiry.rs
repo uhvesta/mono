@@ -58,7 +58,7 @@ impl ConfiguredCheck for CompiledTodoExpiryConfig {
                         line: Some((line_index + 1) as u32),
                         column: Some(1),
                     }),
-                    remediation: Some(self.remediation.clone()),
+                    remediations: vec![self.remediation.clone()],
                     suggested_fix: None,
                 });
             }

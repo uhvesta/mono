@@ -212,7 +212,7 @@ fn parse_versioned_file(
                 line: None,
                 column: None,
             }),
-            remediation: None,
+            remediations: vec![],
             suggested_fix: None,
         })?;
     let contents = String::from_utf8(contents).map_err(|error| Finding {
@@ -226,7 +226,7 @@ fn parse_versioned_file(
             line: None,
             column: None,
         }),
-        remediation: None,
+        remediations: vec![],
         suggested_fix: None,
     })?;
 
@@ -238,7 +238,7 @@ fn parse_versioned_file(
             line: None,
             column: None,
         }),
-        remediation: None,
+        remediations: vec![],
         suggested_fix: None,
     })
 }
@@ -364,10 +364,10 @@ fn broken_target_finding(
             line: Some(block.ifchange_line as u32),
             column: Some(1),
         }),
-        remediation: Some(
+        remediations: vec![
             "Update the linked file or block in the same change, or bypass the check with a documented reason."
                 .to_owned(),
-        ),
+        ],
         suggested_fix: None,
     }
 }

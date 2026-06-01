@@ -80,7 +80,7 @@ impl ConfiguredCheck for CompiledForbiddenImportsDepsConfig {
                             line: Some((line_index + 1) as u32),
                             column: Some(1),
                         }),
-                        remediation: Some(rule.remediation.clone()),
+                        remediations: vec![rule.remediation.clone()],
                         suggested_fix: None,
                     });
                 }
