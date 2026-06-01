@@ -835,6 +835,7 @@ impl ServerState {
         let pane_runner = Arc::new(crate::runner::PaneSpawnRunner::new(
             cfg.clone(),
             work_db.clone(),
+            feature_flags.clone(),
         ));
         let runner_for_coordinator = pane_runner.clone();
         let cube_client_for_state = cube_client.clone();

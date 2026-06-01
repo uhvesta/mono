@@ -700,7 +700,20 @@ impl HostAdapter for SshHostAdapter {
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
-        } = compose_worker_spawn(&self.work_db, execution, work_item, workspace_path, cube_change_id);
+        } = compose_worker_spawn(
+            &self.work_db,
+            execution,
+            work_item,
+            workspace_path,
+            cube_change_id,
+            // Editorial controls default OFF on the remote path: SshHostAdapter
+            // does not hold a FeatureFlagsStore (its `cfg` is "not yet read";
+            // see struct docs). The editorial kill switch defaults off, and the
+            // feature only ever gated the local PaneSpawnRunner path, so passing
+            // `false` preserves the original behavior. Wire feature flags into
+            // the remote path alongside the cross-host config work (PR3/PR4).
+            false,
+        );
         // `compose_execution_prompt` decides the Bazel pre-push gate by
         // probing the LOCAL filesystem, which never matches a remote
         // workspace path — so probe the remote and append it ourselves.

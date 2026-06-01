@@ -113,6 +113,9 @@ pub struct PaneSpawnRunner {
     /// in `run_execution` to compute a 2–4 word label for the work
     /// item before asking the app to spawn the pane.
     work_db: Arc<WorkDb>,
+    /// Feature flags store — checked at spawn time to decide whether
+    /// editorial controls are active for this execution.
+    feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
     /// Set after construction via [`PaneSpawnRunner::set_server_state`].
     /// Stored as `Weak` to avoid the runner ↔ ServerState reference
     /// cycle. Resolved each call.
@@ -120,10 +123,15 @@ pub struct PaneSpawnRunner {
 }
 
 impl PaneSpawnRunner {
-    pub fn new(cfg: Arc<RuntimeConfig>, work_db: Arc<WorkDb>) -> Self {
+    pub fn new(
+        cfg: Arc<RuntimeConfig>,
+        work_db: Arc<WorkDb>,
+        feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    ) -> Self {
         Self {
             cfg,
             work_db,
+            feature_flags,
             server_state: std::sync::OnceLock::new(),
         }
     }
@@ -321,6 +329,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // byte-identical prompt; see that function for the per-execution
         // collaborator lookups (parent project, conflict / CI attempt,
         // crash-recovery branch, automation-triage preamble).
+        let editorial_enabled = self.feature_flags.is_enabled("editorial_controls");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -330,6 +339,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
+            editorial_enabled,
         );
 
         let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
@@ -462,6 +472,7 @@ pub(crate) fn compose_worker_spawn(
     work_item: &WorkItem,
     workspace_path: &Path,
     cube_change_id: Option<&str>,
+    editorial_enabled: bool,
 ) -> ComposedWorkerSpawn {
     // For any project-scoped task (the synthetic `kind = 'design'`
     // task and ordinary `project_task` rows alike), the richer
@@ -614,6 +625,7 @@ pub(crate) fn compose_worker_spawn(
                         .maybe_ci_attempt(ci_attempt.as_ref())
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
                         .pr_template_set(&pr_template_set)
+                        .editorial_enabled(editorial_enabled)
                         .build(),
                 )
             }
@@ -631,6 +643,7 @@ pub(crate) fn compose_worker_spawn(
                 .maybe_ci_attempt(ci_attempt.as_ref())
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
                 .pr_template_set(&pr_template_set)
+                .editorial_enabled(editorial_enabled)
                 .build(),
         )
     };
@@ -678,6 +691,8 @@ struct ExecutionPromptParams<'a> {
     ci_attempt: Option<&'a CiRemediation>,
     editorial_rules: Option<&'a EditorialRules>,
     pr_template_set: &'a crate::pr_template::PrTemplateSet,
+    #[builder(default)]
+    editorial_enabled: bool,
 }
 
 fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
@@ -692,6 +707,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         ci_attempt,
         editorial_rules,
         pr_template_set,
+        editorial_enabled,
     } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
     // the engine-collected log excerpt, the failing-check set, and the
@@ -823,12 +839,14 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         prompt.push('\n');
     }
     prompt.push('\n');
-    // Inject [editorial-rules] block between execution context and per-kind directive
-    // so identifier-redaction guidance is top-of-mind without overriding the
-    // higher-priority "resume existing PR" directive (R11: after [product-preamble],
-    // before the per-kind block).
-    prompt.push_str(&render_editorial_rules_block(editorial_rules, pr_template_set));
-    prompt.push('\n');
+    // Inject [editorial-rules] block when editorial controls are enabled (gated by
+    // the `editorial_controls` feature flag — default OFF). When disabled the block
+    // is omitted entirely so the worker gets no editorial instructions and the
+    // PreToolUse hook is a no-op (nothing downstream enforces).
+    if editorial_enabled {
+        prompt.push_str(&render_editorial_rules_block(editorial_rules, pr_template_set));
+        prompt.push('\n');
+    }
     match execution.kind.as_str() {
         "project_design" => {
             prompt.push_str(&compose_design_directive(parent_project));
@@ -3053,6 +3071,7 @@ mod compose_prompt_tests {
                 .work_item(&chore_without_pr())
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
                 .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(true)
                 .build(),
         );
         assert!(
@@ -3082,6 +3101,7 @@ mod compose_prompt_tests {
                 .work_item(&chore_without_pr())
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
                 .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(true)
                 .build(),
         );
         assert!(
@@ -3111,6 +3131,7 @@ mod compose_prompt_tests {
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
                 .editorial_rules(&rules)
                 .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(true)
                 .build(),
         );
         assert!(
@@ -3149,6 +3170,7 @@ mod compose_prompt_tests {
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
                 .editorial_rules(&rules)
                 .pr_template_set(&pr_template_set)
+                .editorial_enabled(true)
                 .build(),
         );
         assert!(
@@ -3178,6 +3200,7 @@ mod compose_prompt_tests {
                 .work_item(&chore_without_pr())
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
                 .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(true)
                 .build(),
         );
         let editorial_pos = prompt
@@ -3205,6 +3228,7 @@ mod compose_prompt_tests {
                 .workspace_path(std::path::Path::new("/tmp/workspace"))
                 .editorial_rules(&rules)
                 .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(true)
                 .build(),
         );
         assert!(
@@ -3214,6 +3238,87 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("Enforcement:"),
             "enforcement banner must be present when template policy is set:\n{prompt}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // editorial_controls feature flag (kill switch, default off)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn editorial_controls_flag_off_omits_block() {
+        // With editorial_enabled = false, no [editorial-rules] block in the prompt.
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(false)
+                .build(),
+        );
+        assert!(
+            !prompt.contains("[editorial-rules]"),
+            "editorial-rules block must be absent when flag is off:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("[/editorial-rules]"),
+            "editorial-rules closing tag must be absent when flag is off:\n{prompt}",
+        );
+        // Prompt must still be a valid worker prompt (has execution context).
+        assert!(
+            prompt.contains("execution id"),
+            "prompt must still contain execution context when editorial is off:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn editorial_controls_flag_off_omits_block_even_with_configured_rules() {
+        // Rules configured on the product are also suppressed when the flag is off.
+        let rules = boss_protocol::EditorialRules {
+            instructions: Some("No emoji in titles.".to_owned()),
+            ..Default::default()
+        };
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .editorial_rules(&rules)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(false)
+                .build(),
+        );
+        assert!(
+            !prompt.contains("[editorial-rules]"),
+            "editorial-rules block must be absent when flag is off (even with rules configured):\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn editorial_controls_flag_on_preserves_existing_behavior() {
+        // With editorial_enabled = true, the [editorial-rules] block must be present
+        // and contain the baked-in rules — identical to the original behavior.
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .editorial_enabled(true)
+                .build(),
+        );
+        assert!(
+            prompt.contains("[editorial-rules]"),
+            "editorial-rules block must be present when flag is on:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("[/editorial-rules]"),
+            "editorial-rules closing tag must be present when flag is on:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("exec_\u{2026}"),
+            "baked-in identifier rule must be present when flag is on:\n{prompt}",
         );
     }
 }
@@ -3359,7 +3464,10 @@ mod pane_spawn_tests {
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
-        let runner = PaneSpawnRunner::new(cfg, work_db);
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
 
         runner
@@ -3522,7 +3630,10 @@ mod pane_spawn_tests {
         chore_input.product_id = product.id.clone();
         let chore = work_db.create_chore(chore_input).unwrap();
 
-        let runner = PaneSpawnRunner::new(cfg, work_db);
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());
@@ -3866,7 +3977,10 @@ mod pane_spawn_tests {
             })
             .unwrap();
 
-        let runner = PaneSpawnRunner::new(cfg, work_db);
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());
@@ -3996,7 +4110,10 @@ mod pane_spawn_tests {
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
-        let runner = PaneSpawnRunner::new(cfg, work_db);
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
 
         // Engine claimed slot 6 (i.e. handed `worker-6` to the
@@ -4123,7 +4240,10 @@ mod pane_spawn_tests {
             })
             .unwrap();
 
-        let runner = PaneSpawnRunner::new(cfg, work_db);
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());
@@ -4219,7 +4339,10 @@ mod pane_spawn_tests {
             .find(|t| t.kind == "design")
             .expect("create_project should auto-file a kind='design' task");
 
-        let runner = PaneSpawnRunner::new(cfg, work_db);
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());
@@ -4359,7 +4482,10 @@ mod pane_spawn_tests {
             .find(|t| t.kind == "design")
             .expect("create_project should auto-file a kind='design' task");
 
-        let runner = PaneSpawnRunner::new(cfg, work_db);
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg, work_db, flags);
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());

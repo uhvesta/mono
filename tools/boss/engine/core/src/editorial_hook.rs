@@ -266,6 +266,15 @@ fn is_enforced_subcommand(sub: &str) -> bool {
 /// This function intercepts the outer `cube pr ensure` command directly
 /// and applies the same checks as for `gh pr create` (including template
 /// enforcement).
+///
+/// ## Feature-flag gating
+///
+/// The **caller** is responsible for checking the `editorial_controls`
+/// feature flag before invoking this function. When the flag is disabled
+/// the call site should return `EditorialOutcome::allow()` directly and
+/// skip the call entirely — that is the single choke-point gate for the
+/// PreToolUse surface. The function itself does not check the flag so
+/// that callers can unit-test it independently of the flag state.
 pub fn evaluate_gh_pretooluse(
     command: &str,
     cwd: &Path,

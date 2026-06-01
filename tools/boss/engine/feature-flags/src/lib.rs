@@ -86,6 +86,17 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         category: "completion",
         default_enabled: true,
     },
+    FeatureFlagSpec {
+        name: "editorial_controls",
+        description:
+            "Enable editorial controls for agent-authored PRs and GitHub comments: injects the \
+             [editorial-rules] block into worker prompts (T945), activates the PreToolUse hook \
+             on gh pr|issue calls (T946), and enables editorial_actions audit writes (T947). \
+             DEFAULT OFF — set to true to opt in. Kill switch: set to false to make every \
+             editorial surface a no-op without a rebuild.",
+        category: "editorial",
+        default_enabled: false,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.
@@ -324,6 +335,42 @@ mod tests {
         assert!(detect.default_enabled);
         assert!(detect.enabled);
         assert_eq!(detect.category, "completion");
+    }
+
+    #[test]
+    fn editorial_controls_defaults_off() {
+        // The editorial_controls flag must default to false (kill switch is off by
+        // default — operator opts in rather than having to turn it off under fire).
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("editorial_controls"),
+            "editorial_controls must default to disabled",
+        );
+        let snap = store.snapshot_all();
+        let editorial = snap
+            .iter()
+            .find(|s| s.name == "editorial_controls")
+            .expect("editorial_controls must be in registry");
+        assert!(!editorial.default_enabled, "editorial_controls default_enabled must be false");
+        assert!(!editorial.enabled, "editorial_controls enabled must be false with no override");
+        assert_eq!(editorial.category, "editorial");
+    }
+
+    #[test]
+    fn editorial_controls_can_be_enabled_via_store() {
+        // Verify that the flag can be toggled on through the store (normal opt-in path).
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(!store.is_enabled("editorial_controls"));
+        store.set("editorial_controls", true).unwrap();
+        assert!(store.is_enabled("editorial_controls"));
+        // Persists across a fresh store on the same file.
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("editorial_controls"));
     }
 
     #[test]
