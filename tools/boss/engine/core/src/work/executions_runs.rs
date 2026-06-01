@@ -559,6 +559,22 @@ impl WorkDb {
         // kanban. Don't downgrade items already in `done` or
         // `archived` — manual transitions win.
         //
+        // `in_review` is also protected: a row in Review owns an open
+        // PR, and the only legitimate follow-up work on that PR is a
+        // `kind=revision` task (a separate row that rides the base's
+        // PR). A worker-start that lands on the base while it is
+        // `in_review` — e.g. a stray re-dispatch / late execution
+        // racing a revision's push — must NOT yank the base back out of
+        // Review into Doing. Only an explicit human or merge action
+        // advances a row out of Review. This guards the base row
+        // (chore AND project_task — same machinery, same rule) for the
+        // whole revision lifecycle. `reconcile_revision_execution` has
+        // its own settle path that also abandons such stray executions
+        // for engine-spawned *revision* rows; this guard is the
+        // single, kind-agnostic backstop that closes the hole at the
+        // source so the base never strands in Doing (revision-tasks
+        // stranding regression).
+        //
         // `autostart` is cleared here (single-shot semantics): once a
         // row has ever transitioned to Doing, the flag is consumed so
         // that moving the card back to Backlog later does not trigger
@@ -570,7 +586,7 @@ impl WorkDb {
                  updated_at = ?2
              WHERE id = ?1
                AND deleted_at IS NULL
-               AND status NOT IN ('done', 'archived', 'blocked')",
+               AND status NOT IN ('done', 'archived', 'blocked', 'in_review')",
             params![execution.work_item_id, now],
         )?;
 

@@ -2080,3 +2080,124 @@ fn merge_conflict_revision_still_redispatches_while_attempt_active() {
         "the revision must stay dispatchable while its attempt is active",
     );
 }
+
+// ── Revision completion must leave the base row in Review, never Doing ──
+//
+// Contract: a base task/chore that has a revision underway must REMAIN in
+// `in_review` (the Review column) the whole time — while the revision is in
+// flight AND after it completes. A revision is an amendment to the base
+// row's already-open PR; nothing in the revision lifecycle may transition
+// the base out of Review into `active` (Doing). Only an explicit
+// human/merge action advances a row out of Review.
+//
+// The stranding vector is `start_execution_run`: its kanban auto-advance
+// historically flipped any row that was not `done`/`archived`/`blocked`
+// to `active`, so a stray `ready` execution that landed on the base (a
+// re-dispatch race around the revision's PR push) would yank the base
+// from Review into Doing the moment it started. `reconcile_revision_execution`
+// band-aided this for engine-spawned *revision* rows; the base row had no
+// equivalent guard, and the base kind (chore vs project_task) made no
+// difference — both share the same dispatch machinery. The fix closes the
+// hole at the source so both kinds are covered by one rule.
+
+/// Create a `project_task` in `in_review` with a bound PR, mirroring
+/// `make_in_review_chore` but for a project-member task. The project's
+/// auto-design seed task is skipped so the project_task is itself the
+/// chain root the revision is filed against.
+fn make_in_review_project_task(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product_id.to_owned(),
+            name: "Project for revision tests".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+        })
+        .unwrap();
+    let task = db
+        .create_task(CreateTaskInput {
+            product_id: product_id.to_owned(),
+            project_id: project.id.clone(),
+            name: "Project task for revision tests".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task.id, pr_url],
+        )
+        .unwrap();
+    task.id
+}
+
+/// Shared body: with a revision filed against `base_id` (PR open, base in
+/// Review), a fresh `ready` execution that lands on the base — the
+/// re-dispatch race a completing revision can leave behind — must NOT
+/// demote the base into `active`/Doing when it starts.
+fn assert_started_execution_keeps_base_in_review(db: &WorkDb, base_id: &str) {
+    // File a revision against the base so the base genuinely "has a
+    // revision underway" — the precondition for the contract.
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    db.create_revision(revision_input(base_id), &checker).unwrap();
+    assert_eq!(task_status(db, base_id), "in_review", "precondition");
+
+    // Simulate the stray re-dispatch: a `ready` execution bound to the
+    // base, then a worker claiming it.
+    let exec = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(base_id.to_owned())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(exec.status, "ready");
+    db.start_execution_run(
+        &exec.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )
+    .unwrap();
+
+    assert_eq!(
+        task_status(db, base_id),
+        "in_review",
+        "starting an execution against an in_review base must NOT demote it \
+         out of Review into Doing — the revision rides the base's open PR",
+    );
+}
+
+/// Base is a `chore`.
+#[test]
+fn revision_completion_keeps_base_chore_in_review() {
+    let db = WorkDb::open(temp_db_path("rev-base-chore-in-review")).unwrap();
+    let product_id = make_revision_product(&db, "base-chore-review");
+    let pr_url = "https://github.com/spinyfin/mono/pull/533";
+    let base_id = make_in_review_chore(&db, &product_id, pr_url);
+    assert_started_execution_keeps_base_in_review(&db, &base_id);
+}
+
+/// Base is a `project_task`. Same machinery, same contract — the kind must
+/// not change the outcome (the regression this guards against was a fix
+/// applied to only one kind / only the revision row).
+#[test]
+fn revision_completion_keeps_base_project_task_in_review() {
+    let db = WorkDb::open(temp_db_path("rev-base-pt-in-review")).unwrap();
+    let product_id = make_revision_product(&db, "base-pt-review");
+    let pr_url = "https://github.com/spinyfin/mono/pull/534";
+    let base_id = make_in_review_project_task(&db, &product_id, pr_url);
+    assert_started_execution_keeps_base_in_review(&db, &base_id);
+}
