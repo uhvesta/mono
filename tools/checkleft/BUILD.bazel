@@ -56,3 +56,25 @@ rust_test(
         proc_macro_dev = True,
     ),
 )
+
+# Functional / end-to-end change-detection suite: drives a real git repo (and a
+# jj-colocated variant) through every scenario in the design matrix and asserts
+# both the resolved base sha and the scoped file set. Exercises the public
+# `resolve_change_plan` entry point exactly as the binary does. The vendored
+# GitHub event payloads under tests/fixtures are embedded via include_str!.
+rust_test(
+    name = "change_detection_e2e_test",
+    srcs = ["tests/change_detection_e2e.rs"],
+    compile_data = glob(["tests/fixtures/**"]),
+    edition = "2024",
+    deps = [
+        ":checkleft_lib",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+)

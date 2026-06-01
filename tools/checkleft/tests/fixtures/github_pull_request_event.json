@@ -1,0 +1,26 @@
+{
+  "action": "synchronize",
+  "number": 948,
+  "pull_request": {
+    "number": 948,
+    "state": "open",
+    "title": "Robust change detection in checkleft",
+    "base": {
+      "label": "example:main",
+      "ref": "main",
+      "sha": "fedcba9876543210fedcba9876543210fedcba98"
+    },
+    "head": {
+      "label": "example:robust-change-detection",
+      "ref": "robust-change-detection",
+      "sha": "0011223344556677889900aabbccddeeff001122"
+    }
+  },
+  "repository": {
+    "id": 123456789,
+    "name": "mono",
+    "full_name": "example/mono",
+    "default_branch": "main",
+    "private": true
+  }
+}
