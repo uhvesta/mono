@@ -1630,25 +1630,22 @@ impl ExecutionCoordinator {
 
                 if is_automation {
                     auto_pool_exhausted = true;
-                    // For automation triage executions, write the pool-exhausted
-                    // reason into automation_runs.detail so the UI can explain
-                    // "failed, retrying" rather than showing a bare badge.
+                    // For automation triage executions, mark the automation_runs
+                    // row as `pool_throttled` (not `failed_will_retry`) so the UI
+                    // shows "Queued" rather than a failure badge.
                     if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
                         let detail = format!(
                             "automation pool exhausted ({pool_capacity}/{pool_capacity} busy); \
-                             triage deferred, will retry when a slot frees"
+                             triage queued, will dispatch when a slot frees"
                         );
                         if let Err(err) = self
                             .work_db
-                            .update_automation_run_detail_for_triage_execution(
-                                &execution.id,
-                                &detail,
-                            )
+                            .update_automation_run_for_pool_throttle(&execution.id, &detail)
                         {
                             tracing::warn!(
                                 execution_id = %execution.id,
                                 ?err,
-                                "failed to record pool-exhausted detail on automation_runs row",
+                                "failed to record pool_throttled outcome on automation_runs row",
                             );
                         }
                     }
@@ -2049,6 +2046,24 @@ impl ExecutionCoordinator {
                             "execution_started_auto_advance",
                         )
                         .await;
+                }
+                // For automation triage executions, advance the
+                // automation_runs row from its queued/pessimistic state
+                // (`pool_throttled` or `failed_will_retry`) to
+                // `triage_running` now that a pool slot is held and the
+                // agent is about to start. The completion handler will
+                // overwrite this with the terminal outcome.
+                if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                    if let Err(err) = self
+                        .work_db
+                        .mark_automation_run_triage_started(&execution.id)
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            ?err,
+                            "failed to mark automation run triage_running on start",
+                        );
+                    }
                 }
                 // Resume-bounce SHA-delta gate: capture the bound
                 // chore PR's head SHA into the execution row BEFORE

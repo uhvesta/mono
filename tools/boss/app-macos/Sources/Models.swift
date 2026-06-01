@@ -73,6 +73,8 @@ struct AppAutomation: Identifiable, Hashable {
         case "produced_task": return "Produced task"
         case "skipped": return "Skipped"
         case "suppressed_at_limit": return "At limit"
+        case "pool_throttled": return "Queued"
+        case "triage_running": return "Running"
         case "failed_will_retry": return "Failed (retrying)"
         case "failed_gave_up": return "Failed"
         default: return outcome.replacingOccurrences(of: "_", with: " ").capitalized
@@ -98,6 +100,8 @@ struct AppAutomationRun: Identifiable, Hashable {
         case "produced_task": return "Produced task"
         case "skipped": return "Skipped"
         case "suppressed_at_limit": return "At limit"
+        case "pool_throttled": return "Queued"
+        case "triage_running": return "Running"
         case "failed_will_retry": return "Failed (retrying)"
         case "failed_gave_up": return "Failed"
         default: return outcome.replacingOccurrences(of: "_", with: " ").capitalized

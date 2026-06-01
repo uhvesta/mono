@@ -157,6 +157,8 @@ private struct AutomationRowView: View {
         case "produced_task": return .green
         case "skipped": return .secondary
         case "suppressed_at_limit": return .orange
+        case "pool_throttled": return .secondary
+        case "triage_running": return .blue
         case "failed_will_retry": return .orange
         case "failed_gave_up": return .red
         default: return .secondary
@@ -465,6 +467,8 @@ private struct AutomationRunRow: View {
         case "produced_task": return .green
         case "skipped": return .secondary
         case "suppressed_at_limit": return .orange
+        case "pool_throttled": return .secondary
+        case "triage_running": return .blue
         case "failed_will_retry": return .orange
         case "failed_gave_up": return .red
         default: return .secondary

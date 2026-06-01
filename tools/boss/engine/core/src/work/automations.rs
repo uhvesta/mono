@@ -696,6 +696,72 @@ impl WorkDb {
         Ok(rows_changed > 0)
     }
 
+    /// Mark a triage execution's `automation_runs` row as `pool_throttled` —
+    /// the triage execution is queued in `ready` status waiting for an
+    /// automation pool slot. Also updates `automations.last_outcome` so the
+    /// sidebar reflects the correct non-failure state.
+    ///
+    /// Only transitions from `failed_will_retry` (the pessimistic initial
+    /// state the scheduler writes) so it is idempotent: a second call while
+    /// still throttled is a no-op. Returns `true` when a row was updated.
+    pub fn update_automation_run_for_pool_throttle(
+        &self,
+        triage_execution_id: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows_changed = tx.execute(
+            "UPDATE automation_runs
+                SET outcome = 'pool_throttled', detail = ?2
+              WHERE triage_execution_id = ?1
+                AND outcome = 'failed_will_retry'",
+            params![triage_execution_id, detail],
+        )?;
+        if rows_changed > 0 {
+            tx.execute(
+                "UPDATE automations
+                    SET last_outcome = 'pool_throttled'
+                  WHERE id = (SELECT automation_id FROM automation_runs
+                               WHERE triage_execution_id = ?1 LIMIT 1)",
+                params![triage_execution_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows_changed > 0)
+    }
+
+    /// Mark a triage execution's `automation_runs` row as `triage_running` —
+    /// a pool slot was claimed and the triage agent is now active. Also
+    /// updates `automations.last_outcome`. Transitions from `pool_throttled`
+    /// (if the run was previously queued) or `failed_will_retry` (if it was
+    /// dispatched immediately). Returns `true` when a row was updated.
+    pub fn mark_automation_run_triage_started(
+        &self,
+        triage_execution_id: &str,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let rows_changed = tx.execute(
+            "UPDATE automation_runs
+                SET outcome = 'triage_running'
+              WHERE triage_execution_id = ?1
+                AND outcome IN ('failed_will_retry', 'pool_throttled')",
+            params![triage_execution_id],
+        )?;
+        if rows_changed > 0 {
+            tx.execute(
+                "UPDATE automations
+                    SET last_outcome = 'triage_running'
+                  WHERE id = (SELECT automation_id FROM automation_runs
+                               WHERE triage_execution_id = ?1 LIMIT 1)",
+                params![triage_execution_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows_changed > 0)
+    }
+
     /// Create the single maintenance task produced by an automation's triage
     /// phase (`boss task create --automation`). Maint task 6.
     ///

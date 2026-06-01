@@ -298,8 +298,12 @@ pub struct AutomationPatch {
 /// - `skipped` — triage agent decided nothing actionable exists right now.
 /// - `suppressed_at_limit` — fire was due but open-task count was already at
 ///   the cap; no triage agent ran.
-/// - `failed_will_retry` — pre-start failure (VPN down, cube lease error);
-///   same `scheduled_for` will be retried with backoff.
+/// - `pool_throttled` — the automation pool was full; execution is queued
+///   (`ready`) and will self-dispatch when a slot frees. Not a failure.
+/// - `triage_running` — a pool slot was claimed and the triage agent is active.
+///   Replaced by the terminal outcome on completion.
+/// - `failed_will_retry` — genuine pre-start failure (VPN down, cube lease
+///   error); same `scheduled_for` will be retried with backoff.
 /// - `failed_gave_up` — retries exhausted; occurrence abandoned, schedule
 ///   advances.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,11 +343,20 @@ pub struct AutomationRun {
 /// pessimistic `failed_will_retry` default at fire time; the triage
 /// outcome detector flips a fired run to `produced_task` / `skipped` /
 /// `failed_gave_up` once the worker reaches a decision (Maint task 6).
+///
+/// Progressive in-flight states (not terminal):
+/// - `pool_throttled` — the automation pool was full when dispatch was
+///   attempted; the triage execution is queued (`ready`) and will be
+///   dispatched automatically once a slot frees up. Not a failure.
+/// - `triage_running` — a pool slot was claimed and the triage agent is
+///   actively running. Replaced by the terminal outcome on completion.
 pub const AUTOMATION_OUTCOME_PRODUCED_TASK: &str = "produced_task";
 pub const AUTOMATION_OUTCOME_SKIPPED: &str = "skipped";
 pub const AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT: &str = "suppressed_at_limit";
 pub const AUTOMATION_OUTCOME_FAILED_WILL_RETRY: &str = "failed_will_retry";
 pub const AUTOMATION_OUTCOME_FAILED_GAVE_UP: &str = "failed_gave_up";
+pub const AUTOMATION_OUTCOME_POOL_THROTTLED: &str = "pool_throttled";
+pub const AUTOMATION_OUTCOME_TRIAGE_RUNNING: &str = "triage_running";
 
 /// `work_executions.kind` discriminator for an automation triage execution
 /// (Maint task 6). A triage execution is bound to an automation (its
