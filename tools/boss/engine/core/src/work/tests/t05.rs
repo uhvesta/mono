@@ -724,6 +724,148 @@ fn product_design_repo_set_and_clear() {
     let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
 }
 
+/// Investigation tasks on a product with `docs_repo` set must
+/// resolve to `docs_repo` rather than `repo_remote_url`, the
+/// docs-repo analogue of the `design_repo` routing above.
+/// Implementation-kind tasks on the same product are unaffected.
+#[test]
+fn resolve_repo_uses_docs_repo_for_investigation_kind() {
+    let path = disk_db_path("resolve-docs-repo");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+
+    // Create a chore, then flip its kind to `investigation` directly
+    // (bypassing the create invariant) so the resolver sees an
+    // investigation row on a single-repo product.
+    let investigation = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Investigation".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET kind = 'investigation' WHERE id = ?1",
+        [&investigation.id],
+    )
+    .unwrap();
+
+    let resolved = resolve_repo_for_work_item(&conn, &investigation.id).unwrap();
+    assert_eq!(
+        resolved.as_deref(),
+        Some("git@github.com:linkedin-sandbox/bduff.git"),
+        "investigation task must resolve to product.docs_repo",
+    );
+
+    // Implementation-kind tasks on the same product are unaffected.
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Implementation chore".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    let resolved = resolve_repo_for_work_item(&conn, &chore.id).unwrap();
+    assert_eq!(
+        resolved.as_deref(),
+        Some("git@github.com:spinyfin/mono.git"),
+        "implementation-kind tasks must continue to resolve to product.repo_remote_url",
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+}
+
+/// Round-trip: setting `docs_repo` via `create` and clearing it via
+/// `update_work_item("")` mirrors the `design_repo` behaviour.
+/// Confirms the patch path applies / clears the column rather than
+/// silently ignoring it.
+#[test]
+fn product_docs_repo_set_and_clear() {
+    let path = disk_db_path("docs-repo-set-clear");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: Some("git@github.com:linkedin-sandbox/bduff.git".to_owned()),
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    assert_eq!(
+        product.docs_repo.as_deref(),
+        Some("git@github.com:linkedin-sandbox/bduff.git"),
+    );
+
+    // Updating an unrelated field must leave docs_repo intact.
+    let renamed = db
+        .update_work_item(
+            &product.id,
+            WorkItemPatch {
+                name: Some("Boss Renamed".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    let WorkItem::Product(renamed) = renamed else {
+        panic!("expected Product");
+    };
+    assert_eq!(
+        renamed.docs_repo.as_deref(),
+        Some("git@github.com:linkedin-sandbox/bduff.git"),
+        "patch that omits docs_repo must leave it unchanged",
+    );
+
+    let cleared = db
+        .update_work_item(
+            &product.id,
+            WorkItemPatch {
+                docs_repo: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+    let WorkItem::Product(cleared) = cleared else {
+        panic!("expected Product");
+    };
+    assert!(
+        cleared.docs_repo.is_none(),
+        "empty-string patch must clear docs_repo, got {:?}",
+        cleared.docs_repo,
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+}
+
 #[test]
 fn resolve_repo_errors_when_parent_product_is_missing() {
     let (path, db, product_id, task_id) = make_resolve_scaffold(

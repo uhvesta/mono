@@ -1661,6 +1661,13 @@ pub struct WorkItemPatch {
     /// clear (write NULL). Stored canonicalised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_repo: Option<String>,
+    /// Product-level investigation-task ("docs") repo override. Only
+    /// honoured on product-targeted updates; ignored when patching a
+    /// task / chore / project. `None` → leave unchanged. `Some("")` →
+    /// clear (write NULL → fall through to `BOSS_USER_DOCS_REPO`).
+    /// Stored canonicalised. See [`Product::docs_repo`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_repo: Option<String>,
     /// Product-level worker branch-name prefix. Only honoured on
     /// product-targeted updates; ignored when patching a task / chore /
     /// project. `None` → leave unchanged. `Some("")` → clear (write

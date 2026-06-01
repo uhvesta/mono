@@ -36,6 +36,7 @@ exclude_files = [
   "tools/boss/engine/core/src/merge_poller.rs",
   "tools/boss/engine/core/src/runner.rs",
   "tools/boss/cli/src/main.rs",
+  "tools/boss/protocol/src/types.rs",
   "tools/cube/src/app.rs",
   "tools/boss/app-macos/Sources/ContentView.swift",
 ]

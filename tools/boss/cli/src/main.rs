@@ -1305,6 +1305,14 @@ struct ProductCreateArgs {
     #[arg(long = "design-repo")]
     design_repo: Option<String>,
 
+    /// Per-product override for `kind=investigation` tasks. When set,
+    /// investigation writeups on this product open their doc PR against
+    /// this repo (e.g. a docs site) instead of `--repo`. Unset → fall
+    /// through to `BOSS_USER_DOCS_REPO`, then `--repo`. Implementation
+    /// tasks are unaffected; per-task `--repo` overrides still win.
+    #[arg(long = "docs-repo")]
+    docs_repo: Option<String>,
+
     /// Leading prefix for worker branch names on this product. Workers
     /// push to `<prefix>exec_<id>`; only this prefix is configurable
     /// (the `exec_<id>` suffix is fixed). Set it to satisfy orgs that
@@ -1334,6 +1342,13 @@ struct ProductUpdateArgs {
     /// `ProductCreateArgs::design_repo`.
     #[arg(long = "design-repo")]
     design_repo: Option<String>,
+
+    /// Set or clear the per-product investigation-task ("docs") repo
+    /// override. Pass a URL to set it, `""` to clear (→ fall through to
+    /// `BOSS_USER_DOCS_REPO`), or omit to leave unchanged. See
+    /// `ProductCreateArgs::docs_repo`.
+    #[arg(long = "docs-repo")]
+    docs_repo: Option<String>,
 
     #[arg(long)]
     status: Option<ProductStatus>,
@@ -2635,6 +2650,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
             let description = optional_text(args.description, "Description", ctx)?;
             let repo_remote_url = optional_text(args.repo_remote_url, "Repo remote URL", ctx)?;
             let design_repo = args.design_repo;
+            let docs_repo = args.docs_repo;
 
             let product = create_product(
                 &mut client,
@@ -2643,7 +2659,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     description,
                     repo_remote_url,
                     design_repo,
-                    docs_repo: None,
+                    docs_repo,
                     worker_branch_prefix: args.worker_branch_prefix,
                 },
             )
@@ -2673,6 +2689,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 status: args.status.map(|status| status.as_str().to_owned()),
                 repo_remote_url: args.repo_remote_url,
                 design_repo: args.design_repo,
+                docs_repo: args.docs_repo,
                 dispatch_preamble: args.dispatch_preamble,
                 worker_branch_prefix: args.worker_branch_prefix,
                 ..WorkItemPatch::default()
@@ -8055,6 +8072,9 @@ fn print_product_details(title: &str, product: &Product) {
     println!("Repo: {}", product.repo_remote_url.as_deref().unwrap_or(""));
     if let Some(design_repo) = product.design_repo.as_deref() {
         println!("Design repo: {design_repo}");
+    }
+    if let Some(docs_repo) = product.docs_repo.as_deref() {
+        println!("Docs repo: {docs_repo}");
     }
     if let Some(prefix) = product.worker_branch_prefix.as_deref() {
         println!("Worker branch prefix: {prefix}");

@@ -11,6 +11,7 @@ impl WorkDb {
         apply_text_patch(&mut product.description, patch.description);
         apply_repo_remote_url_patch(&mut product.repo_remote_url, patch.repo_remote_url);
         apply_repo_remote_url_patch(&mut product.design_repo, patch.design_repo);
+        apply_repo_remote_url_patch(&mut product.docs_repo, patch.docs_repo);
         apply_text_patch(&mut product.status, patch.status);
         apply_optional_string_patch(&mut product.default_model, patch.default_model);
         apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
@@ -28,7 +29,7 @@ impl WorkDb {
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12
              WHERE id = ?1",
             params![
                 product.id,
@@ -42,6 +43,7 @@ impl WorkDb {
                 product.dispatch_preamble,
                 product.design_repo,
                 product.worker_branch_prefix,
+                product.docs_repo,
             ],
         )?;
 
