@@ -76,10 +76,15 @@ final class ChatViewModel: ObservableObject {
     /// Attention group *members* keyed by `AttentionGroup.id`, in display
     /// order. Populated alongside [[attentionGroupsByProductID]].
     @Published var attentionMembersByGroupID: [String: [Attention]] = [:]
-    /// Product IDs for which a dismissed-groups list response is currently
-    /// in flight. Used by `applyAttentionGroupsList` to route the response
-    /// to the dismissed-merge path rather than the open-replace path.
-    private var pendingDismissedGroupLoads: Set<String> = []
+    /// Count of in-flight dismissed-groups list responses per product ID.
+    /// Used by `applyAttentionGroupsList` to route the response to the
+    /// dismissed-merge path rather than the open-replace path. A counter
+    /// (not a Set) because product selection and work-tree receipt each call
+    /// `loadDismissedAttentionGroups`, so two dismissed requests can be in
+    /// flight simultaneously for the same product — a Set would lose the
+    /// second slot and misroute its response as an open-list, replacing the
+    /// open groups with dismissed ones.
+    var pendingDismissedGroupLoads: [String: Int] = [:]
     /// Historical execution rows keyed by task id. Populated on demand when
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
@@ -125,11 +130,11 @@ final class ChatViewModel: ObservableObject {
     /// badge. Computed by `setDepBadgeHover`; cleared when the pointer
     /// leaves the badge. Views observe this to apply a transient
     /// amber border on every frontier card.
-    @Published private(set) var depFrontierHighlightIDs: Set<String> = []
+    @Published var depFrontierHighlightIDs: Set<String> = []
     /// Set of revision task IDs to highlight when the pointer is over an
     /// "In revision" badge. Computed by `setRevisionBadgeHover`; cleared
     /// on pointer exit. Uses the same green-border overlay as dep frontier.
-    @Published private(set) var revisionHighlightIDs: Set<String> = []
+    @Published var revisionHighlightIDs: Set<String> = []
     /// Task id that scroll views should bring into the visible area.
     /// Set by `revealWorkCard`; cleared after a short delay once the
     /// scroll has been triggered. Views observe this via `.onChange`
@@ -727,7 +732,7 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    private let engine: EngineClient
+    let engine: EngineClient
     /// Test-only hook: forwarded to `EngineClient.outboundRecorder`
     /// so an XCTest can assert that the form's submit lands the
     /// expected `repo_remote_url` on the wire. The real socket write
@@ -957,7 +962,7 @@ final class ChatViewModel: ObservableObject {
         defaults.set(value, forKey: showArchivedProjectsDefaultsKey)
     }
 
-    private func persistProjectFilterIDs() {
+    func persistProjectFilterIDs() {
         if selectedProjectFilterIDs.isEmpty {
             defaults.removeObject(forKey: selectedProjectFilterIDsDefaultsKey)
         } else {
@@ -2166,279 +2171,9 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: Attentions (attentions.md — Notifications toolbar + window)
-
-    /// Replace the product's group set from a full `list_attention_groups`
-    /// reply, bucketing the flat member list by group id and pruning member
-    /// entries for groups that dropped out of the (open) list.
-    ///
-    /// Handles two response kinds:
-    /// - Open-list (default): replaces open/partially_answered groups while
-    ///   preserving dismissed groups so the "Rejected" section survives reloads.
-    /// - Dismissed-list (fired when `pendingDismissedGroupLoads` contains the
-    ///   product id): merges dismissed groups into the stored open list.
-    private func applyAttentionGroupsList(
-        productID: String,
-        groups: [AttentionGroup],
-        members: [Attention]
-    ) {
-        let isDismissedBatch = pendingDismissedGroupLoads.remove(productID) != nil
-        let prior = attentionGroupsByProductID[productID] ?? []
-        let incomingIDs = Set(groups.map(\.id))
-
-        var bucketed: [String: [Attention]] = [:]
-        for member in members {
-            bucketed[member.groupID, default: []].append(member)
-        }
-        for group in groups {
-            attentionMembersByGroupID[group.id] =
-                (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
-        }
-
-        if isDismissedBatch {
-            // Dismissed-only response: upsert dismissed groups, keep open ones.
-            // Remove member data for dismissed groups that are no longer present.
-            let priorDismissedIDs = Set(prior.filter(\.isDismissed).map(\.id))
-            for goneID in priorDismissedIDs.subtracting(incomingIDs) {
-                attentionMembersByGroupID.removeValue(forKey: goneID)
-            }
-            let keptOpen = prior.filter { !$0.isDismissed && !incomingIDs.contains($0.id) }
-            attentionGroupsByProductID[productID] = keptOpen + groups
-        } else {
-            // Open-list response: replace open groups, keep dismissed ones so
-            // the "Rejected" restore UI survives full reloads.
-            let keptDismissed = prior.filter { $0.isDismissed && !incomingIDs.contains($0.id) }
-            let openPriorIDs = Set(prior.filter { !$0.isDismissed }.map(\.id))
-            for goneID in openPriorIDs.subtracting(incomingIDs) {
-                attentionMembersByGroupID.removeValue(forKey: goneID)
-            }
-            attentionGroupsByProductID[productID] = groups + keptDismissed
-        }
-    }
-
-    /// Insert or replace a group within its product bucket (live-update path).
-    private func upsertAttentionGroup(_ group: AttentionGroup) {
-        var list = attentionGroupsByProductID[group.productID] ?? []
-        if let idx = list.firstIndex(where: { $0.id == group.id }) {
-            list[idx] = group
-        } else {
-            list.append(group)
-        }
-        attentionGroupsByProductID[group.productID] = list
-    }
-
-    /// Insert or replace one member within its group's row list.
-    private func upsertAttentionMember(_ member: Attention) {
-        var list = attentionMembersByGroupID[member.groupID] ?? []
-        if let idx = list.firstIndex(where: { $0.id == member.id }) {
-            list[idx] = member
-        } else {
-            list.append(member)
-        }
-        attentionMembersByGroupID[member.groupID] = list.sorted { $0.ordinal < $1.ordinal }
-    }
-
-    /// Record an answer for a question member (`yes`/`no`, a chosen value, or
-    /// free text). The engine replies with `attention_group_updated`.
-    func answerAttention(_ attentionID: String, answer: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: answer, skip: false, dismiss: false)
-    }
-
-    /// Accept a followup member (mark it `answered` with no value) so it is
-    /// included when the group is actioned.
-    func acceptFollowup(_ attentionID: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: false, dismiss: false)
-    }
-
-    /// Mark a member `skipped` — a rejected followup or a question the human
-    /// chooses not to answer. Skipped members contribute nothing on action.
-    func skipAttention(_ attentionID: String) {
-        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: true, dismiss: false)
-    }
-
-    /// Dismiss a single member (`atn_…`) without producing anything.
-    func dismissAttentionMember(_ attentionID: String) {
-        engine.sendDismissAttention(id: attentionID, reason: nil)
-    }
-
-    /// Dismiss a whole group (`atg_…`) without producing anything.
-    func dismissAttentionGroup(_ groupID: String) {
-        engine.sendDismissAttention(id: groupID, reason: nil)
-    }
-
-    /// Restore a dismissed group back to open so the human can re-evaluate it.
-    /// The engine resets all skipped/dismissed members to open and replies
-    /// with `attention_group_updated`, which `upsertAttentionGroup` picks up.
-    func restoreAttentionGroup(_ groupID: String) {
-        engine.sendRestoreAttentionGroup(id: groupID)
-    }
-
-    /// Action a group — produce its downstream artifact (one revision /
-    /// design task, or a batch task-create) and close it. Open members are
-    /// skipped first ("skip remaining") so the human needn't touch every row.
-    func actionAttentionGroup(_ groupID: String) {
-        engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true)
-    }
-
-    /// Load dismissed groups for a product and merge them into the stored list.
-    /// Called alongside `sendListAttentionGroups` so the "Rejected" section
-    /// is populated on product select and app reconnect.
-    private func loadDismissedAttentionGroups(for productID: String) {
-        pendingDismissedGroupLoads.insert(productID)
-        engine.sendListAttentionGroups(productId: productID, state: "dismissed")
-    }
-
-    /// Jump a group's association into view: a task association reveals its
-    /// kanban card; a project association focuses that project's board.
-    func revealAttentionAssociation(_ group: AttentionGroup) {
-        if let taskID = group.associationTaskID,
-           let task = task(withID: taskID) {
-            revealWorkCard(taskID, productID: task.productID)
-        } else if let projectID = group.associationProjectID {
-            revealAttentionProject(projectID)
-        }
-    }
-
-    /// Focus a project's board in the kanban (Work mode, product selected,
-    /// project filter narrowed to the one project).
-    func revealAttentionProject(_ projectID: String) {
-        guard let project = project(withID: projectID) else { return }
-        setNavigationMode(.work)
-        if currentSelectedProductID != project.productID {
-            selectWorkProduct(project.productID)
-        }
-        selectedProjectFilterIDs = [projectID]
-        persistProjectFilterIDs()
-    }
-
-    /// The task a group is associated with, or `nil` for project associations.
-    func attentionAssociationTask(_ group: AttentionGroup) -> WorkTask? {
-        guard let taskID = group.associationTaskID else { return nil }
-        return task(withID: taskID)
-    }
-
-    /// Short display label for a group's association — `"T34"` / `"P12"` /
-    /// a project name / `"Open"` when neither resolves.
-    func attentionAssociationLabel(_ group: AttentionGroup) -> String {
-        if let taskID = group.associationTaskID {
-            if let task = task(withID: taskID), let shortID = task.shortID {
-                return "T\(shortID)"
-            }
-            return "Task"
-        }
-        if let projectID = group.associationProjectID {
-            if let project = project(withID: projectID) {
-                return project.shortID.map { "P\($0)" } ?? project.name
-            }
-            return "Project"
-        }
-        return "Open"
-    }
-
-    /// Reveal a produced revision / task card after a group is actioned.
-    func revealProducedArtifact(_ ref: ProducedArtifactRef) {
-        guard let task = task(withID: ref.taskID) else { return }
-        revealWorkCard(ref.taskID, productID: task.productID)
-    }
-
-    /// Open the design doc a question group is about, reusing the project
-    /// design-doc viewer when the group's association project resolves.
-    func openAttentionDesignDoc(_ group: AttentionGroup) {
-        guard let projectID = group.associationProjectID,
-              let project = project(withID: projectID)
-        else { return }
-        openProjectDesignDoc(project)
-    }
-
-    /// Engine-tab entry point: ask the engine for the current attempt
-    /// list. Idempotent — the view-model just overwrites the array
-    /// when the reply lands.
-    func refreshConflictResolutions() {
-        engine.sendListConflictResolutions(limit: 200)
-    }
-
-    /// Mirror of [[refreshConflictResolutions]] for the CI subsystem
-    /// (design Phase 11 #37). Idempotent.
-    func refreshCiRemediations() {
-        engine.sendListCiRemediations(limit: 200)
-    }
-
-    /// Refresh both engine-tab attempt subsystems together — the
-    /// activity log surfaces a single button that should pull every
-    /// row kind in one call.
-    func refreshEngineAttempts() {
-        engine.sendListConflictResolutions(limit: 200)
-        engine.sendListCiRemediations(limit: 200)
-    }
-
-    // MARK: - Automation actions
-
-    /// Load automations for the currently selected product. No-op when
-    /// disconnected or no product is selected.
-    func refreshAutomations() {
-        guard isConnected, let productID = currentSelectedProductID else { return }
-        engine.sendListAutomations(productId: productID)
-    }
-
-    func createAutomation(
-        productID: String,
-        name: String,
-        cron: String,
-        timezone: String,
-        standingInstruction: String,
-        openTaskLimit: Int = 1,
-        enabled: Bool = true,
-        repoRemoteURL: String? = nil
-    ) {
-        engine.sendCreateAutomation(
-            productId: productID,
-            name: name,
-            cron: cron,
-            timezone: timezone,
-            standingInstruction: standingInstruction,
-            openTaskLimit: openTaskLimit,
-            enabled: enabled,
-            repoRemoteURL: repoRemoteURL
-        )
-    }
-
-    func updateAutomation(
-        id: String,
-        name: String? = nil,
-        cron: String? = nil,
-        timezone: String? = nil,
-        standingInstruction: String? = nil,
-        openTaskLimit: Int? = nil
-    ) {
-        var patch: [String: Any] = [:]
-        if let name { patch["name"] = name }
-        if let cron, let timezone {
-            patch["trigger"] = ["kind": "schedule", "cron": cron, "timezone": timezone]
-        }
-        if let standingInstruction { patch["standing_instruction"] = standingInstruction }
-        if let openTaskLimit { patch["open_task_limit"] = openTaskLimit }
-        guard !patch.isEmpty else { return }
-        engine.sendUpdateAutomation(id: id, patch: patch)
-    }
-
-    func enableAutomation(id: String) {
-        engine.sendEnableAutomation(id: id)
-    }
-
-    func disableAutomation(id: String) {
-        engine.sendDisableAutomation(id: id)
-    }
-
-    func deleteAutomation(id: String) {
-        if selectedAutomationID == id {
-            selectedAutomationID = nil
-        }
-        engine.sendDeleteAutomation(id: id)
-    }
-
     // MARK: - Private Helpers
 
-    private var currentSelectedProductID: String? {
+    var currentSelectedProductID: String? {
         selectedWorkProductID
     }
 
@@ -2525,7 +2260,7 @@ final class ChatViewModel: ObservableObject {
         return nil
     }
 
-    private func task(withID id: String) -> WorkTask? {
+    func task(withID id: String) -> WorkTask? {
         for tasks in tasksByProjectID.values {
             if let task = tasks.first(where: { $0.id == id }) {
                 return task
@@ -2876,350 +2611,7 @@ final class ChatViewModel: ObservableObject {
         cachedAmbiguousRepoNames = nil
     }
 
-    /// Bucket completed tasks by recency for the Done lane:
-    ///   Today | Yesterday | <weekday names back to start of current week>
-    ///   | Last Week | Earlier
-    /// Bucketing uses `updated_at` because the engine doesn't yet record a
-    /// dedicated `done_at` (status-transition) timestamp — see PR description.
-    static func doneSections(
-        items: [WorkTask],
-        now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> [WorkBoardSection] {
-        let isoFractional = ISO8601DateFormatter()
-        isoFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoPlain = ISO8601DateFormatter()
-        isoPlain.formatOptions = [.withInternetDateTime]
 
-        let nowDay = calendar.startOfDay(for: now)
-        guard let yesterdayDay = calendar.date(byAdding: .day, value: -1, to: nowDay) else {
-            return [WorkBoardSection(id: "done-all", title: "Done", items: items)]
-        }
-        let weekday = calendar.component(.weekday, from: nowDay)
-        let firstWeekday = calendar.firstWeekday
-        let daysSinceStartOfWeek = (weekday - firstWeekday + 7) % 7
-        guard let startOfWeek = calendar.date(byAdding: .day, value: -daysSinceStartOfWeek, to: nowDay),
-              let startOfLastWeek = calendar.date(byAdding: .day, value: -7, to: startOfWeek)
-        else {
-            return [WorkBoardSection(id: "done-all", title: "Done", items: items)]
-        }
-
-        let weekdayFormatter = DateFormatter()
-        weekdayFormatter.locale = .current
-        weekdayFormatter.dateFormat = "EEEE"
-
-        struct BucketSpec {
-            let id: String
-            let title: String
-            let defaultExpanded: Bool
-        }
-
-        var bucketOrder: [BucketSpec] = [
-            BucketSpec(id: "today", title: "Today", defaultExpanded: true),
-            BucketSpec(id: "yesterday", title: "Yesterday", defaultExpanded: false),
-        ]
-        if daysSinceStartOfWeek >= 2 {
-            for daysAgo in 2...daysSinceStartOfWeek {
-                if let date = calendar.date(byAdding: .day, value: -daysAgo, to: nowDay) {
-                    bucketOrder.append(
-                        BucketSpec(
-                            id: "weekday-\(daysAgo)",
-                            title: weekdayFormatter.string(from: date),
-                            defaultExpanded: false
-                        )
-                    )
-                }
-            }
-        }
-        bucketOrder.append(BucketSpec(id: "last-week", title: "Last Week", defaultExpanded: false))
-        bucketOrder.append(BucketSpec(id: "earlier", title: "Earlier", defaultExpanded: false))
-
-        var buckets: [String: [WorkTask]] = [:]
-        for task in items {
-            let bucketID = bucketID(
-                for: task,
-                nowDay: nowDay,
-                yesterdayDay: yesterdayDay,
-                startOfWeek: startOfWeek,
-                startOfLastWeek: startOfLastWeek,
-                calendar: calendar,
-                isoFormatters: [isoFractional, isoPlain]
-            )
-            buckets[bucketID, default: []].append(task)
-        }
-
-        return bucketOrder.compactMap { spec -> WorkBoardSection? in
-            guard let tasks = buckets[spec.id], !tasks.isEmpty else { return nil }
-            let sorted = tasks.sorted { $0.updatedAt > $1.updatedAt }
-            return WorkBoardSection(
-                id: "done-\(spec.id)",
-                title: spec.title,
-                items: sorted,
-                isCollapsible: true,
-                defaultExpanded: spec.defaultExpanded
-            )
-        }
-    }
-
-    private static func bucketID(
-        for task: WorkTask,
-        nowDay: Date,
-        yesterdayDay: Date,
-        startOfWeek: Date,
-        startOfLastWeek: Date,
-        calendar: Calendar,
-        isoFormatters: [ISO8601DateFormatter]
-    ) -> String {
-        guard let parsed = parseUpdatedAt(task.updatedAt, isoFormatters: isoFormatters) else {
-            return "earlier"
-        }
-        let day = calendar.startOfDay(for: parsed)
-        if day >= nowDay {
-            return "today"
-        }
-        if day >= yesterdayDay {
-            return "yesterday"
-        }
-        if day >= startOfWeek {
-            let delta = calendar.dateComponents([.day], from: day, to: nowDay).day ?? 0
-            return "weekday-\(delta)"
-        }
-        if day >= startOfLastWeek {
-            return "last-week"
-        }
-        return "earlier"
-    }
-
-    /// `boss chore list --json` currently emits `updated_at` in two
-    /// shapes — Unix epoch seconds as a digit string for older rows
-    /// and ISO 8601 for newer ones. The UI must handle both until the
-    /// data-shape canonicalization chore lands; treat all-digit
-    /// strings as Unix seconds, otherwise fall back to ISO parsing.
-    static func parseUpdatedAt(
-        _ string: String,
-        isoFormatters: [ISO8601DateFormatter]
-    ) -> Date? {
-        let trimmed = string.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty,
-           trimmed.allSatisfy({ $0.isASCII && $0.isNumber }),
-           let seconds = TimeInterval(trimmed) {
-            return Date(timeIntervalSince1970: seconds)
-        }
-        for formatter in isoFormatters {
-            if let date = formatter.date(from: trimmed) {
-                return date
-            }
-        }
-        return nil
-    }
-
-    func isTaskVisible(_ task: WorkTask) -> Bool {
-        workItems(in: effectiveBoardColumn(for: task)).contains(where: { $0.id == task.id })
-    }
-
-    private func mergeTaskRuntimes(
-        _ runtimes: [WorkTaskRuntime],
-        for productID: String,
-        tasks: [WorkTask],
-        chores: [WorkTask]
-    ) {
-        let productItemIDs = Set(tasks.map(\.id) + chores.map(\.id))
-        taskRuntimesByID = taskRuntimesByID.filter { !productItemIDs.contains($0.key) }
-        for runtime in runtimes {
-            taskRuntimesByID[runtime.workItemID] = runtime
-        }
-    }
-
-    func taskRuntime(for taskID: String) -> WorkTaskRuntime? {
-        taskRuntimesByID[taskID]
-    }
-
-    /// Resolve the human-readable label for the rows currently gating
-    /// `task` — i.e. its incomplete `blocks` prerequisites. Used by
-    /// the kanban card to show "Blocked by <prereq title>" under the
-    /// task name when the engine has parked the row in `blocked`. The
-    /// caller is expected to gate on `task.status == "blocked"` so we
-    /// don't compute this for cards that aren't rendering the badge.
-    func blockedByLabel(for task: WorkTask) -> String? {
-        let edges = dependenciesByProductID[task.productID] ?? []
-        guard !edges.isEmpty else { return nil }
-        let names: [String] = edges.compactMap { edge in
-            guard edge.dependentID == task.id, edge.relation == "blocks" else {
-                return nil
-            }
-            guard let name = workItemName(for: edge.prerequisiteID),
-                  !isWorkItemSatisfied(edge.prerequisiteID)
-            else {
-                return nil
-            }
-            return name
-        }
-        guard !names.isEmpty else { return nil }
-        return names.joined(separator: ", ")
-    }
-
-    /// All `blocks` prereqs for `task` joined against the work tree,
-    /// rendered in card-detail and tooltip order. Includes already-
-    /// satisfied edges so the popover can show the full picture (the
-    /// chain badge tooltip and the auto-block predicate filter further
-    /// for "incomplete" only).
-    func dependencyPrereqs(for taskID: String) -> [WorkDependencyRow] {
-        guard let productID = task(withID: taskID)?.productID
-            ?? project(withID: taskID)?.productID
-        else {
-            return []
-        }
-        let edges = dependenciesByProductID[productID] ?? []
-        return edges
-            .filter { $0.dependentID == taskID && $0.relation == "blocks" }
-            .map { workDependencyRow(forID: $0.prerequisiteID) }
-    }
-
-    /// All `blocks` dependents of `taskID`. Used by the card detail
-    /// Dependencies subsection to show "what does this gate?".
-    func dependencyDependents(for taskID: String) -> [WorkDependencyRow] {
-        guard let productID = task(withID: taskID)?.productID
-            ?? project(withID: taskID)?.productID
-        else {
-            return []
-        }
-        let edges = dependenciesByProductID[productID] ?? []
-        return edges
-            .filter { $0.prerequisiteID == taskID && $0.relation == "blocks" }
-            .map { workDependencyRow(forID: $0.dependentID) }
-    }
-
-    /// Subset of `dependencyPrereqs` that are still gating the row —
-    /// i.e. not yet in a satisfied status. Drives the chain badge's
-    /// hover tooltip ("gated by …") and the auto-block predicate.
-    func gatingPrereqs(for taskID: String) -> [WorkDependencyRow] {
-        dependencyPrereqs(for: taskID).filter { !isWorkItemSatisfied($0.id) }
-    }
-
-    /// True iff the engine parked the row in `blocked` (rather than the
-    /// user choosing it). The chain badge appears only for these rows
-    /// per design Q7 — manual blocks already get the lane and would
-    /// double up with the icon.
-    func isAutoBlocked(_ task: WorkTask) -> Bool {
-        task.status == "blocked"
-            && task.lastStatusActor == "engine"
-            && !gatingPrereqs(for: task.id).isEmpty
-    }
-
-    /// True iff the row currently has at least one unsatisfied gating
-    /// prereq. Drag refusal keys on this rather than `lastStatusActor`
-    /// because the engine refuses *any* manual move out of `blocked`
-    /// while gated, regardless of who set the status last (Q4).
-    func hasGatingPrereqs(_ task: WorkTask) -> Bool {
-        !gatingPrereqs(for: task.id).isEmpty
-    }
-
-    // MARK: - Dependency badge hover / frontier highlight
-
-    /// Called when the pointer enters or leaves a Dependency badge on a
-    /// kanban card. On enter, computes the actionable prerequisite
-    /// frontier — the set of reachable, unblocked, open prerequisites —
-    /// and publishes them so every frontier card gets a transient
-    /// highlight. On leave (`nil`), clears the set.
-    func setDepBadgeHover(_ taskID: String?) {
-        guard let taskID else {
-            depFrontierHighlightIDs = []
-            return
-        }
-        depFrontierHighlightIDs = actionablePrereqFrontier(for: taskID)
-    }
-
-    /// Called when the pointer enters or leaves an "In revision" badge on a
-    /// kanban card. On enter, collects all active (todo/active) revision tasks
-    /// whose `parentTaskId` matches `taskID` and highlights them with the same
-    /// green-border overlay used by the dep frontier. On leave (`nil`), clears.
-    func setRevisionBadgeHover(_ taskID: String?) {
-        guard let taskID else {
-            revisionHighlightIDs = []
-            return
-        }
-        let matches: (WorkTask) -> Bool = {
-            $0.kind == "revision"
-                && $0.parentTaskId == taskID
-                && ($0.status == "todo" || $0.status == "active")
-        }
-        var ids: Set<String> = []
-        for tasks in tasksByProjectID.values {
-            ids.formUnion(tasks.filter(matches).map(\.id))
-        }
-        for revisions in productLevelRevisionsByProductID.values {
-            ids.formUnion(revisions.filter(matches).map(\.id))
-        }
-        revisionHighlightIDs = ids
-    }
-
-    /// Transitively walks the prerequisite DAG from `taskID` and
-    /// returns the IDs of every node that is:
-    ///   - reachable (transitively reachable through `blocks` edges),
-    ///   - unblocked (no incomplete prerequisites of its own), AND
-    ///   - open (not in a terminal / satisfied status).
-    ///
-    /// These are the "next actionable" items: completing them advances
-    /// the dependency frontier one step closer to unblocking the chore.
-    /// Deeper nodes that are still blocked themselves are traversed but
-    /// not added to the frontier (they aren't actionable yet); once they
-    /// unblock, the frontier advances through them automatically on the
-    /// next hover.
-    func actionablePrereqFrontier(for taskID: String) -> Set<String> {
-        guard let productID = task(withID: taskID)?.productID else { return [] }
-        let edges = dependenciesByProductID[productID] ?? []
-
-        var frontier: Set<String> = []
-        var visited: Set<String> = [taskID]
-        var queue: [String] = [taskID]
-
-        while !queue.isEmpty {
-            let current = queue.removeFirst()
-            let prereqIDs = edges
-                .filter { $0.dependentID == current && $0.relation == "blocks" }
-                .map { $0.prerequisiteID }
-
-            for prereqID in prereqIDs {
-                guard !visited.contains(prereqID) else { continue }
-                visited.insert(prereqID)
-
-                // Skip already-satisfied (terminal) items — they aren't open.
-                guard !isWorkItemSatisfied(prereqID) else { continue }
-
-                // An unblocked, open item is exactly what "actionable" means.
-                if gatingPrereqs(for: prereqID).isEmpty {
-                    frontier.insert(prereqID)
-                } else {
-                    // Still blocked itself — keep walking its prerequisites
-                    // so we can find the true frontier deeper in the DAG.
-                    queue.append(prereqID)
-                }
-            }
-        }
-
-        return frontier
-    }
-
-    private func workDependencyRow(forID id: String) -> WorkDependencyRow {
-        if id.hasPrefix("proj_") {
-            if let project = project(withID: id) {
-                return WorkDependencyRow(
-                    id: project.id,
-                    title: project.name,
-                    status: project.status,
-                    kind: .project
-                )
-            }
-        } else if let task = task(withID: id) {
-            return WorkDependencyRow(
-                id: task.id,
-                title: task.name,
-                status: task.status,
-                kind: task.isChore ? .chore : .task
-            )
-        }
-        return WorkDependencyRow(id: id, title: id, status: "unknown", kind: .unknown)
-    }
 
     /// Inline drag-refusal banner shown next to the source card when a
     /// drag from Blocked → Doing is rejected because the row still has
@@ -3287,26 +2679,6 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    private func workItemName(for id: String) -> String? {
-        if id.hasPrefix("proj_") {
-            return project(withID: id)?.name
-        }
-        return task(withID: id)?.name
-    }
-
-    /// Mirrors the engine's `status_satisfies` rule: a task/chore is
-    /// satisfied at `done`; a project is satisfied at `done` or
-    /// `archived`. Used to hide already-finished prereqs from the
-    /// "Blocked by …" label on the off-chance an edge survives a
-    /// status change momentarily.
-    private func isWorkItemSatisfied(_ id: String) -> Bool {
-        if id.hasPrefix("proj_") {
-            guard let status = project(withID: id)?.status else { return false }
-            return status == "done" || status == "archived"
-        }
-        guard let status = task(withID: id)?.status else { return false }
-        return status == "done"
-    }
 
     /// Resolve a task to its current LiveWorkerState by joining
     /// `task → execution_id → run_id`. Returns `nil` when the task
