@@ -65,6 +65,17 @@ final class ChatViewModel: ObservableObject {
     /// Attention items keyed by work-item id (product id for external-tracker
     /// items). Populated on product selection and on every workTree refresh.
     @Published var attentionItemsByWorkItemID: [String: [WorkAttentionItem]] = [:]
+    /// Attention *groups* keyed by product id — the agent-authored
+    /// notification feature (attentions.md), distinct from the operational
+    /// `attentionItemsByWorkItemID` store above. Loaded on product selection /
+    /// work-tree refresh and kept live via `AttentionCreated` /
+    /// `AttentionGroupUpdated` / `AttentionGroupActioned` pushes. Holds open
+    /// groups plus any that flipped to actioned/dismissed this session (so the
+    /// produced-artifact link lingers until the next full reload).
+    @Published var attentionGroupsByProductID: [String: [AttentionGroup]] = [:]
+    /// Attention group *members* keyed by `AttentionGroup.id`, in display
+    /// order. Populated alongside [[attentionGroupsByProductID]].
+    @Published var attentionMembersByGroupID: [String: [Attention]] = [:]
     /// Historical execution rows keyed by task id. Populated on demand when
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
@@ -554,6 +565,31 @@ final class ChatViewModel: ObservableObject {
         return (attentionItemsByWorkItemID[productID] ?? []).filter { $0.resolvedAt == nil }
     }
 
+    /// All known attention groups for the selected product (open plus any
+    /// recently actioned/dismissed this session), newest-first.
+    var selectedProductAttentionGroups: [AttentionGroup] {
+        guard let productID = currentSelectedProductID else { return [] }
+        return (attentionGroupsByProductID[productID] ?? [])
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    /// Open (actionable) attention groups for the selected product — the
+    /// Notifications window's primary list and the toolbar badge source.
+    var selectedProductOpenAttentionGroups: [AttentionGroup] {
+        selectedProductAttentionGroups.filter(\.isOpen)
+    }
+
+    /// Count of open attention groups for the selected product. Drives the
+    /// Notifications toolbar bell badge (hidden when 0).
+    var openAttentionGroupCount: Int {
+        selectedProductOpenAttentionGroups.count
+    }
+
+    /// Members of a group, in display order.
+    func attentionMembers(forGroup groupID: String) -> [Attention] {
+        (attentionMembersByGroupID[groupID] ?? []).sorted { $0.ordinal < $1.ordinal }
+    }
+
     var selectedProject: WorkProject? {
         guard selectedProjectFilterIDs.count == 1,
               let projectID = selectedProjectFilterIDs.first else { return nil }
@@ -870,6 +906,7 @@ final class ChatViewModel: ObservableObject {
         if isConnected {
             engine.sendGetWorkTree(productId: productID)
             engine.sendListAttentionItemsForWorkItem(workItemID: productID)
+            engine.sendListAttentionGroups(productId: productID)
         }
     }
 
@@ -1648,6 +1685,7 @@ final class ChatViewModel: ObservableObject {
             engine.sendGitHubAuthStatus()
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
+                engine.sendListAttentionGroups(productId: productID)
             }
         case .appSessionRegistered:
             // No additional state for now; the engine has confirmed
@@ -1721,10 +1759,12 @@ final class ChatViewModel: ObservableObject {
             {
                 engine.sendGetWorkTree(productId: selectedProductID)
                 engine.sendListAttentionItemsForWorkItem(workItemID: selectedProductID)
+                engine.sendListAttentionGroups(productId: selectedProductID)
             } else if let productId,
                       productId == currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productId)
                 engine.sendListAttentionItemsForWorkItem(workItemID: productId)
+                engine.sendListAttentionGroups(productId: productId)
             }
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
@@ -1795,6 +1835,7 @@ final class ChatViewModel: ObservableObject {
             refreshWorkSubscriptions()
             refreshDesignDocStates(for: projects)
             engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
+            engine.sendListAttentionGroups(productId: product.id)
             workErrorMessage = nil
             if let pending = pendingRevealScrollID {
                 let allIDs = Set(tasks.map(\.id) + chores.map(\.id))
@@ -1987,6 +2028,20 @@ final class ChatViewModel: ObservableObject {
             engine.sendListCiRemediations(limit: 200)
         case .attentionItemsForWorkItemList(let workItemID, let items):
             attentionItemsByWorkItemID[workItemID] = items
+        case .attentionGroupsList(let productID, let groups, let members):
+            applyAttentionGroupsList(productID: productID, groups: groups, members: members)
+        case .attentionGroupResult(let group, let members):
+            upsertAttentionGroup(group)
+            attentionMembersByGroupID[group.id] = members
+        case .attentionCreated(let attention, let group):
+            upsertAttentionGroup(group)
+            upsertAttentionMember(attention)
+        case .attentionGroupUpdated(let group, let members):
+            upsertAttentionGroup(group)
+            attentionMembersByGroupID[group.id] = members
+        case .attentionGroupActioned(let group, let members):
+            upsertAttentionGroup(group)
+            attentionMembersByGroupID[group.id] = members
         case .reviewTerminalReady(let workItemID, let workspacePath, let leaseID):
             openingReviewTerminalIDs.remove(workItemID)
             let resolved = task(withID: workItemID)
@@ -2066,6 +2121,145 @@ final class ChatViewModel: ObservableObject {
         } else {
             automationsByProductID[productID] = [automation]
         }
+    }
+
+    // MARK: Attentions (attentions.md — Notifications toolbar + window)
+
+    /// Replace the product's group set from a full `list_attention_groups`
+    /// reply, bucketing the flat member list by group id and pruning member
+    /// entries for groups that dropped out of the (open) list.
+    private func applyAttentionGroupsList(
+        productID: String,
+        groups: [AttentionGroup],
+        members: [Attention]
+    ) {
+        let priorIDs = Set((attentionGroupsByProductID[productID] ?? []).map(\.id))
+        let nextIDs = Set(groups.map(\.id))
+        for goneID in priorIDs.subtracting(nextIDs) {
+            attentionMembersByGroupID.removeValue(forKey: goneID)
+        }
+        var bucketed: [String: [Attention]] = [:]
+        for member in members {
+            bucketed[member.groupID, default: []].append(member)
+        }
+        for group in groups {
+            attentionMembersByGroupID[group.id] =
+                (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
+        }
+        attentionGroupsByProductID[productID] = groups
+    }
+
+    /// Insert or replace a group within its product bucket (live-update path).
+    private func upsertAttentionGroup(_ group: AttentionGroup) {
+        var list = attentionGroupsByProductID[group.productID] ?? []
+        if let idx = list.firstIndex(where: { $0.id == group.id }) {
+            list[idx] = group
+        } else {
+            list.append(group)
+        }
+        attentionGroupsByProductID[group.productID] = list
+    }
+
+    /// Insert or replace one member within its group's row list.
+    private func upsertAttentionMember(_ member: Attention) {
+        var list = attentionMembersByGroupID[member.groupID] ?? []
+        if let idx = list.firstIndex(where: { $0.id == member.id }) {
+            list[idx] = member
+        } else {
+            list.append(member)
+        }
+        attentionMembersByGroupID[member.groupID] = list.sorted { $0.ordinal < $1.ordinal }
+    }
+
+    /// Record an answer for a question member (`yes`/`no`, a chosen value, or
+    /// free text). The engine replies with `attention_group_updated`.
+    func answerAttention(_ attentionID: String, answer: String) {
+        engine.sendAnswerAttention(id: attentionID, answer: answer, skip: false, dismiss: false)
+    }
+
+    /// Accept a followup member (mark it `answered` with no value) so it is
+    /// included when the group is actioned.
+    func acceptFollowup(_ attentionID: String) {
+        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: false, dismiss: false)
+    }
+
+    /// Mark a member `skipped` — a rejected followup or a question the human
+    /// chooses not to answer. Skipped members contribute nothing on action.
+    func skipAttention(_ attentionID: String) {
+        engine.sendAnswerAttention(id: attentionID, answer: nil, skip: true, dismiss: false)
+    }
+
+    /// Dismiss a single member (`atn_…`) without producing anything.
+    func dismissAttentionMember(_ attentionID: String) {
+        engine.sendDismissAttention(id: attentionID, reason: nil)
+    }
+
+    /// Dismiss a whole group (`atg_…`) without producing anything.
+    func dismissAttentionGroup(_ groupID: String) {
+        engine.sendDismissAttention(id: groupID, reason: nil)
+    }
+
+    /// Action a group — produce its downstream artifact (one revision /
+    /// design task, or a batch task-create) and close it. Open members are
+    /// skipped first ("skip remaining") so the human needn't touch every row.
+    func actionAttentionGroup(_ groupID: String) {
+        engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true)
+    }
+
+    /// Jump a group's association into view: a task association reveals its
+    /// kanban card; a project association focuses that project's board.
+    func revealAttentionAssociation(_ group: AttentionGroup) {
+        if let taskID = group.associationTaskID,
+           let task = task(withID: taskID) {
+            revealWorkCard(taskID, productID: task.productID)
+        } else if let projectID = group.associationProjectID {
+            revealAttentionProject(projectID)
+        }
+    }
+
+    /// Focus a project's board in the kanban (Work mode, product selected,
+    /// project filter narrowed to the one project).
+    func revealAttentionProject(_ projectID: String) {
+        guard let project = project(withID: projectID) else { return }
+        setNavigationMode(.work)
+        if currentSelectedProductID != project.productID {
+            selectWorkProduct(project.productID)
+        }
+        selectedProjectFilterIDs = [projectID]
+        persistProjectFilterIDs()
+    }
+
+    /// Short display label for a group's association — `"T34"` / `"P12"` /
+    /// a project name / `"Open"` when neither resolves.
+    func attentionAssociationLabel(_ group: AttentionGroup) -> String {
+        if let taskID = group.associationTaskID {
+            if let task = task(withID: taskID), let shortID = task.shortID {
+                return "T\(shortID)"
+            }
+            return "Task"
+        }
+        if let projectID = group.associationProjectID {
+            if let project = project(withID: projectID) {
+                return project.shortID.map { "P\($0)" } ?? project.name
+            }
+            return "Project"
+        }
+        return "Open"
+    }
+
+    /// Reveal a produced revision / task card after a group is actioned.
+    func revealProducedArtifact(_ ref: ProducedArtifactRef) {
+        guard let task = task(withID: ref.taskID) else { return }
+        revealWorkCard(ref.taskID, productID: task.productID)
+    }
+
+    /// Open the design doc a question group is about, reusing the project
+    /// design-doc viewer when the group's association project resolves.
+    func openAttentionDesignDoc(_ group: AttentionGroup) {
+        guard let projectID = group.associationProjectID,
+              let project = project(withID: projectID)
+        else { return }
+        openProjectDesignDoc(project)
     }
 
     /// Engine-tab entry point: ask the engine for the current attempt

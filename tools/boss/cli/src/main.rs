@@ -4540,7 +4540,7 @@ async fn get_attention_group(
         .await
         .map_err(CliError::internal)?
     {
-        FrontendEvent::AttentionGroupResult { group } => Ok(group),
+        FrontendEvent::AttentionGroupResult { group, .. } => Ok(group),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -4582,7 +4582,7 @@ async fn answer_attention_rpc(
         .await
         .map_err(CliError::internal)?
     {
-        FrontendEvent::AttentionGroupUpdated { group } => Ok(group),
+        FrontendEvent::AttentionGroupUpdated { group, .. } => Ok(group),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -4603,7 +4603,7 @@ async fn action_attention_group_rpc(
         .await
         .map_err(CliError::internal)?
     {
-        FrontendEvent::AttentionGroupActioned { group } => Ok(group),
+        FrontendEvent::AttentionGroupActioned { group, .. } => Ok(group),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }
@@ -4624,7 +4624,7 @@ async fn dismiss_attention_rpc(
         .await
         .map_err(CliError::internal)?
     {
-        FrontendEvent::AttentionGroupUpdated { group } => Ok(group),
+        FrontendEvent::AttentionGroupUpdated { group, .. } => Ok(group),
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
         }

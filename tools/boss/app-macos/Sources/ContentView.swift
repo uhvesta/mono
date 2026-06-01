@@ -206,6 +206,10 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .primaryAction) {
+                NotificationsToolbarButton(model: model)
+            }
+
+            ToolbarItem(placement: .primaryAction) {
                 UpdateBadgeToolbarButton(updateModel: updateModel)
             }
         }
@@ -4705,6 +4709,40 @@ private struct EngineHealthBanner: View {
 
 /// Trailing toolbar button that appears when an update is available in Notify or Automatic mode.
 /// Visibility is driven by `UpdateModel`; clicking opens a popover with version info and actions.
+/// Notifications bell in the primary toolbar (attentions.md — App UI). Shows
+/// a count badge for the selected product's open attention groups and opens
+/// the singleton Attentions window. Mirrors the `.badge(openGroupCount)`
+/// pattern with an overlay (`.badge` only applies inside List/TabView).
+private struct NotificationsToolbarButton: View {
+    @ObservedObject var model: ChatViewModel
+    @Environment(\.openWindow) private var openWindow
+
+    private var count: Int { model.openAttentionGroupCount }
+
+    var body: some View {
+        Button {
+            openWindow(id: "attentions")
+        } label: {
+            Image(systemName: count > 0 ? "bell.badge" : "bell")
+                .overlay(alignment: .topTrailing) {
+                    if count > 0 {
+                        Text(count > 99 ? "99+" : "\(count)")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.red))
+                            .offset(x: 9, y: -7)
+                            .fixedSize()
+                    }
+                }
+        }
+        .help(count > 0
+              ? "\(count) notification\(count == 1 ? "" : "s") need your attention"
+              : "Notifications")
+    }
+}
+
 private struct UpdateBadgeToolbarButton: View {
     @ObservedObject var updateModel: UpdateModel
     @State private var isPopoverPresented = false

@@ -1302,14 +1302,23 @@ pub enum FrontendEvent {
         work_item_id: String,
         items: Vec<WorkAttentionItem>,
     },
-    /// Reply for [`FrontendRequest::ListAttentionGroups`].
+    /// Reply for [`FrontendRequest::ListAttentionGroups`]. `members`
+    /// carries the member rows for every group in `groups`, flattened
+    /// across groups (the client buckets them by `Attention::group_id`)
+    /// so the Notifications window can render inline answer controls
+    /// without a follow-up round-trip per group.
     AttentionGroupsList {
         product_id: String,
         groups: Vec<AttentionGroup>,
+        #[serde(default)]
+        members: Vec<Attention>,
     },
-    /// Reply for [`FrontendRequest::GetAttentionGroup`].
+    /// Reply for [`FrontendRequest::GetAttentionGroup`]. `members` are
+    /// the group's rows in display order.
     AttentionGroupResult {
         group: AttentionGroup,
+        #[serde(default)]
+        members: Vec<Attention>,
     },
     /// Reply for [`FrontendRequest::CreateAttention`]. Also pushed as a
     /// live-update event on the owning product's work-tree topic so the
@@ -1320,15 +1329,21 @@ pub enum FrontendEvent {
     },
     /// Pushed whenever a group's state or a member's answer_state
     /// changes (e.g. after [`FrontendRequest::AnswerAttention`] or
-    /// [`FrontendRequest::DismissAttention`]).
+    /// [`FrontendRequest::DismissAttention`]). `members` carries the
+    /// group's refreshed rows so the UI reflects the new answer states.
     AttentionGroupUpdated {
         group: AttentionGroup,
+        #[serde(default)]
+        members: Vec<Attention>,
     },
     /// Pushed after [`FrontendRequest::ActionAttentionGroup`] succeeds.
     /// Carries the group in its terminal `actioned` state plus the
     /// produced artifact reference so the UI can render a jump link.
+    /// `members` are the group's now-terminal rows.
     AttentionGroupActioned {
         group: AttentionGroup,
+        #[serde(default)]
+        members: Vec<Attention>,
     },
     WorkItemDeleted {
         id: String,

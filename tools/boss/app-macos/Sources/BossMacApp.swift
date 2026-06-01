@@ -118,6 +118,16 @@ struct BossMacApp: App {
         .environmentObject(chatModel.reviewTerminalVM)
         .defaultSize(width: 1000, height: 660)
 
+        // Notifications (Attentions) window: opened from the bell toolbar item
+        // (attentions.md — App UI). A singleton window driven by ChatViewModel
+        // (mirrors Activity / Metrics) rather than a value-keyed WindowGroup —
+        // there is one product-scoped notifications surface, not many.
+        Window("Notifications", id: "attentions") {
+            AttentionsView()
+        }
+        .environmentObject(chatModel)
+        .defaultSize(width: 460, height: 560)
+
         Window("Activity", id: "activity") {
             ActivityView()
         }

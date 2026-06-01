@@ -256,6 +256,23 @@ enum EngineEvent {
     case automationDeleted(automationID: String)
     /// Response to `get_automation_open_task_count`.
     case automationOpenTaskCount(automationID: String, count: Int)
+    // MARK: Attention events (attentions.md — Notifications toolbar + window)
+    /// Reply to `list_attention_groups` — the groups for a product plus
+    /// every group's member rows (flattened; bucketed client-side by
+    /// `Attention.groupID`).
+    case attentionGroupsList(productID: String, groups: [AttentionGroup], members: [Attention])
+    /// Reply to `get_attention_group` — one group plus its members.
+    case attentionGroupResult(group: AttentionGroup, members: [Attention])
+    /// Reply to `create_attention`; also pushed live on the owning
+    /// product's work-tree topic when the engine creates an attention.
+    case attentionCreated(attention: Attention, group: AttentionGroup)
+    /// Pushed (and returned) whenever a group's state or a member's
+    /// answer-state changes — e.g. after `answer_attention` /
+    /// `dismiss_attention`. Carries the group's refreshed members.
+    case attentionGroupUpdated(group: AttentionGroup, members: [Attention])
+    /// Pushed after `action_attention_group` succeeds: the now-`actioned`
+    /// group, its terminal members, and the produced-artifact ref.
+    case attentionGroupActioned(group: AttentionGroup, members: [Attention])
 }
 
 final class EngineClient: @unchecked Sendable {
@@ -441,6 +458,69 @@ final class EngineClient: @unchecked Sendable {
             "type": "list_attention_items_for_work_item",
             "work_item_id": workItemID,
         ])
+    }
+
+    // MARK: Attention groups (attentions.md — Notifications toolbar + window)
+
+    /// List attention groups for a product. Omitting `state` lets the engine
+    /// default to open + partially_answered — the actionable set the
+    /// Notifications window renders. Replies with `attention_groups_list`.
+    func sendListAttentionGroups(
+        productId: String,
+        projectId: String? = nil,
+        taskId: String? = nil,
+        kind: String? = nil,
+        state: String? = nil
+    ) {
+        var payload: [String: Any] = [
+            "type": "list_attention_groups",
+            "product_id": productId,
+        ]
+        if let projectId { payload["project_id"] = projectId }
+        if let taskId { payload["task_id"] = taskId }
+        if let kind { payload["kind"] = kind }
+        if let state { payload["state"] = state }
+        sendLine(payload)
+    }
+
+    /// Fetch one group (`atg_…` or `A<n>`) plus its members. Replies with
+    /// `attention_group_result`.
+    func sendGetAttentionGroup(id: String) {
+        sendLine(["type": "get_attention_group", "id": id])
+    }
+
+    /// Record the human's resolution of one member (`atn_…`): an `answer`
+    /// (value for questions, omitted to "accept" a followup), `skip`, or
+    /// `dismiss`. Replies with `attention_group_updated`.
+    func sendAnswerAttention(id: String, answer: String?, skip: Bool, dismiss: Bool) {
+        var payload: [String: Any] = [
+            "type": "answer_attention",
+            "id": id,
+            "skip": skip,
+            "dismiss": dismiss,
+        ]
+        if let answer { payload["answer"] = answer }
+        sendLine(payload)
+    }
+
+    /// Action a group (`atg_…` or `A<n>`) — produce the downstream artifact
+    /// and transition it to `actioned`. `skipUnanswered` marks every open
+    /// member skipped first so the human needn't touch every row. Replies
+    /// with `attention_group_actioned`.
+    func sendActionAttentionGroup(id: String, skipUnanswered: Bool) {
+        sendLine([
+            "type": "action_attention_group",
+            "id": id,
+            "skip_unanswered": skipUnanswered,
+        ])
+    }
+
+    /// Dismiss a whole group (`atg_…`) or a single member (`atn_…`) without
+    /// producing anything. Replies with `attention_group_updated`.
+    func sendDismissAttention(id: String, reason: String? = nil) {
+        var payload: [String: Any] = ["type": "dismiss_attention", "id": id]
+        if let reason { payload["reason"] = reason }
+        sendLine(payload)
     }
 
     /// Ask the engine to lease a workspace for the given Review-column
@@ -1343,6 +1423,53 @@ final class EngineClient: @unchecked Sendable {
                 if !workItemID.isEmpty {
                     emit(.attentionItemsForWorkItemList(workItemID: workItemID, items: items))
                 }
+            case "attention_groups_list":
+                let productID = payload["product_id"] as? String ?? ""
+                let groups = (payload["groups"] as? [[String: Any]] ?? [])
+                    .compactMap(parseAttentionGroup)
+                let members = (payload["members"] as? [[String: Any]] ?? [])
+                    .compactMap(parseAttention)
+                emit(.attentionGroupsList(productID: productID, groups: groups, members: members))
+            case "attention_group_result":
+                guard let groupPayload = payload["group"] as? [String: Any],
+                      let group = parseAttentionGroup(groupPayload)
+                else {
+                    emit(.error(message: "received invalid attention_group_result payload"))
+                    break
+                }
+                let members = (payload["members"] as? [[String: Any]] ?? [])
+                    .compactMap(parseAttention)
+                emit(.attentionGroupResult(group: group, members: members))
+            case "attention_created":
+                guard let attentionPayload = payload["attention"] as? [String: Any],
+                      let attention = parseAttention(attentionPayload),
+                      let groupPayload = payload["group"] as? [String: Any],
+                      let group = parseAttentionGroup(groupPayload)
+                else {
+                    emit(.error(message: "received invalid attention_created payload"))
+                    break
+                }
+                emit(.attentionCreated(attention: attention, group: group))
+            case "attention_group_updated":
+                guard let groupPayload = payload["group"] as? [String: Any],
+                      let group = parseAttentionGroup(groupPayload)
+                else {
+                    emit(.error(message: "received invalid attention_group_updated payload"))
+                    break
+                }
+                let members = (payload["members"] as? [[String: Any]] ?? [])
+                    .compactMap(parseAttention)
+                emit(.attentionGroupUpdated(group: group, members: members))
+            case "attention_group_actioned":
+                guard let groupPayload = payload["group"] as? [String: Any],
+                      let group = parseAttentionGroup(groupPayload)
+                else {
+                    emit(.error(message: "received invalid attention_group_actioned payload"))
+                    break
+                }
+                let members = (payload["members"] as? [[String: Any]] ?? [])
+                    .compactMap(parseAttention)
+                emit(.attentionGroupActioned(group: group, members: members))
             case "review_terminal_ready":
                 let workItemID = payload["work_item_id"] as? String ?? ""
                 let workspacePath = payload["workspace_path"] as? String ?? ""
@@ -1813,6 +1940,24 @@ final class EngineClient: @unchecked Sendable {
             return nil
         }
         return item
+    }
+
+    private func parseAttentionGroup(_ payload: [String: Any]) -> AttentionGroup? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let group = try? JSONDecoder().decode(AttentionGroup.self, from: data)
+        else {
+            return nil
+        }
+        return group
+    }
+
+    private func parseAttention(_ payload: [String: Any]) -> Attention? {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let attention = try? JSONDecoder().decode(Attention.self, from: data)
+        else {
+            return nil
+        }
+        return attention
     }
 
     private func parseWorkItem(_ payload: [String: Any]) -> WorkItemPayload? {
