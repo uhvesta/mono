@@ -1985,7 +1985,14 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
                 "failed to list jj remotes (is this a jj workspace?): {e}"
             ))
         })?;
-    let owner_repo = parse_github_owner_repo(&remote_output).ok_or_else(|| {
+    // Resolve BOTH the remote *name* and the owner/repo slug. The name
+    // matters: in a cube workspace `origin` is a local on-disk mirror and
+    // the real GitHub upstream is a differently-named remote (commonly
+    // `github`). `jj git push` without an explicit `--remote` would target
+    // jj's default remote — which may be that local mirror — silently
+    // updating a ref that never reaches GitHub. We push to the github.com
+    // remote by name to avoid that trap.
+    let (github_remote, owner_repo) = parse_github_remote(&remote_output).ok_or_else(|| {
         CubeError::InvalidArgument(format!(
             "could not detect a github.com remote from `jj git remote list` output:\n{remote_output}"
         ))
@@ -1997,16 +2004,26 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
         None => detect_jj_bookmark(runner, &cwd)?,
     };
 
-    // Push the branch (--allow-new is idempotent: fine when remote already exists).
+    // Push the branch to the GitHub remote by name (--allow-new is
+    // idempotent: fine when the remote bookmark already exists).
     runner
         .run(&RealCommandRunner::invocation(
             &cwd,
             "jj",
-            &["git", "push", "-b", &branch, "--allow-new"],
+            &[
+                "git", "push", "-b", &branch, "--remote", &github_remote, "--allow-new",
+            ],
         ))
         .map_err(|e| {
             CubeError::InvalidArgument(format!("failed to push branch `{branch}`: {e}"))
         })?;
+
+    // Verify the push actually reached GitHub. Confirming against the same
+    // remote we pushed to (e.g. `git ls-remote origin`) is circular — if
+    // that remote is a local mirror it reports success while GitHub stays
+    // stale. Instead we read GitHub's own truth (the branch head sha) and
+    // assert it matches the local commit, failing loudly on mismatch.
+    verify_push_reached_github(runner, &cwd, &owner_repo, &branch)?;
 
     // Check for an existing open PR.
     let list_json = runner
@@ -2099,23 +2116,90 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     )
 }
 
-/// Parse the first recognisable `owner/repo` slug from `jj git remote list` output.
+/// Parse the first github.com remote from `jj git remote list` output,
+/// returning `(remote_name, owner/repo)`.
 ///
 /// The output format is one remote per line: `<name>\t<url>` (or
 /// space-separated). Accepts both SSH (`git@github.com:owner/repo.git`)
-/// and HTTPS (`https://github.com/owner/repo`) remotes.
-fn parse_github_owner_repo(remote_list_output: &str) -> Option<String> {
+/// and HTTPS (`https://github.com/owner/repo`) remotes. Remotes whose URL
+/// is not a github.com URL — notably the local on-disk mirror that cube
+/// workspaces carry — are skipped, so the returned name is always a real
+/// GitHub upstream regardless of whether it is called `origin`, `github`,
+/// or anything else.
+fn parse_github_remote(remote_list_output: &str) -> Option<(String, String)> {
     for line in remote_list_output.lines() {
         // Split on the first run of whitespace to get (name, url).
         let mut iter = line.splitn(2, |c: char| c.is_whitespace());
-        let _ = iter.next(); // remote name
+        let name = iter.next().map(str::trim).filter(|s| !s.is_empty())?;
         if let Some(url) = iter.next().map(str::trim) {
             if let Some(slug) = parse_github_slug(url) {
-                return Some(slug);
+                return Some((name.to_string(), slug));
             }
         }
     }
     None
+}
+
+/// Parse the first recognisable `owner/repo` slug from `jj git remote list` output.
+///
+/// Thin wrapper over [`parse_github_remote`] for callers that only need the
+/// slug, not the remote name.
+fn parse_github_owner_repo(remote_list_output: &str) -> Option<String> {
+    parse_github_remote(remote_list_output).map(|(_, slug)| slug)
+}
+
+/// Verify that a just-pushed branch actually reached GitHub.
+///
+/// Reads the branch head sha from GitHub's API (the authoritative source)
+/// and compares it to the local commit the bookmark points at. This closes
+/// the "false confirmation" hole where a push lands on a local mirror
+/// remote and a same-remote check (`git ls-remote <that remote>`) reports
+/// success even though GitHub — and therefore any open PR — never advanced.
+fn verify_push_reached_github(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    owner_repo: &str,
+    branch: &str,
+) -> Result<()> {
+    let local_sha = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["log", "-r", branch, "--no-graph", "-T", "commit_id"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "could not resolve local commit for `{branch}` to verify the push: {e}"
+            ))
+        })?;
+    let local_sha = local_sha.trim();
+
+    let api_path = format!("repos/{owner_repo}/branches/{branch}");
+    let remote_sha = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "gh",
+            &["api", &api_path, "--jq", ".commit.sha"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "push verification failed: could not read branch `{branch}` from GitHub \
+                 ({owner_repo}). The push may have gone to a local mirror remote instead of \
+                 GitHub — in cube workspaces the real upstream is the github.com remote, not \
+                 necessarily `origin`. Underlying error: {e}"
+            ))
+        })?;
+    let remote_sha = remote_sha.trim();
+
+    if local_sha != remote_sha {
+        return Err(CubeError::InvalidArgument(format!(
+            "push verification failed: local `{branch}` is at {local_sha} but GitHub \
+             ({owner_repo}) has it at {remote_sha}. The push did not reach GitHub — it likely \
+             landed on a local mirror remote. Re-push to the github.com remote, then re-verify \
+             against `gh api repos/{owner_repo}/branches/{branch} --jq .commit.sha`."
+        )));
+    }
+    Ok(())
 }
 
 /// Parse `owner/repo` from a GitHub remote URL (SSH or HTTPS).
@@ -3569,8 +3653,8 @@ mod tests {
     use super::{
         CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result, current_epoch_s,
         is_bare_repo_slug, is_stdin_path, origin_path_matches_slug, origin_urls_equivalent,
-        parse_github_owner_repo, parse_github_slug, parse_origin, resolve_body_file,
-        run_with_context, run_with_dependencies,
+        parse_github_owner_repo, parse_github_remote, parse_github_slug, parse_origin,
+        resolve_body_file, run_with_context, run_with_dependencies,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -10206,6 +10290,36 @@ steps:
         assert_eq!(parse_github_owner_repo(""), None);
     }
 
+    #[test]
+    fn parse_github_remote_returns_name_and_slug() {
+        let output = "github\tgit@github.com:spinyfin/mono.git\n";
+        assert_eq!(
+            parse_github_remote(output),
+            Some(("github".to_string(), "spinyfin/mono".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_github_remote_skips_local_mirror_named_origin() {
+        // The cube-workspace trap: `origin` is a local on-disk mirror and the
+        // real GitHub upstream is named `github`. We must select `github`,
+        // never the local mirror, so pushes land on GitHub.
+        let output = "\
+origin\t/Users/bduff/dev/agents/repos/mono
+github\tssh://org-1@github.com/spinyfin/mono.git
+";
+        assert_eq!(
+            parse_github_remote(output),
+            Some(("github".to_string(), "spinyfin/mono".to_string())),
+        );
+    }
+
+    #[test]
+    fn parse_github_remote_returns_none_when_only_local_mirror() {
+        let output = "origin\t/Users/bduff/dev/agents/repos/mono\n";
+        assert_eq!(parse_github_remote(output), None);
+    }
+
     // --- resolve_body_file / stdin materialization tests ---
 
     #[test]
@@ -10356,8 +10470,28 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--allow-new"],
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
+                ],
                 "",
+            ),
+            // Push verification: local commit vs GitHub branch head sha.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
@@ -10425,8 +10559,27 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--allow-new"],
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
+                ],
                 "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
@@ -10472,8 +10625,27 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &["git", "push", "-b", "my-feature", "--allow-new"],
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
+                ],
                 "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
@@ -10495,6 +10667,128 @@ steps:
         assert_eq!(result.payload["action"], "exists");
         assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/7");
         assert_eq!(result.payload["number"], 7);
+    }
+
+    #[test]
+    fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
+        // Regression for the "false push" trap: a cube workspace has a local
+        // mirror named `origin` and the real GitHub upstream named `github`.
+        // `cube pr ensure` must push to `github` (resolved by URL, not by the
+        // conventional `origin` name) and verify the push against GitHub.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\t/Users/bduff/dev/agents/repos/mono\n\
+                 github\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            // Push targets `github`, the real upstream — NOT the local mirror.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "github", "--allow-new",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "deadbeef\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "deadbeef\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                ],
+                "[]",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "create", "-R", "spinyfin/mono", "--head", "my-feature", "--base",
+                    "main", "--title", "New PR",
+                ],
+                "https://github.com/spinyfin/mono/pull/77",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr created");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/77");
+    }
+
+    #[test]
+    fn ensure_pr_fails_loudly_when_push_did_not_reach_github() {
+        // The push "succeeded" locally but GitHub's branch head sha does not
+        // match the local commit — the classic local-mirror false positive.
+        // ensure_pr must error rather than report a stale PR as updated.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "4ce6198\n",
+            ),
+            // GitHub still has the OLD sha — push never reached it.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "2f8dd09\n",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner)
+            .expect_err("ensure_pr should fail when push did not reach GitHub");
+        runner.assert_exhausted();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("push verification failed") && msg.contains("4ce6198") && msg.contains("2f8dd09"),
+            "error should name the mismatch loudly: {msg}"
+        );
     }
 
     // --- pr_number_from_url tests ---

@@ -41,6 +41,30 @@ current `jj` bookmark and creates-or-reuses a GitHub PR idempotently via
 scaffolding for stacked-change management and are only partially
 implemented today.
 
+### `pr ensure` pushes to GitHub, not a local mirror
+
+A cube workspace carries **two** git remotes: a local on-disk mirror
+(often named `origin`, pointing at the source clone cube provisioned the
+workspace from) and the real GitHub upstream (often named `github`).
+This is the opposite of the usual convention, and it is a trap: a push
+to `origin` updates the local mirror's ref without ever touching GitHub,
+and a same-remote check like `git ls-remote origin <branch>` then reports
+the new sha — a convincing false confirmation that the work shipped when
+the PR head never moved and CI never re-ran.
+
+`pr ensure` avoids this in two ways. First, it resolves the push target
+by **URL, not by name**: it picks the remote whose URL is a `github.com`
+URL (skipping the local-path mirror) and pushes with an explicit
+`--remote <name>`, so the push lands on GitHub regardless of which remote
+is called `origin`. Second, it **verifies against GitHub's own truth**
+after pushing — it reads the branch head sha via
+`gh api repos/<owner>/<repo>/branches/<branch> --jq .commit.sha` and
+asserts it equals the local commit, failing loudly on mismatch. A push
+that silently went to the mirror is caught here instead of being reported
+as success. If you ever push by hand, mirror this: confirm the push by
+reading the PR/branch head sha from GitHub, never by checking the remote
+you pushed to.
+
 All external work — every `jj` and `gh` invocation — flows through a
 single `CommandRunner` abstraction. The production implementation shells
 out (suppressing colour when stdout isn't a TTY); tests substitute a

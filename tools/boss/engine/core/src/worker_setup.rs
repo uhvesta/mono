@@ -209,6 +209,33 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          jj git push -b my-feature   # no --allow-new needed for subsequent pushes\n\
          ```\n\
          \n\
+         ### The `origin` remote is a LOCAL MIRROR, not GitHub\n\
+         \n\
+         A cube workspace has **two** git remotes: a local on-disk mirror\n\
+         (typically named `origin`) and the real GitHub upstream (typically\n\
+         named `github`). This is the opposite of the usual convention. A\n\
+         raw `jj git push` / `git push origin` / `git fetch origin` can hit\n\
+         the local mirror and update a ref that **never reaches GitHub** —\n\
+         the PR head stays stale and CI never re-runs, even though the push\n\
+         looked successful.\n\
+         \n\
+         - Prefer `cube pr ensure` for all pushes: it pushes to the\n\
+           github.com remote by URL (not by name) and verifies the result\n\
+           against GitHub, so it cannot be fooled by the mirror.\n\
+         - **NEVER confirm a push with `git ls-remote origin` or by checking\n\
+           the same remote you pushed to** — that is circular and confirms\n\
+           the local mirror, not GitHub. Confirm by reading GitHub's head sha\n\
+           and asserting it equals your local commit:\n\
+         \n\
+         ```sh\n\
+         # local commit you intended to ship\n\
+         jj log -r my-feature --no-graph -T commit_id\n\
+         # what GitHub actually has (must match)\n\
+         gh api repos/<owner>/<repo>/branches/my-feature --jq .commit.sha\n\
+         # for a specific PR head:\n\
+         gh api repos/<owner>/<repo>/pulls/<n> --jq .head.sha\n\
+         ```\n\
+         \n\
          ## Boundaries\n\
          \n\
          - Do not modify files outside this workspace. Sibling workspaces\n\
@@ -1234,6 +1261,18 @@ mod tests {
         assert!(rendered.contains(&input.lease_id));
         assert!(rendered.contains("`jj`"));
         assert!(rendered.contains("PR"));
+    }
+
+    #[test]
+    fn claude_md_warns_origin_is_a_local_mirror() {
+        // Workers must be told that in a cube workspace `origin` is a local
+        // mirror, not GitHub, and that pushes must be confirmed against
+        // GitHub's head sha — never against the remote they pushed to.
+        let input = sample_input();
+        let rendered = render_claude_md(&input);
+        assert!(rendered.contains("LOCAL MIRROR"));
+        assert!(rendered.contains("ls-remote"));
+        assert!(rendered.contains(".head.sha") || rendered.contains(".commit.sha"));
     }
 
     #[test]
