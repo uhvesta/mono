@@ -476,7 +476,17 @@ fn ensure_repo_core(
         path: record.workspace_root.clone(),
         source: e,
     })?;
-    materialize_repo_source_if_missing(runner, &record)?;
+    let detected_branch = materialize_repo_source_if_missing(runner, &record)?;
+    let mut record = record;
+    if let Some(branch) = detected_branch {
+        if branch != record.main_branch {
+            eprintln!(
+                "cube: detected default branch `{branch}` for repo `{}`",
+                record.repo
+            );
+        }
+        record.main_branch = branch;
+    }
     store.upsert_repo(&record)
 }
 
@@ -671,14 +681,14 @@ fn default_repo_ensure_defaults() -> Result<RepoEnsureDefaults> {
 fn materialize_repo_source_if_missing(
     runner: &dyn CommandRunner,
     record: &RepoRecord,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let Some(source) = &record.source else {
-        return Ok(());
+        return Ok(None);
     };
 
     if source.exists() {
         if source.is_dir() {
-            return Ok(());
+            return Ok(None);
         }
         return Err(CubeError::InvalidArgument(format!(
             "source path {} exists and is not a directory",
@@ -745,8 +755,15 @@ fn materialize_repo_source_if_missing(
                 "--colocate".to_string(),
             ],
         })?;
+        // The colocated clone already exposes the remote's branches as local
+        // jj bookmarks, so there is nothing to promote here; we only need the
+        // remote's default branch to record as the repo's `main_branch`.
+        Ok(detect_remote_default_branch(runner, source, &record.origin))
     } else {
         eprintln!("cube: using `jj git clone` for repo `{}`", record.repo);
+        // Detect the remote's default branch up front so we can both track the
+        // right bookmark below and record it as the repo's `main_branch`.
+        let default_branch = detect_remote_default_branch(runner, parent, &record.origin);
         runner.run(&CommandInvocation {
             cwd: parent.to_path_buf(),
             program: "jj".to_string(),
@@ -757,9 +774,50 @@ fn materialize_repo_source_if_missing(
                 source.display().to_string(),
             ],
         })?;
-        track_remote_bookmarks(runner, source)?;
+        track_remote_bookmarks(runner, source, default_branch.as_deref())?;
+        Ok(default_branch)
     }
-    Ok(())
+}
+
+/// Best-effort detection of the remote's default (integration) branch via
+/// `git ls-remote --symref <origin> HEAD`, which reports the symbolic ref that
+/// `HEAD` points at without needing the repo cloned first. Returns the short
+/// branch name (e.g. `main`, `master`, `develop`) or `None` when detection
+/// fails for any reason — `git` missing, network/auth failure, or unparseable
+/// output — so callers fall back to the historical `main` default rather than
+/// hard-failing materialization. SSH-prefixed origins (`org-N@github.com:...`)
+/// authenticate via SSH key here, so corporate SSO does not block detection.
+fn detect_remote_default_branch(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    origin: &str,
+) -> Option<String> {
+    let output = runner
+        .run(&CommandInvocation {
+            cwd: cwd.to_path_buf(),
+            program: "git".to_string(),
+            args: vec![
+                "ls-remote".to_string(),
+                "--symref".to_string(),
+                origin.to_string(),
+                "HEAD".to_string(),
+            ],
+        })
+        .ok()?;
+    parse_symref_default_branch(&output)
+}
+
+/// Parse the branch name out of `git ls-remote --symref` output. The relevant
+/// line looks like `ref: refs/heads/<branch>\tHEAD`; the trailing `<sha>\tHEAD`
+/// line and any warnings are ignored. Returns `None` when no such line is
+/// present.
+fn parse_symref_default_branch(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("ref:")?.trim_start();
+        let rest = rest.strip_prefix("refs/heads/")?;
+        let branch = rest.split_whitespace().next()?;
+        (!branch.is_empty()).then(|| branch.to_string())
+    })
 }
 
 /// Promote `main@origin` and `master@origin` to local tracking
@@ -779,9 +837,24 @@ fn materialize_repo_source_if_missing(
 /// surface a hard error rather than letting the caller stumble into
 /// `jj new <missing>` later. Idempotent: re-tracking an already-tracked
 /// bookmark is a no-op.
-fn track_remote_bookmarks(runner: &dyn CommandRunner, repo_path: &Path) -> Result<()> {
+fn track_remote_bookmarks(
+    runner: &dyn CommandRunner,
+    repo_path: &Path,
+    default_branch: Option<&str>,
+) -> Result<()> {
+    // Always attempt the two conventional defaults; additionally attempt the
+    // detected default branch when it is something else (e.g. `develop`,
+    // `trunk`) so the lease's later `jj new <main_branch>` has a local bookmark
+    // to resolve. Keeping `main`/`master` first preserves the historical
+    // tracking order for the common cases.
+    let mut candidates: Vec<String> = vec!["main".to_string(), "master".to_string()];
+    if let Some(branch) = default_branch {
+        if !candidates.iter().any(|c| c == branch) {
+            candidates.push(branch.to_string());
+        }
+    }
     let mut tracked_any = false;
-    for branch in ["main", "master"] {
+    for branch in &candidates {
         let result = runner.run(&CommandInvocation {
             cwd: repo_path.to_path_buf(),
             program: "jj".to_string(),
@@ -798,10 +871,15 @@ fn track_remote_bookmarks(runner: &dyn CommandRunner, repo_path: &Path) -> Resul
         }
     }
     if !tracked_any {
+        let names = candidates
+            .iter()
+            .map(|b| format!("`{b}@origin`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(CubeError::SetupStepFailed {
             step: "track_remote_bookmarks".to_string(),
             error: format!(
-                "fresh clone at `{}` has neither `main@origin` nor `master@origin`; \
+                "fresh clone at `{}` has none of {names}; \
                  cube cannot promote a default branch to local tracking",
                 repo_path.display()
             ),
@@ -2335,7 +2413,7 @@ fn auto_create_workspace(
             staging_path.display().to_string(),
         ],
     })?;
-    track_remote_bookmarks(runner, &staging_path)?;
+    track_remote_bookmarks(runner, &staging_path, Some(repo_record.main_branch.as_str()))?;
 
     // Publish atomically. Staging and final live under the same workspace_root
     // (one filesystem), so the rename is atomic and the final path appears
@@ -3800,6 +3878,11 @@ mod tests {
         run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo");
 
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(
+                defaults.repo_root.clone(),
+                "git@github.com:spinyfin/mono.git",
+                "main",
+            ),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -3849,6 +3932,11 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         let source_path = defaults.repo_root.join("mono");
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(
+                defaults.repo_root.clone(),
+                "git@github.com:spinyfin/mono.git",
+                "main",
+            ),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -3935,6 +4023,13 @@ mod tests {
                 &["git", "init", "--colocate"],
                 "",
             ),
+            // This LinkedIn repo's default branch is `master`, so detection
+            // must record `main_branch = "master"` rather than the old default.
+            ExpectedCommand::ls_remote_symref(
+                source_path.clone(),
+                "org-127256988@github.com:linkedin-multiproduct/frontend-api.git",
+                "master",
+            ),
         ]);
 
         let ensure = Cli::parse_from(["cube", "repo", "ensure", "frontend-api"]);
@@ -3961,6 +4056,7 @@ mod tests {
             result.payload["repo"]["clone_command"],
             "true clone frontend-api"
         );
+        assert_eq!(result.payload["repo"]["main_branch"], "master");
         runner.assert_exhausted();
     }
 
@@ -3972,6 +4068,7 @@ mod tests {
         let origin = "git@github.example.com:corp/widget.git";
 
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), origin, "main"),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -4064,6 +4161,7 @@ mod tests {
         let origin = "git@github.com:spinyfin/mono.git";
 
         let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), origin, "main"),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -4098,7 +4196,199 @@ mod tests {
 
         assert_eq!(result.message, "Ensured repo `mono`.");
         assert_eq!(result.payload["repo"]["origin"], origin);
+        // The remote symref reported `main`, so the recorded default matches.
+        assert_eq!(result.payload["repo"]["main_branch"], "main");
         runner.assert_exhausted();
+    }
+
+    /// When the remote's default branch is `master`, materialization must
+    /// record `main_branch = "master"` (not the historical `main` default) by
+    /// reading the `git ls-remote --symref` symref. `master@origin` already sits
+    /// in the conventional candidate set, so the tracking order is unchanged.
+    #[test]
+    fn repo_ensure_detects_master_default_branch() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("legacy");
+        let origin = "git@github.com:spinyfin/legacy.git";
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), origin, "master"),
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &["git", "clone", origin, &source_path.display().to_string()],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+            ),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+                "",
+            ),
+        ]);
+
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "spinyfin/legacy"]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(crate::config::CubeConfig::default()),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.payload["repo"]["main_branch"], "master");
+        runner.assert_exhausted();
+    }
+
+    /// A non-conventional default branch (`develop`) must be recorded as
+    /// `main_branch` AND promoted to a local tracking bookmark, since neither
+    /// `main` nor `master` would otherwise give the lease's `jj new <branch>` a
+    /// bookmark to resolve. The detected branch is appended after the two
+    /// conventional names in the tracking sequence.
+    #[test]
+    fn repo_ensure_detects_and_tracks_nonconventional_default_branch() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("trunkish");
+        let origin = "git@github.com:spinyfin/trunkish.git";
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), origin, "develop"),
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &["git", "clone", origin, &source_path.display().to_string()],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "develop@origin"],
+                "",
+            ),
+        ]);
+
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "spinyfin/trunkish"]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(crate::config::CubeConfig::default()),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.payload["repo"]["main_branch"], "develop");
+        runner.assert_exhausted();
+    }
+
+    /// If default-branch detection fails (git missing, network/auth error,
+    /// unparseable output), materialization must not abort — it falls back to
+    /// the historical `main` default and still tracks the conventional
+    /// bookmarks.
+    #[test]
+    fn repo_ensure_falls_back_to_main_when_detection_fails() {
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("mono");
+        let origin = "git@github.com:spinyfin/mono.git";
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand {
+                cwd: defaults.repo_root.clone(),
+                program: "git".to_string(),
+                args: vec![
+                    "ls-remote".to_string(),
+                    "--symref".to_string(),
+                    origin.to_string(),
+                    "HEAD".to_string(),
+                ],
+                result: Err(CubeError::CommandFailed {
+                    program: "git".to_string(),
+                    args: Vec::new(),
+                    status: Some(128),
+                    stderr: "fatal: could not read from remote repository".to_string(),
+                }),
+                creates_dir: None,
+            },
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &["git", "clone", origin, &source_path.display().to_string()],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
+
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "spinyfin/mono"]);
+        let result = run_with_context(
+            ensure,
+            Some(&database_path),
+            &runner,
+            Some(&defaults),
+            Some(crate::config::CubeConfig::default()),
+        )
+        .expect("ensure");
+
+        assert_eq!(result.payload["repo"]["main_branch"], "main");
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn parse_symref_default_branch_reads_head_symref() {
+        let out = "ref: refs/heads/master\tHEAD\n\
+                   0123456789abcdef0123456789abcdef01234567\tHEAD";
+        assert_eq!(
+            super::parse_symref_default_branch(out),
+            Some("master".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_symref_default_branch_handles_nonconventional_name() {
+        let out = "ref: refs/heads/develop\tHEAD\ndeadbeef\tHEAD";
+        assert_eq!(
+            super::parse_symref_default_branch(out),
+            Some("develop".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_symref_default_branch_returns_none_without_symref_line() {
+        // Some transports omit the `ref:` line entirely (only the sha/HEAD line).
+        let out = "0123456789abcdef0123456789abcdef01234567\tHEAD";
+        assert_eq!(super::parse_symref_default_branch(out), None);
+        assert_eq!(super::parse_symref_default_branch(""), None);
     }
 
     #[test]
@@ -10112,6 +10402,21 @@ steps:
         fn creating_dir(mut self, path: PathBuf) -> Self {
             self.creates_dir = Some(path);
             self
+        }
+
+        /// Build an expectation for the `git ls-remote --symref <origin> HEAD`
+        /// default-branch probe, returning the symref output that points `HEAD`
+        /// at `branch` (the shape `git` actually prints).
+        fn ls_remote_symref(cwd: PathBuf, origin: &str, branch: &str) -> Self {
+            Self::ok(
+                cwd,
+                "git",
+                &["ls-remote", "--symref", origin, "HEAD"],
+                &format!(
+                    "ref: refs/heads/{branch}\tHEAD\n\
+                     0000000000000000000000000000000000000000\tHEAD"
+                ),
+            )
         }
 
         /// Build an expectation that simulates jj's stale-working-copy
