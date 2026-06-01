@@ -17,11 +17,23 @@
 #   BOSS_REPO_REMOTE_URL   — repo origin URL (used by the worker for
 #                            informational logging only; cube already
 #                            cloned the repo before lease was issued).
-#   BOSS_INITIAL_INPUT     — initial prompt to feed to claude on stdin.
+#   BOSS_INITIAL_INPUT_FILE — path to a file holding the initial prompt.
+#                            Preferred over BOSS_INITIAL_INPUT so a
+#                            multi-KB prompt never has to survive ssh
+#                            argv re-quoting. Read as claude's first
+#                            positional arg (its initial user message).
+#   BOSS_INITIAL_INPUT     — inline fallback for the initial prompt.
 #
-# Contract (output): claude's stdout/stderr is streamed back over the
-# SSH channel. The worker process group's exit status determines
-# success/failure on the engine side.
+# Contract (output): the worker is launched DETACHED (`nohup` +
+# background) so it survives the engine restarting and the launching
+# SSH session closing. Its stdout/stderr are teed to
+# `<workspace>/.boss/worker.log` so the engine can read recent output
+# on demand over the multiplex. The wrapper's own exit status reports
+# only *launch* success (0) or a sentinel config/toolchain failure
+# (78-81) — the worker's real lifecycle is driven by its hook events
+# over the forwarded BOSS_EVENTS_SOCKET, not by this wrapper blocking.
+# The wrapper prints `boss-remote-run: starting … pid=<n>` to stderr so
+# the engine can record `work_runs.remote_pid`.
 #
 # --version: print the embedded BOSS_REMOTE_RUN_VERSION and exit 0.
 # Used by the engine for the lazy version-handshake at dispatch time.
@@ -95,19 +107,46 @@ export BOSS_LEASE_ID
 export BOSS_WORKSPACE
 export BOSS_REPO_REMOTE_URL="${BOSS_REPO_REMOTE_URL:-}"
 
-# Echo the embedded version so the engine sees the wrapper that
-# actually ran (separate from --version, which is a probe-only path).
-# Prefixed `boss-remote-run:` so the engine can recognize it amongst
-# stderr noise without a structured handshake.
-printf 'boss-remote-run: starting run_id=%s version=%s\n' \
-    "$BOSS_RUN_ID" "$BOSS_REMOTE_RUN_VERSION" 1>&2
+# Per-run scratch + log dir under the cube workspace. The engine pulls
+# tails of worker.log over the SSH multiplex on demand (a later phase)
+# so remote runs get the same recent-output surface as local panes —
+# without a second reverse channel.
+boss_run_dir="$BOSS_WORKSPACE/.boss"
+mkdir -p "$boss_run_dir" 2>/dev/null || true
+worker_log="$boss_run_dir/worker.log"
 
-# Hand the worker process the prompt via stdin if one was provided.
-# Otherwise exec claude with no piped input; the engine's local
-# behavior is to bring up an interactive claude pane, but on the
-# remote we run headless and stream stdout/stderr back.
-if [ -n "${BOSS_INITIAL_INPUT:-}" ]; then
-    printf '%s' "$BOSS_INITIAL_INPUT" | exec claude --dangerously-skip-permissions
-else
-    exec claude --dangerously-skip-permissions
+# Resolve the initial prompt. A file (BOSS_INITIAL_INPUT_FILE) is the
+# engine's preferred channel; an inline value is the fallback. Claude
+# Code treats its first positional arg as the initial user message —
+# mirroring the local pane, which launches with `claude "$(cat …)"`.
+initial_input=""
+if [ -n "${BOSS_INITIAL_INPUT_FILE:-}" ] && [ -f "$BOSS_INITIAL_INPUT_FILE" ]; then
+    initial_input="$(cat "$BOSS_INITIAL_INPUT_FILE")"
+elif [ -n "${BOSS_INITIAL_INPUT:-}" ]; then
+    initial_input="$BOSS_INITIAL_INPUT"
 fi
+
+# Launch DETACHED so the worker survives the engine restarting and the
+# launching SSH session closing: `nohup` makes it ignore the SIGHUP the
+# remote sshd sends on session teardown, and backgrounding reparents it
+# off this wrapper. stdin is taken from /dev/null (the prompt rides the
+# positional arg) and stdout+stderr are teed to the per-run log. The
+# wrapper returns immediately; the worker keeps running.
+if [ -n "$initial_input" ]; then
+    nohup claude --dangerously-skip-permissions "$initial_input" \
+        >"$worker_log" 2>&1 </dev/null &
+else
+    nohup claude --dangerously-skip-permissions \
+        >"$worker_log" 2>&1 </dev/null &
+fi
+worker_pid=$!
+
+# Echo the embedded version + worker pid so the engine sees the wrapper
+# that actually ran (separate from --version, a probe-only path) and can
+# record `work_runs.remote_pid`. Prefixed `boss-remote-run:` so the
+# engine can recognize it amongst stderr noise without a structured
+# handshake.
+printf 'boss-remote-run: starting run_id=%s version=%s pid=%s\n' \
+    "$BOSS_RUN_ID" "$BOSS_REMOTE_RUN_VERSION" "$worker_pid" 1>&2
+
+exit 0

@@ -46,6 +46,12 @@ pub const CONTROL_MASTER_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// `disk_full` per the Q6 design table.
 pub const SCP_PUSH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Time budget for a control-channel command (`-O forward` / `-O cancel`)
+/// issued against the existing master. These are local round-trips to
+/// the master process (no new network handshake), so they complete in
+/// well under a second on a healthy link.
+pub const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Classified outcome from running an ssh-side command. Callers that
 /// need fine-grained failure-mode mapping (e.g. wrapper push) inspect
 /// the stderr-derived classification via [`classify_stderr`].
@@ -266,6 +272,77 @@ impl SshTransport {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
+
+    /// Request a reverse Unix-socket forward over the existing master:
+    /// connections to `remote_socket` on the remote are forwarded to
+    /// `local_socket` on this (engine) host. Routed through
+    /// `ssh -O forward` so the forward rides the persistent
+    /// `ControlMaster` — it does **not** open a second SSH session, so
+    /// the "one multiplex per host" invariant holds. The worker's
+    /// `boss-event` shim then writes to what looks like a local socket
+    /// at `remote_socket` and the bytes arrive on the engine's events
+    /// socket.
+    pub async fn add_reverse_unix_forward(
+        &self,
+        remote_socket: &str,
+        local_socket: &str,
+    ) -> Result<SshOutput> {
+        self.control_forward("forward", remote_socket, local_socket).await
+    }
+
+    /// Tear down a forward previously requested with
+    /// [`add_reverse_unix_forward`]. Best-effort: a failure here leaks a
+    /// forward on the master until the master itself exits, which the
+    /// startup sweep handles.
+    pub async fn cancel_reverse_unix_forward(
+        &self,
+        remote_socket: &str,
+        local_socket: &str,
+    ) -> Result<SshOutput> {
+        self.control_forward("cancel", remote_socket, local_socket).await
+    }
+
+    /// Shared body for `-O forward` / `-O cancel`. Both take the same
+    /// `-R <remote>:<local>` forward spec and target the existing
+    /// master via its `ControlPath`.
+    async fn control_forward(
+        &self,
+        op: &str,
+        remote_socket: &str,
+        local_socket: &str,
+    ) -> Result<SshOutput> {
+        let spec = reverse_forward_spec(remote_socket, local_socket);
+        let mut cmd = Command::new("ssh");
+        cmd.args([
+            "-o", "BatchMode=yes",
+            "-o", &format!("ControlPath={}", self.control_socket.display()),
+            "-O", op,
+            "-R", &spec,
+            &self.ssh_target,
+        ]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let output = timeout(CONTROL_COMMAND_TIMEOUT, cmd.output())
+            .await
+            .with_context(|| {
+                format!("ssh -O {op} timed out for host {}", self.host_id)
+            })?
+            .with_context(|| format!("ssh -O {op} io error for host {}", self.host_id))?;
+
+        Ok(SshOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+/// Build the `-R` forward spec for a reverse Unix-socket forward:
+/// `remote_socket_path:local_socket_path`. Kept as a free function so
+/// the (purely syntactic) join is unit-testable without spawning ssh.
+pub fn reverse_forward_spec(remote_socket: &str, local_socket: &str) -> String {
+    format!("{remote_socket}:{local_socket}")
 }
 
 /// Classify an `scp` or `ssh` stderr blob into one of the Q6 wrapper-
@@ -425,6 +502,20 @@ mod tests {
         assert_eq!(
             t.control_socket.file_name().unwrap().to_str().unwrap(),
             "cm-zakalwe.sock"
+        );
+    }
+
+    #[test]
+    fn reverse_forward_spec_joins_remote_then_local() {
+        // `-R <remote>:<local>` — the remote bind path comes first,
+        // the engine-local target second. A swap here would forward
+        // the wrong direction and silently drop every hook event.
+        assert_eq!(
+            reverse_forward_spec(
+                "/tmp/boss-events-run-1.sock",
+                "/Users/me/Library/Application Support/Boss/events.sock",
+            ),
+            "/tmp/boss-events-run-1.sock:/Users/me/Library/Application Support/Boss/events.sock",
         );
     }
 
