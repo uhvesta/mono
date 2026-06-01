@@ -98,7 +98,7 @@ impl HeadProber for GitHeadProber<'_> {
 /// |-----|--------------------|-----------------------------------|
 /// |   1 | Regular PR         | merge-base(base_branch, HEAD)     |
 /// |   2 | GitHub merge queue | merge_group.base_sha or HEAD^1    |
-/// |   3 | Buildkite MQ       | HEAD^1 (merge commit), else row 1 |
+/// |   3 | Buildkite MQ       | HEAD^1                            |
 /// |   4 | Push to default    | HEAD^1                            |
 /// |   5 | Push to branch     | merge-base(default_branch, HEAD)  |
 /// |   6 | Local / pre-push   | merge-base(default) + working tree|
@@ -116,19 +116,30 @@ pub(crate) fn select_base(
         // MUST NOT 2-dot against origin/<base_branch> directly — that sweeps in
         // changes that landed on the base branch after this PR forked (T843/#948).
         //
+        // Use origin/<base_branch> when available so CI agents that reuse
+        // checkout directories (Buildkite) don't see a stale local branch.
+        // The legacy checks.sh always did `git fetch origin main && merge-base
+        // origin/main HEAD`; we mirror that here.
+        //
         // ── Rows 2 & 3: Merge queue — THE OPPOSITE RULE ─────────────────────
         // Merge queue uses HEAD^1 directly (2-dot). Do NOT compute merge-base
         // here. Using merge-base(HEAD^1, HEAD^2) returns the fork point where
         // the PR diverged from main, sweeping in all of main's drift (T774/#910).
         // The two cases are adjacent so the asymmetry is impossible to miss.
         Scenario::PullRequest { base_branch } => {
-            match prober.merge_base(base_branch) {
+            let remote_ref = format!("origin/{base_branch}");
+            let base_ref = if prober.resolve(&remote_ref).is_some() {
+                remote_ref
+            } else {
+                base_branch.clone()
+            };
+            match prober.merge_base(&base_ref) {
                 Some(sha) => BaseSelection::Scoped { base_sha: sha },
                 None => BaseSelection::Empty(EmptyReason::NoMergeBase),
             }
         }
 
-        Scenario::MergeQueue => select_base_merge_queue(env, prober, default_branch),
+        Scenario::MergeQueue => select_base_merge_queue(env, prober),
 
         // ── Row 4: Push to default branch ────────────────────────────────────
         Scenario::PushToDefault => select_base_push_to_default(prober),
@@ -136,10 +147,23 @@ pub(crate) fn select_base(
         // ── Row 5: Push to non-default branch ────────────────────────────────
         // Treated as a pre-merge branch: 3-dot against the default branch,
         // same base rule as PR but without an explicit PR signal.
-        Scenario::PushToBranch { .. } => match prober.merge_base(default_branch) {
-            Some(sha) => BaseSelection::Scoped { base_sha: sha },
-            None => BaseSelection::Empty(EmptyReason::NoMergeBase),
-        },
+        //
+        // Use origin/<default_branch> when available so CI agents that reuse
+        // checkout directories (Buildkite) don't see a stale local branch.
+        // The legacy checks.sh always did `git fetch origin main && merge-base
+        // origin/main HEAD`; we mirror that here.
+        Scenario::PushToBranch { .. } => {
+            let remote_ref = format!("origin/{default_branch}");
+            let base_ref = if prober.resolve(&remote_ref).is_some() {
+                remote_ref
+            } else {
+                default_branch.to_owned()
+            };
+            match prober.merge_base(&base_ref) {
+                Some(sha) => BaseSelection::Scoped { base_sha: sha },
+                None => BaseSelection::Empty(EmptyReason::NoMergeBase),
+            }
+        }
 
         // ── Rows 6 & 8: Local / pre-push with detached-HEAD fallback ─────────
         Scenario::Local => select_base_local(prober, default_branch),
@@ -147,11 +171,7 @@ pub(crate) fn select_base(
 }
 
 /// Rows 2 & 3: GitHub merge queue and Buildkite merge queue.
-fn select_base_merge_queue(
-    env: &CiEnvironment,
-    prober: &dyn HeadProber,
-    default_branch: &str,
-) -> BaseSelection {
+fn select_base_merge_queue(env: &CiEnvironment, prober: &dyn HeadProber) -> BaseSelection {
     // Row 2: GitHub merge queue.
     // Prefer merge_group.base_sha from the event payload (the authoritative
     // current tip of the target branch). Fall back to HEAD^1 when the payload
@@ -168,23 +188,13 @@ fn select_base_merge_queue(
     }
 
     // Row 3: Buildkite merge queue (BUILDKITE_BRANCH = gh-readonly-queue/<target>/…).
-    // HEAD should be a GitHub-created merge commit; verify by checking HEAD^2.
-    // If HEAD is a merge commit, use HEAD^1 directly (2-dot).
-    // If HEAD is not a merge commit (unusual: pipeline ran on a non-merge commit),
-    // fall back to the row-1 rule against the queue's parsed target branch.
-    if prober.resolve("HEAD^2").is_some() {
-        head_parent_or_empty(prober)
-    } else {
-        let target = env
-            .buildkite_branch
-            .as_deref()
-            .and_then(parse_bk_queue_target)
-            .unwrap_or_else(|| default_branch.to_owned());
-        match prober.merge_base(&target) {
-            Some(sha) => BaseSelection::Scoped { base_sha: sha },
-            None => BaseSelection::Empty(EmptyReason::NoMergeBase),
-        }
-    }
+    // Use HEAD^1 unconditionally, exactly mirroring legacy checks.sh:
+    //   git rev-parse HEAD^1
+    // Do NOT check HEAD^2 to gate this: in a shallow Buildkite checkout the second
+    // parent is often not fetched even when HEAD is a genuine merge commit, which
+    // caused the HEAD^2 sentinel to fail and fall through to merge-base(origin/main),
+    // producing 321 changed files instead of the correct 6 (T1016/#1104).
+    head_parent_or_empty(prober)
 }
 
 /// Row 4: Push to the default branch.
@@ -353,6 +363,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn row1_pr_prefers_origin_ref_over_stale_local() {
+        let scenario = Scenario::PullRequest {
+            base_branch: DEFAULT.to_owned(),
+        };
+        let env = gha_env("pull_request");
+        // origin/main is present and fresher; local "main" is stale.
+        // select_base must use origin/main, not local main.
+        let prober = Stub::default()
+            .rev("origin/main", "some_origin_sha") // origin/main resolves
+            .base("origin/main", MERGE_BASE_SHA)
+            .base(DEFAULT, "stale_local_sha");
+        assert_eq!(
+            select_base(&scenario, &env, &prober, DEFAULT),
+            BaseSelection::Scoped {
+                base_sha: MERGE_BASE_SHA.to_owned()
+            }
+        );
+    }
+
     // ── Row 2: GitHub merge queue ─────────────────────────────────────────────
 
     #[test]
@@ -384,13 +414,12 @@ mod tests {
     // ── Row 3: Buildkite merge queue ──────────────────────────────────────────
 
     #[test]
-    fn row3_bk_merge_queue_uses_head_parent_when_merge_commit() {
+    fn row3_bk_merge_queue_uses_head_parent() {
         let scenario = Scenario::MergeQueue;
         let env = bk_env("gh-readonly-queue/main/pr-42-sha-abc");
-        // HEAD^2 exists → HEAD is a merge commit
-        let prober = Stub::default()
-            .rev("HEAD^2", "secondparentsha")
-            .rev("HEAD^1", HEAD1_SHA);
+        // HEAD^1 is the first parent of the merge commit (matches legacy checks.sh).
+        // HEAD^2 is not consulted — it may be absent in a shallow Buildkite checkout.
+        let prober = Stub::default().rev("HEAD^1", HEAD1_SHA);
         assert_eq!(
             select_base(&scenario, &env, &prober, DEFAULT),
             BaseSelection::Scoped {
@@ -400,28 +429,30 @@ mod tests {
     }
 
     #[test]
-    fn row3_bk_merge_queue_falls_back_to_merge_base_when_not_merge_commit() {
+    fn row3_bk_merge_queue_head_parent_absent_gives_empty() {
         let scenario = Scenario::MergeQueue;
         let env = bk_env("gh-readonly-queue/main/pr-42-sha-abc");
-        // HEAD^2 absent → HEAD is not a merge commit; fall back to merge-base of "main"
-        let prober = Stub::default().base("main", MERGE_BASE_SHA);
+        // Neither HEAD^1 nor HEAD^2 resolves → Empty (no fallback to merge-base).
+        let prober = Stub::default();
         assert_eq!(
             select_base(&scenario, &env, &prober, DEFAULT),
-            BaseSelection::Scoped {
-                base_sha: MERGE_BASE_SHA.to_owned()
-            }
+            BaseSelection::Empty(EmptyReason::DetachedHeadNoParent)
         );
     }
 
     #[test]
-    fn row3_bk_merge_queue_parses_target_branch_from_queue_branch_name() {
+    fn row3_bk_merge_queue_head_parent_used_regardless_of_head2_presence() {
+        // HEAD^2 present (genuine merge commit) and HEAD^1 also present.
+        // Result is still HEAD^1 — HEAD^2 is no longer a gating condition.
         let scenario = Scenario::MergeQueue;
-        let env = bk_env("gh-readonly-queue/develop/pr-7-deadbeef");
-        let prober = Stub::default().base("develop", MERGE_BASE_SHA);
+        let env = bk_env("gh-readonly-queue/main/pr-42-sha-abc");
+        let prober = Stub::default()
+            .rev("HEAD^2", "secondparentsha")
+            .rev("HEAD^1", HEAD1_SHA);
         assert_eq!(
             select_base(&scenario, &env, &prober, DEFAULT),
             BaseSelection::Scoped {
-                base_sha: MERGE_BASE_SHA.to_owned()
+                base_sha: HEAD1_SHA.to_owned()
             }
         );
     }
@@ -449,7 +480,28 @@ mod tests {
             branch: "feature/foo".to_owned(),
         };
         let env = gha_env("push");
+        // origin/main not present → falls back to local "main"
         let prober = Stub::default().base(DEFAULT, MERGE_BASE_SHA);
+        assert_eq!(
+            select_base(&scenario, &env, &prober, DEFAULT),
+            BaseSelection::Scoped {
+                base_sha: MERGE_BASE_SHA.to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn row5_push_to_branch_prefers_origin_ref_over_stale_local() {
+        let scenario = Scenario::PushToBranch {
+            branch: "feature/foo".to_owned(),
+        };
+        let env = gha_env("push");
+        // origin/main is present and fresher; local "main" is stale.
+        // select_base must use origin/main, not local main.
+        let prober = Stub::default()
+            .rev("origin/main", "some_origin_sha") // origin/main resolves
+            .base("origin/main", MERGE_BASE_SHA)
+            .base(DEFAULT, "stale_local_sha");
         assert_eq!(
             select_base(&scenario, &env, &prober, DEFAULT),
             BaseSelection::Scoped {

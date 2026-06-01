@@ -681,7 +681,9 @@ fn shallow_pr_deepens_until_base_reachable() {
         "clone must start shallow"
     );
     let vcs = detect(clone);
-    let env = env_gha_pull_request("origin/main");
+    // GITHUB_BASE_REF in real GHA is just the branch name (e.g. "main"),
+    // not the remote-prefixed form. The code adds "origin/" in resolve_change_plan.
+    let env = env_gha_pull_request("main");
 
     let plan = resolve(&env, &vcs, auto());
 
@@ -706,7 +708,8 @@ fn shallow_base_permanently_unreachable_errors() {
     let (remote_dir, clone_dir, _fork) = shallow_pr_clone();
     let clone = clone_dir.path();
     let vcs = detect(clone);
-    let env = env_gha_pull_request("origin/totally-nonexistent-branch");
+    // GITHUB_BASE_REF is the bare branch name; the code adds "origin/" prefix.
+    let env = env_gha_pull_request("totally-nonexistent-branch");
 
     let err = resolve_change_plan(&env, &vcs, &auto())
         .expect_err("unreachable base must error, not silently mis-scope");

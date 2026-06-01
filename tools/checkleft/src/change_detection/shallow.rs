@@ -43,17 +43,19 @@ pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &S
     info!(needed_ref, "repo is shallow; deepening history");
 
     match scenario {
-        // ── Merge-queue / push: only HEAD^1 is needed ────────────────────────
+        // ── Merge-queue / push-to-default: only HEAD^1 is needed ─────────────
         // A single --deepen=1 brings the parent commit into local history.
         // No merge-base computation is required for these scenarios.
-        Scenario::MergeQueue | Scenario::PushToDefault | Scenario::PushToBranch { .. } => {
+        Scenario::MergeQueue | Scenario::PushToDefault => {
             deepen(&git_root, 1)?;
-            info!("deepened by 1 to reach HEAD^1 for merge-queue/push scenario");
+            info!("deepened by 1 to reach HEAD^1 for merge-queue/push-to-default scenario");
         }
 
-        // ── PR / local: need the merge-base against needed_ref ────────────────
+        // ── PR / push-to-branch / local: need the merge-base against needed_ref
         // Try the bounded ladder then full unshallow before erroring.
-        Scenario::PullRequest { .. } | Scenario::Local => {
+        // PushToBranch needs merge-base(origin/<default_branch>, HEAD), so it
+        // requires the same treatment as PR and Local — not just HEAD^1.
+        Scenario::PullRequest { .. } | Scenario::PushToBranch { .. } | Scenario::Local => {
             let reached = deepen_until_reachable(&git_root, needed_ref)?;
             if !reached {
                 bail!(

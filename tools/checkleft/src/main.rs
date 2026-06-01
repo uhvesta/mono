@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use checkleft::change_detection::environment::CiEnvironment;
+use checkleft::change_detection::scenario::Scenario;
 use checkleft::change_detection::{ChangePlan, ChangeOverrides, base_revision_from_plan, resolve_change_plan};
 use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
@@ -56,6 +57,15 @@ enum Commands {
         config: ConfigArgs,
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        base_ref: Option<String>,
+        #[arg(long)]
+        default_branch: Option<String>,
+    },
+    // TEMPORARY: bake-period parity check (P844 migration step 2).
+    // Resolves the change plan and prints base_sha + changed_files without running checks.
+    // Remove once checks.sh scoping is retired.
+    ShowPlan {
         #[arg(long)]
         base_ref: Option<String>,
         #[arg(long)]
@@ -196,6 +206,33 @@ async fn run_cli() -> Result<ExitCode> {
             } else {
                 for check in checks {
                     println!("{check}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        // TEMPORARY: bake-period parity check (P844 migration step 2). Remove once checks.sh is retired.
+        Commands::ShowPlan { base_ref, default_branch } => {
+            let overrides = ChangeOverrides { all: false, base_ref, default_branch };
+            let plan = resolve_change_plan(&env, &vcs, &overrides)?;
+            match &plan {
+                ChangePlan::All => println!("plan=all"),
+                ChangePlan::Empty { .. } => println!("plan=empty"),
+                ChangePlan::Scoped { base_sha, scenario } => {
+                    let changeset = changeset_from_plan(&vcs, &plan)?;
+                    let scenario_str = match scenario {
+                        Scenario::PullRequest { base_branch } => {
+                            format!("pull-request({base_branch})")
+                        }
+                        Scenario::MergeQueue => "merge-queue".to_owned(),
+                        Scenario::PushToDefault => "push-to-default".to_owned(),
+                        Scenario::PushToBranch { branch } => {
+                            format!("push-to-branch({branch})")
+                        }
+                        Scenario::Local => "local".to_owned(),
+                    };
+                    println!("base_sha={base_sha}");
+                    println!("changed_files={}", changeset.changed_files.len());
+                    println!("scenario={scenario_str}");
                 }
             }
             Ok(ExitCode::SUCCESS)

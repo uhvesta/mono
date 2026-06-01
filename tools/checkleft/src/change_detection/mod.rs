@@ -123,9 +123,14 @@ pub fn resolve_change_plan(
     info!(?scenario, "classified CI scenario");
 
     // The ref whose reachability we need to ensure before computing the base.
+    // For PullRequest and PushToBranch we use origin/<branch> so that
+    // shallow-clone deepening fetches from the remote and select_base gets a
+    // fresh ref (matching what the legacy checks.sh did with
+    // `git fetch origin main`).
     let needed_ref: String = match &scenario {
-        Scenario::PullRequest { base_branch } => base_branch.clone(),
-        Scenario::PushToBranch { .. } | Scenario::Local => default_branch.clone(),
+        Scenario::PullRequest { base_branch } => format!("origin/{base_branch}"),
+        Scenario::PushToBranch { .. } => format!("origin/{default_branch}"),
+        Scenario::Local => default_branch.clone(),
         Scenario::MergeQueue | Scenario::PushToDefault => "HEAD^1".to_owned(),
     };
 
