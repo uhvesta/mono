@@ -347,16 +347,24 @@ impl WorkDb {
     /// successful merge-poller probe. Stores the CI and review state strings
     /// (and optional JSON-encoded detail blobs) plus the current timestamp.
     ///
-    /// Returns `Ok(true)` when the CI or review state actually changed (so
-    /// the caller should emit a change event), `Ok(false)` when the probe
-    /// confirmed the same state as before (no event needed), and `Ok(false)`
-    /// when the row was deleted or not found. Errors propagate from
-    /// the underlying DB operations.
+    /// Returns a [`PrPollStateOutcome`] carrying `changed` (the CI, review, or
+    /// merge-queue state actually moved, so the caller should emit a change
+    /// event) and `prior_ci_state` (the `ci_required_state` value stored
+    /// *before* this update). `changed` is `false` when the probe confirmed
+    /// the same state as before, or when the row was deleted / not found.
+    /// Errors propagate from the underlying DB operations.
     ///
     /// The UPDATE is guarded by a `WHERE` clause that skips rows whose
     /// `ci_required_state` AND `review_required_state` are already set to
     /// the incoming values, so `changes() == 0` reliably means "nothing
     /// changed" — the caller does not need to issue a separate read.
+    ///
+    /// `prior_ci_state` is read in the same connection just before the UPDATE
+    /// so the caller can detect a `fail → success` transition (CI recovered at
+    /// the current head) and broadcast a `CiFailureCleared` event, reconciling
+    /// a stale "ci failing" badge away during the poll we already do. Per-task
+    /// poll writes are serialised by the sweep loop, so the read-then-write is
+    /// race-free in practice.
     pub fn update_task_pr_poll_state(
         &self,
         work_item_id: &str,
@@ -365,9 +373,18 @@ impl WorkDb {
         ci_required_detail: Option<&str>,
         review_required_detail: Option<&str>,
         merge_queue_state: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<PrPollStateOutcome> {
         let conn = self.connect()?;
         let now = now_string();
+        let prior_ci_state: Option<String> = conn
+            .query_row(
+                "SELECT ci_required_state FROM tasks
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
         // Only write (and count as changed) when the CI, review, or merge-queue
         // state differs from what's already stored. `COALESCE(col, '')` treats
         // NULL as distinct from any non-empty string, so the first probe after
@@ -395,6 +412,21 @@ impl WorkDb {
                 merge_queue_state,
             ],
         )?;
-        Ok(changed > 0)
+        Ok(PrPollStateOutcome {
+            changed: changed > 0,
+            prior_ci_state,
+        })
     }
+}
+
+/// Outcome of [`WorkDb::update_task_pr_poll_state`].
+#[derive(Debug, Clone)]
+pub struct PrPollStateOutcome {
+    /// `true` when the CI, review, or merge-queue state actually changed
+    /// (so the caller should emit a `pr_poll_state_updated` event).
+    pub changed: bool,
+    /// The `ci_required_state` value stored *before* this update, or `None`
+    /// when the column was NULL / the row was absent. Lets the caller detect
+    /// a `fail → success` transition and clear a stale "ci failing" badge.
+    pub prior_ci_state: Option<String>,
 }

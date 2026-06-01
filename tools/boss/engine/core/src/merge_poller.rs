@@ -2396,7 +2396,7 @@ pub(crate) async fn update_pr_poll_state(
     let review_detail = review_detail_json(probe.review.reviewers());
     let merge_queue_state = merge_queue_state_str(probe.in_merge_queue);
 
-    match work_db.update_task_pr_poll_state(
+    let outcome = match work_db.update_task_pr_poll_state(
         &candidate.work_item_id,
         ci_state,
         review_state,
@@ -2404,34 +2404,69 @@ pub(crate) async fn update_pr_poll_state(
         review_detail.as_deref(),
         merge_queue_state,
     ) {
-        Ok(true) => {
-            // State changed — emit event so the macOS kanban refreshes the
-            // card's CI / review / merging indicators within the poll interval.
-            publisher
-                .publish_work_item_changed(
-                    &candidate.product_id,
-                    &candidate.work_item_id,
-                    "pr_poll_state_updated",
-                )
-                .await;
-            tracing::debug!(
-                work_item_id = %candidate.work_item_id,
-                ci_state,
-                review_state,
-                in_merge_queue = probe.in_merge_queue,
-                "merge poller: PR poll state changed",
-            );
-        }
-        Ok(false) => {
-            // No state change (or row not found / deleted) — skip event.
-        }
+        Ok(outcome) => outcome,
         Err(err) => {
             tracing::warn!(
                 work_item_id = %candidate.work_item_id,
                 ?err,
                 "merge poller: failed to update PR poll state",
             );
+            return;
         }
+    };
+
+    if outcome.changed {
+        // State changed — emit event so the macOS kanban refreshes the
+        // card's CI / review / merging indicators within the poll interval.
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "pr_poll_state_updated",
+            )
+            .await;
+        tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            ci_state,
+            review_state,
+            in_merge_queue = probe.in_merge_queue,
+            "merge poller: PR poll state changed",
+        );
+    }
+
+    // Badge reconciliation (issue #1151): the macOS "ci failing" chip is
+    // driven by `ci_remediations` rows and is cleared only by an explicit
+    // `CiFailureCleared` / `CiRemediationSucceeded` event. The blocked-signal
+    // retire path (`ci_watch::on_ci_resolved`, dispatched from
+    // `maybe_clear_blocked`) emits one of those — but only when the chore is
+    // still `blocked` or carries an active CI signal/attempt to retire. When
+    // CI goes green at a *new* head and the engine's own block was already
+    // quiesced (or never armed a side-table signal), no retire fires and the
+    // chip is stranded on an earlier head's failure (the T52 leak). The poll
+    // observes the truth — `fail → success` at the current head — so broadcast
+    // `CiFailureCleared` here as a head-keyed safety net. This is idempotent
+    // with any retire-path clear that already ran this sweep: the macOS
+    // handler simply drops the chip (a no-op if already gone) and leaves the
+    // "ci auto-fixed" badge untouched. Restricted to `fail → success` so it
+    // never clobbers an active attempt's in-flight badge on `fail → in_progress`
+    // (that transition is owned by `on_ci_in_flight_supersedes_failure`, #901).
+    if outcome.prior_ci_state.as_deref() == Some("fail") && ci_state == "success" {
+        publisher
+            .publish_frontend_event_on_product(
+                &candidate.product_id,
+                boss_protocol::FrontendEvent::CiFailureCleared {
+                    product_id: candidate.product_id.clone(),
+                    work_item_id: candidate.work_item_id.clone(),
+                    pr_url: candidate.pr_url.clone(),
+                },
+            )
+            .await;
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            "merge poller: CI recovered to success at current head; \
+             broadcast CiFailureCleared to clear any stale ci-failing badge",
+        );
     }
 }
 
@@ -2740,6 +2775,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingPublisher {
         work_events: Mutex<Vec<(String, String, String)>>,
+        frontend_events: Mutex<Vec<boss_protocol::FrontendEvent>>,
     }
 
     impl RecordingPublisher {
@@ -2754,6 +2790,21 @@ mod tests {
                 .filter(|(_, _, reason)| reason != "pr_poll_state_updated")
                 .map(|(_, _, reason)| reason.clone())
                 .collect()
+        }
+
+        /// Count of `CiFailureCleared` frontend events broadcast for `pr_url`.
+        async fn ci_failure_cleared_count(&self, pr_url: &str) -> usize {
+            self.frontend_events
+                .lock()
+                .await
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        boss_protocol::FrontendEvent::CiFailureCleared { pr_url: p, .. } if p == pr_url
+                    )
+                })
+                .count()
         }
     }
 
@@ -2775,8 +2826,9 @@ mod tests {
         async fn publish_frontend_event_on_product(
             &self,
             _product_id: &str,
-            _event: boss_protocol::FrontendEvent,
+            event: boss_protocol::FrontendEvent,
         ) {
+            self.frontend_events.lock().await.push(event);
         }
     }
 
@@ -6156,6 +6208,115 @@ mod tests {
             has_poll_update,
             "pr_poll_state_updated must be emitted when ci_required_state changes; \
              got: {all_events:?}",
+        );
+
+        // The retire path emits a clear event; the poll-state safety net may
+        // also re-emit `CiFailureCleared` (idempotent). Either way the macOS
+        // "ci failing" chip must receive at least one clear signal.
+        assert!(
+            publisher.ci_failure_cleared_count(pr).await >= 1,
+            "a CiFailureCleared event must reach the UI when CI recovers to success",
+        );
+    }
+
+    /// Issue #1151: a stale "ci failing" badge keyed to an earlier head must
+    /// be cleared by the state poll even when the engine has no active
+    /// blocked signal / remediation attempt to retire. This is the leak the
+    /// blocked-signal retire path (`maybe_clear_blocked` → `on_ci_resolved`)
+    /// does not cover: the chore sits `in_review` with a persisted
+    /// `ci_required_state = "fail"` left over from a prior commit's failing
+    /// poll, no `task_blocked_signals` row armed, yet the macOS card still
+    /// shows the "ci failing" chip. When the current head polls green the poll
+    /// must broadcast `CiFailureCleared` so the chip reconciles away.
+    #[tokio::test]
+    async fn stale_ci_failing_badge_cleared_by_poll_without_active_signal() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/1151";
+        let (product, chore) = make_chore_in_review(&db, "C-stale-badge", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Seed a stale failing poll-state directly — simulating the earlier
+        // head's failing rollup having been recorded, while the engine's block
+        // has since been quiesced (no active signal, status still in_review).
+        let seeded = db
+            .update_task_pr_poll_state(&chore, "fail", "unknown", None, None, None)
+            .unwrap();
+        assert!(seeded.changed, "seed write must register a state change");
+        assert!(
+            db.active_blocked_signals(&chore).unwrap().is_empty(),
+            "precondition: no active blocked signal — this is the uncovered leak path",
+        );
+
+        // Current head polls green.
+        probe
+            .states
+            .lock()
+            .unwrap()
+            .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-2")));
+        let out = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+
+        // No retire path fired (there was nothing blocked to retire) — proving
+        // the clear came from the poll-state safety net, not `on_ci_resolved`.
+        assert_eq!(
+            out.ci_cleared, 0,
+            "no blocked-signal retire should fire; the clear must come from the poll",
+        );
+
+        // The persisted CI state must now read success.
+        let ci_state = match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => t.ci_required_state,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(ci_state.as_deref(), Some("success"));
+
+        // And the UI must have received the badge-clearing event.
+        assert_eq!(
+            publisher.ci_failure_cleared_count(pr).await,
+            1,
+            "the poll must broadcast exactly one CiFailureCleared on fail → success",
+        );
+
+        // Sanity: the event carries the right product/work-item identifiers.
+        let events = publisher.frontend_events.lock().await.clone();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                boss_protocol::FrontendEvent::CiFailureCleared { product_id: p, work_item_id: w, pr_url: u }
+                    if p == &product && w == &chore && u == pr
+            )),
+            "CiFailureCleared must carry the chore's product/work-item/pr ids; got: {events:?}",
+        );
+    }
+
+    /// The poll-state safety net must NOT fire on a no-op clean poll: a chore
+    /// whose CI was already `success` (or never failing) must not emit a
+    /// spurious `CiFailureCleared` on every sweep. Only a genuine
+    /// `fail → success` transition clears the badge.
+    #[tokio::test]
+    async fn clean_poll_without_prior_failure_does_not_emit_clear() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/1152";
+        let (_product, _chore) = make_chore_in_review(&db, "C-no-spurious-clear", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        probe
+            .states
+            .lock()
+            .unwrap()
+            .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
+        // Two sweeps: the first writes success (prior NULL), the second is a
+        // confirmed no-op. Neither saw a prior "fail" so neither may clear.
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+
+        assert_eq!(
+            publisher.ci_failure_cleared_count(pr).await,
+            0,
+            "a clean poll with no prior failing state must not emit CiFailureCleared",
         );
     }
 
