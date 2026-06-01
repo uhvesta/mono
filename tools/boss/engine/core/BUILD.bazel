@@ -320,7 +320,11 @@ test_suite(
 
 rust_test(
     name = "work_crud_test",
-    srcs = ["tests/work_crud.rs"],
+    srcs = [
+        "tests/watcher_support.rs",
+        "tests/work_crud.rs",
+    ],
+    crate_root = "tests/work_crud.rs",
     edition = "2024",
     size = "small",
     timeout = "moderate",
@@ -360,7 +364,11 @@ rust_test(
 
 rust_test(
     name = "comments_crud_test",
-    srcs = ["tests/comments_crud.rs"],
+    srcs = [
+        "tests/comments_crud.rs",
+        "tests/watcher_support.rs",
+    ],
+    crate_root = "tests/comments_crud.rs",
     edition = "2024",
     size = "small",
     timeout = "moderate",
