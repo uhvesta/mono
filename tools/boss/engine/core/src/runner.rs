@@ -465,31 +465,35 @@ impl ExecutionRunner for PaneSpawnRunner {
                          falling back to generic prompt",
                     );
                     compose_execution_prompt(
-                        execution,
-                        work_item,
-                        parent_project.as_ref(),
-                        workspace_path,
-                        cube_change_id,
-                        conflict_attempt.as_ref(),
-                        recovery_branch.as_deref(),
-                        ci_attempt.as_ref(),
-                        product_editorial_rules.as_ref(),
-                        &pr_template_set,
+                        ExecutionPromptParams::builder()
+                            .execution(execution)
+                            .work_item(work_item)
+                            .workspace_path(workspace_path)
+                            .maybe_parent_project(parent_project.as_ref())
+                            .maybe_cube_change_id(cube_change_id)
+                            .maybe_conflict_attempt(conflict_attempt.as_ref())
+                            .maybe_recovery_branch(recovery_branch.as_deref())
+                            .maybe_ci_attempt(ci_attempt.as_ref())
+                            .maybe_editorial_rules(product_editorial_rules.as_ref())
+                            .pr_template_set(&pr_template_set)
+                            .build(),
                     )
                 }
             }
         } else {
             compose_execution_prompt(
-                execution,
-                work_item,
-                parent_project.as_ref(),
-                workspace_path,
-                cube_change_id,
-                conflict_attempt.as_ref(),
-                recovery_branch.as_deref(),
-                ci_attempt.as_ref(),
-                product_editorial_rules.as_ref(),
-                &pr_template_set,
+                ExecutionPromptParams::builder()
+                    .execution(execution)
+                    .work_item(work_item)
+                    .workspace_path(workspace_path)
+                    .maybe_parent_project(parent_project.as_ref())
+                    .maybe_cube_change_id(cube_change_id)
+                    .maybe_conflict_attempt(conflict_attempt.as_ref())
+                    .maybe_recovery_branch(recovery_branch.as_deref())
+                    .maybe_ci_attempt(ci_attempt.as_ref())
+                    .maybe_editorial_rules(product_editorial_rules.as_ref())
+                    .pr_template_set(&pr_template_set)
+                    .build(),
             )
         };
         let spawn_config = resolve_spawn_config(
@@ -620,18 +624,33 @@ impl ExecutionRunner for PaneSpawnRunner {
     }
 }
 
-fn compose_execution_prompt(
-    execution: &WorkExecution,
-    work_item: &WorkItem,
-    parent_project: Option<&Project>,
-    workspace_path: &Path,
-    cube_change_id: Option<&str>,
-    conflict_attempt: Option<&ConflictResolution>,
-    recovery_branch: Option<&str>,
-    ci_attempt: Option<&CiRemediation>,
-    editorial_rules: Option<&EditorialRules>,
-    pr_template_set: &crate::pr_template::PrTemplateSet,
-) -> String {
+#[derive(bon::Builder)]
+struct ExecutionPromptParams<'a> {
+    execution: &'a WorkExecution,
+    work_item: &'a WorkItem,
+    workspace_path: &'a Path,
+    parent_project: Option<&'a Project>,
+    cube_change_id: Option<&'a str>,
+    conflict_attempt: Option<&'a ConflictResolution>,
+    recovery_branch: Option<&'a str>,
+    ci_attempt: Option<&'a CiRemediation>,
+    editorial_rules: Option<&'a EditorialRules>,
+    pr_template_set: &'a crate::pr_template::PrTemplateSet,
+}
+
+fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
+    let ExecutionPromptParams {
+        execution,
+        work_item,
+        parent_project,
+        workspace_path,
+        cube_change_id,
+        conflict_attempt,
+        recovery_branch,
+        ci_attempt,
+        editorial_rules,
+        pr_template_set,
+    } = params;
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
     // the engine-collected log excerpt, the failing-check set, and the
     // attempt-kind-specific playbook (rebase-first for `fix`, just the
@@ -2017,16 +2036,12 @@ mod compose_prompt_tests {
     #[test]
     fn no_resume_directive_when_pr_url_is_absent() {
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -2038,16 +2053,12 @@ mod compose_prompt_tests {
     fn no_resume_directive_when_pr_url_is_empty() {
         let chore = chore_with_pr("");
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -2059,16 +2070,12 @@ mod compose_prompt_tests {
     fn resume_directive_present_when_pr_url_is_set() {
         let chore = chore_with_pr("https://github.com/org/repo/pull/42");
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("## RESUME EXISTING PR"),
@@ -2088,16 +2095,12 @@ mod compose_prompt_tests {
     fn resume_directive_appears_before_execution_context() {
         let chore = chore_with_pr("https://github.com/org/repo/pull/99");
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         let resume_pos = prompt.find("## RESUME EXISTING PR").expect("missing resume block");
         let exec_pos = prompt.find("Execution context:").expect("missing execution context");
@@ -2111,16 +2114,12 @@ mod compose_prompt_tests {
     fn expected_branch_name_suppressed_when_pr_url_set() {
         let chore = chore_with_pr("https://github.com/org/repo/pull/42");
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("expected branch name"),
@@ -2131,16 +2130,12 @@ mod compose_prompt_tests {
     #[test]
     fn expected_branch_name_present_when_no_pr_url() {
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("expected branch name"),
@@ -2152,16 +2147,12 @@ mod compose_prompt_tests {
     fn acceptance_criterion_references_existing_pr_when_pr_url_set() {
         let chore = chore_with_pr("https://github.com/org/repo/pull/42");
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("Do NOT open a new PR"),
@@ -2176,16 +2167,12 @@ mod compose_prompt_tests {
     #[test]
     fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("jj bookmark create"),
@@ -2200,16 +2187,12 @@ mod compose_prompt_tests {
     #[test]
     fn no_recovery_block_when_no_prior_branch() {
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("STARTUP RECOVERY"),
@@ -2220,16 +2203,13 @@ mod compose_prompt_tests {
     #[test]
     fn recovery_block_injected_when_prior_branch_provided() {
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            Some("boss/exec_prior123_09"),
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .recovery_branch("boss/exec_prior123_09")
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("## STARTUP RECOVERY"),
@@ -2252,16 +2232,13 @@ mod compose_prompt_tests {
         // also appear (that would be contradictory).
         let chore = chore_with_pr("https://github.com/org/repo/pull/42");
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            Some("boss/exec_prior123_09"),
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .recovery_branch("boss/exec_prior123_09")
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("STARTUP RECOVERY"),
@@ -2276,16 +2253,13 @@ mod compose_prompt_tests {
     #[test]
     fn recovery_block_appears_before_execution_context() {
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            Some("boss/exec_prior123_09"),
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .recovery_branch("boss/exec_prior123_09")
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         let recovery_pos = prompt.find("## STARTUP RECOVERY").expect("missing recovery block");
         let exec_pos = prompt.find("Execution context:").expect("missing execution context");
@@ -2300,16 +2274,13 @@ mod compose_prompt_tests {
         // The new worker should push under the NEW expected branch name
         // (derived from the current execution id), not the prior one.
         let prompt = compose_execution_prompt(
-            &base_execution(),   // id = "exec_abc123_01"
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            Some("boss/exec_prior123_09"),
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .recovery_branch("boss/exec_prior123_09")
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         // "boss/exec_abc123_01" is the new expected branch
         assert!(
@@ -2338,16 +2309,12 @@ mod compose_prompt_tests {
         // that the engine auto-transitions to Review once CI is effectively
         // green. This general guidance applies regardless of org.
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("do not babysit CI"),
@@ -2366,16 +2333,12 @@ mod compose_prompt_tests {
         // not re-hardcoded in the prompt — single sourcing is the fix.
         let exec = execution_for_remote("git@github.com:linkedin-multiproduct/some-repo.git");
         let prompt = compose_execution_prompt(
-            &exec,
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&exec)
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("Owner Approval"),
@@ -2392,16 +2355,12 @@ mod compose_prompt_tests {
         // A non-LinkedIn org has no review-signal rules; the directive's
         // general guidance stands alone without naming any check.
         let prompt = compose_execution_prompt(
-            &execution_for_remote("git@github.com:org/repo.git"),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&execution_for_remote("git@github.com:org/repo.git"))
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("do not babysit CI"),
@@ -2581,16 +2540,12 @@ mod compose_prompt_tests {
             other => other,
         };
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("## RESUME EXISTING PR"),
@@ -2603,16 +2558,12 @@ mod compose_prompt_tests {
         // Positive case: task with an explicit pr_url gets the RESUME block.
         let chore = chore_with_pr("https://github.com/org/repo/pull/235");
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("## RESUME EXISTING PR"),
@@ -2653,16 +2604,12 @@ mod compose_prompt_tests {
     fn bazel_gate_present_for_chore_on_bazel_workspace() {
         let ws = bazel_workspace();
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            ws.path(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("## Pre-push build gate (Bazel workspace)"),
@@ -2687,16 +2634,12 @@ mod compose_prompt_tests {
         // Empty tempdir — no MODULE.bazel / WORKSPACE marker.
         let ws = tempfile::TempDir::new().unwrap();
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            ws.path(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("Pre-push build gate"),
@@ -2708,16 +2651,12 @@ mod compose_prompt_tests {
     fn bazel_gate_present_for_revision_on_bazel_workspace() {
         let ws = bazel_workspace();
         let prompt = compose_execution_prompt(
-            &revision_execution("https://github.com/org/repo/pull/250"),
-            &chore_without_pr(),
-            None,
-            ws.path(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/250"))
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("## Pre-push build gate (Bazel workspace)"),
@@ -2734,16 +2673,12 @@ mod compose_prompt_tests {
         // parent PR's existing branch, so the line must be omitted.
         let ws = tempfile::TempDir::new().unwrap();
         let prompt = compose_execution_prompt(
-            &revision_execution("https://github.com/org/repo/pull/250"),
-            &chore_without_pr(),
-            None,
-            ws.path(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/250"))
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("expected branch name"),
@@ -2764,16 +2699,12 @@ mod compose_prompt_tests {
         // engine-supplied branch name to push to.
         let ws = tempfile::TempDir::new().unwrap();
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            ws.path(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("expected branch name"),
@@ -2886,16 +2817,13 @@ mod compose_prompt_tests {
         );
         let attempt = sample_conflict_attempt();
         let prompt = compose_execution_prompt(
-            &revision_execution("https://github.com/org/repo/pull/77"),
-            &work_item,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            Some(&attempt),
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .conflict_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         // Must contain the conflict-resolution section header.
         assert!(
@@ -2932,16 +2860,13 @@ mod compose_prompt_tests {
         );
         let attempt = sample_ci_attempt();
         let prompt = compose_execution_prompt(
-            &revision_execution("https://github.com/org/repo/pull/77"),
-            &work_item,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            Some(&attempt),
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .ci_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         // Must contain the CI remediation section header.
         assert!(
@@ -2984,16 +2909,12 @@ mod compose_prompt_tests {
         // Operator-triggered revision: no conflict or CI attempt → no fragment.
         let work_item = revision_task_with_created_via(None, "operator");
         let prompt = compose_execution_prompt(
-            &revision_execution("https://github.com/org/repo/pull/77"),
-            &work_item,
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("## Conflict resolution context"),
@@ -3017,16 +2938,12 @@ mod compose_prompt_tests {
     fn editorial_rules_block_always_rendered_with_baked_in_rules() {
         // Default config: block always appears with baked-in rules.
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("[editorial-rules]"),
@@ -3050,16 +2967,12 @@ mod compose_prompt_tests {
     fn editorial_rules_block_default_config_has_no_instructions_section() {
         // Default config: no instructions, no template, no enforcement banner.
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             !prompt.contains("Product-specific rules"),
@@ -3082,16 +2995,13 @@ mod compose_prompt_tests {
             ..Default::default()
         };
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            Some(&rules),
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .editorial_rules(&rules)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("Product-specific rules"),
@@ -3123,16 +3033,13 @@ mod compose_prompt_tests {
             ..Default::default()
         };
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            Some(&rules),
-            &pr_template_set,
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .editorial_rules(&rules)
+                .pr_template_set(&pr_template_set)
+                .build(),
         );
         assert!(
             prompt.contains("Template policy: Enforce"),
@@ -3156,16 +3063,12 @@ mod compose_prompt_tests {
     fn editorial_rules_block_appears_before_per_kind_directive() {
         // [editorial-rules] must appear before "Expected outcome for this run:"
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         let editorial_pos = prompt
             .find("[editorial-rules]")
@@ -3186,16 +3089,13 @@ mod compose_prompt_tests {
             ..Default::default()
         };
         let prompt = compose_execution_prompt(
-            &base_execution(),
-            &chore_without_pr(),
-            None,
-            std::path::Path::new("/tmp/workspace"),
-            None,
-            None,
-            None,
-            None,
-            Some(&rules),
-            &crate::pr_template::PrTemplateSet::default(),
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .editorial_rules(&rules)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
         );
         assert!(
             prompt.contains("Template policy: Advise"),
