@@ -4,9 +4,11 @@
 //! An *attention* is an agent-authored, human-actionable notification
 //! (a `question` or a `followup`). Attentions never stand alone: each is a
 //! member of an [`AttentionGroup`], the unit the human reads and acts on.
-//! This module owns creation + reconciliation + the answer/dismiss state
-//! transitions; producing the downstream artifact (`ActionAttentionGroup`)
-//! is task 3 and lives elsewhere.
+//! This module owns creation + reconciliation, the answer/dismiss state
+//! transitions, and — via [`WorkDb::action_attention_group`] — producing the
+//! single downstream artifact when the human actions a group: a revision (or
+//! a fresh design task) for a question group, or a batch task-create for a
+//! followup group.
 //!
 //! Reconciliation is an upsert on the `(grouping_key, generation)` unique
 //! index: re-running a source that emits the same questions/followups joins
@@ -564,5 +566,394 @@ impl WorkDb {
             .with_context(|| format!("missing attention group after update: {}", group.id))?;
         tx.commit()?;
         Ok(group)
+    }
+}
+
+// ===========================================================================
+// ActionAttentionGroup — the single terminal producer (design §"Engine
+// behaviour and take action per kind"). One entry point so the Notifications
+// window and the inline doc surface produce identical effects.
+// ===========================================================================
+
+/// Outcome of [`WorkDb::action_attention_group`]: the now-`actioned` group
+/// plus the ids of the work items the action produced. The RPC handler emits
+/// [`boss_protocol::FrontendEvent::AttentionGroupActioned`] with the group and
+/// publishes a work-tree invalidation for the produced ids so the kanban
+/// reflects the new revision / tasks without a manual reload.
+#[derive(Debug, Clone)]
+pub struct ActionedAttentionGroup {
+    pub group: AttentionGroup,
+    pub produced_work_item_ids: Vec<String>,
+}
+
+/// Load a group's members in display order within an open transaction.
+fn members_in_tx(conn: &Connection, group_id: &str) -> Result<Vec<Attention>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ATTN_COLS} FROM attentions WHERE group_id = ?1 ORDER BY ordinal ASC, id ASC"
+    ))?;
+    collect_rows(stmt.query_map([group_id], map_attention)?)
+}
+
+/// Map a `proposed_effort` hint (`"trivial"`…`"max"`) to an [`EffortLevel`].
+/// Unrecognised / empty values yield `None`, letting the dispatcher fall
+/// through to the product / engine default.
+fn parse_effort(raw: Option<&str>) -> Option<EffortLevel> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("trivial") => Some(EffortLevel::Trivial),
+        Some("small") => Some(EffortLevel::Small),
+        Some("medium") => Some(EffortLevel::Medium),
+        Some("large") => Some(EffortLevel::Large),
+        Some("max") => Some(EffortLevel::Max),
+        _ => None,
+    }
+}
+
+/// A concise card title for the revision / design task produced from a
+/// question group — derived from the source doc's basename when known.
+fn question_artifact_name(group: &AttentionGroup) -> String {
+    match group
+        .source_doc_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        Some(path) => {
+            let base = path.rsplit('/').next().unwrap_or(path);
+            format!("Apply answered questions to {base}")
+        }
+        None => "Apply answered design questions".to_owned(),
+    }
+}
+
+/// Render the `answered` question/answer pairs into a markdown brief handed
+/// to the revision / design worker. Skipped and dismissed members contribute
+/// nothing (the design: "produces one downstream artifact from the answered
+/// set").
+fn build_qa_brief(group: &AttentionGroup, answered: &[&Attention]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    match group.source_doc_path.as_deref().filter(|s| !s.is_empty()) {
+        Some(path) => {
+            let _ = writeln!(
+                out,
+                "The operator answered open questions about the design doc `{path}`. \
+                 Incorporate every answer below into the doc."
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "The operator answered open questions about this design. \
+                 Incorporate every answer below into the doc."
+            );
+        }
+    }
+    out.push_str("\n## Answered questions\n");
+    for m in answered {
+        let prompt = m.prompt_text.as_deref().unwrap_or("(question)");
+        let _ = write!(out, "\n### {prompt}\n");
+        if let Some(anchor) = m.source_anchor.as_deref().filter(|s| !s.is_empty()) {
+            let _ = writeln!(out, "_Section: {anchor}_");
+        }
+        let _ = writeln!(out, "\n**Answer:** {}", m.answer.as_deref().unwrap_or(""));
+    }
+    out
+}
+
+/// Insert a fresh `kind = 'design'` task seeded with the answered-questions
+/// brief. Used when a question group's source doc has already merged, so a
+/// revision (which needs an open PR) is impossible: a new design task opens a
+/// new PR instead. Mirrors [`insert_design_task_for_project_in_tx`] but
+/// carries a real description, a normal ordinal (the project's original
+/// design task occupies ordinal 0), and `created_via = attention`.
+fn insert_seeded_design_task_in_tx(
+    conn: &Connection,
+    product_id: &str,
+    project_id: &str,
+    name: &str,
+    description: &str,
+) -> Result<Task> {
+    let id = next_id("task");
+    let now = now_string();
+    let ordinal = next_task_ordinal(conn, project_id)?;
+    let short_id = allocate_short_id(conn, product_id)?;
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
+         pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, short_id) \
+         VALUES (?1, ?2, ?3, 'design', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, 1, 'medium', ?8, ?9)",
+        params![
+            id,
+            product_id,
+            project_id,
+            name,
+            description,
+            ordinal,
+            now,
+            CREATED_VIA_ATTENTION,
+            short_id,
+        ],
+    )?;
+    query_task(conn, &id)?.with_context(|| format!("missing seeded design task after insert: {id}"))
+}
+
+/// Produce the downstream artifact for a **question** group. Returns
+/// `(produced_artifact_kind, produced_artifact_ref_json, produced_ids)`.
+///
+/// Prefer a revision against the source doc's still-open PR. The revision
+/// gate (parent PR open and unmerged) is the exact condition the design forks
+/// on, so we attempt the revision and fall back to a fresh design task
+/// *precisely* when the gate refuses (no PR / merged / closed). Any other
+/// failure (e.g. a `gh` probe error) is a real error and propagates.
+fn action_question_group(
+    conn: &Connection,
+    group: &AttentionGroup,
+    members: &[Attention],
+    pr_checker: &dyn PrStateChecker,
+) -> Result<(String, String, Vec<String>)> {
+    let answered: Vec<&Attention> = members
+        .iter()
+        .filter(|m| m.answer_state == "answered")
+        .collect();
+    if answered.is_empty() {
+        bail!(
+            "attention group {} has no answered questions to act on; \
+             dismiss it instead of actioning",
+            group.id
+        );
+    }
+    let brief = build_qa_brief(group, &answered);
+    let name = question_artifact_name(group);
+
+    if let Some(parent_task_id) = group
+        .source_task_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        let input = CreateRevisionInput::builder()
+            .parent_task_id(parent_task_id)
+            .description(brief.clone())
+            .name(name.clone())
+            .created_via(CREATED_VIA_ATTENTION)
+            .build();
+        match assert_parent_revisable_and_insert(conn, input, pr_checker) {
+            Ok(revision) => {
+                let reference = serde_json::json!({
+                    "task_id": revision.id,
+                    "short_id": revision.short_id,
+                })
+                .to_string();
+                return Ok(("revision".to_owned(), reference, vec![revision.id]));
+            }
+            Err(err) => {
+                // Fall back to a fresh design task only when the gate refused
+                // (the source doc has no open PR to revise). The gate's checks
+                // run before it inserts anything, so the transaction is still
+                // clean here.
+                if err.downcast_ref::<RevisionGateError>().is_none() {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    // Merged doc (or no source task / open PR): a fresh design task opens a
+    // new PR seeded with the Q&A.
+    let project_id = group
+        .association_project_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "question group {} has no associated project; cannot create a design task",
+                group.id
+            )
+        })?;
+    let task = insert_seeded_design_task_in_tx(conn, &group.product_id, project_id, &name, &brief)?;
+    let reference = serde_json::json!({
+        "task_id": task.id,
+        "short_id": task.short_id,
+    })
+    .to_string();
+    Ok(("design_task".to_owned(), reference, vec![task.id]))
+}
+
+/// Produce the downstream artifact for a **followup** group: one task/chore
+/// per accepted (answered) member, created in the originating task's
+/// product/project. Skipped/dismissed members contribute nothing. Returns
+/// `(produced_artifact_kind, produced_artifact_ref_json, produced_ids)`.
+///
+/// `proposed_work_kind` is honoured as `chore` vs (project-)`task`; a
+/// `project` hint is materialised as a task in the originating project (v1
+/// produces tasks/chores, per the Attn-3 scope). When the originating work
+/// item has no project (it is itself a chore), the followup is created as a
+/// product-level chore.
+fn action_followup_group(
+    conn: &Connection,
+    group: &AttentionGroup,
+    members: &[Attention],
+) -> Result<(String, String, Vec<String>)> {
+    let accepted: Vec<&Attention> = members
+        .iter()
+        .filter(|m| m.answer_state == "answered")
+        .collect();
+    if accepted.is_empty() {
+        bail!(
+            "attention group {} has no accepted followups to create; \
+             dismiss it instead of actioning",
+            group.id
+        );
+    }
+
+    // New work items inherit the originating task's product + project.
+    let origin_id = group
+        .association_task_id
+        .as_deref()
+        .or(group.source_task_id.as_deref())
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("followup group {} has no originating task", group.id))?;
+    let origin = query_task(conn, origin_id)?.with_context(|| {
+        format!("followup group {} references a missing task {origin_id}", group.id)
+    })?;
+    let product_id = origin.product_id.clone();
+    let project_id = origin.project_id.clone();
+
+    let mut created_ids = Vec::with_capacity(accepted.len());
+    let mut created_refs = Vec::with_capacity(accepted.len());
+    for m in accepted {
+        let name = m
+            .proposed_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .with_context(|| format!("accepted followup {} has no proposed_name", m.id))?;
+        let effort = parse_effort(m.proposed_effort.as_deref());
+        // A `chore` hint, or the absence of a project to file into, lands a
+        // product-level chore; everything else becomes a project task. The
+        // duplicate guard is bypassed: actioning is an explicit human gesture.
+        let as_chore = m.proposed_work_kind.as_deref() == Some("chore") || project_id.is_none();
+
+        let created = if as_chore {
+            insert_chore_in_tx(
+                conn,
+                CreateChoreInput::builder()
+                    .product_id(product_id.clone())
+                    .name(name)
+                    .maybe_description(m.proposed_description.clone())
+                    .maybe_effort_level(effort)
+                    .created_via(CREATED_VIA_ATTENTION)
+                    .force_duplicate(true)
+                    .build(),
+            )?
+        } else {
+            let project_id = project_id
+                .clone()
+                .expect("project_id is present when as_chore is false");
+            insert_task_in_tx(
+                conn,
+                CreateTaskInput::builder()
+                    .product_id(product_id.clone())
+                    .project_id(project_id)
+                    .name(name)
+                    .maybe_description(m.proposed_description.clone())
+                    .maybe_effort_level(effort)
+                    .created_via(CREATED_VIA_ATTENTION)
+                    .force_duplicate(true)
+                    .build(),
+            )?
+        };
+        created_refs.push(serde_json::json!({
+            "task_id": created.id,
+            "short_id": created.short_id,
+            "kind": created.kind,
+        }));
+        created_ids.push(created.id);
+    }
+
+    let reference = serde_json::json!({ "tasks": created_refs }).to_string();
+    Ok(("tasks".to_owned(), reference, created_ids))
+}
+
+impl WorkDb {
+    /// Action an open / partially-answered attention group: produce the single
+    /// downstream artifact and transition the group to `actioned` (terminal),
+    /// recording `produced_artifact_kind` + `produced_artifact_ref`. All of it
+    /// — the artifact insert and the group flip — happens in one transaction
+    /// so a re-action can never spawn a second artifact.
+    ///
+    /// `skip_unanswered` marks every still-`open` member `skipped` first, so
+    /// the caller does not have to touch every row. After that, *every* member
+    /// must be in a terminal answer-state (`answered` / `skipped` / `dismissed`)
+    /// — otherwise the action is refused.
+    ///
+    /// - **question** group → a revision on the source doc's open PR, or a
+    ///   fresh `design` task when the doc has already merged.
+    /// - **followup** group → a batch of tasks/chores from the accepted members.
+    ///
+    /// `pr_checker` supplies the live PR state for the question→revision gate;
+    /// pass `&GhPrStateChecker` in production, `&FakePrStateChecker` in tests.
+    pub fn action_attention_group(
+        &self,
+        id: &str,
+        skip_unanswered: bool,
+        pr_checker: &dyn PrStateChecker,
+    ) -> Result<ActionedAttentionGroup> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let group =
+            resolve_group(&tx, id)?.with_context(|| format!("unknown attention group: {id}"))?;
+        match group.state.as_str() {
+            "actioned" => bail!(
+                "attention group {} is already actioned; an actioned group is terminal",
+                group.id
+            ),
+            "dismissed" => bail!(
+                "attention group {} is dismissed; a dismissed group cannot be actioned",
+                group.id
+            ),
+            _ => {}
+        }
+
+        if skip_unanswered {
+            tx.execute(
+                "UPDATE attentions SET answer_state = 'skipped' \
+                 WHERE group_id = ?1 AND answer_state = 'open'",
+                params![group.id],
+            )?;
+        }
+
+        let members = members_in_tx(&tx, &group.id)?;
+        if members.is_empty() {
+            bail!("attention group {} has no members to action", group.id);
+        }
+        let unanswered = members.iter().filter(|m| m.answer_state == "open").count();
+        if unanswered > 0 {
+            bail!(
+                "attention group {} has {unanswered} unanswered member(s); answer or skip them \
+                 (or pass skip_unanswered) before actioning",
+                group.id
+            );
+        }
+
+        let (produced_kind, produced_ref, produced_work_item_ids) = match group.kind.as_str() {
+            "question" => action_question_group(&tx, &group, &members, pr_checker)?,
+            "followup" => action_followup_group(&tx, &group, &members)?,
+            other => bail!("cannot action attention group {} of kind {other:?}", group.id),
+        };
+
+        let now = now_string();
+        tx.execute(
+            "UPDATE attention_groups \
+                SET state = 'actioned', produced_artifact_kind = ?2, \
+                    produced_artifact_ref = ?3, actioned_at = ?4 \
+              WHERE id = ?1",
+            params![group.id, produced_kind, produced_ref, now],
+        )?;
+        let group = query_attention_group(&tx, &group.id)?
+            .with_context(|| format!("missing attention group after action: {}", group.id))?;
+        tx.commit()?;
+        Ok(ActionedAttentionGroup {
+            group,
+            produced_work_item_ids,
+        })
     }
 }

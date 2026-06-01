@@ -67,8 +67,9 @@ pub use boss_protocol::{
     AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
     AutomationTrigger, BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE,
     COMMENT_STATUS_DISMISSED, COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED,
-    CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX,
-    CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution,
+    CREATED_VIA_ATTENTION, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_ENGINE_AUTO,
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation,
+    CommentAnchor, CommentResolution,
     ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
     CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
@@ -208,6 +209,7 @@ pub(crate) use migrations_b::*;
 pub(crate) use query_ensure::*;
 pub(crate) use revision_helpers::*;
 
+pub use attentions::ActionedAttentionGroup;
 pub use audit_misc::AUDIT_ACTOR_DESIGN_DETECTOR;
 pub use audit_misc::AUDIT_ACTOR_HUMAN;
 pub use automations::AutomationFireRecord;

@@ -371,3 +371,301 @@ fn rejecting_mismatched_kind_on_explicit_group() {
         "unexpected error: {err}"
     );
 }
+
+// ── ActionAttentionGroup (task 3) ─────────────────────────────────────────
+
+/// A question whose group records `source_task_id` (the originating design
+/// task), so the action path can target that task's PR.
+fn question_from_task(
+    project_id: &str,
+    source_task_id: &str,
+    doc_path: &str,
+    prompt: &str,
+) -> CreateAttentionInput {
+    CreateAttentionInput::builder()
+        .kind("question")
+        .association_project_id(project_id)
+        .source_kind("design_doc")
+        .source_task_id(source_task_id)
+        .source_doc_path(doc_path)
+        .question_type("prompt")
+        .prompt_text(prompt)
+        .build()
+}
+
+/// Stamp a task's PR url + status to simulate "doc in review".
+fn set_task_pr(db: &WorkDb, task_id: &str, pr_url: &str, status: &str) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = ?2, pr_url = ?3 WHERE id = ?1",
+        rusqlite::params![task_id, status, pr_url],
+    )
+    .unwrap();
+}
+
+fn read_task(db: &WorkDb, id: &str) -> Task {
+    let conn = db.connect().unwrap();
+    query_task(&conn, id).unwrap().unwrap()
+}
+
+#[test]
+fn action_question_with_open_pr_creates_revision() {
+    let (db, _product, project_id, task_id) = fixture();
+    set_task_pr(
+        &db,
+        &task_id,
+        "https://github.com/spinyfin/mono/pull/42",
+        "in_review",
+    );
+    let (a, _g) = db
+        .create_attention(question_from_task(
+            &project_id,
+            &task_id,
+            "docs/x.md",
+            "one table or two?",
+        ))
+        .unwrap();
+    let g = db
+        .answer_attention(&a.id, Some("two tables".to_owned()), false, false)
+        .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+
+    assert_eq!(actioned.group.state, "actioned");
+    assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("revision"));
+    assert!(actioned.group.actioned_at.is_some());
+    assert_eq!(actioned.produced_work_item_ids.len(), 1);
+
+    let revision = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(revision.kind, "revision");
+    assert_eq!(revision.parent_task_id.as_deref(), Some(task_id.as_str()));
+    assert_eq!(revision.created_via, "attention");
+    assert!(
+        revision.description.contains("two tables"),
+        "revision should carry the Q&A brief: {}",
+        revision.description
+    );
+    // The produced ref links back to the revision.
+    assert!(
+        actioned
+            .group
+            .produced_artifact_ref
+            .as_deref()
+            .unwrap()
+            .contains(&revision.id),
+        "ref should reference the revision id"
+    );
+}
+
+#[test]
+fn action_question_with_merged_doc_creates_design_task() {
+    let (db, _product, project_id, task_id) = fixture();
+    set_task_pr(
+        &db,
+        &task_id,
+        "https://github.com/spinyfin/mono/pull/7",
+        "in_review",
+    );
+    let (a, _g) = db
+        .create_attention(question_from_task(
+            &project_id,
+            &task_id,
+            "docs/x.md",
+            "gate behind a flag?",
+        ))
+        .unwrap();
+    let g = db
+        .answer_attention(&a.id, Some("yes, flag it".to_owned()), false, false)
+        .unwrap();
+
+    // The live PR probe reports Merged, so the revision gate refuses and the
+    // action falls back to a fresh design task.
+    let checker = FakePrStateChecker::always(PrOpenState::Merged);
+    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+
+    assert_eq!(actioned.group.state, "actioned");
+    assert_eq!(
+        actioned.group.produced_artifact_kind.as_deref(),
+        Some("design_task")
+    );
+    assert_eq!(actioned.produced_work_item_ids.len(), 1);
+
+    let design = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(design.kind, "design");
+    assert_eq!(design.project_id.as_deref(), Some(project_id.as_str()));
+    assert_eq!(design.created_via, "attention");
+    assert!(
+        design.description.contains("yes, flag it") && design.description.contains("docs/x.md"),
+        "design task should carry the Q&A brief: {}",
+        design.description
+    );
+}
+
+#[test]
+fn action_question_without_source_task_creates_design_task() {
+    let (db, _product, project_id, _task) = fixture();
+    // The default fixture question carries no source_task_id.
+    let (a, _g) = db
+        .create_attention(question(&project_id, "docs/y.md", "rename the column?"))
+        .unwrap();
+    let g = db
+        .answer_attention(&a.id, Some("no".to_owned()), false, false)
+        .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+    assert_eq!(
+        actioned.group.produced_artifact_kind.as_deref(),
+        Some("design_task")
+    );
+    let design = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(design.kind, "design");
+}
+
+#[test]
+fn action_followup_group_creates_tasks() {
+    let (db, _product, project_id, task_id) = fixture();
+    let (a1, _g) = db.create_attention(followup(&task_id, "extract helper")).unwrap();
+    let (a2, _g) = db.create_attention(followup(&task_id, "add a test")).unwrap();
+    // Accept the first, skip the second — only accepted members produce work.
+    db.answer_attention(&a1.id, None, false, false).unwrap();
+    let g = db.answer_attention(&a2.id, None, true, false).unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+
+    assert_eq!(actioned.group.state, "actioned");
+    assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("tasks"));
+    assert_eq!(
+        actioned.produced_work_item_ids.len(),
+        1,
+        "only the accepted followup becomes a task"
+    );
+    let task = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(task.kind, "project_task");
+    assert_eq!(task.name, "extract helper");
+    assert_eq!(task.project_id.as_deref(), Some(project_id.as_str()));
+    assert_eq!(task.created_via, "attention");
+}
+
+#[test]
+fn action_followup_honours_chore_work_kind() {
+    let (db, _product, _project, task_id) = fixture();
+    let mut input = followup(&task_id, "tidy the logs");
+    input.proposed_work_kind = Some("chore".to_owned());
+    let (a, _g) = db.create_attention(input).unwrap();
+    let g = db.answer_attention(&a.id, None, false, false).unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
+    let chore = read_task(&db, &actioned.produced_work_item_ids[0]);
+    assert_eq!(chore.kind, "chore");
+    assert!(chore.project_id.is_none(), "chores are product-level");
+}
+
+#[test]
+fn action_requires_every_member_terminal() {
+    let (db, _product, project_id, _task) = fixture();
+    let (a1, _g) = db
+        .create_attention(question(&project_id, "docs/x.md", "Q1"))
+        .unwrap();
+    let (_a2, _g) = db
+        .create_attention(question(&project_id, "docs/x.md", "Q2"))
+        .unwrap();
+    let g = db
+        .answer_attention(&a1.id, Some("yes".to_owned()), false, false)
+        .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let err = db
+        .action_attention_group(&g.id, false, &checker)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unanswered"),
+        "unexpected error: {err}"
+    );
+    // The group is untouched — still actionable later.
+    let reloaded = db.get_attention_group(&g.id).unwrap();
+    assert_eq!(reloaded.state, "partially_answered");
+}
+
+#[test]
+fn action_with_skip_unanswered_clears_open_members_then_actions() {
+    let (db, _product, project_id, task_id) = fixture();
+    set_task_pr(
+        &db,
+        &task_id,
+        "https://github.com/spinyfin/mono/pull/9",
+        "in_review",
+    );
+    let (a1, _g) = db
+        .create_attention(question_from_task(&project_id, &task_id, "docs/x.md", "Q1"))
+        .unwrap();
+    let (a2, _g) = db
+        .create_attention(question_from_task(&project_id, &task_id, "docs/x.md", "Q2"))
+        .unwrap();
+    db.answer_attention(&a1.id, Some("answered".to_owned()), false, false)
+        .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let actioned = db.action_attention_group(&a2.group_id, true, &checker).unwrap();
+    assert_eq!(actioned.group.state, "actioned");
+    assert_eq!(actioned.group.produced_artifact_kind.as_deref(), Some("revision"));
+
+    let members = db.list_attentions_for_group(&actioned.group.id).unwrap();
+    let skipped = members.iter().find(|m| m.id == a2.id).unwrap();
+    assert_eq!(skipped.answer_state, "skipped");
+}
+
+#[test]
+fn action_all_skipped_question_group_has_nothing_to_produce() {
+    let (db, _product, project_id, _task) = fixture();
+    let (a, _g) = db
+        .create_attention(question(&project_id, "docs/x.md", "Q"))
+        .unwrap();
+    let g = db.answer_attention(&a.id, None, true, false).unwrap();
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let err = db
+        .action_attention_group(&g.id, false, &checker)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no answered questions"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn action_rejects_terminal_group() {
+    let (db, _product, project_id, _task) = fixture();
+    let (_a, g) = db
+        .create_attention(question(&project_id, "docs/x.md", "Q"))
+        .unwrap();
+    db.dismiss_attention(&g.id, None).unwrap();
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let err = db
+        .action_attention_group(&g.id, true, &checker)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("dismissed"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn actioned_group_cannot_be_actioned_again() {
+    let (db, _product, project_id, _task) = fixture();
+    let (a, _g) = db
+        .create_attention(question(&project_id, "docs/x.md", "Q"))
+        .unwrap();
+    let g = db.answer_attention(&a.id, Some("x".to_owned()), false, false).unwrap();
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    db.action_attention_group(&g.id, false, &checker).unwrap();
+    let err = db
+        .action_attention_group(&g.id, false, &checker)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already actioned"),
+        "unexpected error: {err}"
+    );
+}

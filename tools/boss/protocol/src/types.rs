@@ -606,6 +606,11 @@ pub const CREATED_VIA_MERGE_CONFLICT_PREFIX: &str = "merge-conflict:";
 /// Prefix for engine-triggered revisions spawned by the CI-failure watcher:
 /// `ci-fix:<ci_remediations.id>`. Mirrors `CREATED_VIA_MERGE_CONFLICT_PREFIX`.
 pub const CREATED_VIA_CI_FIX_PREFIX: &str = "ci-fix:";
+/// Engine-triggered work spawned by actioning an attention group
+/// (`ActionAttentionGroup`): the revision / design task produced from a
+/// question group, or the batch of tasks/chores produced from a followup
+/// group. Design: `tools/boss/docs/designs/attentions.md`.
+pub const CREATED_VIA_ATTENTION: &str = "attention";
 
 /// Documented `created_via` values. The engine canonicalises caller-
 /// supplied strings against this set; values outside it are stored
@@ -616,6 +621,7 @@ pub const KNOWN_CREATED_VIA: &[&str] = &[
     CREATED_VIA_MAC_APP,
     CREATED_VIA_ENGINE_AUTO,
     CREATED_VIA_EXTERNAL_TRACKER_SYNC,
+    CREATED_VIA_ATTENTION,
     CREATED_VIA_UNKNOWN,
 ];
 

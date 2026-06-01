@@ -39,7 +39,10 @@ use crate::external_tracker::github_oauth::{
     DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
 };
 use crate::repo_slug;
-use crate::work::{DuplicateTaskError, GhPrStateChecker, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem};
+use crate::work::{
+    ActionedAttentionGroup, DuplicateTaskError, GhPrStateChecker, SetRunTranscriptPathOutcome,
+    Task, WorkDb, WorkItem,
+};
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
@@ -5459,16 +5462,54 @@ async fn handle_frontend_connection(
                     }
                 }
             }
-            FrontendRequest::ActionAttentionGroup { .. } => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: "attentions: ActionAttentionGroup is not yet implemented (task 3)"
-                            .to_string(),
-                    },
-                );
-            }
+            FrontendRequest::ActionAttentionGroup {
+                id,
+                skip_unanswered,
+            } => match work_db.action_attention_group(&id, skip_unanswered, &GhPrStateChecker) {
+                Ok(ActionedAttentionGroup {
+                    group,
+                    produced_work_item_ids,
+                }) => {
+                    // Live-update the Notifications window + inline doc surface.
+                    server_state
+                        .publisher
+                        .publish_frontend_event_on_product(
+                            &group.product_id,
+                            FrontendEvent::AttentionGroupActioned {
+                                group: group.clone(),
+                            },
+                        )
+                        .await;
+                    // Refresh the kanban / work tree so the produced revision
+                    // or tasks appear without a manual reload.
+                    if !produced_work_item_ids.is_empty() {
+                        publish_work_invalidation(
+                            &server_state,
+                            &session_id,
+                            &request_id,
+                            vec![work_product_topic(&group.product_id)],
+                            "attention_group_actioned",
+                            Some(group.product_id.clone()),
+                            produced_work_item_ids,
+                        )
+                        .await;
+                    }
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::AttentionGroupActioned { group },
+                    );
+                }
+                Err(err) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::WorkError {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            },
             FrontendRequest::RegisterAppSession => {
                 // Trust the peer if any of:
                 //   (a) it matches the declared app pid exactly. The
